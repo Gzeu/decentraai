@@ -14,10 +14,10 @@
 - [x] Chunk transfer engine with per-chunk verification and resume
 - [x] End-to-end test: two nodes exchange a real model
 
-## 3. Runtime
-- [ ] llama.cpp integration for GGUF inference
-- [ ] Inference admission control wired to system probe
-- [ ] Local OpenAI-compatible API endpoint
+## 3. Runtime (M4 — in progress)
+- [x] M4a: llama-server process manager crate (`decentraai-runtime`)
+- [ ] M4b: inference admission control wired to the system probe
+- [ ] M4c: local OpenAI-compatible API endpoint + `decentraai serve`
 
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler
