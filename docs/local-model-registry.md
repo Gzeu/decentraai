@@ -4,7 +4,7 @@ The local model registry discovers model artifacts only from a caller-approved d
 
 ## Supported artifacts
 
-The scanner recognizes files with these case-insensitive extensions: `.gguf`, `.safetensors`, `.onnx`, `.bin`, `.pt`, and `.pth`.
+The scanner recognizes files with these case-insensitive extensions: `.gguf` only. GGUF is the only format that decentraai-manifest can verify in v1, and other formats like `.pt`/`.pth` (pickle-based) conflict with the threat model's prohibition on unsafe deserialization.
 
 ## Safety rules
 
@@ -19,4 +19,4 @@ Records are keyed by their path relative to the approved root, so scans are dete
 
 ## Integration status
 
-The standalone scanner module is intended for `crates/node-cli/src/model_registry.rs`. CLI command wiring requires the existing contents of `crates/node-cli/src/main.rs`, which are not currently exposed by the GitHub connector. No remote model discovery or inference is included.
+The standalone scanner module is implemented in `crates/registry` (decentraai-registry crate). CLI command wiring is in `crates/node-cli/src/main.rs`. No remote model discovery or inference is included.

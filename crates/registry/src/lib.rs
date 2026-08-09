@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["gguf", "safetensors", "onnx", "bin", "pt", "pth"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["gguf"];
 
 const REGISTRY_VERSION: u32 = 1;
 
@@ -237,15 +237,10 @@ mod tests {
         let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
 
         create_test_file(temp_dir.path(), "model.gguf", b"GGUF magic");
-        create_test_file(temp_dir.path(), "model.safetensors", b"safetensors");
-        create_test_file(temp_dir.path(), "model.onnx", b"onnx");
-        create_test_file(temp_dir.path(), "model.bin", b"bin");
-        create_test_file(temp_dir.path(), "model.pt", b"pt");
-        create_test_file(temp_dir.path(), "model.pth", b"pth");
 
         let count = registry.scan_directory(temp_dir.path()).unwrap();
-        assert_eq!(count, 6);
-        assert_eq!(registry.model_count(), 6);
+        assert_eq!(count, 1);
+        assert_eq!(registry.model_count(), 1);
     }
 
     #[test]
@@ -256,6 +251,11 @@ mod tests {
         create_test_file(temp_dir.path(), "model.txt", b"text");
         create_test_file(temp_dir.path(), "model.json", b"json");
         create_test_file(temp_dir.path(), "model.unknown", b"unknown");
+        create_test_file(temp_dir.path(), "model.safetensors", b"safetensors");
+        create_test_file(temp_dir.path(), "model.onnx", b"onnx");
+        create_test_file(temp_dir.path(), "model.bin", b"bin");
+        create_test_file(temp_dir.path(), "model.pt", b"pt");
+        create_test_file(temp_dir.path(), "model.pth", b"pth");
 
         let count = registry.scan_directory(temp_dir.path()).unwrap();
         assert_eq!(count, 0);

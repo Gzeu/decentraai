@@ -34,7 +34,7 @@ Decentralized P2P distribution of AI model artifacts and verifiable local or rem
 
 ### M2: Local Model Discovery ✅
 - **Implemented**: Local model scanning and persistent registry
-- **Supported formats**: `.gguf`, `.safetensors`, `.onnx`, `.bin`, `.pt`, `.pth`
+- **Supported formats**: `.gguf` only (matches verification capability in decentraai-manifest)
 - **CLI commands**:
   - `decentraai registry scan --directory <path> --registry <path>`: Scan directory for models
   - `decentraai registry list --registry <path>`: List registered models
@@ -42,7 +42,7 @@ Decentralized P2P distribution of AI model artifacts and verifiable local or rem
 
 ### Previous Milestones
 - **M0**: Repository bootstrap ✅
-- **M1**: Identity and system doctor ✅
+- **M1**: System doctor ✅ / identity pending
 
 ## Security baseline
 No artifact is usable before hash, manifest, and policy verification. Prompts and outputs are never logged by default. Private keys never enter Git or telemetry.
