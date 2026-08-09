@@ -1,0 +1,31 @@
+# Secrets and identities
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+identity/
+
+# Local node state
+.decentraai/
+cache/
+models/
+quarantine/
+staging/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Rust
+/target/
+
+# Python tooling
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
