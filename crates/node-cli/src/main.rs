@@ -310,12 +310,17 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Runs gated inference in the foreground: admission check, registry
-/// resolution, llama-server spawn with readiness wait, Ctrl+C to stop.
+/// Runs gated inference with the OpenAI-compatible API: admission check,
+/// registry resolution, llama-server spawn, Bearer token, thin proxy on
+/// inference.bind_address, idle unload, Ctrl+C to stop.
 async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
+    use decentraai_runtime::api::{ApiState, ensure_api_token, serve_api};
     use decentraai_runtime::{
-        LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server, resolve_model,
+        LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
 
     let config = NodeConfig::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
@@ -339,13 +344,46 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     runtime.parallel = config.inference.max_concurrent_requests;
 
     let server = LlamaServer::spawn(&binary, &runtime).await?;
+    let backend_url = server.base_url();
+    let idle_timeout =
+        Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+    let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));
+
+    // Idle watcher: unloads the model after the configured timeout.
+    let watcher = manager.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let mut guard = watcher.lock().await;
+            if !guard.is_loaded() {
+                break;
+            }
+            let _ = guard.unload_if_idle().await;
+        }
+    });
+
+    let token = if config.inference.api_auth_required {
+        Some(ensure_api_token(&data_dir.join("runtime/api.token"))?)
+    } else {
+        None
+    };
+    let state = ApiState::new(backend_url, token.clone(), manager.clone());
+    let api_addr = serve_api(state, &config.inference.bind_address).await?;
+
+    let auth_hint = match &token {
+        Some(_) => format!("Bearer token: {}", data_dir.join("runtime/api.token").display()),
+        None => "no auth required by config".to_string(),
+    };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  Endpoint: {}\n  Press Ctrl+C to stop",
+        "DecentraAI inference running\n  Model: {}\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
         model_path.display(),
-        server.base_url()
+        api_addr,
+        auth_hint,
+        config.inference.idle_model_unload_minutes
     );
     tokio::signal::ctrl_c().await?;
-    server.stop().await?;
+    manager.lock().await.shutdown().await?;
     Ok(())
 }
 

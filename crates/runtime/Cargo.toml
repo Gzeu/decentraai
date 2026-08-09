@@ -7,9 +7,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 decentraai-config = { path = "../config" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }
+hex.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

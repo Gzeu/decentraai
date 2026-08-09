@@ -1,10 +1,13 @@
 //! Managed llama.cpp `llama-server` subprocess plus the admission gate
-//! and serve lifecycle (M4a/M4b).
+//! and serve lifecycle (M4a/M4b), and the OpenAI-compatible API proxy
+//! (M4c, in [`api`]).
 //!
 //! The inference engine runs as an external process, not FFI bindings:
 //! upgrades are simple binary swaps and a crash in inference never takes
 //! the node down. Before any model loads, the admission gate checks the
 //! config mode and the live hardware budgets from the system probe.
+
+pub mod api;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};

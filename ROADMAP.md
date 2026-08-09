@@ -14,10 +14,10 @@
 - [x] Chunk transfer engine with per-chunk verification and resume
 - [x] End-to-end test: two nodes exchange a real model
 
-## 3. Runtime (M4 — in progress)
+## 3. Runtime (done)
 - [x] M4a: llama-server process manager crate (`decentraai-runtime`)
 - [x] M4b: inference admission gate + `decentraai serve start`
-- [ ] M4c: local OpenAI-compatible API endpoint with idle unload
+- [x] M4c: OpenAI-compatible API endpoint with Bearer auth and idle unload
 
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler
