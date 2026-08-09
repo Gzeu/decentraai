@@ -35,6 +35,8 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
+    /// Creates a node. Must be called from within a Tokio runtime context:
+    /// the mDNS behaviour registers with the reactor at construction.
     pub fn new(identity: &Identity, max_message_bytes: usize) -> Result<Self> {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
@@ -205,23 +207,23 @@ async fn write_frame<T: AsyncWrite + Unpin + Send>(io: &mut T, data: &[u8]) -> i
 mod tests {
     use super::*;
 
-    #[test]
-    fn libp2p_peer_id_is_derived_from_node_identity() {
+    #[tokio::test]
+    async fn libp2p_peer_id_is_derived_from_node_identity() {
         let identity = Identity::generate();
         let node = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
         let again = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
         assert_eq!(node.local_peer_id(), again.local_peer_id());
     }
 
-    #[test]
-    fn distinct_identities_have_distinct_peer_ids() {
+    #[tokio::test]
+    async fn distinct_identities_have_distinct_peer_ids() {
         let a = P2PNode::new(&Identity::generate(), DEFAULT_MAX_MESSAGE_BYTES).unwrap();
         let b = P2PNode::new(&Identity::generate(), DEFAULT_MAX_MESSAGE_BYTES).unwrap();
         assert_ne!(a.local_peer_id(), b.local_peer_id());
     }
 
-    #[test]
-    fn listen_on_localhost() {
+    #[tokio::test]
+    async fn listen_on_localhost() {
         let identity = Identity::generate();
         let mut node = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
         node.listen("/ip4/127.0.0.1/tcp/0").unwrap();
