@@ -1,10 +1,8 @@
-mod model_registry;
-
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
+use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
-use model_registry::ModelRegistry;
 use std::fs;
 use std::path::PathBuf;
 use tracing::info;

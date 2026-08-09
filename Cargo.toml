@@ -3,6 +3,7 @@ members = [
   "crates/config",
   "crates/manifest",
   "crates/node-cli",
+  "crates/registry",
   "crates/system-probe",
 ]
 resolver = "2"

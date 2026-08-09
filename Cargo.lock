@@ -214,10 +214,8 @@ dependencies = [
  "anyhow",
  "clap",
  "decentraai-config",
+ "decentraai-registry",
  "decentraai-system-probe",
- "serde",
- "serde_json",
- "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -240,6 +238,17 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "decentraai-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
