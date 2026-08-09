@@ -35,7 +35,12 @@ pub struct NodeSection {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NodeMode { Conservative, Balanced, Contributor, Dedicated }
+pub enum NodeMode {
+    Conservative,
+    Balanced,
+    Contributor,
+    Dedicated,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,15 +125,56 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.node.name.trim().is_empty() { return Err(ConfigError::Validation("node.name must not be empty".into())); }
-        if self.network.max_connections == 0 { return Err(ConfigError::Validation("network.max_connections must be greater than zero".into())); }
-        if !(1..=64).contains(&self.storage.chunk_size_mb) { return Err(ConfigError::Validation("storage.chunk_size_mb must be between 1 and 64".into())); }
-        if self.storage.hash_algorithm != "blake3" && self.storage.hash_algorithm != "sha256" { return Err(ConfigError::Validation("storage.hash_algorithm must be blake3 or sha256".into())); }
-        for (name, value) in [("resources.cpu_max_percent", self.resources.cpu_max_percent), ("resources.memory_max_percent", self.resources.memory_max_percent), ("resources.gpu_max_vram_percent", self.resources.gpu_max_vram_percent)] {
-            if value == 0 || value > 100 { return Err(ConfigError::Validation(format!("{name} must be between 1 and 100"))); }
+        if self.node.name.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "node.name must not be empty".into(),
+            ));
         }
-        if self.inference.bind_address != "127.0.0.1" && self.inference.bind_address != "::1" && !self.inference.api_auth_required { return Err(ConfigError::Validation("non-local inference bind_address requires api_auth_required: true".into())); }
-        if self.inference.allow_remote_inference && !self.network.private_swarm { return Err(ConfigError::Validation("remote inference requires private_swarm in the initial release".into())); }
+        if self.network.max_connections == 0 {
+            return Err(ConfigError::Validation(
+                "network.max_connections must be greater than zero".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.storage.chunk_size_mb) {
+            return Err(ConfigError::Validation(
+                "storage.chunk_size_mb must be between 1 and 64".into(),
+            ));
+        }
+        if self.storage.hash_algorithm != "blake3" && self.storage.hash_algorithm != "sha256" {
+            return Err(ConfigError::Validation(
+                "storage.hash_algorithm must be blake3 or sha256".into(),
+            ));
+        }
+        for (name, value) in [
+            ("resources.cpu_max_percent", self.resources.cpu_max_percent),
+            (
+                "resources.memory_max_percent",
+                self.resources.memory_max_percent,
+            ),
+            (
+                "resources.gpu_max_vram_percent",
+                self.resources.gpu_max_vram_percent,
+            ),
+        ] {
+            if value == 0 || value > 100 {
+                return Err(ConfigError::Validation(format!(
+                    "{name} must be between 1 and 100"
+                )));
+            }
+        }
+        if self.inference.bind_address != "127.0.0.1"
+            && self.inference.bind_address != "::1"
+            && !self.inference.api_auth_required
+        {
+            return Err(ConfigError::Validation(
+                "non-local inference bind_address requires api_auth_required: true".into(),
+            ));
+        }
+        if self.inference.allow_remote_inference && !self.network.private_swarm {
+            return Err(ConfigError::Validation(
+                "remote inference requires private_swarm in the initial release".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -141,7 +187,8 @@ mod tests {
     #[test]
     fn example_configuration_is_valid() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(include_bytes!("../../../configs/node.example.yaml")).unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
         assert!(NodeConfig::load(file.path()).is_ok());
     }
 }

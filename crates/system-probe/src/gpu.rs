@@ -18,13 +18,25 @@ pub struct GpuSnapshot {
 
 pub fn probe_gpu() -> GpuProbeStatus {
     let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total,memory.free,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total,memory.free,utilization.gpu,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
         .output();
-    let Ok(output) = output else { return GpuProbeStatus::Unavailable("nvidia-smi not found".into()); };
-    if !output.status.success() { return GpuProbeStatus::Unavailable("nvidia-smi returned an error".into()); }
-    let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() else { return GpuProbeStatus::Unavailable("nvidia-smi returned no GPU records".into()); };
+    let Ok(output) = output else {
+        return GpuProbeStatus::Unavailable("nvidia-smi not found".into());
+    };
+    if !output.status.success() {
+        return GpuProbeStatus::Unavailable("nvidia-smi returned an error".into());
+    }
+    let binding = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = binding.lines().next() else {
+        return GpuProbeStatus::Unavailable("nvidia-smi returned no GPU records".into());
+    };
     let fields: Vec<_> = line.split(',').map(str::trim).collect();
-    if fields.len() != 6 { return GpuProbeStatus::Unavailable("nvidia-smi returned an unexpected format".into()); }
+    if fields.len() != 6 {
+        return GpuProbeStatus::Unavailable("nvidia-smi returned an unexpected format".into());
+    }
     let parsed = || -> Option<GpuSnapshot> {
         Some(GpuSnapshot {
             name: fields[0].to_owned(),
@@ -35,5 +47,7 @@ pub fn probe_gpu() -> GpuProbeStatus {
             power_draw_watts: fields[5].parse().ok()?,
         })
     };
-    parsed().map(GpuProbeStatus::Nvidia).unwrap_or_else(|| GpuProbeStatus::Unavailable("unable to parse nvidia-smi metrics".into()))
+    parsed()
+        .map(GpuProbeStatus::Nvidia)
+        .unwrap_or_else(|| GpuProbeStatus::Unavailable("unable to parse nvidia-smi metrics".into()))
 }

@@ -14,5 +14,10 @@ anyhow.workspace = true
 clap.workspace = true
 decentraai-config = { path = "../config" }
 decentraai-system-probe = { path = "../system-probe" }
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
