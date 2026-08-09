@@ -4,6 +4,7 @@
 use anyhow::Result;
 use decentraai_identity::Identity;
 use decentraai_manifest::{CHUNK_SIZE, Manifest, scan};
+use decentraai_p2p::reputation::ReputationStore;
 use decentraai_p2p::transfer::download;
 use decentraai_p2p::{
     DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RequestHandler,
@@ -54,6 +55,17 @@ async fn node_pair(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, P2PNod
     (server, client)
 }
 
+/// A reputation store with a high ban threshold: neutral for tests that
+/// do not exercise banning.
+fn test_reputation(dir: &Path) -> ReputationStore {
+    ReputationStore::load(
+        &dir.join("reputation.json"),
+        100,
+        Duration::from_secs(300),
+    )
+    .unwrap()
+}
+
 /// Retries the download while the freshly dialed connection settles.
 /// Progress persists across attempts thanks to the resume bitmap.
 async fn download_with_retry(
@@ -61,10 +73,11 @@ async fn download_with_retry(
     peer: PeerId,
     manifest_id: &str,
     dir: &Path,
+    reputation: &mut ReputationStore,
 ) -> Result<PathBuf> {
     let mut last_err = None;
     for _ in 0..50 {
-        match download(client, peer, manifest_id, dir).await {
+        match download(client, peer, manifest_id, dir, reputation).await {
             Ok(path) => return Ok(path),
             Err(e) => {
                 last_err = Some(e);
@@ -100,16 +113,28 @@ async fn end_to_end_download_matches_source() {
     ));
 
     let (server, client) = node_pair(Some(handler)).await;
+    let mut reputation = test_reputation(dir.path());
     let out_dir = dir.path().join("client");
-    let path = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
-        .await
-        .unwrap();
+    let path = download_with_retry(
+        &client,
+        server.local_peer_id(),
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), data);
     assert_eq!(path.file_name().unwrap().to_str().unwrap(), "model.gguf");
     let staging = out_dir.join("staging");
     assert!(!staging.join(format!("{manifest_id}.part")).exists());
     assert!(!staging.join(format!("{manifest_id}.done")).exists());
+    assert_eq!(
+        reputation.score(&server.local_peer_id()),
+        2.0,
+        "two verified chunks must credit the peer twice"
+    );
 }
 
 /// Serves a valid manifest but garbage chunk data.
@@ -146,14 +171,69 @@ async fn corrupted_chunk_is_rejected() {
     });
 
     let (server, client) = node_pair(Some(handler)).await;
+    let mut reputation = test_reputation(dir.path());
     let out_dir = dir.path().join("client");
-    let err = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
-        .await
-        .unwrap_err();
+    let err = download_with_retry(
+        &client,
+        server.local_peer_id(),
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.to_string().contains("failed verification"),
         "expected a verification failure, got: {err}"
     );
+    assert!(
+        reputation.failures(&server.local_peer_id()) >= 1,
+        "corrupt chunks must be recorded as failures"
+    );
+}
+
+#[tokio::test]
+async fn misbehaving_peer_gets_banned() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    std::fs::write(&source_path, test_bytes(CHUNK_SIZE + 1)).unwrap();
+
+    let manifest = scan(&source_path).unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let handler = Arc::new(CorruptChunkHandler {
+        manifest_response: manifest_bytes(manifest),
+    });
+
+    let (server, client) = node_pair(Some(handler)).await;
+    // Let the dialed connection settle before direct (non-retried) calls.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut reputation = ReputationStore::load(
+        &dir.path().join("reputation.json"),
+        2,
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    let out_dir = dir.path().join("client");
+    let peer = server.local_peer_id();
+
+    let first = download(&client, peer, &manifest_id, &out_dir, &mut reputation)
+        .await
+        .unwrap_err();
+    assert!(first.to_string().contains("failed verification"));
+    assert!(!reputation.is_banned(&peer));
+
+    let second = download(&client, peer, &manifest_id, &out_dir, &mut reputation)
+        .await
+        .unwrap_err();
+    assert!(second.to_string().contains("failed verification"));
+    assert!(reputation.is_banned(&peer), "peer must be banned at the threshold");
+
+    // The third attempt is refused locally, before any network traffic.
+    let third = download(&client, peer, &manifest_id, &out_dir, &mut reputation)
+        .await
+        .unwrap_err();
+    assert!(third.to_string().contains("banned"));
 }
 
 /// Delegates to StaticFileServer while counting chunk requests.
@@ -209,14 +289,26 @@ async fn download_resumes_from_bitmap() {
     }
     std::fs::write(staging.join(format!("{manifest_id}.done")), [1u8, 0u8]).unwrap();
 
-    let path = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
-        .await
-        .unwrap();
+    let mut reputation = test_reputation(dir.path());
+    let path = download_with_retry(
+        &client,
+        server.local_peer_id(),
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), data);
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
         "only the missing chunk should have been requested"
+    );
+    assert_eq!(
+        reputation.successes(&server.local_peer_id()),
+        1,
+        "resumed chunks must not be credited twice"
     );
 }

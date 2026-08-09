@@ -7,6 +7,7 @@
 //! The libp2p keypair is derived from the node identity, binding the
 //! transport PeerId to the Ed25519 node key.
 
+pub mod reputation;
 pub mod transfer;
 
 use anyhow::{Context, Result, bail};

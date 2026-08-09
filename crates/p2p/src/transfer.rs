@@ -1,6 +1,10 @@
 //! Verified model download: fetch the manifest, download every chunk with
 //! per-chunk BLAKE3 verification, persist progress for resume, and finish
 //! with a full-file Merkle-root check and atomic rename.
+//!
+//! Every chunk outcome is recorded in the reputation store: verified
+//! chunks raise the peer's score, corrupted ones count toward a temporary
+//! ban. Banned peers are refused before any network traffic.
 
 use anyhow::{Result, bail};
 use decentraai_manifest::{CHUNK_SIZE, Manifest, merkle_root};
@@ -11,8 +15,9 @@ use decentraai_protocol::{
 use libp2p::PeerId;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::reputation::ReputationStore;
 use crate::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
 
 /// Downloads the artifact described by `manifest_id` from `peer`.
@@ -26,7 +31,12 @@ pub async fn download(
     peer: PeerId,
     manifest_id: &str,
     data_dir: &Path,
+    reputation: &mut ReputationStore,
 ) -> Result<PathBuf> {
+    if let Some(until) = reputation.banned_until(&peer) {
+        bail!("peer {peer} is banned until unix time {until} (too many invalid chunks)");
+    }
+
     let manifest = fetch_manifest(node, peer, manifest_id).await?;
     if manifest.chunk_size != CHUNK_SIZE {
         bail!(
@@ -78,6 +88,10 @@ pub async fn download(
         let expected = &manifest.chunk_hashes[index];
         let actual = blake3::hash(&response.chunk_data).to_hex().to_string();
         if &actual != expected {
+            reputation.record_failure(&peer);
+            if let Err(e) = reputation.save() {
+                warn!(error = %e, "failed to persist reputation after invalid chunk");
+            }
             bail!(
                 "chunk {} failed verification: expected {}, got {}",
                 index,
@@ -95,6 +109,7 @@ pub async fn download(
 
         done[index] = true;
         save_bitmap(&bitmap_path, &done)?;
+        reputation.record_success(&peer);
         info!(chunk = index, total = chunk_count, "chunk verified and stored");
     }
 
@@ -123,6 +138,9 @@ pub async fn download(
     let final_path = models_dir.join(&manifest.file_name);
     std::fs::rename(&staging_path, &final_path)?;
     let _ = std::fs::remove_file(&bitmap_path);
+    if let Err(e) = reputation.save() {
+        warn!(error = %e, "failed to persist reputation after download");
+    }
     info!(path = %final_path.display(), "download complete and verified");
     Ok(final_path)
 }

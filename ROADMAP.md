@@ -22,7 +22,7 @@
 
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler
-- [ ] Reputation and peer scoring
+- [x] Reputation and peer scoring (M5a: bans, decay, persistence)
 - [ ] Multi-provider downloads (swarm fetching)
 
 ## 5. Hardening
