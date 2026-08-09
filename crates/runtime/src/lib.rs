@@ -294,8 +294,9 @@ impl ServeManager {
         Ok(false)
     }
 
-    /// Stops the server if one is still running.
-    pub async fn shutdown(mut self) -> Result<()> {
+    /// Stops the server if one is still running. Borrows the manager so
+    /// the handle stays usable for status checks afterwards.
+    pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(server) = self.server.take() {
             server.stop().await?;
         }
