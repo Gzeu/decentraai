@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 decentraai-identity = { path = "../identity" }
 decentraai-manifest = { path = "../manifest" }
 decentraai-protocol = { path = "../protocol" }
@@ -17,5 +18,4 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-blake3.workspace = true
 tempfile.workspace = true

@@ -256,7 +256,7 @@ fn list_registry(registry: String) -> Result<()> {
 /// Runs the swarm: loads identity and config, listens on an ephemeral TCP
 /// port, and drives the event loop until interrupted.
 async fn swarm_start(config_path: PathBuf) -> Result<()> {
-    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode};
 
     let config = NodeConfig::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
@@ -273,7 +273,6 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
         None,
     )?;
-    let _ = DEFAULT_MAX_MESSAGE_BYTES;
     node.listen("/ip4/0.0.0.0/tcp/0").await?;
     println!(
         "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Press Ctrl+C to stop",

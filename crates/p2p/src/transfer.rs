@@ -2,7 +2,7 @@
 //! per-chunk BLAKE3 verification, persist progress for resume, and finish
 //! with a full-file Merkle-root check and atomic rename.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use decentraai_manifest::{CHUNK_SIZE, Manifest, merkle_root};
 use decentraai_protocol::{
     CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest, ManifestResponse,

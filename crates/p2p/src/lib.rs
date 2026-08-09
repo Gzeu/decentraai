@@ -16,7 +16,7 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, mdns, noise, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, mdns, noise, tcp, yamux};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CHUNK_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
 
 /// Serves inbound requests from peers.
-pub trait RequestHandler: Send + 'static {
+pub trait RequestHandler: Send + Sync + 'static {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>>;
 }
 
@@ -45,21 +45,14 @@ pub struct StaticFileServer {
     manifest_response: Vec<u8>,
     file: std::path::PathBuf,
     chunk_size: u64,
-    max_response_bytes: usize,
 }
 
 impl StaticFileServer {
-    pub fn new(
-        manifest_response: Vec<u8>,
-        file: std::path::PathBuf,
-        chunk_size: u64,
-        max_response_bytes: usize,
-    ) -> Self {
+    pub fn new(manifest_response: Vec<u8>, file: std::path::PathBuf, chunk_size: u64) -> Self {
         Self {
             manifest_response,
             file,
             chunk_size,
-            max_response_bytes,
         }
     }
 }
@@ -174,8 +167,6 @@ impl P2PNode {
                 request_response::OutboundRequestId,
                 oneshot::Sender<Result<Vec<u8>>>,
             > = HashMap::new();
-            let mut outbound_failures: HashMap<request_response::OutboundRequestId, ()> =
-                HashMap::new();
 
             loop {
                 tokio::select! {
@@ -259,7 +250,6 @@ impl P2PNode {
                                     request_id, error, ..
                                 },
                             )) => {
-                                outbound_failures.insert(request_id, ());
                                 if let Some(reply) = pending.remove(&request_id) {
                                     let _ = reply.send(Err(anyhow::anyhow!(
                                         "outbound request failed: {error}"
