@@ -1,15 +1,65 @@
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use decentraai_identity::Identity;
 use decentraai_manifest::Manifest;
-use serde::{Deserialize, Serialize};
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+
+// Serde helper modules for base64 encoding/decoding
+mod b64 {
+    use super::*;
+
+    pub fn serialize<S>(data: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = STANDARD.encode(data);
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded: String = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
+mod b64_opt {
+    use super::*;
+
+    pub fn serialize<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match data {
+            Some(bytes) => b64::serialize(bytes, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded: Option<String> = Option::deserialize(deserializer)?;
+        match encoded {
+            Some(s) => Ok(Some(STANDARD.decode(s).map_err(serde::de::Error::custom)?)),
+            None => Ok(None),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestAnnouncement {
     pub protocol_version: u16,
     pub manifest: Manifest,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
     pub signature: Option<Vec<u8>>,
 }
 
@@ -18,12 +68,17 @@ pub struct ManifestAnnouncement {
 pub struct ManifestRequest {
     pub protocol_version: u16,
     pub manifest_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
     pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Response to a manifest request.
+///
+/// Intentionally carries no signature: manifest integrity is anchored in the signed
+/// manifest's chunk_hashes + Merkle root. Per-chunk BLAKE3 verification at assembly
+/// ensures the manifest was not tampered with.
 pub struct ManifestResponse {
     pub protocol_version: u16,
     pub manifest: Manifest,
@@ -39,9 +94,15 @@ pub struct ChunkRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Response to a chunk request.
+///
+/// Intentionally carries no signature: chunk integrity is anchored in the signed
+/// manifest's chunk_hashes + Merkle root. Per-chunk BLAKE3 verification at assembly
+/// ensures the chunk was not tampered with.
 pub struct ChunkResponse {
     pub protocol_version: u16,
     pub chunk_index: u32,
+    #[serde(with = "b64")]
     pub chunk_data: Vec<u8>,
 }
 
@@ -61,9 +122,53 @@ pub fn serialize_message<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(message).context("failed to serialize message")
 }
 
+/// Calculate the maximum serialized size for a chunk response message.
+///
+/// Chunk responses use base64 encoding for binary data, which has a 4/3 overhead.
+/// This function calculates the worst-case size including:
+/// - Base64 encoding overhead (chunk_size * 4 / 3)
+/// - JSON header overhead (4096 bytes headroom)
+///
+/// Note: Chunk responses use this cap, not the control-plane cap (network.max_message_bytes).
+/// The config allows chunk_size_mb 1..=64, so worst-case chunk message is ~89.5 MB,
+/// which is acceptable on LAN v1.
+pub fn max_chunk_message_bytes(chunk_size: usize) -> usize {
+    chunk_size * 4 / 3 + 4096
+}
+
+/// Generate canonical bytes for signing a manifest.
+///
+/// Signers and verifiers MUST use compact serialization with fields in declaration order;
+/// never pretty-print; never sign raw wire bytes. This function uses serde_json::to_vec
+/// to produce deterministic JSON because Manifest has no map fields.
+pub fn canonical_manifest_bytes(manifest: &Manifest) -> Vec<u8> {
+    serde_json::to_vec(manifest).expect("manifest must be serializable")
+}
+
+/// Sign a manifest using the node's Ed25519 identity.
+///
+/// The signature is computed over the canonical bytes of the manifest.
+pub fn sign_manifest(identity: &Identity, manifest: &Manifest) -> Signature {
+    let bytes = canonical_manifest_bytes(manifest);
+    identity.sign(&bytes)
+}
+
+/// Verify a manifest signature against a public key.
+///
+/// Verifies that the signature was computed over the canonical bytes of the manifest.
+pub fn verify_manifest_signature(
+    key: &VerifyingKey,
+    manifest: &Manifest,
+    sig: &Signature,
+) -> Result<()> {
+    let bytes = canonical_manifest_bytes(manifest);
+    decentraai_identity::verify_signature(key, &bytes, sig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decentraai_identity::Identity;
 
     fn create_test_manifest() -> Manifest {
         Manifest {
@@ -162,6 +267,43 @@ mod tests {
     }
 
     #[test]
+    fn test_4mb_chunk_roundtrip() {
+        let chunk_size = 4 * 1024 * 1024; // 4 MiB
+        let chunk_data = vec![42u8; chunk_size];
+        let response = ChunkResponse {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            chunk_index: 0,
+            chunk_data: chunk_data.clone(),
+        };
+
+        let serialized = serialize_message(&response).unwrap();
+        let max_size = max_chunk_message_bytes(chunk_size);
+
+        // Verify the serialized size is reasonable (< 5.5 MiB for 4 MiB chunk)
+        let five_point_five_mib = 5 * 1024 * 1024 + 512 * 1024; // 5.5 MiB
+        assert!(
+            serialized.len() < five_point_five_mib,
+            "serialized size {} exceeds 5.5 MiB",
+            serialized.len()
+        );
+
+        // Verify it fits within the calculated max size
+        assert!(
+            serialized.len() <= max_size,
+            "serialized size {} exceeds max {}",
+            serialized.len(),
+            max_size
+        );
+
+        let deserialized: ChunkResponse = deserialize_message(&serialized, max_size).unwrap();
+
+        assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(deserialized.chunk_index, 0);
+        assert_eq!(deserialized.chunk_data.len(), chunk_size);
+        assert_eq!(deserialized.chunk_data, chunk_data);
+    }
+
+    #[test]
     fn test_unknown_field_rejection() {
         let announcement = ManifestAnnouncement {
             protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -226,5 +368,43 @@ mod tests {
         let serialized_with_sig = serialize_message(&announcement_with_sig).unwrap();
         assert!(!serialized_with_sig.is_empty());
         assert!(serialized_with_sig.len() > serialized_no_sig.len());
+    }
+
+    #[test]
+    fn test_canonical_manifest_signing_roundtrip() {
+        let identity = Identity::generate();
+        let manifest = create_test_manifest();
+
+        let signature = sign_manifest(&identity, &manifest);
+        let public_key = identity.public_key();
+
+        assert!(verify_manifest_signature(public_key, &manifest, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_canonical_manifest_tamper_detection() {
+        let identity = Identity::generate();
+        let mut manifest = create_test_manifest();
+
+        let signature = sign_manifest(&identity, &manifest);
+        let public_key = identity.public_key();
+
+        // Tamper with the manifest by changing a chunk hash
+        manifest.chunk_hashes[0] = blake3::hash(b"tampered").to_hex().to_string();
+
+        assert!(verify_manifest_signature(public_key, &manifest, &signature).is_err());
+    }
+
+    #[test]
+    fn test_canonical_manifest_determinism() {
+        let manifest = create_test_manifest();
+
+        let bytes1 = canonical_manifest_bytes(&manifest);
+        let bytes2 = canonical_manifest_bytes(&manifest);
+
+        assert_eq!(
+            bytes1, bytes2,
+            "canonical serialization must be deterministic"
+        );
     }
 }

@@ -10,7 +10,7 @@
 | Threat | Mandatory control |
 |---|---|
 | Corrupted or poisoned chunks | Per-chunk BLAKE3, Merkle-root check, signed manifest, quarantine |
-| Manifest spoofing | Canonical serialization, Ed25519 signatures, trust store |
+| Manifest spoofing | Canonical serialization, Ed25519 signatures, trust store. Note: ManifestResponse and ChunkResponse carry no signature because integrity is anchored in the signed manifest's chunk_hashes + Merkle root; per-chunk BLAKE3 verification at assembly ensures the manifest/chunk was not tampered with. |
 | Replay and request forgery | Request ID, nonce, timestamps, signatures, expiry |
 | Sybil and flood | Per-peer limits, connection caps, temporary bans, private-first swarm |
 | DHT eclipse | Multiple bootstrap peers, bounded trust, independent peer observations |
