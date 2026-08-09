@@ -29,6 +29,10 @@ enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    Swarm {
+        #[command(subcommand)]
+        command: SwarmCommand,
+    },
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -62,8 +66,16 @@ enum RegistryCommand {
         registry: String,
     },
 }
+#[derive(Debug, Subcommand)]
+enum SwarmCommand {
+    Start {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(cli.log_level))
@@ -81,6 +93,9 @@ fn main() -> Result<()> {
         Command::Registry {
             command: RegistryCommand::List { registry },
         } => list_registry(registry),
+        Command::Swarm {
+            command: SwarmCommand::Start { config },
+        } => swarm_start(config).await,
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -238,6 +253,38 @@ fn list_registry(registry: String) -> Result<()> {
     Ok(())
 }
 
+/// Runs the swarm: loads identity and config, listens on an ephemeral TCP
+/// port, and drives the event loop until interrupted.
+async fn swarm_start(config_path: PathBuf) -> Result<()> {
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
+
+    let config = NodeConfig::load(&config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    if !identity_path.exists() {
+        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+    }
+    let identity = Identity::load(&identity_path)?;
+
+    let node = P2PNode::new(
+        &identity,
+        config.network.max_message_bytes as usize,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )?;
+    let _ = DEFAULT_MAX_MESSAGE_BYTES;
+    node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    println!(
+        "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Press Ctrl+C to stop",
+        identity.peer_id(),
+        node.local_peer_id()
+    );
+    tokio::signal::ctrl_c().await?;
+    node.shutdown();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +314,16 @@ mod tests {
     #[test]
     fn rejects_legacy_top_level_scan() {
         assert!(Cli::try_parse_from(["decentraai", "scan"]).is_err());
+    }
+
+    #[test]
+    fn parses_swarm_start_command() {
+        let cli = Cli::try_parse_from(["decentraai", "swarm", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Swarm {
+                command: SwarmCommand::Start { .. }
+            }
+        ));
     }
 }

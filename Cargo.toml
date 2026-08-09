@@ -36,6 +36,6 @@ serde_yaml = "0.9"
 sysinfo = "0.33"
 tempfile = "3.15"
 thiserror = "2.0"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "io-util"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "io-util", "fs", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

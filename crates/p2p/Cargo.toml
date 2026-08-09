@@ -9,9 +9,13 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 decentraai-identity = { path = "../identity" }
+decentraai-manifest = { path = "../manifest" }
+decentraai-protocol = { path = "../protocol" }
 futures.workspace = true
 libp2p.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+blake3.workspace = true
+tempfile.workspace = true

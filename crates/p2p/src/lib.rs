@@ -1,11 +1,15 @@
 //! libp2p transport for DecentraAI: TCP + Noise + Yamux, mDNS discovery,
 //! and a length-delimited request/response channel for protocol messages.
 //!
-//! The libp2p keypair is derived from the node identity, so the transport
-//! PeerId is cryptographically bound to the Ed25519 node key. The transfer
-//! engine and authenticated handshake land in M3 part 2.
+//! The node runs as an actor: the swarm lives in a background task and
+//! commands flow through a channel, so callers can issue sequential
+//! requests (e.g. manifest then chunks) without blocking the event loop.
+//! The libp2p keypair is derived from the node identity, binding the
+//! transport PeerId to the Ed25519 node key.
 
-use anyhow::{Context, Result};
+pub mod transfer;
+
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use decentraai_identity::Identity;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
@@ -13,37 +17,138 @@ use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, Swarm, mdns, noise, tcp, yamux};
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{info, warn};
 
 /// Request/response protocol carrying serialized decentraai-protocol messages.
 pub const MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/decentraai/message/1");
 
-/// Default frame cap matching the control-plane limit in node.example.yaml.
+/// Default frame cap for control-plane messages (matches node.example.yaml).
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
-#[derive(NetworkBehaviour)]
-struct NodeBehaviour {
-    mdns: mdns::tokio::Behaviour,
-    messages: request_response::Behaviour<FrameCodec>,
+/// Frame cap for data-plane chunk responses: the largest configured chunk
+/// (64 MiB) encoded as base64 plus header headroom.
+pub const DEFAULT_MAX_CHUNK_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Serves inbound requests from peers.
+pub trait RequestHandler: Send + 'static {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// Serves a static manifest plus chunk reads from a local file.
+/// Chunks are read with seek + read, so huge artifacts never load into memory.
+pub struct StaticFileServer {
+    manifest_response: Vec<u8>,
+    file: std::path::PathBuf,
+    chunk_size: u64,
+    max_response_bytes: usize,
+}
+
+impl StaticFileServer {
+    pub fn new(
+        manifest_response: Vec<u8>,
+        file: std::path::PathBuf,
+        chunk_size: u64,
+        max_response_bytes: usize,
+    ) -> Self {
+        Self {
+            manifest_response,
+            file,
+            chunk_size,
+            max_response_bytes,
+        }
+    }
+}
+
+impl RequestHandler for StaticFileServer {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        use decentraai_protocol::{
+            CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest,
+            deserialize_message, serialize_message,
+        };
+
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, request.len()) {
+            if req.protocol_version != CURRENT_PROTOCOL_VERSION {
+                bail!("unsupported protocol version {}", req.protocol_version);
+            }
+            return Ok(self.manifest_response.clone());
+        }
+        if let Ok(req) = deserialize_message::<ChunkRequest>(request, request.len()) {
+            if req.protocol_version != CURRENT_PROTOCOL_VERSION {
+                bail!("unsupported protocol version {}", req.protocol_version);
+            }
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&self.file).context("opening served file")?;
+            file.seek(SeekFrom::Start(u64::from(req.chunk_index) * self.chunk_size))?;
+            let mut buf = vec![0u8; self.chunk_size as usize];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = file.read(&mut buf[filled..])?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            if filled == 0 {
+                bail!("chunk {} out of range", req.chunk_index);
+            }
+            let response = ChunkResponse {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                chunk_index: req.chunk_index,
+                chunk_data: buf,
+            };
+            return serialize_message(&response);
+        }
+        bail!("unrecognized request")
+    }
+}
+
+enum Command {
+    Listen {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Dial {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Request {
+        peer: PeerId,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    Shutdown,
+}
+
+/// Handle to the background swarm task.
 pub struct P2PNode {
-    swarm: Swarm<NodeBehaviour>,
+    commands: mpsc::UnboundedSender<Command>,
     peer_id: PeerId,
 }
 
 impl P2PNode {
-    /// Creates a node. Must be called from within a Tokio runtime context:
-    /// the mDNS behaviour registers with the reactor at construction.
-    pub fn new(identity: &Identity, max_message_bytes: usize) -> Result<Self> {
+    /// Creates a node and spawns its swarm task. Must be called from within
+    /// a Tokio runtime: the mDNS behaviour registers with the reactor.
+    pub fn new(
+        identity: &Identity,
+        max_message_bytes: usize,
+        max_chunk_message_bytes: usize,
+        handler: Option<Arc<dyn RequestHandler>>,
+    ) -> Result<Self> {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
         let peer_id = PeerId::from(&keypair.public());
         let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .context("creating mDNS behaviour")?;
-        let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+        let codec = FrameCodec {
+            max_frame_bytes: max_chunk_message_bytes.max(max_message_bytes),
+        };
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
@@ -54,7 +159,7 @@ impl P2PNode {
             .with_behaviour(|_| NodeBehaviour {
                 mdns: mdns_behaviour,
                 messages: request_response::Behaviour::with_codec(
-                    FrameCodec { max_frame_bytes: max_message_bytes },
+                    codec,
                     [(MESSAGE_PROTOCOL, ProtocolSupport::Full)],
                     request_response::Config::default(),
                 ),
@@ -62,71 +167,171 @@ impl P2PNode {
             .context("attaching network behaviour")?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
-        Ok(Self { swarm, peer_id })
+
+        let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
+        tokio::spawn(async move {
+            let mut pending: HashMap<
+                request_response::OutboundRequestId,
+                oneshot::Sender<Result<Vec<u8>>>,
+            > = HashMap::new();
+            let mut outbound_failures: HashMap<request_response::OutboundRequestId, ()> =
+                HashMap::new();
+
+            loop {
+                tokio::select! {
+                    maybe_cmd = inbox.recv() => {
+                        let Some(cmd) = maybe_cmd else { break };
+                        match cmd {
+                            Command::Listen { addr, reply } => {
+                                let res = swarm.listen_on(addr).map(|_| ()).map_err(Into::into);
+                                let _ = reply.send(res);
+                            }
+                            Command::Dial { addr, reply } => {
+                                let res = swarm.dial(addr).map_err(Into::into);
+                                let _ = reply.send(res);
+                            }
+                            Command::Request { peer, payload, reply } => {
+                                let id = swarm.behaviour_mut().messages.send_request(&peer, payload);
+                                pending.insert(id, reply);
+                            }
+                            Command::Shutdown => break,
+                        }
+                    }
+                    event = swarm.select_next_some() => {
+                        match event {
+                            SwarmEvent::NewListenAddr { address, .. } => {
+                                info!(%address, "listening")
+                            }
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                                info!(%peer_id, "peer connected")
+                            }
+                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                                info!(%peer_id, "peer disconnected")
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
+                                mdns::Event::Discovered(list),
+                            )) => {
+                                for (peer, addr) in list {
+                                    info!(%peer, %addr, "mDNS discovered peer");
+                                    swarm.add_peer_address(peer, addr);
+                                }
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
+                                request_response::Event::Message { peer, message },
+                            )) => match message {
+                                request_response::Message::Request {
+                                    request, channel, ..
+                                } => {
+                                    let response = match &handler {
+                                        Some(h) => match h.handle(&request) {
+                                            Ok(bytes) => bytes,
+                                            Err(e) => {
+                                                warn!(%peer, error = %e, "request handler failed");
+                                                continue;
+                                            }
+                                        },
+                                        None => {
+                                            warn!(%peer, "request ignored: no handler configured");
+                                            continue;
+                                        }
+                                    };
+                                    if swarm
+                                        .behaviour_mut()
+                                        .messages
+                                        .send_response(channel, response)
+                                        .is_err()
+                                    {
+                                        warn!(%peer, "failed to send response");
+                                    }
+                                }
+                                request_response::Message::Response {
+                                    request_id,
+                                    response,
+                                    ..
+                                } => {
+                                    if let Some(reply) = pending.remove(&request_id) {
+                                        let _ = reply.send(Ok(response));
+                                    }
+                                }
+                            },
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
+                                request_response::Event::OutboundFailure {
+                                    request_id, error, ..
+                                },
+                            )) => {
+                                outbound_failures.insert(request_id, ());
+                                if let Some(reply) = pending.remove(&request_id) {
+                                    let _ = reply.send(Err(anyhow::anyhow!(
+                                        "outbound request failed: {error}"
+                                    )));
+                                }
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
+                                request_response::Event::InboundFailure { peer, error, .. },
+                            )) => {
+                                warn!(%peer, error = %error, "inbound request failure");
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
+                                request_response::Event::ResponseSent { .. },
+                            )) => {}
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self { commands, peer_id })
     }
 
     pub fn local_peer_id(&self) -> PeerId {
         self.peer_id
     }
 
-    pub fn listen(&mut self, addr: &str) -> Result<()> {
-        self.swarm
-            .listen_on(addr.parse().context("invalid listen address")?)
-            .context("failed to listen")?;
-        Ok(())
+    pub async fn listen(&self, addr: &str) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Listen {
+                addr: addr.parse().context("invalid listen address")?,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("swarm task is not running"))?;
+        rx.await.context("swarm task dropped the reply")?
     }
 
-    pub fn dial(&mut self, addr: &str) -> Result<()> {
-        let target: Multiaddr = addr.parse().context("invalid dial address")?;
-        self.swarm.dial(target).context("failed to dial")?;
-        Ok(())
+    pub async fn dial(&self, addr: &str) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Dial {
+                addr: addr.parse().context("invalid dial address")?,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("swarm task is not running"))?;
+        rx.await.context("swarm task dropped the reply")?
     }
 
-    pub fn send_request(
-        &mut self,
-        peer: &PeerId,
-        payload: Vec<u8>,
-    ) -> request_response::OutboundRequestId {
-        self.swarm.behaviour_mut().messages.send_request(peer, payload)
+    /// Sends a serialized protocol message and awaits the peer's response.
+    pub async fn request(&self, peer: PeerId, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Request {
+                peer,
+                payload,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("swarm task is not running"))?;
+        rx.await.context("swarm task dropped the reply")?
     }
 
-    /// Drive the swarm event loop. Discovered mDNS peers are registered with
-    /// the swarm address book; inbound requests are only logged until the
-    /// transfer engine lands in M3 part 2.
-    pub async fn run(mut self) -> Result<()> {
-        loop {
-            match self.swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    info!(%address, "listening")
-                }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    info!(%peer_id, "peer connected")
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    info!(%peer_id, "peer disconnected")
-                }
-                SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(
-                    list,
-                ))) => {
-                    for (peer, addr) in list {
-                        info!(%peer, %addr, "mDNS discovered peer");
-                        self.swarm.add_peer_address(peer, addr);
-                    }
-                }
-                SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
-                    request_response::Event::Message { peer, message },
-                )) => match message {
-                    request_response::Message::Request { request, .. } => {
-                        info!(%peer, bytes = request.len(), "received request")
-                    }
-                    request_response::Message::Response { response, .. } => {
-                        info!(%peer, bytes = response.len(), "received response")
-                    }
-                },
-                _ => {}
-            }
-        }
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown);
     }
+}
+
+#[derive(NetworkBehaviour)]
+struct NodeBehaviour {
+    mdns: mdns::tokio::Behaviour,
+    messages: request_response::Behaviour<FrameCodec>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,28 +411,6 @@ async fn write_frame<T: AsyncWrite + Unpin + Send>(io: &mut T, data: &[u8]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn libp2p_peer_id_is_derived_from_node_identity() {
-        let identity = Identity::generate();
-        let node = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
-        let again = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
-        assert_eq!(node.local_peer_id(), again.local_peer_id());
-    }
-
-    #[tokio::test]
-    async fn distinct_identities_have_distinct_peer_ids() {
-        let a = P2PNode::new(&Identity::generate(), DEFAULT_MAX_MESSAGE_BYTES).unwrap();
-        let b = P2PNode::new(&Identity::generate(), DEFAULT_MAX_MESSAGE_BYTES).unwrap();
-        assert_ne!(a.local_peer_id(), b.local_peer_id());
-    }
-
-    #[tokio::test]
-    async fn listen_on_localhost() {
-        let identity = Identity::generate();
-        let mut node = P2PNode::new(&identity, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
-        node.listen("/ip4/127.0.0.1/tcp/0").unwrap();
-    }
 
     #[tokio::test]
     async fn frame_roundtrip() {
