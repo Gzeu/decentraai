@@ -1,0 +1,17 @@
+[package]
+name = "decentraai-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+decentraai-identity = { path = "../identity" }
+futures.workspace = true
+libp2p.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

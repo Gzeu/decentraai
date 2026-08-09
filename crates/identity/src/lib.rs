@@ -100,6 +100,15 @@ impl Identity {
         &self.public_key
     }
 
+    /// Returns the raw 32-byte Ed25519 secret key.
+    ///
+    /// Sensitive: callers must not log, persist unprotected, or transmit these
+    /// bytes. Used to derive the libp2p transport keypair so the network
+    /// PeerId is bound to this node identity.
+    pub fn signing_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.signing_key.sign(message)
     }
@@ -176,6 +185,14 @@ mod tests {
 
         assert_eq!(peer_id1, peer_id2);
         assert_eq!(peer_id1.as_str().len(), 64); // 32 bytes hex-encoded
+    }
+
+    #[test]
+    fn test_signing_key_bytes_roundtrip() {
+        let identity = Identity::generate();
+        let bytes = identity.signing_key_bytes();
+        let restored = SigningKey::from_bytes(&bytes);
+        assert_eq!(restored.verifying_key(), *identity.public_key());
     }
 
     #[test]
