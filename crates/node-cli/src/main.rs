@@ -314,11 +314,8 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
 
     // Announce every model we serve, signed with the node identity.
     let mut announced = 0usize;
-    if let Some(server) = node.handler_ref() {
-        let _ = server;
-    }
-    if let Some(registry_path) = registry_path.exists().then_some(&registry_path) {
-        let registry = ModelRegistry::load(registry_path)?;
+    if registry_path.exists() {
+        let registry = ModelRegistry::load(&registry_path)?;
         let server = RegistryServer::new(registry);
         for manifest in server.manifests() {
             let signature = decentraai_protocol::sign_manifest(&identity, &manifest);
