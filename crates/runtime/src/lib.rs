@@ -122,6 +122,15 @@ pub struct LlamaServer {
     port: u16,
 }
 
+impl std::fmt::Debug for LlamaServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlamaServer")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LlamaServer {
     /// Spawns the child without waiting for readiness (exposed for tests).
     pub fn start(binary: &Path, config: &RuntimeConfig) -> Result<Self> {
@@ -161,13 +170,16 @@ impl LlamaServer {
         format!("http://{}:{}", self.host, self.port)
     }
 
-    /// Kills the child and waits for it to exit.
+    /// Kills the child and waits for it to exit, returning its status.
     pub async fn stop(mut self) -> Result<ExitStatus> {
+        self.child
+            .start_kill()
+            .context("failed to kill llama-server")?;
         let status = self
             .child
-            .kill()
+            .wait()
             .await
-            .context("failed to kill llama-server")?;
+            .context("failed to reap llama-server")?;
         info!(port = self.port, "llama-server stopped");
         Ok(status)
     }
