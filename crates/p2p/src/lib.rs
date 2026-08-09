@@ -17,7 +17,7 @@ use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, mdns, noise, tcp, yamux};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +104,7 @@ impl RequestHandler for StaticFileServer {
 enum Command {
     Listen {
         addr: Multiaddr,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<Multiaddr>>,
     },
     Dial {
         addr: Multiaddr,
@@ -167,6 +167,8 @@ impl P2PNode {
                 request_response::OutboundRequestId,
                 oneshot::Sender<Result<Vec<u8>>>,
             > = HashMap::new();
+            let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> =
+                VecDeque::new();
 
             loop {
                 tokio::select! {
@@ -174,8 +176,12 @@ impl P2PNode {
                         let Some(cmd) = maybe_cmd else { break };
                         match cmd {
                             Command::Listen { addr, reply } => {
-                                let res = swarm.listen_on(addr).map(|_| ()).map_err(Into::into);
-                                let _ = reply.send(res);
+                                match swarm.listen_on(addr) {
+                                    Ok(_) => pending_listens.push_back(reply),
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e.into()));
+                                    }
+                                }
                             }
                             Command::Dial { addr, reply } => {
                                 let res = swarm.dial(addr).map_err(Into::into);
@@ -191,7 +197,10 @@ impl P2PNode {
                     event = swarm.select_next_some() => {
                         match event {
                             SwarmEvent::NewListenAddr { address, .. } => {
-                                info!(%address, "listening")
+                                info!(%address, "listening");
+                                if let Some(reply) = pending_listens.pop_front() {
+                                    let _ = reply.send(Ok(address));
+                                }
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 info!(%peer_id, "peer connected")
@@ -278,7 +287,9 @@ impl P2PNode {
         self.peer_id
     }
 
-    pub async fn listen(&self, addr: &str) -> Result<()> {
+    /// Starts listening and resolves with the actual bound address
+    /// (useful with ephemeral ports like `/ip4/127.0.0.1/tcp/0`).
+    pub async fn listen(&self, addr: &str) -> Result<Multiaddr> {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::Listen {

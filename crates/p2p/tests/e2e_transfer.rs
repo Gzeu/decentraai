@@ -1,0 +1,222 @@
+//! End-to-end transfer tests: two real nodes on loopback exchanging a
+//! manifest and chunks through the libp2p request/response channel.
+
+use anyhow::Result;
+use decentraai_identity::Identity;
+use decentraai_manifest::{CHUNK_SIZE, Manifest};
+use decentraai_p2p::transfer::download;
+use decentraai_p2p::{
+    DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RequestHandler,
+    StaticFileServer,
+};
+use decentraai_protocol::{
+    CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest, ManifestResponse,
+    deserialize_message, serialize_message,
+};
+use libp2p::PeerId;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tempfile::TempDir;
+
+fn test_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Spins up a serving node (with handler) and a client node, connected
+/// over loopback via an explicit dial with the server's PeerId.
+async fn node_pair(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, P2PNode) {
+    let server = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        handler,
+    )
+    .unwrap();
+    let addr = server.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    let client = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    client
+        .dial(&format!("{addr}/p2p/{}", server.local_peer_id()))
+        .await
+        .unwrap();
+    (server, client)
+}
+
+/// Retries the download while the freshly dialed connection settles.
+/// Progress persists across attempts thanks to the resume bitmap.
+async fn download_with_retry(
+    client: &P2PNode,
+    peer: PeerId,
+    manifest_id: &str,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match download(client, peer, manifest_id, dir).await {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+fn manifest_bytes(manifest: &Manifest) -> Vec<u8> {
+    serialize_message(&ManifestResponse {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        manifest: manifest.clone(),
+        signature: None,
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn end_to_end_download_matches_source() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    let data = test_bytes(CHUNK_SIZE + 123);
+    std::fs::write(&source_path, &data).unwrap();
+
+    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let handler = Arc::new(StaticFileServer::new(
+        manifest_bytes(&manifest),
+        source_path.clone(),
+        CHUNK_SIZE as u64,
+    ));
+
+    let (server, client) = node_pair(Some(handler)).await;
+    let out_dir = dir.path().join("client");
+    let path = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(path.file_name().unwrap().to_str().unwrap(), "model.gguf");
+    let staging = out_dir.join("staging");
+    assert!(!staging.join(format!("{manifest_id}.part")).exists());
+    assert!(!staging.join(format!("{manifest_id}.done")).exists());
+}
+
+/// Serves a valid manifest but garbage chunk data.
+struct CorruptChunkHandler {
+    manifest_response: Vec<u8>,
+}
+
+impl RequestHandler for CorruptChunkHandler {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        if deserialize_message::<ManifestRequest>(request, request.len()).is_ok() {
+            return Ok(self.manifest_response.clone());
+        }
+        if let Ok(req) = deserialize_message::<ChunkRequest>(request, request.len()) {
+            return serialize_message(&ChunkResponse {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                chunk_index: req.chunk_index,
+                chunk_data: vec![0xFF; 64],
+            });
+        }
+        anyhow::bail!("unrecognized request")
+    }
+}
+
+#[tokio::test]
+async fn corrupted_chunk_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    std::fs::write(&source_path, test_bytes(CHUNK_SIZE + 1)).unwrap();
+
+    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let handler = Arc::new(CorruptChunkHandler {
+        manifest_response: manifest_bytes(&manifest),
+    });
+
+    let (server, client) = node_pair(Some(handler)).await;
+    let out_dir = dir.path().join("client");
+    let err = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("failed verification"),
+        "expected a verification failure, got: {err}"
+    );
+}
+
+/// Delegates to StaticFileServer while counting chunk requests.
+struct CountingHandler {
+    inner: StaticFileServer,
+    chunk_requests: Arc<AtomicUsize>,
+}
+
+impl RequestHandler for CountingHandler {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        if deserialize_message::<ChunkRequest>(request, request.len()).is_ok() {
+            self.chunk_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.handle(request)
+    }
+}
+
+#[tokio::test]
+async fn download_resumes_from_bitmap() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    let data = test_bytes(CHUNK_SIZE * 2);
+    std::fs::write(&source_path, &data).unwrap();
+
+    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(CountingHandler {
+        inner: StaticFileServer::new(
+            manifest_bytes(&manifest),
+            source_path.clone(),
+            CHUNK_SIZE as u64,
+        ),
+        chunk_requests: counter.clone(),
+    });
+
+    let (server, client) = node_pair(Some(handler)).await;
+
+    // Simulate an interrupted download: chunk 0 already staged and marked done.
+    let out_dir = dir.path().join("client");
+    let staging = out_dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(staging.join(format!("{manifest_id}.part")))
+            .unwrap();
+        file.set_len(data.len() as u64).unwrap();
+        file.write_all(&data[..CHUNK_SIZE]).unwrap();
+    }
+    std::fs::write(
+        staging.join(format!("{manifest_id}.done")),
+        [1u8, 0u8],
+    )
+    .unwrap();
+
+    let path = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "only the missing chunk should have been requested"
+    );
+}

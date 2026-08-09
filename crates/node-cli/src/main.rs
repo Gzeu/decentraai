@@ -273,10 +273,12 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
         None,
     )?;
-    node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    let bound = node.listen("/ip4/0.0.0.0/tcp/0").await?;
     println!(
-        "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Press Ctrl+C to stop",
+        "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Listening: {}/p2p/{}\n  Press Ctrl+C to stop",
         identity.peer_id(),
+        node.local_peer_id(),
+        bound,
         node.local_peer_id()
     );
     tokio::signal::ctrl_c().await?;
