@@ -1,0 +1,22 @@
+# Local model registry
+
+The local model registry discovers model artifacts only from a caller-approved directory. It is designed for the M2 local-first workflow and does not enable remote inference or change the P2P protocol.
+
+## Supported artifacts
+
+The scanner recognizes files with these case-insensitive extensions: `.gguf`, `.safetensors`, `.onnx`, `.bin`, `.pt`, and `.pth`.
+
+## Safety rules
+
+- The scan root must exist and be a directory.
+- Every path is canonicalized before registration.
+- Symbolic links are skipped; the scanner never traverses a symlinked directory or registers a symlinked file.
+- A canonical file path must remain under the approved root.
+
+## Registry behavior
+
+Records are keyed by their path relative to the approved root, so scans are deterministic. Re-scanning an unchanged model updates the existing record rather than adding a duplicate. The stored metadata is the canonical path, byte size, and modification time.
+
+## Integration status
+
+The standalone scanner module is intended for `crates/node-cli/src/model_registry.rs`. CLI command wiring requires the existing contents of `crates/node-cli/src/main.rs`, which are not currently exposed by the GitHub connector. No remote model discovery or inference is included.
