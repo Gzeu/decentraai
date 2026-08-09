@@ -600,6 +600,7 @@ dependencies = [
  "decentraai-identity",
  "decentraai-p2p",
  "decentraai-registry",
+ "decentraai-runtime",
  "decentraai-system-probe",
  "tokio",
  "tracing",
@@ -691,6 +692,9 @@ name = "decentraai-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "decentraai-config",
+ "decentraai-registry",
+ "decentraai-system-probe",
  "tempfile",
  "tokio",
  "tracing",
