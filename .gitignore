@@ -6,6 +6,7 @@
 *.pem
 *.p12
 identity/
+!crates/identity/
 
 # Local node state
 .decentraai/

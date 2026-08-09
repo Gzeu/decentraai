@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 decentraai-config = { path = "../config" }
+decentraai-identity = { path = "../identity" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }
 tracing.workspace = true

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
+use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
@@ -98,12 +99,44 @@ fn init(args: InitArgs) -> Result<()> {
         fs::create_dir_all(data_dir.join(directory))
             .with_context(|| format!("creating {directory}"))?;
     }
+
+    // Generate identity if it doesn't exist
+    let identity_path = data_dir.join("identity/key.pem");
+    if !identity_path.exists() {
+        let identity = Identity::generate();
+        identity
+            .save(&identity_path)
+            .with_context(|| format!("saving identity to {}", identity_path.display()))?;
+        info!(peer_id = %identity.peer_id(), "generated new identity");
+        println!("Generated new identity with PeerId: {}", identity.peer_id());
+    } else {
+        let identity = Identity::load(&identity_path)
+            .with_context(|| format!("loading identity from {}", identity_path.display()))?;
+        info!(peer_id = %identity.peer_id(), "existing identity found");
+        println!(
+            "Existing identity found with PeerId: {}",
+            identity.peer_id()
+        );
+    }
+
     info!(path = %data_dir.display(), "node data directories initialized");
     Ok(())
 }
 fn doctor(args: DoctorArgs) -> Result<()> {
     let config = NodeConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
+
+    // Load and display identity
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    let peer_id = if identity_path.exists() {
+        let identity = Identity::load(&identity_path)
+            .with_context(|| format!("loading identity from {}", identity_path.display()))?;
+        identity.peer_id().to_string()
+    } else {
+        "not initialized (run 'decentraai init')".to_string()
+    };
+
     let snapshot = SystemSnapshot::collect();
     let budget = snapshot.derive_budget(
         &config.resources,
@@ -125,7 +158,8 @@ fn doctor(args: DoctorArgs) -> Result<()> {
         AdmissionDecision::Reject(reason) => reason.as_str(),
     };
     println!(
-        "DecentraAI resource report\n  CPU threads budget: {}\n  RAM budget: {:.2} GiB\n  Cache budget: {:.2} GiB\n  GPU: {}\n  Inference admission: {}",
+        "DecentraAI node report\n  PeerId: {}\n  CPU threads budget: {}\n  RAM budget: {:.2} GiB\n  Cache budget: {:.2} GiB\n  GPU: {}\n  Inference admission: {}",
+        peer_id,
         budget.max_cpu_threads,
         bytes_to_gib(budget.max_memory_bytes),
         bytes_to_gib(budget.max_cache_bytes),
