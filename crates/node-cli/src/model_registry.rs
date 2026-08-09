@@ -61,8 +61,7 @@ impl ModelRegistry {
             file.sync_all()
                 .with_context(|| format!("syncing temporary registry {}", tmp.display()))?;
         }
-        fs::rename(&tmp, path)
-            .with_context(|| format!("replacing registry {}", path.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("replacing registry {}", path.display()))?;
         Ok(())
     }
 
