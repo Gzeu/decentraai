@@ -42,6 +42,35 @@ pub enum NodeMode {
     Dedicated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuPolicy {
+    Auto,
+    Required,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceRuntime {
+    LlamaServer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustMode {
+    Private,
+    Open,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSection {
@@ -73,7 +102,7 @@ pub struct ResourceSection {
     pub reserve_cpu_cores: u16,
     pub memory_max_percent: u8,
     pub reserve_ram_mb: u32,
-    pub gpu_enabled: String,
+    pub gpu_enabled: GpuPolicy,
     pub gpu_max_vram_percent: u8,
     pub reserve_vram_mb: u32,
     pub stop_gpu_temperature_celsius: u8,
@@ -84,8 +113,8 @@ pub struct ResourceSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceSection {
-    pub enabled: String,
-    pub runtime: String,
+    pub enabled: InferenceMode,
+    pub runtime: InferenceRuntime,
     pub bind_address: String,
     pub api_auth_required: bool,
     pub allow_remote_inference: bool,
@@ -109,7 +138,7 @@ pub struct PrivacySection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecuritySection {
-    pub trust_mode: String,
+    pub trust_mode: TrustMode,
     pub require_signed_announcements: bool,
     pub require_request_signatures: bool,
     pub ban_duration_minutes: u32,
@@ -189,6 +218,73 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(include_bytes!("../../../configs/node.example.yaml"))
             .unwrap();
-        assert!(NodeConfig::load(file.path()).is_ok());
+        let result = NodeConfig::load(file.path());
+        if let Err(e) = &result {
+            eprintln!("Config load error: {}", e);
+        }
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn invalid_gpu_policy_fails_to_parse() {
+        let yaml = r#"
+node:
+  name: test
+  mode: balanced
+  data_dir: /tmp
+network:
+  private_swarm: true
+  lan_discovery: true
+  dht_enabled: true
+  relay_enabled: true
+  bootstrap_peers: []
+  max_connections: 50
+  max_message_bytes: 1048576
+storage:
+  chunk_size_mb: 16
+  hash_algorithm: blake3
+  max_cache_gb: 100
+  min_free_disk_gb: 20
+  verify_full_file_after_assembly: true
+  allow_unsigned_models: false
+  auto_seed_verified_models: true
+resources:
+  cpu_max_percent: 80
+  reserve_cpu_cores: 2
+  memory_max_percent: 80
+  reserve_ram_mb: 1024
+  gpu_enabled: require
+  gpu_max_vram_percent: 75
+  reserve_vram_mb: 1024
+  stop_gpu_temperature_celsius: 83
+  max_upload_mbps: 20
+  max_download_mbps: 80
+inference:
+  enabled: auto
+  runtime: llama_server
+  bind_address: 127.0.0.1
+  api_auth_required: true
+  allow_remote_inference: false
+  max_concurrent_requests: 4
+  max_context_tokens: 4096
+  max_generated_tokens: 2048
+  request_timeout_seconds: 120
+  queue_max_requests: 10
+  idle_model_unload_minutes: 10
+privacy:
+  log_prompts: false
+  log_outputs: false
+  publish_exact_hardware: false
+  telemetry_opt_in: false
+security:
+  trust_mode: private
+  require_signed_announcements: true
+  require_request_signatures: true
+  ban_duration_minutes: 60
+  max_invalid_chunks_per_peer: 10
+"#;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        assert!(NodeConfig::load(file.path()).is_err());
     }
 }

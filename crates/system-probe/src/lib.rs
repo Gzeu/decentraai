@@ -2,13 +2,13 @@ mod gpu;
 
 pub use gpu::{GpuProbeStatus, GpuSnapshot, probe_gpu};
 
-use decentraai_config::ResourceSection;
+use decentraai_config::{GpuPolicy, ResourceSection};
 use sysinfo::{Disks, System};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SystemSnapshot {
     pub logical_cpus: usize,
     pub cpu_usage_percent: f32,
@@ -18,14 +18,14 @@ pub struct SystemSnapshot {
     pub total_disk_free_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ResourceBudget {
     pub max_cpu_threads: usize,
     pub max_memory_bytes: u64,
     pub max_cache_bytes: u64,
     pub max_upload_mbps: u32,
     pub max_download_mbps: u32,
-    pub gpu_policy: String,
+    pub gpu_policy: GpuPolicy,
     pub gpu_vram_limit_percent: u8,
     pub gpu_vram_reserve_bytes: u64,
 }
@@ -73,7 +73,7 @@ impl SystemSnapshot {
             ),
             max_upload_mbps: policy.max_upload_mbps,
             max_download_mbps: policy.max_download_mbps,
-            gpu_policy: policy.gpu_enabled.clone(),
+            gpu_policy: policy.gpu_enabled,
             gpu_vram_limit_percent: policy.gpu_max_vram_percent,
             gpu_vram_reserve_bytes: u64::from(policy.reserve_vram_mb) * MIB,
         }
@@ -91,7 +91,7 @@ impl SystemSnapshot {
             );
         }
         match gpu {
-            GpuProbeStatus::Unavailable(_) if budget.gpu_policy == "required" => {
+            GpuProbeStatus::Unavailable(_) if budget.gpu_policy == GpuPolicy::Required => {
                 AdmissionDecision::Reject("GPU is required by policy but unavailable".into())
             }
             GpuProbeStatus::Nvidia(info) if info.temperature_celsius >= temperature_limit => {
@@ -120,7 +120,7 @@ mod tests {
             max_cache_bytes: GIB,
             max_upload_mbps: 20,
             max_download_mbps: 80,
-            gpu_policy: "required".into(),
+            gpu_policy: GpuPolicy::Required,
             gpu_vram_limit_percent: 75,
             gpu_vram_reserve_bytes: 1024 * MIB,
         }
@@ -143,7 +143,7 @@ mod tests {
             reserve_cpu_cores: 2,
             memory_max_percent: 50,
             reserve_ram_mb: 1024,
-            gpu_enabled: "auto".into(),
+            gpu_enabled: GpuPolicy::Auto,
             gpu_max_vram_percent: 75,
             reserve_vram_mb: 1024,
             stop_gpu_temperature_celsius: 83,
