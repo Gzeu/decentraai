@@ -84,7 +84,10 @@ pub fn merkle_root(hashes: &[String]) -> String {
     }
     let mut level: Vec<[u8; 32]> = hashes
         .iter()
-        .map(|h| *blake3::hash(h.as_bytes()).as_bytes())
+        .map(|h| {
+            let raw = hex::decode(h).expect("chunk hash must be valid hex");
+            <[u8; 32]>::try_from(raw.as_slice()).expect("chunk hash must be 32 bytes")
+        })
         .collect();
     while level.len() > 1 {
         level = level
@@ -103,9 +106,30 @@ pub fn merkle_root(hashes: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn root_is_stable() {
-        let x = vec!["a".into(), "b".into()];
+        let x = vec![
+            blake3::hash(b"a").to_hex().to_string(),
+            blake3::hash(b"b").to_hex().to_string(),
+        ];
         assert_eq!(merkle_root(&x), merkle_root(&x));
+    }
+
+    #[test]
+    fn root_of_single_chunk_is_the_chunk_hash() {
+        let hash = blake3::hash(b"chunk").to_hex().to_string();
+        assert_eq!(merkle_root(&[hash.clone()]), hash);
+    }
+
+    #[test]
+    fn root_combines_raw_digests() {
+        let a = blake3::hash(b"a");
+        let b = blake3::hash(b"b");
+        let mut expected = Hasher::new();
+        expected.update(a.as_bytes());
+        expected.update(b.as_bytes());
+        let root = merkle_root(&[a.to_hex().to_string(), b.to_hex().to_string()]);
+        assert_eq!(root, expected.finalize().to_hex().to_string());
     }
 }

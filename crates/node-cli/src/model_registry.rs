@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["gguf", "safetensors", "onnx", "bin", "pt", "pth"];
+
+const REGISTRY_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRecord {
@@ -17,8 +20,10 @@ pub struct ModelRecord {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ModelRegistry {
+    #[serde(default)]
+    pub version: u32,
     pub root: String,
-    pub models: HashMap<String, ModelRecord>,
+    pub models: BTreeMap<String, ModelRecord>,
 }
 
 impl ModelRegistry {
@@ -31,8 +36,9 @@ impl ModelRegistry {
         }
 
         Ok(ModelRegistry {
+            version: REGISTRY_VERSION,
             root: canonical_root.to_string_lossy().to_string(),
-            models: HashMap::new(),
+            models: BTreeMap::new(),
         })
     }
 
@@ -46,8 +52,17 @@ impl ModelRegistry {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string_pretty(self).context("serializing registry to JSON")?;
-        fs::write(path, content)
-            .with_context(|| format!("writing registry to {}", path.display()))?;
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut file = fs::File::create(&tmp)
+                .with_context(|| format!("creating temporary registry {}", tmp.display()))?;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("writing temporary registry {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing temporary registry {}", tmp.display()))?;
+        }
+        fs::rename(&tmp, path)
+            .with_context(|| format!("replacing registry {}", path.display()))?;
         Ok(())
     }
 
@@ -71,6 +86,8 @@ impl ModelRegistry {
             &canonical_registry_root,
             &mut found_count,
         )?;
+        self.models
+            .retain(|_, record| Path::new(&record.canonical_path).exists());
         Ok(found_count)
     }
 
@@ -279,6 +296,20 @@ mod tests {
         let count2 = registry.scan_directory(temp_dir.path()).unwrap();
         assert_eq!(count2, 1);
         assert_eq!(registry.model_count(), 1); // Still 1, not 2
+    }
+
+    #[test]
+    fn test_scan_removes_deleted_models() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = create_test_file(temp_dir.path(), "model.gguf", b"GGUF magic");
+        registry.scan_directory(temp_dir.path()).unwrap();
+        assert_eq!(registry.model_count(), 1);
+
+        fs::remove_file(&file_path).unwrap();
+        registry.scan_directory(temp_dir.path()).unwrap();
+        assert_eq!(registry.model_count(), 0);
     }
 
     #[test]

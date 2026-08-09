@@ -112,6 +112,7 @@ impl SystemSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn budget() -> ResourceBudget {
         ResourceBudget {
             max_cpu_threads: 2,
@@ -124,6 +125,7 @@ mod tests {
             gpu_vram_reserve_bytes: 1024 * MIB,
         }
     }
+
     fn snapshot() -> SystemSnapshot {
         SystemSnapshot {
             logical_cpus: 4,
@@ -134,6 +136,22 @@ mod tests {
             total_disk_free_bytes: 50 * GIB,
         }
     }
+
+    fn policy() -> ResourceSection {
+        ResourceSection {
+            cpu_max_percent: 50,
+            reserve_cpu_cores: 2,
+            memory_max_percent: 50,
+            reserve_ram_mb: 1024,
+            gpu_enabled: "auto".into(),
+            gpu_max_vram_percent: 75,
+            reserve_vram_mb: 1024,
+            stop_gpu_temperature_celsius: 83,
+            max_upload_mbps: 20,
+            max_download_mbps: 80,
+        }
+    }
+
     #[test]
     fn rejects_required_gpu_when_unavailable() {
         assert!(matches!(
@@ -145,6 +163,7 @@ mod tests {
             AdmissionDecision::Reject(_)
         ));
     }
+
     #[test]
     fn rejects_hot_gpu() {
         let gpu = GpuProbeStatus::Nvidia(GpuSnapshot {
@@ -159,5 +178,35 @@ mod tests {
             snapshot().admit_inference(&budget(), &gpu, 83),
             AdmissionDecision::Reject(_)
         ));
+    }
+
+    #[test]
+    fn budget_respects_cpu_memory_and_disk_reserves() {
+        let snapshot = SystemSnapshot {
+            logical_cpus: 8,
+            cpu_usage_percent: 10.0,
+            total_memory_bytes: 16 * GIB,
+            available_memory_bytes: 12 * GIB,
+            used_swap_bytes: 0,
+            total_disk_free_bytes: 200 * GIB,
+        };
+        let budget = snapshot.derive_budget(&policy(), 100, 20);
+        assert_eq!(budget.max_cpu_threads, 3);
+        assert_eq!(budget.max_memory_bytes, 11 * GIB / 2);
+        assert_eq!(budget.max_cache_bytes, 100 * GIB);
+    }
+
+    #[test]
+    fn cache_never_consumes_reserved_free_space() {
+        let snapshot = SystemSnapshot {
+            logical_cpus: 2,
+            cpu_usage_percent: 0.0,
+            total_memory_bytes: 8 * GIB,
+            available_memory_bytes: 4 * GIB,
+            used_swap_bytes: 0,
+            total_disk_free_bytes: 25 * GIB,
+        };
+        let budget = snapshot.derive_budget(&policy(), 100, 20);
+        assert_eq!(budget.max_cache_bytes, 5 * GIB);
     }
 }
