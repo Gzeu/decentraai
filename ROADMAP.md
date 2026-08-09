@@ -18,6 +18,7 @@
 - [x] M4a: llama-server process manager crate (`decentraai-runtime`)
 - [x] M4b: inference admission gate + `decentraai serve start`
 - [x] M4c: OpenAI-compatible API endpoint with Bearer auth and idle unload
+- [x] Fixed configurable API port + friendly root info page
 
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler

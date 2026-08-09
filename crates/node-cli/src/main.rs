@@ -312,7 +312,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
 
 /// Runs gated inference with the OpenAI-compatible API: admission check,
 /// registry resolution, llama-server spawn, Bearer token, thin proxy on
-/// inference.bind_address, idle unload, Ctrl+C to stop.
+/// inference.bind_address:api_port, idle unload, Ctrl+C to stop.
 async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
     use decentraai_runtime::api::{ApiState, ensure_api_token, serve_api};
     use decentraai_runtime::{
@@ -369,7 +369,8 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         None
     };
     let state = ApiState::new(backend_url, token.clone(), manager.clone());
-    let api_addr = serve_api(state, &config.inference.bind_address).await?;
+    let api_addr =
+        serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
 
     let auth_hint = match &token {
         Some(_) => format!("Bearer token: {}", data_dir.join("runtime/api.token").display()),

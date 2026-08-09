@@ -46,20 +46,24 @@ impl ApiState {
 }
 
 /// Builds the proxy router exposing the OpenAI-compatible surface.
+/// Unknown paths (and `/`) answer with a small info page instead of a
+/// bare 404, so browsers and curious clients land somewhere useful.
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
+        .route("/", get(info_handler))
         .route("/v1/models", get(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
+        .fallback(info_handler)
         .with_state(state)
 }
 
-/// Binds the API on an ephemeral port of `host` and serves it in the
-/// background. Returns the actual bound address.
-pub async fn serve_api(state: ApiState, host: &str) -> Result<SocketAddr> {
-    let listener = tokio::net::TcpListener::bind((host, 0))
+/// Binds the API on `host:port` (port 0 means ephemeral) and serves it
+/// in the background. Returns the actual bound address.
+pub async fn serve_api(state: ApiState, host: &str, port: u16) -> Result<SocketAddr> {
+    let listener = tokio::net::TcpListener::bind((host, port))
         .await
-        .with_context(|| format!("binding API on {host}"))?;
+        .with_context(|| format!("binding API on {host}:{port}"))?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, build_router(state)).await {
@@ -67,6 +71,15 @@ pub async fn serve_api(state: ApiState, host: &str) -> Result<SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+/// Friendly landing page for browsers and unknown paths.
+async fn info_handler(State(state): State<ApiState>) -> Response {
+    let body = format!(
+        "{{\"name\":\"decentraai\",\"version\":\"0.1.0\",\"endpoints\":[\"GET /v1/models\",\"POST /v1/completions\",\"POST /v1/chat/completions\"],\"backend\":\"{}\",\"note\":\"/v1/* requires a Bearer token when api_auth_required is on\"}}",
+        state.backend_url
+    );
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 async fn proxy_handler(
@@ -207,7 +220,7 @@ mod tests {
         let (backend, hits) = start_backend().await;
         let manager = test_manager(dir.path()).await;
         let state = ApiState::new(format!("http://{backend}"), None, manager.clone());
-        let api = serve_api(state, "127.0.0.1").await.unwrap();
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
         let response = reqwest::get(format!("http://{api}/v1/models"))
             .await
@@ -229,7 +242,7 @@ mod tests {
             Some("secret".to_string()),
             manager.clone(),
         );
-        let api = serve_api(state, "127.0.0.1").await.unwrap();
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let client = reqwest::Client::new();
 
         let denied = client
@@ -257,7 +270,7 @@ mod tests {
         let (backend, _) = start_backend().await;
         let manager = test_manager(dir.path()).await;
         let state = ApiState::new(format!("http://{backend}"), None, manager.clone());
-        let api = serve_api(state, "127.0.0.1").await.unwrap();
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
         let payload = "{\"model\":\"test\",\"messages\":[]}";
         let response = reqwest::Client::new()
@@ -270,6 +283,30 @@ mod tests {
         assert_eq!(response.status(), 200);
         let echo = response.text().await.unwrap();
         assert!(echo.contains(&payload.len().to_string()));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_and_unknown_paths_serve_info_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, _) = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(format!("http://{backend}"), None, manager.clone());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        for path in ["/", "/v1", "/anything-else"] {
+            let response = client
+                .get(format!("http://{api}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "path {path} must serve the info page");
+            let body = response.text().await.unwrap();
+            assert!(body.contains("decentraai"));
+            assert!(body.contains("/v1/chat/completions"));
+        }
         manager.lock().await.shutdown().await.unwrap();
     }
 

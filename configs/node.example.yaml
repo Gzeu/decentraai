@@ -45,6 +45,7 @@ inference:
   request_timeout_seconds: 180
   queue_max_requests: 20
   idle_model_unload_minutes: 15
+  api_port: 8080
 
 privacy:
   log_prompts: false

@@ -124,6 +124,8 @@ pub struct InferenceSection {
     pub request_timeout_seconds: u32,
     pub queue_max_requests: u16,
     pub idle_model_unload_minutes: u16,
+    /// Fixed port for the OpenAI-compatible API; 0 means ephemeral.
+    pub api_port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +206,11 @@ impl NodeConfig {
                 "remote inference requires private_swarm in the initial release".into(),
             ));
         }
+        if self.inference.api_port != 0 && self.inference.api_port < 1024 {
+            return Err(ConfigError::Validation(
+                "inference.api_port must be 0 (ephemeral) or at least 1024".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -271,6 +278,7 @@ inference:
   request_timeout_seconds: 120
   queue_max_requests: 10
   idle_model_unload_minutes: 10
+  api_port: 0
 privacy:
   log_prompts: false
   log_outputs: false
@@ -286,5 +294,17 @@ security:
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(yaml.as_bytes()).unwrap();
         assert!(NodeConfig::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn privileged_api_port_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace("api_port: 8080", "api_port: 80");
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("api_port"));
     }
 }
