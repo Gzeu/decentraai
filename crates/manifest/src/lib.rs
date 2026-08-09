@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn root_of_single_chunk_is_the_chunk_hash() {
         let hash = blake3::hash(b"chunk").to_hex().to_string();
-        assert_eq!(merkle_root(&[hash.clone()]), hash);
+        assert_eq!(merkle_root(std::slice::from_ref(&hash)), hash);
     }
 
     #[test]
