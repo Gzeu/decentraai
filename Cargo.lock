@@ -645,9 +645,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "decentraai-identity",
+ "decentraai-manifest",
+ "decentraai-protocol",
  "futures",
  "libp2p",
+ "tempfile",
  "tokio",
  "tracing",
 ]
