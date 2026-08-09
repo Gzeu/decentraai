@@ -7,8 +7,8 @@ use decentraai_manifest::{CHUNK_SIZE, Manifest, scan};
 use decentraai_p2p::reputation::ReputationStore;
 use decentraai_p2p::transfer::download;
 use decentraai_p2p::{
-    DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RequestHandler,
-    StaticFileServer,
+    DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RegistryServer,
+    RequestHandler, StaticFileServer,
 };
 use decentraai_protocol::{
     CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest, ManifestResponse,
@@ -311,4 +311,36 @@ async fn download_resumes_from_bitmap() {
         1,
         "resumed chunks must not be credited twice"
     );
+}
+
+#[tokio::test]
+async fn registry_server_serves_scanned_models() {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let data = test_bytes(CHUNK_SIZE * 2 + 7);
+    std::fs::write(models_dir.join("tiny.gguf"), &data).unwrap();
+
+    let mut registry = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+    registry.scan_directory(&models_dir).unwrap();
+    let manifest = scan(models_dir.join("tiny.gguf")).unwrap();
+    let manifest_id = manifest.model_id.clone();
+
+    let handler = Arc::new(RegistryServer::new(registry));
+    let (server, client) = node_pair(Some(handler)).await;
+    let mut reputation = test_reputation(dir.path());
+    let out_dir = dir.path().join("client");
+    let path = download_with_retry(
+        &client,
+        server.local_peer_id(),
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(path.file_name().unwrap().to_str().unwrap(), "tiny.gguf");
+    assert_eq!(reputation.score(&server.local_peer_id()), 3.0);
 }

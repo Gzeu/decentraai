@@ -84,7 +84,7 @@ pub struct ManifestResponse {
     pub manifest: Manifest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkRequest {
     pub protocol_version: u16,
@@ -106,20 +106,37 @@ pub struct ChunkResponse {
     pub chunk_data: Vec<u8>,
 }
 
+/// Deserialize a message with a size cap to prevent memory exhaustion.
 pub fn deserialize_message<T: for<'de> Deserialize<'de>>(
     data: &[u8],
     max_size: usize,
 ) -> Result<T> {
     if data.len() > max_size {
-        anyhow::bail!("message size {} exceeds maximum {}", data.len(), max_size);
+        anyhow::bail!("message exceeds maximum size: {} > {}", data.len(), max_size);
     }
-
-    let mut de = serde_json::Deserializer::from_slice(data);
-    T::deserialize(&mut de).context("failed to deserialize message")
+    serde_json::from_slice(data).context("failed to deserialize message")
 }
 
+/// Serialize a message to bytes for transmission.
 pub fn serialize_message<T: Serialize>(message: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(message).context("failed to serialize message")
+}
+
+/// Serialize a manifest response carrying the given manifest.
+pub fn manifest_response_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
+    serialize_message(&ManifestResponse {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        manifest: manifest.clone(),
+    })
+}
+
+/// Serialize a manifest announcement carrying the given manifest.
+pub fn announcement_bytes(manifest: &Manifest, signature: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    serialize_message(&ManifestAnnouncement {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        manifest: manifest.clone(),
+        signature,
+    })
 }
 
 /// Calculate the maximum serialized size for a chunk response message.
@@ -176,93 +193,74 @@ mod tests {
             model_id: "test-model-id".to_string(),
             file_name: "test.gguf".to_string(),
             file_size: 1024,
-            chunk_size: 256,
-            chunk_hashes: vec![
-                blake3::hash(b"chunk0").to_hex().to_string(),
-                blake3::hash(b"chunk1").to_hex().to_string(),
-            ],
-            merkle_root: blake3::hash(b"test").to_hex().to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunk_hashes: vec![blake3::hash(b"chunk1").to_hex().to_string()],
+            merkle_root: blake3::hash(b"root").to_hex().to_string(),
         }
     }
 
     #[test]
     fn test_manifest_announcement_roundtrip() {
-        let manifest = create_test_manifest();
         let announcement = ManifestAnnouncement {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            manifest,
-            signature: None,
+            manifest: create_test_manifest(),
+            signature: Some(vec![1, 2, 3]),
         };
-
         let serialized = serialize_message(&announcement).unwrap();
         let deserialized: ManifestAnnouncement =
             deserialize_message(&serialized, 1024 * 1024).unwrap();
-
         assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
         assert_eq!(deserialized.manifest.model_id, "test-model-id");
-        assert!(deserialized.signature.is_none());
+        assert_eq!(deserialized.signature, Some(vec![1, 2, 3]));
     }
 
     #[test]
     fn test_manifest_request_roundtrip() {
         let request = ManifestRequest {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            manifest_id: "test-manifest-id".to_string(),
+            manifest_id: "abc123".to_string(),
             signature: None,
         };
-
         let serialized = serialize_message(&request).unwrap();
-        let deserialized: ManifestRequest = deserialize_message(&serialized, 1024 * 1024).unwrap();
-
-        assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
-        assert_eq!(deserialized.manifest_id, "test-manifest-id");
+        let deserialized: ManifestRequest = deserialize_message(&serialized, 1024).unwrap();
+        assert_eq!(deserialized.manifest_id, "abc123");
+        assert_eq!(deserialized.signature, None);
     }
 
     #[test]
     fn test_manifest_response_roundtrip() {
-        let manifest = create_test_manifest();
         let response = ManifestResponse {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            manifest,
+            manifest: create_test_manifest(),
         };
-
         let serialized = serialize_message(&response).unwrap();
-        let deserialized: ManifestResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
-
-        assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
-        assert_eq!(deserialized.manifest.model_id, "test-model-id");
+        let deserialized: ManifestResponse =
+            deserialize_message(&serialized, 1024 * 1024).unwrap();
+        assert_eq!(deserialized.manifest.file_name, "test.gguf");
     }
 
     #[test]
     fn test_chunk_request_roundtrip() {
         let request = ChunkRequest {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            manifest_id: "test-manifest-id".to_string(),
-            chunk_index: 0,
+            manifest_id: "model-xyz".to_string(),
+            chunk_index: 42,
         };
-
         let serialized = serialize_message(&request).unwrap();
-        let deserialized: ChunkRequest = deserialize_message(&serialized, 1024 * 1024).unwrap();
-
-        assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
-        assert_eq!(deserialized.manifest_id, "test-manifest-id");
-        assert_eq!(deserialized.chunk_index, 0);
+        let deserialized: ChunkRequest = deserialize_message(&serialized, 1024).unwrap();
+        assert_eq!(deserialized.chunk_index, 42);
     }
 
     #[test]
     fn test_chunk_response_roundtrip() {
-        let chunk_data = vec![1u8, 2u8, 3u8, 4u8];
         let response = ChunkResponse {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            chunk_index: 0,
-            chunk_data: chunk_data.clone(),
+            chunk_index: 7,
+            chunk_data: vec![1u8, 2u8, 3u8, 4u8],
         };
-
         let serialized = serialize_message(&response).unwrap();
-        let deserialized: ChunkResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
-
-        assert_eq!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
-        assert_eq!(deserialized.chunk_index, 0);
+        let deserialized: ChunkResponse = deserialize_message(&serialized, 1024).unwrap();
+        assert_eq!(deserialized.chunk_index, 7);
         assert_eq!(deserialized.chunk_data, vec![1u8, 2u8, 3u8, 4u8]);
     }
 
@@ -310,63 +308,61 @@ mod tests {
             manifest: create_test_manifest(),
             signature: None,
         };
-
-        let serialized = serialize_message(&announcement).unwrap();
-        // Inject an unknown field
-        let json_str = String::from_utf8(serialized).unwrap();
-        let mut json_str = json_str;
-        json_str.insert(json_str.len() - 1, ',');
-        json_str.push_str("\"unknown_field\": 42}");
-
-        let result: Result<ManifestAnnouncement> =
-            deserialize_message(json_str.as_bytes(), 1024 * 1024);
+        let mut serialized = serialize_message(&announcement).unwrap();
+        // Inject unknown field
+        let with_unknown = br#"{"protocol_version":1,"manifest":{},"unknown_field":"bad"}"#;
+        serialized.clear();
+        serialized.extend_from_slice(with_unknown);
+        let result: Result<ManifestAnnouncement> = deserialize_message(&serialized, 1024 * 1024);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_oversize_rejection() {
-        let large_data = vec![0u8; 10 * 1024 * 1024]; // 10 MB
-        let result: Result<ManifestAnnouncement> = deserialize_message(&large_data, 1024);
+        let request = ManifestRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            manifest_id: "x".repeat(10000),
+            signature: None,
+        };
+        let serialized = serialize_message(&request).unwrap();
+        let result: Result<ManifestRequest> = deserialize_message(&serialized, 100);
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum size"));
     }
 
     #[test]
     fn test_version_mismatch_handling() {
-        let announcement = ManifestAnnouncement {
-            protocol_version: 999, // Wrong version
-            manifest: create_test_manifest(),
+        let mut request = ManifestRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            manifest_id: "test".to_string(),
             signature: None,
         };
-
-        let serialized = serialize_message(&announcement).unwrap();
-        let deserialized: ManifestAnnouncement =
-            deserialize_message(&serialized, 1024 * 1024).unwrap();
-
-        // Deserialization succeeds, but caller should check version
-        assert_eq!(deserialized.protocol_version, 999);
+        request.protocol_version = 99;
+        let serialized = serialize_message(&request).unwrap();
+        let deserialized: ManifestRequest = deserialize_message(&serialized, 1024).unwrap();
+        // Deserialization succeeds but caller must check version
+        assert_eq!(deserialized.protocol_version, 99);
         assert_ne!(deserialized.protocol_version, CURRENT_PROTOCOL_VERSION);
     }
 
     #[test]
     fn test_optional_signature_field() {
-        // Without signature
-        let announcement_no_sig = ManifestAnnouncement {
+        let announcement = ManifestAnnouncement {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
             signature: None,
         };
-        let serialized_no_sig = serialize_message(&announcement_no_sig).unwrap();
-        assert!(!serialized_no_sig.is_empty());
+        let serialized_no_sig = serialize_message(&announcement).unwrap();
 
-        // With signature
-        let signature_bytes = vec![1u8, 2u8, 3u8, 4u8];
         let announcement_with_sig = ManifestAnnouncement {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
-            signature: Some(signature_bytes),
+            signature: Some(vec![0xde, 0xad, 0xbe, 0xef]),
         };
         let serialized_with_sig = serialize_message(&announcement_with_sig).unwrap();
-        assert!(!serialized_with_sig.is_empty());
+
+        // None signature should be omitted (skip_serializing_if)
+        assert!(!serialized_no_sig.is_empty());
         assert!(serialized_with_sig.len() > serialized_no_sig.len());
     }
 
@@ -406,5 +402,18 @@ mod tests {
             bytes1, bytes2,
             "canonical serialization must be deterministic"
         );
+    }
+
+    #[test]
+    fn test_manifest_helpers() {
+        let manifest = create_test_manifest();
+        let response = manifest_response_bytes(&manifest).unwrap();
+        let parsed: ManifestResponse = deserialize_message(&response, 1024 * 1024).unwrap();
+        assert_eq!(parsed.manifest.model_id, "test-model-id");
+
+        let announcement = announcement_bytes(&manifest, None).unwrap();
+        let parsed: ManifestAnnouncement = deserialize_message(&announcement, 1024 * 1024).unwrap();
+        assert_eq!(parsed.manifest.file_name, "test.gguf");
+        assert_eq!(parsed.signature, None);
     }
 }

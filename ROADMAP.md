@@ -23,7 +23,8 @@
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler
 - [x] Reputation and peer scoring (M5a: bans, decay, persistence)
-- [ ] Multi-provider downloads (swarm fetching)
+- [x] Manifest announcements + registry-backed serving (M5b)
+- [ ] Multi-provider downloads (swarm fetching, M5c)
 
 ## 5. Hardening
 - [ ] Quarantine workflow for corrupted artifacts

@@ -277,10 +277,12 @@ fn list_registry(registry: String) -> Result<()> {
     Ok(())
 }
 
-/// Runs the swarm: loads identity and config, listens on an ephemeral TCP
-/// port, and drives the event loop until interrupted.
+/// Runs the swarm: loads identity and config, serves every model in the
+/// local registry to LAN peers, broadcasts signed announcements, and
+/// drives the event loop until interrupted.
 async fn swarm_start(config_path: PathBuf) -> Result<()> {
-    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode};
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer};
+    use std::sync::Arc;
 
     let config = NodeConfig::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
@@ -291,19 +293,51 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     }
     let identity = Identity::load(&identity_path)?;
 
+    // Load the registry if one exists; the node serves its models.
+    let registry_path = data_dir.join("db/registry.json");
+    let handler = if registry_path.exists() {
+        let registry = ModelRegistry::load(&registry_path)
+            .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+        Some(Arc::new(RegistryServer::new(registry)) as Arc<dyn decentraai_p2p::RequestHandler>)
+    } else {
+        info!("no registry found; node will not serve models");
+        None
+    };
+
     let node = P2PNode::new(
         &identity,
         config.network.max_message_bytes as usize,
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
-        None,
+        handler,
     )?;
     let bound = node.listen("/ip4/0.0.0.0/tcp/0").await?;
+
+    // Announce every model we serve, signed with the node identity.
+    let mut announced = 0usize;
+    if let Some(server) = node.handler_ref() {
+        let _ = server;
+    }
+    if let Some(registry_path) = registry_path.exists().then_some(&registry_path) {
+        let registry = ModelRegistry::load(registry_path)?;
+        let server = RegistryServer::new(registry);
+        for manifest in server.manifests() {
+            let signature = decentraai_protocol::sign_manifest(&identity, &manifest);
+            let payload = decentraai_protocol::announcement_bytes(
+                &manifest,
+                Some(signature.to_bytes().to_vec()),
+            )?;
+            node.announce(payload);
+            announced += 1;
+        }
+    }
+
     println!(
-        "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Listening: {}/p2p/{}\n  Press Ctrl+C to stop",
+        "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Listening: {}/p2p/{}\n  Serving: {} model(s) announced\n  Press Ctrl+C to stop",
         identity.peer_id(),
         node.local_peer_id(),
         bound,
-        node.local_peer_id()
+        node.local_peer_id(),
+        announced
     );
     tokio::signal::ctrl_c().await?;
     node.shutdown();

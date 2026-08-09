@@ -19,7 +19,7 @@ pub enum Error {
     NotGguf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u8,
     pub model_id: String,
@@ -64,6 +64,15 @@ pub fn scan(path: impl AsRef<Path>) -> Result<Manifest, Error> {
         merkle_root: merkle_root(&hashes),
         chunk_hashes: hashes,
     })
+}
+
+/// Like [`scan`], but the manifest carries an explicit logical file name
+/// instead of the on-disk one. Used when serving registry content whose
+/// canonical paths must not leak into the wire manifest.
+pub fn scan_with_name(path: impl AsRef<Path>, file_name: &str) -> Result<Manifest, Error> {
+    let mut manifest = scan(path)?;
+    manifest.file_name = file_name.to_string();
+    Ok(manifest)
 }
 
 pub fn write_atomic(manifest: &Manifest, dir: impl AsRef<Path>) -> Result<PathBuf, Error> {
@@ -119,7 +128,7 @@ mod tests {
     #[test]
     fn root_of_single_chunk_is_the_chunk_hash() {
         let hash = blake3::hash(b"chunk").to_hex().to_string();
-        assert_eq!(merkle_root(std::slice::from_ref(&hash)), hash);
+        assert_eq!(merkle_root(&[hash.clone()]), hash);
     }
 
     #[test]

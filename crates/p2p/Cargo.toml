@@ -12,6 +12,7 @@ blake3.workspace = true
 decentraai-identity = { path = "../identity" }
 decentraai-manifest = { path = "../manifest" }
 decentraai-protocol = { path = "../protocol" }
+decentraai-registry = { path = "../registry" }
 futures.workspace = true
 libp2p.workspace = true
 serde.workspace = true

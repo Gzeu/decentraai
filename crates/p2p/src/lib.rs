@@ -102,6 +102,102 @@ impl RequestHandler for StaticFileServer {
     }
 }
 
+/// Serves every model in a local ModelRegistry: manifests are built on
+/// demand with the registry-relative name, chunks are read with
+/// seek + read from the canonical path. Content-addressed: the manifest
+/// id is the BLAKE3 of the file, so peers always know what they get.
+pub struct RegistryServer {
+    registry: decentraai_registry::ModelRegistry,
+}
+
+impl RegistryServer {
+    pub fn new(registry: decentraai_registry::ModelRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Scans every registered model and returns its manifest. Missing or
+    /// invalid files are skipped with a warning, not fatal errors.
+    pub fn manifests(&self) -> Vec<decentraai_manifest::Manifest> {
+        self.registry
+            .list_models()
+            .into_iter()
+            .filter_map(|record| {
+                match decentraai_manifest::scan_with_name(
+                    &record.canonical_path,
+                    &record.relative_path,
+                ) {
+                    Ok(manifest) => Some(manifest),
+                    Err(e) => {
+                        warn!(path = %record.canonical_path, error = %e, "skipping unscannable model");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+impl RequestHandler for RegistryServer {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        use decentraai_protocol::{
+            CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest,
+            deserialize_message, manifest_response_bytes, serialize_message,
+        };
+
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, request.len()) {
+            if req.protocol_version != CURRENT_PROTOCOL_VERSION {
+                bail!("unsupported protocol version {}", req.protocol_version);
+            }
+            let manifest = self
+                .manifests()
+                .into_iter()
+                .find(|m| m.model_id == req.manifest_id)
+                .with_context(|| format!("unknown manifest {}", req.manifest_id))?;
+            return manifest_response_bytes(&manifest);
+        }
+        if let Ok(req) = deserialize_message::<ChunkRequest>(request, request.len()) {
+            if req.protocol_version != CURRENT_PROTOCOL_VERSION {
+                bail!("unsupported protocol version {}", req.protocol_version);
+            }
+            let manifest = self
+                .manifests()
+                .into_iter()
+                .find(|m| m.model_id == req.manifest_id)
+                .with_context(|| format!("unknown manifest {}", req.manifest_id))?;
+            let record = self
+                .registry
+                .get_model(&manifest.file_name)
+                .with_context(|| format!("registry entry missing for {}", manifest.file_name))?;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&record.canonical_path)
+                .context("opening registered model")?;
+            file.seek(SeekFrom::Start(
+                u64::from(req.chunk_index) * manifest.chunk_size as u64,
+            ))?;
+            let mut buf = vec![0u8; manifest.chunk_size];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = file.read(&mut buf[filled..])?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            if filled == 0 {
+                bail!("chunk {} out of range", req.chunk_index);
+            }
+            let response = ChunkResponse {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                chunk_index: req.chunk_index,
+                chunk_data: buf,
+            };
+            return serialize_message(&response);
+        }
+        bail!("unrecognized request")
+    }
+}
+
 enum Command {
     Listen {
         addr: Multiaddr,
@@ -115,6 +211,10 @@ enum Command {
         peer: PeerId,
         payload: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    /// Fire-and-forget broadcast to every connected peer (announcements).
+    Broadcast {
+        payload: Vec<u8>,
     },
     Shutdown,
 }
@@ -170,6 +270,7 @@ impl P2PNode {
             > = HashMap::new();
             let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> =
                 VecDeque::new();
+            let mut connected: Vec<PeerId> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -192,6 +293,11 @@ impl P2PNode {
                                 let id = swarm.behaviour_mut().messages.send_request(&peer, payload);
                                 pending.insert(id, reply);
                             }
+                            Command::Broadcast { payload } => {
+                                for peer in &connected {
+                                    swarm.behaviour_mut().messages.send_request(peer, payload.clone());
+                                }
+                            }
                             Command::Shutdown => break,
                         }
                     }
@@ -204,10 +310,14 @@ impl P2PNode {
                                 }
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                                info!(%peer_id, "peer connected")
+                                info!(%peer_id, "peer connected");
+                                if !connected.contains(&peer_id) {
+                                    connected.push(peer_id);
+                                }
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                                info!(%peer_id, "peer disconnected")
+                                info!(%peer_id, "peer disconnected");
+                                connected.retain(|p| p != &peer_id);
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
                                 mdns::Event::Discovered(list),
@@ -223,6 +333,15 @@ impl P2PNode {
                                 request_response::Message::Request {
                                     request, channel, ..
                                 } => {
+                                    if deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
+                                        &request,
+                                        request.len(),
+                                    )
+                                    .is_ok()
+                                    {
+                                        info!(%peer, bytes = request.len(), "received manifest announcement");
+                                        continue;
+                                    }
                                     let response = match &handler {
                                         Some(h) => match h.handle(&request) {
                                             Ok(bytes) => bytes,
@@ -323,6 +442,12 @@ impl P2PNode {
             })
             .map_err(|_| anyhow::anyhow!("swarm task is not running"))?;
         rx.await.context("swarm task dropped the reply")?
+    }
+
+    /// Broadcasts a serialized ManifestAnnouncement to every connected
+    /// peer. Fire-and-forget: delivery failures are logged, not fatal.
+    pub fn announce(&self, payload: Vec<u8>) {
+        let _ = self.commands.send(Command::Broadcast { payload });
     }
 
     pub fn shutdown(&self) {
