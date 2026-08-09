@@ -657,6 +657,7 @@ dependencies = [
  "decentraai-config",
  "decentraai-identity",
  "decentraai-p2p",
+ "decentraai-protocol",
  "decentraai-registry",
  "decentraai-runtime",
  "decentraai-system-probe",
