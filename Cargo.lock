@@ -712,6 +712,8 @@ dependencies = [
  "decentraai-protocol",
  "futures",
  "libp2p",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
