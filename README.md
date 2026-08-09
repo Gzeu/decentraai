@@ -36,7 +36,7 @@ Decentralized P2P distribution of AI model artifacts and verifiable local or rem
 - **Implemented**: Local model scanning and persistent registry
 - **Supported formats**: `.gguf`, `.safetensors`, `.onnx`, `.bin`, `.pt`, `.pth`
 - **CLI commands**:
-  - `decentraai scan --directory <path> --registry <path>`: Scan directory for models
+  - `decentraai registry scan --directory <path> --registry <path>`: Scan directory for models
   - `decentraai registry list --registry <path>`: List registered models
 - **Safety features**: Path validation, symlink rejection, canonical paths, idempotent operations
 

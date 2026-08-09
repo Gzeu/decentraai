@@ -24,7 +24,6 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    Scan(ScanArgs),
     Registry {
         #[command(subcommand)]
         command: RegistryCommand,
@@ -56,6 +55,7 @@ struct ScanArgs {
 }
 #[derive(Debug, Subcommand)]
 enum RegistryCommand {
+    Scan(ScanArgs),
     List {
         #[arg(long, default_value = "~/.decentraai/db/registry.json")]
         registry: String,
@@ -74,7 +74,9 @@ fn main() -> Result<()> {
         Command::Config {
             command: ConfigCommand::Validate { file },
         } => validate_config(file),
-        Command::Scan(args) => scan(args),
+        Command::Registry {
+            command: RegistryCommand::Scan(args),
+        } => scan(args),
         Command::Registry {
             command: RegistryCommand::List { registry },
         } => list_registry(registry),
@@ -182,7 +184,7 @@ fn list_registry(registry: String) -> Result<()> {
     let registry_path = expand_tilde(&registry);
     if !registry_path.exists() {
         println!("Registry not found at {}", registry_path.display());
-        println!("Run 'decentraai scan' to create a registry.");
+        println!("Run 'decentraai registry scan' to create a registry.");
         return Ok(());
     }
     let registry = ModelRegistry::load(&registry_path)
@@ -200,4 +202,36 @@ fn list_registry(registry: String) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_registry_scan_command() {
+        let cli = Cli::try_parse_from(["decentraai", "registry", "scan"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Registry {
+                command: RegistryCommand::Scan(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_registry_list_command() {
+        let cli = Cli::try_parse_from(["decentraai", "registry", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Registry {
+                command: RegistryCommand::List { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_top_level_scan() {
+        assert!(Cli::try_parse_from(["decentraai", "scan"]).is_err());
+    }
 }
