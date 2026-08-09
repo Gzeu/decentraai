@@ -33,6 +33,10 @@ enum Command {
         #[command(subcommand)]
         command: SwarmCommand,
     },
+    Serve {
+        #[command(subcommand)]
+        command: ServeCommand,
+    },
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -73,6 +77,19 @@ enum SwarmCommand {
         config: PathBuf,
     },
 }
+#[derive(Debug, Subcommand)]
+enum ServeCommand {
+    Start {
+        /// Model reference: registry relative path or direct file path.
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Explicit llama-server binary path (overrides env and PATH search).
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -96,6 +113,13 @@ async fn main() -> Result<()> {
         Command::Swarm {
             command: SwarmCommand::Start { config },
         } => swarm_start(config).await,
+        Command::Serve {
+            command: ServeCommand::Start {
+                model,
+                config,
+                binary,
+            },
+        } => serve_start(config, model, binary).await,
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -286,6 +310,45 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Runs gated inference in the foreground: admission check, registry
+/// resolution, llama-server spawn with readiness wait, Ctrl+C to stop.
+async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
+    use decentraai_runtime::{
+        LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server, resolve_model,
+    };
+
+    let config = NodeConfig::load(&config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    ensure_admitted(&config)?;
+
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let registry_path = data_dir.join("db/registry.json");
+    if !registry_path.exists() {
+        anyhow::bail!(
+            "registry not found at {}; run 'decentraai registry scan' first",
+            registry_path.display()
+        );
+    }
+    let registry = ModelRegistry::load(&registry_path)
+        .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+    let model_path = resolve_model(&registry, &model)?;
+    let binary = find_llama_server(binary.as_deref())?;
+
+    let mut runtime = RuntimeConfig::new(model_path.clone());
+    runtime.ctx_size = config.inference.max_context_tokens;
+    runtime.parallel = config.inference.max_concurrent_requests;
+
+    let server = LlamaServer::spawn(&binary, &runtime).await?;
+    println!(
+        "DecentraAI inference running\n  Model: {}\n  Endpoint: {}\n  Press Ctrl+C to stop",
+        model_path.display(),
+        server.base_url()
+    );
+    tokio::signal::ctrl_c().await?;
+    server.stop().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +389,22 @@ mod tests {
                 command: SwarmCommand::Start { .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_serve_start_command() {
+        let cli =
+            Cli::try_parse_from(["decentraai", "serve", "start", "--model", "model.gguf"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                command: ServeCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_start_requires_a_model() {
+        assert!(Cli::try_parse_from(["decentraai", "serve", "start"]).is_err());
     }
 }

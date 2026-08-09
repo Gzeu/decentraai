@@ -16,8 +16,8 @@
 
 ## 3. Runtime (M4 — in progress)
 - [x] M4a: llama-server process manager crate (`decentraai-runtime`)
-- [ ] M4b: inference admission control wired to the system probe
-- [ ] M4c: local OpenAI-compatible API endpoint + `decentraai serve`
+- [x] M4b: inference admission gate + `decentraai serve start`
+- [ ] M4c: local OpenAI-compatible API endpoint with idle unload
 
 ## 4. Swarm Intelligence
 - [ ] Deterministic task scheduler

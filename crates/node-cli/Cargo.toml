@@ -16,6 +16,7 @@ decentraai-config = { path = "../config" }
 decentraai-identity = { path = "../identity" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-registry = { path = "../registry" }
+decentraai-runtime = { path = "../runtime" }
 decentraai-system-probe = { path = "../system-probe" }
 tokio.workspace = true
 tracing.workspace = true

@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+decentraai-config = { path = "../config" }
+decentraai-registry = { path = "../registry" }
+decentraai-system-probe = { path = "../system-probe" }
 tokio.workspace = true
 tracing.workspace = true
 

@@ -1,12 +1,15 @@
-//! Managed llama.cpp `llama-server` subprocess (M4a).
+//! Managed llama.cpp `llama-server` subprocess plus the admission gate
+//! and serve lifecycle (M4a/M4b).
 //!
 //! The inference engine runs as an external process, not FFI bindings:
 //! upgrades are simple binary swaps and a crash in inference never takes
-//! the node down. This crate locates the binary, derives its arguments
-//! from the node configuration, waits for the HTTP health endpoint, and
-//! guarantees the child is killed when the manager goes away.
+//! the node down. Before any model loads, the admission gate checks the
+//! config mode and the live hardware budgets from the system probe.
 
 use anyhow::{Context, Result, bail};
+use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};
+use decentraai_registry::ModelRegistry;
+use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -114,6 +117,56 @@ pub fn allocate_port(host: &str) -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Resolves a model reference to a filesystem path: the registry is
+/// consulted first (by relative path), then a direct path fallback.
+pub fn resolve_model(registry: &ModelRegistry, reference: &str) -> Result<PathBuf> {
+    if let Some(record) = registry.get_model(reference) {
+        return Ok(PathBuf::from(&record.canonical_path));
+    }
+    let path = PathBuf::from(reference);
+    if path.is_file() {
+        return Ok(path);
+    }
+    bail!("model '{reference}' not found in the registry or on disk")
+}
+
+/// Hard gate for `inference.enabled`: `never` disables the runtime entirely.
+pub fn check_inference_mode(mode: InferenceMode) -> Result<()> {
+    if mode == InferenceMode::Never {
+        bail!("inference is disabled by configuration (inference.enabled = never)");
+    }
+    Ok(())
+}
+
+/// Evaluates the admission policy against a hardware snapshot. Split from
+/// [`ensure_admitted`] so tests can drive it with synthetic snapshots.
+pub fn evaluate_admission(
+    snapshot: &SystemSnapshot,
+    gpu: &GpuProbeStatus,
+    resources: &ResourceSection,
+    max_cache_gb: u32,
+    min_free_disk_gb: u32,
+) -> Result<()> {
+    let budget = snapshot.derive_budget(resources, max_cache_gb, min_free_disk_gb);
+    match snapshot.admit_inference(&budget, gpu, resources.stop_gpu_temperature_celsius) {
+        AdmissionDecision::Admit => Ok(()),
+        AdmissionDecision::Reject(reason) => bail!("inference admission rejected: {reason}"),
+    }
+}
+
+/// Full pre-flight check before loading a model: config mode first, then a
+/// fresh hardware probe evaluated against the configured budgets.
+pub fn ensure_admitted(config: &NodeConfig) -> Result<()> {
+    check_inference_mode(config.inference.enabled)?;
+    evaluate_admission(
+        &SystemSnapshot::collect(),
+        &probe_gpu(),
+        &config.resources,
+        config.storage.max_cache_gb,
+        config.storage.min_free_disk_gb,
+    )
+}
+
 /// Handle to a running llama-server child process.
 /// Kills the child on drop as a backstop; prefer [`LlamaServer::stop`].
 pub struct LlamaServer {
@@ -192,6 +245,64 @@ impl Drop for LlamaServer {
     }
 }
 
+/// Tracks a running server and unloads it after an idle period.
+/// The OpenAI-compatible proxy (M4c) calls [`ServeManager::note_activity`]
+/// on every request; until then the CLI keeps the model in the foreground.
+pub struct ServeManager {
+    server: Option<LlamaServer>,
+    idle_timeout: Duration,
+    last_activity: Instant,
+}
+
+impl ServeManager {
+    pub fn new(server: LlamaServer, idle_timeout: Duration) -> Self {
+        Self {
+            server: Some(server),
+            idle_timeout,
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// Marks the model as actively serving; resets the idle clock.
+    pub fn note_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.base_url())
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity.elapsed()
+    }
+
+    /// Stops the server when it has been idle longer than the configured
+    /// timeout. Returns true when an unload actually happened.
+    pub async fn unload_if_idle(&mut self) -> Result<bool> {
+        if self.idle_for() < self.idle_timeout {
+            return Ok(false);
+        }
+        if let Some(server) = self.server.take() {
+            info!(idle_for_ms = self.idle_for().as_millis(), "idle timeout reached, unloading model");
+            server.stop().await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Stops the server if one is still running.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(server) = self.server.take() {
+            server.stop().await?;
+        }
+        Ok(())
+    }
+}
+
 /// Polls the health endpoint until it answers HTTP 200 or `timeout` elapses.
 pub async fn wait_until_ready(host: &str, port: u16, timeout: Duration) -> Result<()> {
     let start = Instant::now();
@@ -241,6 +352,7 @@ fn probe_health(host: &str, port: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decentraai_config::GpuPolicy;
 
     #[test]
     fn args_carry_model_context_and_parallelism() {
@@ -268,6 +380,97 @@ mod tests {
     fn allocate_port_returns_usable_port() {
         let port = allocate_port("127.0.0.1").unwrap();
         assert!(port > 0);
+    }
+
+    #[test]
+    fn resolve_model_prefers_registry_records() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"GGUF test").unwrap();
+        let mut registry = ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        registry.scan_directory(dir.path()).unwrap();
+        let resolved = resolve_model(&registry, "model.gguf").unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_file());
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_direct_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("direct.gguf");
+        std::fs::write(&file, b"GGUF test").unwrap();
+        let registry = ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        let resolved = resolve_model(&registry, file.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, file);
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        assert!(resolve_model(&registry, "missing.gguf").is_err());
+    }
+
+    #[test]
+    fn mode_never_disables_inference() {
+        let err = check_inference_mode(InferenceMode::Never).unwrap_err();
+        assert!(err.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn mode_auto_and_always_pass_the_gate() {
+        check_inference_mode(InferenceMode::Auto).unwrap();
+        check_inference_mode(InferenceMode::Always).unwrap();
+    }
+
+    fn test_resources(policy: GpuPolicy) -> ResourceSection {
+        ResourceSection {
+            cpu_max_percent: 80,
+            reserve_cpu_cores: 2,
+            memory_max_percent: 80,
+            reserve_ram_mb: 1024,
+            gpu_enabled: policy,
+            gpu_max_vram_percent: 75,
+            reserve_vram_mb: 1024,
+            stop_gpu_temperature_celsius: 83,
+            max_upload_mbps: 20,
+            max_download_mbps: 80,
+        }
+    }
+
+    fn test_snapshot() -> SystemSnapshot {
+        SystemSnapshot {
+            logical_cpus: 8,
+            cpu_usage_percent: 10.0,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            available_memory_bytes: 16 * 1024 * 1024 * 1024,
+            used_swap_bytes: 0,
+            total_disk_free_bytes: 500 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn admission_rejects_missing_required_gpu() {
+        let err = evaluate_admission(
+            &test_snapshot(),
+            &GpuProbeStatus::Unavailable("none".into()),
+            &test_resources(GpuPolicy::Required),
+            100,
+            20,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("admission rejected"));
+    }
+
+    #[test]
+    fn admission_accepts_healthy_system() {
+        evaluate_admission(
+            &test_snapshot(),
+            &GpuProbeStatus::Unavailable("none".into()),
+            &test_resources(GpuPolicy::Auto),
+            100,
+            20,
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -349,5 +552,39 @@ mod tests {
         config.ready_timeout = Duration::from_millis(500);
         let err = LlamaServer::spawn(&binary, &config).await.unwrap_err();
         assert!(err.to_string().contains("did not become ready"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_manager_unloads_after_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = write_fake_server(dir.path());
+        let config = RuntimeConfig::new(dir.path().join("model.gguf"));
+        let server = LlamaServer::start(&binary, &config).unwrap();
+        let mut manager = ServeManager::new(server, Duration::from_millis(100));
+        assert!(manager.is_loaded());
+        assert!(manager.base_url().is_some());
+        assert!(!manager.unload_if_idle().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(manager.unload_if_idle().await.unwrap());
+        assert!(!manager.is_loaded());
+        assert!(manager.base_url().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_manager_activity_resets_idle_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = write_fake_server(dir.path());
+        let config = RuntimeConfig::new(dir.path().join("model.gguf"));
+        let server = LlamaServer::start(&binary, &config).unwrap();
+        let mut manager = ServeManager::new(server, Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        manager.note_activity();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!manager.unload_if_idle().await.unwrap());
+        assert!(manager.is_loaded());
+        manager.shutdown().await.unwrap();
+        assert!(!manager.is_loaded());
     }
 }
