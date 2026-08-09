@@ -39,6 +39,8 @@ impl P2PNode {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
         let peer_id = PeerId::from(&keypair.public());
+        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+            .context("creating mDNS behaviour")?;
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -47,18 +49,13 @@ impl P2PNode {
                 yamux::Config::default,
             )
             .context("building TCP transport")?
-            .with_behaviour(|key| {
-                Ok(NodeBehaviour {
-                    mdns: mdns::tokio::Behaviour::new(
-                        mdns::Config::default(),
-                        key.public().to_peer_id(),
-                    )?,
-                    messages: request_response::Behaviour::with_codec(
-                        FrameCodec { max_frame_bytes: max_message_bytes },
-                        [(MESSAGE_PROTOCOL, ProtocolSupport::Full)],
-                        request_response::Config::default(),
-                    ),
-                })
+            .with_behaviour(|_| NodeBehaviour {
+                mdns: mdns_behaviour,
+                messages: request_response::Behaviour::with_codec(
+                    FrameCodec { max_frame_bytes: max_message_bytes },
+                    [(MESSAGE_PROTOCOL, ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                ),
             })
             .context("attaching network behaviour")?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -239,10 +236,10 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip() {
         let payload = b"hello decentraai".to_vec();
-        let mut cursor = io::Cursor::new(Vec::new());
-        write_frame(&mut cursor, &payload).await.unwrap();
-        cursor.set_position(0);
-        let read = read_frame(&mut cursor, DEFAULT_MAX_MESSAGE_BYTES)
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &payload).await.unwrap();
+        let mut slice = buf.as_slice();
+        let read = read_frame(&mut slice, DEFAULT_MAX_MESSAGE_BYTES)
             .await
             .unwrap();
         assert_eq!(read, payload);
@@ -251,9 +248,9 @@ mod tests {
     #[tokio::test]
     async fn frame_oversize_is_rejected() {
         let payload = vec![0u8; 64];
-        let mut cursor = io::Cursor::new(Vec::new());
-        write_frame(&mut cursor, &payload).await.unwrap();
-        cursor.set_position(0);
-        assert!(read_frame(&mut cursor, 16).await.is_err());
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &payload).await.unwrap();
+        let mut slice = buf.as_slice();
+        assert!(read_frame(&mut slice, 16).await.is_err());
     }
 }
