@@ -25,7 +25,7 @@ impl ModelRegistry {
     pub fn new(root: PathBuf) -> Result<Self> {
         let canonical_root = fs::canonicalize(&root)
             .with_context(|| format!("canonicalizing root path {}", root.display()))?;
-        
+
         if !canonical_root.is_dir() {
             anyhow::bail!("not a directory: {}", canonical_root.display());
         }
@@ -45,8 +45,7 @@ impl ModelRegistry {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)
-            .context("serializing registry to JSON")?;
+        let content = serde_json::to_string_pretty(self).context("serializing registry to JSON")?;
         fs::write(path, content)
             .with_context(|| format!("writing registry to {}", path.display()))?;
         Ok(())
@@ -55,9 +54,9 @@ impl ModelRegistry {
     pub fn scan_directory(&mut self, scan_root: &Path) -> Result<usize> {
         let canonical_scan_root = fs::canonicalize(scan_root)
             .with_context(|| format!("canonicalizing scan root {}", scan_root.display()))?;
-        
+
         let canonical_registry_root = PathBuf::from(&self.root);
-        
+
         if !canonical_scan_root.starts_with(&canonical_registry_root) {
             anyhow::bail!(
                 "scan root {} outside registry root {}",
@@ -67,7 +66,11 @@ impl ModelRegistry {
         }
 
         let mut found_count = 0;
-        self.scan_recursive(&canonical_scan_root, &canonical_registry_root, &mut found_count)?;
+        self.scan_recursive(
+            &canonical_scan_root,
+            &canonical_registry_root,
+            &mut found_count,
+        )?;
         Ok(found_count)
     }
 
@@ -77,13 +80,13 @@ impl ModelRegistry {
         registry_root: &Path,
         found_count: &mut usize,
     ) -> Result<()> {
-        let entries = fs::read_dir(dir)
-            .with_context(|| format!("reading directory {}", dir.display()))?;
+        let entries =
+            fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
 
         for entry in entries {
             let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
             let path = entry.path();
-            
+
             // Check for symlinks
             if path.is_symlink() {
                 continue; // Skip symlinks entirely
@@ -135,7 +138,8 @@ impl ModelRegistry {
             relative_path: relative_path.clone(),
             canonical_path: canonical_path.to_string_lossy().to_string(),
             size_bytes: metadata.len(),
-            modification_time: metadata.modified()?
+            modification_time: metadata
+                .modified()?
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
