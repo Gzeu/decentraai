@@ -333,7 +333,7 @@ impl P2PNode {
                                 request_response::Message::Request {
                                     request, channel, ..
                                 } => {
-                                    if deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
+                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
                                         &request,
                                         request.len(),
                                     )
