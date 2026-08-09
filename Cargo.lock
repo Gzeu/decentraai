@@ -710,6 +710,7 @@ dependencies = [
  "decentraai-identity",
  "decentraai-manifest",
  "decentraai-protocol",
+ "decentraai-registry",
  "futures",
  "libp2p",
  "serde",
