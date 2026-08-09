@@ -15,6 +15,7 @@ clap.workspace = true
 decentraai-config = { path = "../config" }
 decentraai-identity = { path = "../identity" }
 decentraai-p2p = { path = "../p2p" }
+decentraai-protocol = { path = "../protocol" }
 decentraai-registry = { path = "../registry" }
 decentraai-runtime = { path = "../runtime" }
 decentraai-system-probe = { path = "../system-probe" }
