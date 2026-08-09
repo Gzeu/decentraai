@@ -12,7 +12,7 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::{PeerId, Swarm, mdns, noise, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, Swarm, mdns, noise, tcp, yamux};
 use std::io;
 use std::time::Duration;
 use tracing::info;
@@ -75,9 +75,8 @@ impl P2PNode {
     }
 
     pub fn dial(&mut self, addr: &str) -> Result<()> {
-        self.swarm
-            .dial(addr.parse().context("invalid dial address")?)
-            .context("failed to dial")?;
+        let target: Multiaddr = addr.parse().context("invalid dial address")?;
+        self.swarm.dial(target).context("failed to dial")?;
         Ok(())
     }
 
@@ -90,8 +89,8 @@ impl P2PNode {
     }
 
     /// Drive the swarm event loop. Discovered mDNS peers are registered with
-    /// the request/response behaviour; inbound requests are only logged until
-    /// the transfer engine lands in M3 part 2.
+    /// the swarm address book; inbound requests are only logged until the
+    /// transfer engine lands in M3 part 2.
     pub async fn run(mut self) -> Result<()> {
         loop {
             match self.swarm.select_next_some().await {
@@ -109,12 +108,7 @@ impl P2PNode {
                 ))) => {
                     for (peer, addr) in list {
                         info!(%peer, %addr, "mDNS discovered peer");
-                        self.swarm.behaviour_mut().messages.add_address(&peer, addr);
-                    }
-                }
-                SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer, addr) in list {
-                        self.swarm.behaviour_mut().messages.remove_address(&peer, &addr);
+                        self.swarm.add_peer_address(peer, addr);
                     }
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
