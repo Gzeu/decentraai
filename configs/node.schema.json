@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DecentraAI Node Configuration",
+  "type": "object",
+  "required": ["node", "network", "storage", "resources", "inference", "privacy", "security"],
+  "additionalProperties": false,
+  "properties": {
+    "node": {"type": "object"},
+    "network": {"type": "object"},
+    "storage": {"type": "object"},
+    "resources": {"type": "object"},
+    "inference": {"type": "object"},
+    "privacy": {"type": "object"},
+    "security": {"type": "object"}
+  }
+}
