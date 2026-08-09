@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use decentraai_identity::Identity;
-use decentraai_manifest::{CHUNK_SIZE, Manifest};
+use decentraai_manifest::{CHUNK_SIZE, Manifest, scan};
 use decentraai_p2p::transfer::download;
 use decentraai_p2p::{
     DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RequestHandler,
@@ -20,8 +20,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Deterministic bytes starting with the GGUF magic (required by `scan`).
 fn test_bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i % 251) as u8).collect()
+    assert!(len >= 4, "test data must fit the GGUF magic");
+    let mut data = b"GGUF".to_vec();
+    data.extend((4..len).map(|i| (i % 251) as u8));
+    data
 }
 
 /// Spins up a serving node (with handler) and a client node, connected
@@ -71,11 +75,11 @@ async fn download_with_retry(
     Err(last_err.unwrap())
 }
 
-fn manifest_bytes(manifest: &Manifest) -> Vec<u8> {
+/// Serializes a ManifestResponse. Takes ownership because `Manifest` is not Clone.
+fn manifest_bytes(manifest: Manifest) -> Vec<u8> {
     serialize_message(&ManifestResponse {
         protocol_version: CURRENT_PROTOCOL_VERSION,
-        manifest: manifest.clone(),
-        signature: None,
+        manifest,
     })
     .unwrap()
 }
@@ -87,10 +91,10 @@ async fn end_to_end_download_matches_source() {
     let data = test_bytes(CHUNK_SIZE + 123);
     std::fs::write(&source_path, &data).unwrap();
 
-    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest = scan(&source_path).unwrap();
     let manifest_id = manifest.model_id.clone();
     let handler = Arc::new(StaticFileServer::new(
-        manifest_bytes(&manifest),
+        manifest_bytes(manifest),
         source_path.clone(),
         CHUNK_SIZE as u64,
     ));
@@ -135,10 +139,10 @@ async fn corrupted_chunk_is_rejected() {
     let source_path = dir.path().join("model.gguf");
     std::fs::write(&source_path, test_bytes(CHUNK_SIZE + 1)).unwrap();
 
-    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest = scan(&source_path).unwrap();
     let manifest_id = manifest.model_id.clone();
     let handler = Arc::new(CorruptChunkHandler {
-        manifest_response: manifest_bytes(&manifest),
+        manifest_response: manifest_bytes(manifest),
     });
 
     let (server, client) = node_pair(Some(handler)).await;
@@ -174,12 +178,12 @@ async fn download_resumes_from_bitmap() {
     let data = test_bytes(CHUNK_SIZE * 2);
     std::fs::write(&source_path, &data).unwrap();
 
-    let manifest = Manifest::from_file(&source_path, "e2e-model").unwrap();
+    let manifest = scan(&source_path).unwrap();
     let manifest_id = manifest.model_id.clone();
     let counter = Arc::new(AtomicUsize::new(0));
     let handler = Arc::new(CountingHandler {
         inner: StaticFileServer::new(
-            manifest_bytes(&manifest),
+            manifest_bytes(manifest),
             source_path.clone(),
             CHUNK_SIZE as u64,
         ),
@@ -203,11 +207,7 @@ async fn download_resumes_from_bitmap() {
         file.set_len(data.len() as u64).unwrap();
         file.write_all(&data[..CHUNK_SIZE]).unwrap();
     }
-    std::fs::write(
-        staging.join(format!("{manifest_id}.done")),
-        [1u8, 0u8],
-    )
-    .unwrap();
+    std::fs::write(staging.join(format!("{manifest_id}.done")), [1u8, 0u8]).unwrap();
 
     let path = download_with_retry(&client, server.local_peer_id(), &manifest_id, &out_dir)
         .await
