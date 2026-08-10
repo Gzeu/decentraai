@@ -46,6 +46,11 @@ pub struct RuntimeConfig {
     pub ctx_size: u32,
     /// Concurrent slots, from `inference.max_concurrent_requests`.
     pub parallel: u16,
+    /// CPU threads for token generation. `None` leaves the llama.cpp
+    /// default; the CLI sets it to the physical-core budget (logical
+    /// CPUs minus the configured reserve), because oversubscribed
+    /// threads are the most common cause of slow CPU inference.
+    pub threads: Option<usize>,
     /// How long to wait for the server to become ready (model load time).
     pub ready_timeout: Duration,
     /// Extra arguments passed through verbatim (e.g. `--n-gpu-layers 99`).
@@ -59,6 +64,7 @@ impl RuntimeConfig {
             bind_host: "127.0.0.1".to_string(),
             ctx_size: 4096,
             parallel: 4,
+            threads: None,
             ready_timeout: Duration::from_secs(120),
             extra_args: Vec::new(),
         }
@@ -66,6 +72,9 @@ impl RuntimeConfig {
 }
 
 /// Builds the llama-server CLI arguments. Pure function for easy testing.
+/// `--jinja` enables the model's own chat template (required for
+/// instruct models to answer properly); `--flash-attn on` is the fast
+/// path for prompt processing and smaller KV cache traffic.
 pub fn server_args(config: &RuntimeConfig, port: u16) -> Vec<String> {
     let mut args = vec![
         "--model".to_string(),
@@ -79,6 +88,13 @@ pub fn server_args(config: &RuntimeConfig, port: u16) -> Vec<String> {
         "--parallel".to_string(),
         config.parallel.to_string(),
     ];
+    if let Some(threads) = config.threads {
+        args.push("--threads".to_string());
+        args.push(threads.to_string());
+    }
+    args.push("--flash-attn".to_string());
+    args.push("on".to_string());
+    args.push("--jinja".to_string());
     args.extend(config.extra_args.iter().cloned());
     args
 }
@@ -385,6 +401,7 @@ mod tests {
         let mut config = RuntimeConfig::new(PathBuf::from("/models/test.gguf"));
         config.ctx_size = 8192;
         config.parallel = 2;
+        config.threads = Some(3);
         config.extra_args = vec!["--n-gpu-layers".to_string(), "99".to_string()];
         let args = server_args(&config, 8080);
         let joined = args.join(" ");
@@ -393,7 +410,18 @@ mod tests {
         assert!(joined.contains("--port 8080"));
         assert!(joined.contains("--ctx-size 8192"));
         assert!(joined.contains("--parallel 2"));
+        assert!(joined.contains("--threads 3"));
+        assert!(joined.contains("--flash-attn on"));
+        assert!(joined.contains("--jinja"));
         assert!(joined.ends_with("--n-gpu-layers 99"));
+    }
+
+    #[test]
+    fn threads_are_omitted_when_unset() {
+        let config = RuntimeConfig::new(PathBuf::from("/models/test.gguf"));
+        let joined = server_args(&config, 8080).join(" ");
+        assert!(!joined.contains("--threads"));
+        assert!(joined.contains("--flash-attn on"));
     }
 
     #[test]

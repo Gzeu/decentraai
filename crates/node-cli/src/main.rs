@@ -424,6 +424,15 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     let mut runtime = RuntimeConfig::new(model_path.clone());
     runtime.ctx_size = config.inference.max_context_tokens;
     runtime.parallel = config.inference.max_concurrent_requests;
+    // Thread budget for token generation: logical CPUs minus the
+    // configured reserve (min 1). Oversubscribed threads are the most
+    // common cause of slow CPU inference.
+    runtime.threads = Some(
+        SystemSnapshot::collect()
+            .logical_cpus
+            .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
+            .max(1),
+    );
 
     let server = LlamaServer::spawn(&binary, &runtime).await?;
     let backend_url = server.base_url();
@@ -493,8 +502,9 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         "tiers: off (add a tiers: section to the config to enable subscriptions)"
     };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
+        "DecentraAI inference running\n  Model: {}\n  Threads: {} (logical CPUs minus reserve)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
         model_path.display(),
+        runtime.threads.unwrap_or(0),
         api_addr,
         api_addr,
         auth_hint,
@@ -617,10 +627,10 @@ async fn pull(args: PullArgs) -> Result<()> {
 fn token_command(command: TokenCommand) -> Result<()> {
     use decentraai_tokens::{Tier, TokenStore};
 
-    let (config_path, action) = match &command {
+    let config_path = match &command {
         TokenCommand::Create { config, .. }
         | TokenCommand::List { config }
-        | TokenCommand::Revoke { config, .. } => (config, ()),
+        | TokenCommand::Revoke { config, .. } => config,
     };
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
@@ -629,7 +639,6 @@ fn token_command(command: TokenCommand) -> Result<()> {
     let mut store = TokenStore::load(&registry_path)
         .with_context(|| format!("loading token registry from {}", registry_path.display()))?;
     let logs_dir = data_dir.join("logs");
-    let _ = action;
 
     match command {
         TokenCommand::Create { name, tier, .. } => {

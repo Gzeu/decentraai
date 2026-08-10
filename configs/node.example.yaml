@@ -40,7 +40,9 @@ inference:
   api_auth_required: true
   allow_remote_inference: false
   max_concurrent_requests: 1
-  max_context_tokens: 8192
+  # Smaller contexts mean faster prompt processing and a smaller KV
+  # cache on CPU nodes; raise it only when you need long documents.
+  max_context_tokens: 4096
   max_generated_tokens: 1024
   request_timeout_seconds: 180
   queue_max_requests: 20

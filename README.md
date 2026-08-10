@@ -3,6 +3,7 @@
 Decentralized P2P distribution of AI model artifacts and verifiable local or remote inference.
 Nodes discover each other on the LAN, exchange cryptographically verified model chunks,
 and serve inference through a local OpenAI-compatible endpoint with a live web dashboard.
+Free, contribution-tiered subscriptions gate models and request rates per token.
 
 ## What exists today
 
@@ -16,6 +17,8 @@ and serve inference through a local OpenAI-compatible endpoint with a live web d
 | M6 | Hardening: quarantine workflow, audit logging | Done |
 | M7 | Sharing + UX: peer catalog, `decentraai pull`, live web dashboard | Done |
 | M8 | Packaging: `scripts/install.sh` + [deployment guide](docs/deployment.md) | Done |
+| P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
+| P2 | Chat UI in the dashboard | Next |
 
 ## Using DecentraAI today
 
@@ -91,14 +94,37 @@ appended to `logs/audit.jsonl`.
 decentraai serve start --model tinyllama.gguf
 # prints: Dashboard: http://127.0.0.1:8080/ (status, peers, share guide)
 #         API: http://127.0.0.1:8080/v1 (OpenAI-compatible)
-#         Auth: Bearer token: ~/.decentraai/runtime/api.token
+#         Auth: master token: ~/.decentraai/runtime/api.token
+#         Subscriptions: tiers: on
+#         Threads: N (logical CPUs minus reserve)
 ```
 
 The gate before every load: config mode (`inference.enabled`), live RAM/GPU
-budgets, and GPU temperature from the system probe. The model unloads
-automatically after `idle_model_unload_minutes` without requests.
+budgets, and GPU temperature from the system probe. llama-server starts
+with `--threads` (physical-core budget), `--flash-attn on`, and `--jinja`
+(the model's own chat template). The model unloads automatically after
+`idle_model_unload_minutes` without requests.
 
-### 4. Watch the node in your browser (dashboard)
+### 4. Subscriptions: issue tokens with tiers (P1)
+
+Everything is free; the tier reflects contribution. The master token in
+`runtime/api.token` is unlimited admin; issued tokens get per-tier model
+allowlists and rate limits, applied at the next request (no restart):
+
+```bash
+decentraai token create --name alice --tier 1   # guest: allowlisted models only, 10 req/min
+decentraai token create --name bob --tier 2     # contributor: all models, 60 req/min
+decentraai token list
+decentraai token revoke --name alice
+```
+
+Tokens are `dsk_<64 hex>`, shown once at creation and stored only as
+BLAKE3 hashes in `db/tokens.json`. The `tiers:` section of the config
+defines each tier's `models` allowlist (empty = all models) and
+`rate_limit_per_minute`. Subscribers get 403 for out-of-tier models and
+429 past the rate limit; both are audited and visible on the dashboard.
+
+### 5. Watch the node in your browser (dashboard)
 
 Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard refreshes
 every 3 seconds and shows:
@@ -111,23 +137,45 @@ every 3 seconds and shows:
   temperature, free VRAM, utilization
 - tracked peers with verified/failed chunks, score, and ban status
   (`GET /v1/peers`, token-guarded)
-- the latest security events from the audit log
+- the latest security events from the audit log (incl. token and
+  rate-limit events)
 - a share guide with the exact `swarm start` + `pull` commands for this node
 
 The dashboard reads only `GET /status` and `GET /v1/peers` — watching the
 page never touches the inference backend, so it neither inflates the
-request counter nor resets the idle-unload clock. The dashboard and
-`/status` are public on loopback (no secrets); the API endpoints require
-the Bearer token.
+request counter nor resets the idle-unload clock.
 
 ```bash
 TOKEN=$(cat ~/.decentraai/runtime/api.token)
-curl http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $TOKEN"
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model":"tinyllama","messages":[{"role":"user","content":"Hello"}],"max_tokens":20}'
 ```
+
+### 6. Better answers: model quality and speed
+
+TinyLlama 1.1B is a smoke-test model — it proves the pipeline, but its
+answers are weak and it hallucinates languages. For real conversations
+on a 16 GB / 4-thread CPU node:
+
+| Model | Size (Q4_K_M) | Why |
+|---|---|---|
+| **Qwen3-4B-Instruct** (2507) | ~2.5 GB | Best multilingual 3–4B tier, includes Romanian; recommended default |
+| **Phi-4-mini** (3.8B) | ~2.5 GB | Best reasoning/math at this size (English-first) |
+| Qwen3-8B (stretch) | ~5 GB | Noticeably smarter, ~half the speed; fits in 16 GB RAM |
+
+```bash
+# download the GGUF (Q4_K_M variant) from Hugging Face into your models dir,
+# e.g. https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507-GGUF
+decentraai registry scan --directory ~/models
+decentraai serve start --model qwen3-4b-instruct-2507-q4_k_m.gguf
+# and add the new file name to the tiers allowlists you want to grant
+```
+
+Built-in speed tuning (automatic since this release): `--threads` set
+to logical CPUs minus the configured reserve, `--flash-attn on`,
+`--jinja` (proper chat templates), and a 4096-token default context.
 
 ### Current limitations
 
@@ -135,6 +183,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - Dashboard binds to loopback only (no LAN exposure yet)
 - Remote inference between nodes is not enabled yet (private-swarm first)
 - After idle unload, restart `serve` to reload the model
+- Token usage counters are in-memory (persistence lands with P3)
 
 ## CLI quick reference
 
@@ -148,6 +197,9 @@ decentraai swarm start --config <path>          # serve + announce models on the
 decentraai pull --from <multiaddr> --list       # browse a peer's catalog
 decentraai pull --from <multiaddr> --model <f>  # verified download from a peer
 decentraai serve start --model <name>           # gated inference + dashboard :8080
+decentraai token create --name <n> --tier 1..3  # issue a subscription token
+decentraai token list                           # show issued tokens
+decentraai token revoke --name <n>              # revoke (effective next request)
 ```
 
 ## Architecture highlights
@@ -166,16 +218,18 @@ decentraai serve start --model <name>           # gated inference + dashboard :8
 - **Reputation** (`crates/p2p/reputation.rs`): only cryptographic failures count
   toward bans; scores persist atomically; deterministic ranking (score desc,
   PeerId asc) feeds the scheduler; serializable summaries feed the dashboard
-- **Runtime** (`crates/runtime`): llama-server as a managed subprocess (never FFI),
-  health-probed, killed on drop; thin axum proxy with Bearer auth, inference
-  metrics (tokens, tok/s, recent calls), and the live dashboard; token at
-  `runtime/api.token` (0600)
+- **Runtime** (`crates/runtime`): llama-server as a managed subprocess (never FFI)
+  with tuned flags (`--threads`, `--flash-attn on`, `--jinja`); thin axum proxy
+  with tiered Bearer auth (master + subscription tokens), rate limits, inference
+  metrics, and the live dashboard; token at `runtime/api.token` (0600)
+- **Tokens** (`crates/tokens`): subscription registry; plaintext shown once,
+  BLAKE3 hashes only on disk
 - **Audit** (`crates/audit`): append-only `logs/audit.jsonl` for security events
 
 ## Layout
 
 - `crates/audit` — append-only security audit log
-- `crates/config` — typed YAML configuration with validation
+- `crates/config` — typed YAML configuration with validation (incl. tiers)
 - `crates/identity` — Ed25519 keypairs and PeerId derivation
 - `crates/manifest` — GGUF manifests: chunk hashes, Merkle root, atomic writes
 - `crates/protocol` — swarm message schemas (incl. catalog) and canonical signing
@@ -183,9 +237,10 @@ decentraai serve start --model <name>           # gated inference + dashboard :8
 - `crates/registry` — local model registry with path safety
 - `crates/runtime` — llama-server manager, admission gate, OpenAI API + dashboard
 - `crates/system-probe` — hardware probing and admission decisions
+- `crates/tokens` — subscription token registry (hashed, tiered)
 - `crates/node-cli` — the `decentraai` binary
 - `scripts/install.sh`, `docs/deployment.md` — installer and production guide
-- `action-plan.md`, `ROADMAP.md`, `docs/` — design and handoff documents
+- `AGENTS.md`, `action-plan.md`, `ROADMAP.md`, `docs/` — design and handoff docs
 
 ## Security baseline
 
@@ -193,5 +248,6 @@ No artifact is usable before hash, manifest, and policy verification. Manifest a
 chunk responses carry no signatures by design: integrity is anchored in the signed
 manifest's `chunk_hashes` and Merkle root, enforced by per-chunk BLAKE3
 verification at assembly. Prompts and outputs are never logged by default.
-Private keys and API tokens never enter Git or telemetry. The dashboard never
-exposes secrets; the API token guards every `/v1/*` endpoint.
+Private keys and API tokens never enter Git or telemetry; subscription tokens
+are stored only as hashes. The dashboard never exposes secrets; the API token
+guards every `/v1/*` endpoint.
