@@ -1,6 +1,7 @@
 //! Managed llama.cpp `llama-server` subprocess plus the admission gate
-//! and serve lifecycle (M4a/M4b), and the OpenAI-compatible API proxy
-//! (M4c, in [`api`]).
+//! and serve lifecycle (M4a/M4b), the OpenAI-compatible API proxy
+//! (M4c, in [`api`]), and the fair FIFO inference queue (Q2, in
+//! [`queue`]).
 //!
 //! The inference engine runs as an external process, not FFI bindings:
 //! upgrades are simple binary swaps and a crash in inference never takes
@@ -9,6 +10,7 @@
 //! rejections are written to the audit log (M6).
 
 pub mod api;
+pub mod queue;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};
