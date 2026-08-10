@@ -10,6 +10,7 @@ anyhow.workspace = true
 axum.workspace = true
 decentraai-audit = { path = "../audit" }
 decentraai-config = { path = "../config" }
+decentraai-p2p = { path = "../p2p" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }
 hex.workspace = true
