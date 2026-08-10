@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DecentraAI - Worker Discovery</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 2rem;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        header p {
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+
+        .status-bar {
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: white;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .workers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .worker-card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .worker-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .worker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .worker-name {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1f2937;
+        }
+
+        .worker-status {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-pending {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .status-active {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .worker-peer-id {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 1rem;
+            word-break: break-all;
+        }
+
+        .resources {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .resource-item {
+            background: #f9fafb;
+            padding: 0.75rem;
+            border-radius: 8px;
+        }
+
+        .resource-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+
+        .resource-value {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #1f2937;
+        }
+
+        .gpu-badge {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .gpu-badge.no-gpu {
+            background: #f3f4f6;
+            color: #6b7280;
+        }
+
+        .actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-approve {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+
+        .btn-approve:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+        }
+
+        .btn-reject {
+            background: #f3f4f6;
+            color: #dc2626;
+        }
+
+        .btn-reject:hover {
+            background: #fee2e2;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 4rem 2rem;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            color: white;
+        }
+
+        .empty-state h3 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .empty-state p {
+            opacity: 0.9;
+        }
+
+        .last-updated {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.8);
+            margin-top: 2rem;
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔍 Worker Discovery</h1>
+            <p>Automatic detection of workers on your LAN</p>
+        </header>
+
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div class="status-dot"></div>
+                <span>Listening for workers...</span>
+            </div>
+            <div id="worker-count">0 workers found</div>
+        </div>
+
+        <div id="workers-grid" class="workers-grid">
+            <!-- Worker cards will be injected here -->
+        </div>
+
+        <div id="empty-state" class="empty-state" style="display: none;">
+            <h3>No workers discovered yet</h3>
+            <p>Workers on your LAN will appear here automatically</p>
+        </div>
+
+        <div class="last-updated">
+            Last updated: <span id="last-updated">-</span>
+        </div>
+    </div>
+
+    <script>
+        // Sample data - will be replaced with API call
+        let workers = [];
+
+        async function fetchWorkers() {
+            try {
+                const response = await fetch('/api/workers');
+                workers = await response.json();
+                renderWorkers();
+                updateLastUpdated();
+            } catch (error) {
+                console.error('Failed to fetch workers:', error);
+            }
+        }
+
+        function renderWorkers() {
+            const grid = document.getElementById('workers-grid');
+            const emptyState = document.getElementById('empty-state');
+            const countLabel = document.getElementById('worker-count');
+
+            countLabel.textContent = `${workers.length} worker${workers.length !== 1 ? 's' : ''} found`;
+
+            if (workers.length === 0) {
+                grid.innerHTML = '';
+                emptyState.style.display = 'block';
+                return;
+            }
+
+            emptyState.style.display = 'none';
+
+            grid.innerHTML = workers.map(worker => `
+                <div class="worker-card">
+                    <div class="worker-header">
+                        <div class="worker-name">${escapeHtml(worker.node_name)}</div>
+                        <div class="worker-status status-${worker.status.toLowerCase()}">
+                            ${worker.status}
+                        </div>
+                    </div>
+                    <div class="worker-peer-id">${worker.peer_id}</div>
+
+                    ${worker.resources.gpu_vram_gb ? `
+                        <div class="gpu-badge">
+                            🎮 GPU: ${worker.resources.gpu_vram_gb}GB VRAM
+                        </div>
+                    ` : `
+                        <div class="gpu-badge no-gpu">
+                            No GPU detected
+                        </div>
+                    `}
+
+                    <div class="resources">
+                        <div class="resource-item">
+                            <div class="resource-label">CPU Cores</div>
+                            <div class="resource-value">${worker.resources.cpu_cores}</div>
+                        </div>
+                        <div class="resource-item">
+                            <div class="resource-label">RAM</div>
+                            <div class="resource-value">${worker.resources.ram_gb} GB</div>
+                        </div>
+                        <div class="resource-item">
+                            <div class="resource-label">Disk</div>
+                            <div class="resource-value">${worker.resources.disk_available_gb} GB</div>
+                        </div>
+                        <div class="resource-item">
+                            <div class="resource-label">Bandwidth</div>
+                            <div class="resource-value">${worker.resources.bandwidth_mbps} Mbps</div>
+                        </div>
+                    </div>
+
+                    ${worker.status === 'Pending' ? `
+                        <div class="actions">
+                            <button class="btn btn-approve" onclick="approveWorker('${worker.peer_id}')">
+                                ✓ Approve
+                            </button>
+                            <button class="btn btn-reject" onclick="rejectWorker('${worker.peer_id}')">
+                                ✗ Reject
+                            </button>
+                        </div>
+                    ` : `
+                        <div class="actions">
+                            <button class="btn" style="background: #f3f4f6; color: #6b7280;" disabled>
+                                Active
+                            </button>
+                        </div>
+                    `}
+                </div>
+            `).join('');
+        }
+
+        async function approveWorker(peerId) {
+            try {
+                await fetch(`/api/workers/${peerId}/approve`, { method: 'POST' });
+                await fetchWorkers();
+            } catch (error) {
+                console.error('Failed to approve worker:', error);
+                alert('Failed to approve worker');
+            }
+        }
+
+        async function rejectWorker(peerId) {
+            try {
+                await fetch(`/api/workers/${peerId}/reject`, { method: 'POST' });
+                await fetchWorkers();
+            } catch (error) {
+                console.error('Failed to reject worker:', error);
+                alert('Failed to reject worker');
+            }
+        }
+
+        function updateLastUpdated() {
+            const now = new Date();
+            document.getElementById('last-updated').textContent = now.toLocaleTimeString();
+        }
+
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+
+        // Initial fetch
+        fetchWorkers();
+
+        // Auto-refresh every 10 seconds
+        setInterval(fetchWorkers, 10000);
+    </script>
+</body>
+</html>
