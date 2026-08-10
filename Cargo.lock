@@ -673,6 +673,7 @@ dependencies = [
  "decentraai-registry",
  "decentraai-runtime",
  "decentraai-system-probe",
+ "decentraai-tokens",
  "serde_json",
  "tokio",
  "tracing",
@@ -774,6 +775,7 @@ dependencies = [
  "decentraai-p2p",
  "decentraai-registry",
  "decentraai-system-probe",
+ "decentraai-tokens",
  "hex",
  "rand_core 0.6.4",
  "reqwest",
@@ -791,6 +793,20 @@ dependencies = [
  "decentraai-config",
  "sysinfo",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "decentraai-tokens"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hex",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
