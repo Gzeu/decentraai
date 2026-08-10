@@ -206,6 +206,55 @@ async fn corrupted_chunk_is_rejected() {
 }
 
 #[tokio::test]
+async fn corrupted_download_is_quarantined() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    std::fs::write(&source_path, test_bytes(CHUNK_SIZE + 1)).unwrap();
+
+    let manifest = scan(&source_path).unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let handler = Arc::new(CorruptChunkHandler {
+        manifest_response: manifest_bytes(manifest),
+    });
+
+    let (server, client) = node_pair(Some(handler)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut reputation = test_reputation(dir.path());
+    let out_dir = dir.path().join("client");
+    let err = download(
+        &client,
+        server.local_peer_id(),
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("failed verification"));
+
+    // The staging artifact moved to quarantine with metadata.
+    let quarantine = out_dir.join("quarantine");
+    let meta_path = quarantine.join(format!("{manifest_id}.quarantine.json"));
+    assert!(meta_path.exists(), "quarantine metadata must exist");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+    assert_eq!(meta["manifest_id"].as_str().unwrap(), manifest_id);
+    assert_eq!(meta["peer"].as_str().unwrap(), server.local_peer_id().to_string());
+    assert!(meta["reason"].as_str().unwrap().contains("failed verification"));
+    assert!(
+        !out_dir
+            .join("staging")
+            .join(format!("{manifest_id}.part"))
+            .exists(),
+        "staging must be emptied by the quarantine move"
+    );
+
+    // The security events reached the audit log.
+    let audit = std::fs::read_to_string(out_dir.join("logs/audit.jsonl")).unwrap();
+    assert!(audit.contains("chunk_verification_failed"));
+}
+
+#[tokio::test]
 async fn misbehaving_peer_gets_banned() {
     let dir = TempDir::new().unwrap();
     let source_path = dir.path().join("model.gguf");
@@ -247,6 +296,9 @@ async fn misbehaving_peer_gets_banned() {
         .await
         .unwrap_err();
     assert!(third.to_string().contains("banned"));
+
+    let audit = std::fs::read_to_string(out_dir.join("logs/audit.jsonl")).unwrap();
+    assert!(audit.contains("peer_banned"));
 }
 
 /// Delegates to StaticFileServer while counting chunk requests.

@@ -9,7 +9,9 @@
 //!
 //! Every chunk outcome is recorded in the reputation store: verified
 //! chunks raise the peer's score, corrupted ones count toward a ban.
-//! Network errors never touch the score.
+//! Network errors never touch the score. Corrupted staging artifacts
+//! are quarantined with metadata (M6), and security events are written
+//! to the audit log.
 
 use anyhow::{Result, bail};
 use decentraai_manifest::{CHUNK_SIZE, Manifest, merkle_root};
@@ -56,6 +58,17 @@ pub async fn download(
             if let Err(e) = reputation.save() {
                 warn!(error = %e, "failed to persist reputation after invalid chunk");
             }
+            audit_security_event(
+                data_dir,
+                "chunk_verification_failed",
+                &peer,
+                &manifest.model_id,
+                index,
+            );
+            if reputation.is_banned(&peer) {
+                audit_security_event(data_dir, "peer_banned", &peer, &manifest.model_id, index);
+            }
+            quarantine_staging(data_dir, &manifest, &peer, &e.to_string());
             return Err(e);
         }
         write_chunk(&staging_path, manifest.chunk_size as u64, index, &data)?;
@@ -127,25 +140,27 @@ pub async fn download_multi(
                     }
                     Err(_) => {
                         reputation.record_failure(&assigned);
-                        fetch_verified_chunk(
+                        fetch_verified_or_quarantine(
                             node,
                             &providers,
                             (i % width) + 1,
                             &manifest,
                             i,
                             reputation,
+                            data_dir,
                         )
                         .await?
                     }
                 },
                 Err(_) => {
-                    fetch_verified_chunk(
+                    fetch_verified_or_quarantine(
                         node,
                         &providers,
                         (i % width) + 1,
                         &manifest,
                         i,
                         reputation,
+                        data_dir,
                     )
                     .await?
                 }
@@ -165,20 +180,23 @@ pub async fn download_multi(
     Ok(final_path)
 }
 
-/// Fetches and verifies one chunk, trying providers in deterministic
-/// order starting at `start` (round-robin position plus attempt offset).
-/// Verification failures are recorded; network errors are not.
-async fn fetch_verified_chunk(
+/// Fetches and verifies one chunk via deterministic fallback, auditing
+/// every verification failure. When every provider fails, the staging
+/// artifact is quarantined before the error propagates.
+async fn fetch_verified_or_quarantine(
     node: &P2PNode,
     providers: &[PeerId],
     start: usize,
     manifest: &Manifest,
     chunk_index: usize,
     reputation: &mut ReputationStore,
+    data_dir: &Path,
 ) -> Result<Vec<u8>> {
     let mut last_err = anyhow::anyhow!("no providers available");
+    let mut last_provider = providers[start % providers.len()];
     for attempt in 0..providers.len() {
         let provider = providers[(start + attempt) % providers.len()];
+        last_provider = provider;
         match fetch_chunk(node, provider, manifest, chunk_index).await {
             Ok(data) => match verify_chunk(manifest, chunk_index, &data) {
                 Ok(()) => {
@@ -187,6 +205,22 @@ async fn fetch_verified_chunk(
                 }
                 Err(e) => {
                     reputation.record_failure(&provider);
+                    audit_security_event(
+                        data_dir,
+                        "chunk_verification_failed",
+                        &provider,
+                        &manifest.model_id,
+                        chunk_index,
+                    );
+                    if reputation.is_banned(&provider) {
+                        audit_security_event(
+                            data_dir,
+                            "peer_banned",
+                            &provider,
+                            &manifest.model_id,
+                            chunk_index,
+                        );
+                    }
                     last_err = e;
                 }
             },
@@ -195,7 +229,62 @@ async fn fetch_verified_chunk(
             }
         }
     }
+    quarantine_staging(data_dir, manifest, &last_provider, &last_err.to_string());
     Err(last_err)
+}
+
+/// Moves the staging artifact into `quarantine/` and records why.
+/// Best-effort: a quarantine failure is logged, never fatal.
+fn quarantine_staging(data_dir: &Path, manifest: &Manifest, peer: &PeerId, reason: &str) {
+    let result = (|| -> Result<()> {
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+        let staging = data_dir
+            .join("staging")
+            .join(format!("{}.part", manifest.model_id));
+        if staging.exists() {
+            std::fs::rename(
+                &staging,
+                quarantine_dir.join(format!("{}.part", manifest.model_id)),
+            )?;
+        }
+        let metadata = serde_json::json!({
+            "manifest_id": manifest.model_id,
+            "file_name": manifest.file_name,
+            "peer": peer.to_string(),
+            "reason": reason,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        });
+        std::fs::write(
+            quarantine_dir.join(format!("{}.quarantine.json", manifest.model_id)),
+            serde_json::to_string_pretty(&metadata)?,
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        warn!(error = %e, "failed to quarantine corrupted artifact");
+    }
+}
+
+fn audit_security_event(
+    data_dir: &Path,
+    event: &str,
+    peer: &PeerId,
+    manifest_id: &str,
+    chunk_index: usize,
+) {
+    decentraai_audit::record_best_effort(
+        &data_dir.join("logs"),
+        event,
+        serde_json::json!({
+            "peer": peer.to_string(),
+            "manifest_id": manifest_id,
+            "chunk": chunk_index,
+        }),
+    );
 }
 
 async fn fetch_manifest(node: &P2PNode, peer: PeerId, manifest_id: &str) -> Result<Manifest> {

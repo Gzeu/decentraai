@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+decentraai-audit = { path = "../audit" }
 decentraai-identity = { path = "../identity" }
 decentraai-manifest = { path = "../manifest" }
 decentraai-protocol = { path = "../protocol" }

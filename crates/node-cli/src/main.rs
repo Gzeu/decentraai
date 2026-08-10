@@ -403,6 +403,15 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     let api_addr =
         serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
 
+    decentraai_audit::record_best_effort(
+        &data_dir.join("logs"),
+        "inference_started",
+        serde_json::json!({
+            "model": model_path.display().to_string(),
+            "api": api_addr.to_string(),
+        }),
+    );
+
     let auth_hint = match &token {
         Some(_) => format!("Bearer token: {}", data_dir.join("runtime/api.token").display()),
         None => "no auth required by config".to_string(),

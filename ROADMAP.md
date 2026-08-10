@@ -25,7 +25,8 @@
 - [x] Manifest announcements + registry-backed serving (M5b)
 - [x] Deterministic multi-provider scheduler (M5c: ranked waves + fallback)
 
-## 5. Hardening
-- [ ] Quarantine workflow for corrupted artifacts
-- [ ] Audit logging and metrics
+## 5. Hardening (in progress)
+- [x] Quarantine workflow for corrupted artifacts (metadata + reason)
+- [x] RAM admission fix (reject below the configured reserve)
+- [x] Security audit log (bans, admission rejections, verification failures)
 - [ ] Packaging and deployment guide

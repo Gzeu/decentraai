@@ -28,6 +28,8 @@ pub struct ResourceBudget {
     pub gpu_policy: GpuPolicy,
     pub gpu_vram_limit_percent: u8,
     pub gpu_vram_reserve_bytes: u64,
+    /// Absolute floor for free RAM; inference is rejected below it.
+    pub ram_reserve_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +78,7 @@ impl SystemSnapshot {
             gpu_policy: policy.gpu_enabled,
             gpu_vram_limit_percent: policy.gpu_max_vram_percent,
             gpu_vram_reserve_bytes: u64::from(policy.reserve_vram_mb) * MIB,
+            ram_reserve_bytes: u64::from(policy.reserve_ram_mb) * MIB,
         }
     }
 
@@ -85,9 +88,9 @@ impl SystemSnapshot {
         gpu: &GpuProbeStatus,
         temperature_limit: u8,
     ) -> AdmissionDecision {
-        if self.available_memory_bytes < budget.max_memory_bytes {
+        if self.available_memory_bytes < budget.ram_reserve_bytes {
             return AdmissionDecision::Reject(
-                "available RAM is below the configured inference budget".into(),
+                "available RAM is below the configured reserve".into(),
             );
         }
         match gpu {
@@ -123,6 +126,7 @@ mod tests {
             gpu_policy: GpuPolicy::Required,
             gpu_vram_limit_percent: 75,
             gpu_vram_reserve_bytes: 1024 * MIB,
+            ram_reserve_bytes: 1024 * MIB,
         }
     }
 
@@ -181,6 +185,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_when_ram_below_reserve() {
+        let low_ram = SystemSnapshot {
+            available_memory_bytes: 512 * MIB,
+            ..snapshot()
+        };
+        let decision = low_ram.admit_inference(
+            &budget(),
+            &GpuProbeStatus::Unavailable("none".into()),
+            83,
+        );
+        match decision {
+            AdmissionDecision::Reject(reason) => assert!(reason.contains("RAM")),
+            AdmissionDecision::Admit => panic!("512 MiB free must be rejected with a 1 GiB reserve"),
+        }
+    }
+
+    #[test]
+    fn admits_when_ram_meets_reserve() {
+        let mut flexible = budget();
+        flexible.gpu_policy = GpuPolicy::Auto;
+        assert_eq!(
+            snapshot().admit_inference(
+                &flexible,
+                &GpuProbeStatus::Unavailable("none".into()),
+                83
+            ),
+            AdmissionDecision::Admit
+        );
+    }
+
+    #[test]
     fn budget_respects_cpu_memory_and_disk_reserves() {
         let snapshot = SystemSnapshot {
             logical_cpus: 8,
@@ -194,6 +229,7 @@ mod tests {
         assert_eq!(budget.max_cpu_threads, 3);
         assert_eq!(budget.max_memory_bytes, 11 * GIB / 2);
         assert_eq!(budget.max_cache_bytes, 100 * GIB);
+        assert_eq!(budget.ram_reserve_bytes, 1024 * MIB);
     }
 
     #[test]

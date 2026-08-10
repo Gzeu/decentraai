@@ -5,7 +5,8 @@
 //! The inference engine runs as an external process, not FFI bindings:
 //! upgrades are simple binary swaps and a crash in inference never takes
 //! the node down. Before any model loads, the admission gate checks the
-//! config mode and the live hardware budgets from the system probe.
+//! config mode and the live hardware budgets from the system probe, and
+//! rejections are written to the audit log (M6).
 
 pub mod api;
 
@@ -159,15 +160,36 @@ pub fn evaluate_admission(
 
 /// Full pre-flight check before loading a model: config mode first, then a
 /// fresh hardware probe evaluated against the configured budgets.
+/// Rejections are written to the audit log (M6).
 pub fn ensure_admitted(config: &NodeConfig) -> Result<()> {
     check_inference_mode(config.inference.enabled)?;
-    evaluate_admission(
+    let result = evaluate_admission(
         &SystemSnapshot::collect(),
         &probe_gpu(),
         &config.resources,
         config.storage.max_cache_gb,
         config.storage.min_free_disk_gb,
-    )
+    );
+    if let Err(e) = &result {
+        decentraai_audit::record_best_effort(
+            &PathBuf::from(expand_home(&config.node.data_dir)).join("logs"),
+            "inference_admission_rejected",
+            serde_json::json!({"reason": e.to_string()}),
+        );
+    }
+    result
+}
+
+/// Expands a leading `~` in config paths (the CLI has the same helper).
+fn expand_home(value: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    if value == "~" {
+        return home;
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return format!("{home}/{rest}");
+    }
+    value.to_string()
 }
 
 /// Handle to a running llama-server child process.
