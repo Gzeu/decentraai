@@ -6,6 +6,13 @@ use decentraai_manifest::Manifest;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod infer_protocol;
+
+pub use infer_protocol::{
+    InferRequest, InferResponse, InferProgress, InferMessage,
+    WorkerStatus, TaskPlacement, WorkerAnnouncement
+};
+
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 
 // Serde helper modules for base64 encoding/decoding

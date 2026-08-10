@@ -159,3 +159,15 @@ pub struct TaskPlacement {
     pub estimated_time_ms: u32,
     pub confidence: f32,  // 0.0 - 1.0
 }
+
+/// Worker announcement for discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerAnnouncement {
+    pub peer_id: PeerId,
+    pub node_name: String,
+    pub loaded_models: Vec<String>,
+    pub available_capacity: f32,
+    pub queue_depth: u32,
+    pub tokens_per_second: u32,
+    pub current_latency_ms: u32,
+}

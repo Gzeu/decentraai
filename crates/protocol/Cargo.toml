@@ -13,9 +13,11 @@ decentraai-identity = { path = "../identity" }
 decentraai-manifest = { path = "../manifest" }
 ed25519-dalek.workspace = true
 hex.workspace = true
+libp2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

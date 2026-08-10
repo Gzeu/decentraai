@@ -2,6 +2,7 @@
 members = [
   "crates/audit",
   "crates/config",
+  "crates/discovery",
   "crates/identity",
   "crates/manifest",
   "crates/node-cli",
@@ -28,13 +29,15 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 blake3 = "1.6"
+chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2.1"
 futures = "0.3"
 hex = "0.4"
-libp2p = { version = "0.54", features = ["macros", "mdns", "tokio", "noise", "yamux", "tcp", "request-response"] }
+libp2p = { version = "0.54", features = ["macros", "mdns", "tokio", "noise", "yamux", "tcp", "request-response", "serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rusqlite = "0.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -44,3 +47,4 @@ thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "io-util", "fs", "sync", "signal", "process", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use libp2p::PeerId;
-use identity::Identity;
+use decentraai_identity::Identity;
 use chrono::{DateTime, Utc};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -70,7 +70,8 @@ impl PairingCode {
             self.pairing_token,
             self.expires_at
         );
-        identity.sign(message.as_bytes())
+        let signature = identity.sign(message.as_bytes());
+        Ok(signature.to_bytes().to_vec())
     }
 
     /// Verify pairing signature
@@ -82,7 +83,16 @@ impl PairingCode {
             self.pairing_token,
             self.expires_at
         );
-        identity.verify(&message.as_bytes(), signature)
+        
+        if signature.len() != 64 {
+            return false;
+        }
+        
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(signature);
+        
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        decentraai_identity::verify_signature(identity.public_key(), message.as_bytes(), &sig).is_ok()
     }
 }
 
@@ -198,15 +208,21 @@ impl TrustStore {
         )?;
 
         let row = stmt.query_row([&worker_peer_id], |row| {
+            let paired_at_str: String = row.get(3)?;
+            let last_seen_str: String = row.get(4)?;
+            let trust_score_str: String = row.get(5)?;
+            let total_requests_str: String = row.get(6)?;
+            let successful_requests_str: String = row.get(7)?;
+            
             Ok(TrustRecordPersisted {
                 worker_peer_id: row.get(0)?,
                 controller_peer_id: row.get(1)?,
                 node_name: row.get(2)?,
-                paired_at: row.get::<_, String>(3)?.parse()?,
-                last_seen: row.get::<_, String>(4)?.parse()?,
-                trust_score: row.get::<_, String>(5)?.parse()?,
-                total_requests: row.get::<_, String>(6)?.parse()?,
-                successful_requests: row.get::<_, String>(7)?.parse()?,
+                paired_at: paired_at_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                last_seen: last_seen_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                trust_score: trust_score_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                total_requests: total_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                successful_requests: successful_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 pairing_token: row.get(8)?,
             })
         });
@@ -222,15 +238,21 @@ impl TrustStore {
         let conn = self.conn.as_ref().unwrap();
         let mut stmt = conn.prepare("SELECT * FROM trust_records")?;
         let records = stmt.query_map([], |row| {
+            let paired_at_str: String = row.get(3)?;
+            let last_seen_str: String = row.get(4)?;
+            let trust_score_str: String = row.get(5)?;
+            let total_requests_str: String = row.get(6)?;
+            let successful_requests_str: String = row.get(7)?;
+            
             Ok(TrustRecordPersisted {
                 worker_peer_id: row.get(0)?,
                 controller_peer_id: row.get(1)?,
                 node_name: row.get(2)?,
-                paired_at: row.get::<_, String>(3)?.parse()?,
-                last_seen: row.get::<_, String>(4)?.parse()?,
-                trust_score: row.get::<_, String>(5)?.parse()?,
-                total_requests: row.get::<_, String>(6)?.parse()?,
-                successful_requests: row.get::<_, String>(7)?.parse()?,
+                paired_at: paired_at_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                last_seen: last_seen_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                trust_score: trust_score_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                total_requests: total_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                successful_requests: successful_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 pairing_token: row.get(8)?,
             })
         })?

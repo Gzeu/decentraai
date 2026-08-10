@@ -42,6 +42,7 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    Worker(WorkerArgs),
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -95,6 +96,11 @@ enum ServeCommand {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+}
+#[derive(Debug, Args)]
+struct WorkerArgs {
+    #[arg(long)]
+    name: String,
 }
 #[derive(Debug, Args)]
 struct PullArgs {
@@ -167,6 +173,7 @@ async fn main() -> Result<()> {
         } => serve_start(config, model, binary).await,
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
+        Command::Worker(args) => worker_command(args),
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -693,6 +700,53 @@ async fn pull(args: PullArgs) -> Result<()> {
 /// Issues, lists, and revokes subscription tokens (P1). The admin is
 /// whoever has local access to the data directory, mirroring the master
 /// token file's security posture.
+fn worker_command(args: WorkerArgs) -> Result<()> {
+    use decentraai_discovery::{PairingCode, TrustStore};
+    use decentraai_identity::Identity;
+    use libp2p::PeerId;
+    
+    println!("Starting worker with name: {}", args.name);
+    
+    // Load or generate identity
+    let data_dir = expand_tilde("~/.decentraai");
+    let identity_path = std::path::PathBuf::from(&data_dir).join("identity/key.pem");
+    let identity = if identity_path.exists() {
+        Identity::load(&identity_path)?
+    } else {
+        let identity = Identity::generate();
+        identity.save(&identity_path)?;
+        identity
+    };
+    
+    let peer_id = identity.peer_id();
+    println!("Worker PeerId: {}", peer_id.as_str());
+    
+    // Generate random libp2p PeerId for demo purposes
+    // In production, this would be derived from the identity
+    let worker_peer_id = PeerId::random();
+    
+    // Generate pairing code for controller
+    let controller_peer_id = PeerId::random(); // In real scenario, this would be the actual controller
+    let pairing = PairingCode::new(
+        worker_peer_id,
+        controller_peer_id,
+        args.name.clone(),
+        300, // 5 minutes TTL
+    );
+    
+    let qr_data = pairing.to_qr_data()?;
+    println!("Pairing QR code data: {}", qr_data);
+    
+    // Initialize trust store
+    let trust_db_path = std::path::PathBuf::from(&data_dir).join("trust.db");
+    let _trust_store = TrustStore::new(&trust_db_path)?;
+    
+    println!("Worker '{}' is ready for pairing", args.name);
+    println!("Scan the QR code from the controller to complete pairing");
+    
+    Ok(())
+}
+
 fn token_command(command: TokenCommand) -> Result<()> {
     use decentraai_tokens::{Tier, TokenStore};
 

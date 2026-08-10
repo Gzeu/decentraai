@@ -2,10 +2,8 @@
 
 use std::collections::HashMap;
 use libp2p::PeerId;
-use tracing::{info, warn, error};
 
-use crate::{WorkerAnnouncement, WorkerStatus as WorkerState};
-use protocol::{InferRequest, InferMessage, WorkerStatus, TaskPlacement};
+use decentraai_protocol::{InferRequest, WorkerStatus, TaskPlacement, WorkerAnnouncement};
 
 /// Scheduler configuration
 #[derive(Debug, Clone)]
@@ -118,7 +116,7 @@ impl WorkerScheduler {
     }
 
     /// Score worker based on multiple factors
-    fn score_worker(&self, worker: &WorkerStatus, request: &InferRequest) -> f32 {
+    fn score_worker(&self, worker: &WorkerStatus, _request: &InferRequest) -> f32 {
         let mut score = 0.0;
 
         // Lower queue depth = better (weight: 0.4)
@@ -217,7 +215,7 @@ impl WorkerScheduler {
         &mut self,
         worker_id: &PeerId,
         request_id: uuid::Uuid,
-        success: bool,
+        _success: bool,
         time_ms: u32,
     ) {
         self.dequeue_request(worker_id, request_id);
