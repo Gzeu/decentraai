@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use decentraai_config::TiersSection;
+use decentraai_config::{GenerationSection, TiersSection};
 use rand_core::RngCore;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -102,6 +102,8 @@ pub struct DashboardInfo {
     pub model_name: String,
     /// Model file size in bytes (0 when unknown).
     pub model_size_bytes: u64,
+    /// Sampling defaults merged into inference requests (Q1).
+    pub generation: GenerationSection,
 }
 
 /// Shared proxy state.
@@ -305,6 +307,55 @@ impl ApiState {
     }
 }
 
+/// Fills missing sampling fields from the configured generation
+/// defaults and prepends the system prompt when the conversation has
+/// none. Fields the caller set are never touched; malformed bodies pass
+/// through unchanged and fail downstream as before.
+pub fn apply_generation_defaults(generation: &GenerationSection, body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return body.to_vec();
+    };
+    obj.entry("temperature")
+        .or_insert_with(|| serde_json::json!(generation.temperature));
+    obj.entry("top_p")
+        .or_insert_with(|| serde_json::json!(generation.top_p));
+    if let Some(k) = generation.top_k {
+        obj.entry("top_k").or_insert_with(|| serde_json::json!(k));
+    }
+    obj.entry("repeat_penalty")
+        .or_insert_with(|| serde_json::json!(generation.repeat_penalty));
+    if !generation.system_prompt.is_empty() {
+        if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
+            let has_system = messages.iter().any(|m| m["role"] == "system");
+            if !has_system {
+                messages.insert(
+                    0,
+                    serde_json::json!({"role": "system", "content": generation.system_prompt}),
+                );
+            }
+        }
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+/// The models indexed in the local registry, for the dashboard.
+fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
+    let path = data_dir.join("db/registry.json");
+    let Ok(registry) = decentraai_registry::ModelRegistry::load(&path) else {
+        return Vec::new();
+    };
+    registry
+        .list_models()
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({"name": m.relative_path, "size_bytes": m.size_bytes})
+        })
+        .collect()
+}
+
 /// Builds the proxy router: the OpenAI-compatible surface, the dashboard
 /// (also the fallback), and the small JSON views that feed it.
 pub fn build_router(state: ApiState) -> Router {
@@ -378,6 +429,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         "requests_served": state.requests_served.load(Ordering::SeqCst),
         "tokens_generated": state.tokens_generated.load(Ordering::SeqCst),
         "recent_requests": recent,
+        "available_models": registry_models(&state.info.repo_root),
         "system": {
             "cpu_threads": snapshot.logical_cpus,
             "ram_total_gib": snapshot.total_memory_bytes as f64 / GIB,
@@ -449,12 +501,18 @@ async fn proxy_handler(
     state.manager.lock().await.note_activity();
     let started = Instant::now();
 
+    let outgoing = if is_inference {
+        apply_generation_defaults(&state.info.generation, &body)
+    } else {
+        body.to_vec()
+    };
+
     let url = format!("{}{}", state.backend_url, uri.path());
     let mut request = state.client.request(method, &url);
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
-    match request.body(body.to_vec()).send().await {
+    match request.body(outgoing).send().await {
         Ok(upstream) => {
             let status = StatusCode::from_u16(upstream.status().as_u16())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -573,6 +631,7 @@ ol{padding-left:20px} li{margin:6px 0}
   <h2>Model</h2>
   <div class="bignum" id="model-name">&hellip;</div>
   <div class="small"><span id="model-size"></span> &middot; <span id="model-status">loading&hellip;</span></div>
+  <div class="small" id="also-models"></div>
 </div>
 <div class="card">
   <h2>Inference</h2>
@@ -647,6 +706,10 @@ async function refresh() {
     document.getElementById('model-status').innerHTML = s.model_loaded
       ? '<span class="ok">&#9679; loaded</span>'
       : '<span class="off">&#9675; unloaded (idle timeout)</span>';
+    const others = (s.available_models || []).filter(m => m.name !== s.model);
+    document.getElementById('also-models').textContent = others.length
+      ? 'also indexed: ' + others.map(m => esc(m.name) + ' (' + (m.size_bytes / 1073741824).toFixed(2) + ' GiB)').join(', ')
+      : '';
     document.getElementById('requests').textContent = s.requests_served;
     document.getElementById('tokens').textContent = s.tokens_generated;
     const last = s.recent_requests[0];
@@ -748,6 +811,13 @@ mod tests {
             api_port: 8080,
             model_name: "test-model.gguf".to_string(),
             model_size_bytes: 1024,
+            generation: GenerationSection {
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(40),
+                repeat_penalty: 1.1,
+                system_prompt: "Test system line.".to_string(),
+            },
         }
     }
 
@@ -788,6 +858,28 @@ mod tests {
         addr
     }
 
+    /// Backend that echoes the request body, proving what the proxy sent.
+    async fn start_echo_backend() -> SocketAddr {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: Bytes| async move {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    format!(
+                        "{{\"echo\":{},\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
+                        String::from_utf8_lossy(&body)
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
     async fn start_stateful_api(
         dir: &Path,
         master: Option<String>,
@@ -806,6 +898,42 @@ mod tests {
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         (api, manager)
+    }
+
+    #[test]
+    fn generation_defaults_fill_only_missing_fields() {
+        let generation = GenerationSection {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: Some(40),
+            repeat_penalty: 1.1,
+            system_prompt: "Be helpful.".to_string(),
+        };
+        // Missing everything: all defaults land, system prompt prepended.
+        let merged = apply_generation_defaults(
+            &generation,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(value["temperature"], 0.7);
+        assert_eq!(value["top_p"], 0.9);
+        assert_eq!(value["top_k"], 40);
+        assert_eq!(value["repeat_penalty"], 1.1);
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Be helpful.");
+
+        // Caller-set values and an existing system message survive.
+        let kept = apply_generation_defaults(
+            &generation,
+            br#"{"model":"m","temperature":0.1,"messages":[{"role":"system","content":"mine"},{"role":"user","content":"hi"}]}"#,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(value["temperature"], 0.1, "caller values win");
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "no second system message");
+        assert_eq!(messages[0]["content"], "mine");
     }
 
     #[cfg(unix)]
@@ -1046,6 +1174,7 @@ mod tests {
         assert_eq!(status["model_size_bytes"], 1024);
         assert_eq!(status["recent_events"].as_array().unwrap().len(), 1);
         assert_eq!(status["recent_events"][0]["event"], "inference_started");
+        assert!(status["available_models"].is_array());
 
         let peers: serde_json::Value = client
             .get(format!("http://{api}/v1/peers"))
@@ -1058,6 +1187,71 @@ mod tests {
         assert_eq!(peers.as_array().unwrap().len(), 1);
         assert_eq!(peers[0]["banned"], true);
 
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_lists_registry_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("extra.gguf"), b"GGUF test").unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+        registry.scan_directory(&models_dir).unwrap();
+        registry.save(&dir.path().join("db/registry.json")).unwrap();
+
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let models = status["available_models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["name"], "extra.gguf");
+        assert!(models[0]["size_bytes"].as_u64().unwrap() > 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_merges_generation_into_outgoing_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_echo_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let echoed = response.text().await.unwrap();
+        assert!(echoed.contains("temperature"), "sampling defaults must reach the backend");
+        assert!(echoed.contains("Test system line."), "system prompt must reach the backend");
         manager.lock().await.shutdown().await.unwrap();
     }
 
