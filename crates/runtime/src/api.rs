@@ -7,10 +7,12 @@
 //! on every request — no restart needed after `token create/revoke` —
 //! and get per-tier model allowlists and sliding-window rate limits.
 //!
-//! The dashboard (GET /) renders live node status from /status and
-//! /v1/peers only — it never calls the proxied inference endpoints, so
-//! watching the page neither inflates the request counter nor resets
-//! the idle-unload clock.
+//! Every inference request joins a fair FIFO queue (Q2): one request
+//! at a time reaches the backend with the machine's full resources,
+//! everyone else waits in arrival order. The dashboard (GET /) renders
+//! live node status from /status and /v1/peers only — it never calls
+//! the proxied inference endpoints, so watching the page neither
+//! inflates the request counter nor resets the idle-unload clock.
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -31,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::ServeManager;
+use crate::queue::InferenceQueue;
 
 /// Maximum audit events shown on the dashboard.
 const DASHBOARD_EVENT_LIMIT: usize = 10;
@@ -85,6 +88,16 @@ enum Auth {
     Subscriber { name: String, tier: u8 },
 }
 
+impl Auth {
+    fn who(&self) -> String {
+        match self {
+            Self::Open => "open".to_string(),
+            Self::Master => "master".to_string(),
+            Self::Subscriber { name, .. } => name.clone(),
+        }
+    }
+}
+
 /// Static node details the dashboard renders (kept separate so
 /// [`ApiState::new`] stays readable).
 #[derive(Clone)]
@@ -121,6 +134,8 @@ pub struct ApiState {
     token_store_path: Option<PathBuf>,
     /// Tier policies from the config; None = admin-token-only.
     tiers: Option<TiersSection>,
+    /// Fair FIFO queue for inference requests (Q2).
+    queue: Arc<InferenceQueue>,
     started_at: Instant,
     /// Completed inference calls (POST /v1/completions, /v1/chat/completions).
     requests_served: Arc<AtomicU64>,
@@ -142,6 +157,7 @@ impl ApiState {
         info: DashboardInfo,
         token_store_path: Option<PathBuf>,
         tiers: Option<TiersSection>,
+        queue: Arc<InferenceQueue>,
     ) -> Self {
         Self {
             backend_url,
@@ -151,6 +167,7 @@ impl ApiState {
             info,
             token_store_path,
             tiers,
+            queue,
             started_at: Instant::now(),
             requests_served: Arc::new(AtomicU64::new(0)),
             tokens_generated: Arc::new(AtomicU64::new(0)),
@@ -420,6 +437,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         .iter()
         .cloned()
         .collect();
+    let (serving, waiting) = state.queue.snapshot();
     let body = serde_json::json!({
         "model": state.info.model_name,
         "model_size_bytes": state.info.model_size_bytes,
@@ -430,6 +448,14 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         "tokens_generated": state.tokens_generated.load(Ordering::SeqCst),
         "recent_requests": recent,
         "available_models": registry_models(&state.info.repo_root),
+        "queue": {
+            "serving": serving.map(|s| serde_json::json!({
+                "who": s.who, "endpoint": s.endpoint, "elapsed_secs": s.elapsed_secs,
+            })),
+            "waiting": waiting.iter().map(|w| serde_json::json!({
+                "who": w.who, "endpoint": w.endpoint, "waited_secs": w.waited_secs,
+            })).collect::<Vec<_>>(),
+        },
         "system": {
             "cpu_threads": snapshot.logical_cpus,
             "ram_total_gib": snapshot.total_memory_bytes as f64 / GIB,
@@ -495,6 +521,32 @@ async fn proxy_handler(
         }
         if let Err(e) = state.check_rate_limit(&auth) {
             return e.into_response();
+        }
+    }
+
+    // Q2: join the fair queue. The ticket releases the slot on drop,
+    // whatever happens from here on (success, error, disconnect).
+    let ticket = if is_inference {
+        match state.queue.enqueue(&auth.who(), uri.path()) {
+            Ok(ticket) => Some(ticket),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{\"error\":{\"message\":\"inference queue is full; try again in a moment\",\"type\":\"server_error\"}}",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ticket) = &ticket {
+        if ticket.wait_turn().await.is_err() {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                "{\"error\":{\"message\":\"waited too long in the inference queue\",\"type\":\"timeout_error\"}}",
+            )
+                .into_response();
         }
     }
 
@@ -648,6 +700,13 @@ ol{padding-left:20px} li{margin:6px 0}
   </table>
 </div>
 <div class="card">
+  <h2>Queue</h2>
+  <table>
+    <tr><td>Serving now</td><td id="queue-serving"><span class="off">idle</span></td></tr>
+    <tr><td>Waiting</td><td id="queue-waiting"><span class="off">nobody</span></td></tr>
+  </table>
+</div>
+<div class="card">
   <h2>Recent inference calls</h2>
   <table><thead><tr><th>Time</th><th>Endpoint</th><th>Prompt tok</th><th>Gen tok</th><th>ms</th><th>tok/s</th></tr></thead>
   <tbody id="recent"><tr><td colspan="6" class="off">loading&hellip;</td></tr></tbody></table>
@@ -717,6 +776,16 @@ async function refresh() {
     document.getElementById('uptime').textContent = fmtUptime(s.uptime_secs);
     document.getElementById('idle').textContent = Math.floor(s.idle_for_secs / 60) + ' min';
     document.getElementById('backend').textContent = s.backend;
+    const q = s.queue || {};
+    document.getElementById('queue-serving').innerHTML = q.serving
+      ? '<span class="ok">&#9679;</span> <code>' + esc(q.serving.who) + '</code> &mdash; ' +
+        esc(q.serving.endpoint.replace('/v1/', '')) + ' (' + q.serving.elapsed_secs + 's)'
+      : '<span class="off">idle</span>';
+    document.getElementById('queue-waiting').innerHTML = (q.waiting || []).length
+      ? (q.waiting || []).map((w, i) =>
+          '#' + (i + 1) + ' <code>' + esc(w.who) + '</code> (' + w.waited_secs + 's)'
+        ).join(' &middot; ')
+      : '<span class="off">nobody</span>';
     const rr = s.recent_requests.map(r => {
       const d = new Date(r.timestamp * 1000).toLocaleTimeString();
       return '<tr><td>' + d + '</td><td><code>' + esc(r.endpoint.replace('/v1/', '')) + '</code></td><td>' +
@@ -838,6 +907,10 @@ mod tests {
         }
     }
 
+    fn test_queue() -> Arc<InferenceQueue> {
+        InferenceQueue::new(4, Duration::from_secs(2))
+    }
+
     async fn start_backend() -> SocketAddr {
         let app = Router::new()
             .route(
@@ -895,6 +968,7 @@ mod tests {
             test_info(dir, None),
             token_store,
             tiers,
+            test_queue(),
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         (api, manager)
@@ -1099,6 +1173,42 @@ mod tests {
         assert!(recent[0]["tokens_per_second"].as_f64().unwrap() > 19.0);
         assert!(status["uptime_secs"].as_u64().is_some());
         assert!(status["system"]["cpu_threads"].as_u64().unwrap() >= 1);
+        assert!(status["queue"]["waiting"].is_array());
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_queue_answers_503_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        // Waiting room of zero: any second request is rejected instantly.
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            InferenceQueue::new(0, Duration::from_secs(5)),
+        );
+        let api = serve_api(state.clone(), "127.0.0.1", 0).await.unwrap();
+
+        // Hold the serving slot with a manual ticket so the queue is busy.
+        let hold = state.queue.enqueue("holder", "/v1/chat/completions").unwrap();
+        hold.wait_turn().await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"m\",\"messages\":[]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        assert!(response.text().await.unwrap().contains("queue is full"));
+        drop(hold);
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -1119,6 +1229,7 @@ mod tests {
             let body = response.text().await.unwrap();
             assert!(body.contains("DecentraAI dashboard"));
             assert!(body.contains("Tokens generated"));
+            assert!(body.contains("Queue"));
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
         }
@@ -1157,6 +1268,7 @@ mod tests {
             test_info(dir.path(), Some(reputation_path)),
             None,
             None,
+            test_queue(),
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let client = reqwest::Client::new();
@@ -1175,6 +1287,7 @@ mod tests {
         assert_eq!(status["recent_events"].as_array().unwrap().len(), 1);
         assert_eq!(status["recent_events"][0]["event"], "inference_started");
         assert!(status["available_models"].is_array());
+        assert!(status["queue"]["serving"].is_null());
 
         let peers: serde_json::Value = client
             .get(format!("http://{api}/v1/peers"))
@@ -1210,6 +1323,7 @@ mod tests {
             test_info(dir.path(), None),
             None,
             None,
+            test_queue(),
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
@@ -1238,6 +1352,7 @@ mod tests {
             test_info(dir.path(), None),
             None,
             None,
+            test_queue(),
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
