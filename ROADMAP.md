@@ -20,11 +20,10 @@
 - [x] M4c: OpenAI-compatible API endpoint with Bearer auth and idle unload
 - [x] Fixed configurable API port + friendly root info page
 
-## 4. Swarm Intelligence
-- [ ] Deterministic task scheduler
+## 4. Swarm Intelligence (done)
 - [x] Reputation and peer scoring (M5a: bans, decay, persistence)
 - [x] Manifest announcements + registry-backed serving (M5b)
-- [ ] Multi-provider downloads (swarm fetching, M5c)
+- [x] Deterministic multi-provider scheduler (M5c: ranked waves + fallback)
 
 ## 5. Hardening
 - [ ] Quarantine workflow for corrupted artifacts

@@ -1,5 +1,6 @@
-//! Local peer reputation (M5a): per-peer track records, temporary bans
-//! for repeated invalid chunks, and atomic JSON persistence.
+//! Local peer reputation (M5a) and deterministic provider ranking (M5c):
+//! per-peer track records, temporary bans for repeated invalid chunks,
+//! and atomic JSON persistence.
 //!
 //! Only cryptographic verification failures count toward the ban
 //! threshold: a flaky connection is not proof of malice, a corrupted
@@ -133,6 +134,26 @@ impl ReputationStore {
     }
 }
 
+/// Orders providers for a multi-provider download: eligible (non-banned)
+/// peers sorted by score descending, ties broken by PeerId ascending.
+/// The same peer set always produces the same order — determinism is a
+/// hard requirement for reproducible scheduling.
+pub fn rank_providers(peers: &[PeerId], reputation: &ReputationStore) -> Vec<PeerId> {
+    let mut eligible: Vec<PeerId> = peers
+        .iter()
+        .filter(|peer| !reputation.is_banned(peer))
+        .copied()
+        .collect();
+    eligible.sort_by(|a, b| {
+        reputation
+            .score(b)
+            .partial_cmp(&reputation.score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.to_string().cmp(&b.to_string()))
+    });
+    eligible
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -228,5 +249,42 @@ mod tests {
         std::fs::write(dir.path().join("reputation.json"), b"not json").unwrap();
         let store = open_store(dir.path(), 2, 60);
         assert_eq!(store.score(&PeerId::random()), 0.0);
+    }
+
+    #[test]
+    fn ranking_excludes_banned_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open_store(dir.path(), 1, 3600);
+        let good = PeerId::random();
+        let banned = PeerId::random();
+        store.record_failure(&banned);
+        let ranked = rank_providers(&[good, banned], &store);
+        assert_eq!(ranked, vec![good]);
+    }
+
+    #[test]
+    fn ranking_prefers_higher_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open_store(dir.path(), 10, 60);
+        let veteran = PeerId::random();
+        let newcomer = PeerId::random();
+        store.record_success(&veteran);
+        store.record_success(&veteran);
+        let ranked = rank_providers(&[newcomer, veteran], &store);
+        assert_eq!(ranked, vec![veteran, newcomer]);
+    }
+
+    #[test]
+    fn ranking_is_deterministic_on_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path(), 10, 60);
+        let a = PeerId::random();
+        let b = PeerId::random();
+        let first = rank_providers(&[a, b], &store);
+        let second = rank_providers(&[b, a], &store);
+        assert_eq!(first, second, "tie-breaking must not depend on input order");
+        let mut expected = vec![a, b];
+        expected.sort_by_key(|p| p.to_string());
+        assert_eq!(first, expected, "ties break by PeerId ascending");
     }
 }

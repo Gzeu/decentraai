@@ -1,11 +1,11 @@
-//! End-to-end transfer tests: two real nodes on loopback exchanging a
-//! manifest and chunks through the libp2p request/response channel.
+//! End-to-end transfer tests: real nodes on loopback exchanging
+//! manifests and chunks through the libp2p request/response channel.
 
 use anyhow::Result;
 use decentraai_identity::Identity;
 use decentraai_manifest::{CHUNK_SIZE, Manifest, scan};
 use decentraai_p2p::reputation::ReputationStore;
-use decentraai_p2p::transfer::download;
+use decentraai_p2p::transfer::{download, download_multi};
 use decentraai_p2p::{
     DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, RegistryServer,
     RequestHandler, StaticFileServer,
@@ -53,6 +53,18 @@ async fn node_pair(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, P2PNod
         .await
         .unwrap();
     (server, client)
+}
+
+async fn spawn_server(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, String) {
+    let server = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        handler,
+    )
+    .unwrap();
+    let addr = server.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    (server, format!("{addr}/p2p/{}", server.local_peer_id()))
 }
 
 /// A reputation store with a high ban threshold: neutral for tests that
@@ -343,4 +355,116 @@ async fn registry_server_serves_scanned_models() {
     assert_eq!(std::fs::read(&path).unwrap(), data);
     assert_eq!(path.file_name().unwrap().to_str().unwrap(), "tiny.gguf");
     assert_eq!(reputation.score(&server.local_peer_id()), 3.0);
+}
+
+#[tokio::test]
+async fn multi_provider_download_splits_chunks() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    let data = test_bytes(CHUNK_SIZE * 4);
+    std::fs::write(&source_path, &data).unwrap();
+
+    let manifest = scan(&source_path).unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let response_bytes = manifest_bytes(manifest);
+
+    let (server_a, addr_a) = spawn_server(Some(Arc::new(StaticFileServer::new(
+        response_bytes.clone(),
+        source_path.clone(),
+        CHUNK_SIZE as u64,
+    ))))
+    .await;
+    let (server_b, addr_b) = spawn_server(Some(Arc::new(StaticFileServer::new(
+        response_bytes,
+        source_path.clone(),
+        CHUNK_SIZE as u64,
+    ))))
+    .await;
+
+    let client = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    client.dial(&addr_a).await.unwrap();
+    client.dial(&addr_b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut reputation = test_reputation(dir.path());
+    let out_dir = dir.path().join("client");
+    let path = download_multi(
+        &client,
+        &[server_a.local_peer_id(), server_b.local_peer_id()],
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert_eq!(
+        reputation.successes(&server_a.local_peer_id()),
+        2,
+        "round-robin assigns two of four chunks to each provider"
+    );
+    assert_eq!(reputation.successes(&server_b.local_peer_id()), 2);
+}
+
+#[tokio::test]
+async fn multi_provider_falls_back_after_corruption() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    let data = test_bytes(CHUNK_SIZE * 2);
+    std::fs::write(&source_path, &data).unwrap();
+
+    let manifest = scan(&source_path).unwrap();
+    let manifest_id = manifest.model_id.clone();
+    let response_bytes = manifest_bytes(manifest);
+
+    let (corrupt, addr_corrupt) = spawn_server(Some(Arc::new(CorruptChunkHandler {
+        manifest_response: response_bytes.clone(),
+    })))
+    .await;
+    let (honest, addr_honest) = spawn_server(Some(Arc::new(StaticFileServer::new(
+        response_bytes,
+        source_path.clone(),
+        CHUNK_SIZE as u64,
+    ))))
+    .await;
+
+    let client = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    client.dial(&addr_corrupt).await.unwrap();
+    client.dial(&addr_honest).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut reputation = test_reputation(dir.path());
+    let out_dir = dir.path().join("client");
+    let path = download_multi(
+        &client,
+        &[corrupt.local_peer_id(), honest.local_peer_id()],
+        &manifest_id,
+        &out_dir,
+        &mut reputation,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+    assert!(
+        reputation.failures(&corrupt.local_peer_id()) >= 1,
+        "the corrupt provider must be recorded"
+    );
+    assert!(
+        reputation.successes(&honest.local_peer_id()) >= 1,
+        "the honest provider must serve the fallback chunks"
+    );
 }
