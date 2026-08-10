@@ -25,11 +25,12 @@
 - [x] Manifest announcements + registry-backed serving (M5b)
 - [x] Deterministic multi-provider scheduler (M5c: ranked waves + fallback)
 
-## 5. Hardening (in progress)
+## 5. Hardening (done)
 - [x] Quarantine workflow for corrupted artifacts (metadata + reason)
 - [x] RAM admission fix (reject below the configured reserve)
 - [x] Security audit log (bans, admission rejections, verification failures)
-- [ ] Packaging and deployment guide
+- [x] M8: packaging — `scripts/install.sh` + `docs/deployment.md`
+  (systemd unit, firewall, security checklist, troubleshooting)
 
 ## 6. Sharing and UX (done)
 - [x] M7a: peer catalog + `decentraai pull` (share models with one command)

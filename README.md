@@ -15,7 +15,7 @@ and serve inference through a local OpenAI-compatible endpoint with a live web d
 | M5 | Swarm intelligence: peer reputation with bans, signed manifest announcements, deterministic multi-provider scheduler | Done |
 | M6 | Hardening: quarantine workflow, audit logging | Done |
 | M7 | Sharing + UX: peer catalog, `decentraai pull`, live web dashboard | Done |
-| M8 | Packaging and deployment guide | Planned |
+| M8 | Packaging: `scripts/install.sh` + [deployment guide](docs/deployment.md) | Done |
 
 ## Using DecentraAI today
 
@@ -23,12 +23,15 @@ and serve inference through a local OpenAI-compatible endpoint with a live web d
 
 ```bash
 git clone https://github.com/Gzeu/decentraai && cd decentraai
-cargo install --path crates/node-cli
-# llama.cpp for inference (only needed for `serve`):
-cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build
-cmake --build /path/to/llama.cpp/build --config Release --target llama-server
-export DECENTRAAI_LLAMA_SERVER=/path/to/llama.cpp/build/bin/llama-server
+bash scripts/install.sh              # --no-llama to skip the llama.cpp build
+export DECENTRAAI_LLAMA_SERVER=$HOME/llama.cpp/build/bin/llama-server
 ```
+
+The installer checks the Rust toolchain (installs rustup when missing),
+`cargo install`s the `decentraai` binary, builds llama.cpp's
+`llama-server`, and runs `decentraai init`. For production setups
+(systemd, firewall, security checklist) see
+[docs/deployment.md](docs/deployment.md).
 
 ### 1. Index your local models
 
@@ -181,6 +184,7 @@ decentraai serve start --model <name>           # gated inference + dashboard :8
 - `crates/runtime` — llama-server manager, admission gate, OpenAI API + dashboard
 - `crates/system-probe` — hardware probing and admission decisions
 - `crates/node-cli` — the `decentraai` binary
+- `scripts/install.sh`, `docs/deployment.md` — installer and production guide
 - `action-plan.md`, `ROADMAP.md`, `docs/` — design and handoff documents
 
 ## Security baseline
