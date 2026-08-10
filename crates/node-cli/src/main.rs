@@ -360,7 +360,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
 /// Runs gated inference with the OpenAI-compatible API and the web
 /// dashboard on inference.bind_address:api_port.
 async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
-    use decentraai_runtime::api::{ApiState, ensure_api_token, serve_api};
+    use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
@@ -388,6 +388,7 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         .and_then(|name| name.to_str())
         .unwrap_or("model")
         .to_string();
+    let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
     let binary = find_llama_server(binary.as_deref())?;
 
     let mut runtime = RuntimeConfig::new(model_path.clone());
@@ -419,17 +420,16 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     } else {
         None
     };
-    let state = ApiState::new(
-        backend_url,
-        token.clone(),
-        manager.clone(),
-        data_dir.clone(),
-        Some(data_dir.join("db/reputation.json")),
-        config.security.max_invalid_chunks_per_peer,
-        Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
-        config.inference.api_port,
+    let info = DashboardInfo {
+        repo_root: data_dir.clone(),
+        reputation_path: Some(data_dir.join("db/reputation.json")),
+        max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
+        ban_duration: Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+        api_port: config.inference.api_port,
         model_name,
-    );
+        model_size_bytes,
+    };
+    let state = ApiState::new(backend_url, token.clone(), manager.clone(), info);
     let api_addr =
         serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
 

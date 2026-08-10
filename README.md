@@ -14,7 +14,7 @@ and serve inference through a local OpenAI-compatible endpoint with a live web d
 | M4 | Inference runtime: llama-server manager, admission gate, OpenAI-compatible API with auth and idle unload | Done |
 | M5 | Swarm intelligence: peer reputation with bans, signed manifest announcements, deterministic multi-provider scheduler | Done |
 | M6 | Hardening: quarantine workflow, audit logging | Done |
-| M7 | Sharing + UX: peer catalog, `decentraai pull`, web dashboard | Done |
+| M7 | Sharing + UX: peer catalog, `decentraai pull`, live web dashboard | Done |
 | M8 | Packaging and deployment guide | Planned |
 
 ## Using DecentraAI today
@@ -100,15 +100,22 @@ automatically after `idle_model_unload_minutes` without requests.
 Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard refreshes
 every 3 seconds and shows:
 
-- the loaded model (read from the backend's `/v1/models`), requests served,
-  idle timer, backend and API addresses
+- the loaded model with file size, plus uptime and idle timer
+- inference metrics: completed requests, total tokens generated, last
+  request speed (tok/s), and the last 12 inference calls with prompt /
+  completion tokens and duration
+- live system pressure: free/total RAM, CPU threads, GPU name,
+  temperature, free VRAM, utilization
 - tracked peers with verified/failed chunks, score, and ban status
   (`GET /v1/peers`, token-guarded)
 - the latest security events from the audit log
 - a share guide with the exact `swarm start` + `pull` commands for this node
 
-The dashboard and `GET /status` are public on loopback (no secrets);
-the API endpoints require the Bearer token.
+The dashboard reads only `GET /status` and `GET /v1/peers` — watching the
+page never touches the inference backend, so it neither inflates the
+request counter nor resets the idle-unload clock. The dashboard and
+`/status` are public on loopback (no secrets); the API endpoints require
+the Bearer token.
 
 ```bash
 TOKEN=$(cat ~/.decentraai/runtime/api.token)
@@ -157,8 +164,9 @@ decentraai serve start --model <name>           # gated inference + dashboard :8
   toward bans; scores persist atomically; deterministic ranking (score desc,
   PeerId asc) feeds the scheduler; serializable summaries feed the dashboard
 - **Runtime** (`crates/runtime`): llama-server as a managed subprocess (never FFI),
-  health-probed, killed on drop; thin axum proxy with Bearer auth and the
-  live dashboard; token at `runtime/api.token` (0600)
+  health-probed, killed on drop; thin axum proxy with Bearer auth, inference
+  metrics (tokens, tok/s, recent calls), and the live dashboard; token at
+  `runtime/api.token` (0600)
 - **Audit** (`crates/audit`): append-only `logs/audit.jsonl` for security events
 
 ## Layout

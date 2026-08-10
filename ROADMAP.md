@@ -31,6 +31,9 @@
 - [x] Security audit log (bans, admission rejections, verification failures)
 - [ ] Packaging and deployment guide
 
-## 6. Sharing and UX (in progress)
+## 6. Sharing and UX (done)
 - [x] M7a: peer catalog + `decentraai pull` (share models with one command)
-- [ ] M7b: web dashboard on the API port
+- [x] M7b: web dashboard on the API port
+- [x] M7c: dashboard v2 — real inference metrics (tokens, tok/s, recent
+  calls, uptime, RAM/GPU), self-poll fix (watching the page no longer
+  inflates the counter or blocks idle unload)
