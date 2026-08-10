@@ -64,7 +64,8 @@ async fn spawn_server(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, Str
     )
     .unwrap();
     let addr = server.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
-    (server, format!("{addr}/p2p/{}", server.local_peer_id()))
+    let peer_id = server.local_peer_id();
+    (server, format!("{addr}/p2p/{peer_id}"))
 }
 
 /// A reputation store with a high ban threshold: neutral for tests that
