@@ -48,6 +48,14 @@ inference:
   queue_max_requests: 20
   idle_model_unload_minutes: 15
   api_port: 8080
+  # Sampling defaults applied when a request omits them (Q1). Small
+  # models answer far more coherently with sampling + a system line.
+  generation:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    system_prompt: "You are a helpful assistant. Answer in the same language as the user's message."
 
 privacy:
   log_prompts: false

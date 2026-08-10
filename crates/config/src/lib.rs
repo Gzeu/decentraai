@@ -130,6 +130,38 @@ pub struct InferenceSection {
     pub idle_model_unload_minutes: u16,
     /// Fixed port for the OpenAI-compatible API; 0 means ephemeral.
     pub api_port: u16,
+    /// Sampling defaults applied when a request omits them (Q1).
+    #[serde(default)]
+    pub generation: GenerationSection,
+}
+
+/// Generation defaults injected into inference requests that do not
+/// specify them. Small models answer far more coherently with sampling
+/// parameters and a system line than with raw llama.cpp defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationSection {
+    pub temperature: f32,
+    pub top_p: f32,
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    pub repeat_penalty: f32,
+    /// Prepended as a system message when the conversation has none.
+    /// Empty = no system prompt.
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+impl Default for GenerationSection {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: Some(40),
+            repeat_penalty: 1.1,
+            system_prompt: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +278,22 @@ impl NodeConfig {
                 "inference.api_port must be 0 (ephemeral) or at least 1024".into(),
             ));
         }
+        let generation = &self.inference.generation;
+        if !(0.0..=2.0).contains(&generation.temperature) {
+            return Err(ConfigError::Validation(
+                "inference.generation.temperature must be between 0.0 and 2.0".into(),
+            ));
+        }
+        if generation.top_p <= 0.0 || generation.top_p > 1.0 {
+            return Err(ConfigError::Validation(
+                "inference.generation.top_p must be in (0.0, 1.0]".into(),
+            ));
+        }
+        if !(0.0..=2.0).contains(&generation.repeat_penalty) {
+            return Err(ConfigError::Validation(
+                "inference.generation.repeat_penalty must be between 0.0 and 2.0".into(),
+            ));
+        }
         if let Some(tiers) = &self.tiers {
             for (name, policy) in [
                 ("tiers.tier1", &tiers.tier1),
@@ -278,6 +326,31 @@ mod tests {
             eprintln!("Config load error: {}", e);
         }
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn example_generation_defaults_are_sane() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let generation = &config.inference.generation;
+        assert_eq!(generation.temperature, 0.7);
+        assert_eq!(generation.top_p, 0.9);
+        assert_eq!(generation.repeat_penalty, 1.1);
+        assert!(!generation.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_temperature_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace("temperature: 0.7", "temperature: 9.0");
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("temperature"));
     }
 
     #[test]
