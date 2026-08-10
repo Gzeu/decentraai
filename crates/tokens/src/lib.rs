@@ -162,7 +162,7 @@ impl TokenStore {
     /// All records (active and revoked), newest first, for `token list`.
     pub fn list(&self) -> Vec<TokenRecord> {
         let mut out: Vec<TokenRecord> = self.tokens.values().cloned().collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         out
     }
 }
