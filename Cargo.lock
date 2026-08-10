@@ -719,7 +719,6 @@ dependencies = [
  "decentraai-runtime",
  "decentraai-system-probe",
  "decentraai-tokens",
- "libp2p",
  "serde_json",
  "tokio",
  "tracing",
