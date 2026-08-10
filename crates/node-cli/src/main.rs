@@ -38,6 +38,10 @@ enum Command {
         command: ServeCommand,
     },
     Pull(PullArgs),
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -105,6 +109,31 @@ struct PullArgs {
     #[arg(long, default_value = "configs/node.example.yaml")]
     config: PathBuf,
 }
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Issue a subscription token; printed once, stored only as a hash.
+    Create {
+        #[arg(long)]
+        name: String,
+        /// 1 = guest, 2 = contributor, 3 = core.
+        #[arg(long)]
+        tier: u8,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Show every issued token (active and revoked).
+    List {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Revoke a token by name; it stops working immediately.
+    Revoke {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -136,6 +165,7 @@ async fn main() -> Result<()> {
             },
         } => serve_start(config, model, binary).await,
         Command::Pull(args) => pull(args).await,
+        Command::Token { command } => token_command(command),
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -429,7 +459,18 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         model_name,
         model_size_bytes,
     };
-    let state = ApiState::new(backend_url, token.clone(), manager.clone(), info);
+    let token_store_path = config
+        .tiers
+        .as_ref()
+        .map(|_| data_dir.join("db/tokens.json"));
+    let state = ApiState::new(
+        backend_url,
+        token.clone(),
+        manager.clone(),
+        info,
+        token_store_path,
+        config.tiers.clone(),
+    );
     let api_addr =
         serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
 
@@ -443,15 +484,21 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     );
 
     let auth_hint = match &token {
-        Some(_) => format!("Bearer token: {}", data_dir.join("runtime/api.token").display()),
+        Some(_) => format!("master token: {}", data_dir.join("runtime/api.token").display()),
         None => "no auth required by config".to_string(),
     };
+    let tiers_hint = if config.tiers.is_some() {
+        "tiers: on (decentraai token create --name <n> --tier 1..3)"
+    } else {
+        "tiers: off (add a tiers: section to the config to enable subscriptions)"
+    };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
+        "DecentraAI inference running\n  Model: {}\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
         model_path.display(),
         api_addr,
         api_addr,
         auth_hint,
+        tiers_hint,
         config.inference.idle_model_unload_minutes
     );
     tokio::signal::ctrl_c().await?;
@@ -564,6 +611,67 @@ async fn pull(args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+/// Issues, lists, and revokes subscription tokens (P1). The admin is
+/// whoever has local access to the data directory, mirroring the master
+/// token file's security posture.
+fn token_command(command: TokenCommand) -> Result<()> {
+    use decentraai_tokens::{Tier, TokenStore};
+
+    let (config_path, action) = match &command {
+        TokenCommand::Create { config, .. }
+        | TokenCommand::List { config }
+        | TokenCommand::Revoke { config, .. } => (config, ()),
+    };
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let registry_path = data_dir.join("db/tokens.json");
+    let mut store = TokenStore::load(&registry_path)
+        .with_context(|| format!("loading token registry from {}", registry_path.display()))?;
+    let logs_dir = data_dir.join("logs");
+    let _ = action;
+
+    match command {
+        TokenCommand::Create { name, tier, .. } => {
+            let tier = Tier::parse(tier)?;
+            let plaintext = store.create(&name, tier)?;
+            decentraai_audit::record_best_effort(
+                &logs_dir,
+                "token_created",
+                serde_json::json!({"name": name, "tier": tier.0}),
+            );
+            println!("Subscription token for '{name}' (tier {} — {}):", tier.0, tier.name());
+            println!("  {plaintext}");
+            println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
+            println!("Active at the next API request; no restart needed.");
+        }
+        TokenCommand::List { .. } => {
+            let records = store.list();
+            println!("Subscription tokens ({}):", records.len());
+            for record in records {
+                let status = if record.revoked { "revoked" } else { "active" };
+                println!(
+                    "  {} (tier {}, {}) — created {}",
+                    record.name, record.tier, status, record.created_at
+                );
+            }
+            if store.list().is_empty() {
+                println!("  none yet — create one with: decentraai token create --name <n> --tier 1..3");
+            }
+        }
+        TokenCommand::Revoke { name, .. } => {
+            store.revoke(&name)?;
+            decentraai_audit::record_best_effort(
+                &logs_dir,
+                "token_revoked",
+                serde_json::json!({"name": name}),
+            );
+            println!("Token '{name}' revoked; it stops working at the next API request.");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,5 +756,26 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::Pull(_)));
+    }
+
+    #[test]
+    fn parses_token_create_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai", "token", "create", "--name", "alice", "--tier", "1",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Token { .. }));
+    }
+
+    #[test]
+    fn parses_token_list_and_revoke_commands() {
+        assert!(
+            Cli::try_parse_from(["decentraai", "token", "list"]).is_ok(),
+            "token list must parse"
+        );
+        assert!(
+            Cli::try_parse_from(["decentraai", "token", "revoke", "--name", "alice"]).is_ok(),
+            "token revoke must parse"
+        );
     }
 }

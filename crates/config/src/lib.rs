@@ -23,6 +23,10 @@ pub struct NodeConfig {
     pub inference: InferenceSection,
     pub privacy: PrivacySection,
     pub security: SecuritySection,
+    /// Subscription tiers (P1). Absent = admin-token-only, which keeps
+    /// existing installs unchanged.
+    #[serde(default)]
+    pub tiers: Option<TiersSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +151,37 @@ pub struct SecuritySection {
     pub max_invalid_chunks_per_peer: u8,
 }
 
+/// One subscription tier: which models its tokens may use and how fast.
+/// `models` is an allowlist of model file names; an empty list means
+/// "every model the node serves" (the admin's own posture).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierPolicy {
+    #[serde(default)]
+    pub models: Vec<String>,
+    pub rate_limit_per_minute: u32,
+}
+
+/// Subscription tiers (P1): guest / contributor / core.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TiersSection {
+    pub tier1: TierPolicy,
+    pub tier2: TierPolicy,
+    pub tier3: TierPolicy,
+}
+
+impl TiersSection {
+    pub fn policy(&self, tier: u8) -> Option<&TierPolicy> {
+        match tier {
+            1 => Some(&self.tier1),
+            2 => Some(&self.tier2),
+            3 => Some(&self.tier3),
+            _ => None,
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -211,6 +246,19 @@ impl NodeConfig {
                 "inference.api_port must be 0 (ephemeral) or at least 1024".into(),
             ));
         }
+        if let Some(tiers) = &self.tiers {
+            for (name, policy) in [
+                ("tiers.tier1", &tiers.tier1),
+                ("tiers.tier2", &tiers.tier2),
+                ("tiers.tier3", &tiers.tier3),
+            ] {
+                if policy.rate_limit_per_minute == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "{name}.rate_limit_per_minute must be greater than zero"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -230,6 +278,31 @@ mod tests {
             eprintln!("Config load error: {}", e);
         }
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn example_tiers_parse_and_gate_models() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let tiers = config.tiers.expect("example config defines tiers");
+        assert_eq!(tiers.tier1.rate_limit_per_minute, 10);
+        assert_eq!(tiers.policy(1).unwrap().models.len(), 1);
+        assert_eq!(tiers.policy(3).unwrap().models.len(), 0, "empty allowlist = all models");
+        assert!(tiers.policy(4).is_none());
+    }
+
+    #[test]
+    fn zero_tier_rate_limit_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace("rate_limit_per_minute: 10", "rate_limit_per_minute: 0");
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("rate_limit_per_minute"));
     }
 
     #[test]

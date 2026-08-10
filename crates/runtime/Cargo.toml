@@ -13,6 +13,7 @@ decentraai-config = { path = "../config" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }
+decentraai-tokens = { path = "../tokens" }
 hex.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true

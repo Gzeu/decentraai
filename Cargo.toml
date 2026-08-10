@@ -10,6 +10,7 @@ members = [
   "crates/registry",
   "crates/runtime",
   "crates/system-probe",
+  "crates/tokens",
 ]
 resolver = "2"
 

@@ -38,3 +38,12 @@
 - [x] M7c: dashboard v2 — real inference metrics (tokens, tok/s, recent
   calls, uptime, RAM/GPU), self-poll fix (watching the page no longer
   inflates the counter or blocks idle unload)
+
+## 7. Subscriptions: free, tiered by contribution (in progress)
+- [x] P1: token registry (`db/tokens.json`, hashed) + `decentraai token`
+  CLI + tiered auth in the proxy (per-tier model allowlist, sliding-window
+  rate limit, usage counters, audits)
+- [ ] P2: chat UI in the dashboard (model selector filtered by tier)
+- [ ] P3: admin dashboard (create/revoke tokens, usage per token)
+- [ ] P4: contribution-based tier suggestions from catalog + reputation
+- [ ] P5: invites (`decentraai join <invite>`)

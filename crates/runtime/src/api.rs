@@ -1,7 +1,11 @@
-//! OpenAI-compatible API endpoint (M4c) plus the web dashboard (M7b/M7c):
-//! a thin proxy in front of the managed llama-server. It adds local
-//! Bearer auth, tracks request activity for the idle-unload lifecycle,
-//! and stays deliberately dumb: all inference logic lives in llama.cpp.
+//! OpenAI-compatible API endpoint (M4c), the web dashboard (M7b/M7c),
+//! and tiered subscription auth (P1): a thin proxy in front of the
+//! managed llama-server. All inference logic lives in llama.cpp.
+//!
+//! Auth model: the master token (runtime/api.token) is unlimited admin.
+//! Issued subscription tokens (`dsk_…`) resolve through db/tokens.json
+//! on every request — no restart needed after `token create/revoke` —
+//! and get per-tier model allowlists and sliding-window rate limits.
 //!
 //! The dashboard (GET /) renders live node status from /status and
 //! /v1/peers only — it never calls the proxied inference endpoints, so
@@ -15,9 +19,10 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use decentraai_config::TiersSection;
 use rand_core::RngCore;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +36,8 @@ use crate::ServeManager;
 const DASHBOARD_EVENT_LIMIT: usize = 10;
 /// Maximum inference calls kept in the recent-requests ring buffer.
 const RECENT_REQUEST_LIMIT: usize = 12;
+/// Sliding rate-limit window.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// One completed inference call, shown in the dashboard's recent list.
@@ -42,6 +49,17 @@ pub struct RequestStat {
     pub completion_tokens: u64,
     pub duration_ms: u64,
     pub tokens_per_second: f64,
+}
+
+/// How the caller authenticated on this request.
+#[derive(Debug)]
+enum Auth {
+    /// No token configured on the node at all (api_auth_required=false).
+    Open,
+    /// The master admin token: unlimited.
+    Master,
+    /// An issued subscription token with its tier.
+    Subscriber { name: String, tier: u8 },
 }
 
 /// Static node details the dashboard renders (kept separate so
@@ -68,12 +86,16 @@ pub struct DashboardInfo {
 pub struct ApiState {
     /// Base URL of the managed llama-server (e.g. http://127.0.0.1:41501).
     backend_url: String,
-    /// Optional Bearer token; checked on every request when set.
+    /// Optional master Bearer token; admin when set.
     auth_token: Option<Arc<str>>,
     /// Lifecycle handle; activity is recorded per request.
     manager: Arc<Mutex<ServeManager>>,
     client: reqwest::Client,
     info: DashboardInfo,
+    /// Subscription registry (db/tokens.json) when tiers are in use.
+    token_store_path: Option<PathBuf>,
+    /// Tier policies from the config; None = admin-token-only.
+    tiers: Option<TiersSection>,
     started_at: Instant,
     /// Completed inference calls (POST /v1/completions, /v1/chat/completions).
     requests_served: Arc<AtomicU64>,
@@ -81,6 +103,10 @@ pub struct ApiState {
     tokens_generated: Arc<AtomicU64>,
     /// Newest-first ring buffer of recent inference calls.
     recent_requests: Arc<StdMutex<VecDeque<RequestStat>>>,
+    /// Per-token sliding-window timestamps (rate limiting).
+    rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
+    /// Per-token usage counters: (requests, generated tokens, last-used secs).
+    token_usage: Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>,
 }
 
 impl ApiState {
@@ -89,6 +115,8 @@ impl ApiState {
         auth_token: Option<String>,
         manager: Arc<Mutex<ServeManager>>,
         info: DashboardInfo,
+        token_store_path: Option<PathBuf>,
+        tiers: Option<TiersSection>,
     ) -> Self {
         Self {
             backend_url,
@@ -96,25 +124,113 @@ impl ApiState {
             manager,
             client: reqwest::Client::new(),
             info,
+            token_store_path,
+            tiers,
             started_at: Instant::now(),
             requests_served: Arc::new(AtomicU64::new(0)),
             tokens_generated: Arc::new(AtomicU64::new(0)),
             recent_requests: Arc::new(StdMutex::new(VecDeque::new())),
+            rate_windows: Arc::new(StdMutex::new(HashMap::new())),
+            token_usage: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
-    /// Token check shared by the proxy and the guarded JSON views.
-    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+    fn presented_token(headers: &HeaderMap) -> Option<&str> {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+    }
+
+    /// Classifies the caller: master token, issued subscription token
+    /// (resolved through the registry on every request), or open.
+    fn classify(&self, headers: &HeaderMap) -> Result<Auth, Response> {
+        let presented = Self::presented_token(headers);
         match &self.auth_token {
-            None => true,
-            Some(token) => {
-                let expected = format!("Bearer {token}");
-                headers
-                    .get(header::AUTHORIZATION)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value == expected)
+            None => Ok(Auth::Open),
+            Some(master) => {
+                let presented = presented.ok_or_else(unauthorized)?;
+                if presented == master.as_ref() {
+                    return Ok(Auth::Master);
+                }
+                match &self.token_store_path {
+                    Some(path) => {
+                        let store = decentraai_tokens::TokenStore::load(path)
+                            .map_err(|_| unauthorized())?;
+                        match store.lookup(presented) {
+                            Some(record) => Ok(Auth::Subscriber {
+                                name: record.name.clone(),
+                                tier: record.tier,
+                            }),
+                            None => Err(unauthorized()),
+                        }
+                    }
+                    None => Err(unauthorized()),
+                }
             }
         }
+    }
+
+    /// Per-tier model allowlist. The request body's `model` field is
+    /// advisory (llama-server serves what it loaded), but we enforce it
+    /// anyway: it is honest about what the tier may use, and it protects
+    /// multi-model routing when that lands.
+    fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), Response> {
+        let Auth::Subscriber { tier, name } = auth else {
+            return Ok(());
+        };
+        let Some(tiers) = &self.tiers else {
+            return Ok(());
+        };
+        let Some(policy) = tiers.policy(*tier) else {
+            return Ok(());
+        };
+        if policy.models.is_empty() {
+            return Ok(());
+        }
+        let requested: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let Some(model) = requested["model"].as_str() else {
+            return Ok(());
+        };
+        let base = Path::new(model)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(model);
+        if policy.models.iter().any(|allowed| allowed == model || allowed == base) {
+            Ok(())
+        } else {
+            Err(forbidden(&format!(
+                "model '{base}' is not available to your tier ({name}, tier {tier})"
+            )))
+        }
+    }
+
+    /// Sliding-window rate limit per token. The master token and the
+    /// open mode are unlimited; the window is pruned on every call.
+    fn check_rate_limit(&self, auth: &Auth) -> Result<(), Response> {
+        let Auth::Subscriber { name, tier } = auth else {
+            return Ok(());
+        };
+        let Some(policy) = self.tiers.as_ref().and_then(|t| t.policy(*tier)) else {
+            return Ok(());
+        };
+        let limit = policy.rate_limit_per_minute as usize;
+        let mut windows = self.rate_windows.lock().unwrap();
+        let window = windows.entry(name.clone()).or_default();
+        let cutoff = Instant::now() - RATE_WINDOW;
+        while window.front().is_some_and(|t| *t < cutoff) {
+            window.pop_front();
+        }
+        if window.len() >= limit {
+            decentraai_audit::record_best_effort(
+                &self.info.repo_root.join("logs"),
+                "rate_limited",
+                serde_json::json!({"token": name, "tier": tier, "limit_per_minute": limit}),
+            );
+            return Err(too_many_requests(limit));
+        }
+        window.push_back(Instant::now());
+        Ok(())
     }
 
     /// Records one completed inference call: counters plus the ring buffer.
@@ -149,6 +265,20 @@ impl ApiState {
         let mut log = self.recent_requests.lock().unwrap();
         log.push_front(stat);
         log.truncate(RECENT_REQUEST_LIMIT);
+    }
+
+    fn note_token_usage(&self, auth: &Auth, generated: u64) {
+        let Auth::Subscriber { name, .. } = auth else {
+            return;
+        };
+        let mut usage = self.token_usage.lock().unwrap();
+        let entry = usage.entry(name.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += generated;
+        entry.2 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
     }
 }
 
@@ -251,7 +381,7 @@ async fn token_handler(State(state): State<ApiState>) -> Response {
 
 /// Token-guarded JSON view of the reputation store, shown on the dashboard.
 async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if !state.is_authorized(&headers) {
+    if state.classify(&headers).is_err() {
         return unauthorized();
     }
     let peers = match &state.info.reputation_path {
@@ -278,16 +408,22 @@ async fn proxy_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !state.is_authorized(&headers) {
-        return unauthorized();
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let is_inference = method == Method::POST
+        && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
+    if is_inference {
+        if let Err(response) = state.check_model_access(&auth, &body) {
+            return response;
+        }
+        if let Err(response) = state.check_rate_limit(&auth) {
+            return response;
+        }
     }
 
     state.manager.lock().await.note_activity();
-
-    // Only real inference calls count as "requests served"; metadata
-    // GETs like /v1/models are free.
-    let is_inference = method == Method::POST
-        && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
     let started = Instant::now();
 
     let url = format!("{}{}", state.backend_url, uri.path());
@@ -303,6 +439,12 @@ async fn proxy_handler(
             let bytes = upstream.bytes().await.unwrap_or_default();
             if is_inference && status.is_success() {
                 state.record_inference(uri.path(), started.elapsed(), &bytes);
+                let generated: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or_default();
+                let completion = generated["usage"]["completion_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                state.note_token_usage(&auth, completion);
             }
             let mut response = (status, bytes).into_response();
             if let Some(value) = content_type {
@@ -322,6 +464,27 @@ fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         "{\"error\":{\"message\":\"missing or invalid API token\",\"type\":\"authentication_error\"}}",
+    )
+        .into_response()
+}
+
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "{{\"error\":{{\"message\":\"{}\",\"type\":\"permission_error\"}}}}",
+            message.replace('"', "\\\"")
+        ),
+    )
+        .into_response()
+}
+
+fn too_many_requests(limit: usize) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "{{\"error\":{{\"message\":\"rate limit exceeded ({limit} requests/minute for your tier)\",\"type\":\"rate_limit_error\"}}}}"
+        ),
     )
         .into_response()
 }
@@ -532,6 +695,7 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{LlamaServer, RuntimeConfig};
+    use decentraai_config::{TierPolicy, TiersSection};
 
     #[cfg(unix)]
     fn write_fake_server(dir: &Path) -> std::path::PathBuf {
@@ -564,6 +728,23 @@ mod tests {
         }
     }
 
+    fn test_tiers(limit: u32) -> TiersSection {
+        TiersSection {
+            tier1: TierPolicy {
+                models: vec!["tinyllama.gguf".to_string()],
+                rate_limit_per_minute: limit,
+            },
+            tier2: TierPolicy {
+                models: vec![],
+                rate_limit_per_minute: 60,
+            },
+            tier3: TierPolicy {
+                models: vec![],
+                rate_limit_per_minute: 120,
+            },
+        }
+    }
+
     async fn start_backend() -> SocketAddr {
         let app = Router::new()
             .route(
@@ -584,20 +765,31 @@ mod tests {
         addr
     }
 
+    async fn start_stateful_api(
+        dir: &Path,
+        master: Option<String>,
+        tiers: Option<TiersSection>,
+    ) -> (SocketAddr, Arc<Mutex<ServeManager>>) {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let token_store = tiers.as_ref().map(|_| dir.join("db/tokens.json"));
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            master,
+            manager.clone(),
+            test_info(dir, None),
+            token_store,
+            tiers,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        (api, manager)
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn proxy_forwards_models_to_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_backend().await;
-        let manager = test_manager(dir.path()).await;
-        let state = ApiState::new(
-            format!("http://{backend}"),
-            None,
-            manager.clone(),
-            test_info(dir.path(), None),
-        );
-        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
-
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
         let response = reqwest::get(format!("http://{api}/v1/models"))
             .await
             .unwrap();
@@ -610,15 +802,8 @@ mod tests {
     #[tokio::test]
     async fn proxy_enforces_bearer_token() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_backend().await;
-        let manager = test_manager(dir.path()).await;
-        let state = ApiState::new(
-            format!("http://{backend}"),
-            Some("secret".to_string()),
-            manager.clone(),
-            test_info(dir.path(), None),
-        );
-        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let (api, manager) =
+            start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
         let client = reqwest::Client::new();
 
         let denied = client
@@ -647,17 +832,91 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn subscriber_tokens_get_tier_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("db/tokens.json");
+        let guest;
+        {
+            let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
+            guest = store.create("guest", decentraai_tokens::Tier::GUEST).unwrap();
+        }
+        let (api, manager) = start_stateful_api(
+            dir.path(),
+            Some("master".to_string()),
+            Some(test_tiers(60)),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        // Guest can call the allowed model.
+        let ok = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {guest}"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"tinyllama.gguf\",\"messages\":[]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+
+        // But not a model outside the tier allowlist.
+        let denied = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {guest}"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"llama-70b.gguf\",\"messages\":[]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403);
+
+        // Unknown tokens are rejected even when a master exists.
+        let unknown = client
+            .get(format!("http://{api}/v1/models"))
+            .header("Authorization", "Bearer dsk_nope")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 401);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rate_limit_returns_429_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let registry_path = dir.path().join("db/tokens.json");
+        let guest;
+        {
+            let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
+            guest = store.create("guest", decentraai_tokens::Tier::GUEST).unwrap();
+        }
+        let (api, manager) =
+            start_stateful_api(dir.path(), Some("master".to_string()), Some(test_tiers(2))).await;
+        let client = reqwest::Client::new();
+
+        for expected in [200, 200, 429] {
+            let response = client
+                .post(format!("http://{api}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {guest}"))
+                .header("Content-Type", "application/json")
+                .body("{\"model\":\"tinyllama.gguf\",\"messages\":[]}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        assert!(audit.contains("rate_limited"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn inference_calls_are_counted_with_token_stats() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_backend().await;
-        let manager = test_manager(dir.path()).await;
-        let state = ApiState::new(
-            format!("http://{backend}"),
-            None,
-            manager.clone(),
-            test_info(dir.path(), None),
-        );
-        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
         let client = reqwest::Client::new();
 
         // Metadata GETs must not count as inference.
@@ -696,15 +955,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_is_served_at_root_and_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_backend().await;
-        let manager = test_manager(dir.path()).await;
-        let state = ApiState::new(
-            format!("http://{backend}"),
-            None,
-            manager.clone(),
-            test_info(dir.path(), None),
-        );
-        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
         let client = reqwest::Client::new();
 
         for path in ["/", "/v1", "/anything-else"] {
@@ -753,6 +1004,8 @@ mod tests {
             None,
             manager.clone(),
             test_info(dir.path(), Some(reputation_path)),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let client = reqwest::Client::new();

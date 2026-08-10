@@ -20,6 +20,7 @@ decentraai-protocol = { path = "../protocol" }
 decentraai-registry = { path = "../registry" }
 decentraai-runtime = { path = "../runtime" }
 decentraai-system-probe = { path = "../system-probe" }
+decentraai-tokens = { path = "../tokens" }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

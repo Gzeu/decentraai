@@ -59,3 +59,18 @@ security:
   require_request_signatures: true
   ban_duration_minutes: 60
   max_invalid_chunks_per_peer: 2
+
+# Subscription tiers (P1): everything is free; your tier reflects your
+# contribution. `models` is an allowlist of model file names; an empty
+# list means "all models the node serves". Delete this section to run
+# admin-token-only, like before tiers existed.
+tiers:
+  tier1: # guest — invited by the admin
+    models: ["tinyllama.gguf"]
+    rate_limit_per_minute: 10
+  tier2: # contributor — shares at least one verified model
+    models: []
+    rate_limit_per_minute: 60
+  tier3: # core — large contributions, clean reputation
+    models: []
+    rate_limit_per_minute: 120
