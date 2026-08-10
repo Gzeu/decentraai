@@ -40,6 +40,9 @@ const RECENT_REQUEST_LIMIT: usize = 12;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// Per-token usage counters: (requests, generated tokens, last-used unix secs).
+type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
+
 /// One completed inference call, shown in the dashboard's recent list.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestStat {
@@ -49,6 +52,26 @@ pub struct RequestStat {
     pub completion_tokens: u64,
     pub duration_ms: u64,
     pub tokens_per_second: f64,
+}
+
+/// Auth/gate failures. Small enough to return by value (a full axum
+/// Response is 128+ bytes and trips clippy::result_large_err); converted
+/// into an HTTP response only at the handler boundary.
+#[derive(Debug)]
+enum GateError {
+    Unauthorized,
+    Forbidden(String),
+    RateLimited(usize),
+}
+
+impl GateError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => unauthorized(),
+            Self::Forbidden(message) => forbidden(&message),
+            Self::RateLimited(limit) => too_many_requests(limit),
+        }
+    }
 }
 
 /// How the caller authenticated on this request.
@@ -105,8 +128,8 @@ pub struct ApiState {
     recent_requests: Arc<StdMutex<VecDeque<RequestStat>>>,
     /// Per-token sliding-window timestamps (rate limiting).
     rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
-    /// Per-token usage counters: (requests, generated tokens, last-used secs).
-    token_usage: Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>,
+    /// Per-token usage counters.
+    token_usage: UsageCounters,
 }
 
 impl ApiState {
@@ -144,28 +167,28 @@ impl ApiState {
 
     /// Classifies the caller: master token, issued subscription token
     /// (resolved through the registry on every request), or open.
-    fn classify(&self, headers: &HeaderMap) -> Result<Auth, Response> {
+    fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
         let presented = Self::presented_token(headers);
         match &self.auth_token {
             None => Ok(Auth::Open),
             Some(master) => {
-                let presented = presented.ok_or_else(unauthorized)?;
+                let presented = presented.ok_or(GateError::Unauthorized)?;
                 if presented == master.as_ref() {
                     return Ok(Auth::Master);
                 }
                 match &self.token_store_path {
                     Some(path) => {
                         let store = decentraai_tokens::TokenStore::load(path)
-                            .map_err(|_| unauthorized())?;
+                            .map_err(|_| GateError::Unauthorized)?;
                         match store.lookup(presented) {
                             Some(record) => Ok(Auth::Subscriber {
                                 name: record.name.clone(),
                                 tier: record.tier,
                             }),
-                            None => Err(unauthorized()),
+                            None => Err(GateError::Unauthorized),
                         }
                     }
-                    None => Err(unauthorized()),
+                    None => Err(GateError::Unauthorized),
                 }
             }
         }
@@ -175,7 +198,7 @@ impl ApiState {
     /// advisory (llama-server serves what it loaded), but we enforce it
     /// anyway: it is honest about what the tier may use, and it protects
     /// multi-model routing when that lands.
-    fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), Response> {
+    fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), GateError> {
         let Auth::Subscriber { tier, name } = auth else {
             return Ok(());
         };
@@ -199,7 +222,7 @@ impl ApiState {
         if policy.models.iter().any(|allowed| allowed == model || allowed == base) {
             Ok(())
         } else {
-            Err(forbidden(&format!(
+            Err(GateError::Forbidden(format!(
                 "model '{base}' is not available to your tier ({name}, tier {tier})"
             )))
         }
@@ -207,7 +230,7 @@ impl ApiState {
 
     /// Sliding-window rate limit per token. The master token and the
     /// open mode are unlimited; the window is pruned on every call.
-    fn check_rate_limit(&self, auth: &Auth) -> Result<(), Response> {
+    fn check_rate_limit(&self, auth: &Auth) -> Result<(), GateError> {
         let Auth::Subscriber { name, tier } = auth else {
             return Ok(());
         };
@@ -227,7 +250,7 @@ impl ApiState {
                 "rate_limited",
                 serde_json::json!({"token": name, "tier": tier, "limit_per_minute": limit}),
             );
-            return Err(too_many_requests(limit));
+            return Err(GateError::RateLimited(limit));
         }
         window.push_back(Instant::now());
         Ok(())
@@ -381,8 +404,8 @@ async fn token_handler(State(state): State<ApiState>) -> Response {
 
 /// Token-guarded JSON view of the reputation store, shown on the dashboard.
 async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if state.classify(&headers).is_err() {
-        return unauthorized();
+    if let Err(e) = state.classify(&headers) {
+        return e.into_response();
     }
     let peers = match &state.info.reputation_path {
         Some(path) => decentraai_p2p::reputation::ReputationStore::load(
@@ -410,16 +433,16 @@ async fn proxy_handler(
 ) -> Response {
     let auth = match state.classify(&headers) {
         Ok(auth) => auth,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     let is_inference = method == Method::POST
         && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
     if is_inference {
-        if let Err(response) = state.check_model_access(&auth, &body) {
-            return response;
+        if let Err(e) = state.check_model_access(&auth, &body) {
+            return e.into_response();
         }
-        if let Err(response) = state.check_rate_limit(&auth) {
-            return response;
+        if let Err(e) = state.check_rate_limit(&auth) {
+            return e.into_response();
         }
     }
 
