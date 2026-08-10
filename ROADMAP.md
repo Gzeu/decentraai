@@ -30,3 +30,7 @@
 - [x] RAM admission fix (reject below the configured reserve)
 - [x] Security audit log (bans, admission rejections, verification failures)
 - [ ] Packaging and deployment guide
+
+## 6. Sharing and UX (in progress)
+- [x] M7a: peer catalog + `decentraai pull` (share models with one command)
+- [ ] M7b: web dashboard on the API port

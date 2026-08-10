@@ -11,8 +11,8 @@ use decentraai_p2p::{
     RequestHandler, StaticFileServer,
 };
 use decentraai_protocol::{
-    CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest, ManifestResponse,
-    deserialize_message, serialize_message,
+    CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest, ChunkResponse,
+    ManifestRequest, ManifestResponse, deserialize_message, serialize_message,
 };
 use libp2p::PeerId;
 use std::path::{Path, PathBuf};
@@ -408,6 +408,36 @@ async fn registry_server_serves_scanned_models() {
     assert_eq!(std::fs::read(&path).unwrap(), data);
     assert_eq!(path.file_name().unwrap().to_str().unwrap(), "tiny.gguf");
     assert_eq!(reputation.score(&server.local_peer_id()), 3.0);
+}
+
+#[tokio::test]
+async fn registry_server_answers_catalog_requests() {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join("tiny.gguf"), test_bytes(CHUNK_SIZE + 5)).unwrap();
+
+    let mut registry = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+    registry.scan_directory(&models_dir).unwrap();
+    let manifest_id = scan(models_dir.join("tiny.gguf")).unwrap().model_id;
+
+    let handler = Arc::new(RegistryServer::new(registry));
+    let (server, client) = node_pair(Some(handler)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let request = serialize_message(&CatalogRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+    })
+    .unwrap();
+    let raw = client
+        .request(server.local_peer_id(), request)
+        .await
+        .unwrap();
+    let catalog: CatalogResponse = deserialize_message(&raw, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
+    assert_eq!(catalog.protocol_version, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(catalog.manifests.len(), 1);
+    assert_eq!(catalog.manifests[0].model_id, manifest_id);
+    assert_eq!(catalog.manifests[0].file_name, "tiny.gguf");
 }
 
 #[tokio::test]

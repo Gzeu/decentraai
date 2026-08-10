@@ -106,6 +106,21 @@ pub struct ChunkResponse {
     pub chunk_data: Vec<u8>,
 }
 
+/// Asks a peer for the full list of manifests it serves (M7a).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogRequest {
+    pub protocol_version: u16,
+}
+
+/// The peer's served catalog: one manifest per shared model.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogResponse {
+    pub protocol_version: u16,
+    pub manifests: Vec<Manifest>,
+}
+
 /// Deserialize a message with a size cap to prevent memory exhaustion.
 pub fn deserialize_message<T: for<'de> Deserialize<'de>>(
     data: &[u8],
@@ -415,5 +430,24 @@ mod tests {
         let parsed: ManifestAnnouncement = deserialize_message(&announcement, 1024 * 1024).unwrap();
         assert_eq!(parsed.manifest.file_name, "test.gguf");
         assert_eq!(parsed.signature, None);
+    }
+
+    #[test]
+    fn test_catalog_roundtrip() {
+        let request = CatalogRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+        };
+        let serialized = serialize_message(&request).unwrap();
+        let parsed: CatalogRequest = deserialize_message(&serialized, 1024).unwrap();
+        assert_eq!(parsed.protocol_version, CURRENT_PROTOCOL_VERSION);
+
+        let response = CatalogResponse {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            manifests: vec![create_test_manifest()],
+        };
+        let serialized = serialize_message(&response).unwrap();
+        let parsed: CatalogResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
+        assert_eq!(parsed.manifests.len(), 1);
+        assert_eq!(parsed.manifests[0].file_name, "test.gguf");
     }
 }

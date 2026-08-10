@@ -37,6 +37,7 @@ enum Command {
         #[command(subcommand)]
         command: ServeCommand,
     },
+    Pull(PullArgs),
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -90,6 +91,20 @@ enum ServeCommand {
         binary: Option<PathBuf>,
     },
 }
+#[derive(Debug, Args)]
+struct PullArgs {
+    /// Peer address, e.g. /ip4/192.168.1.5/tcp/4001/p2p/<PEER_ID>
+    #[arg(long)]
+    from: String,
+    /// Model file name or manifest id from the peer's catalog.
+    #[arg(long)]
+    model: Option<String>,
+    /// Only list the peer's catalog, without downloading.
+    #[arg(long)]
+    list: bool,
+    #[arg(long, default_value = "configs/node.example.yaml")]
+    config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -120,6 +135,7 @@ async fn main() -> Result<()> {
                 binary,
             },
         } => serve_start(config, model, binary).await,
+        Command::Pull(args) => pull(args).await,
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -428,6 +444,111 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     Ok(())
 }
 
+/// Pulls a model from a peer: fetch its catalog, pick the model,
+/// download with verification, resume, reputation, and quarantine.
+async fn pull(args: PullArgs) -> Result<()> {
+    use decentraai_p2p::reputation::ReputationStore;
+    use decentraai_p2p::transfer::download;
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, PeerId};
+    use decentraai_protocol::{
+        CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, deserialize_message,
+        serialize_message,
+    };
+    use std::time::Duration;
+
+    let config = NodeConfig::load(&args.config)
+        .with_context(|| format!("loading {}", args.config.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    if !identity_path.exists() {
+        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+    }
+    let identity = Identity::load(&identity_path)?;
+
+    let peer_str = args
+        .from
+        .rsplit("/p2p/")
+        .next()
+        .filter(|s| !s.contains('/'))
+        .context("--from must end with /p2p/<peer-id> (see swarm start output)")?;
+    let peer_id: PeerId = peer_str.parse().context("invalid peer id in --from")?;
+
+    let node = P2PNode::new(
+        &identity,
+        config.network.max_message_bytes as usize,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )?;
+    node.dial(&args.from).await?;
+
+    // Fetch the catalog; the fresh connection may need a moment.
+    let catalog_request = serialize_message(&CatalogRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+    })?;
+    let raw = {
+        let mut last_err = None;
+        let mut result = None;
+        for _ in 0..10 {
+            match node.request(peer_id, catalog_request.clone()).await {
+                Ok(bytes) => {
+                    result = Some(bytes);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        match result {
+            Some(bytes) => bytes,
+            None => return Err(last_err.unwrap()),
+        }
+    };
+    let catalog: CatalogResponse = deserialize_message(&raw, DEFAULT_MAX_MESSAGE_BYTES)?;
+    if catalog.protocol_version != CURRENT_PROTOCOL_VERSION {
+        anyhow::bail!("peer answered with protocol version {}", catalog.protocol_version);
+    }
+
+    if args.list || args.model.is_none() {
+        println!("Peer {} serves {} model(s):", peer_id, catalog.manifests.len());
+        for manifest in &catalog.manifests {
+            println!(
+                "  {} ({:.2} GiB, id: {}...)",
+                manifest.file_name,
+                manifest.file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                &manifest.model_id[..16.min(manifest.model_id.len())]
+            );
+        }
+        if args.model.is_none() && !args.list {
+            println!("\nUse --model <file_name> to download one.");
+        }
+        return Ok(());
+    }
+
+    let wanted = args.model.unwrap();
+    let manifest = catalog
+        .manifests
+        .iter()
+        .find(|m| m.file_name == wanted || m.model_id == wanted || m.model_id.starts_with(&wanted))
+        .with_context(|| format!("model '{wanted}' not in the peer's catalog; try --list"))?;
+
+    let mut reputation = ReputationStore::load(
+        &data_dir.join("db/reputation.json"),
+        config.security.max_invalid_chunks_per_peer,
+        Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+    )?;
+
+    println!("Downloading {} ({} chunks)...", manifest.file_name, manifest.chunk_hashes.len());
+    let path = download(&node, peer_id, &manifest.model_id, &data_dir, &mut reputation).await?;
+    println!("Downloaded and verified: {}", path.display());
+    println!(
+        "Index it with: decentraai registry scan --directory {}",
+        data_dir.join("models").display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +606,32 @@ mod tests {
     #[test]
     fn serve_start_requires_a_model() {
         assert!(Cli::try_parse_from(["decentraai", "serve", "start"]).is_err());
+    }
+
+    #[test]
+    fn parses_pull_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "pull",
+            "--from",
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWabc",
+            "--model",
+            "tiny.gguf",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
+    }
+
+    #[test]
+    fn parses_pull_list_only() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "pull",
+            "--from",
+            "/ip4/10.0.0.2/tcp/9999/p2p/12D3KooWxyz",
+            "--list",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
     }
 }

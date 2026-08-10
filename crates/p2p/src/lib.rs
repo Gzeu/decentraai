@@ -10,6 +10,8 @@
 pub mod reputation;
 pub mod transfer;
 
+pub use libp2p::PeerId;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use decentraai_identity::Identity;
@@ -17,7 +19,7 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, mdns, noise, tcp, yamux};
+use libp2p::{Multiaddr, mdns, noise, tcp, yamux};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -102,10 +104,9 @@ impl RequestHandler for StaticFileServer {
     }
 }
 
-/// Serves every model in a local ModelRegistry: manifests are built on
-/// demand with the registry-relative name, chunks are read with
-/// seek + read from the canonical path. Content-addressed: the manifest
-/// id is the BLAKE3 of the file, so peers always know what they get.
+/// Serves every model in a local ModelRegistry: catalogs, manifests, and
+/// chunks. Manifests are built on demand with the registry-relative
+/// name; chunks are read with seek + read from the canonical path.
 pub struct RegistryServer {
     registry: decentraai_registry::ModelRegistry,
 }
@@ -140,10 +141,20 @@ impl RegistryServer {
 impl RequestHandler for RegistryServer {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::{
-            CURRENT_PROTOCOL_VERSION, ChunkRequest, ChunkResponse, ManifestRequest,
-            deserialize_message, manifest_response_bytes, serialize_message,
+            CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest,
+            ChunkResponse, ManifestRequest, deserialize_message, manifest_response_bytes,
+            serialize_message,
         };
 
+        if let Ok(req) = deserialize_message::<CatalogRequest>(request, request.len()) {
+            if req.protocol_version != CURRENT_PROTOCOL_VERSION {
+                bail!("unsupported protocol version {}", req.protocol_version);
+            }
+            return serialize_message(&CatalogResponse {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                manifests: self.manifests(),
+            });
+        }
         if let Ok(req) = deserialize_message::<ManifestRequest>(request, request.len()) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
