@@ -47,3 +47,15 @@
 - [ ] P3: admin dashboard (create/revoke tokens, usage per token)
 - [ ] P4: contribution-based tier suggestions from catalog + reputation
 - [ ] P5: invites (`decentraai join <invite>`)
+
+## 8. Operations and scale (in progress)
+- [x] Q1: generation defaults (sampling + system prompt merged into
+  requests), interactive model picker with memory-fit verdicts,
+  dashboard lists every indexed model
+- [ ] Q2: fair FIFO queue for inference requests (position feedback,
+  queue depth on the dashboard)
+- [ ] Q3: remote backend (`serve start --backend http://host:port`) —
+  a weaker station keeps auth/tiers/queue while a stronger machine runs
+  the model
+- [ ] Q4: onboarding wizard (`decentraai setup`) writing a validated
+  config on first run

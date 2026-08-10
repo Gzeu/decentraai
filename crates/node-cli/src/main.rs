@@ -86,8 +86,9 @@ enum SwarmCommand {
 enum ServeCommand {
     Start {
         /// Model reference: registry relative path or direct file path.
+        /// Omit it to pick interactively from the registry.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
         /// Explicit llama-server binary path (overrides env and PATH search).
@@ -387,9 +388,62 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Interactive model picker (Q1): lists every registry model with its
+/// size and a memory-fit verdict from the live budget, then reads a
+/// choice from stdin. Non-interactive runs (piped scripts) get a clear
+/// error instead of hanging.
+fn pick_model_interactively(registry: &ModelRegistry, config: &NodeConfig) -> Result<String> {
+    use std::io::IsTerminal;
+
+    let models = registry.list_models();
+    if models.is_empty() {
+        anyhow::bail!(
+            "no models in the registry; run 'decentraai registry scan --directory <path>' first"
+        );
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--model is required in non-interactive mode; available: {}",
+            models.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>().join(", "));
+    }
+
+    let budget = SystemSnapshot::collect().derive_budget(
+        &config.resources,
+        config.storage.max_cache_gb,
+        config.storage.min_free_disk_gb,
+    );
+    println!("Available models (memory budget: {:.1} GiB):", bytes_to_gib(budget.max_memory_bytes));
+    for (i, model) in models.iter().enumerate() {
+        let verdict = if model.size_bytes <= budget.max_memory_bytes {
+            "fits"
+        } else {
+            "too large for the current budget"
+        };
+        println!(
+            "  [{}] {} ({:.2} GiB, {})",
+            i + 1,
+            model.relative_path,
+            bytes_to_gib(model.size_bytes),
+            verdict
+        );
+    }
+    print!("Choose a model [1-{}]: ", models.len());
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let choice: usize = input
+        .trim()
+        .parse()
+        .context("please answer with the model number")?;
+    if choice == 0 || choice > models.len() {
+        anyhow::bail!("choice {choice} is out of range 1..={}", models.len());
+    }
+    Ok(models[choice - 1].relative_path.clone())
+}
+
 /// Runs gated inference with the OpenAI-compatible API and the web
 /// dashboard on inference.bind_address:api_port.
-async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
+async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option<PathBuf>) -> Result<()> {
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
@@ -412,6 +466,10 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     }
     let registry = ModelRegistry::load(&registry_path)
         .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+    let model = match model {
+        Some(reference) => reference,
+        None => pick_model_interactively(&registry, &config)?,
+    };
     let model_path = resolve_model(&registry, &model)?;
     let model_name = model_path
         .file_name()
@@ -467,6 +525,7 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         api_port: config.inference.api_port,
         model_name,
         model_size_bytes,
+        generation: config.inference.generation.clone(),
     };
     let token_store_path = config
         .tiers
@@ -736,8 +795,15 @@ mod tests {
     }
 
     #[test]
-    fn serve_start_requires_a_model() {
-        assert!(Cli::try_parse_from(["decentraai", "serve", "start"]).is_err());
+    fn serve_start_model_is_optional() {
+        // Without --model the picker opens (interactive); parsing must succeed.
+        let cli = Cli::try_parse_from(["decentraai", "serve", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                command: ServeCommand::Start { .. }
+            }
+        ));
     }
 
     #[test]
