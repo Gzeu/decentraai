@@ -24,6 +24,16 @@ pub struct PeerScore {
     pub banned_until: Option<u64>,
 }
 
+/// Serializable snapshot of one peer for the dashboard (M7b).
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerSummary {
+    pub peer_id: String,
+    pub verified: u64,
+    pub failed: u64,
+    pub score: f64,
+    pub banned: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ReputationFile {
     schema_version: u32,
@@ -131,6 +141,34 @@ impl ReputationStore {
             .get(&peer.to_string())
             .map(|e| e.failed_chunks)
             .unwrap_or(0)
+    }
+
+    /// Dashboard view: every tracked peer, sorted by score descending
+    /// (ties by PeerId ascending, matching the scheduler's determinism).
+    pub fn summaries(&self) -> Vec<PeerSummary> {
+        let mut out: Vec<PeerSummary> = self
+            .scores
+            .iter()
+            .map(|(peer_id, entry)| {
+                let banned = entry
+                    .banned_until
+                    .is_some_and(|until| until > now_secs());
+                PeerSummary {
+                    peer_id: peer_id.clone(),
+                    verified: entry.verified_chunks,
+                    failed: entry.failed_chunks,
+                    score: entry.verified_chunks as f64 - entry.failed_chunks as f64 * 2.0,
+                    banned,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.peer_id.cmp(&b.peer_id))
+        });
+        out
     }
 }
 
@@ -286,5 +324,23 @@ mod tests {
         let mut expected = vec![a, b];
         expected.sort_by_key(|p| p.to_string());
         assert_eq!(first, expected, "ties break by PeerId ascending");
+    }
+
+    #[test]
+    fn summaries_cover_every_peer_sorted_by_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open_store(dir.path(), 1, 3600);
+        let good = PeerId::random();
+        let bad = PeerId::random();
+        store.record_success(&good);
+        store.record_success(&good);
+        store.record_failure(&bad);
+        let summaries = store.summaries();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].peer_id, good.to_string(), "highest score first");
+        assert_eq!(summaries[0].score, 2.0);
+        assert!(!summaries[0].banned);
+        assert_eq!(summaries[1].peer_id, bad.to_string());
+        assert!(summaries[1].banned);
     }
 }

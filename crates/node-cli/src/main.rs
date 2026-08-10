@@ -357,9 +357,8 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Runs gated inference with the OpenAI-compatible API: admission check,
-/// registry resolution, llama-server spawn, Bearer token, thin proxy on
-/// inference.bind_address:api_port, idle unload, Ctrl+C to stop.
+/// Runs gated inference with the OpenAI-compatible API and the web
+/// dashboard on inference.bind_address:api_port.
 async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf>) -> Result<()> {
     use decentraai_runtime::api::{ApiState, ensure_api_token, serve_api};
     use decentraai_runtime::{
@@ -384,6 +383,11 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     let registry = ModelRegistry::load(&registry_path)
         .with_context(|| format!("loading registry from {}", registry_path.display()))?;
     let model_path = resolve_model(&registry, &model)?;
+    let model_name = model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model")
+        .to_string();
     let binary = find_llama_server(binary.as_deref())?;
 
     let mut runtime = RuntimeConfig::new(model_path.clone());
@@ -415,7 +419,17 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
     } else {
         None
     };
-    let state = ApiState::new(backend_url, token.clone(), manager.clone());
+    let state = ApiState::new(
+        backend_url,
+        token.clone(),
+        manager.clone(),
+        data_dir.clone(),
+        Some(data_dir.join("db/reputation.json")),
+        config.security.max_invalid_chunks_per_peer,
+        Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+        config.inference.api_port,
+        model_name,
+    );
     let api_addr =
         serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
 
@@ -433,8 +447,9 @@ async fn serve_start(config_path: PathBuf, model: String, binary: Option<PathBuf
         None => "no auth required by config".to_string(),
     };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
+        "DecentraAI inference running\n  Model: {}\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
         model_path.display(),
+        api_addr,
         api_addr,
         auth_hint,
         config.inference.idle_model_unload_minutes
