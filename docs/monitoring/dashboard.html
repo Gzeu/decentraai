@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DecentraAI - Monitoring Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 2rem;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+        }
+
+        .card h2 {
+            font-size: 1.25rem;
+            color: #1f2937;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+        }
+
+        .metric-item {
+            text-align: center;
+            padding: 1rem;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #1f2937;
+        }
+
+        .metric-change {
+            font-size: 0.75rem;
+            margin-top: 0.25rem;
+        }
+
+        .metric-change.up {
+            color: #10b981;
+        }
+
+        .metric-change.down {
+            color: #ef4444;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 0.5rem;
+        }
+
+        .status-healthy {
+            background: #10b981;
+        }
+
+        .status-warning {
+            background: #f59e0b;
+        }
+
+        .status-critical {
+            background: #ef4444;
+        }
+
+        .chart-placeholder {
+            height: 200px;
+            background: #f9fafb;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #9ca3af;
+            font-size: 0.875rem;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .table th,
+        .table td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .table th {
+            font-weight: 600;
+            color: #6b7280;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+
+        .badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .badge-warning {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge-error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e5e7eb;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 Monitoring Dashboard</h1>
+            <p>Real-time metrics, system health, and performance insights</p>
+        </header>
+
+        <div class="dashboard-grid">
+            <!-- System Health -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    System Health
+                </h2>
+                <div class="metric-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">CPU Usage</div>
+                        <div class="metric-value">45%</div>
+                        <div class="metric-change up">↓ 5% from avg</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Memory</div>
+                        <div class="metric-value">62%</div>
+                        <div class="metric-change down">↑ 8% from avg</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">GPU VRAM</div>
+                        <div class="metric-value">78%</div>
+                        <div class="metric-change down">↑ 12% from avg</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Disk I/O</div>
+                        <div class="metric-value">23%</div>
+                        <div class="metric-change up">↓ 3% from avg</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Network Metrics -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    Network Metrics
+                </h2>
+                <div class="metric-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">P2P Connections</div>
+                        <div class="metric-value">47</div>
+                        <div class="metric-change up">+12 active</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Latency (avg)</div>
+                        <div class="metric-value">85ms</div>
+                        <div class="metric-change up">↓ 15ms faster</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Bandwidth In</div>
+                        <div class="metric-value">125 Mbps</div>
+                        <div class="metric-change down">↑ 20 Mbps</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Bandwidth Out</div>
+                        <div class="metric-value">98 Mbps</div>
+                        <div class="metric-change up">↓ 5 Mbps</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Performance -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    Model Performance
+                </h2>
+                <div class="metric-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">Active Models</div>
+                        <div class="metric-value">6</div>
+                        <div class="metric-change">3 LLM, 2 Embed, 1 Vision</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Tokens/sec</div>
+                        <div class="metric-value">342</div>
+                        <div class="metric-change up">↑ 45 t/s</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Avg Latency</div>
+                        <div class="metric-value">120ms</div>
+                        <div class="metric-change up">↓ 20ms</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Queue Depth</div>
+                        <div class="metric-value">12</div>
+                        <div class="metric-change down">↑ 3 pending</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Worker Status -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    Worker Status
+                </h2>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Worker</th>
+                            <th>Status</th>
+                            <th>Load</th>
+                            <th>Uptime</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>gpu-worker-1</strong></td>
+                            <td><span class="badge badge-success">Active</span></td>
+                            <td>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: 78%;"></div>
+                                </div>
+                            </td>
+                            <td>99.8%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>gpu-worker-2</strong></td>
+                            <td><span class="badge badge-success">Active</span></td>
+                            <td>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: 65%;"></div>
+                                </div>
+                            </td>
+                            <td>99.5%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>cpu-worker-1</strong></td>
+                            <td><span class="badge badge-warning">Busy</span></td>
+                            <td>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: 92%;"></div>
+                                </div>
+                            </td>
+                            <td>98.2%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>worker-4</strong></td>
+                            <td><span class="badge badge-error">Offline</span></td>
+                            <td>-</td>
+                            <td>0%</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Request Metrics -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    Request Metrics (24h)
+                </h2>
+                <div class="metric-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">Total Requests</div>
+                        <div class="metric-value">12,847</div>
+                        <div class="metric-change up">↑ 1,234 vs yesterday</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Success Rate</div>
+                        <div class="metric-value">99.2%</div>
+                        <div class="metric-change up">↑ 0.3%</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">P50 Latency</div>
+                        <div class="metric-value">95ms</div>
+                        <div class="metric-change up">↓ 12ms</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">P99 Latency</div>
+                        <div class="metric-value">340ms</div>
+                        <div class="metric-change down">↑ 45ms</div>
+                    </div>
+                </div>
+                <div style="margin-top: 1rem;">
+                    <div class="chart-placeholder">
+                        [Request Volume Chart - Last 24 Hours]
+                    </div>
+                </div>
+            </div>
+
+            <!-- Rewards Distribution -->
+            <div class="card">
+                <h2>
+                    <span class="status-indicator status-healthy"></span>
+                    Rewards Distribution (Current Epoch)
+                </h2>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Worker</th>
+                            <th>Tokens Generated</th>
+                            <th>Reward</th>
+                            <th>Quality</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>gpu-worker-1</strong></td>
+                            <td>1,250,000</td>
+                            <td>15,625,000</td>
+                            <td><span class="badge badge-success">98%</span></td>
+                        </tr>
+                        <tr>
+                            <td><strong>gpu-worker-2</strong></td>
+                            <td>875,000</td>
+                            <td>10,062,500</td>
+                            <td><span class="badge badge-success">96%</span></td>
+                        </tr>
+                        <tr>
+                            <td><strong>cpu-worker-1</strong></td>
+                            <td>620,000</td>
+                            <td>6,820,000</td>
+                            <td><span class="badge badge-warning">92%</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Security Status -->
+        <div class="card" style="margin-bottom: 2rem;">
+            <h2>
+                <span class="status-indicator status-healthy"></span>
+                Security Status
+            </h2>
+            <div class="metric-grid" style="margin-bottom: 1rem;">
+                <div class="metric-item">
+                    <div class="metric-label">Auth Failures (24h)</div>
+                    <div class="metric-value">3</div>
+                    <div class="metric-change up">All resolved</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Rate Limit Hits</div>
+                    <div class="metric-value">127</div>
+                    <div class="metric-change down">↑ 23 vs yesterday</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Suspicious Activity</div>
+                    <div class="metric-value">0</div>
+                    <div class="metric-change up">Clean</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Last Security Audit</div>
+                    <div class="metric-value">2h ago</div>
+                    <div class="metric-change up">All checks passed</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Auto-refresh metrics every 5 seconds
+        setInterval(() => {
+            // In real implementation, fetch from API
+            // fetch('/api/metrics').then(r => r.json()).then(updateDashboard);
+            console.log('Refreshing metrics...');
+        }, 5000);
+    </script>
+</body>
+</html>
