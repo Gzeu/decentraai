@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DecentraAI - Onboarding Wizard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+
+        .wizard-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 700px;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        .wizard-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        .wizard-header h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .wizard-header p {
+            opacity: 0.9;
+        }
+
+        .progress-bar {
+            display: flex;
+            background: #f3f4f6;
+            padding: 1.5rem 2rem;
+            gap: 0.5rem;
+        }
+
+        .progress-step {
+            flex: 1;
+            text-align: center;
+            position: relative;
+        }
+
+        .progress-step::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            right: -50%;
+            width: 100%;
+            height: 2px;
+            background: #e5e7eb;
+            transform: translateY(-50%);
+            z-index: 0;
+        }
+
+        .progress-step:last-child::after {
+            display: none;
+        }
+
+        .progress-step.active::after {
+            background: #667eea;
+        }
+
+        .step-number {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #e5e7eb;
+            color: #6b7280;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        .progress-step.active .step-number {
+            background: #667eea;
+            color: white;
+        }
+
+        .progress-step.completed .step-number {
+            background: #10b981;
+            color: white;
+        }
+
+        .step-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            font-weight: 500;
+        }
+
+        .progress-step.active .step-label {
+            color: #667eea;
+        }
+
+        .wizard-body {
+            padding: 2rem;
+        }
+
+        .step {
+            display: none;
+        }
+
+        .step.active {
+            display: block;
+        }
+
+        .step h2 {
+            font-size: 1.5rem;
+            color: #1f2937;
+            margin-bottom: 1rem;
+        }
+
+        .step p {
+            color: #6b7280;
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 0.5rem;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .role-cards {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .role-card {
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 1.5rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .role-card:hover {
+            border-color: #667eea;
+            transform: translateY(-2px);
+        }
+
+        .role-card.selected {
+            border-color: #667eea;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+        }
+
+        .role-card h3 {
+            font-size: 1.1rem;
+            color: #1f2937;
+            margin-bottom: 0.5rem;
+        }
+
+        .role-card p {
+            font-size: 0.875rem;
+            color: #6b7280;
+        }
+
+        .resource-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .resource-item {
+            background: #f9fafb;
+            padding: 1rem;
+            border-radius: 8px;
+        }
+
+        .resource-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+
+        .resource-value {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #1f2937;
+        }
+
+        .qr-section {
+            text-align: center;
+            padding: 2rem;
+            background: #f9fafb;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+        }
+
+        .qr-placeholder {
+            width: 200px;
+            height: 200px;
+            background: white;
+            border: 2px dashed #d1d5db;
+            border-radius: 8px;
+            margin: 0 auto 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #9ca3af;
+        }
+
+        .wizard-footer {
+            display: flex;
+            justify-content: space-between;
+            padding: 1.5rem 2rem;
+            background: #f9fafb;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .btn {
+            padding: 0.75rem 2rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            transition: all 0.2s;
+        }
+
+        .btn-secondary {
+            background: #f3f4f6;
+            color: #374151;
+        }
+
+        .btn-secondary:hover {
+            background: #e5e7eb;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .success-message {
+            text-align: center;
+            padding: 2rem;
+        }
+
+        .success-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
+
+        .success-message h2 {
+            color: #10b981;
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="wizard-container">
+        <div class="wizard-header">
+            <h1>🚀 Welcome to DecentraAI</h1>
+            <p>Let's set up your node in 5 simple steps</p>
+        </div>
+
+        <div class="progress-bar">
+            <div class="progress-step active" data-step="1">
+                <div class="step-number">1</div>
+                <div class="step-label">Resources</div>
+            </div>
+            <div class="progress-step" data-step="2">
+                <div class="step-number">2</div>
+                <div class="step-label">Identity</div>
+            </div>
+            <div class="progress-step" data-step="3">
+                <div class="step-number">3</div>
+                <div class="step-label">Role</div>
+            </div>
+            <div class="progress-step" data-step="4">
+                <div class="step-number">4</div>
+                <div class="step-label">Network</div>
+            </div>
+            <div class="progress-step" data-step="5">
+                <div class="step-number">5</div>
+                <div class="step-label">Pairing</div>
+            </div>
+        </div>
+
+        <div class="wizard-body">
+            <!-- Step 1: System Resources -->
+            <div class="step active" data-step="1">
+                <h2>System Resources</h2>
+                <p>We've detected your available compute resources:</p>
+
+                <div class="resource-grid">
+                    <div class="resource-item">
+                        <div class="resource-label">CPU Cores</div>
+                        <div class="resource-value" id="cpu-cores">-</div>
+                    </div>
+                    <div class="resource-item">
+                        <div class="resource-label">RAM</div>
+                        <div class="resource-value" id="ram-gb">- GB</div>
+                    </div>
+                    <div class="resource-item">
+                        <div class="resource-label">GPU VRAM</div>
+                        <div class="resource-value" id="gpu-vram">- GB</div>
+                    </div>
+                    <div class="resource-item">
+                        <div class="resource-label">Disk Space</div>
+                        <div class="resource-value" id="disk-gb">- GB</div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="node-name">Node Name</label>
+                    <input type="text" id="node-name" placeholder="e.g., my-gpu-worker" value="worker-1">
+                </div>
+            </div>
+
+            <!-- Step 2: Identity -->
+            <div class="step" data-step="2">
+                <h2>Identity</h2>
+                <p>Choose how to set up your node identity:</p>
+
+                <div class="form-group">
+                    <label>
+                        <input type="radio" name="identity" value="generate" checked>
+                        Generate new identity (recommended)
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        <input type="radio" name="identity" value="restore">
+                        Restore from backup
+                    </label>
+                </div>
+
+                <div class="form-group" id="restore-section" style="display: none;">
+                    <label for="backup-file">Backup File</label>
+                    <input type="file" id="backup-file" accept=".json">
+                </div>
+            </div>
+
+            <!-- Step 3: Role -->
+            <div class="step" data-step="3">
+                <h2>Select Role</h2>
+                <p>What will this node do?</p>
+
+                <div class="role-cards">
+                    <div class="role-card selected" data-role="worker">
+                        <h3>🔧 Worker</h3>
+                        <p>Execute inference tasks and earn rewards</p>
+                    </div>
+                    <div class="role-card" data-role="controller">
+                        <h3>🎮 Controller</h3>
+                        <p>Submit tasks and manage workers</p>
+                    </div>
+                    <div class="role-card" data-role="both">
+                        <h3>🔄 Both</h3>
+                        <p>Execute tasks and submit requests</p>
+                    </div>
+                    <div class="role-card" data-role="validator">
+                        <h3>✅ Validator</h3>
+                        <p>Verify computation results</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 4: Network -->
+            <div class="step" data-step="4">
+                <h2>Network Configuration</h2>
+                <p>Configure P2P network settings:</p>
+
+                <div class="form-group">
+                    <label for="p2p-port">P2P Port</label>
+                    <input type="number" id="p2p-port" value="4001">
+                </div>
+
+                <div class="form-group">
+                    <label for="bootstrap-peers">Bootstrap Peers (comma-separated)</label>
+                    <textarea id="bootstrap-peers" rows="3" placeholder="/ip4/10.0.0.1/tcp/4001/p2p/16Uiu8...">/dns4/bootstrap.decentraai.io/tcp/4001/p2p/16Uiu8gKvJDuLEqNvJ9qNvJ9qNvJ9qNvJ9qNvJ9q</textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="enable-mdns" checked>
+                        Enable mDNS for local discovery
+                    </label>
+                </div>
+            </div>
+
+            <!-- Step 5: Pairing -->
+            <div class="step" data-step="5">
+                <h2>Worker Pairing</h2>
+                <p>Scan this QR code with your controller to pair:</p>
+
+                <div class="qr-section">
+                    <div class="qr-placeholder" id="qr-code">
+                        Generating QR...
+                    </div>
+                    <p style="color: #6b7280; font-size: 0.875rem;">
+                        Or copy the pairing code below
+                    </p>
+                    <div style="margin-top: 1rem;">
+                        <code id="pairing-code" style="background: #f3f4f6; padding: 0.5rem 1rem; border-radius: 4px; font-size: 0.875rem;">
+                            Loading...
+                        </code>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Success -->
+            <div class="step" data-step="success">
+                <div class="success-message">
+                    <div class="success-icon">✅</div>
+                    <h2>Setup Complete!</h2>
+                    <p>Your node is ready to start.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="wizard-footer">
+            <button class="btn btn-secondary" id="btn-back" disabled>Back</button>
+            <button class="btn btn-primary" id="btn-next">Next</button>
+        </div>
+    </div>
+
+    <script>
+        let currentStep = 1;
+        const totalSteps = 5;
+        const config = {};
+
+        // Detect system resources
+        async function detectResources() {
+            try {
+                const response = await fetch('/api/system-info');
+                const info = await response.json();
+                
+                document.getElementById('cpu-cores').textContent = info.cpu_cores || '8';
+                document.getElementById('ram-gb').textContent = (info.ram_gb || '16') + ' GB';
+                document.getElementById('gpu-vram').textContent = (info.gpu_vram_gb || '0') + ' GB';
+                document.getElementById('disk-gb').textContent = (info.disk_gb || '500') + ' GB';
+                
+                config.resources = info;
+            } catch (error) {
+                console.error('Failed to detect resources:', error);
+                // Fallback values
+                document.getElementById('cpu-cores').textContent = '8';
+                document.getElementById('ram-gb').textContent = '16 GB';
+                document.getElementById('gpu-vram').textContent = '0 GB';
+                document.getElementById('disk-gb').textContent = '500 GB';
+            }
+        }
+
+        // Generate QR code
+        function generateQRCode() {
+            const peerId = '16Uiu8gK' + Math.random().toString(36).substring(2, 10);
+            const pairingCode = {
+                worker_peer_id: peerId,
+                controller_peer_id: '',
+                pairing_token: 'pair_' + Math.random().toString(36).substring(2, 15),
+                expires_at: Date.now() + 300000, // 5 minutes
+                node_name: document.getElementById('node-name').value
+            };
+
+            const qrData = JSON.stringify(pairingCode);
+            document.getElementById('pairing-code').textContent = qrData;
+            
+            // In real implementation, use QR library to render
+            document.getElementById('qr-code').textContent = '[QR Code Generated]';
+            
+            config.pairing = pairingCode;
+        }
+
+        // Update progress bar
+        function updateProgress() {
+            document.querySelectorAll('.progress-step').forEach(step => {
+                const stepNum = parseInt(step.dataset.step);
+                step.classList.remove('active', 'completed');
+                
+                if (stepNum < currentStep) {
+                    step.classList.add('completed');
+                } else if (stepNum === currentStep) {
+                    step.classList.add('active');
+                }
+            });
+
+            document.querySelectorAll('.step').forEach(step => {
+                step.classList.remove('active');
+                if (step.dataset.step == currentStep || step.dataset.step === 'success') {
+                    if (step.dataset.step == currentStep) {
+                        step.classList.add('active');
+                    }
+                }
+            });
+
+            document.getElementById('btn-back').disabled = currentStep === 1;
+            document.getElementById('btn-next').textContent = 
+                currentStep === totalSteps ? 'Complete' : 'Next';
+        }
+
+        // Navigation
+        document.getElementById('btn-next').addEventListener('click', () => {
+            if (currentStep === totalSteps) {
+                // Complete setup
+                saveConfig();
+                currentStep = 'success';
+                document.getElementById('btn-next').style.display = 'none';
+                document.getElementById('btn-back').style.display = 'none';
+            } else {
+                currentStep++;
+            }
+            updateProgress();
+
+            if (currentStep === 5) {
+                generateQRCode();
+            }
+        });
+
+        document.getElementById('btn-back').addEventListener('click', () => {
+            if (currentStep > 1) {
+                currentStep--;
+                updateProgress();
+            }
+        });
+
+        // Role selection
+        document.querySelectorAll('.role-card').forEach(card => {
+            card.addEventListener('click', () => {
+                document.querySelectorAll('.role-card').forEach(c => c.classList.remove('selected'));
+                card.classList.add('selected');
+                config.role = card.dataset.role;
+            });
+        });
+
+        // Identity restore toggle
+        document.querySelectorAll('input[name="identity"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                document.getElementById('restore-section').style.display = 
+                    e.target.value === 'restore' ? 'block' : 'none';
+            });
+        });
+
+        // Save configuration
+        function saveConfig() {
+            config.nodeName = document.getElementById('node-name').value;
+            config.p2pPort = parseInt(document.getElementById('p2p-port').value);
+            config.bootstrapPeers = document.getElementById('bootstrap-peers').value.split(',');
+            config.enableMdns = document.getElementById('enable-mdns').checked;
+
+            // POST to API
+            fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            }).then(() => {
+                console.log('Config saved');
+                // Redirect or start node
+                setTimeout(() => {
+                    window.location.href = '/dashboard';
+                }, 2000);
+            });
+        }
+
+        // Initialize
+        detectResources();
+        updateProgress();
+    </script>
+</body>
+</html>
