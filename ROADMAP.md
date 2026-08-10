@@ -52,8 +52,9 @@
 - [x] Q1: generation defaults (sampling + system prompt merged into
   requests), interactive model picker with memory-fit verdicts,
   dashboard lists every indexed model
-- [ ] Q2: fair FIFO queue for inference requests (position feedback,
-  queue depth on the dashboard)
+- [x] Q2: fair FIFO queue for inference requests — one request at a
+  time reaches the backend with full resources, 503/504 on full/timeout,
+  Queue card on the dashboard shows serving + waiting live
 - [ ] Q3: remote backend (`serve start --backend http://host:port`) —
   a weaker station keeps auth/tiers/queue while a stronger machine runs
   the model

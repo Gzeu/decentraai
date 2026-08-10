@@ -445,6 +445,7 @@ fn pick_model_interactively(registry: &ModelRegistry, config: &NodeConfig) -> Re
 /// dashboard on inference.bind_address:api_port.
 async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option<PathBuf>) -> Result<()> {
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
+    use decentraai_runtime::queue::InferenceQueue;
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
@@ -531,6 +532,12 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
         .tiers
         .as_ref()
         .map(|_| data_dir.join("db/tokens.json"));
+    // Q2: one request at a time reaches the backend with the machine's
+    // full resources; the waiting room and wait limit come from config.
+    let queue = InferenceQueue::new(
+        usize::from(config.inference.queue_max_requests),
+        Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
+    );
     let state = ApiState::new(
         backend_url,
         token.clone(),
@@ -538,6 +545,7 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
         info,
         token_store_path,
         config.tiers.clone(),
+        queue,
     );
     let api_addr =
         serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
@@ -561,9 +569,11 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
         "tiers: off (add a tiers: section to the config to enable subscriptions)"
     };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  Threads: {} (logical CPUs minus reserve)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
+        "DecentraAI inference running\n  Model: {}\n  Threads: {} (logical CPUs minus reserve)\n  Queue: FIFO, {} waiting slots, {}s wait limit (dashboard shows it live)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
         model_path.display(),
         runtime.threads.unwrap_or(0),
+        config.inference.queue_max_requests,
+        config.inference.request_timeout_seconds,
         api_addr,
         api_addr,
         auth_hint,
