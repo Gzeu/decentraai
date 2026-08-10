@@ -771,6 +771,7 @@ dependencies = [
  "axum",
  "decentraai-audit",
  "decentraai-config",
+ "decentraai-p2p",
  "decentraai-registry",
  "decentraai-system-probe",
  "hex",
