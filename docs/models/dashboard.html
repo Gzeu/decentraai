@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DecentraAI - Model Hub</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 2rem;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .search-bar {
+            background: white;
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 2rem;
+            display: flex;
+            gap: 1rem;
+        }
+
+        .search-bar input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 1rem;
+        }
+
+        .search-bar input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .search-bar button {
+            padding: 0.75rem 2rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .models-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .model-card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, box-shadow 0.2s;
+            cursor: pointer;
+        }
+
+        .model-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .model-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .model-name {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #1f2937;
+        }
+
+        .model-type {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .type-llm { background: #dbeafe; color: #1e40af; }
+        .type-embedding { background: #d1fae5; color: #065f46; }
+        .type-vision { background: #fee2e2; color: #991b1b; }
+        .type-multimodal { background: #fef3c7; color: #92400e; }
+
+        .model-description {
+            color: #6b7280;
+            margin-bottom: 1rem;
+            line-height: 1.5;
+        }
+
+        .model-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 0.75rem;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+
+        .stat-value {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #1f2937;
+        }
+
+        .version-tags {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .version-tag {
+            padding: 0.25rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .tag-stable { background: #10b981; color: white; }
+        .tag-canary { background: #f59e0b; color: white; }
+        .tag-latest { background: #667eea; color: white; }
+
+        .model-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #f3f4f6;
+            color: #374151;
+        }
+
+        .btn-secondary:hover {
+            background: #e5e7eb;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            max-width: 800px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .modal-header h2 {
+            font-size: 1.5rem;
+            color: #1f2937;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            font-size: 1.5rem;
+            cursor: pointer;
+            color: #6b7280;
+        }
+
+        .version-list {
+            margin-top: 1rem;
+        }
+
+        .version-item {
+            padding: 1rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .version-item:hover {
+            border-color: #667eea;
+            background: #f9fafb;
+        }
+
+        .version-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .version-name {
+            font-weight: 700;
+            color: #1f2937;
+        }
+
+        .version-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .metric {
+            font-size: 0.875rem;
+            color: #6b7280;
+        }
+
+        .metric strong {
+            color: #1f2937;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🧠 Model Hub</h1>
+            <p>Browse, compare, and manage models with version control</p>
+        </header>
+
+        <div class="search-bar">
+            <input type="text" id="search-input" placeholder="Search models (e.g., llama, mistral, embedding)...">
+            <button onclick="searchModels()">Search</button>
+        </div>
+
+        <div id="models-grid" class="models-grid">
+            <!-- Model cards injected by JS -->
+        </div>
+    </div>
+
+    <!-- Model Details Modal -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Model Name</h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="modal-body">
+                <!-- Version list injected by JS -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Sample models data
+        const models = [
+            {
+                name: "Llama 3",
+                type: "llm",
+                description: "Meta's latest large language model with excellent reasoning capabilities",
+                parameters: "8B",
+                context: "8K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 50, accuracy: 0.95 },
+                    { version: "v1.1.0", stable: false, canary: true, tps: 52, accuracy: 0.96 }
+                ]
+            },
+            {
+                name: "Mistral 7B",
+                type: "llm",
+                description: "High-performance open-source model with efficient architecture",
+                parameters: "7B",
+                context: "32K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 60, accuracy: 0.92 },
+                    { version: "v2.0.0", stable: false, canary: true, tps: 45, accuracy: 0.96 }
+                ]
+            },
+            {
+                name: "Qwen3.5",
+                type: "multimodal",
+                description: "Multimodal model with vision, text, and code understanding",
+                parameters: "4B",
+                context: "128K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 40, accuracy: 0.94 }
+                ]
+            },
+            {
+                name: "Gemma 4",
+                type: "llm",
+                description: "Google's efficient model optimized for speed and quality",
+                parameters: "2B",
+                context: "8K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 80, accuracy: 0.89 }
+                ]
+            },
+            {
+                name: "E5-Mistral",
+                type: "embedding",
+                description: "High-quality text embeddings for semantic search",
+                parameters: "7B",
+                context: "8K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 70, accuracy: 0.91 }
+                ]
+            },
+            {
+                name: "Phi-3",
+                type: "llm",
+                description: "Microsoft's small but powerful model for edge deployment",
+                parameters: "3.8B",
+                context: "128K",
+                quantization: "Q4_K_M",
+                versions: [
+                    { version: "v1.0.0", stable: true, canary: false, tps: 75, accuracy: 0.90 }
+                ]
+            }
+        ];
+
+        function renderModels(modelsToRender) {
+            const grid = document.getElementById('models-grid');
+            grid.innerHTML = modelsToRender.map(model => `
+                <div class="model-card" onclick="openModal('${model.name}')">
+                    <div class="model-header">
+                        <div class="model-name">${model.name}</div>
+                        <div class="model-type type-${model.type}">${model.type}</div>
+                    </div>
+                    <div class="model-description">${model.description}</div>
+                    <div class="model-stats">
+                        <div class="stat-item">
+                            <div class="stat-label">Parameters</div>
+                            <div class="stat-value">${model.parameters}</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Context</div>
+                            <div class="stat-value">${model.context}</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Quant</div>
+                            <div class="stat-value">${model.quantization}</div>
+                        </div>
+                    </div>
+                    <div class="version-tags">
+                        ${model.versions.map(v => `
+                            ${v.stable ? '<span class="version-tag tag-stable">Stable</span>' : ''}
+                            ${v.canary ? '<span class="version-tag tag-canary">Canary</span>' : ''}
+                            <span class="version-tag tag-latest">Latest: ${v.version}</span>
+                        `).join('')}
+                    </div>
+                    <div class="model-actions">
+                        <button class="btn btn-primary" onclick="openModal('${model.name}'); event.stopPropagation();">View Details</button>
+                        <button class="btn btn-secondary" onclick="pullModel('${model.name}'); event.stopPropagation();">Pull</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function openModal(modelName) {
+            const model = models.find(m => m.name === modelName);
+            if (!model) return;
+
+            document.getElementById('modal-title').textContent = model.name;
+            document.getElementById('modal-body').innerHTML = `
+                <p style="margin-bottom: 1.5rem; color: #6b7280;">${model.description}</p>
+                
+                <h3 style="margin-bottom: 1rem;">Available Versions</h3>
+                <div class="version-list">
+                    ${model.versions.map(v => `
+                        <div class="version-item">
+                            <div class="version-header">
+                                <div class="version-name">${v.version}</div>
+                                <div>
+                                    ${v.stable ? '<span class="version-tag tag-stable">Stable</span>' : ''}
+                                    ${v.canary ? '<span class="version-tag tag-canary">Canary</span>' : ''}
+                                </div>
+                            </div>
+                            <div class="version-metrics">
+                                <div class="metric"><strong>Speed:</strong> ${v.tps} tokens/s</div>
+                                <div class="metric"><strong>Accuracy:</strong> ${(v.accuracy * 100).toFixed(1)}%</div>
+                                <div class="metric"><strong>Size:</strong> ${model.parameters}</div>
+                                <div class="metric"><strong>Context:</strong> ${model.context}</div>
+                            </div>
+                            <div style="margin-top: 0.75rem; display: flex; gap: 0.5rem;">
+                                <button class="btn btn-primary" onclick="useVersion('${model.name}', '${v.version}')">Use This Version</button>
+                                <button class="btn btn-secondary" onclick="downloadVersion('${model.name}', '${v.version}')">Download</button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+
+            document.getElementById('modal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('active');
+        }
+
+        function searchModels() {
+            const query = document.getElementById('search-input').value.toLowerCase();
+            const filtered = models.filter(m => 
+                m.name.toLowerCase().includes(query) ||
+                m.description.toLowerCase().includes(query) ||
+                m.type.toLowerCase().includes(query)
+            );
+            renderModels(filtered);
+        }
+
+        function pullModel(modelName) {
+            alert(`Pulling ${modelName}... (latest stable version)`);
+        }
+
+        function useVersion(modelName, version) {
+            alert(`Set ${modelName}:${version} as default`);
+        }
+
+        function downloadVersion(modelName, version) {
+            alert(`Downloading ${modelName}:${version}...`);
+        }
+
+        // Initial render
+        renderModels(models);
+
+        // Close modal on outside click
+        document.getElementById('modal').addEventListener('click', (e) => {
+            if (e.target.id === 'modal') {
+                closeModal();
+            }
+        });
+
+        // Search on Enter
+        document.getElementById('search-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                searchModels();
+            }
+        });
+    </script>
+</body>
+</html>
