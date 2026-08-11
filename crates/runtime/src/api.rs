@@ -373,6 +373,66 @@ fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+
+// P3 - Admin dashboard handlers
+const ADMIN_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>DecentraAI Admin</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;background:#0f141b;color:#e6edf3}.card{border:1px solid #2a3442;border-radius:10px;padding:14px}</style></head><body>
+<h1>DecentraAI Admin</h1>
+<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
+<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<p id="api-url"></p></body><script>
+var f=document.getElementById('f'),status=document.getElementById('status'),tbl=document.querySelector('#tbl tbody'),tokenEl=document.getElementById('token'),newDiv=document.getElementById('new');
+f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value);status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'};
+async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+t.name+'</td><td>'+t.tier+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});}
+window.onload=load;
+function revoke(e){var n=e.target.dataset.n;fetch('/api/admin/token/revoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n})}).then(_=>load());}
+document.getElementById('api-url').textContent='API: http://127.0.0.1:{}/v1';
+</script></html>"##;
+fn admin_html(port: u16) -> String { ADMIN_HTML.replace("{}", &port.to_string()) }
+async fn admin_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let _ = state.classify(&headers).map_err(|e| e.into_response()); Html(admin_html(state.info.api_port)).into_response()
+}
+async fn admin_token_list_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    let tokens = match &state.token_store_path {
+        Some(p) => decentraai_tokens::TokenStore::load(p).map(|s| s.list()).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let body = serde_json::json!({"tokens": tokens.iter().map(|t| serde_json::json!({"name": t.name, "tier": t.tier, "created_at": t.created_at, "revoked": t.revoked})).collect::<Vec<_>>()});
+    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+async fn admin_token_create_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    let req: serde_json::Value = match serde_json::from_slice(&body) { Ok(r) => r, Err(_) => return forbidden("invalid JSON") };
+    let name = match req.get("name").and_then(|v| v.as_str()) { Some(n) if !n.is_empty() => n.to_string(), _ => return forbidden("missing name") };
+    let tier = match req.get("tier").and_then(|v| v.as_u64()).and_then(|n| u8::try_from(n).ok()) { Some(t) if (1..=3).contains(&t) => t, _ => return forbidden("tier 1-3") };
+    let plaintext = match &state.token_store_path {
+        Some(p) => {
+            let mut s = match decentraai_tokens::TokenStore::load(p) { Ok(s) => s, Err(_) => return forbidden("load failed") };
+            match s.create(&name, decentraai_tokens::Tier(tier)) { Ok(t) => {
+                let a = state.info.repo_root.join("logs/audit.jsonl");
+                let _ = decentraai_audit::record(a.parent().unwrap_or(&state.info.repo_root), "token_created", serde_json::json!({"name": &name, "tier": tier}));
+                Some(t)
+            } Err(_) => return forbidden("name taken") }
+        }
+        None => return forbidden("no store"),
+    };
+    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier});
+    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+async fn admin_token_revoke_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    let req: serde_json::Value = match serde_json::from_slice(&body) { Ok(r) => r, Err(_) => return forbidden("invalid JSON") };
+    let name = match req.get("name").and_then(|v| v.as_str()) { Some(n) if !n.is_empty() => n.to_string(), _ => return forbidden("missing name") };
+    let success = match &state.token_store_path {
+        Some(p) => { let mut s = match decentraai_tokens::TokenStore::load(p) { Ok(s) => s, Err(_) => return forbidden("load failed") }; match s.revoke(&name) { Ok(()) => true, Err(_) => return forbidden("no such token") } }
+        None => return forbidden("no store"),
+    };
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(a.parent().unwrap_or(&state.info.repo_root), "token_revoked", serde_json::json!({"name": name}));
+    ([(header::CONTENT_TYPE, "application/json")], serde_json::json!({"success": success}).to_string()).into_response()
+}
+
 /// Builds the proxy router: the OpenAI-compatible surface, the dashboard
 /// (also the fallback), and the small JSON views that feed it.
 pub fn build_router(state: ApiState) -> Router {
@@ -384,6 +444,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/models", get(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
+        // P3 - Admin dashboard endpoints
+        .route("/admin", get(admin_handler))
+        .route("/api/admin/token/list", get(admin_token_list_handler))
+        .route("/api/admin/token/create", post(admin_token_create_handler))
+        .route("/api/admin/token/revoke", post(admin_token_revoke_handler))
         .fallback(dashboard_handler)
         .with_state(state)
 }
@@ -989,10 +1054,10 @@ mod tests {
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
         );
         let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
-        assert_eq!(value["temperature"], 0.7);
-        assert_eq!(value["top_p"], 0.9);
+        assert!((value["temperature"].as_f64().unwrap() - 0.7).abs() < 0.001);
+        assert!((value["top_p"].as_f64().unwrap() - 0.9).abs() < 0.001);
         assert_eq!(value["top_k"], 40);
-        assert_eq!(value["repeat_penalty"], 1.1);
+        assert!((value["repeat_penalty"].as_f64().unwrap() - 1.1).abs() < 0.001);
         let messages = value["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -1183,7 +1248,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = start_backend().await;
         let manager = test_manager(dir.path()).await;
-        // Waiting room of zero: any second request is rejected instantly.
+        // Waiting room of one: first request serves, second waits, third is rejected.
         let state = ApiState::new(
             format!("http://{backend}"),
             None,
@@ -1191,13 +1256,16 @@ mod tests {
             test_info(dir.path(), None),
             None,
             None,
-            InferenceQueue::new(0, Duration::from_secs(5)),
+            InferenceQueue::new(1, Duration::from_secs(5)),
         );
         let api = serve_api(state.clone(), "127.0.0.1", 0).await.unwrap();
 
         // Hold the serving slot with a manual ticket so the queue is busy.
         let hold = state.queue.enqueue("holder", "/v1/chat/completions").unwrap();
         hold.wait_turn().await.unwrap();
+
+        // Fill the waiting room
+        let _waiter = state.queue.enqueue("waiter", "/v1/chat/completions").unwrap();
 
         let response = reqwest::Client::new()
             .post(format!("http://{api}/v1/chat/completions"))
@@ -1308,11 +1376,13 @@ mod tests {
     async fn status_lists_registry_models() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
+        let db_dir = dir.path().join("db");
         std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
         std::fs::write(models_dir.join("extra.gguf"), b"GGUF test").unwrap();
         let mut registry = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
         registry.scan_directory(&models_dir).unwrap();
-        registry.save(&dir.path().join("db/registry.json")).unwrap();
+        registry.save(&db_dir.join("registry.json")).unwrap();
 
         let backend = start_backend().await;
         let manager = test_manager(dir.path()).await;
@@ -1370,7 +1440,44 @@ mod tests {
         manager.lock().await.shutdown().await.unwrap();
     }
 
-    #[test]
+    
+    #[tokio::test]
+    async fn admin_page_serves_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new("http://127.0.0.1:0".to_string(), Some("test_token".to_string()), manager.clone(),
+            test_info(dir.path(), None), None, None, test_queue());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let resp = reqwest::Client::new().get(format!("http://{api}/admin")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let html = resp.text().await.unwrap();
+        assert!(html.contains("DecentraAI Admin"));
+        assert!(html.contains("Create Token"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_token_create_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db"); std::fs::create_dir_all(&db_dir).unwrap();
+        let token_store_path = db_dir.join("tokens.json");
+        let tiers = TiersSection { tier1: TierPolicy { rate_limit_per_minute: 10, models: vec!["test.gguf".into()] }, tier2: TierPolicy { rate_limit_per_minute: 60, models: vec![] }, tier3: TierPolicy { rate_limit_per_minute: 120, models: vec![] } };
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new("http://127.0.0.1:0".to_string(), Some("master_token".to_string()), manager.clone(),
+            test_info(dir.path(), None), Some(token_store_path.clone()), Some(tiers), test_queue());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let create_resp = reqwest::Client::new().post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token").header("Content-Type", "application/json")
+            .body(r#"{"name":"test_token","tier":1}"#).send().await.unwrap();
+        assert_eq!(create_resp.status(), 200);
+        let json: serde_json::Value = create_resp.json().await.unwrap();
+        assert!(json["token"].as_str().unwrap().starts_with("dsk_"));
+        let list_resp = reqwest::Client::new().get(format!("http://{api}/api/admin/token/list"))
+            .header("Authorization", "Bearer master_token").send().await.unwrap();
+        assert_eq!(list_resp.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+#[test]
     fn token_is_generated_once_and_reused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime/api.token");

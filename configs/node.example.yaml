@@ -22,10 +22,10 @@ storage:
   auto_seed_verified_models: false
 
 resources:
-  cpu_max_percent: 65
-  reserve_cpu_cores: 2
+  cpu_max_percent: 50
   memory_max_percent: 60
-  reserve_ram_mb: 4096
+  reserve_cpu_cores: 1
+  reserve_ram_mb: 2048
   gpu_enabled: "auto"
   gpu_max_vram_percent: 75
   reserve_vram_mb: 1536

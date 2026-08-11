@@ -83,7 +83,7 @@ mod tests {
         
         // Record metric
         monitoring.record_metric(
-            "cpu_usage".to_string(),
+            "cpu_usage_percent".to_string(),
             45.5,
             vec![("host".to_string(), "worker-1".to_string())]
         ).await;
@@ -93,6 +93,6 @@ mod tests {
         assert_eq!(logs.len(), 1);
         
         let metrics = monitoring.get_metrics().await;
-        assert!(metrics.system.cpu_usage > 0.0);
+        assert!(metrics.system.cpu_usage_percent > 0.0);
     }
 }

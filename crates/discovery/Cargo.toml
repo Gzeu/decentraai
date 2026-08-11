@@ -20,3 +20,7 @@ uuid.workspace = true
 
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

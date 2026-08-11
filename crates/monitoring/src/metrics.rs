@@ -40,8 +40,11 @@ impl MetricsCollector {
     pub fn record(&mut self, name: String, value: f64, labels: Vec<(String, String)>) {
         let key = format!("{}|{:?}", name, labels);
         
-        // Update current value
+        // Update current value with labels
         self.gauges.insert(key.clone(), value);
+        
+        // Also store by name alone for dashboard queries
+        self.gauges.insert(name.clone(), value);
         
         // Add to history
         self.history.push(Metric {
