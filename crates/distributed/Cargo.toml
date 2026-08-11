@@ -1,0 +1,27 @@
+[package]
+name = "decentraai-distributed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# Internal dependencies
+decentraai-config = { path = "../config" }
+decentraai-discovery = { path = "../discovery" }
+decentraai-identity = { path = "../identity" }
+decentraai-protocol = { path = "../protocol" }
+decentraai-p2p = { path = "../p2p" }

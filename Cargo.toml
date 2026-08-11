@@ -3,6 +3,7 @@ members = [
   "crates/audit",
   "crates/config",
   "crates/discovery",
+  "crates/distributed",
   "crates/identity",
   "crates/manifest",
   "crates/monitoring",

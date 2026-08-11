@@ -43,6 +43,7 @@ enum Command {
         command: TokenCommand,
     },
     Worker(WorkerArgs),
+    Distributed(DistributedArgs),
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -101,6 +102,15 @@ enum ServeCommand {
 struct WorkerArgs {
     #[arg(long)]
     name: String,
+}
+
+#[derive(Debug, Args)]
+struct DistributedArgs {
+    /// Model reference: registry relative path or direct file path.
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value = "configs/node.example.yaml")]
+    config: PathBuf,
 }
 #[derive(Debug, Args)]
 struct PullArgs {
@@ -174,6 +184,7 @@ async fn main() -> Result<()> {
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
         Command::Worker(args) => worker_command(args),
+        Command::Distributed(args) => distributed_command(args).await,
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -917,4 +928,105 @@ mod tests {
             "token revoke must parse"
         );
     }
+}
+
+/// Runs a distributed inference node (M9)
+///
+/// This command starts a node that can act as both a worker (serving models)
+/// and a client (routing requests to other workers).
+async fn distributed_command(args: DistributedArgs) -> Result<()> {
+    use decentraai_distributed::{DistributedInference, InferenceConfig};
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer};
+    use decentraai_identity::Identity;
+    use std::sync::Arc;
+
+    let config = NodeConfig::load(&args.config)
+        .with_context(|| format!("loading {}", args.config.display()))?;
+
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    if !identity_path.exists() {
+        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+    }
+    let identity = Identity::load(&identity_path)?;
+
+    // Load the registry if one exists; the node serves its models.
+    let registry_path = data_dir.join("db/registry.json");
+    let registry_handler = if registry_path.exists() {
+        let registry = ModelRegistry::load(&registry_path)
+            .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+        Some(Arc::new(RegistryServer::new(registry)) as Arc<dyn decentraai_p2p::RequestHandler>)
+    } else {
+        info!("no registry found; node will not serve models");
+        None
+    };
+
+    // Create P2P node
+    let p2p_node = P2PNode::new(
+        &identity,
+        config.network.max_message_bytes as usize,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        registry_handler.clone(),
+    )?;
+
+    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    let local_peer_id = p2p_node.local_peer_id();
+
+    // Create distributed inference coordinator
+    let distributed_config = InferenceConfig::default();
+    let mut distributed = DistributedInference::new(p2p_node, distributed_config)?;
+
+    // Track if we registered as a worker
+    let is_worker = args.model.is_some();
+
+    // If we have a model specified, register as a worker
+    if let Some(ref model) = args.model {
+        let registry = if registry_path.exists() {
+            ModelRegistry::load(&registry_path)?
+        } else {
+            anyhow::bail!("registry not found at {}; run 'decentraai registry scan' first", registry_path.display());
+        };
+        
+        let model_path = decentraai_runtime::resolve_model(&registry, model)?;
+        let model_name = model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model")
+            .to_string();
+        
+        // Calculate model hash
+        let model_hash = blake3::hash(&std::fs::read(&model_path)?)
+            .to_hex()
+            .to_string();
+        
+        // Register as worker
+        distributed.register_as_worker(
+            model_name,
+            vec![model_hash],
+            1.0, // Full capacity initially
+        )?;
+
+        // Start the runtime to serve the model
+        // In a full implementation, we would start the llama-server here
+        // For now, we just register as a worker that can accept requests
+        
+        info!(peer_id = %local_peer_id, "registered as distributed worker");
+    }
+
+    // Start worker discovery
+    distributed.start_worker_discovery().await?;
+
+    println!(
+        "DecentraAI distributed node running\n  PeerId: {}\n  Listening: {}/p2p/{}\n  Mode: {}",
+        local_peer_id,
+        bound,
+        local_peer_id,
+        if is_worker { "worker" } else { "client" }
+    );
+
+    // Keep running until interrupted
+    tokio::signal::ctrl_c().await?;
+    
+    distributed.shutdown();
+    Ok(())
 }

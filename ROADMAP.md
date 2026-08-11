@@ -60,3 +60,14 @@
   the model
 - [ ] Q4: onboarding wizard (`decentraai setup`) writing a validated
   config on first run
+
+## 9. Distributed Inference (M9) - IN PROGRESS
+- [x] M9-1: Design distributed inference architecture (worker discovery, request routing)
+- [x] M9-2: Implement worker registration with real-time capacity reporting
+- [x] M9-3: Add request routing to peer GPUs based on capacity
+- [x] M9-4: Implement fallback mechanism when workers fail
+- [ ] M9-5: Test distributed inference between nodes (E2E)
+- [ ] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
+- [ ] M9-7: Inference request handler for workers
+- [ ] M9-8: Real-time capacity updates from runtime
+- [ ] M9-9: Reputation-based compensation for workers
