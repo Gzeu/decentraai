@@ -17,6 +17,7 @@ Free, contribution-tiered subscriptions gate models and request rates per token.
 | M6 | Hardening: quarantine workflow, audit logging | Done |
 | M7 | Sharing + UX: peer catalog, `decentraai pull`, live web dashboard | Done |
 | M8 | Packaging: `scripts/install.sh` + [deployment guide](docs/deployment.md) | Done |
+| M9 | Distributed inference: route requests to peer GPUs, paid in reputation | Done |
 | P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
 | P2 | Chat UI in the dashboard | Next |
 
@@ -181,9 +182,50 @@ to logical CPUs minus the configured reserve, `--flash-attn on`,
 
 - GGUF models only (matches the verification capability)
 - Dashboard binds to loopback only (no LAN exposure yet)
-- Remote inference between nodes is not enabled yet (private-swarm first)
+- Remote inference between nodes is partially enabled via distributed mode (see below)
 - After idle unload, restart `serve` to reload the model
 - Token usage counters are in-memory (persistence lands with P3)
+
+### M9: Distributed Inference (P2P request routing)
+
+DecentraAI now supports distributed inference across the P2P network. Nodes can
+register as workers to serve models and route inference requests to peer GPUs.
+Work is compensated in reputation.
+
+**Start a distributed node** (acts as both worker and client):
+
+```bash
+decentraai distributed start --model tinyllama.gguf
+# prints: DecentraAI distributed node running
+#         PeerId: 12D3KooW...
+#         Listening: /ip4/0.0.0.0/tcp/<PORT>/p2p/12D3KooW...
+#         Mode: worker
+```
+
+**Distributed node modes:**
+- **worker**: Serves models for inference (requires `--model`)
+- **client**: Routes requests to other workers (no `--model`)
+
+**Key features:**
+- Worker discovery and real-time capacity reporting
+- Intelligent request routing based on worker capacity, latency, and throughput
+- Automatic fallback to alternative workers when primary workers fail
+- Request queue management with FIFO processing and timeout handling
+- Reputation-based compensation for worker contributions
+
+**Configuration options:**
+```bash
+# Custom configuration file
+decentraai distributed start --config custom.yaml --model my-model.gguf
+
+# Multiple models
+decentraai distributed start --model model1.gguf --model model2.gguf
+```
+
+**Monitoring:**
+The distributed node exposes the same dashboard at `http://127.0.0.1:8080/` with
+additional distributed inference metrics including worker count, queued requests,
+and routing statistics.
 
 ## CLI quick reference
 
@@ -197,6 +239,8 @@ decentraai swarm start --config <path>          # serve + announce models on the
 decentraai pull --from <multiaddr> --list       # browse a peer's catalog
 decentraai pull --from <multiaddr> --model <f>  # verified download from a peer
 decentraai serve start --model <name>           # gated inference + dashboard :8080
+decentraai distributed start --model <name>     # distributed inference node (worker mode)
+decentraai distributed start                    # distributed inference node (client mode)
 decentraai token create --name <n> --tier 1..3  # issue a subscription token
 decentraai token list                           # show issued tokens
 decentraai token revoke --name <n>              # revoke (effective next request)
@@ -230,6 +274,7 @@ decentraai token revoke --name <n>              # revoke (effective next request
 
 - `crates/audit` — append-only security audit log
 - `crates/config` — typed YAML configuration with validation (incl. tiers)
+- `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, fallback handling
 - `crates/identity` — Ed25519 keypairs and PeerId derivation
 - `crates/manifest` — GGUF manifests: chunk hashes, Merkle root, atomic writes
 - `crates/protocol` — swarm message schemas (incl. catalog) and canonical signing
