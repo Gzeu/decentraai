@@ -6,7 +6,7 @@
 //! - Tracking queue depth per worker for capacity management
 
 use libp2p::PeerId;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -187,6 +187,10 @@ pub struct RequestQueueManager {
     default_max_depth: usize,
     /// Global timeout for requests
     default_timeout: Duration,
+    /// In-flight requests currently being processed: request_id -> worker
+    in_flight: Arc<Mutex<HashMap<Uuid, PeerId>>>,
+    /// Requests that have been cancelled while in-flight
+    cancelled: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl RequestQueueManager {
@@ -195,6 +199,8 @@ impl RequestQueueManager {
             queues: Arc::new(Mutex::new(HashMap::new())),
             default_max_depth,
             default_timeout,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            cancelled: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -248,7 +254,16 @@ impl RequestQueueManager {
     pub async fn dequeue_request(&self, worker_peer_id: &PeerId) -> Option<QueuedRequest> {
         let queue = self.get_queue(worker_peer_id).await?;
         let mut queue_lock = queue.lock().await;
-        queue_lock.dequeue()
+        if let Some(req) = queue_lock.dequeue() {
+            // Mark worker as processing
+            queue_lock.set_processing(true);
+            // Register in-flight
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.insert(req.request_id, worker_peer_id.clone());
+            Some(req)
+        } else {
+            None
+        }
     }
 
     /// Gets the current queue depth for a worker
@@ -276,18 +291,24 @@ impl RequestQueueManager {
 
     /// Removes a request from any queue by its ID
     pub async fn cancel_request(&self, request_id: Uuid) -> bool {
+        // First try to remove from queued requests
         let queues = self.queues.lock().await;
-        let mut cancelled = false;
-
         for queue_arc in queues.values() {
             let mut queue_lock = queue_arc.lock().await;
             if queue_lock.remove(request_id).is_some() {
-                cancelled = true;
-                break;
+                return true;
             }
         }
 
-        cancelled
+        // If not queued, mark as cancelled if in-flight
+        let mut in_flight = self.in_flight.lock().await;
+        if in_flight.contains_key(&request_id) {
+            let mut cancelled = self.cancelled.lock().await;
+            cancelled.insert(request_id);
+            return true;
+        }
+
+        false
     }
 
     /// Removes all timed out requests from all queues
@@ -301,6 +322,32 @@ impl RequestQueueManager {
         }
 
         timed_out
+    }
+
+    /// Marks a previously-dequeued in-flight request as completed. This
+    /// clears the in-flight marker and updates the worker's processing flag.
+    pub async fn complete_request(&self, request_id: Uuid) -> bool {
+        let mut in_flight = self.in_flight.lock().await;
+        if let Some(worker) = in_flight.remove(&request_id) {
+            // Clear processing flag for the worker if its queue exists
+            if let Some(queue_arc) = self.get_queue(&worker).await {
+                let mut queue_lock = queue_arc.lock().await;
+                queue_lock.set_processing(false);
+            }
+            // Ensure cancelled set no longer holds this id
+            let mut cancelled = self.cancelled.lock().await;
+            cancelled.remove(&request_id);
+            return true;
+        }
+        false
+    }
+
+    /// Returns true if the given request has been marked cancelled while
+    /// in-flight. Callers (processing code) should check this and abort
+    /// work if true to ensure single terminal event semantics.
+    pub async fn is_cancelled(&self, request_id: Uuid) -> bool {
+        let cancelled = self.cancelled.lock().await;
+        cancelled.contains(&request_id)
     }
 
     /// Gets all worker peer IDs that have queues
@@ -402,5 +449,49 @@ mod tests {
 
         // Should be timed out now
         assert!(queued.is_timed_out());
+    }
+
+    #[test]
+    fn test_cancel_queued_and_inflight() {
+        let manager = RequestQueueManager::new(10, Duration::from_secs(60));
+        let peer_id = create_test_peer_id();
+        let req = create_test_request();
+        let req_id = req.request_id;
+
+        // Queue the request
+        let queued = futures::executor::block_on(manager.queue_request(req.clone(), peer_id));
+        assert!(queued);
+
+        // Cancel while queued - should remove and return true
+        let cancelled = futures::executor::block_on(manager.cancel_request(req_id));
+        assert!(cancelled, "cancel of queued request should succeed");
+        let total = futures::executor::block_on(manager.total_queued());
+        assert_eq!(total, 0, "queue should be empty after cancellation");
+
+        // Re-queue and dequeue to simulate in-flight
+        let _ = futures::executor::block_on(manager.queue_request(req.clone(), peer_id));
+        let dequeued = futures::executor::block_on(manager.dequeue_request(&peer_id));
+        assert!(dequeued.is_some());
+
+        // Cancel in-flight: should mark as cancelled
+        let cancelled_inflight = futures::executor::block_on(manager.cancel_request(req_id));
+        assert!(
+            cancelled_inflight,
+            "cancel of in-flight request should mark cancelled"
+        );
+        let is_cancelled = futures::executor::block_on(manager.is_cancelled(req_id));
+        assert!(
+            is_cancelled,
+            "request should be marked cancelled while in-flight"
+        );
+
+        // Completing the request should clear in-flight and cancelled markers
+        let completed = futures::executor::block_on(manager.complete_request(req_id));
+        assert!(completed, "complete_request should succeed");
+        let is_cancelled_after = futures::executor::block_on(manager.is_cancelled(req_id));
+        assert!(
+            !is_cancelled_after,
+            "cancelled flag should be cleared after completion"
+        );
     }
 }
