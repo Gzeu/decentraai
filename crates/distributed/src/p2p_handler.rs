@@ -106,6 +106,7 @@ mod tests {
     use decentraai_p2p::RequestHandler;
     use decentraai_protocol::{WorkerAnnouncement, deserialize_message, serialize_message};
     use libp2p::identity::Keypair;
+    use chrono::Utc;
 
     fn create_test_peer_id() -> libp2p::PeerId {
         let keypair = Keypair::generate_ed25519();
@@ -147,7 +148,9 @@ mod tests {
         let handler = DistributedP2PHandler::with_infer_handler(move |request| {
             Ok(InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
+                completed_at: Utc::now().to_rfc3339(),
                 output: "test output".to_string(),
                 tokens_used: 10,
                 processing_time_ms: 100,
@@ -191,7 +194,9 @@ mod tests {
             move |request: InferRequest| {
                 Ok(InferResponse {
                     request_id: request.request_id,
+                    trace_id: request.trace_id.clone(),
                     worker_peer_id: peer_id,
+                    completed_at: Utc::now().to_rfc3339(),
                     output: format!("Processed: {}", request.prompt),
                     tokens_used: request.max_tokens,
                     processing_time_ms: 50,
@@ -244,7 +249,9 @@ mod tests {
 
             Ok(InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
+                completed_at: Utc::now().to_rfc3339(),
                 output: "completed".to_string(),
                 tokens_used: 100,
                 processing_time_ms: 10,
@@ -282,7 +289,9 @@ mod tests {
             }
             Ok(InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
+                completed_at: Utc::now().to_rfc3339(),
                 output: "test".to_string(),
                 tokens_used: 0,
                 processing_time_ms: 0,
@@ -317,7 +326,9 @@ mod tests {
             }
             Ok(InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
+                completed_at: Utc::now().to_rfc3339(),
                 output: "test".to_string(),
                 tokens_used: 0,
                 processing_time_ms: 0,
