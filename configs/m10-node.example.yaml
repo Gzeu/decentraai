@@ -1,0 +1,37 @@
+# Copy to a node-specific config and replace all placeholder values.
+node:
+  name: m10-node
+  data_dir: ./data
+  bind_address: 0.0.0.0
+  api_port: 8080
+  p2p_port: 4001
+
+identity:
+  key_path: ./data/identity/key.pem
+
+security:
+  require_authenticated_workers: true
+  announcement_max_age_seconds: 120
+  replay_window_seconds: 300
+  max_prompt_bytes: 200000
+  max_output_tokens: 8192
+  max_request_timeout_ms: 300000
+  rate_limit_requests_per_minute: 60
+
+inference:
+  backend: openai_compatible
+  base_url: http://127.0.0.1:8081
+  model: local-model
+  connect_timeout_ms: 3000
+  request_timeout_ms: 300000
+  stream: true
+
+queue:
+  max_depth_per_worker: 100
+  cleanup_interval_ms: 1000
+
+observability:
+  json_logs: true
+  metrics_enabled: true
+  audit_enabled: true
+  redact_prompts: true
