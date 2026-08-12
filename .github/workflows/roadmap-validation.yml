@@ -1,0 +1,20 @@
+name: Roadmap validation
+
+on:
+  push:
+    branches: [main, 'feature/m10-inference-vertical-slice']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-roadmap:
+    name: Validate roadmap tracker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate steps 1-345
+        run: python3 scripts/validate_roadmap.py
