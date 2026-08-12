@@ -1030,7 +1030,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 worker_peer_id: local_peer_id_clone,
                 output: response.output,
                 tokens_used: response.tokens_used.unwrap_or(0),
-                time_ms: elapsed_ms,
+                processing_time_ms: elapsed_ms,
                 success: true,
                 error: None,
             })
