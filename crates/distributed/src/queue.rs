@@ -388,17 +388,8 @@ mod tests {
 
     #[test]
     fn test_queued_request_timeout() {
-        let request = InferRequest {
-            request_id: Uuid::new_v4(),
-            model_hash: "test".to_string(),
-            prompt: "test".to_string(),
-            max_tokens: 100,
-            temperature: 0.7,
-            top_p: 0.9,
-            timeout_ms: 100, // 100ms timeout
-            stream: false,
-            priority: 128,
-        };
+        let mut request = create_test_request();
+        request.timeout_ms = 100; // 100ms timeout
 
         let peer_id = create_test_peer_id();
         let queued = QueuedRequest::new(request, peer_id);
