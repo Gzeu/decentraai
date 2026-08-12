@@ -1027,7 +1027,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             // Build successful response
             Ok(decentraai_protocol::InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: local_peer_id_clone,
+                completed_at: chrono::Utc::now().to_rfc3339(),
                 output: response.output,
                 tokens_used: response.tokens_used.unwrap_or(0),
                 processing_time_ms: elapsed_ms,
