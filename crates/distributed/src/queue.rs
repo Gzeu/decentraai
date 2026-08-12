@@ -9,8 +9,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use libp2p::PeerId;
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tokio::sync::Mutex;
+use tracing::warn;
 use uuid::Uuid;
 
 use decentraai_protocol::{InferRequest, InferResponse};
@@ -147,7 +147,6 @@ impl WorkerRequestQueue {
     /// Removes all timed out requests
     pub fn remove_timed_out(&mut self) -> Vec<QueuedRequest> {
         let mut timed_out = Vec::new();
-        let now = Instant::now();
         
         // Filter out timed out requests
         self.requests.retain(|req| {
@@ -179,10 +178,11 @@ impl WorkerRequestQueue {
 }
 
 /// Manages all request queues for distributed workers
+/// Uses Arc<Mutex<HashMap>> for shared state across all accesses
 #[derive(Debug)]
 pub struct RequestQueueManager {
-    /// Map of worker peer ID to their queue
-    queues: RwLock<HashMap<PeerId, WorkerRequestQueue>>,
+    /// Map of worker peer ID to their queue - shared mutable state
+    queues: Arc<Mutex<HashMap<PeerId, Arc<Mutex<WorkerRequestQueue>>>>>,
     /// Maximum queue depth per worker (default)
     default_max_depth: usize,
     /// Global timeout for requests
@@ -192,7 +192,7 @@ pub struct RequestQueueManager {
 impl RequestQueueManager {
     pub fn new(default_max_depth: usize, default_timeout: Duration) -> Self {
         Self {
-            queues: RwLock::new(HashMap::new()),
+            queues: Arc::new(Mutex::new(HashMap::new())),
             default_max_depth,
             default_timeout,
         }
@@ -204,28 +204,25 @@ impl RequestQueueManager {
     }
 
     /// Gets or creates a queue for a worker
+    /// Returns a shared reference to the queue (same Arc for all callers)
     pub async fn get_or_create_queue(&self, peer_id: PeerId) -> Arc<Mutex<WorkerRequestQueue>> {
-        let mut queues = self.queues.write().await;
+        let mut queues = self.queues.lock().await;
         
-        if !queues.contains_key(&peer_id) {
-            let queue = WorkerRequestQueue::new(peer_id, self.default_max_depth);
-            queues.insert(peer_id, queue);
+        // Check if queue already exists
+        if let Some(queue_arc) = queues.get(&peer_id) {
+            return queue_arc.clone();
         }
-
-        // Return an Arc<Mutex<...>> for thread-safe access
-        // Note: This is a simplification; in production, we'd want to avoid
-        // cloning the queue or use a different locking strategy
-        let queue = queues.get(&peer_id).unwrap().clone();
-        Arc::new(Mutex::new(queue))
+        
+        // Create new queue with shared state
+        let queue = Arc::new(Mutex::new(WorkerRequestQueue::new(peer_id, self.default_max_depth)));
+        queues.insert(peer_id, queue.clone());
+        queue
     }
 
     /// Gets a queue for a worker if it exists
     pub async fn get_queue(&self, peer_id: &PeerId) -> Option<Arc<Mutex<WorkerRequestQueue>>> {
-        let queues = self.queues.read().await;
-        queues.get(peer_id).map(|q| {
-            let queue = q.clone();
-            Arc::new(Mutex::new(queue))
-        })
+        let queues = self.queues.lock().await;
+        queues.get(peer_id).cloned()
     }
 
     /// Queues a request for a specific worker
@@ -263,17 +260,21 @@ impl RequestQueueManager {
 
     /// Gets the total number of queued requests across all workers
     pub async fn total_queued(&self) -> usize {
-        let queues = self.queues.read().await;
-        queues.values().map(|q| q.len()).sum()
+        let queues = self.queues.lock().await;
+        queues.values().map(|q| {
+            let queue_lock = q.blocking_lock();
+            queue_lock.len()
+        }).sum()
     }
 
     /// Removes a request from any queue by its ID
     pub async fn cancel_request(&self, request_id: Uuid) -> bool {
-        let mut queues = self.queues.write().await;
+        let queues = self.queues.lock().await;
         let mut cancelled = false;
         
-        for (_, queue) in queues.iter_mut() {
-            if queue.remove(request_id).is_some() {
+        for (_, queue_arc) in queues.iter() {
+            let mut queue_lock = queue_arc.lock().await;
+            if queue_lock.remove(request_id).is_some() {
                 cancelled = true;
                 break;
             }
@@ -284,11 +285,12 @@ impl RequestQueueManager {
 
     /// Removes all timed out requests from all queues
     pub async fn cleanup_timed_out(&self) -> Vec<QueuedRequest> {
-        let mut queues = self.queues.write().await;
+        let queues = self.queues.lock().await;
         let mut timed_out = Vec::new();
         
-        for (_, queue) in queues.iter_mut() {
-            timed_out.extend(queue.remove_timed_out());
+        for (_, queue_arc) in queues.iter() {
+            let mut queue_lock = queue_arc.lock().await;
+            timed_out.extend(queue_lock.remove_timed_out());
         }
         
         timed_out
@@ -296,7 +298,7 @@ impl RequestQueueManager {
 
     /// Gets all worker peer IDs that have queues
     pub async fn workers_with_queues(&self) -> Vec<PeerId> {
-        let queues = self.queues.read().await;
+        let queues = self.queues.lock().await;
         queues.keys().cloned().collect()
     }
 
