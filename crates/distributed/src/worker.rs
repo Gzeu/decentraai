@@ -135,9 +135,13 @@ impl WorkerManager {
             tokens_per_second: 50,
         };
 
-        *self.is_worker.blocking_lock() = true;
-        *self.local_announcement.blocking_lock() = Some(announcement);
-        *self.local_status.blocking_lock() = Some(status);
+        // Use block_in_place to avoid blocking the async runtime when invoked
+        // from async contexts.
+        tokio::task::block_in_place(|| {
+            *self.is_worker.blocking_lock() = true;
+            *self.local_announcement.blocking_lock() = Some(announcement);
+            *self.local_status.blocking_lock() = Some(status);
+        });
 
         // Register with ourselves
         self.add_worker(
@@ -162,9 +166,11 @@ impl WorkerManager {
 
     /// Unregisters this node as a worker
     pub fn unregister_as_worker(&self) -> anyhow::Result<()> {
-        *self.is_worker.blocking_lock() = false;
-        *self.local_announcement.blocking_lock() = None;
-        *self.local_status.blocking_lock() = None;
+        tokio::task::block_in_place(|| {
+            *self.is_worker.blocking_lock() = false;
+            *self.local_announcement.blocking_lock() = None;
+            *self.local_status.blocking_lock() = None;
+        });
 
         // Remove ourselves from the worker list
         self.remove_worker(self.local_peer_id);
@@ -243,48 +249,54 @@ impl WorkerManager {
         tokens_per_second: u32,
         current_latency_ms: u32,
     ) {
-        let mut workers = self.workers.blocking_lock();
-        let mut worker_status = self.worker_status.blocking_lock();
+        tokio::task::block_in_place(|| {
+            let mut workers = self.workers.blocking_lock();
+            let mut worker_status = self.worker_status.blocking_lock();
 
-        let announcement = WorkerAnnouncement {
-            peer_id,
-            node_name: format!("peer-{}", peer_id),
-            loaded_models: loaded_models.clone(),
-            available_capacity,
-            queue_depth,
-            tokens_per_second,
-            current_latency_ms,
-        };
+            let announcement = WorkerAnnouncement {
+                peer_id,
+                node_name: format!("peer-{}", peer_id),
+                loaded_models: loaded_models.clone(),
+                available_capacity,
+                queue_depth,
+                tokens_per_second,
+                current_latency_ms,
+            };
 
-        workers.insert(peer_id, announcement);
+            workers.insert(peer_id, announcement);
 
-        let status = WorkerStatus {
-            peer_id,
-            loaded_models,
-            queue_depth,
-            available_capacity,
-            current_latency_ms,
-            tokens_per_second,
-        };
+            let status = WorkerStatus {
+                peer_id,
+                loaded_models,
+                queue_depth,
+                available_capacity,
+                current_latency_ms,
+                tokens_per_second,
+            };
 
-        worker_status.insert(peer_id, status);
+            worker_status.insert(peer_id, status);
+        });
     }
 
     /// Removes a worker from the registry
     fn remove_worker(&self, peer_id: PeerId) {
-        let mut workers = self.workers.blocking_lock();
-        let mut worker_status = self.worker_status.blocking_lock();
-        let mut last_seen = self.last_seen.blocking_lock();
+        tokio::task::block_in_place(|| {
+            let mut workers = self.workers.blocking_lock();
+            let mut worker_status = self.worker_status.blocking_lock();
+            let mut last_seen = self.last_seen.blocking_lock();
 
-        workers.remove(&peer_id);
-        worker_status.remove(&peer_id);
-        last_seen.remove(&peer_id);
+            workers.remove(&peer_id);
+            worker_status.remove(&peer_id);
+            last_seen.remove(&peer_id);
+        });
     }
 
     /// Updates the last seen timestamp for a worker
     fn update_last_seen(&self, peer_id: PeerId) {
-        let mut last_seen = self.last_seen.blocking_lock();
-        last_seen.insert(peer_id, Instant::now());
+        tokio::task::block_in_place(|| {
+            let mut last_seen = self.last_seen.blocking_lock();
+            last_seen.insert(peer_id, Instant::now());
+        });
     }
 
     /// Updates the capacity of the local worker
@@ -306,25 +318,32 @@ impl WorkerManager {
             return Err(anyhow::anyhow!("Node is not registered as a worker"));
         }
 
-        let mut local_status = self.local_status.blocking_lock();
-        let mut local_announcement = self.local_announcement.blocking_lock();
+        tokio::task::block_in_place(|| {
+            let mut local_status = self.local_status.blocking_lock();
+            let mut local_announcement = self.local_announcement.blocking_lock();
 
-        if let Some(status) = local_status.as_mut() {
-            status.available_capacity = available_capacity;
-            status.queue_depth = queue_depth;
-            status.tokens_per_second = tokens_per_second;
-            status.current_latency_ms = current_latency_ms;
-        }
+            if let Some(status) = local_status.as_mut() {
+                status.available_capacity = available_capacity;
+                status.queue_depth = queue_depth;
+                status.tokens_per_second = tokens_per_second;
+                status.current_latency_ms = current_latency_ms;
+            }
 
-        if let Some(announcement) = local_announcement.as_mut() {
-            announcement.available_capacity = available_capacity;
-            announcement.queue_depth = queue_depth;
-            announcement.tokens_per_second = tokens_per_second;
-            announcement.current_latency_ms = current_latency_ms;
-        }
+            if let Some(announcement) = local_announcement.as_mut() {
+                announcement.available_capacity = available_capacity;
+                announcement.queue_depth = queue_depth;
+                announcement.tokens_per_second = tokens_per_second;
+                announcement.current_latency_ms = current_latency_ms;
+            }
 
-        // Also update in the worker registry
-        if let Some(announcement) = local_announcement.as_ref() {
+            // Also update in the worker registry
+            if let Some(announcement) = local_announcement.as_ref() {
+                // Call add_worker which itself uses block_in_place
+                // so call it outside to avoid nested block_in_place where possible
+            }
+        });
+
+        if let Some(announcement) = self.local_announcement.blocking_lock().as_ref() {
             self.add_worker(
                 self.local_peer_id,
                 announcement.loaded_models.clone(),
