@@ -947,6 +947,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "chrono",
  "clap",
  "decentraai-audit",
  "decentraai-config",
@@ -1002,6 +1003,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-identity",
