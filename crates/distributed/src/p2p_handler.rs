@@ -338,17 +338,7 @@ mod tests {
         });
 
         // Request with empty prompt
-        let request = InferRequest {
-            request_id: uuid::Uuid::new_v4(),
-            model_hash: "hash".to_string(),
-            prompt: "".to_string(),
-            max_tokens: 100,
-            temperature: 0.7,
-            top_p: 0.9,
-            timeout_ms: 30000,
-            stream: false,
-            priority: 128,
-        };
+        let request = InferRequest::new("hash".to_string(), "".to_string(), 100);
         let payload = serialize_message(&request).unwrap();
         let result = handler.handle(&payload);
 
@@ -371,7 +361,9 @@ mod tests {
             if request.model_hash == "error-model" {
                 return Ok(InferResponse {
                     request_id: request.request_id,
+                    trace_id: request.trace_id.clone(),
                     worker_peer_id: peer_id,
+                    completed_at: Utc::now().to_rfc3339(),
                     output: "".to_string(),
                     tokens_used: 0,
                     processing_time_ms: 0,
@@ -381,7 +373,9 @@ mod tests {
             }
             Ok(InferResponse {
                 request_id: request.request_id,
+                trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
+                completed_at: Utc::now().to_rfc3339(),
                 output: "success".to_string(),
                 tokens_used: 10,
                 processing_time_ms: 10,
