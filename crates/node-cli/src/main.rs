@@ -936,8 +936,10 @@ mod tests {
 /// and a client (routing requests to other workers).
 async fn distributed_command(args: DistributedArgs) -> Result<()> {
     use decentraai_distributed::{DistributedInference, InferenceConfig};
-    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer};
+    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer, ChainedHandler};
     use decentraai_identity::Identity;
+    use libp2p::identity::Keypair as Libp2pKeypair;
+    use libp2p::PeerId as Libp2pPeerId;
     use std::sync::Arc;
 
     let config = NodeConfig::load(&args.config)
@@ -949,32 +951,61 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
     }
     let identity = Identity::load(&identity_path)?;
+    
+    // Derive the libp2p peer_id from the identity's signing key
+    // This ensures we use the same peer_id that P2PNode will use
+    let keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
+        .expect("Failed to create libp2p keypair from identity");
+    let local_peer_id = Libp2pPeerId::from(keypair.public());
 
     // Load the registry if one exists; the node serves its models.
     let registry_path = data_dir.join("db/registry.json");
-    let registry_handler = if registry_path.exists() {
+    
+    // Track if we'll register as a worker
+    let will_be_worker = args.model.is_some();
+    
+    // Create worker manager with the libp2p peer_id
+    let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
+        local_peer_id,
+        decentraai_distributed::InferenceConfig::default(),
+    ));
+    
+    let distributed_handler = decentraai_distributed::DistributedP2PHandler::with_worker_manager(
+        worker_manager.clone(),
+    );
+    
+    // Create a chained handler for manifest, distributed, and other messages
+    let mut chained_handler = ChainedHandler::new();
+    
+    // Add distributed handler first (for worker announcements and inference requests)
+    chained_handler = chained_handler.add_handler(Arc::new(distributed_handler));
+    
+    // Add registry handler if registry exists
+    if registry_path.exists() {
         let registry = ModelRegistry::load(&registry_path)
             .with_context(|| format!("loading registry from {}", registry_path.display()))?;
-        Some(Arc::new(RegistryServer::new(registry)) as Arc<dyn decentraai_p2p::RequestHandler>)
-    } else {
-        info!("no registry found; node will not serve models");
-        None
-    };
+        chained_handler = chained_handler.add_handler(Arc::new(RegistryServer::new(registry)));
+    } else if will_be_worker {
+        anyhow::bail!("registry not found at {}; run 'decentraai registry scan' first", registry_path.display());
+    }
 
-    // Create P2P node
+    // Create P2P node with chained handler
     let p2p_node = P2PNode::new(
         &identity,
         config.network.max_message_bytes as usize,
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
-        registry_handler.clone(),
+        Some(Arc::new(chained_handler)),
     )?;
 
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
-    let local_peer_id = p2p_node.local_peer_id();
 
-    // Create distributed inference coordinator
+    // Create distributed inference coordinator with the shared worker manager
     let distributed_config = InferenceConfig::default();
-    let mut distributed = DistributedInference::new(p2p_node, distributed_config)?;
+    let mut distributed = DistributedInference::new(
+        p2p_node,
+        distributed_config,
+        Some(worker_manager.clone()),
+    )?;
 
     // Track if we registered as a worker
     let is_worker = args.model.is_some();
@@ -1001,16 +1032,38 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         
         // Register as worker
         distributed.register_as_worker(
-            model_name,
-            vec![model_hash],
+            model_name.clone(),
+            vec![model_hash.clone()],
             1.0, // Full capacity initially
         )?;
 
-        // Start the runtime to serve the model
-        // In a full implementation, we would start the llama-server here
-        // For now, we just register as a worker that can accept requests
+        // Create an inference handler for this worker
+        // For now, this is a mock handler that returns a simple response
+        // In a full implementation, this would forward to the local llama-server
+        let model_hash_for_handler = model_hash.clone();
+        let infer_handler = move |request: decentraai_protocol::InferRequest| -> anyhow::Result<decentraai_protocol::InferResponse> {
+            // Check if we can serve this model
+            if request.model_hash != model_hash_for_handler {
+                anyhow::bail!("Model not available on this worker");
+            }
+            
+            // Mock inference - in production, this would call the local inference engine
+            Ok(decentraai_protocol::InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: local_peer_id,
+                output: format!("Mock response for: {}", request.prompt),
+                tokens_used: request.max_tokens,
+                time_ms: 100,
+                success: true,
+                error: None,
+            })
+        };
         
-        info!(peer_id = %local_peer_id, "registered as distributed worker");
+        // Create a distributed P2P handler and add it to the chained handler
+        // Note: This requires modifying the P2P node to add the handler after creation
+        // For now, we'll broadcast our worker status periodically
+        
+        info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
 
     // Start worker discovery

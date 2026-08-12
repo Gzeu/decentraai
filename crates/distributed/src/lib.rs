@@ -17,17 +17,19 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use decentraai_distributed::{DistributedInference, InferenceConfig};
+//! use decentraai_distributed::{DistributedInference, InferenceConfig, WorkerManager};
 //! use decentraai_p2p::P2PNode;
 //! use decentraai_identity::Identity;
 //! use std::path::Path;
+//! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let identity = Identity::load(Path::new("identity/key.pem"))?;
 //! let p2p_node = P2PNode::new(&identity, 1024 * 1024, 1024 * 1024 * 100, None)?;
 //!
 //! let config = InferenceConfig::default();
-//! let mut distributed = DistributedInference::new(p2p_node, config)?;
+//! let worker_manager = Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone()));
+//! let mut distributed = DistributedInference::new(p2p_node, config, Some(worker_manager))?;
 //!
 //! // Start worker discovery
 //! distributed.start_worker_discovery().await?;
@@ -39,16 +41,22 @@
 //! # }
 //! ```
 
-pub mod worker;
-pub mod router;
-pub mod fallback;
+use std::sync::Arc;
+
 pub mod config;
+pub mod fallback;
+pub mod p2p_handler;
+pub mod queue;
+pub mod router;
+pub mod worker;
 
 pub use worker::WorkerManager;
 pub use router::RequestRouter;
 pub use fallback::FallbackHandler;
+pub use queue::{RequestQueueManager, QueuedRequest, WorkerRequestQueue, QueueProcessResult};
 pub use config::InferenceConfig;
 pub use error::DistributedError;
+pub use p2p_handler::DistributedP2PHandler;
 
 /// Re-export protocol types for convenience
 pub use decentraai_protocol::{InferRequest, InferResponse, WorkerAnnouncement, WorkerStatus, TaskPlacement};
@@ -88,9 +96,10 @@ mod error {
 /// into a single interface for distributed inference.
 pub struct DistributedInference {
     p2p_node: decentraai_p2p::P2PNode,
-    worker_manager: WorkerManager,
+    worker_manager: Arc<WorkerManager>,
     request_router: RequestRouter,
     fallback_handler: FallbackHandler,
+    queue_manager: RequestQueueManager,
     config: InferenceConfig,
 }
 
@@ -101,19 +110,27 @@ impl DistributedInference {
     ///
     /// * `p2p_node` - The P2P node for network communication
     /// * `config` - Distributed inference configuration
+    /// * `worker_manager` - Optional worker manager to use (if None, a new one will be created)
     pub fn new(
         p2p_node: decentraai_p2p::P2PNode,
         config: InferenceConfig,
+        worker_manager: Option<Arc<WorkerManager>>,
     ) -> anyhow::Result<Self> {
-        let worker_manager = WorkerManager::new(p2p_node.local_peer_id(), config.clone());
+        let worker_manager = worker_manager
+            .unwrap_or_else(|| Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone())));
         let request_router = RequestRouter::new(p2p_node.local_peer_id());
         let fallback_handler = FallbackHandler::new(config.max_retries);
+        let queue_manager = RequestQueueManager::new(
+            config.max_queue_depth as usize,
+            std::time::Duration::from_millis(config.request_timeout_ms),
+        );
 
         Ok(Self {
             p2p_node,
             worker_manager,
             request_router,
             fallback_handler,
+            queue_manager,
             config,
         })
     }
@@ -130,7 +147,13 @@ impl DistributedInference {
 
     /// Returns a mutable reference to the worker manager
     pub fn worker_manager_mut(&mut self) -> &mut WorkerManager {
-        &mut self.worker_manager
+        Arc::get_mut(&mut self.worker_manager)
+            .expect("WorkerManager is shared elsewhere")
+    }
+
+    /// Returns a clone of the Arc-wrapped worker manager
+    pub fn worker_manager_arc(&self) -> Arc<WorkerManager> {
+        self.worker_manager.clone()
     }
 
     /// Returns a reference to the request router
@@ -141,6 +164,11 @@ impl DistributedInference {
     /// Returns a reference to the fallback handler
     pub fn fallback_handler(&self) -> &FallbackHandler {
         &self.fallback_handler
+    }
+
+    /// Returns a reference to the queue manager
+    pub fn queue_manager(&self) -> &RequestQueueManager {
+        &self.queue_manager
     }
 
     /// Starts the worker discovery process
@@ -237,7 +265,8 @@ impl DistributedInference {
         )
     }
 
-    /// Gets statistics about the distributed inference system
+    /// Gets statistics about the distributed inference system (synchronous)
+    /// Note: queued_requests will be 0 as it requires async access
     pub fn get_stats(&self) -> DistributedStats {
         DistributedStats {
             worker_count: self.worker_manager.worker_count_sync(),
@@ -246,6 +275,21 @@ impl DistributedInference {
             total_requests: self.request_router.total_requests_sync(),
             successful_requests: self.request_router.successful_requests_sync(),
             failed_requests: self.request_router.failed_requests_sync(),
+            queued_requests: 0, // Async access needed for accurate count
+        }
+    }
+
+    /// Gets statistics about the distributed inference system (async)
+    /// Includes queue information which requires async access
+    pub async fn get_stats_async(&self) -> DistributedStats {
+        DistributedStats {
+            worker_count: self.worker_manager.worker_count_sync(),
+            local_worker_registered: self.worker_manager.is_registered_sync(),
+            pending_requests: self.request_router.pending_requests_sync(),
+            total_requests: self.request_router.total_requests_sync(),
+            successful_requests: self.request_router.successful_requests_sync(),
+            failed_requests: self.request_router.failed_requests_sync(),
+            queued_requests: self.queue_manager.total_queued().await,
         }
     }
 
@@ -264,6 +308,7 @@ pub struct DistributedStats {
     pub total_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
+    pub queued_requests: usize,
 }
 
 #[cfg(test)]
