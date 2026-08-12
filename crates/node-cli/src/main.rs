@@ -996,12 +996,16 @@ mod tests {
 async fn distributed_command(args: DistributedArgs) -> Result<()> {
     use decentraai_distributed::{DistributedInference, InferenceConfig};
     use decentraai_identity::Identity;
+    use decentraai_inference_adapter::{
+        BackendConfig, BackendRequest, BackendResponse, InferenceBackend, OpenAiCompatibleBackend,
+    };
     use decentraai_p2p::{
         ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer,
     };
     use libp2p::PeerId as Libp2pPeerId;
     use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
+    use std::time::Instant;
 
     let config = NodeConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
@@ -1028,14 +1032,145 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Track if we'll register as a worker
     let will_be_worker = args.model.is_some();
 
+    // Pre-load registry and prepare inference backend if we're a worker
+    let (registry, model_hash, model_name, backend) = if will_be_worker {
+        if !registry_path.exists() {
+            anyhow::bail!(
+                "registry not found at {}; run 'decentraai registry scan' first",
+                registry_path.display()
+            );
+        }
+        let registry = ModelRegistry::load(&registry_path)
+            .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+
+        let model = args.model.as_ref().unwrap();
+        let model_path = decentraai_runtime::resolve_model(&registry, model)?;
+        let model_name = model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model")
+            .to_string();
+
+        // Calculate model hash
+        let model_hash = blake3::hash(&std::fs::read(&model_path)?)
+            .to_hex()
+            .to_string();
+
+        // Create inference backend for real llama-server calls
+        let backend_config = BackendConfig {
+            base_url: "http://127.0.0.1:8081".to_string(),
+            model: model_name.clone(),
+            api_key: None,
+            connect_timeout: std::time::Duration::from_secs(3),
+            request_timeout: std::time::Duration::from_secs(300),
+            max_prompt_bytes: 200_000,
+            max_output_tokens: 8192,
+        };
+
+        let backend = OpenAiCompatibleBackend::new(backend_config)
+            .map_err(|e| anyhow::anyhow!("Failed to create inference backend: {}", e))?;
+
+        (
+            Some(registry),
+            Some(model_hash),
+            Some(model_name),
+            Some(backend),
+        )
+    } else {
+        // Not a worker, load registry if it exists for RegistryServer
+        let registry =
+            if registry_path.exists() {
+                Some(ModelRegistry::load(&registry_path).with_context(|| {
+                    format!("loading registry from {}", registry_path.display())
+                })?)
+            } else {
+                None
+            };
+        (registry, None, None, None)
+    };
+
     // Create worker manager with the libp2p peer_id
     let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
         local_peer_id,
         decentraai_distributed::InferenceConfig::default(),
     ));
 
-    let distributed_handler =
-        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    // Create inference handler if we're a worker
+    let infer_handler: Option<
+        Arc<
+            dyn Fn(
+                    decentraai_protocol::InferRequest,
+                ) -> anyhow::Result<decentraai_protocol::InferResponse>
+                + Send
+                + Sync,
+        >,
+    > = if let (Some(backend), Some(model_hash)) = (&backend, &model_hash) {
+        let local_peer_id_clone = local_peer_id;
+        let model_hash_clone = model_hash.clone();
+        let backend_clone = backend.clone();
+
+        let handler = move |request: decentraai_protocol::InferRequest|
+            -> anyhow::Result<decentraai_protocol::InferResponse> {
+            // Check if we can serve this model
+            if request.model_hash != model_hash_clone {
+                anyhow::bail!("Model not available on this worker");
+            }
+
+            // Create start time for metrics
+            let start_time = Instant::now();
+
+            // Convert InferRequest to BackendRequest
+            let backend_request = BackendRequest {
+                request_id: request.request_id.to_string(),
+                prompt: request.prompt.clone(),
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+                top_p: request.top_p,
+            };
+
+            // Validate the request
+            if let Err(e) = backend_clone.validate(&backend_request) {
+                anyhow::bail!("Request validation failed: {}", e);
+            }
+
+            // Call the backend synchronously (blocking)
+            // Note: In production, this should be async, but we're in a sync closure
+            // For now, we'll use a blocking call to the backend
+            let runtime = tokio::runtime::Handle::current();
+            let response: BackendResponse = runtime.block_on(async {
+                backend_clone.complete(backend_request).await
+            })
+            .map_err(|e| anyhow::anyhow!("Backend inference failed: {}", e))?;
+
+            // Calculate elapsed time
+            let elapsed_ms = start_time.elapsed().as_millis() as u32;
+
+            // Build successful response
+            Ok(decentraai_protocol::InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: local_peer_id_clone,
+                output: response.output,
+                tokens_used: response.tokens_used.unwrap_or(0),
+                time_ms: elapsed_ms,
+                success: true,
+                error: None,
+            })
+        };
+
+        Some(Arc::new(handler))
+    } else {
+        None
+    };
+
+    // Create distributed P2P handler with appropriate configuration
+    let distributed_handler = if let Some(infer_handler) = infer_handler {
+        decentraai_distributed::DistributedP2PHandler::with_both(
+            worker_manager.clone(),
+            move |request| infer_handler(request),
+        )
+    } else {
+        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone())
+    };
 
     // Create a chained handler for manifest, distributed, and other messages
     let mut chained_handler = ChainedHandler::new();
@@ -1044,15 +1179,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     chained_handler = chained_handler.add_handler(Arc::new(distributed_handler));
 
     // Add registry handler if registry exists
-    if registry_path.exists() {
-        let registry = ModelRegistry::load(&registry_path)
-            .with_context(|| format!("loading registry from {}", registry_path.display()))?;
+    if let Some(registry) = registry {
         chained_handler = chained_handler.add_handler(Arc::new(RegistryServer::new(registry)));
-    } else if will_be_worker {
-        anyhow::bail!(
-            "registry not found at {}; run 'decentraai registry scan' first",
-            registry_path.display()
-        );
     }
 
     // Create P2P node with chained handler
@@ -1070,31 +1198,10 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     let mut distributed =
         DistributedInference::new(p2p_node, distributed_config, Some(worker_manager.clone()))?;
 
-    // Track if we registered as a worker
-    let is_worker = args.model.is_some();
-
     // If we have a model specified, register as a worker
-    if let Some(ref model) = args.model {
-        let registry = if registry_path.exists() {
-            ModelRegistry::load(&registry_path)?
-        } else {
-            anyhow::bail!(
-                "registry not found at {}; run 'decentraai registry scan' first",
-                registry_path.display()
-            );
-        };
-
-        let model_path = decentraai_runtime::resolve_model(&registry, model)?;
-        let model_name = model_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("model")
-            .to_string();
-
-        // Calculate model hash
-        let model_hash = blake3::hash(&std::fs::read(&model_path)?)
-            .to_hex()
-            .to_string();
+    if will_be_worker {
+        let model_hash = model_hash.expect("model_hash must be set for worker");
+        let model_name = model_name.expect("model_name must be set for worker");
 
         // Register as worker
         distributed.register_as_worker(
@@ -1102,32 +1209,6 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             vec![model_hash.clone()],
             1.0, // Full capacity initially
         )?;
-
-        // Create an inference handler for this worker
-        // For now, this is a mock handler that returns a simple response
-        // In a full implementation, this would forward to the local llama-server
-        let model_hash_for_handler = model_hash.clone();
-        let infer_handler = move |request: decentraai_protocol::InferRequest| -> anyhow::Result<decentraai_protocol::InferResponse> {
-            // Check if we can serve this model
-            if request.model_hash != model_hash_for_handler {
-                anyhow::bail!("Model not available on this worker");
-            }
-
-            // Mock inference - in production, this would call the local inference engine
-            Ok(decentraai_protocol::InferResponse {
-                request_id: request.request_id,
-                worker_peer_id: local_peer_id,
-                output: format!("Mock response for: {}", request.prompt),
-                tokens_used: request.max_tokens,
-                time_ms: 100,
-                success: true,
-                error: None,
-            })
-        };
-
-        // Create a distributed P2P handler and add it to the chained handler
-        // Note: This requires modifying the P2P node to add the handler after creation
-        // For now, we'll broadcast our worker status periodically
 
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
@@ -1140,7 +1221,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         local_peer_id,
         bound,
         local_peer_id,
-        if is_worker { "worker" } else { "client" }
+        if will_be_worker { "worker" } else { "client" }
     );
 
     // Keep running until interrupted

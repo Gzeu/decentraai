@@ -97,7 +97,7 @@ impl OpenAiCompatibleBackend {
         Ok(Self { client, config })
     }
 
-    fn validate(&self, request: &BackendRequest) -> Result<(), BackendError> {
+    pub fn validate(&self, request: &BackendRequest) -> Result<(), BackendError> {
         if request.prompt.len() > self.config.max_prompt_bytes {
             return Err(BackendError::PromptTooLarge);
         }

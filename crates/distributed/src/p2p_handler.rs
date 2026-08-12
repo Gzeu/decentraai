@@ -98,7 +98,7 @@ mod tests {
     use crate::config::InferenceConfig;
     use crate::worker::WorkerManager;
     use decentraai_p2p::RequestHandler;
-    use decentraai_protocol::{WorkerAnnouncement, serialize_message, deserialize_message};
+    use decentraai_protocol::{WorkerAnnouncement, deserialize_message, serialize_message};
     use libp2p::identity::Keypair;
 
     fn create_test_peer_id() -> libp2p::PeerId {
@@ -171,5 +171,220 @@ mod tests {
 
         let result = handler.handle(b"unknown message");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_infer_request_with_both_handlers() {
+        // Test that both worker_manager and infer_handler work together
+        let peer_id = create_test_peer_id();
+        let config = InferenceConfig::default();
+        let worker_manager = Arc::new(WorkerManager::new(peer_id, config));
+
+        let handler = DistributedP2PHandler::with_both(
+            worker_manager.clone(),
+            move |request: InferRequest| {
+                Ok(InferResponse {
+                    request_id: request.request_id,
+                    worker_peer_id: peer_id,
+                    output: format!("Processed: {}", request.prompt),
+                    tokens_used: request.max_tokens,
+                    time_ms: 50,
+                    success: true,
+                    error: None,
+                })
+            },
+        );
+
+        // Test worker announcement handling
+        let announcement = WorkerAnnouncement {
+            peer_id: create_test_peer_id(),
+            node_name: "test-worker".to_string(),
+            loaded_models: vec!["model1".to_string()],
+            available_capacity: 1.0,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 100,
+        };
+        let announcement_payload = serialize_message(&announcement).unwrap();
+        let result = handler.handle(&announcement_payload);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+        assert_eq!(worker_manager.worker_count_sync(), 1);
+
+        // Test inference request handling
+        let request = InferRequest::new("model-hash".to_string(), "test prompt".to_string(), 100);
+        let request_payload = serialize_message(&request).unwrap();
+        let result = handler.handle(&request_payload);
+        assert!(result.is_ok());
+        let response_bytes = result.unwrap();
+        let response: InferResponse =
+            deserialize_message(&response_bytes, response_bytes.len()).unwrap();
+        assert_eq!(response.output, "Processed: test prompt");
+        assert!(response.success);
+    }
+
+    #[test]
+    fn test_infer_request_lifecycle_states() {
+        // Test request lifecycle: received -> processed -> completed
+        let peer_id = create_test_peer_id();
+
+        // Track request states through the handler
+        let handler = DistributedP2PHandler::with_infer_handler(move |request: InferRequest| {
+            // Simulate request processing lifecycle
+            // 1. Request received (implicit)
+            // 2. Request validated (implicit in handler)
+            // 3. Request processed
+            // 4. Response completed
+
+            Ok(InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: peer_id,
+                output: "completed".to_string(),
+                tokens_used: 100,
+                time_ms: 10,
+                success: true,
+                error: None,
+            })
+        });
+
+        let request =
+            InferRequest::new("model-hash".to_string(), "lifecycle test".to_string(), 100);
+        let original_request_id = request.request_id;
+
+        let payload = serialize_message(&request).unwrap();
+        let result = handler.handle(&payload);
+
+        assert!(result.is_ok());
+        let response_bytes = result.unwrap();
+        let response: InferResponse =
+            deserialize_message(&response_bytes, response_bytes.len()).unwrap();
+
+        // Verify request lifecycle completion
+        assert_eq!(response.request_id, original_request_id);
+        assert_eq!(response.output, "completed");
+        assert!(response.success);
+        assert_eq!(response.tokens_used, 100);
+    }
+
+    #[test]
+    fn test_infer_request_model_not_available() {
+        let peer_id = create_test_peer_id();
+
+        let handler = DistributedP2PHandler::with_infer_handler(move |request: InferRequest| {
+            if request.model_hash != "expected-hash" {
+                anyhow::bail!("Model not available on this worker");
+            }
+            Ok(InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: peer_id,
+                output: "test".to_string(),
+                tokens_used: 0,
+                time_ms: 0,
+                success: true,
+                error: None,
+            })
+        });
+
+        // Request with wrong model hash
+        let request = InferRequest::new("wrong-hash".to_string(), "test".to_string(), 100);
+        let payload = serialize_message(&request).unwrap();
+        let result = handler.handle(&payload);
+
+        // Should fail with model not available error
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Model not available")
+        );
+    }
+
+    #[test]
+    fn test_infer_request_validation_error() {
+        let peer_id = create_test_peer_id();
+
+        let handler = DistributedP2PHandler::with_infer_handler(move |request: InferRequest| {
+            // Simulate validation error
+            if request.prompt.is_empty() {
+                anyhow::bail!("Prompt cannot be empty");
+            }
+            Ok(InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: peer_id,
+                output: "test".to_string(),
+                tokens_used: 0,
+                time_ms: 0,
+                success: true,
+                error: None,
+            })
+        });
+
+        // Request with empty prompt
+        let request = InferRequest {
+            request_id: uuid::Uuid::new_v4(),
+            model_hash: "hash".to_string(),
+            prompt: "".to_string(),
+            max_tokens: 100,
+            temperature: 0.7,
+            top_p: 0.9,
+            timeout_ms: 30000,
+            stream: false,
+            priority: 128,
+        };
+        let payload = serialize_message(&request).unwrap();
+        let result = handler.handle(&payload);
+
+        // Should fail with validation error
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Prompt cannot be empty")
+        );
+    }
+
+    #[test]
+    fn test_infer_request_with_error_response() {
+        let peer_id = create_test_peer_id();
+
+        let handler = DistributedP2PHandler::with_infer_handler(move |request: InferRequest| {
+            // Simulate a backend error that returns an error response
+            if request.model_hash == "error-model" {
+                return Ok(InferResponse {
+                    request_id: request.request_id,
+                    worker_peer_id: peer_id,
+                    output: "".to_string(),
+                    tokens_used: 0,
+                    time_ms: 0,
+                    success: false,
+                    error: Some("Backend timeout".to_string()),
+                });
+            }
+            Ok(InferResponse {
+                request_id: request.request_id,
+                worker_peer_id: peer_id,
+                output: "success".to_string(),
+                tokens_used: 10,
+                time_ms: 10,
+                success: true,
+                error: None,
+            })
+        });
+
+        // Request that triggers error response
+        let request = InferRequest::new("error-model".to_string(), "test".to_string(), 100);
+        let payload = serialize_message(&request).unwrap();
+        let result = handler.handle(&payload);
+
+        assert!(result.is_ok());
+        let response_bytes = result.unwrap();
+        let response: InferResponse =
+            deserialize_message(&response_bytes, response_bytes.len()).unwrap();
+
+        // Response should indicate failure
+        assert!(!response.success);
+        assert_eq!(response.error, Some("Backend timeout".to_string()));
     }
 }
