@@ -150,7 +150,7 @@ mod tests {
                 worker_peer_id: peer_id,
                 output: "test output".to_string(),
                 tokens_used: 10,
-                time_ms: 100,
+                processing_time_ms: 100,
                 success: true,
                 error: None,
             })
@@ -194,7 +194,7 @@ mod tests {
                     worker_peer_id: peer_id,
                     output: format!("Processed: {}", request.prompt),
                     tokens_used: request.max_tokens,
-                    time_ms: 50,
+                    processing_time_ms: 50,
                     success: true,
                     error: None,
                 })
@@ -247,7 +247,7 @@ mod tests {
                 worker_peer_id: peer_id,
                 output: "completed".to_string(),
                 tokens_used: 100,
-                time_ms: 10,
+                processing_time_ms: 10,
                 success: true,
                 error: None,
             })
@@ -285,7 +285,7 @@ mod tests {
                 worker_peer_id: peer_id,
                 output: "test".to_string(),
                 tokens_used: 0,
-                time_ms: 0,
+                processing_time_ms: 0,
                 success: true,
                 error: None,
             })
@@ -320,7 +320,7 @@ mod tests {
                 worker_peer_id: peer_id,
                 output: "test".to_string(),
                 tokens_used: 0,
-                time_ms: 0,
+                processing_time_ms: 0,
                 success: true,
                 error: None,
             })
@@ -363,7 +363,7 @@ mod tests {
                     worker_peer_id: peer_id,
                     output: "".to_string(),
                     tokens_used: 0,
-                    time_ms: 0,
+                    processing_time_ms: 0,
                     success: false,
                     error: Some("Backend timeout".to_string()),
                 });
@@ -373,7 +373,7 @@ mod tests {
                 worker_peer_id: peer_id,
                 output: "success".to_string(),
                 tokens_used: 10,
-                time_ms: 10,
+                processing_time_ms: 10,
                 success: true,
                 error: None,
             })
