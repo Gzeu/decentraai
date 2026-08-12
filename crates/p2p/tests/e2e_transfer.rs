@@ -71,12 +71,7 @@ async fn spawn_server(handler: Option<Arc<dyn RequestHandler>>) -> (P2PNode, Str
 /// A reputation store with a high ban threshold: neutral for tests that
 /// do not exercise banning.
 fn test_reputation(dir: &Path) -> ReputationStore {
-    ReputationStore::load(
-        &dir.join("reputation.json"),
-        100,
-        Duration::from_secs(300),
-    )
-    .unwrap()
+    ReputationStore::load(&dir.join("reputation.json"), 100, Duration::from_secs(300)).unwrap()
 }
 
 /// Retries the download while the freshly dialed connection settles.
@@ -239,8 +234,16 @@ async fn corrupted_download_is_quarantined() {
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
     assert_eq!(meta["manifest_id"].as_str().unwrap(), manifest_id);
-    assert_eq!(meta["peer"].as_str().unwrap(), server.local_peer_id().to_string());
-    assert!(meta["reason"].as_str().unwrap().contains("failed verification"));
+    assert_eq!(
+        meta["peer"].as_str().unwrap(),
+        server.local_peer_id().to_string()
+    );
+    assert!(
+        meta["reason"]
+            .as_str()
+            .unwrap()
+            .contains("failed verification")
+    );
     assert!(
         !out_dir
             .join("staging")
@@ -289,7 +292,10 @@ async fn misbehaving_peer_gets_banned() {
         .await
         .unwrap_err();
     assert!(second.to_string().contains("failed verification"));
-    assert!(reputation.is_banned(&peer), "peer must be banned at the threshold");
+    assert!(
+        reputation.is_banned(&peer),
+        "peer must be banned at the threshold"
+    );
 
     // The third attempt is refused locally, before any network traffic.
     let third = download(&client, peer, &manifest_id, &out_dir, &mut reputation)

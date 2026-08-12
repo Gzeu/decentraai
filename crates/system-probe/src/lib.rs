@@ -190,14 +190,13 @@ mod tests {
             available_memory_bytes: 512 * MIB,
             ..snapshot()
         };
-        let decision = low_ram.admit_inference(
-            &budget(),
-            &GpuProbeStatus::Unavailable("none".into()),
-            83,
-        );
+        let decision =
+            low_ram.admit_inference(&budget(), &GpuProbeStatus::Unavailable("none".into()), 83);
         match decision {
             AdmissionDecision::Reject(reason) => assert!(reason.contains("RAM")),
-            AdmissionDecision::Admit => panic!("512 MiB free must be rejected with a 1 GiB reserve"),
+            AdmissionDecision::Admit => {
+                panic!("512 MiB free must be rejected with a 1 GiB reserve")
+            }
         }
     }
 
@@ -206,11 +205,7 @@ mod tests {
         let mut flexible = budget();
         flexible.gpu_policy = GpuPolicy::Auto;
         assert_eq!(
-            snapshot().admit_inference(
-                &flexible,
-                &GpuProbeStatus::Unavailable("none".into()),
-                83
-            ),
+            snapshot().admit_inference(&flexible, &GpuProbeStatus::Unavailable("none".into()), 83),
             AdmissionDecision::Admit
         );
     }

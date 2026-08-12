@@ -6,18 +6,16 @@
 //! - Historical latency and throughput
 //! - Model availability
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use libp2p::PeerId;
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, info};
 
-use decentraai_discovery::scheduler::{WorkerScheduler, SchedulerConfig};
-use decentraai_protocol::{InferRequest, InferResponse, WorkerAnnouncement, WorkerStatus, TaskPlacement};
+use decentraai_discovery::scheduler::{SchedulerConfig, WorkerScheduler};
 use decentraai_p2p::P2PNode;
+use decentraai_protocol::{InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement};
 
-use crate::{DistributedError, InferenceConfig};
+use crate::DistributedError;
 
 /// Manages request routing to distributed workers
 ///
@@ -26,10 +24,10 @@ use crate::{DistributedError, InferenceConfig};
 pub struct RequestRouter {
     /// The peer ID of the local node
     local_peer_id: PeerId,
-    
+
     /// The worker scheduler for selecting optimal workers
     scheduler: Arc<Mutex<WorkerScheduler>>,
-    
+
     /// Counters for statistics
     total_requests: Arc<Mutex<u64>>,
     successful_requests: Arc<Mutex<u64>>,
@@ -50,7 +48,7 @@ impl RequestRouter {
             enable_load_balancing: true,
             fallback_timeout_ms: 5000,
         };
-        
+
         let scheduler = WorkerScheduler::new(scheduler_config);
 
         Self {
@@ -63,6 +61,11 @@ impl RequestRouter {
         }
     }
 
+    /// Returns the peer ID of the local node this router serves.
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
     /// Updates the scheduler with the current list of workers
     ///
     /// Call this when the worker list changes to ensure the scheduler
@@ -73,11 +76,11 @@ impl RequestRouter {
     /// * `workers` - List of current worker announcements
     pub async fn update_workers(&self, workers: Vec<WorkerAnnouncement>) {
         let mut scheduler = self.scheduler.lock().await;
-        
+
         // Clear existing workers
         // Note: This is a simplification; in production, we'd want to
         // only update changed workers
-        
+
         // Register all workers with the scheduler
         for worker in workers {
             scheduler.register_worker(worker);
@@ -106,19 +109,21 @@ impl RequestRouter {
         // Note: This is synchronous, so we use a blocking lock
         // In a real implementation, we'd want to maintain the worker list
         // separately or use an async-friendly approach
-        
+
         let mut scheduler = self.scheduler.blocking_lock();
-        
+
         // Clear and re-register workers
         // This is a simplification for now
         for worker in workers {
             scheduler.register_worker(worker.clone());
         }
-        
+
         // Select the best worker
         match scheduler.select_worker(request) {
             Some(placement) => Ok(placement),
-            None => Err(DistributedError::NoWorkersAvailable(request.model_hash.clone())),
+            None => Err(DistributedError::NoWorkersAvailable(
+                request.model_hash.clone(),
+            )),
         }
     }
 
@@ -144,9 +149,9 @@ impl RequestRouter {
         // Increment counters
         self.increment_total().await;
         self.increment_pending().await;
-        
+
         let worker_peer_id = placement.selected_worker;
-        
+
         debug!(
             request_id = %request.request_id,
             worker_peer_id = %worker_peer_id,
@@ -156,11 +161,11 @@ impl RequestRouter {
 
         // Serialize the request
         let payload = Self::serialize_request(&request)?;
-        
+
         // Send via P2P
         // Note: This is where we need to extend the P2P node to handle
         // InferRequest messages properly
-        
+
         // For now, we'll use the generic request method
         // In production, we'd want a dedicated method for inference requests
         let response_bytes = match p2p_node.request(worker_peer_id, payload).await {
@@ -174,11 +179,11 @@ impl RequestRouter {
 
         // Deserialize the response
         let response = Self::deserialize_response(&response_bytes)?;
-        
+
         // Decrement pending and increment success
         self.decrement_pending().await;
         self.increment_success().await;
-        
+
         info!(
             request_id = %request.request_id,
             worker_peer_id = %worker_peer_id,
@@ -211,10 +216,10 @@ impl RequestRouter {
     ) -> Result<InferResponse, DistributedError> {
         // Update the scheduler with current workers
         self.update_workers(workers.clone()).await;
-        
+
         // Select the best worker
         let placement = self.select_worker(&request, &workers)?;
-        
+
         // Send the request
         self.send_request(p2p_node, request, placement).await
     }
@@ -222,15 +227,14 @@ impl RequestRouter {
     /// Serializes an inference request to bytes
     fn serialize_request(request: &InferRequest) -> Result<Vec<u8>, DistributedError> {
         use decentraai_protocol::serialize_message;
-        
-        serialize_message(request)
-            .map_err(|e| DistributedError::SerializationError(e.to_string()))
+
+        serialize_message(request).map_err(|e| DistributedError::SerializationError(e.to_string()))
     }
 
     /// Deserializes an inference response from bytes
     fn deserialize_response(bytes: &[u8]) -> Result<InferResponse, DistributedError> {
         use decentraai_protocol::deserialize_message;
-        
+
         deserialize_message::<InferResponse>(bytes, bytes.len())
             .map_err(|e| DistributedError::SerializationError(e.to_string()))
     }
@@ -319,17 +323,19 @@ impl decentraai_p2p::RequestHandler for InferenceRequestHandler {
     fn handle(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
         // Try to deserialize as an InferRequest
         use decentraai_protocol::deserialize_message;
-        
-        let infer_request: InferRequest = deserialize_message(request, request.len())?;
-        
+
+        let _infer_request: InferRequest = deserialize_message(request, request.len())?;
+
         // In a real implementation, this would:
         // 1. Validate the request
         // 2. Check if we can serve the requested model
         // 3. Process the request (or queue it)
         // 4. Return a response or error
-        
+
         // For now, return an error indicating this is not implemented
-        Err(anyhow::anyhow!("Inference request handling not implemented in P2P handler"))
+        Err(anyhow::anyhow!(
+            "Inference request handling not implemented in P2P handler"
+        ))
     }
 }
 
@@ -355,7 +361,7 @@ mod tests {
     fn test_request_router_creation() {
         let peer_id = create_test_peer_id();
         let router = RequestRouter::new(peer_id);
-        
+
         assert_eq!(router.local_peer_id, peer_id);
         assert_eq!(router.total_requests_sync(), 0);
         assert_eq!(router.successful_requests_sync(), 0);
@@ -366,13 +372,11 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_request() {
         let request = create_test_request();
-        
+
         let serialized = RequestRouter::serialize_request(&request).unwrap();
-        let deserialized: InferRequest = decentraai_protocol::deserialize_message(
-            &serialized,
-            serialized.len(),
-        ).unwrap();
-        
+        let deserialized: InferRequest =
+            decentraai_protocol::deserialize_message(&serialized, serialized.len()).unwrap();
+
         assert_eq!(deserialized.request_id, request.request_id);
         assert_eq!(deserialized.model_hash, request.model_hash);
         assert_eq!(deserialized.prompt, request.prompt);
@@ -383,7 +387,7 @@ mod tests {
     fn test_select_worker_with_workers() {
         let peer_id = create_test_peer_id();
         let router = RequestRouter::new(peer_id);
-        
+
         let worker_peer_id = create_test_peer_id();
         let workers = vec![WorkerAnnouncement {
             peer_id: worker_peer_id,
@@ -394,10 +398,10 @@ mod tests {
             tokens_per_second: 50,
             current_latency_ms: 100,
         }];
-        
+
         let request = create_test_request();
         let placement = router.select_worker(&request, &workers).unwrap();
-        
+
         assert_eq!(placement.selected_worker, worker_peer_id);
     }
 
@@ -405,7 +409,7 @@ mod tests {
     fn test_select_worker_no_matching_model() {
         let peer_id = create_test_peer_id();
         let router = RequestRouter::new(peer_id);
-        
+
         let worker_peer_id = create_test_peer_id();
         let workers = vec![WorkerAnnouncement {
             peer_id: worker_peer_id,
@@ -416,10 +420,13 @@ mod tests {
             tokens_per_second: 50,
             current_latency_ms: 100,
         }];
-        
+
         let request = create_test_request(); // Requests "test-model-hash"
         let result = router.select_worker(&request, &workers);
-        
-        assert!(matches!(result, Err(DistributedError::NoWorkersAvailable(_))));
+
+        assert!(matches!(
+            result,
+            Err(DistributedError::NoWorkersAvailable(_))
+        ));
     }
 }

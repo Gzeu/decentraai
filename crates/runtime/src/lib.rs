@@ -330,7 +330,10 @@ impl ServeManager {
             return Ok(false);
         }
         if let Some(server) = self.server.take() {
-            info!(idle_for_ms = self.idle_for().as_millis(), "idle timeout reached, unloading model");
+            info!(
+                idle_for_ms = self.idle_for().as_millis(),
+                "idle timeout reached, unloading model"
+            );
             server.stop().await?;
             return Ok(true);
         }
@@ -357,7 +360,11 @@ pub async fn wait_until_ready(host: &str, port: u16, timeout: Duration) -> Resul
             .context("health probe task failed")?;
         match probe {
             Ok(()) => {
-                info!(port, elapsed_ms = start.elapsed().as_millis(), "llama-server is ready");
+                info!(
+                    port,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "llama-server is ready"
+                );
                 return Ok(());
             }
             Err(e) => {

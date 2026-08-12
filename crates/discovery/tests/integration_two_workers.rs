@@ -7,8 +7,8 @@
 use decentraai_discovery::{PairingCode, TrustRecordPersisted};
 use decentraai_identity::Identity;
 use libp2p::PeerId;
-use tempfile::TempDir;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::time::sleep;
 
 #[tokio::test]
@@ -65,12 +65,7 @@ async fn pairing_code_serialization_roundtrip() {
     let peer_id1 = PeerId::random();
     let peer_id2 = PeerId::random();
 
-    let original = PairingCode::new(
-        peer_id1,
-        peer_id2,
-        "test-node".to_string(),
-        3600,
-    );
+    let original = PairingCode::new(peer_id1, peer_id2, "test-node".to_string(), 3600);
 
     // Serialize to QR data
     let qr_data = original.to_qr_data().unwrap();
@@ -113,12 +108,7 @@ async fn trust_score_exponential_moving_average() {
     let peer_id1 = PeerId::random();
     let peer_id2 = PeerId::random();
 
-    let pairing_code = PairingCode::new(
-        peer_id1,
-        peer_id2,
-        "test-node".to_string(),
-        3600,
-    );
+    let pairing_code = PairingCode::new(peer_id1, peer_id2, "test-node".to_string(), 3600);
 
     let mut trust_record = TrustRecordPersisted::new(&pairing_code);
     assert_eq!(trust_record.trust_score, 1.0);
@@ -143,7 +133,8 @@ async fn trust_score_exponential_moving_average() {
     // Verify the EMA formula: new_score = 0.8 * old_score + 0.2 * success_rate
     // With 10 successes and 5 failures: success_rate = 10/15 = 0.667
     // The score should converge toward this value (but may not be exactly equal due to EMA smoothing)
-    let final_success_rate = trust_record.successful_requests as f32 / trust_record.total_requests as f32;
+    let final_success_rate =
+        trust_record.successful_requests as f32 / trust_record.total_requests as f32;
     // The EMA smooths the transition, so the score will be between the initial 1.0 and the final success rate
     assert!(trust_record.trust_score >= final_success_rate);
     assert!(trust_record.trust_score <= 1.0);

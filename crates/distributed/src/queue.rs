@@ -203,6 +203,11 @@ impl RequestQueueManager {
         Self::new(100, Duration::from_secs(60))
     }
 
+    /// Returns the global default request timeout.
+    pub fn default_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
     /// Gets or creates a queue for a worker
     /// Returns a shared reference to the queue (same Arc for all callers)
     pub async fn get_or_create_queue(&self, peer_id: PeerId) -> Arc<Mutex<WorkerRequestQueue>> {
@@ -274,7 +279,7 @@ impl RequestQueueManager {
         let queues = self.queues.lock().await;
         let mut cancelled = false;
 
-        for (_, queue_arc) in queues.iter() {
+        for queue_arc in queues.values() {
             let mut queue_lock = queue_arc.lock().await;
             if queue_lock.remove(request_id).is_some() {
                 cancelled = true;
@@ -290,7 +295,7 @@ impl RequestQueueManager {
         let queues = self.queues.lock().await;
         let mut timed_out = Vec::new();
 
-        for (_, queue_arc) in queues.iter() {
+        for queue_arc in queues.values() {
             let mut queue_lock = queue_arc.lock().await;
             timed_out.extend(queue_lock.remove_timed_out());
         }

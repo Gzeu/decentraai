@@ -184,7 +184,10 @@ mod tests {
         assert_eq!(plaintext.len(), 4 + 64);
 
         let on_disk = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();
-        assert!(!on_disk.contains(&plaintext), "plaintext must never be persisted");
+        assert!(
+            !on_disk.contains(&plaintext),
+            "plaintext must never be persisted"
+        );
         assert!(on_disk.contains(&hash_token(&plaintext)));
 
         let record = store.lookup(&plaintext).unwrap();

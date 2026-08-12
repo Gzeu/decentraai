@@ -61,7 +61,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
         record(&logs, "peer_banned", serde_json::json!({"peer": "abc"})).unwrap();
-        record(&logs, "inference_started", serde_json::json!({"model": "m.gguf"})).unwrap();
+        record(
+            &logs,
+            "inference_started",
+            serde_json::json!({"model": "m.gguf"}),
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(logs.join(AUDIT_FILE_NAME)).unwrap();
         let lines: Vec<&str> = content.lines().collect();

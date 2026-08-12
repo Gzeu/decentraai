@@ -9,8 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod infer_protocol;
 
 pub use infer_protocol::{
-    InferRequest, InferResponse, InferProgress, InferMessage,
-    WorkerStatus, TaskPlacement, WorkerAnnouncement
+    InferMessage, InferProgress, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement,
+    WorkerStatus,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
@@ -134,7 +134,11 @@ pub fn deserialize_message<T: for<'de> Deserialize<'de>>(
     max_size: usize,
 ) -> Result<T> {
     if data.len() > max_size {
-        anyhow::bail!("message exceeds maximum size: {} > {}", data.len(), max_size);
+        anyhow::bail!(
+            "message exceeds maximum size: {} > {}",
+            data.len(),
+            max_size
+        );
     }
     serde_json::from_slice(data).context("failed to deserialize message")
 }
@@ -256,8 +260,7 @@ mod tests {
             manifest: create_test_manifest(),
         };
         let serialized = serialize_message(&response).unwrap();
-        let deserialized: ManifestResponse =
-            deserialize_message(&serialized, 1024 * 1024).unwrap();
+        let deserialized: ManifestResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
         assert_eq!(deserialized.manifest.file_name, "test.gguf");
     }
 
@@ -349,7 +352,12 @@ mod tests {
         let serialized = serialize_message(&request).unwrap();
         let result: Result<ManifestRequest> = deserialize_message(&serialized, 100);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum size")
+        );
     }
 
     #[test]

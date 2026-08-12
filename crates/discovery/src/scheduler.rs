@@ -22,10 +22,10 @@
 //! Each worker maintains a request queue with depth tracking. The scheduler estimates wait times
 //! based on queue depth and average request duration, providing realistic time estimates to clients.
 
-use std::collections::HashMap;
 use libp2p::PeerId;
+use std::collections::HashMap;
 
-use decentraai_protocol::{InferRequest, WorkerStatus, TaskPlacement, WorkerAnnouncement};
+use decentraai_protocol::{InferRequest, TaskPlacement, WorkerAnnouncement, WorkerStatus};
 
 /// Scheduler configuration
 ///
@@ -149,7 +149,8 @@ impl WorkerScheduler {
     ///
     /// Some(TaskPlacement) with the selected worker and estimates, or None if no eligible workers exist.
     pub fn select_worker(&self, request: &InferRequest) -> Option<TaskPlacement> {
-        let candidates: Vec<_> = self.worker_status
+        let candidates: Vec<_> = self
+            .worker_status
             .values()
             .filter(|w| w.can_accept_request(&request.model_hash))
             .collect();
@@ -164,7 +165,9 @@ impl WorkerScheduler {
             .max_by(|a, b| {
                 let score_a = self.score_worker(a, request);
                 let score_b = self.score_worker(b, request);
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap();
 
@@ -263,8 +266,8 @@ impl WorkerScheduler {
     /// A confidence score between 0.0 and 1.0.
     fn calculate_confidence(&self, worker: &WorkerStatus) -> f32 {
         // Higher capacity + lower queue = higher confidence
-        worker.available_capacity * 0.5 +
-        (1.0 - (worker.queue_depth as f32 / self.config.max_queue_depth as f32)) * 0.5
+        worker.available_capacity * 0.5
+            + (1.0 - (worker.queue_depth as f32 / self.config.max_queue_depth as f32)) * 0.5
     }
 
     /// Add request to worker queue

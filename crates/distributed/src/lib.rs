@@ -311,8 +311,6 @@ pub struct DistributedStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decentraai_identity::Identity;
-    use libp2p::PeerId;
 
     #[test]
     fn test_distributed_stats_default() {

@@ -15,8 +15,8 @@ export const POST: RequestHandler = async ({ request }) => {
       stream: body.stream || false
     };
 
-    // Use hardcoded token for now (in production, would come from user localStorage)
-    const API_TOKEN = '32508c50e6bd1a7c149ac8a580c42cdf1afea10657a9c6961466b1897e240ba2';
+    // Use master token from DecentraAI backend
+    const API_TOKEN = '8f8858d04611a013787ffe98e86c5053aaae42b931d4acbffd08d070f95ede73';
 
     // Proxy to llama-server (assumes it's running on localhost:8080)
     const response = await fetch('http://127.0.0.1:8080/v1/chat/completions', {

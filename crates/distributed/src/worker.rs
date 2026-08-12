@@ -6,18 +6,17 @@
 //! - Worker heartbeat and stale detection
 //! - Worker status tracking
 
+use libp2p::PeerId;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
-use libp2p::PeerId;
+use std::time::Instant;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use decentraai_protocol::{WorkerAnnouncement, WorkerStatus};
 use decentraai_p2p::P2PNode;
+use decentraai_protocol::{WorkerAnnouncement, WorkerStatus};
 
 use crate::config::InferenceConfig;
-use crate::DistributedError;
 
 /// Manages worker discovery, registration, and status tracking
 ///
@@ -31,25 +30,25 @@ use crate::DistributedError;
 pub struct WorkerManager {
     /// The peer ID of the local node
     local_peer_id: PeerId,
-    
+
     /// Configuration for distributed inference
     config: InferenceConfig,
-    
+
     /// Map of peer ID to worker announcement
     workers: Arc<Mutex<HashMap<PeerId, WorkerAnnouncement>>>,
-    
+
     /// Map of peer ID to worker status (for scheduling)
     worker_status: Arc<Mutex<HashMap<PeerId, WorkerStatus>>>,
-    
+
     /// Map of peer ID to last seen timestamp
     last_seen: Arc<Mutex<HashMap<PeerId, Instant>>>,
-    
+
     /// Whether this node is registered as a worker
     is_worker: Arc<Mutex<bool>>,
-    
+
     /// Local worker announcement (if registered as worker)
     local_announcement: Arc<Mutex<Option<WorkerAnnouncement>>>,
-    
+
     /// Local worker status (if registered as worker)
     local_status: Arc<Mutex<Option<WorkerStatus>>>,
 }
@@ -77,6 +76,11 @@ impl WorkerManager {
     /// Returns the local peer ID
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
+    }
+
+    /// Returns the distributed inference configuration for this manager.
+    pub fn config(&self) -> &InferenceConfig {
+        &self.config
     }
 
     /// Returns whether this node is registered as a worker
@@ -118,7 +122,7 @@ impl WorkerManager {
             loaded_models: loaded_models.clone(),
             available_capacity: initial_capacity,
             queue_depth: 0,
-            tokens_per_second: 50, // Default TPS
+            tokens_per_second: 50,   // Default TPS
             current_latency_ms: 100, // Default latency
         };
 
@@ -134,9 +138,16 @@ impl WorkerManager {
         *self.is_worker.blocking_lock() = true;
         *self.local_announcement.blocking_lock() = Some(announcement);
         *self.local_status.blocking_lock() = Some(status);
-        
+
         // Register with ourselves
-        self.add_worker(self.local_peer_id, loaded_models.clone(), initial_capacity, 0, 50, 100);
+        self.add_worker(
+            self.local_peer_id,
+            loaded_models.clone(),
+            initial_capacity,
+            0,
+            50,
+            100,
+        );
 
         info!(
             peer_id = %self.local_peer_id,
@@ -154,7 +165,7 @@ impl WorkerManager {
         *self.is_worker.blocking_lock() = false;
         *self.local_announcement.blocking_lock() = None;
         *self.local_status.blocking_lock() = None;
-        
+
         // Remove ourselves from the worker list
         self.remove_worker(self.local_peer_id);
 
@@ -192,7 +203,7 @@ impl WorkerManager {
     /// * `announcement` - The received worker announcement
     pub fn process_announcement(&self, announcement: WorkerAnnouncement) -> anyhow::Result<()> {
         let peer_id = announcement.peer_id;
-        
+
         // Skip our own announcements
         if peer_id == self.local_peer_id {
             return Ok(());
@@ -234,7 +245,7 @@ impl WorkerManager {
     ) {
         let mut workers = self.workers.blocking_lock();
         let mut worker_status = self.worker_status.blocking_lock();
-        
+
         let announcement = WorkerAnnouncement {
             peer_id,
             node_name: format!("peer-{}", peer_id),
@@ -264,7 +275,7 @@ impl WorkerManager {
         let mut workers = self.workers.blocking_lock();
         let mut worker_status = self.worker_status.blocking_lock();
         let mut last_seen = self.last_seen.blocking_lock();
-        
+
         workers.remove(&peer_id);
         worker_status.remove(&peer_id);
         last_seen.remove(&peer_id);
@@ -297,7 +308,7 @@ impl WorkerManager {
 
         let mut local_status = self.local_status.blocking_lock();
         let mut local_announcement = self.local_announcement.blocking_lock();
-        
+
         if let Some(status) = local_status.as_mut() {
             status.available_capacity = available_capacity;
             status.queue_depth = queue_depth;
@@ -343,7 +354,7 @@ impl WorkerManager {
         }
 
         let local_announcement = self.local_announcement.blocking_lock();
-        
+
         if let Some(announcement) = local_announcement.as_ref() {
             let payload = Self::serialize_announcement(announcement)?;
             p2p_node.announce(payload);
@@ -355,8 +366,8 @@ impl WorkerManager {
 
     /// Serializes a worker announcement to bytes
     fn serialize_announcement(announcement: &WorkerAnnouncement) -> anyhow::Result<Vec<u8>> {
-        use decentraai_protocol::{CURRENT_PROTOCOL_VERSION, serialize_message};
-        
+        use decentraai_protocol::serialize_message;
+
         let message = WorkerAnnouncement {
             peer_id: announcement.peer_id,
             node_name: announcement.node_name.clone(),
@@ -366,17 +377,17 @@ impl WorkerManager {
             tokens_per_second: announcement.tokens_per_second,
             current_latency_ms: announcement.current_latency_ms,
         };
-        
+
         serialize_message(&message)
             .map_err(|e| anyhow::anyhow!("Failed to serialize announcement: {}", e))
     }
 
     /// Deserializes a worker announcement from bytes
     pub fn deserialize_announcement(bytes: &[u8]) -> anyhow::Result<WorkerAnnouncement> {
-        use decentraai_protocol::{deserialize_message, CURRENT_PROTOCOL_VERSION};
-        
+        use decentraai_protocol::{CURRENT_PROTOCOL_VERSION, deserialize_message};
+
         let announcement: WorkerAnnouncement = deserialize_message(bytes, bytes.len())?;
-        
+
         // Verify protocol version
         if CURRENT_PROTOCOL_VERSION != 1 {
             // In the future, we might need to handle version compatibility
@@ -385,7 +396,7 @@ impl WorkerManager {
                 "protocol version check not implemented for worker announcements"
             );
         }
-        
+
         Ok(announcement)
     }
 
@@ -406,7 +417,11 @@ impl WorkerManager {
 
     /// Gets the worker status for all known workers (synchronous)
     pub fn get_all_worker_status_sync(&self) -> Vec<WorkerStatus> {
-        self.worker_status.blocking_lock().values().cloned().collect()
+        self.worker_status
+            .blocking_lock()
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Gets a specific worker by peer ID
@@ -488,7 +503,7 @@ mod tests {
         let peer_id = create_test_peer_id();
         let config = InferenceConfig::default();
         let manager = WorkerManager::new(peer_id, config);
-        
+
         assert_eq!(manager.local_peer_id(), peer_id);
         assert!(!manager.is_registered_sync());
         assert_eq!(manager.worker_count_sync(), 0);
@@ -499,13 +514,15 @@ mod tests {
         let peer_id = create_test_peer_id();
         let config = InferenceConfig::default();
         let manager = WorkerManager::new(peer_id, config);
-        
-        manager.register_as_worker(
-            "test-worker".to_string(),
-            vec!["model1".to_string(), "model2".to_string()],
-            0.8,
-        ).unwrap();
-        
+
+        manager
+            .register_as_worker(
+                "test-worker".to_string(),
+                vec!["model1".to_string(), "model2".to_string()],
+                0.8,
+            )
+            .unwrap();
+
         assert!(manager.is_registered_sync());
         assert_eq!(manager.worker_count_sync(), 1); // Self-registered
     }
@@ -515,7 +532,7 @@ mod tests {
         let peer_id = create_test_peer_id();
         let config = InferenceConfig::default();
         let manager = WorkerManager::new(peer_id, config);
-        
+
         // Create a test announcement from a different peer
         let other_peer_id = create_test_peer_id();
         let announcement = WorkerAnnouncement {
@@ -527,9 +544,9 @@ mod tests {
             tokens_per_second: 40,
             current_latency_ms: 150,
         };
-        
+
         manager.process_announcement(announcement).unwrap();
-        
+
         assert_eq!(manager.worker_count_sync(), 1);
         assert!(manager.is_worker_trusted_sync(&other_peer_id));
     }
@@ -546,17 +563,26 @@ mod tests {
             tokens_per_second: 30,
             current_latency_ms: 200,
         };
-        
+
         let serialized = WorkerManager::serialize_announcement(&announcement).unwrap();
         let deserialized = WorkerManager::deserialize_announcement(&serialized).unwrap();
-        
+
         assert_eq!(deserialized.peer_id, announcement.peer_id);
         assert_eq!(deserialized.node_name, announcement.node_name);
         assert_eq!(deserialized.loaded_models, announcement.loaded_models);
-        assert!((deserialized.available_capacity - announcement.available_capacity).abs() < f32::EPSILON);
+        assert!(
+            (deserialized.available_capacity - announcement.available_capacity).abs()
+                < f32::EPSILON
+        );
         assert_eq!(deserialized.queue_depth, announcement.queue_depth);
-        assert_eq!(deserialized.tokens_per_second, announcement.tokens_per_second);
-        assert_eq!(deserialized.current_latency_ms, announcement.current_latency_ms);
+        assert_eq!(
+            deserialized.tokens_per_second,
+            announcement.tokens_per_second
+        );
+        assert_eq!(
+            deserialized.current_latency_ms,
+            announcement.current_latency_ms
+        );
     }
 
     #[test]
@@ -564,15 +590,13 @@ mod tests {
         let peer_id = create_test_peer_id();
         let config = InferenceConfig::default();
         let manager = WorkerManager::new(peer_id, config);
-        
-        manager.register_as_worker(
-            "test-worker".to_string(),
-            vec!["model1".to_string()],
-            1.0,
-        ).unwrap();
-        
+
+        manager
+            .register_as_worker("test-worker".to_string(), vec!["model1".to_string()], 1.0)
+            .unwrap();
+
         manager.update_local_capacity(0.5, 3, 100, 50).unwrap();
-        
+
         let status = manager.get_worker_status_by_id_sync(&peer_id).unwrap();
         assert!((status.available_capacity - 0.5).abs() < f32::EPSILON);
         assert_eq!(status.queue_depth, 3);

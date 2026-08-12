@@ -362,7 +362,11 @@ mod tests {
         let tiers = config.tiers.expect("example config defines tiers");
         assert_eq!(tiers.tier1.rate_limit_per_minute, 10);
         assert_eq!(tiers.policy(1).unwrap().models.len(), 1);
-        assert_eq!(tiers.policy(3).unwrap().models.len(), 0, "empty allowlist = all models");
+        assert_eq!(
+            tiers.policy(3).unwrap().models.len(),
+            0,
+            "empty allowlist = all models"
+        );
         assert!(tiers.policy(4).is_none());
     }
 
@@ -454,3 +458,6 @@ security:
         assert!(err.to_string().contains("api_port"));
     }
 }
+
+mod helpers;
+pub use helpers::ensure_mode_0600;

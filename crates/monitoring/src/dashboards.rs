@@ -1,8 +1,8 @@
 //! Dashboard data aggregation
 
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
 use crate::metrics::MetricsCollector;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardData {
@@ -117,8 +117,10 @@ impl DashboardData {
                 load_average_15m: metrics.get_gauge("load_average_15m").unwrap_or(0.0),
             },
             network: NetworkDashboard {
-                p2p_connections_active: metrics.get_gauge("p2p_connections_active").unwrap_or(0.0) as u32,
-                p2p_connections_total: metrics.get_gauge("p2p_connections_total").unwrap_or(0.0) as u32,
+                p2p_connections_active: metrics.get_gauge("p2p_connections_active").unwrap_or(0.0)
+                    as u32,
+                p2p_connections_total: metrics.get_gauge("p2p_connections_total").unwrap_or(0.0)
+                    as u32,
                 latency_avg_ms: metrics.get_gauge("latency_avg_ms").unwrap_or(0.0),
                 latency_p95_ms: metrics.get_gauge("latency_p95_ms").unwrap_or(0.0),
                 latency_p99_ms: metrics.get_gauge("latency_p99_ms").unwrap_or(0.0),
@@ -131,13 +133,24 @@ impl DashboardData {
                 models_active: metrics.get_gauge("models_active").unwrap_or(0.0) as u32,
                 models_total: metrics.get_gauge("models_total").unwrap_or(0.0) as u32,
                 models_by_type: vec![
-                    ("llm".to_string(), metrics.get_gauge("models_llm").unwrap_or(0.0) as u32),
-                    ("embedding".to_string(), metrics.get_gauge("models_embedding").unwrap_or(0.0) as u32),
-                    ("vision".to_string(), metrics.get_gauge("models_vision").unwrap_or(0.0) as u32),
+                    (
+                        "llm".to_string(),
+                        metrics.get_gauge("models_llm").unwrap_or(0.0) as u32,
+                    ),
+                    (
+                        "embedding".to_string(),
+                        metrics.get_gauge("models_embedding").unwrap_or(0.0) as u32,
+                    ),
+                    (
+                        "vision".to_string(),
+                        metrics.get_gauge("models_vision").unwrap_or(0.0) as u32,
+                    ),
                 ],
                 models_loaded: vec![], // Populated from model registry
                 total_vram_usage_gb: metrics.get_gauge("models_vram_total_gb").unwrap_or(0.0),
-                avg_tokens_per_sec: metrics.get_gauge("models_avg_tokens_per_sec").unwrap_or(0.0),
+                avg_tokens_per_sec: metrics
+                    .get_gauge("models_avg_tokens_per_sec")
+                    .unwrap_or(0.0),
             },
             workers: WorkersDashboard {
                 workers_total: metrics.get_gauge("workers_total").unwrap_or(0.0) as u32,
@@ -147,11 +160,14 @@ impl DashboardData {
                 workers: vec![], // Populated from worker registry
                 avg_load_percent: metrics.get_gauge("workers_avg_load").unwrap_or(0.0),
                 avg_uptime_percent: metrics.get_gauge("workers_avg_uptime").unwrap_or(0.0),
-                total_tasks_completed: metrics.get_counter("workers_tasks_completed_total").unwrap_or(0.0) as u64,
+                total_tasks_completed: metrics
+                    .get_counter("workers_tasks_completed_total")
+                    .unwrap_or(0.0) as u64,
             },
             performance: PerformanceDashboard {
                 requests_total: metrics.get_counter("requests_total").unwrap_or(0.0) as u64,
-                requests_success: metrics.get_counter("requests_success_total").unwrap_or(0.0) as u64,
+                requests_success: metrics.get_counter("requests_success_total").unwrap_or(0.0)
+                    as u64,
                 requests_failed: metrics.get_counter("requests_failed_total").unwrap_or(0.0) as u64,
                 success_rate_percent: metrics.get_gauge("requests_success_rate").unwrap_or(0.0),
                 throughput_rps: metrics.get_gauge("requests_throughput_rps").unwrap_or(0.0),

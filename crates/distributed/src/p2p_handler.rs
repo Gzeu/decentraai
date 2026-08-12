@@ -57,6 +57,12 @@ impl DistributedP2PHandler {
     }
 }
 
+impl Default for DistributedP2PHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::deserialize_message;

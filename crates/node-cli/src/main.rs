@@ -868,127 +868,6 @@ fn token_command(command: TokenCommand) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_registry_scan_command() {
-        let cli = Cli::try_parse_from(["decentraai", "registry", "scan"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Registry {
-                command: RegistryCommand::Scan(_)
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_registry_list_command() {
-        let cli = Cli::try_parse_from(["decentraai", "registry", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Registry {
-                command: RegistryCommand::List { .. }
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_legacy_top_level_scan() {
-        assert!(Cli::try_parse_from(["decentraai", "scan"]).is_err());
-    }
-
-    #[test]
-    fn parses_swarm_start_command() {
-        let cli = Cli::try_parse_from(["decentraai", "swarm", "start"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Swarm {
-                command: SwarmCommand::Start { .. }
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_serve_start_command() {
-        let cli =
-            Cli::try_parse_from(["decentraai", "serve", "start", "--model", "model.gguf"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Serve {
-                command: ServeCommand::Start { .. }
-            }
-        ));
-    }
-
-    #[test]
-    fn serve_start_model_is_optional() {
-        // Without --model the picker opens (interactive); parsing must succeed.
-        let cli = Cli::try_parse_from(["decentraai", "serve", "start"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Serve {
-                command: ServeCommand::Start { .. }
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_pull_command() {
-        let cli = Cli::try_parse_from([
-            "decentraai",
-            "pull",
-            "--from",
-            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWabc",
-            "--model",
-            "tiny.gguf",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Command::Pull(_)));
-    }
-
-    #[test]
-    fn parses_pull_list_only() {
-        let cli = Cli::try_parse_from([
-            "decentraai",
-            "pull",
-            "--from",
-            "/ip4/10.0.0.2/tcp/9999/p2p/12D3KooWxyz",
-            "--list",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Command::Pull(_)));
-    }
-
-    #[test]
-    fn parses_token_create_command() {
-        let cli = Cli::try_parse_from([
-            "decentraai",
-            "token",
-            "create",
-            "--name",
-            "alice",
-            "--tier",
-            "1",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Command::Token { .. }));
-    }
-
-    #[test]
-    fn parses_token_list_and_revoke_commands() {
-        assert!(
-            Cli::try_parse_from(["decentraai", "token", "list"]).is_ok(),
-            "token list must parse"
-        );
-        assert!(
-            Cli::try_parse_from(["decentraai", "token", "revoke", "--name", "alice"]).is_ok(),
-            "token revoke must parse"
-        );
-    }
-}
-
 /// Runs a distributed inference node (M9)
 ///
 /// This command starts a node that can act as both a worker (serving models)
@@ -1229,4 +1108,125 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     distributed.shutdown();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_registry_scan_command() {
+        let cli = Cli::try_parse_from(["decentraai", "registry", "scan"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Registry {
+                command: RegistryCommand::Scan(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_registry_list_command() {
+        let cli = Cli::try_parse_from(["decentraai", "registry", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Registry {
+                command: RegistryCommand::List { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_top_level_scan() {
+        assert!(Cli::try_parse_from(["decentraai", "scan"]).is_err());
+    }
+
+    #[test]
+    fn parses_swarm_start_command() {
+        let cli = Cli::try_parse_from(["decentraai", "swarm", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Swarm {
+                command: SwarmCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_serve_start_command() {
+        let cli =
+            Cli::try_parse_from(["decentraai", "serve", "start", "--model", "model.gguf"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                command: ServeCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_start_model_is_optional() {
+        // Without --model the picker opens (interactive); parsing must succeed.
+        let cli = Cli::try_parse_from(["decentraai", "serve", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                command: ServeCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_pull_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "pull",
+            "--from",
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWabc",
+            "--model",
+            "tiny.gguf",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
+    }
+
+    #[test]
+    fn parses_pull_list_only() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "pull",
+            "--from",
+            "/ip4/10.0.0.2/tcp/9999/p2p/12D3KooWxyz",
+            "--list",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Pull(_)));
+    }
+
+    #[test]
+    fn parses_token_create_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "token",
+            "create",
+            "--name",
+            "alice",
+            "--tier",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Token { .. }));
+    }
+
+    #[test]
+    fn parses_token_list_and_revoke_commands() {
+        assert!(
+            Cli::try_parse_from(["decentraai", "token", "list"]).is_ok(),
+            "token list must parse"
+        );
+        assert!(
+            Cli::try_parse_from(["decentraai", "token", "revoke", "--name", "alice"]).is_ok(),
+            "token revoke must parse"
+        );
+    }
 }

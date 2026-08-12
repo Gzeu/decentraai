@@ -1,7 +1,7 @@
 //! Structured logging
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -93,18 +93,19 @@ impl LogCollector {
             Some(lvl) => self.entries.iter().filter(|e| e.level == lvl).collect(),
             None => self.entries.iter().collect(),
         };
-        
+
         filtered.reverse();
         filtered.truncate(n);
         filtered.into_iter().cloned().collect()
     }
 
     pub fn get_by_component(&self, component: &str, n: usize) -> Vec<LogEntry> {
-        let mut filtered: Vec<_> = self.entries
+        let mut filtered: Vec<_> = self
+            .entries
             .iter()
             .filter(|e| e.component == component)
             .collect();
-        
+
         filtered.reverse();
         filtered.truncate(n);
         filtered.into_iter().cloned().collect()

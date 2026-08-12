@@ -1,7 +1,7 @@
 //! Metrics collection (Prometheus-style)
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +17,11 @@ pub struct Metric {
 pub enum MetricType {
     Counter(f64),
     Gauge(f64),
-    Histogram { count: u64, sum: f64, buckets: Vec<(f64, u64)> },
+    Histogram {
+        count: u64,
+        sum: f64,
+        buckets: Vec<(f64, u64)>,
+    },
 }
 
 pub struct MetricsCollector {
@@ -39,13 +43,13 @@ impl MetricsCollector {
 
     pub fn record(&mut self, name: String, value: f64, labels: Vec<(String, String)>) {
         let key = format!("{}|{:?}", name, labels);
-        
+
         // Update current value with labels
         self.gauges.insert(key.clone(), value);
-        
+
         // Also store by name alone for dashboard queries
         self.gauges.insert(name.clone(), value);
-        
+
         // Add to history
         self.history.push(Metric {
             name,
@@ -53,7 +57,7 @@ impl MetricsCollector {
             labels,
             timestamp: Utc::now(),
         });
-        
+
         // Trim history
         if self.history.len() > self.max_history {
             self.history.remove(0);
@@ -82,11 +86,8 @@ impl MetricsCollector {
     }
 
     pub fn get_by_name(&self, name: &str, last_n: usize) -> Vec<Metric> {
-        let mut metrics: Vec<_> = self.history
-            .iter()
-            .filter(|m| m.name == name)
-            .collect();
-        
+        let mut metrics: Vec<_> = self.history.iter().filter(|m| m.name == name).collect();
+
         metrics.reverse();
         metrics.truncate(last_n);
         metrics.into_iter().cloned().collect()

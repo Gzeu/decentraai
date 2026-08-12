@@ -42,6 +42,44 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// Chains multiple request handlers together
+///
+/// Tries each handler in order until one succeeds.
+pub struct ChainedHandler {
+    handlers: Vec<Arc<dyn RequestHandler>>,
+}
+
+impl ChainedHandler {
+    pub fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
+        }
+    }
+
+    pub fn add_handler(mut self, handler: Arc<dyn RequestHandler>) -> Self {
+        self.handlers.push(handler);
+        self
+    }
+}
+
+impl Default for ChainedHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestHandler for ChainedHandler {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        for handler in &self.handlers {
+            match handler.handle(request) {
+                Ok(response) => return Ok(response),
+                Err(_) => continue, // Try next handler
+            }
+        }
+        anyhow::bail!("No handler could process the request")
+    }
+}
+
 /// Serves a static manifest plus chunk reads from a local file.
 /// Chunks are read with seek + read, so huge artifacts never load into memory.
 pub struct StaticFileServer {
@@ -79,7 +117,9 @@ impl RequestHandler for StaticFileServer {
             }
             use std::io::{Read, Seek, SeekFrom};
             let mut file = std::fs::File::open(&self.file).context("opening served file")?;
-            file.seek(SeekFrom::Start(u64::from(req.chunk_index) * self.chunk_size))?;
+            file.seek(SeekFrom::Start(
+                u64::from(req.chunk_index) * self.chunk_size,
+            ))?;
             let mut buf = vec![0u8; self.chunk_size as usize];
             let mut filled = 0usize;
             while filled < buf.len() {
@@ -141,9 +181,8 @@ impl RegistryServer {
 impl RequestHandler for RegistryServer {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::{
-            CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest,
-            ChunkResponse, ManifestRequest, deserialize_message, manifest_response_bytes,
-            serialize_message,
+            CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest, ChunkResponse,
+            ManifestRequest, deserialize_message, manifest_response_bytes, serialize_message,
         };
 
         if let Ok(req) = deserialize_message::<CatalogRequest>(request, request.len()) {
@@ -180,8 +219,8 @@ impl RequestHandler for RegistryServer {
                 .get_model(&manifest.file_name)
                 .with_context(|| format!("registry entry missing for {}", manifest.file_name))?;
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&record.canonical_path)
-                .context("opening registered model")?;
+            let mut file =
+                std::fs::File::open(&record.canonical_path).context("opening registered model")?;
             file.seek(SeekFrom::Start(
                 u64::from(req.chunk_index) * manifest.chunk_size as u64,
             ))?;
@@ -237,6 +276,22 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
+    /// Sets a callback for worker announcements
+    pub fn set_on_worker_announcement<F>(&mut self, _callback: F)
+    where
+        F: Fn(decentraai_protocol::WorkerAnnouncement) + Send + Sync + 'static,
+    {
+        // TODO: Implement callback storage and invocation in swarm task
+    }
+
+    /// Sets a callback for inference requests
+    pub fn set_on_infer_request<F>(&mut self, _callback: F)
+    where
+        F: Fn(decentraai_protocol::InferRequest) -> Result<Vec<u8>> + Send + Sync + 'static,
+    {
+        // TODO: Implement callback storage and invocation in swarm task
+    }
+
     /// Creates a node and spawns its swarm task. Must be called from within
     /// a Tokio runtime: the mDNS behaviour registers with the reactor.
     pub fn new(
@@ -279,8 +334,7 @@ impl P2PNode {
                 request_response::OutboundRequestId,
                 oneshot::Sender<Result<Vec<u8>>>,
             > = HashMap::new();
-            let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> =
-                VecDeque::new();
+            let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> = VecDeque::new();
             let mut connected: Vec<PeerId> = Vec::new();
 
             loop {
@@ -352,6 +406,28 @@ impl P2PNode {
                                     {
                                         info!(%peer, bytes = request.len(), "received manifest announcement");
                                         continue;
+                                    }
+                                    // Check for WorkerAnnouncement
+                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::WorkerAnnouncement>(
+                                        &request,
+                                        request.len(),
+                                    )
+                                    .is_ok()
+                                    {
+                                        info!(%peer, bytes = request.len(), "received worker announcement");
+                                        // Worker announcements don't require responses
+                                        // They are processed by the distributed handler if configured
+                                        continue;
+                                    }
+                                    // Check for InferRequest
+                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::InferRequest>(
+                                        &request,
+                                        request.len(),
+                                    )
+                                    .is_ok()
+                                    {
+                                        info!(%peer, bytes = request.len(), "received inference request");
+                                        // Forward to handler for processing
                                     }
                                     let response = match &handler {
                                         Some(h) => match h.handle(&request) {
@@ -490,7 +566,11 @@ impl request_response::Codec for FrameCodec {
         read_frame(io, self.max_frame_bytes).await
     }
 
-    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {

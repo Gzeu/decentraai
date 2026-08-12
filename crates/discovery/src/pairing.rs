@@ -18,11 +18,11 @@
 //! - Trust scores use exponential moving averages to smooth reputation changes
 //! - SQLite database stores trust records with atomic writes for consistency
 
-use serde::{Deserialize, Serialize};
-use libp2p::PeerId;
-use decentraai_identity::Identity;
-use chrono::{DateTime, Utc};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use decentraai_identity::Identity;
+use libp2p::PeerId;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Pairing code for QR generation
@@ -72,7 +72,8 @@ impl PairingCode {
         let expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() + ttl_secs;
+            .as_secs()
+            + ttl_secs;
 
         let pairing_token = uuid::Uuid::new_v4().to_string();
 
@@ -109,8 +110,7 @@ impl PairingCode {
     ///
     /// Returns an error if the JSON is invalid or doesn't match the expected structure.
     pub fn from_qr_data(data: &str) -> Result<Self> {
-        let code: Self = serde_json::from_str(data)
-            .context("Invalid QR code data")?;
+        let code: Self = serde_json::from_str(data).context("Invalid QR code data")?;
         Ok(code)
     }
 
@@ -140,10 +140,7 @@ impl PairingCode {
     pub fn sign_pairing(&self, identity: &Identity) -> Result<Vec<u8>> {
         let message = format!(
             "pair:{}:{}:{}:{}",
-            self.worker_peer_id,
-            self.controller_peer_id,
-            self.pairing_token,
-            self.expires_at
+            self.worker_peer_id, self.controller_peer_id, self.pairing_token, self.expires_at
         );
         let signature = identity.sign(message.as_bytes());
         Ok(signature.to_bytes().to_vec())
@@ -164,10 +161,7 @@ impl PairingCode {
     pub fn verify_pairing(&self, signature: &[u8], identity: &Identity) -> bool {
         let message = format!(
             "pair:{}:{}:{}:{}",
-            self.worker_peer_id,
-            self.controller_peer_id,
-            self.pairing_token,
-            self.expires_at
+            self.worker_peer_id, self.controller_peer_id, self.pairing_token, self.expires_at
         );
 
         if signature.len() != 64 {
@@ -178,7 +172,8 @@ impl PairingCode {
         sig_bytes.copy_from_slice(signature);
 
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        decentraai_identity::verify_signature(identity.public_key(), message.as_bytes(), &sig).is_ok()
+        decentraai_identity::verify_signature(identity.public_key(), message.as_bytes(), &sig)
+            .is_ok()
     }
 }
 
@@ -291,8 +286,8 @@ impl TrustStore {
     /// Returns an error if the database cannot be opened or the table cannot be created.
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref().to_string_lossy().to_string();
-        let conn = rusqlite::Connection::open(&db_path)
-            .context("Failed to open trust store database")?;
+        let conn =
+            rusqlite::Connection::open(&db_path).context("Failed to open trust store database")?;
 
         // Create tables
         conn.execute(
@@ -310,7 +305,10 @@ impl TrustStore {
             [],
         )?;
 
-        Ok(Self { _db_path: db_path, conn: Some(conn) })
+        Ok(Self {
+            _db_path: db_path,
+            conn: Some(conn),
+        })
     }
 
     /// Adds or updates a trust record in the database
@@ -361,9 +359,7 @@ impl TrustStore {
     /// Returns an error if the database query fails.
     pub fn get_trust(&self, worker_peer_id: &str) -> Result<Option<TrustRecordPersisted>> {
         let conn = self.conn.as_ref().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM trust_records WHERE worker_peer_id = ?1"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM trust_records WHERE worker_peer_id = ?1")?;
 
         let row = stmt.query_row([&worker_peer_id], |row| {
             let paired_at_str: String = row.get(3)?;
@@ -376,11 +372,21 @@ impl TrustStore {
                 worker_peer_id: row.get(0)?,
                 controller_peer_id: row.get(1)?,
                 node_name: row.get(2)?,
-                paired_at: paired_at_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                last_seen: last_seen_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                trust_score: trust_score_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                total_requests: total_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                successful_requests: successful_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                paired_at: paired_at_str
+                    .parse()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                last_seen: last_seen_str
+                    .parse()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                trust_score: trust_score_str
+                    .parse()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                total_requests: total_requests_str
+                    .parse()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                successful_requests: successful_requests_str
+                    .parse()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 pairing_token: row.get(8)?,
             })
         });
@@ -406,27 +412,38 @@ impl TrustStore {
     pub fn list_trusted(&self) -> Result<Vec<TrustRecordPersisted>> {
         let conn = self.conn.as_ref().unwrap();
         let mut stmt = conn.prepare("SELECT * FROM trust_records")?;
-        let records = stmt.query_map([], |row| {
-            let paired_at_str: String = row.get(3)?;
-            let last_seen_str: String = row.get(4)?;
-            let trust_score_str: String = row.get(5)?;
-            let total_requests_str: String = row.get(6)?;
-            let successful_requests_str: String = row.get(7)?;
+        let records = stmt
+            .query_map([], |row| {
+                let paired_at_str: String = row.get(3)?;
+                let last_seen_str: String = row.get(4)?;
+                let trust_score_str: String = row.get(5)?;
+                let total_requests_str: String = row.get(6)?;
+                let successful_requests_str: String = row.get(7)?;
 
-            Ok(TrustRecordPersisted {
-                worker_peer_id: row.get(0)?,
-                controller_peer_id: row.get(1)?,
-                node_name: row.get(2)?,
-                paired_at: paired_at_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                last_seen: last_seen_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                trust_score: trust_score_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                total_requests: total_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                successful_requests: successful_requests_str.parse().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                pairing_token: row.get(8)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+                Ok(TrustRecordPersisted {
+                    worker_peer_id: row.get(0)?,
+                    controller_peer_id: row.get(1)?,
+                    node_name: row.get(2)?,
+                    paired_at: paired_at_str
+                        .parse()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    last_seen: last_seen_str
+                        .parse()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    trust_score: trust_score_str
+                        .parse()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    total_requests: total_requests_str
+                        .parse()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    successful_requests: successful_requests_str
+                        .parse()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    pairing_token: row.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(records)
     }
@@ -442,7 +459,10 @@ impl TrustStore {
     /// Returns an error if the database operation fails.
     pub fn remove_trust(&self, worker_peer_id: &str) -> Result<()> {
         let conn = self.conn.as_ref().unwrap();
-        conn.execute("DELETE FROM trust_records WHERE worker_peer_id = ?1", [&worker_peer_id])?;
+        conn.execute(
+            "DELETE FROM trust_records WHERE worker_peer_id = ?1",
+            [&worker_peer_id],
+        )?;
         Ok(())
     }
 }
