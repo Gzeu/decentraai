@@ -33,8 +33,8 @@ pub fn ensure_mode_0600(path: &Path) -> Result<(), HelperError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::os::unix::fs::PermissionsExt;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn temp_file_ok_with_0600() {

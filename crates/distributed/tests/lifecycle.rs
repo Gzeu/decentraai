@@ -9,7 +9,11 @@ fn create_test_peer_id() -> libp2p::PeerId {
 }
 
 fn create_test_request(timeout_ms: u32) -> InferRequest {
-    let mut req = InferRequest::new("test-model-hash".to_string(), "test prompt".to_string(), 100);
+    let mut req = InferRequest::new(
+        "test-model-hash".to_string(),
+        "test prompt".to_string(),
+        100,
+    );
     req.timeout_ms = timeout_ms;
     req
 }
@@ -35,7 +39,10 @@ fn test_queue_lifecycle_enqueue_dequeue_and_timeout() {
 
     // Cleanup timed out requests
     let timed_out = futures::executor::block_on(manager.cleanup_timed_out());
-    assert!(!timed_out.is_empty(), "timed out requests should be returned");
+    assert!(
+        !timed_out.is_empty(),
+        "timed out requests should be returned"
+    );
 
     // After cleanup total should be 0
     let total_after = futures::executor::block_on(manager.total_queued());

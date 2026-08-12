@@ -103,10 +103,10 @@ mod tests {
     use super::*;
     use crate::config::InferenceConfig;
     use crate::worker::WorkerManager;
+    use chrono::Utc;
     use decentraai_p2p::RequestHandler;
     use decentraai_protocol::{WorkerAnnouncement, deserialize_message, serialize_message};
     use libp2p::identity::Keypair;
-    use chrono::Utc;
 
     fn create_test_peer_id() -> libp2p::PeerId {
         let keypair = Keypair::generate_ed25519();

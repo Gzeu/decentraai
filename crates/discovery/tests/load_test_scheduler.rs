@@ -91,7 +91,7 @@ async fn scheduler_scoring_under_load() {
     }
 
     let mut request = InferRequest::new("test-model".to_string(), "test prompt".to_string(), 100);
-        request = request.with_priority(128).with_streaming(false);
+    request = request.with_priority(128).with_streaming(false);
 
     // Best worker should be selected (high capacity, high throughput, low queue)
     let placement = scheduler.select_worker(&request);
@@ -122,7 +122,7 @@ async fn scheduler_fallback_under_load() {
     }
 
     let mut request = InferRequest::new("test-model".to_string(), "test prompt".to_string(), 100);
-        request = request.with_priority(128).with_streaming(false);
+    request = request.with_priority(128).with_streaming(false);
 
     // Get primary selection
     let primary = scheduler.select_worker(&request);
@@ -163,7 +163,7 @@ async fn scheduler_queue_management_under_load() {
     }
 
     let mut request = InferRequest::new("test-model".to_string(), "test prompt".to_string(), 100);
-        request = request.with_priority(128).with_streaming(false);
+    request = request.with_priority(128).with_streaming(false);
 
     // Queue multiple requests on first worker
     for _ in 0..5 {
@@ -257,7 +257,7 @@ async fn scheduler_worker_removal_under_load() {
 
     // Verify requests can still be scheduled
     let mut request = InferRequest::new("test-model".to_string(), "test prompt".to_string(), 100);
-        request = request.with_priority(128).with_streaming(false);
+    request = request.with_priority(128).with_streaming(false);
 
     let placement = scheduler.select_worker(&request);
     assert!(

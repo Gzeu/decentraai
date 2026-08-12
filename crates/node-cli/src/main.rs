@@ -911,6 +911,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Track if we'll register as a worker
     let will_be_worker = args.model.is_some();
 
+    // Optional running llama-server handle (spawned only when acting as a worker)
+    let mut maybe_server: Option<decentraai_runtime::LlamaServer> = None;
+
     // Pre-load registry and prepare inference backend if we're a worker
     let (registry, model_hash, model_name, backend) = if will_be_worker {
         if !registry_path.exists() {
@@ -935,9 +938,43 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             .to_hex()
             .to_string();
 
-        // Create inference backend for real llama-server calls
+        // Attempt to start a local llama-server for real inference. If the
+        // binary is not available, fall back to a default base URL so tests
+        // and environments without llama-server continue to work.
+        use decentraai_runtime::{LlamaServer, RuntimeConfig, find_llama_server};
+        let backend_base = match find_llama_server(None) {
+            Ok(binary) => {
+                // Spawn the server and wait until ready
+                let mut runtime_cfg = RuntimeConfig::new(model_path.clone());
+                runtime_cfg.ctx_size = config.inference.max_context_tokens;
+                runtime_cfg.parallel = config.inference.max_concurrent_requests;
+                runtime_cfg.threads = Some(
+                    SystemSnapshot::collect()
+                        .logical_cpus
+                        .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
+                        .max(1),
+                );
+                match LlamaServer::spawn(&binary, &runtime_cfg).await {
+                    Ok(server) => {
+                        let url = server.base_url();
+                        maybe_server = Some(server);
+                        url
+                    }
+                    Err(e) => {
+                        info!(error = %e, "failed to spawn llama-server, falling back to default backend URL");
+                        "http://127.0.0.1:8081".to_string()
+                    }
+                }
+            }
+            Err(e) => {
+                info!(error = %e, "llama-server not found on PATH; using default backend URL");
+                "http://127.0.0.1:8081".to_string()
+            }
+        };
+
+        // Create inference backend pointing at the chosen base URL
         let backend_config = BackendConfig {
-            base_url: "http://127.0.0.1:8081".to_string(),
+            base_url: backend_base,
             model: model_name.clone(),
             api_key: None,
             connect_timeout: std::time::Duration::from_secs(3),
@@ -1107,6 +1144,11 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // Keep running until interrupted
     tokio::signal::ctrl_c().await?;
+
+    // If we spawned a local llama-server for worker mode, stop it cleanly.
+    if let Some(server) = maybe_server.take() {
+        let _ = server.stop().await;
+    }
 
     distributed.shutdown();
     Ok(())
