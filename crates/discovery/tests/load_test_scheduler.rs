@@ -3,7 +3,7 @@
 //! This test creates 10+ simulated workers and tests the scheduler's performance
 //! under load, verifying that scoring and selection remain efficient and correct.
 
-use decentraai_discovery::{WorkerScheduler, SchedulerConfig};
+use decentraai_discovery::{SchedulerConfig, WorkerScheduler};
 use decentraai_protocol::{InferRequest, WorkerAnnouncement};
 use libp2p::PeerId;
 use uuid::Uuid;
@@ -40,20 +40,15 @@ async fn scheduler_load_test_with_10_workers() {
     // Test worker selection with different model requests
     for i in 0..10 {
         let model_hash = format!("model-hash-{}", i % 3);
-        let request = InferRequest {
-            request_id: Uuid::new_v4(),
-            model_hash: model_hash.clone(),
-            prompt: "test prompt".to_string(),
-            max_tokens: 100,
-            temperature: 0.7,
-            top_p: 0.9,
-            timeout_ms: 30000,
-            stream: false,
-            priority: 128,
-        };
+        let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
         let placement = scheduler.select_worker(&request);
-        assert!(placement.is_some(), "Should find worker for model {}", model_hash);
+        assert!(
+            placement.is_some(),
+            "Should find worker for model {}",
+            model_hash
+        );
 
         let placement = placement.unwrap();
         assert!(!placement.selected_worker.to_string().is_empty());
@@ -70,9 +65,9 @@ async fn scheduler_scoring_under_load() {
 
     // Create workers with different performance characteristics
     let worker_configs = [
-        (1.0, 50, 0),   // High capacity, high throughput, no queue
-        (0.5, 30, 5),   // Medium capacity, medium throughput, some queue
-        (0.2, 20, 8),   // Low capacity, low throughput, high queue
+        (1.0, 50, 0), // High capacity, high throughput, no queue
+        (0.5, 30, 5), // Medium capacity, medium throughput, some queue
+        (0.2, 20, 8), // Low capacity, low throughput, high queue
     ];
 
     for (i, (capacity, tps, queue_depth)) in worker_configs.iter().enumerate() {
@@ -95,17 +90,8 @@ async fn scheduler_scoring_under_load() {
         // This would normally be updated through runtime metrics
     }
 
-    let request = InferRequest {
-        request_id: Uuid::new_v4(),
-        model_hash: "test-model".to_string(),
-        prompt: "test prompt".to_string(),
-        max_tokens: 100,
-        temperature: 0.7,
-        top_p: 0.9,
-        timeout_ms: 30000,
-        stream: false,
-        priority: 128,
-    };
+    let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
     // Best worker should be selected (high capacity, high throughput, low queue)
     let placement = scheduler.select_worker(&request);
@@ -135,17 +121,8 @@ async fn scheduler_fallback_under_load() {
         scheduler.register_worker(announcement);
     }
 
-    let request = InferRequest {
-        request_id: Uuid::new_v4(),
-        model_hash: "test-model".to_string(),
-        prompt: "test prompt".to_string(),
-        max_tokens: 100,
-        temperature: 0.7,
-        top_p: 0.9,
-        timeout_ms: 30000,
-        stream: false,
-        priority: 128,
-    };
+    let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
     // Get primary selection
     let primary = scheduler.select_worker(&request);
@@ -154,7 +131,10 @@ async fn scheduler_fallback_under_load() {
 
     // Get fallback workers (excluding primary)
     let fallbacks = scheduler.get_fallback_workers(&request, &primary_worker);
-    assert!(!fallbacks.is_empty(), "Should have fallback workers available");
+    assert!(
+        !fallbacks.is_empty(),
+        "Should have fallback workers available"
+    );
     assert!(fallbacks.len() <= 14, "Should exclude primary worker");
 }
 
@@ -182,17 +162,8 @@ async fn scheduler_queue_management_under_load() {
         scheduler.register_worker(announcement);
     }
 
-    let request = InferRequest {
-        request_id: Uuid::new_v4(),
-        model_hash: "test-model".to_string(),
-        prompt: "test prompt".to_string(),
-        max_tokens: 100,
-        temperature: 0.7,
-        top_p: 0.9,
-        timeout_ms: 30000,
-        stream: false,
-        priority: 128,
-    };
+    let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
     // Queue multiple requests on first worker
     for _ in 0..5 {
@@ -236,17 +207,8 @@ async fn scheduler_concurrent_selections() {
     let mut successful_selections = 0;
     for i in 0..50 {
         let model_hash = format!("model-{}", i % 5);
-        let request = InferRequest {
-            request_id: Uuid::new_v4(),
-            model_hash,
-            prompt: "test prompt".to_string(),
-            max_tokens: 100,
-            temperature: 0.7,
-            top_p: 0.9,
-            timeout_ms: 30000,
-            stream: false,
-            priority: 128,
-        };
+        let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
         if scheduler.select_worker(&request).is_some() {
             successful_selections += 1;
@@ -254,7 +216,10 @@ async fn scheduler_concurrent_selections() {
     }
 
     // Most requests should be successfully scheduled
-    assert!(successful_selections >= 45, "Should successfully schedule most requests");
+    assert!(
+        successful_selections >= 45,
+        "Should successfully schedule most requests"
+    );
 }
 
 #[tokio::test]
@@ -291,18 +256,12 @@ async fn scheduler_worker_removal_under_load() {
     assert_eq!(remaining.len(), 5);
 
     // Verify requests can still be scheduled
-    let request = InferRequest {
-        request_id: Uuid::new_v4(),
-        model_hash: "test-model".to_string(),
-        prompt: "test prompt".to_string(),
-        max_tokens: 100,
-        temperature: 0.7,
-        top_p: 0.9,
-        timeout_ms: 30000,
-        stream: false,
-        priority: 128,
-    };
+    let mut request = InferRequest::new(model_hash.clone(), "test prompt".to_string(), 100);
+        request = request.with_priority(128).with_streaming(false);
 
     let placement = scheduler.select_worker(&request);
-    assert!(placement.is_some(), "Should still find workers after removal");
+    assert!(
+        placement.is_some(),
+        "Should still find workers after removal"
+    );
 }
