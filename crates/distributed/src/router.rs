@@ -188,7 +188,7 @@ impl RequestRouter {
             request_id = %request.request_id,
             worker_peer_id = %worker_peer_id,
             tokens_used = response.tokens_used,
-            time_ms = response.time_ms,
+            processing_time_ms = response.processing_time_ms,
             "request completed successfully"
         );
 
