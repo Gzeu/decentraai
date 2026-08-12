@@ -322,7 +322,7 @@ impl RequestRouterWithFallback {
     /// * `max_retries` - Maximum number of retry attempts
     pub fn new(local_peer_id: PeerId, max_retries: u32) -> Self {
         Self {
-            router: RequestRouter::new(local_peer_id),
+            router: RequestRouter::new(local_peer_id, None),
             fallback_handler: FallbackHandler::new(max_retries),
         }
     }

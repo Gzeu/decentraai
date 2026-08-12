@@ -48,6 +48,7 @@ pub mod fallback;
 pub mod p2p_handler;
 pub mod queue;
 pub mod router;
+pub mod tracker;
 pub mod worker;
 
 pub use config::InferenceConfig;
@@ -56,6 +57,7 @@ pub use fallback::FallbackHandler;
 pub use p2p_handler::DistributedP2PHandler;
 pub use queue::{QueueProcessResult, QueuedRequest, RequestQueueManager, WorkerRequestQueue};
 pub use router::RequestRouter;
+pub use tracker::RequestTracker;
 pub use worker::WorkerManager;
 
 /// Re-export protocol types for convenience
@@ -101,8 +103,9 @@ pub struct DistributedInference {
     worker_manager: Arc<WorkerManager>,
     request_router: RequestRouter,
     fallback_handler: FallbackHandler,
-    queue_manager: RequestQueueManager,
+    queue_manager: Arc<RequestQueueManager>,
     config: InferenceConfig,
+    tracker: Option<Arc<RequestTracker>>,
 }
 
 impl DistributedInference {
@@ -117,16 +120,17 @@ impl DistributedInference {
         p2p_node: decentraai_p2p::P2PNode,
         config: InferenceConfig,
         worker_manager: Option<Arc<WorkerManager>>,
+        tracker: Option<Arc<RequestTracker>>,
     ) -> anyhow::Result<Self> {
         let worker_manager = worker_manager.unwrap_or_else(|| {
             Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone()))
         });
-        let request_router = RequestRouter::new(p2p_node.local_peer_id());
+        let request_router = RequestRouter::new(p2p_node.local_peer_id(), tracker.clone());
         let fallback_handler = FallbackHandler::new(config.max_retries);
-        let queue_manager = RequestQueueManager::new(
+        let queue_manager = Arc::new(RequestQueueManager::new(
             config.max_queue_depth as usize,
             std::time::Duration::from_millis(config.request_timeout_ms),
-        );
+        ));
 
         Ok(Self {
             p2p_node,
@@ -135,6 +139,7 @@ impl DistributedInference {
             fallback_handler,
             queue_manager,
             config,
+            tracker,
         })
     }
 
@@ -170,7 +175,7 @@ impl DistributedInference {
 
     /// Returns a reference to the queue manager
     pub fn queue_manager(&self) -> &RequestQueueManager {
-        &self.queue_manager
+        &*self.queue_manager
     }
 
     /// Starts the worker discovery process
@@ -200,6 +205,140 @@ impl DistributedInference {
     ) -> anyhow::Result<()> {
         self.worker_manager
             .register_as_worker(node_name, loaded_models, initial_capacity)
+    }
+
+    /// Registers a backend to serve inference on this node and installs the
+    /// P2P on_infer handler that accepts requests, enqueues them, and streams
+    /// progress back to the requester. This method must be called after the
+    /// DistributedInference is constructed and takes ownership of the backend.
+    pub fn register_worker_backend(
+        &mut self,
+        backend: decentraai_inference_adapter::OpenAiCompatibleBackend,
+        model_hash: String,
+    ) -> anyhow::Result<()> {
+        use decentraai_inference_adapter::InferenceBackend;
+        use decentraai_protocol::{InferProgress, InferMessage, InferResponse, serialize_message};
+
+        let local_peer = self.p2p_node.local_peer_id();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<decentraai_protocol::InferRequest>();
+        let tx_clone = tx.clone();
+        let p2p_clone = self.p2p_node.clone();
+        let queue_mgr = self.queue_manager.clone();
+        let backend_clone = backend.clone();
+        let model_hash_clone = model_hash.clone();
+
+        // Register sync on_infer handler that enqueues the request and returns Accept
+        self.p2p_node.set_on_infer_request(move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
+            // Only accept requests for the configured model
+            if req.model_hash != model_hash_clone {
+                let resp = InferResponse {
+                    request_id: req.request_id,
+                    trace_id: req.trace_id.clone(),
+                    worker_peer_id: local_peer,
+                    completed_at: chrono::Utc::now().to_rfc3339(),
+                    output: "".to_string(),
+                    tokens_used: 0,
+                    processing_time_ms: 0,
+                    success: false,
+                    error: Some("Model not available on this worker".to_string()),
+                };
+                return Ok(serialize_message(&InferMessage::InferResponse(resp))?);
+            }
+
+            // Send to processing channel (background task will enqueue)
+            tx_clone.send(req).map_err(|e| anyhow::anyhow!("failed to enqueue infer request: {}", e))?;
+
+            // Respond with InferAccepted (use the original request_id)
+            let msg = InferMessage::InferAccepted {
+                request_id: uuid::Uuid::new_v4(),
+                worker_peer_id: local_peer,
+                estimated_wait_ms: 10,
+            };
+            Ok(serialize_message(&msg)?)
+        });
+
+        // Spawn background task to process queued requests and stream
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(req) = rx.recv().await {
+                // Queue the request
+                let _ = queue_mgr.queue_request(req.clone(), local_peer).await;
+
+                // Try to dequeue and process
+                while let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
+                    let request_id = queued.request_id;
+                    let backend_req = decentraai_inference_adapter::BackendRequest {
+                        request_id: request_id.to_string(),
+                        prompt: queued.request.prompt.clone(),
+                        max_tokens: queued.request.max_tokens,
+                        temperature: queued.request.temperature,
+                        top_p: queued.request.top_p,
+                    };
+
+                    match backend_clone.stream(backend_req).await {
+                        Ok(mut stream) => {
+                            let mut seq: u64 = 0;
+                            while let Some(chunk_res) = stream.next().await {
+                                match chunk_res {
+                                    Ok(chunk) => {
+                                        seq += 1;
+                                        let progress = InferProgress {
+                                            request_id,
+                                            worker_peer_id: local_peer,
+                                            tokens_generated: seq as u32,
+                                            partial_output: chunk.text.clone(),
+                                            percent_complete: 0.0,
+                                        };
+                                        if let Ok(bytes) = serialize_message(&InferMessage::InferProgress(progress.clone())) {
+                                            let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
+                                        }
+
+                                        // Check cancellation
+                                        if queue_mgr.is_cancelled(request_id).await {
+                                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id, worker_peer_id: local_peer, error: "cancelled".to_string(), retryable: false }) {
+                                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id, worker_peer_id: local_peer, error: format!("backend error: {}", e), retryable: false }) {
+                                            let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // On completion send final InferResponse
+                            let final_resp = InferResponse {
+                                request_id,
+                                trace_id: queued.request.trace_id.clone(),
+                                worker_peer_id: local_peer,
+                                completed_at: chrono::Utc::now().to_rfc3339(),
+                                output: "".to_string(),
+                                tokens_used: 0,
+                                processing_time_ms: 0,
+                                success: true,
+                                error: None,
+                            };
+                            if let Ok(bytes) = serialize_message(&InferMessage::InferResponse(final_resp)) {
+                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
+                            }
+                            let _ = queue_mgr.complete_request(request_id).await;
+                        }
+                        Err(e) => {
+                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id: queued.request.request_id, worker_peer_id: local_peer, error: format!("backend error: {}", e), retryable: false }) {
+                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
+                            }
+                            let _ = queue_mgr.complete_request(queued.request.request_id).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     /// Routes an inference request to the best available worker

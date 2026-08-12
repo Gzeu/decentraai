@@ -14,8 +14,10 @@ use std::sync::Arc;
 pub struct DistributedP2PHandler {
     /// Worker manager for processing announcements
     worker_manager: Option<Arc<crate::worker::WorkerManager>>,
-    /// Inference request handler function
-    infer_handler: Option<Arc<dyn Fn(InferRequest) -> Result<InferResponse> + Send + Sync>>,
+    /// Inference request handler function (synchronous callback that may spawn async work)
+    infer_handler: Option<Arc<dyn Fn(InferRequest) -> Result<Vec<u8>> + Send + Sync>>,
+    /// Optional tracker to deliver progress / final messages back to waiting coordinators
+    tracker: Option<Arc<crate::tracker::RequestTracker>>,
 }
 
 impl DistributedP2PHandler {
@@ -24,6 +26,7 @@ impl DistributedP2PHandler {
         Self {
             worker_manager: None,
             infer_handler: None,
+            tracker: None,
         }
     }
 
@@ -32,28 +35,36 @@ impl DistributedP2PHandler {
         Self {
             worker_manager: Some(worker_manager),
             infer_handler: None,
+            tracker: None,
         }
     }
 
     /// Creates a new handler with inference request handler
     pub fn with_infer_handler(
-        infer_handler: impl Fn(InferRequest) -> Result<InferResponse> + Send + Sync + 'static,
+        infer_handler: impl Fn(InferRequest) -> Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             worker_manager: None,
             infer_handler: Some(Arc::new(infer_handler)),
+            tracker: None,
         }
     }
 
     /// Creates a new handler with both worker manager and inference handler
     pub fn with_both(
         worker_manager: Arc<crate::worker::WorkerManager>,
-        infer_handler: impl Fn(InferRequest) -> Result<InferResponse> + Send + Sync + 'static,
+        infer_handler: impl Fn(InferRequest) -> Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             worker_manager: Some(worker_manager),
             infer_handler: Some(Arc::new(infer_handler)),
+            tracker: None,
         }
+    }
+
+    /// Attach a RequestTracker so progress messages are delivered to waiting coordinators
+    pub fn set_tracker(&mut self, tracker: Arc<crate::tracker::RequestTracker>) {
+        self.tracker = Some(tracker);
     }
 }
 
@@ -65,7 +76,7 @@ impl Default for DistributedP2PHandler {
 
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
-        use decentraai_protocol::deserialize_message;
+        use decentraai_protocol::{InferMessage, deserialize_message};
 
         // Try to deserialize as WorkerAnnouncement
         if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, request.len())
@@ -76,11 +87,23 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
             return Ok(Vec::new()); // No response for announcements
         }
 
+        // Try to deserialize as a generic InferMessage (progress/response/etc)
+        if let Ok(msg) = deserialize_message::<InferMessage>(request, request.len()) {
+            // If a tracker is registered, deliver the message there for the waiting coordinator
+            if let Some(tracker) = &self.tracker {
+                let _ = futures::executor::block_on(tracker.deliver(msg));
+                return Ok(Vec::new());
+            }
+            anyhow::bail!("No tracker configured to receive infer messages");
+        }
+
         // Try to deserialize as InferRequest
         if let Ok(infer_request) = deserialize_message::<InferRequest>(request, request.len()) {
             if let Some(handler) = &self.infer_handler {
-                let response = handler(infer_request)?;
-                return Self::serialize_response(&response);
+                // The handler returns raw bytes so it may serialize an InferAccepted
+                // message and spawn background tasks for streaming progress.
+                let response_bytes = handler(infer_request)?;
+                return Ok(response_bytes);
             }
             anyhow::bail!("No inference handler configured");
         }
@@ -146,7 +169,7 @@ mod tests {
         let peer_id = create_test_peer_id();
 
         let handler = DistributedP2PHandler::with_infer_handler(move |request| {
-            Ok(InferResponse {
+            let resp = InferResponse {
                 request_id: request.request_id,
                 trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
@@ -156,7 +179,8 @@ mod tests {
                 processing_time_ms: 100,
                 success: true,
                 error: None,
-            })
+            };
+            Ok(decentraai_protocol::serialize_message(&resp).unwrap())
         });
 
         let request = InferRequest::new("model-hash".to_string(), "test prompt".to_string(), 100);

@@ -1080,14 +1080,30 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         None
     };
 
+    // Create a shared request tracker for streaming progress
+    let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
+
     // Create distributed P2P handler with appropriate configuration
     let distributed_handler = if let Some(infer_handler) = infer_handler {
-        decentraai_distributed::DistributedP2PHandler::with_both(
+        // Wrap the sync infer_handler so it returns serialized bytes
+        let wrapped = move |request: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
+            let resp = infer_handler(request)?;
+            let bytes = decentraai_protocol::serialize_message(&resp)
+                .map_err(|e| anyhow::anyhow!("serialize error: {}", e))?;
+            Ok(bytes)
+        };
+        let mut h = decentraai_distributed::DistributedP2PHandler::with_both(
             worker_manager.clone(),
-            move |request| infer_handler(request),
-        )
+            wrapped,
+        );
+        h.set_tracker(tracker.clone());
+        h
     } else {
-        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone())
+        let mut h = decentraai_distributed::DistributedP2PHandler::with_worker_manager(
+            worker_manager.clone(),
+        );
+        h.set_tracker(tracker.clone());
+        h
     };
 
     // Create a chained handler for manifest, distributed, and other messages
@@ -1113,9 +1129,12 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // Create distributed inference coordinator with the shared worker manager
     let distributed_config = InferenceConfig::default();
-    let mut distributed =
-        DistributedInference::new(p2p_node, distributed_config, Some(worker_manager.clone()))?;
-
+    let mut distributed = DistributedInference::new(
+        p2p_node,
+        distributed_config,
+        Some(worker_manager.clone()),
+        Some(tracker.clone()),
+    )?;
     // If we have a model specified, register as a worker
     if will_be_worker {
         let model_hash = model_hash.expect("model_hash must be set for worker");
@@ -1127,6 +1146,11 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             vec![model_hash.clone()],
             1.0, // Full capacity initially
         )?;
+
+        // Register the local backend to handle inference and streaming
+        if let Some(backend) = &backend {
+            distributed.register_worker_backend(backend.clone(), model_hash.clone())?;
+        }
 
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }

@@ -26,3 +26,4 @@ decentraai-discovery = { path = "../discovery" }
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }
+decentraai-inference-adapter = { path = "../inference-adapter" }

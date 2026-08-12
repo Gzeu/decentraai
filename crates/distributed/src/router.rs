@@ -25,6 +25,9 @@ pub struct RequestRouter {
     /// The peer ID of the local node
     local_peer_id: PeerId,
 
+    /// Optional tracker for progress messages
+    tracker: Option<Arc<crate::tracker::RequestTracker>>,
+
     /// The worker scheduler for selecting optimal workers
     scheduler: Arc<Mutex<WorkerScheduler>>,
 
@@ -41,7 +44,10 @@ impl RequestRouter {
     /// # Arguments
     ///
     /// * `local_peer_id` - The peer ID of the local node
-    pub fn new(local_peer_id: PeerId) -> Self {
+    pub fn new(
+        local_peer_id: PeerId,
+        tracker: Option<Arc<crate::tracker::RequestTracker>>,
+    ) -> Self {
         let scheduler_config = SchedulerConfig {
             max_queue_depth: 10,
             min_available_capacity: 0.1,
@@ -53,6 +59,7 @@ impl RequestRouter {
 
         Self {
             local_peer_id,
+            tracker,
             scheduler: Arc::new(Mutex::new(scheduler)),
             total_requests: Arc::new(Mutex::new(0)),
             successful_requests: Arc::new(Mutex::new(0)),
@@ -163,11 +170,6 @@ impl RequestRouter {
         let payload = Self::serialize_request(&request)?;
 
         // Send via P2P
-        // Note: This is where we need to extend the P2P node to handle
-        // InferRequest messages properly
-
-        // For now, we'll use the generic request method
-        // In production, we'd want a dedicated method for inference requests
         let response_bytes = match p2p_node.request(worker_peer_id, payload).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -177,22 +179,103 @@ impl RequestRouter {
             }
         };
 
-        // Deserialize the response
-        let response = Self::deserialize_response(&response_bytes)?;
+        // Try to decode as an InferResponse first
+        use decentraai_protocol::{InferMessage, deserialize_message};
+        if let Ok(infer_resp) =
+            deserialize_message::<InferResponse>(&response_bytes, response_bytes.len())
+        {
+            self.decrement_pending().await;
+            self.increment_success().await;
+            info!(
+                request_id = %request.request_id,
+                worker_peer_id = %worker_peer_id,
+                tokens_used = infer_resp.tokens_used,
+                processing_time_ms = infer_resp.processing_time_ms,
+                "request completed successfully"
+            );
+            return Ok(infer_resp);
+        }
 
-        // Decrement pending and increment success
+        // Otherwise try to decode as an InferMessage (likely InferAccepted)
+        let first_msg: InferMessage = deserialize_message(&response_bytes, response_bytes.len())
+            .map_err(|e| DistributedError::SerializationError(e.to_string()))?;
+
+        // If we have a tracker registered, wait for progress/final messages
+        if let Some(tracker) = &self.tracker {
+            let mut rx = tracker.register(request.request_id).await;
+            let mut accumulated = String::new();
+            let mut final_response: Option<InferResponse> = None;
+
+            // If the initial message is a progress frame, deliver it locally first
+            match first_msg {
+                InferMessage::InferProgress(p) => {
+                    accumulated.push_str(&p.partial_output);
+                }
+                InferMessage::InferResponse(resp) => {
+                    final_response = Some(resp);
+                }
+                InferMessage::InferFailed {
+                    request_id: _,
+                    worker_peer_id: _,
+                    error,
+                    ..
+                } => {
+                    self.decrement_pending().await;
+                    self.increment_failed().await;
+                    return Err(DistributedError::AllWorkersFailed(error));
+                }
+                _ => {}
+            }
+
+            // Loop until final response
+            while final_response.is_none() {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                    Ok(Some(msg)) => match msg {
+                        InferMessage::InferProgress(p) => {
+                            accumulated.push_str(&p.partial_output);
+                        }
+                        InferMessage::InferResponse(resp) => {
+                            final_response = Some(resp);
+                        }
+                        InferMessage::InferFailed {
+                            request_id: _,
+                            worker_peer_id: _,
+                            error,
+                            ..
+                        } => {
+                            self.decrement_pending().await;
+                            self.increment_failed().await;
+                            return Err(DistributedError::AllWorkersFailed(error));
+                        }
+                        _ => {}
+                    },
+                    Ok(None) => break, // channel closed
+                    Err(_) => {
+                        // timeout
+                        self.decrement_pending().await;
+                        self.increment_failed().await;
+                        return Err(DistributedError::RequestTimeout(request.timeout_ms as u64));
+                    }
+                }
+            }
+
+            if let Some(mut resp) = final_response {
+                // attach accumulated output if needed
+                if resp.output.is_empty() {
+                    resp.output = accumulated.clone();
+                }
+                self.decrement_pending().await;
+                self.increment_success().await;
+                return Ok(resp);
+            }
+        }
+
+        // If we reached here, we couldn't produce a response
         self.decrement_pending().await;
-        self.increment_success().await;
-
-        info!(
-            request_id = %request.request_id,
-            worker_peer_id = %worker_peer_id,
-            tokens_used = response.tokens_used,
-            processing_time_ms = response.processing_time_ms,
-            "request completed successfully"
-        );
-
-        Ok(response)
+        self.increment_failed().await;
+        Err(DistributedError::AllWorkersFailed(
+            request.request_id.to_string(),
+        ))
     }
 
     /// Routes a request to the best available worker
@@ -360,7 +443,7 @@ mod tests {
     #[test]
     fn test_request_router_creation() {
         let peer_id = create_test_peer_id();
-        let router = RequestRouter::new(peer_id);
+        let router = RequestRouter::new(peer_id, None);
 
         assert_eq!(router.local_peer_id, peer_id);
         assert_eq!(router.total_requests_sync(), 0);
@@ -386,7 +469,7 @@ mod tests {
     #[test]
     fn test_select_worker_with_workers() {
         let peer_id = create_test_peer_id();
-        let router = RequestRouter::new(peer_id);
+        let router = RequestRouter::new(peer_id, None);
 
         let worker_peer_id = create_test_peer_id();
         let workers = vec![WorkerAnnouncement {
@@ -408,7 +491,7 @@ mod tests {
     #[test]
     fn test_select_worker_no_matching_model() {
         let peer_id = create_test_peer_id();
-        let router = RequestRouter::new(peer_id);
+        let router = RequestRouter::new(peer_id, None);
 
         let worker_peer_id = create_test_peer_id();
         let workers = vec![WorkerAnnouncement {
