@@ -270,9 +270,23 @@ enum Command {
 }
 
 /// Handle to the background swarm task.
+#[derive(Clone)]
 pub struct P2PNode {
     commands: mpsc::UnboundedSender<Command>,
     peer_id: PeerId,
+    /// Optional callback invoked for inbound InferRequest messages. Stored
+    /// here so callers can register a handler after the node is created.
+    on_infer: std::sync::Arc<
+        tokio::sync::Mutex<
+            Option<
+                std::sync::Arc<
+                    dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
+                        + Send
+                        + Sync,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl P2PNode {
@@ -281,15 +295,20 @@ impl P2PNode {
     where
         F: Fn(decentraai_protocol::WorkerAnnouncement) + Send + Sync + 'static,
     {
-        // TODO: Implement callback storage and invocation in swarm task
+        // Worker announcements are handled elsewhere; not implemented yet.
+        let _ = _callback;
     }
 
-    /// Sets a callback for inference requests
-    pub fn set_on_infer_request<F>(&mut self, _callback: F)
+    /// Sets a callback for inference requests. The callback should return an
+    /// immediate response (e.g., an InferAccepted message), and may spawn
+    /// background tasks to stream progress back to the requester using
+    /// P2PNode::request().
+    pub fn set_on_infer_request<F>(&mut self, callback: F)
     where
-        F: Fn(decentraai_protocol::InferRequest) -> Result<Vec<u8>> + Send + Sync + 'static,
+        F: Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
     {
-        // TODO: Implement callback storage and invocation in swarm task
+        let mut guard = futures::executor::block_on(self.on_infer.lock());
+        *guard = Some(std::sync::Arc::new(callback));
     }
 
     /// Creates a node and spawns its swarm task. Must be called from within
@@ -329,6 +348,19 @@ impl P2PNode {
             .build();
 
         let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
+        // Shared on_infer callback storage for runtime registration
+        let on_infer: std::sync::Arc<
+            tokio::sync::Mutex<
+                Option<
+                    std::sync::Arc<
+                        dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
+                            + Send
+                            + Sync,
+                    >,
+                >,
+            >,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let on_infer_clone = on_infer.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -420,14 +452,32 @@ impl P2PNode {
                                         continue;
                                     }
                                     // Check for InferRequest
-                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::InferRequest>(
+                                    if let Ok(infer_req) = decentraai_protocol::deserialize_message::<decentraai_protocol::InferRequest>(
                                         &request,
                                         request.len(),
-                                    )
-                                    .is_ok()
-                                    {
+                                    ) {
                                         info!(%peer, bytes = request.len(), "received inference request");
-                                        // Forward to handler for processing
+                                        // If a runtime on_infer callback has been registered, call it
+                                        let guard = on_infer_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            match cb(infer_req) {
+                                                Ok(bytes) => {
+                                                    if swarm
+                                                        .behaviour_mut()
+                                                        .messages
+                                                        .send_response(channel, bytes)
+                                                        .is_err()
+                                                    {
+                                                        warn!(%peer, "failed to send response");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(%peer, error = %e, "on_infer handler failed");
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        // else fallthrough to normal handler
                                     }
                                     let response = match &handler {
                                         Some(h) => match h.handle(&request) {
@@ -487,7 +537,11 @@ impl P2PNode {
             }
         });
 
-        Ok(Self { commands, peer_id })
+        Ok(Self {
+            commands,
+            peer_id,
+            on_infer,
+        })
     }
 
     pub fn local_peer_id(&self) -> PeerId {
