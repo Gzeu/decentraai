@@ -50,16 +50,18 @@ pub mod queue;
 pub mod router;
 pub mod worker;
 
-pub use worker::WorkerManager;
-pub use router::RequestRouter;
-pub use fallback::FallbackHandler;
-pub use queue::{RequestQueueManager, QueuedRequest, WorkerRequestQueue, QueueProcessResult};
 pub use config::InferenceConfig;
 pub use error::DistributedError;
+pub use fallback::FallbackHandler;
 pub use p2p_handler::DistributedP2PHandler;
+pub use queue::{QueueProcessResult, QueuedRequest, RequestQueueManager, WorkerRequestQueue};
+pub use router::RequestRouter;
+pub use worker::WorkerManager;
 
 /// Re-export protocol types for convenience
-pub use decentraai_protocol::{InferRequest, InferResponse, WorkerAnnouncement, WorkerStatus, TaskPlacement};
+pub use decentraai_protocol::{
+    InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
+};
 
 /// Module for error types
 mod error {
@@ -69,22 +71,22 @@ mod error {
     pub enum DistributedError {
         #[error("No workers available for model {0}")]
         NoWorkersAvailable(String),
-        
+
         #[error("All workers failed for request {0}")]
         AllWorkersFailed(String),
-        
+
         #[error("Request timeout after {0}ms")]
         RequestTimeout(u64),
-        
+
         #[error("Worker {0} rejected request: {1}")]
         WorkerRejected(String, String),
-        
+
         #[error("P2P communication error: {0}")]
         P2PError(#[from] anyhow::Error),
-        
+
         #[error("Serialization error: {0}")]
         SerializationError(String),
-        
+
         #[error("Worker {0} is not trusted")]
         UntrustedWorker(String),
     }
@@ -116,8 +118,9 @@ impl DistributedInference {
         config: InferenceConfig,
         worker_manager: Option<Arc<WorkerManager>>,
     ) -> anyhow::Result<Self> {
-        let worker_manager = worker_manager
-            .unwrap_or_else(|| Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone())));
+        let worker_manager = worker_manager.unwrap_or_else(|| {
+            Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone()))
+        });
         let request_router = RequestRouter::new(p2p_node.local_peer_id());
         let fallback_handler = FallbackHandler::new(config.max_retries);
         let queue_manager = RequestQueueManager::new(
@@ -147,8 +150,7 @@ impl DistributedInference {
 
     /// Returns a mutable reference to the worker manager
     pub fn worker_manager_mut(&mut self) -> &mut WorkerManager {
-        Arc::get_mut(&mut self.worker_manager)
-            .expect("WorkerManager is shared elsewhere")
+        Arc::get_mut(&mut self.worker_manager).expect("WorkerManager is shared elsewhere")
     }
 
     /// Returns a clone of the Arc-wrapped worker manager
@@ -196,11 +198,8 @@ impl DistributedInference {
         loaded_models: Vec<String>,
         initial_capacity: f32,
     ) -> anyhow::Result<()> {
-        self.worker_manager.register_as_worker(
-            node_name,
-            loaded_models,
-            initial_capacity,
-        )
+        self.worker_manager
+            .register_as_worker(node_name, loaded_models, initial_capacity)
     }
 
     /// Routes an inference request to the best available worker
@@ -223,10 +222,10 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         // Get the current worker list from the manager (sync version for now)
         let workers = self.worker_manager.get_workers_sync();
-        
+
         // Select the best worker for this request
         let placement = self.request_router.select_worker(&request, &workers)?;
-        
+
         // Send the request and handle the response
         self.request_router
             .send_request(&self.p2p_node, request, placement)
@@ -235,9 +234,7 @@ impl DistributedInference {
 
     /// Broadcasts this worker's current status to all connected peers
     pub async fn broadcast_worker_status(&self) -> anyhow::Result<()> {
-        self.worker_manager
-            .broadcast_status(&self.p2p_node)
-            .await
+        self.worker_manager.broadcast_status(&self.p2p_node).await
     }
 
     /// Updates the capacity of the local worker
@@ -326,8 +323,9 @@ mod tests {
             total_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
+            queued_requests: 0,
         };
-        
+
         assert!(!stats.local_worker_registered);
         assert_eq!(stats.worker_count, 0);
     }

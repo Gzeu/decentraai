@@ -22,18 +22,41 @@ pub struct BackendConfig {
 
 impl Default for BackendConfig {
     fn default() -> Self {
-        Self { base_url: "http://127.0.0.1:8081".into(), model: "local-model".into(), api_key: None, connect_timeout: Duration::from_secs(3), request_timeout: Duration::from_secs(300), max_prompt_bytes: 200_000, max_output_tokens: 8192 }
+        Self {
+            base_url: "http://127.0.0.1:8081".into(),
+            model: "local-model".into(),
+            api_key: None,
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(300),
+            max_prompt_bytes: 200_000,
+            max_output_tokens: 8192,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct BackendRequest { pub request_id: String, pub prompt: String, pub max_tokens: u32, pub temperature: f32, pub top_p: f32 }
+pub struct BackendRequest {
+    pub request_id: String,
+    pub prompt: String,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+}
 
 #[derive(Debug, Clone)]
-pub struct BackendResponse { pub output: String, pub tokens_used: Option<u32>, pub finish_reason: Option<String> }
+pub struct BackendResponse {
+    pub output: String,
+    pub tokens_used: Option<u32>,
+    pub finish_reason: Option<String>,
+}
 
 #[derive(Debug, Clone)]
-pub struct StreamChunk { pub request_id: String, pub sequence: u64, pub text: String, pub finish_reason: Option<String> }
+pub struct StreamChunk {
+    pub request_id: String,
+    pub sequence: u64,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -59,26 +82,47 @@ pub trait InferenceBackend: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct OpenAiCompatibleBackend { client: Client, config: BackendConfig }
+pub struct OpenAiCompatibleBackend {
+    client: Client,
+    config: BackendConfig,
+}
 
 impl OpenAiCompatibleBackend {
     pub fn new(config: BackendConfig) -> Result<Self, BackendError> {
-        let client = Client::builder().connect_timeout(config.connect_timeout).timeout(config.request_timeout).build().map_err(|e| BackendError::Transport(e.to_string()))?;
+        let client = Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .build()
+            .map_err(|e| BackendError::Transport(e.to_string()))?;
         Ok(Self { client, config })
     }
 
     fn validate(&self, request: &BackendRequest) -> Result<(), BackendError> {
-        if request.prompt.len() > self.config.max_prompt_bytes { return Err(BackendError::PromptTooLarge); }
-        if request.max_tokens > self.config.max_output_tokens { return Err(BackendError::OutputLimitExceeded); }
+        if request.prompt.len() > self.config.max_prompt_bytes {
+            return Err(BackendError::PromptTooLarge);
+        }
+        if request.max_tokens > self.config.max_output_tokens {
+            return Err(BackendError::OutputLimitExceeded);
+        }
         Ok(())
     }
 
-    fn endpoint(&self, path: &str) -> String { format!("{}/{}", self.config.base_url.trim_end_matches('/'), path) }
-    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder { self.config.api_key.as_ref().map_or(request, |key| request.bearer_auth(key)) }
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
+    }
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.config.api_key {
+            Some(key) => request.bearer_auth(key),
+            None => request,
+        }
+    }
 
     async fn http_error(response: reqwest::Response) -> BackendError {
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_else(|_| "unreadable body".into());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unreadable body".into());
         BackendError::Http { status, body }
     }
 }
@@ -86,42 +130,126 @@ impl OpenAiCompatibleBackend {
 #[async_trait]
 impl InferenceBackend for OpenAiCompatibleBackend {
     async fn health(&self) -> Result<(), BackendError> {
-        let response = self.auth(self.client.get(self.endpoint("health"))).send().await.map_err(|e| if e.is_timeout() { BackendError::Timeout } else { BackendError::Transport(e.to_string()) })?;
-        if response.status().is_success() { Ok(()) } else { Err(Self::http_error(response).await) }
+        let response = self
+            .auth(self.client.get(self.endpoint("health")))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    BackendError::Timeout
+                } else {
+                    BackendError::Transport(e.to_string())
+                }
+            })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::http_error(response).await)
+        }
     }
 
     async fn complete(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
         self.validate(&request)?;
         let body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": false});
-        let response = self.auth(self.client.post(self.endpoint("v1/chat/completions"))).json(&body).send().await.map_err(|e| if e.is_timeout() { BackendError::Timeout } else { BackendError::Transport(e.to_string()) })?;
-        if !response.status().is_success() { return Err(Self::http_error(response).await); }
-        let raw: OpenAiResponse = response.json().await.map_err(|e| BackendError::Protocol(e.to_string()))?;
-        let choice = raw.choices.into_iter().next().ok_or_else(|| BackendError::Protocol("missing choice".into()))?;
-        Ok(BackendResponse { output: choice.message.content, tokens_used: raw.usage.and_then(|u| u.completion_tokens), finish_reason: choice.finish_reason })
+        let response = self
+            .auth(self.client.post(self.endpoint("v1/chat/completions")))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    BackendError::Timeout
+                } else {
+                    BackendError::Transport(e.to_string())
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(Self::http_error(response).await);
+        }
+        let raw: OpenAiResponse = response
+            .json()
+            .await
+            .map_err(|e| BackendError::Protocol(e.to_string()))?;
+        let choice = raw
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::Protocol("missing choice".into()))?;
+        Ok(BackendResponse {
+            output: choice.message.content,
+            tokens_used: raw.usage.and_then(|u| u.completion_tokens),
+            finish_reason: choice.finish_reason,
+        })
     }
 
     async fn stream(&self, request: BackendRequest) -> Result<TokenStream, BackendError> {
         self.validate(&request)?;
         let body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": true});
-        let response = self.auth(self.client.post(self.endpoint("v1/chat/completions"))).json(&body).send().await.map_err(|e| if e.is_timeout() { BackendError::Timeout } else { BackendError::Transport(e.to_string()) })?;
-        if !response.status().is_success() { return Err(Self::http_error(response).await); }
-        Ok(Box::pin(parse_sse(response.bytes_stream(), request.request_id)))
+        let response = self
+            .auth(self.client.post(self.endpoint("v1/chat/completions")))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    BackendError::Timeout
+                } else {
+                    BackendError::Transport(e.to_string())
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(Self::http_error(response).await);
+        }
+        Ok(Box::pin(parse_sse(
+            response.bytes_stream(),
+            request.request_id,
+        )))
     }
 }
 
-#[derive(Debug, Deserialize)] struct OpenAiResponse { choices: Vec<OpenAiChoice>, usage: Option<OpenAiUsage> }
-#[derive(Debug, Deserialize)] struct OpenAiChoice { message: OpenAiMessage, finish_reason: Option<String> }
-#[derive(Debug, Deserialize)] struct OpenAiMessage { content: String }
-#[derive(Debug, Deserialize)] struct OpenAiUsage { completion_tokens: Option<u32> }
-#[derive(Debug, Deserialize)] struct OpenAiStreamResponse { choices: Vec<OpenAiStreamChoice> }
-#[derive(Debug, Deserialize)] struct OpenAiStreamChoice { delta: OpenAiDelta, finish_reason: Option<String> }
-#[derive(Debug, Deserialize)] struct OpenAiDelta { content: Option<String> }
+#[derive(Debug, Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+    finish_reason: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    content: String,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    completion_tokens: Option<u32>,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamResponse {
+    choices: Vec<OpenAiStreamChoice>,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    delta: OpenAiDelta,
+    finish_reason: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct OpenAiDelta {
+    content: Option<String>,
+}
 
-async fn parse_sse<S, E>(mut input: S, request_id: String) -> impl Stream<Item = Result<StreamChunk, BackendError>>
-where S: Stream<Item = Result<bytes::Bytes, E>> + Unpin + Send + 'static, E: std::fmt::Display {
+fn parse_sse<S, E>(
+    input: S,
+    request_id: String,
+) -> impl Stream<Item = Result<StreamChunk, BackendError>> + Send + 'static
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     use futures_util::StreamExt;
     async_stream::stream! {
-        let mut buffer = String::new(); let mut sequence = 0;
+        let mut buffer = String::new(); let mut sequence = 0; let mut input = input;
         while let Some(item) = input.next().await {
             let bytes = match item { Ok(v) => v, Err(e) => { yield Err(BackendError::Transport(e.to_string())); return; } };
             buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -142,6 +270,39 @@ where S: Stream<Item = Result<bytes::Bytes, E>> + Unpin + Send + 'static, E: std
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn rejects_large_prompt() { let b = OpenAiCompatibleBackend::new(BackendConfig { max_prompt_bytes: 2, ..Default::default() }).unwrap(); let r = BackendRequest { request_id: "r".into(), prompt: "abc".into(), max_tokens: 1, temperature: 0.7, top_p: 0.9 }; assert!(matches!(b.validate(&r), Err(BackendError::PromptTooLarge))); }
-    #[test] fn rejects_large_output() { let b = OpenAiCompatibleBackend::new(BackendConfig { max_output_tokens: 2, ..Default::default() }).unwrap(); let r = BackendRequest { request_id: "r".into(), prompt: "ok".into(), max_tokens: 3, temperature: 0.7, top_p: 0.9 }; assert!(matches!(b.validate(&r), Err(BackendError::OutputLimitExceeded))); }
+    #[test]
+    fn rejects_large_prompt() {
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            max_prompt_bytes: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let r = BackendRequest {
+            request_id: "r".into(),
+            prompt: "abc".into(),
+            max_tokens: 1,
+            temperature: 0.7,
+            top_p: 0.9,
+        };
+        assert!(matches!(b.validate(&r), Err(BackendError::PromptTooLarge)));
+    }
+    #[test]
+    fn rejects_large_output() {
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            max_output_tokens: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let r = BackendRequest {
+            request_id: "r".into(),
+            prompt: "ok".into(),
+            max_tokens: 3,
+            temperature: 0.7,
+            top_p: 0.9,
+        };
+        assert!(matches!(
+            b.validate(&r),
+            Err(BackendError::OutputLimitExceeded)
+        ));
+    }
 }

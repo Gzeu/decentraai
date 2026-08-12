@@ -62,7 +62,8 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         use decentraai_protocol::deserialize_message;
 
         // Try to deserialize as WorkerAnnouncement
-        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, request.len()) {
+        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, request.len())
+        {
             if let Some(manager) = &self.worker_manager {
                 manager.process_announcement(announcement)?;
             }
@@ -87,17 +88,17 @@ impl DistributedP2PHandler {
     /// Serializes an InferResponse to bytes
     fn serialize_response(response: &InferResponse) -> Result<Vec<u8>> {
         use decentraai_protocol::serialize_message;
-        serialize_message(response)
-            .context("Failed to serialize InferResponse")
+        serialize_message(response).context("Failed to serialize InferResponse")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::WorkerManager;
     use crate::config::InferenceConfig;
-    use decentraai_protocol::{serialize_message, WorkerAnnouncement};
+    use crate::worker::WorkerManager;
+    use decentraai_p2p::RequestHandler;
+    use decentraai_protocol::{WorkerAnnouncement, serialize_message, deserialize_message};
     use libp2p::identity::Keypair;
 
     fn create_test_peer_id() -> libp2p::PeerId {
@@ -110,7 +111,7 @@ mod tests {
         let peer_id = create_test_peer_id();
         let config = InferenceConfig::default();
         let worker_manager = Arc::new(WorkerManager::new(peer_id, config));
-        
+
         let handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
 
         let announcement = WorkerAnnouncement {
@@ -124,11 +125,11 @@ mod tests {
         };
 
         let payload = serialize_message(&announcement).unwrap();
-        
+
         let result = handler.handle(&payload);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty()); // No response expected
-        
+
         // Verify worker was added
         assert_eq!(worker_manager.worker_count_sync(), 1);
     }
@@ -136,8 +137,8 @@ mod tests {
     #[test]
     fn test_infer_request_handling() {
         let peer_id = create_test_peer_id();
-        
-        let handler = DistributedP2PHandler::with_infer_handler(|request| {
+
+        let handler = DistributedP2PHandler::with_infer_handler(move |request| {
             Ok(InferResponse {
                 request_id: request.request_id,
                 worker_peer_id: peer_id,
@@ -149,20 +150,17 @@ mod tests {
             })
         });
 
-        let request = InferRequest::new(
-            "model-hash".to_string(),
-            "test prompt".to_string(),
-            100,
-        );
+        let request = InferRequest::new("model-hash".to_string(), "test prompt".to_string(), 100);
 
         let payload = serialize_message(&request).unwrap();
-        
+
         let result = handler.handle(&payload);
         assert!(result.is_ok());
-        
+
         let response_bytes = result.unwrap();
-        let response: InferResponse = deserialize_message(&response_bytes, response_bytes.len()).unwrap();
-        
+        let response: InferResponse =
+            deserialize_message(&response_bytes, response_bytes.len()).unwrap();
+
         assert_eq!(response.output, "test output");
         assert!(response.success);
     }
@@ -170,7 +168,7 @@ mod tests {
     #[test]
     fn test_unknown_message() {
         let handler = DistributedP2PHandler::new();
-        
+
         let result = handler.handle(b"unknown message");
         assert!(result.is_err());
     }

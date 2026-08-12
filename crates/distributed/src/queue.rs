@@ -5,10 +5,10 @@
 //! - Managing request timeouts and cancellation
 //! - Tracking queue depth per worker for capacity management
 
+use libp2p::PeerId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use libp2p::PeerId;
 use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
@@ -147,7 +147,7 @@ impl WorkerRequestQueue {
     /// Removes all timed out requests
     pub fn remove_timed_out(&mut self) -> Vec<QueuedRequest> {
         let mut timed_out = Vec::new();
-        
+
         // Filter out timed out requests
         self.requests.retain(|req| {
             if req.is_timed_out() {
@@ -207,14 +207,17 @@ impl RequestQueueManager {
     /// Returns a shared reference to the queue (same Arc for all callers)
     pub async fn get_or_create_queue(&self, peer_id: PeerId) -> Arc<Mutex<WorkerRequestQueue>> {
         let mut queues = self.queues.lock().await;
-        
+
         // Check if queue already exists
         if let Some(queue_arc) = queues.get(&peer_id) {
             return queue_arc.clone();
         }
-        
+
         // Create new queue with shared state
-        let queue = Arc::new(Mutex::new(WorkerRequestQueue::new(peer_id, self.default_max_depth)));
+        let queue = Arc::new(Mutex::new(WorkerRequestQueue::new(
+            peer_id,
+            self.default_max_depth,
+        )));
         queues.insert(peer_id, queue.clone());
         queue
     }
@@ -228,14 +231,10 @@ impl RequestQueueManager {
     /// Queues a request for a specific worker
     ///
     /// Returns true if the request was queued, false if the queue is full
-    pub async fn queue_request(
-        &self,
-        request: InferRequest,
-        worker_peer_id: PeerId,
-    ) -> bool {
+    pub async fn queue_request(&self, request: InferRequest, worker_peer_id: PeerId) -> bool {
         let queue = self.get_or_create_queue(worker_peer_id).await;
         let queued_request = QueuedRequest::new(request, worker_peer_id);
-        
+
         let mut queue_lock = queue.lock().await;
         queue_lock.enqueue(queued_request)
     }
@@ -261,17 +260,20 @@ impl RequestQueueManager {
     /// Gets the total number of queued requests across all workers
     pub async fn total_queued(&self) -> usize {
         let queues = self.queues.lock().await;
-        queues.values().map(|q| {
-            let queue_lock = q.blocking_lock();
-            queue_lock.len()
-        }).sum()
+        queues
+            .values()
+            .map(|q| {
+                let queue_lock = q.blocking_lock();
+                queue_lock.len()
+            })
+            .sum()
     }
 
     /// Removes a request from any queue by its ID
     pub async fn cancel_request(&self, request_id: Uuid) -> bool {
         let queues = self.queues.lock().await;
         let mut cancelled = false;
-        
+
         for (_, queue_arc) in queues.iter() {
             let mut queue_lock = queue_arc.lock().await;
             if queue_lock.remove(request_id).is_some() {
@@ -279,7 +281,7 @@ impl RequestQueueManager {
                 break;
             }
         }
-        
+
         cancelled
     }
 
@@ -287,12 +289,12 @@ impl RequestQueueManager {
     pub async fn cleanup_timed_out(&self) -> Vec<QueuedRequest> {
         let queues = self.queues.lock().await;
         let mut timed_out = Vec::new();
-        
+
         for (_, queue_arc) in queues.iter() {
             let mut queue_lock = queue_arc.lock().await;
             timed_out.extend(queue_lock.remove_timed_out());
         }
-        
+
         timed_out
     }
 
@@ -350,13 +352,13 @@ mod tests {
     fn test_worker_queue_enqueue_dequeue() {
         let peer_id = create_test_peer_id();
         let mut queue = WorkerRequestQueue::new(peer_id, 10);
-        
+
         let request = create_test_request();
         let queued = QueuedRequest::new(request, peer_id);
-        
+
         assert!(queue.enqueue(queued.clone()));
         assert_eq!(queue.len(), 1);
-        
+
         let dequeued = queue.dequeue();
         assert!(dequeued.is_some());
         assert_eq!(dequeued.unwrap().request_id, queued.request_id);
@@ -367,13 +369,13 @@ mod tests {
     fn test_worker_queue_full() {
         let peer_id = create_test_peer_id();
         let mut queue = WorkerRequestQueue::new(peer_id, 2);
-        
+
         let request = create_test_request();
-        
+
         // Fill the queue
         assert!(queue.enqueue(QueuedRequest::new(request.clone(), peer_id)));
         assert!(queue.enqueue(QueuedRequest::new(request.clone(), peer_id)));
-        
+
         // Third request should fail
         assert!(!queue.enqueue(QueuedRequest::new(request, peer_id)));
         assert_eq!(queue.len(), 2);
@@ -392,16 +394,16 @@ mod tests {
             stream: false,
             priority: 128,
         };
-        
+
         let peer_id = create_test_peer_id();
         let queued = QueuedRequest::new(request, peer_id);
-        
+
         // Should not be timed out immediately
         assert!(!queued.is_timed_out());
-        
+
         // Wait for timeout
         std::thread::sleep(Duration::from_millis(150));
-        
+
         // Should be timed out now
         assert!(queued.is_timed_out());
     }

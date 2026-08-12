@@ -175,11 +175,12 @@ async fn main() -> Result<()> {
             command: SwarmCommand::Start { config },
         } => swarm_start(config).await,
         Command::Serve {
-            command: ServeCommand::Start {
-                model,
-                config,
-                binary,
-            },
+            command:
+                ServeCommand::Start {
+                    model,
+                    config,
+                    binary,
+                },
         } => serve_start(config, model, binary).await,
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
@@ -354,7 +355,10 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     let data_dir = expand_tilde(&config.node.data_dir);
     let identity_path = data_dir.join("identity/key.pem");
     if !identity_path.exists() {
-        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+        anyhow::bail!(
+            "identity not found at {}; run 'decentraai init' first",
+            identity_path.display()
+        );
     }
     let identity = Identity::load(&identity_path)?;
 
@@ -420,8 +424,14 @@ fn pick_model_interactively(registry: &ModelRegistry, config: &NodeConfig) -> Re
         );
     }
     if !std::io::stdin().is_terminal() {
-        anyhow::bail!("--model is required in non-interactive mode; available: {}",
-            models.iter().map(|m| m.relative_path.as_str()).collect::<Vec<_>>().join(", "));
+        anyhow::bail!(
+            "--model is required in non-interactive mode; available: {}",
+            models
+                .iter()
+                .map(|m| m.relative_path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     let budget = SystemSnapshot::collect().derive_budget(
@@ -429,7 +439,10 @@ fn pick_model_interactively(registry: &ModelRegistry, config: &NodeConfig) -> Re
         config.storage.max_cache_gb,
         config.storage.min_free_disk_gb,
     );
-    println!("Available models (memory budget: {:.1} GiB):", bytes_to_gib(budget.max_memory_bytes));
+    println!(
+        "Available models (memory budget: {:.1} GiB):",
+        bytes_to_gib(budget.max_memory_bytes)
+    );
     for (i, model) in models.iter().enumerate() {
         let verdict = if model.size_bytes <= budget.max_memory_bytes {
             "fits"
@@ -461,7 +474,11 @@ fn pick_model_interactively(registry: &ModelRegistry, config: &NodeConfig) -> Re
 
 /// Runs gated inference with the OpenAI-compatible API and the web
 /// dashboard on inference.bind_address:api_port.
-async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option<PathBuf>) -> Result<()> {
+async fn serve_start(
+    config_path: PathBuf,
+    model: Option<String>,
+    binary: Option<PathBuf>,
+) -> Result<()> {
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::queue::InferenceQueue;
     use decentraai_runtime::{
@@ -565,8 +582,12 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
         config.tiers.clone(),
         queue,
     );
-    let api_addr =
-        serve_api(state, &config.inference.bind_address, config.inference.api_port).await?;
+    let api_addr = serve_api(
+        state,
+        &config.inference.bind_address,
+        config.inference.api_port,
+    )
+    .await?;
 
     decentraai_audit::record_best_effort(
         &data_dir.join("logs"),
@@ -578,7 +599,10 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
     );
 
     let auth_hint = match &token {
-        Some(_) => format!("master token: {}", data_dir.join("runtime/api.token").display()),
+        Some(_) => format!(
+            "master token: {}",
+            data_dir.join("runtime/api.token").display()
+        ),
         None => "no auth required by config".to_string(),
     };
     let tiers_hint = if config.tiers.is_some() {
@@ -608,7 +632,9 @@ async fn serve_start(config_path: PathBuf, model: Option<String>, binary: Option
 async fn pull(args: PullArgs) -> Result<()> {
     use decentraai_p2p::reputation::ReputationStore;
     use decentraai_p2p::transfer::download;
-    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, PeerId};
+    use decentraai_p2p::{
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode, PeerId,
+    };
     use decentraai_protocol::{
         CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, deserialize_message,
         serialize_message,
@@ -620,7 +646,10 @@ async fn pull(args: PullArgs) -> Result<()> {
     let data_dir = expand_tilde(&config.node.data_dir);
     let identity_path = data_dir.join("identity/key.pem");
     if !identity_path.exists() {
-        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+        anyhow::bail!(
+            "identity not found at {}; run 'decentraai init' first",
+            identity_path.display()
+        );
     }
     let identity = Identity::load(&identity_path)?;
 
@@ -666,11 +695,18 @@ async fn pull(args: PullArgs) -> Result<()> {
     };
     let catalog: CatalogResponse = deserialize_message(&raw, DEFAULT_MAX_MESSAGE_BYTES)?;
     if catalog.protocol_version != CURRENT_PROTOCOL_VERSION {
-        anyhow::bail!("peer answered with protocol version {}", catalog.protocol_version);
+        anyhow::bail!(
+            "peer answered with protocol version {}",
+            catalog.protocol_version
+        );
     }
 
     if args.list || args.model.is_none() {
-        println!("Peer {} serves {} model(s):", peer_id, catalog.manifests.len());
+        println!(
+            "Peer {} serves {} model(s):",
+            peer_id,
+            catalog.manifests.len()
+        );
         for manifest in &catalog.manifests {
             println!(
                 "  {} ({:.2} GiB, id: {}...)",
@@ -698,8 +734,19 @@ async fn pull(args: PullArgs) -> Result<()> {
         Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
     )?;
 
-    println!("Downloading {} ({} chunks)...", manifest.file_name, manifest.chunk_hashes.len());
-    let path = download(&node, peer_id, &manifest.model_id, &data_dir, &mut reputation).await?;
+    println!(
+        "Downloading {} ({} chunks)...",
+        manifest.file_name,
+        manifest.chunk_hashes.len()
+    );
+    let path = download(
+        &node,
+        peer_id,
+        &manifest.model_id,
+        &data_dir,
+        &mut reputation,
+    )
+    .await?;
     println!("Downloaded and verified: {}", path.display());
     println!(
         "Index it with: decentraai registry scan --directory {}",
@@ -715,9 +762,9 @@ fn worker_command(args: WorkerArgs) -> Result<()> {
     use decentraai_discovery::{PairingCode, TrustStore};
     use decentraai_identity::Identity;
     use libp2p::PeerId;
-    
+
     println!("Starting worker with name: {}", args.name);
-    
+
     // Load or generate identity
     let data_dir = expand_tilde("~/.decentraai");
     let identity_path = std::path::PathBuf::from(&data_dir).join("identity/key.pem");
@@ -728,14 +775,14 @@ fn worker_command(args: WorkerArgs) -> Result<()> {
         identity.save(&identity_path)?;
         identity
     };
-    
+
     let peer_id = identity.peer_id();
     println!("Worker PeerId: {}", peer_id.as_str());
-    
+
     // Generate random libp2p PeerId for demo purposes
     // In production, this would be derived from the identity
     let worker_peer_id = PeerId::random();
-    
+
     // Generate pairing code for controller
     let controller_peer_id = PeerId::random(); // In real scenario, this would be the actual controller
     let pairing = PairingCode::new(
@@ -744,17 +791,17 @@ fn worker_command(args: WorkerArgs) -> Result<()> {
         args.name.clone(),
         300, // 5 minutes TTL
     );
-    
+
     let qr_data = pairing.to_qr_data()?;
     println!("Pairing QR code data: {}", qr_data);
-    
+
     // Initialize trust store
     let trust_db_path = std::path::PathBuf::from(&data_dir).join("trust.db");
     let _trust_store = TrustStore::new(&trust_db_path)?;
-    
+
     println!("Worker '{}' is ready for pairing", args.name);
     println!("Scan the QR code from the controller to complete pairing");
-    
+
     Ok(())
 }
 
@@ -783,7 +830,11 @@ fn token_command(command: TokenCommand) -> Result<()> {
                 "token_created",
                 serde_json::json!({"name": name, "tier": tier.0}),
             );
-            println!("Subscription token for '{name}' (tier {} — {}):", tier.0, tier.name());
+            println!(
+                "Subscription token for '{name}' (tier {} — {}):",
+                tier.0,
+                tier.name()
+            );
             println!("  {plaintext}");
             println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
             println!("Active at the next API request; no restart needed.");
@@ -799,7 +850,9 @@ fn token_command(command: TokenCommand) -> Result<()> {
                 );
             }
             if store.list().is_empty() {
-                println!("  none yet — create one with: decentraai token create --name <n> --tier 1..3");
+                println!(
+                    "  none yet — create one with: decentraai token create --name <n> --tier 1..3"
+                );
             }
         }
         TokenCommand::Revoke { name, .. } => {
@@ -911,7 +964,13 @@ mod tests {
     #[test]
     fn parses_token_create_command() {
         let cli = Cli::try_parse_from([
-            "decentraai", "token", "create", "--name", "alice", "--tier", "1",
+            "decentraai",
+            "token",
+            "create",
+            "--name",
+            "alice",
+            "--tier",
+            "1",
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::Token { .. }));
@@ -936,10 +995,12 @@ mod tests {
 /// and a client (routing requests to other workers).
 async fn distributed_command(args: DistributedArgs) -> Result<()> {
     use decentraai_distributed::{DistributedInference, InferenceConfig};
-    use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer, ChainedHandler};
     use decentraai_identity::Identity;
-    use libp2p::identity::Keypair as Libp2pKeypair;
+    use decentraai_p2p::{
+        ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer,
+    };
     use libp2p::PeerId as Libp2pPeerId;
+    use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
 
     let config = NodeConfig::load(&args.config)
@@ -948,10 +1009,13 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     let data_dir = expand_tilde(&config.node.data_dir);
     let identity_path = data_dir.join("identity/key.pem");
     if !identity_path.exists() {
-        anyhow::bail!("identity not found at {}; run 'decentraai init' first", identity_path.display());
+        anyhow::bail!(
+            "identity not found at {}; run 'decentraai init' first",
+            identity_path.display()
+        );
     }
     let identity = Identity::load(&identity_path)?;
-    
+
     // Derive the libp2p peer_id from the identity's signing key
     // This ensures we use the same peer_id that P2PNode will use
     let keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
@@ -960,33 +1024,35 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // Load the registry if one exists; the node serves its models.
     let registry_path = data_dir.join("db/registry.json");
-    
+
     // Track if we'll register as a worker
     let will_be_worker = args.model.is_some();
-    
+
     // Create worker manager with the libp2p peer_id
     let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
         local_peer_id,
         decentraai_distributed::InferenceConfig::default(),
     ));
-    
-    let distributed_handler = decentraai_distributed::DistributedP2PHandler::with_worker_manager(
-        worker_manager.clone(),
-    );
-    
+
+    let distributed_handler =
+        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+
     // Create a chained handler for manifest, distributed, and other messages
     let mut chained_handler = ChainedHandler::new();
-    
+
     // Add distributed handler first (for worker announcements and inference requests)
     chained_handler = chained_handler.add_handler(Arc::new(distributed_handler));
-    
+
     // Add registry handler if registry exists
     if registry_path.exists() {
         let registry = ModelRegistry::load(&registry_path)
             .with_context(|| format!("loading registry from {}", registry_path.display()))?;
         chained_handler = chained_handler.add_handler(Arc::new(RegistryServer::new(registry)));
     } else if will_be_worker {
-        anyhow::bail!("registry not found at {}; run 'decentraai registry scan' first", registry_path.display());
+        anyhow::bail!(
+            "registry not found at {}; run 'decentraai registry scan' first",
+            registry_path.display()
+        );
     }
 
     // Create P2P node with chained handler
@@ -1001,11 +1067,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // Create distributed inference coordinator with the shared worker manager
     let distributed_config = InferenceConfig::default();
-    let mut distributed = DistributedInference::new(
-        p2p_node,
-        distributed_config,
-        Some(worker_manager.clone()),
-    )?;
+    let mut distributed =
+        DistributedInference::new(p2p_node, distributed_config, Some(worker_manager.clone()))?;
 
     // Track if we registered as a worker
     let is_worker = args.model.is_some();
@@ -1015,21 +1078,24 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let registry = if registry_path.exists() {
             ModelRegistry::load(&registry_path)?
         } else {
-            anyhow::bail!("registry not found at {}; run 'decentraai registry scan' first", registry_path.display());
+            anyhow::bail!(
+                "registry not found at {}; run 'decentraai registry scan' first",
+                registry_path.display()
+            );
         };
-        
+
         let model_path = decentraai_runtime::resolve_model(&registry, model)?;
         let model_name = model_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("model")
             .to_string();
-        
+
         // Calculate model hash
         let model_hash = blake3::hash(&std::fs::read(&model_path)?)
             .to_hex()
             .to_string();
-        
+
         // Register as worker
         distributed.register_as_worker(
             model_name.clone(),
@@ -1046,7 +1112,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             if request.model_hash != model_hash_for_handler {
                 anyhow::bail!("Model not available on this worker");
             }
-            
+
             // Mock inference - in production, this would call the local inference engine
             Ok(decentraai_protocol::InferResponse {
                 request_id: request.request_id,
@@ -1058,11 +1124,11 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 error: None,
             })
         };
-        
+
         // Create a distributed P2P handler and add it to the chained handler
         // Note: This requires modifying the P2P node to add the handler after creation
         // For now, we'll broadcast our worker status periodically
-        
+
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
 
@@ -1079,7 +1145,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // Keep running until interrupted
     tokio::signal::ctrl_c().await?;
-    
+
     distributed.shutdown();
     Ok(())
 }

@@ -5,6 +5,7 @@ members = [
   "crates/discovery",
   "crates/distributed",
   "crates/identity",
+  "crates/inference-adapter",
   "crates/manifest",
   "crates/monitoring",
   "crates/node-cli",
