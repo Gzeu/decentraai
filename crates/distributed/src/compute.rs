@@ -247,6 +247,10 @@ pub struct ComputeManager {
     /// Per-worker contribution ledger (M17): accrued online time and served
     /// request counts, feeding the tier-suggestion engine.
     contribution: std::sync::Mutex<BTreeMap<PeerId, ContributionTracker>>,
+    /// Live, coordinator-side network graph (M19): measured RTT / bandwidth
+    /// to each peer, fed by a periodic `InferPing` probe and read by the
+    /// execution planner to weight reach cost.
+    network: std::sync::Mutex<decentraai_fabric::NetworkGraph>,
 }
 
 impl ComputeManager {
@@ -274,6 +278,7 @@ impl ComputeManager {
             last_local_ad: std::sync::Mutex::new(None),
             metrics: std::sync::Arc::new(RuntimeMetrics::new()),
             contribution: std::sync::Mutex::new(BTreeMap::new()),
+            network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
         }
     }
 
@@ -329,6 +334,33 @@ impl ComputeManager {
     /// Marks a peer offline (stale heartbeat or explicit disconnect).
     pub async fn mark_offline(&self, peer: &PeerId) {
         self.scheduler.lock().await.mark_offline(peer);
+    }
+
+    /// Records a measured round-trip time to `peer` (M19). Written by the
+    /// periodic `InferPing` network probe; read by the execution planner for
+    /// reach-cost-aware selection.
+    pub fn record_rtt(&self, peer: &PeerId, rtt_us: u64, bandwidth_mbps: u32) {
+        let mut graph = self.network.lock().unwrap();
+        let prior = graph.get(&peer.to_string());
+        let measured_rtt_us = if rtt_us > 0 { Some(rtt_us as u32) } else { None };
+        let link = decentraai_fabric::LinkMetrics::prior(
+            prior.locality,
+            measured_rtt_us,
+        );
+        if bandwidth_mbps > 0 {
+            let link = decentraai_fabric::LinkMetrics {
+                bandwidth_mbps,
+                ..link
+            };
+            graph.set(&peer.to_string(), link.refresh());
+        } else {
+            graph.set(&peer.to_string(), link);
+        }
+    }
+
+    /// The current network graph snapshot (coordinator-centric link metrics).
+    pub fn network_graph(&self) -> decentraai_fabric::NetworkGraph {
+        self.network.lock().unwrap().clone()
     }
 
     /// Snapshot of live workers, newest-advertisement first.
@@ -405,7 +437,11 @@ impl ComputeManager {
         &self,
         req: &WorkloadRequirements,
     ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
-        let planner = decentraai_fabric::ExecutionPlanner::new();
+        let planner = decentraai_fabric::ExecutionPlanner {
+            network: self.network.lock().unwrap().clone(),
+            experts: decentraai_fabric::ExpertRegistry::new(),
+            allow_multi_stage: true,
+        };
         let facts = self.fabric_facts(&req.model_hash).await;
         if facts.is_empty() {
             return None;

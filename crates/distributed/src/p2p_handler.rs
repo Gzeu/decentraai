@@ -94,7 +94,7 @@ impl Default for DistributedP2PHandler {
 
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
-        use decentraai_protocol::{InferMessage, deserialize_message};
+        use decentraai_protocol::{InferMessage, deserialize_message, serialize_message};
 
         // Try to deserialize as a compute advertisement
         if let Ok(adv) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
@@ -121,8 +121,22 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as a generic InferMessage (progress/response/etc)
+        if let Ok(InferMessage::InferPing { .. }) =
+            deserialize_message::<InferMessage>(request, request.len())
+        {
+            // Network probe (M19): a coordinator measures its own wall-clock
+            // RTT to this worker by timing the round trip; we just reply with
+            // a Pong carrying a nominal processing latency so stats stay honest.
+            let pong = InferMessage::InferPong {
+                request_id: uuid::Uuid::new_v4(),
+                latency_ms: 1,
+            };
+            let bytes = serialize_message(&pong)?;
+            return Ok(bytes);
+        }
+
+        // Try to deserialize as a generic InferMessage (progress/response/etc)
         if let Ok(msg) = deserialize_message::<InferMessage>(request, request.len()) {
-            // If a tracker is registered, deliver the message there for the waiting coordinator
             if let Some(tracker) = &self.tracker {
                 let _ = futures::executor::block_on(tracker.deliver(msg));
                 return Ok(Vec::new());
@@ -154,7 +168,7 @@ mod tests {
     use chrono::Utc;
     use decentraai_p2p::RequestHandler;
     use decentraai_protocol::{
-        InferResponse, WorkerAnnouncement, deserialize_message, serialize_message,
+        InferMessage, InferResponse, WorkerAnnouncement, deserialize_message, serialize_message,
     };
     use libp2p::identity::Keypair;
 
@@ -167,6 +181,21 @@ mod tests {
     /// which are typed `Fn(InferRequest) -> Result<Vec<u8>>`.
     fn resp_bytes(resp: InferResponse) -> anyhow::Result<Vec<u8>> {
         decentraai_protocol::serialize_message(&resp)
+    }
+
+    #[test]
+    fn ping_is_answered_with_pong() {
+        let handler = DistributedP2PHandler::new();
+        let ping = InferMessage::InferPing {
+            request_id: uuid::Uuid::new_v4(),
+        };
+        let payload = serialize_message(&ping).unwrap();
+        let result = handler.handle(&payload);
+        assert!(result.is_ok(), "network probe must be answered");
+        let bytes = result.unwrap();
+        let pong: InferMessage =
+            deserialize_message(&bytes, bytes.len()).expect("response is an InferMessage");
+        assert!(matches!(pong, InferMessage::InferPong { .. }));
     }
 
     #[test]

@@ -1647,6 +1647,14 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
 
+    // M19: periodically measure RTT to each known remote worker so the
+    // execution planner weights reach cost, not just nominal performance.
+    spawn_network_probe(
+        compute_manager.clone(),
+        distributed.p2p_node().clone(),
+    )
+    .await;
+
     // Start worker discovery
     distributed.start_worker_discovery().await?;
 
@@ -1783,6 +1791,43 @@ async fn spawn_compute_broadcaster(
         }
     });
     Ok(())
+}
+
+/// Periodically measures round-trip latency to each known *remote* worker by
+/// sending an `InferPing` over the P2P request/response channel and timing the
+/// reply (M19). The measured RTT is recorded on the compute manager's network
+/// graph so the execution planner weights reach cost. The local node's own
+/// advertisement is never pinged (self-dial is refused by libp2p).
+async fn spawn_network_probe(
+    compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
+    p2p_node: decentraai_p2p::P2PNode,
+) {
+    use decentraai_protocol::{InferMessage, serialize_message};
+    use std::time::{Duration, Instant};
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let local = compute_manager.local_peer();
+            let peers = compute_manager.workers().await;
+            for adv in peers.iter().filter(|w| w.peer_id != local) {
+                let peer = adv.peer_id;
+                let pong = InferMessage::InferPing {
+                    request_id: uuid::Uuid::new_v4(),
+                };
+                let Ok(bytes) = serialize_message(&pong) else {
+                    continue;
+                };
+                let start = Instant::now();
+                // Best-effort: a busy worker may drop the ping; we just skip it.
+                if p2p_node.request(peer, bytes).await.is_ok() {
+                    let rtt_us = start.elapsed().as_micros() as u64;
+                    compute_manager.record_rtt(&peer, rtt_us, 0);
+                }
+            }
+        }
+    });
 }
 
 /// Serves live compute metrics (M16) as JSON on a loopback-only HTTP port.
