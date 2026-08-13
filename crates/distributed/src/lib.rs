@@ -612,7 +612,8 @@ impl DistributedInference {
         // the request.
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
-                if let Some((plan, placement)) = compute.plan_and_reserve(&req).await {
+                let prompt_tokens = prompt_token_estimate(&request.prompt);
+                if let Some((plan, placement)) = compute.plan_and_reserve(&req, prompt_tokens).await {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -672,7 +673,8 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
-                if let Some((plan, placement)) = compute.plan_and_reserve(&req).await {
+                let prompt_tokens = prompt_token_estimate(&request.prompt);
+                if let Some((plan, placement)) = compute.plan_and_reserve(&req, prompt_tokens).await {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -1227,6 +1229,14 @@ pub struct DistributedStats {
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub queued_requests: usize,
+}
+
+/// Rough prompt-token estimate from character count. A true tokenizer lives in
+/// the model engine; this is the conservative ~4 chars/token approximation the
+/// KV-aware planner (M20) uses to steer long-context requests to KV-rich
+/// workers. It need not be exact — only proportionate.
+fn prompt_token_estimate(prompt: &str) -> u32 {
+    (prompt.chars().count() as u32).div_ceil(4)
 }
 
 #[cfg(test)]

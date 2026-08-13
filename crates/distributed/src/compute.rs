@@ -427,32 +427,53 @@ impl ComputeManager {
     /// the reservation on the planned worker. Returns the plan and the
     /// reserved placement, or `None` when the fabric finds no eligible worker.
     ///
-    /// This replaces the pure scheduler `select` as the coordinator's first
-    /// choice: the planner computes *whom* (engine/network-aware), the
-    /// scheduler then enforces capacity via `reserve_worker` (M18). If the
-    /// planner's top worker cannot be reserved (became full / dropped / is the
-    /// local node), we fall back to the plain scheduler `select` so a request
-    /// is never stranded by planner optimism.
+    /// `prompt_tokens` is the caller's estimated prompt length (KV-aware
+    /// routing, M20). This replaces the pure scheduler `select` as the
+    /// coordinator's first choice: the planner computes *whom*
+    /// (engine/network/KV-aware), the scheduler then enforces capacity via
+    /// `reserve_worker` (M18). If the planner's top worker cannot be reserved
+    /// (became full / dropped / is the local node), we fall back to the plain
+    /// scheduler `select` so a request is never stranded by planner optimism.
     pub async fn plan_and_reserve(
         &self,
         req: &WorkloadRequirements,
+        prompt_tokens: u32,
     ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
-        let planner = decentraai_fabric::ExecutionPlanner {
-            network: self.network.lock().unwrap().clone(),
-            experts: decentraai_fabric::ExpertRegistry::new(),
-            allow_multi_stage: true,
-        };
         let facts = self.fabric_facts(&req.model_hash).await;
         if facts.is_empty() {
             return None;
         }
+
+        let mut experts = decentraai_fabric::ExpertRegistry::new();
+        // M21: if any worker advertises expert-level routing for the model,
+        // record its shard so the planner may split. Today no engine reports
+        // `expert_routing`, so this stays empty and the router honestly returns
+        // a whole-model decision — the abstraction is live, not mocked.
+        for f in &facts {
+            if f.capabilities.expert_routing && f.serves_model {
+                experts.record(
+                    &req.model_hash,
+                    &f.peer_id,
+                    decentraai_fabric::ExpertShard {
+                        experts: Vec::new(),
+                        routing_capable: true,
+                        coverage: 1.0,
+                    },
+                );
+            }
+        }
+        let planner = decentraai_fabric::ExecutionPlanner {
+            network: self.network.lock().unwrap().clone(),
+            experts,
+            allow_multi_stage: true,
+        };
 
         let rfacts = decentraai_fabric::RequestFacts {
             model_hash: req.model_hash.clone(),
             est_ram_mb: req.est_ram_mb,
             est_vram_mb: req.est_vram_mb,
             context: decentraai_fabric::ContextProfile {
-                prompt_tokens: 0,
+                prompt_tokens,
                 max_output_tokens: req.max_tokens,
                 is_continuation: false,
                 prefix_resident_on: None,
@@ -469,7 +490,7 @@ impl ComputeManager {
         // coordinator never schedules a remote request onto itself via P2P.
         let peer: libp2p::PeerId = match first.parse() {
             Ok(p) if p != self.local_peer => p,
-            _ => return self.select_pub(req).await.map(|p| (result.plan, p)),
+            _ => return self.select_pub_remote(req).await.map(|p| (result.plan, p)),
         };
 
         let placement = self
@@ -480,12 +501,19 @@ impl ComputeManager {
         match placement {
             Some(p) => Some((result.plan, p)),
             // Planner's top worker is full/unreservable → scheduler fallback.
-            None => self.select_pub(req).await.map(|p| (result.plan, p)),
+            None => self.select_pub_remote(req).await.map(|p| (result.plan, p)),
         }
     }
 
-    async fn select_pub(&self, req: &WorkloadRequirements) -> Option<Placement> {
-        self.scheduler.lock().await.select(req, Instant::now())
+    /// The scheduler's best placement that is NOT this coordinator
+    /// (a routed request must never be sent to the local node over P2P).
+    async fn select_pub_remote(&self, req: &WorkloadRequirements) -> Option<Placement> {
+        let mut scheduler = self.scheduler.lock().await;
+        let best = scheduler.select(req, Instant::now());
+        match best {
+            Some(p) if p.worker != self.local_peer => Some(p),
+            _ => None,
+        }
     }
 
     /// Releases a reservation (call on workload completion or failure).
@@ -835,6 +863,43 @@ mod tests {
         assert!(manager.select(&req).await.is_some(), "only one reservation tracked per select");
         manager.release(placement.reservation.reservation_id).await;
         assert!(manager.select(&req).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn plan_and_reserve_builds_executed_plan() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let adv = build_advertisement(worker, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
+        manager.process_advertisement(adv).await;
+        manager.record_rtt(&worker, 2_000, 1_000);
+
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (plan, placement) = manager
+            .plan_and_reserve(&req, 200)
+            .await
+            .expect("fabric planner finds the worker");
+        assert_eq!(plan.stage_count(), 1, "single GPU worker -> single-stage plan");
+        assert_eq!(placement.worker, worker, "planner books the remote worker");
+        assert_eq!(manager.in_flight(&worker).await, 1);
+
+        manager.release(placement.reservation.reservation_id).await;
+        assert_eq!(manager.in_flight(&worker).await, 0, "release frees the booking");
+    }
+
+    #[tokio::test]
+    async fn plan_and_reserve_never_selects_local_node() {
+        let local = peer();
+        // Only the local node advertises; the planner must not self-schedule.
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([local]));
+        let adv = build_advertisement(local, "self", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
+        manager.process_advertisement(adv).await;
+
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        assert!(
+            manager.plan_and_reserve(&req, 10).await.is_none(),
+            "coordinator must not route a remote request to itself"
+        );
     }
 
     #[tokio::test]
