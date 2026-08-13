@@ -173,7 +173,20 @@ behind `expert_routing` (M21 — none advertise it; whole-model fallback is
 correct, never mocked), `EngineKind` + capability probe (M22 multi-engine), an
 `ExecutionPlanner` (M23), and the coordinator reaper `reap_unhealthy` (M24).
 Do NOT mark M21–M24 as done in documentation until their behaviors are
-production-verified.
+production-verified. So far M24 has landed two production gaps (see below);
+request-level retry and a P2P reconnect loop remain un-wired.
+
+**M24 (resilience) is partially landed**: the coordinator reaper, reservation
+TTLs, stale/offline worker eviction with audit, graceful + startup recovery,
+mDNS recovery all exist; **false-ready prevention** (`7b22dbf`, the compute
+broadcaster gates worker advertisement on live engine health) and **engine
+crash auto-recovery** (`a4aa762`, `ServeManager::ensure_healthy` respawns a
+crashed llama-server from a stored restart spec via a periodic supervisor) are
+shipped. Remaining M24: a bounded, non-idempotent-safe request retry in the
+route path and an explicit P2P reconnect loop (today reconnection is passive
+via mDNS re-discovery). The legacy `FallbackHandler` has bounded retry/backoff
+state but a stub fallback-worker selector and is not wired into the fabric
+route path.
 
 **M20 (KV-aware inference fabric) is verified-DONE** (commit `caf9121`):
 coordinator-side KV/session accounting (`SessionAccount`), continuation
@@ -205,6 +218,16 @@ immediately — control plane up even while the model loads or faults).
 `scripts/uninstall-app.sh` + `deploy/decentraai.desktop` install a normal-user
 app. Run/stop: `systemctl --user {start,stop,restart,status} decentraai-node`;
 logs: `journalctl --user -u decentraai-node -f`.
+
+User interface (ONE app): the product has a single user-facing UI — the embedded
+dashboard served by the node from `crates/runtime/src/api.rs`. It is the one
+control plane; there is no separate frontend project (the old SvelteKit
+`frontend/` was obsolete — never served/built by the node — and was removed).
+The dashboard renders Overview, Chat (`/v1/chat/completions`), Workers, Network,
+Execution (planner decisions with network/KV reasons), Models/Settings coded in
+the embedded HTML, and Diagnostics from the audit log, all from real runtime
+state surfaced by `/status`, `/v1/compute`, `/v1/network`, `/v1/execution` and
+`/v1/peers` — no mock data, watching the page never touches the backend.
 
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core
