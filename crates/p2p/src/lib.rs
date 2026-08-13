@@ -266,11 +266,16 @@ enum Command {
     Broadcast {
         payload: Vec<u8>,
     },
+    /// Reply with the ids of currently connected peers.
+    Connected {
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     Shutdown,
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
-type InferHandler = Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+type InferHandler =
+    Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 /// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
 type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
@@ -278,8 +283,7 @@ type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
 /// Handler for inbound manifest announcements, called with the announcing
 /// peer and the announced manifest. MUST be non-blocking: the swarm event
 /// loop invokes it inline, so downloads belong in a spawned task.
-type ManifestAnnouncementHandler =
-    Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
+type ManifestAnnouncementHandler = Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
 
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
@@ -434,6 +438,9 @@ impl P2PNode {
                                         .messages
                                         .send_request(&peer, payload.clone());
                                 }
+                            }
+                            Command::Connected { reply } => {
+                                let _ = reply.send(connected.clone());
                             }
                             Command::Shutdown => break,
                         }
@@ -660,6 +667,16 @@ impl P2PNode {
 
     pub fn shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
+    }
+
+    /// Returns the PeerIds of currently connected peers. Best-effort: an
+    /// empty/truncated result is returned if the swarm task is busy or gone.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        if self.commands.send(Command::Connected { reply }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 }
 

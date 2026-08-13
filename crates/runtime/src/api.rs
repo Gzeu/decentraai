@@ -147,9 +147,16 @@ pub struct ApiState {
     rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
     /// Per-token usage counters.
     token_usage: UsageCounters,
+    /// Real distributed-compute coordinator state (M23/M24), wired into the
+    /// dashboard so WORKERS/NETWORK/EXECUTION views render real state only.
+    /// `None` when running without a compute manager (e.g. plain serve).
+    compute: Option<Arc<decentraai_distributed::ComputeManager>>,
+    /// The live P2P node, for the NETWORK view (connected peers).
+    p2p: Option<decentraai_p2p::P2PNode>,
 }
 
 impl ApiState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_url: String,
         auth_token: Option<String>,
@@ -158,6 +165,8 @@ impl ApiState {
         token_store_path: Option<PathBuf>,
         tiers: Option<TiersSection>,
         queue: Arc<InferenceQueue>,
+        compute: Option<Arc<decentraai_distributed::ComputeManager>>,
+        p2p: Option<decentraai_p2p::P2PNode>,
     ) -> Self {
         Self {
             backend_url,
@@ -174,6 +183,8 @@ impl ApiState {
             recent_requests: Arc::new(StdMutex::new(VecDeque::new())),
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
+            compute,
+            p2p,
         }
     }
 
@@ -510,6 +521,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/status", get(status_handler))
         .route("/v1/token", get(token_handler))
         .route("/v1/peers", get(peers_handler))
+        .route("/v1/compute", get(compute_handler))
+        .route("/v1/network", get(network_handler))
+        .route("/v1/execution", get(execution_handler))
         .route("/v1/models", get(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
@@ -636,6 +650,91 @@ async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&peers).unwrap_or_else(|_| "[]".to_string()),
+    )
+        .into_response()
+}
+
+/// WORKERS + OVERVIEW real state: the coordinator's live mesh (workers,
+/// health, load, capacity, models, reservations, local perf) and local node
+/// status. Empty structure when no compute manager is attached.
+async fn compute_handler(State(state): State<ApiState>) -> Response {
+    let mut body = serde_json::json!({
+        "attached": false,
+        "workers": [],
+        "executions": [],
+    });
+    if let Some(compute) = &state.compute {
+        let report = compute.metrics_report().await;
+        let executions = compute.executions();
+        let session_count = compute.session_count();
+        body = serde_json::json!({
+            "attached": true,
+            "workers": report.workers,
+            "contributions": report.contributions,
+            "local_peer": report.local_peer,
+            "local_perf": report.local_perf,
+            "totals": report.totals,
+            "sessions": session_count,
+            "executions": executions,
+        });
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
+/// locality), connected peers, and local peer id. Empty when no compute/P2P.
+async fn network_handler(State(state): State<ApiState>) -> Response {
+    let mut body = serde_json::json!({
+        "attached": false,
+        "connected": [],
+        "links": [],
+        "local_peer": null,
+    });
+    if let Some(p2p) = &state.p2p {
+        let connected = p2p.connected_peers().await;
+        body["connected"] =
+            serde_json::json!(connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+    }
+    if let Some(compute) = &state.compute {
+        let graph = compute.network_graph();
+        let links: Vec<_> = graph
+            .peers()
+            .map(|(peer, link)| {
+                serde_json::json!({
+                    "peer": peer,
+                    "rtt_ms": link.rtt_us / 1000,
+                    "bandwidth_mbps": link.bandwidth_mbps,
+                    "transfer_ms_per_mib": link.transfer_ms_per_mib,
+                    "locality": format!("{:?}", link.locality),
+                })
+            })
+            .collect();
+        body["links"] = serde_json::json!(links);
+        body["local_peer"] = serde_json::json!(compute.local_peer().to_string());
+        body["attached"] = serde_json::json!(state.compute.is_some());
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// EXECUTION real state: recent planner decisions with reasons, reservations
+/// and outcomes. Empty when no compute manager is attached.
+async fn execution_handler(State(state): State<ApiState>) -> Response {
+    let mut body = serde_json::json!({ "attached": false, "executions": [] });
+    if let Some(compute) = &state.compute {
+        body["executions"] = serde_json::json!(compute.executions());
+        body["attached"] = serde_json::json!(true);
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
 }
@@ -1110,6 +1209,8 @@ mod tests {
             token_store,
             tiers,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         (api, manager)
@@ -1336,6 +1437,8 @@ mod tests {
             None,
             None,
             InferenceQueue::new(1, Duration::from_secs(5)),
+            None,
+            None,
         );
         let api = serve_api(state.clone(), "127.0.0.1", 0).await.unwrap();
 
@@ -1426,6 +1529,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let client = reqwest::Client::new();
@@ -1460,6 +1565,64 @@ mod tests {
         manager.lock().await.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn compute_network_execution_endpoints_respond() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Without a compute manager these return a well-formed "not attached"
+        // structure (never mock data).
+        let compute: serde_json::Value = client
+            .get(format!("http://{api}/v1/compute"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(compute["attached"], false);
+        assert!(compute["workers"].is_array());
+
+        let network: serde_json::Value = client
+            .get(format!("http://{api}/v1/network"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(network["attached"], false);
+        assert!(network["connected"].is_array());
+
+        let exec: serde_json::Value = client
+            .get(format!("http://{api}/v1/execution"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exec["attached"], false);
+        assert!(exec["executions"].is_array());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn status_lists_registry_models() {
@@ -1483,6 +1646,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
@@ -1512,6 +1677,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
@@ -1547,6 +1714,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let resp = reqwest::Client::new()
@@ -1590,6 +1759,8 @@ mod tests {
             Some(token_store_path.clone()),
             Some(tiers),
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let create_resp = reqwest::Client::new()

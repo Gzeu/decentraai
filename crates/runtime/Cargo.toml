@@ -9,7 +9,10 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 decentraai-audit = { path = "../audit" }
+decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
+decentraai-distributed = { path = "../distributed" }
+decentraai-fabric = { path = "../fabric" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }

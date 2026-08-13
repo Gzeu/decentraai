@@ -649,6 +649,24 @@ impl DistributedInference {
                         .await;
                     // Release the booking whether or not the request succeeded.
                     compute.release(placement.reservation.reservation_id).await;
+                    // M23: record the executed planner decision for the
+                    // dashboard EXECUTION view (real state).
+                    let cont = request
+                        .session_id
+                        .as_deref()
+                        .and_then(|s| compute.session_residency(s));
+                    compute.record_execution(
+                        &request.request_id.to_string(),
+                        &plan,
+                        &placement,
+                        cont.is_some(),
+                        cont.map(|p| p.to_string()),
+                        if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                    );
                     // M20: record the session's KV prefix residency from the
                     // real tokens the worker reported.
                     if let Some(session_id) = &request.session_id {
@@ -735,6 +753,24 @@ impl DistributedInference {
                         )
                         .await;
                     compute.release(placement.reservation.reservation_id).await;
+                    // M23: record the executed planner decision for the
+                    // dashboard EXECUTION view (real state).
+                    let cont = request
+                        .session_id
+                        .as_deref()
+                        .and_then(|s| compute.session_residency(s));
+                    compute.record_execution(
+                        &request.request_id.to_string(),
+                        &plan,
+                        &placement,
+                        cont.is_some(),
+                        cont.map(|p| p.to_string()),
+                        if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                    );
                     // M20: record the session's KV prefix residency from the
                     // real tokens the worker reported.
                     if let Some(session_id) = &request.session_id {

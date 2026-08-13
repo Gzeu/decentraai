@@ -972,6 +972,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             token_store_path,
             config.tiers.clone(),
             queue,
+            Some(compute_manager.clone()),
+            Some(distributed.p2p_node().clone()),
         );
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
@@ -1583,6 +1585,8 @@ async fn serve_start(
         token_store_path,
         config.tiers.clone(),
         queue,
+        None,
+        None,
     );
     let api_addr = serve_api(
         state,

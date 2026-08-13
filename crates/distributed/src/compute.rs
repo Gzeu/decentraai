@@ -11,7 +11,7 @@
 //! discovery: new compute peers advertise hardware; the legacy path keeps
 //! serving nodes that have not opted in to compute sharing yet.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -248,6 +248,10 @@ pub struct ComputeManager {
     /// holds each conversation's KV prefix and the honest per-worker KV
     /// occupancy derived from real routed requests + advertised `n_ctx`.
     sessions: std::sync::Mutex<crate::session::SessionAccount>,
+    /// Bounded, newest-first history of executed plans (M23): real planner
+    /// decisions + placements + outcomes surfaced by the dashboard EXECUTION
+    /// view. `None` until `record_execution` is called.
+    recent_executions: std::sync::Mutex<VecDeque<ExecutedPlan>>,
 }
 
 impl ComputeManager {
@@ -270,6 +274,7 @@ impl ComputeManager {
             contribution: std::sync::Mutex::new(BTreeMap::new()),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
+            recent_executions: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -450,6 +455,53 @@ impl ComputeManager {
     /// Number of coordinator-tracked sessions (observability).
     pub fn session_count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// Records an executed plan (M23): the real planner decision + placement +
+    /// outcome, surfaced by the dashboard EXECUTION view. Bounded to the most
+    /// recent 128 executions so the buffer cannot grow unbounded.
+    pub fn record_execution(
+        &self,
+        request_id: &str,
+        plan: &decentraai_fabric::ExecutionPlan,
+        placement: &Placement,
+        is_continuation: bool,
+        prefix_worker: Option<String>,
+        outcome: &str,
+    ) {
+        const MAX_EXECUTIONS: usize = 128;
+        let mut ring = self.recent_executions.lock().unwrap();
+        ring.push_back(ExecutedPlan {
+            request_id: request_id.to_string(),
+            plan_id: plan.plan_id.clone(),
+            model_hash: plan.model_hash.clone(),
+            selected_worker: placement.worker.to_string(),
+            score: placement.confidence,
+            stages: plan.stage_count(),
+            reservation_id: placement.reservation.reservation_id.to_string(),
+            is_continuation,
+            prefix_worker,
+            outcome: outcome.to_string(),
+            reasoning: "fabric planner single-stage placement (network+KV+capability aware)".to_string(),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        });
+        while ring.len() > MAX_EXECUTIONS {
+            ring.pop_front();
+        }
+    }
+
+    /// Snapshot of recent executed plans, newest-first (M23).
+    pub fn executions(&self) -> Vec<ExecutedPlan> {
+        self.recent_executions
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot of live workers, newest-advertisement first.
@@ -808,6 +860,34 @@ pub struct TotalsSnapshot {
     pub requests_completed: u64,
     pub requests_failed: u64,
     pub tokens_total: u64,
+}
+
+/// A recorded execution decision + its outcome, surfaced by the dashboard's
+/// EXECUTION view (M23/M24). Pure real state captured from the live planner
+/// and the routing result — never mocked.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExecutedPlan {
+    pub request_id: String,
+    pub plan_id: String,
+    pub model_hash: String,
+    /// The selected worker (PeerId).
+    pub selected_worker: String,
+    /// Planner confidence in this placement (0..1).
+    pub score: f32,
+    /// Number of execution stages in the plan.
+    pub stages: usize,
+    /// Reservation id held for this request.
+    pub reservation_id: String,
+    /// Whether the request is a KV continuation of an existing session.
+    pub is_continuation: bool,
+    /// Worker holding the session's KV prefix, if a continuation.
+    pub prefix_worker: Option<String>,
+    /// Outcome: succeeded / failed / in flight.
+    pub outcome: String,
+    /// Human-readable planner reasoning for selecting this worker.
+    pub reasoning: String,
+    /// Wall-clock timestamp (unix seconds) when the decision was recorded.
+    pub ts: u64,
 }
 
 impl ComputeManager {
