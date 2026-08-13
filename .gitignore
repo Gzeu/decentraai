@@ -14,6 +14,7 @@ cache/
 models/
 quarantine/
 staging/
+logs/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
