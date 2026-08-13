@@ -425,3 +425,19 @@ planner integration + `reserve_worker` capacity tests. All green, clippy clean.
 - [x] Verified end-to-end: `setup` → `config validate` → `doctor` → boots a
   real libp2p distributed node off the generated config. Idempotent across
   reruns (same PeerId), model-discovery works, no-model degrades gracefully.
+
+## 17. Installable Application (Productization) — IN PROGRESS
+
+Turn DecentraAI into an installable app; the normal user flow is
+**Download → Install → Open → Ready**, hiding distributed-compute complexity.
+
+- [x] `decentraai node` — a single background daemon that auto-provisions
+  identity + config (reusing `setup`), brings up LAN/P2P discovery + verified
+  auto-share, auto-detects + serves a model, and binds the dashboard/API
+  immediately (control plane is up even while the model loads or faults).
+  Shuts down cleanly on SIGINT/SIGTERM; the target executable for systemd.
+- [x] `decentraai open` — opens the running dashboard in the default browser.
+- [x] `RuntimeConfig.port` — fixed backend port so the product node can target
+  the model backend deterministically before it is ready.
+- [ ] systemd user unit + installer + uninstaller + `.desktop` launcher +
+  auto-start on boot/reboot.

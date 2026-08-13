@@ -57,6 +57,13 @@ enum Command {
         #[command(subcommand)]
         command: TierCommand,
     },
+    /// Run the full node as a background daemon — LAN/P2P discovery, model
+    /// serving and the dashboard all at once, the way the desktop app / systemd
+    /// service drives it. Detects and provisions a model automatically; the
+    /// node is usable without any manual topology or port configuration.
+    Node(NodeArgs),
+    /// Open the running node's dashboard in the default browser.
+    Open(OpenArgs),
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -77,6 +84,17 @@ struct SetupArgs {
     /// Human-readable node name; defaults to `<hostname>-node`.
     #[arg(long)]
     name: Option<String>,
+}
+#[derive(Debug, Args)]
+struct NodeArgs {
+    #[arg(long, default_value = "~/.decentraai/node.yaml")]
+    config: PathBuf,
+}
+#[derive(Debug, Args)]
+struct OpenArgs {
+    /// The port of the node dashboard (matches config `inference.api_port`).
+    #[arg(long, default_value = "8080")]
+    port: u16,
 }
 #[derive(Debug, Args)]
 struct DoctorArgs {
@@ -287,6 +305,8 @@ async fn main() -> Result<()> {
         Command::Distributed(args) => distributed_command(args).await,
         Command::Trust { command } => trust_command(command),
         Command::Tier { command } => tier_command(command),
+        Command::Node(args) => node_start(args).await,
+        Command::Open(args) => open_dashboard(args),
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -522,6 +542,235 @@ sharing:
         max_context = max_context,
         api_port = api_port,
     )
+}
+
+/// Opens the running node's dashboard in the system default browser.
+/// Cross-platform best-effort: xdg-open, open, start, in that order.
+fn open_dashboard(args: OpenArgs) -> Result<()> {
+    use std::process::Command as StdCommand;
+    let url = format!("http://127.0.0.1:{}/", args.port);
+    let tried: &[(&str, &[&str])] = &[
+        ("xdg-open", &["--", &url]),
+        ("xdg-open", &[&url]),
+        ("open", &[&url]),
+    ];
+    for (bin, argv) in tried {
+        if let Ok(mut child) = StdCommand::new(bin).args(*argv).spawn() {
+            let _ = child.wait();
+            println!("Opened dashboard at {url}");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no browser launcher found; open {url} manually");
+}
+
+/// Runs the full node as a single background daemon (the desktop app / systemd
+/// service target). It composes the pieces a normal user should never have to
+/// wire by hand:
+///
+/// 1. ensures identity + validated config exist (auto-generating them),
+/// 2. brings up LAN/P2P discovery + verified auto-share,
+/// 3. serves the dashboard + OpenAI API, auto-loading a detected model,
+/// 4. advertises real compute and exposes live node/worker/compute status.
+///
+/// Congestion and topology are hidden: the node just comes up and peers on the
+/// same LAN discover each other automatically. Shuts down cleanly on
+/// SIGINT/SIGTERM (which is what Ctrl+C and systemd send).
+async fn node_start(args: NodeArgs) -> Result<()> {
+    use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
+    use decentraai_runtime::queue::InferenceQueue;
+    use decentraai_runtime::{
+        LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    let config_path = expand_tilde(&args.config.to_string_lossy());
+
+    // 1. Auto-provision identity + config if this is a truly first run.
+    if !config_path.exists() {
+        let data_dir = expand_tilde("~/.decentraai");
+        setup(SetupArgs {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            config: config_path.clone(),
+            models_dir: None,
+            name: None,
+        })?;
+    }
+
+    let config = NodeConfig::load(&config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    ensure_admitted(&config)?;
+
+    let data_dir = expand_tilde(&config.node.data_dir);
+    // Copy the values the outer loop needs before moving `config` into the
+    // serving task.
+    let node_name = config.node.name.clone();
+    let api_port = config.inference.api_port;
+    let bind_address = config.inference.bind_address.clone();
+
+    let identity_path = data_dir.join("identity/key.pem");
+    let identity = if identity_path.exists() {
+        Identity::load(&identity_path)?
+    } else {
+        let identity = Identity::generate();
+        identity.save(&identity_path)?;
+        identity
+    };
+    info!(peer_id = %identity.peer_id(), "node identity ready");
+
+    // A shared shutdown signal so discovery and serving stop together.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // 2 + 3. Serving: automatically load a detected model and serve the
+    // dashboard. If no model is present the node still runs (discovery +
+    // status) and shows onboarding guidance in the dashboard.
+    let serve_handle = {
+        let data_dir = data_dir.clone();
+        let serve_shutdown = shutdown_tx.clone();
+        let mut shutdown_rx = serve_shutdown.subscribe();
+        let model_name = auto_detect_model(&data_dir.join("models")).unwrap_or_default();
+        tokio::spawn(async move {
+            if model_name.is_empty() {
+                info!("no local model found; running status-only mode (add a .gguf to models/)");
+                return;
+            }
+            let registry = ModelRegistry::new(data_dir.join("models"));
+            let registry = match registry {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "could not create model registry");
+                    return;
+                }
+            };
+            let models_dir = data_dir.join("models");
+            let model = match resolve_model(
+                &registry,
+                &model_path(&models_dir, &model_name),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "detected model not usable");
+                    return;
+                }
+            };
+            let binary = match find_llama_server(None) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "llama-server not found; dashboard will run without a backend model");
+                    return;
+                }
+            };
+            let mut runtime = RuntimeConfig::new(model.clone());
+            runtime.ctx_size = config.inference.max_context_tokens;
+            runtime.parallel = config.inference.max_concurrent_requests;
+            runtime.threads = Some(
+                SystemSnapshot::collect()
+                    .logical_cpus
+                    .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
+                    .max(1),
+            );
+            let server = match LlamaServer::start(&binary, &runtime) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "failed to start llama-server");
+                    return;
+                }
+            };
+            let backend_url = server.base_url();
+            let idle_timeout = Duration::from_secs(
+                u64::from(config.inference.idle_model_unload_minutes) * 60,
+            );
+            let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));
+            let watcher = manager.clone();
+            let mut watcher_shutdown = serve_shutdown.subscribe();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    if watcher_shutdown.try_recv().is_ok() {
+                        break;
+                    }
+                    let _ = watcher.lock().await.unload_if_idle().await;
+                }
+            });
+            let token = if config.inference.api_auth_required {
+                ensure_api_token(&data_dir.join("runtime/api.token")).ok()
+            } else {
+                None
+            };
+            let info = DashboardInfo {
+                repo_root: data_dir.clone(),
+                reputation_path: Some(data_dir.join("db/reputation.json")),
+                max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
+                ban_duration: Duration::from_secs(
+                    u64::from(config.security.ban_duration_minutes) * 60,
+                ),
+                api_port: config.inference.api_port,
+                model_name,
+                model_size_bytes: metadata_size(&model),
+                generation: config.inference.generation.clone(),
+            };
+            let token_store_path = config
+                .tiers
+                .as_ref()
+                .map(|_| data_dir.join("db/tokens.json"));
+            let queue = InferenceQueue::new(
+                usize::from(config.inference.queue_max_requests),
+                Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
+            );
+            let state = ApiState::new(
+                backend_url,
+                token.clone(),
+                manager.clone(),
+                info,
+                token_store_path,
+                config.tiers.clone(),
+                queue,
+            );
+            let addr = serve_api(
+                state,
+                &config.inference.bind_address,
+                config.inference.api_port,
+            )
+            .await;
+            match addr {
+                Ok(a) => info!(address = %a, "dashboard serving"),
+                Err(e) => warn!(error = %e, "dashboard failed to bind"),
+            }
+            let _ = shutdown_rx.recv().await;
+            let _ = manager.lock().await.shutdown().await;
+        })
+    };
+
+    // 4. Node/watch loop: hold the daemon open and print status until stopped.
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    println!(
+        "DecentraAI node running\n  Node   : {node_name}\n  PeerId : {pid}\n  Config : {conf}\n  Dashboard/API: http://{bind}:{port}/  (dashboard + OpenAI-compatible API)\n  Press Ctrl+C to stop",
+        node_name = node_name,
+        pid = identity.peer_id(),
+        conf = config_path.display(),
+        bind = bind_address,
+        port = api_port
+    );
+    tokio::select! {
+        _ = shutdown_rx.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    let _ = shutdown_tx.send(());
+    let _ = serve_handle.await;
+    Ok(())
+}
+
+/// Joins the models dir with a detected model filename.
+fn model_path(models_dir: &std::path::Path, name: &str) -> String {
+    models_dir.join(name).display().to_string()
+}
+
+/// Best-effort file size (MiB-in bytes); 0 when unknown.
+fn metadata_size(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 fn init(args: InitArgs) -> Result<()> {

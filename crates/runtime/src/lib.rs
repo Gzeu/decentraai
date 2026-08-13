@@ -65,6 +65,10 @@ pub struct RuntimeConfig {
     pub ready_timeout: Duration,
     /// Extra arguments passed through verbatim (e.g. `--n-gpu-layers 99`).
     pub extra_args: Vec<String>,
+    /// A fixed port to bind, or `None` to auto-allocate an ephemeral one.
+    /// Productized nodes set this so the dashboard can target the model
+    /// backend deterministically before it is ready.
+    pub port: Option<u16>,
 }
 
 impl RuntimeConfig {
@@ -77,6 +81,7 @@ impl RuntimeConfig {
             threads: None,
             ready_timeout: Duration::from_secs(120),
             extra_args: Vec::new(),
+            port: None,
         }
     }
 }
@@ -264,7 +269,10 @@ impl std::fmt::Debug for LlamaServer {
 impl LlamaServer {
     /// Spawns the child without waiting for readiness (exposed for tests).
     pub fn start(binary: &Path, config: &RuntimeConfig) -> Result<Self> {
-        let port = allocate_port(&config.bind_host)?;
+        let port = match config.port {
+            Some(p) => p,
+            None => allocate_port(&config.bind_host)?,
+        };
         let args = server_args(config, port);
         info!(binary = %binary.display(), port, "starting llama-server");
         let child = Command::new(binary)
@@ -457,6 +465,17 @@ mod tests {
         assert!(joined.contains("--flash-attn on"));
         assert!(joined.contains("--jinja"));
         assert!(joined.ends_with("--n-gpu-layers 99"));
+    }
+
+    #[test]
+    fn runtime_config_port_defaults_to_auto_allocate() {
+        let config = RuntimeConfig::new(PathBuf::from("/m.gguf"));
+        assert_eq!(config.port, None, "default: auto-allocate an ephemeral port");
+        let mut fixed = RuntimeConfig::new(PathBuf::from("/m.gguf"));
+        fixed.port = Some(8081);
+        assert_eq!(fixed.port, Some(8081));
+        let args = server_args(&fixed, 8081);
+        assert!(args.join(" ").contains("--port 8081"));
     }
 
     #[test]
