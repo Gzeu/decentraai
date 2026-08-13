@@ -224,10 +224,11 @@ dashboard served by the node from `crates/runtime/src/api.rs`. It is the one
 control plane; there is no separate frontend project (the old SvelteKit
 `frontend/` was obsolete — never served/built by the node — and was removed).
 The dashboard renders Overview, Chat (`/v1/chat/completions`), Workers, Network,
-Execution (planner decisions with network/KV reasons), Models/Settings coded in
-the embedded HTML, and Diagnostics from the audit log, all from real runtime
-state surfaced by `/status`, `/v1/compute`, `/v1/network`, `/v1/execution` and
-`/v1/peers` — no mock data, watching the page never touches the backend.
+Execution (planner decisions with network/KV reasons), Models, Settings and
+Diagnostics in the embedded HTML, all from real runtime state surfaced by
+`/status`, `/v1/compute`, `/v1/network`, `/v1/execution` and `/v1/peers` — no
+mock data, watching the page never touches the backend. Chat history is kept
+in-page for the session (server-side conversation persistence is not wired).
 
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core
