@@ -471,6 +471,23 @@ impl ComputeManager {
     ) {
         const MAX_EXECUTIONS: usize = 128;
         let mut ring = self.recent_executions.lock().unwrap();
+        // Real network + KV reasons from the coordinator's live state at the
+        // moment this decision was made (M19/M20).
+        let link = self
+            .network
+            .lock()
+            .unwrap()
+            .get(&placement.worker.to_string());
+        let rtt_ms = link.rtt_us / 1000;
+        let kv_headroom = {
+            use decentraai_fabric::KVCacheState;
+            match self.kv_state_for(&placement.worker, &plan.model_hash) {
+                KVCacheState::Partial { used, capacity } => format!("{used}/{capacity}"),
+                KVCacheState::Empty => "unbounded (no n_ctx advertised)".to_string(),
+                KVCacheState::Full => "full".to_string(),
+                KVCacheState::Unknown => "unknown".to_string(),
+            }
+        };
         ring.push_back(ExecutedPlan {
             request_id: request_id.to_string(),
             plan_id: plan.plan_id.clone(),
@@ -481,8 +498,11 @@ impl ComputeManager {
             reservation_id: placement.reservation.reservation_id.to_string(),
             is_continuation,
             prefix_worker,
+            network_rtt_ms: rtt_ms,
+            kv_headroom,
             outcome: outcome.to_string(),
-            reasoning: "fabric planner single-stage placement (network+KV+capability aware)".to_string(),
+            reasoning: "fabric planner single-stage placement (network+KV+capability aware)"
+                .to_string(),
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -882,6 +902,11 @@ pub struct ExecutedPlan {
     pub is_continuation: bool,
     /// Worker holding the session's KV prefix, if a continuation.
     pub prefix_worker: Option<String>,
+    /// Measured RTT to the selected worker (ms), from the M19 network graph.
+    pub network_rtt_ms: u32,
+    /// KV-cache headroom of the selected worker at decision time (e.g.
+    /// "500/2048"), from real n_ctx + accounted usage.
+    pub kv_headroom: String,
     /// Outcome: succeeded / failed / in flight.
     pub outcome: String,
     /// Human-readable planner reasoning for selecting this worker.
@@ -1466,5 +1491,80 @@ mod tests {
         assert_eq!(report.workers[0].in_flight, 1);
         assert!(report.workers[0].reserved_ram_mb >= 256);
         manager.release(placement.reservation.reservation_id).await;
+    }
+
+    #[tokio::test]
+    async fn record_execution_captures_network_and_kv_reasons() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![ServedModel {
+                    context_tokens: 2048,
+                    ..model()
+                }],
+                false,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+        manager.record_rtt(&worker, 50_000, 1000); // 50ms RTT
+
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (plan, placement) = manager
+            .plan_and_reserve(&req, 100, None)
+            .await
+            .expect("plan");
+        let plan = plan.clone();
+        // Account some session usage so KV headroom is a Partial value.
+        manager
+            .record_session_usage("s1", &worker, "abc", 500)
+            .await;
+
+        manager.record_execution("r1", &plan, &placement, false, None, "succeeded");
+        let recs = manager.executions();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].request_id, "r1");
+        assert_eq!(recs[0].selected_worker, worker.to_string());
+        assert_eq!(recs[0].network_rtt_ms, 50);
+        assert_eq!(recs[0].kv_headroom, "500/2048");
+        // Ring buffer bounds.
+        for i in 0..150 {
+            manager.record_execution(
+                &format!("r{i}"),
+                &plan,
+                &placement,
+                false,
+                None,
+                "succeeded",
+            );
+        }
+        assert!(manager.executions().len() <= 128);
+        // Continue the session so continuation reasons render in the record.
+        let cont = manager
+            .plan_and_reserve(&req, 50, Some("s1"))
+            .await
+            .expect("cont");
+        manager.record_execution(
+            "c1",
+            &cont.0,
+            &cont.1,
+            true,
+            Some(worker.to_string()),
+            "succeeded",
+        );
+        let recs = manager.executions();
+        let c = recs.iter().find(|r| r.request_id == "c1").unwrap();
+        assert!(c.is_continuation);
+        assert_eq!(
+            c.prefix_worker.as_deref(),
+            Some(worker.to_string().as_str())
+        );
     }
 }

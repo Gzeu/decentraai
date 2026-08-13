@@ -987,8 +987,8 @@ ol{padding-left:20px} li{margin:6px 0}
 </div>
 <div class="card">
   <h2>Execution (planner decisions)</h2>
-  <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Outcome</th><th>Reasoning</th></tr></thead>
-  <tbody id="execution"><tr><td colspan="7" class="off">loading&hellip;</td></tr></tbody></table>
+  <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Network</th><th>KV</th><th>Outcome</th><th>Reasoning</th></tr></thead>
+  <tbody id="execution"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
 </div>
 <div class="card">
   <h2>Recent security events (audit log)</h2>
@@ -1135,9 +1135,9 @@ async function refresh() {
     const x = await (await fetch('/v1/execution', { headers })).json();
     const xrows = (x.executions || []).slice(0, 12).map(e =>
       '<tr><td><code>' + esc(e.request_id.slice(0, 8)) + '</code></td><td><code>' + esc(e.selected_worker.slice(0, 12)) + '&hellip;</code></td><td>' + e.score.toFixed(2) + '</td><td>' + e.stages + '</td><td>' +
-      (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
+      (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + e.network_rtt_ms + ' ms</td><td class="small">' + esc(e.kv_headroom || '') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
     ).join('');
-    document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="7" class="off">no executions yet</td></tr>';
+    document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="9" class="off">no executions yet</td></tr>';
   } catch (e) {}
 }
 refresh(); setInterval(refresh, 3000);
