@@ -344,6 +344,11 @@ decentraai token revoke --name <n>              # revoke (effective next request
 
 - `crates/audit` — append-only security audit log
 - `crates/config` — typed YAML configuration with validation (incl. tiers)
+- `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, f
+## Layout
+
+- `crates/audit` — append-only security audit log
+- `crates/config` — typed YAML configuration with validation (incl. tiers)
 - `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, fallback handling
 - `crates/identity` — Ed25519 keypairs and PeerId derivation
 - `crates/manifest` — GGUF manifests: chunk hashes, Merkle root, atomic writes

@@ -120,6 +120,62 @@ impl ReservationLedger {
     }
 }
 
+/// Why a worker-local workload was rejected for lack of headroom (M15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitReason {
+    InsufficientRam { available: u64, required: u64 },
+    InsufficientVram { available: u64, required: u64 },
+}
+
+/// The capacity context against which a worker admits a workload (M15):
+/// what the worker advertises as free plus the absolute floor it must keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admission {
+    pub available_ram_mb: u64,
+    pub available_vram_mb: Option<u64>,
+    pub min_free_ram_mb: u64,
+    pub min_free_vram_mb: u64,
+}
+
+impl ReservationLedger {
+    /// Worker-side reservation enforcement (M15): can a workload of
+    /// `req_ram_mb`/`req_vram_mb` be admitted on top of the reservations
+    /// already booked for `worker`, given the free capacity `capacity`
+    /// describes (advertised free minus the absolute floor to keep)?
+    ///
+    /// Mirrors the coordinator's `CapabilityMatcher` so both ends agree on
+    /// headroom: the coordinator refuses to route when the ledger it holds
+    /// would overbook a worker, and the worker refuses to serve even if a
+    /// buggy or malicious coordinator sends more than it booked.
+    pub fn admit(
+        &self,
+        worker: &PeerId,
+        capacity: Admission,
+        req_ram_mb: u64,
+        req_vram_mb: u64,
+    ) -> Result<(), AdmitReason> {
+        let total_ram = req_ram_mb.saturating_add(capacity.min_free_ram_mb);
+        let free_ram = capacity.available_ram_mb.saturating_sub(self.reserved_ram(worker));
+        if free_ram < total_ram {
+            return Err(AdmitReason::InsufficientRam {
+                available: free_ram,
+                required: total_ram,
+            });
+        }
+        if let Some(free_vram) = capacity.available_vram_mb {
+            let free_vram = free_vram.saturating_sub(self.reserved_vram(worker));
+            let total_vram = req_vram_mb.saturating_add(capacity.min_free_vram_mb);
+            if free_vram < total_vram {
+                return Err(AdmitReason::InsufficientVram {
+                    available: free_vram,
+                    required: total_vram,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +231,72 @@ mod tests {
         let freed = ledger.prune_expired(Instant::now());
         assert_eq!(freed, 1);
         assert_eq!(ledger.in_flight(&p), 0);
+    }
+
+    #[test]
+    fn admit_allows_with_headroom() {
+        let mut ledger = ReservationLedger::new(Duration::from_secs(60), 8);
+        let p = peer();
+        ledger.reserve(p, 256, 3072);
+        let cap = Admission {
+            available_ram_mb: 12 * 1024,
+            available_vram_mb: Some(18 * 1024),
+            min_free_ram_mb: 1024,
+            min_free_vram_mb: 512,
+        };
+        assert_eq!(ledger.admit(&p, cap, 256, 3072), Ok(()));
+    }
+
+    #[test]
+    fn admit_rejects_when_ram_would_overbook() {
+        let mut ledger = ReservationLedger::new(Duration::from_secs(60), 8);
+        let p = peer();
+        ledger.reserve(p, 10 * 1024, 0);
+        let cap = Admission {
+            available_ram_mb: 12 * 1024,
+            available_vram_mb: Some(18 * 1024),
+            min_free_ram_mb: 1024,
+            min_free_vram_mb: 512,
+        };
+        assert_eq!(
+            ledger.admit(&p, cap, 2048, 0),
+            Err(AdmitReason::InsufficientRam {
+                available: 2 * 1024,
+                required: 3072,
+            })
+        );
+    }
+
+    #[test]
+    fn admit_rejects_when_vram_would_overbook() {
+        let mut ledger = ReservationLedger::new(Duration::from_secs(60), 8);
+        let p = peer();
+        ledger.reserve(p, 0, 16 * 1024);
+        let cap = Admission {
+            available_ram_mb: 12 * 1024,
+            available_vram_mb: Some(18 * 1024),
+            min_free_ram_mb: 1024,
+            min_free_vram_mb: 512,
+        };
+        assert_eq!(
+            ledger.admit(&p, cap, 0, 4096),
+            Err(AdmitReason::InsufficientVram {
+                available: 2 * 1024,
+                required: 4608,
+            })
+        );
+    }
+
+    #[test]
+    fn admit_skips_vram_check_when_worker_has_no_gpu() {
+        let ledger = ReservationLedger::new(Duration::from_secs(60), 8);
+        let p = peer();
+        let cap = Admission {
+            available_ram_mb: 12 * 1024,
+            available_vram_mb: None,
+            min_free_ram_mb: 1024,
+            min_free_vram_mb: 512,
+        };
+        assert_eq!(ledger.admit(&p, cap, 2048, 999_999), Ok(()));
     }
 }

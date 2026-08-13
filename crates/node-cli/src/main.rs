@@ -129,6 +129,10 @@ struct DistributedArgs {
     /// Human-readable node name advertised in compute advertisements.
     #[arg(long, default_value = "decentraai-node")]
     name: String,
+    /// Loopback HTTP port that serves live compute metrics (workers, load,
+    /// reservations, tokens/sec, latency) as JSON at /v1/compute (M16).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 #[derive(Debug, Subcommand)]
 enum TrustCommand {
@@ -1469,7 +1473,16 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     if let Some(prompt) = args.prompt {
         run_distributed_ask(&distributed, prompt, &worker_manager, local_peer_id).await?;
     } else {
-        // Persistent coordinator / worker: keep running until interrupted.
+        // Persistent coordinator / worker: expose live compute metrics and
+        // keep running until interrupted.
+        if let Some(port) = args.metrics_port {
+            let cm = compute_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = spawn_compute_metrics_server(cm, port).await {
+                    tracing::warn!(error = %e, "compute metrics server exited");
+                }
+            });
+        }
         tokio::signal::ctrl_c().await?;
     }
 
@@ -1562,6 +1575,36 @@ async fn spawn_compute_broadcaster(
             }
         }
     });
+    Ok(())
+}
+
+/// Serves live compute metrics (M16) as JSON on a loopback-only HTTP port.
+/// `/v1/compute` returns the coordinator's view of the mesh: each worker's
+/// load, queue, tokens/sec, latency, capacity and current reservations, plus
+/// the local node's perf and lifetime totals. Bound to 127.0.0.1 so it never
+/// leaks capacity/paths over the LAN.
+async fn spawn_compute_metrics_server(
+    compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
+    port: u16,
+) -> anyhow::Result<()> {
+    use axum::Router;
+    use axum::extract::State;
+    use axum::routing::get;
+    use axum::Json;
+
+    async fn compute_metrics_handler(
+        State(cm): State<std::sync::Arc<decentraai_distributed::ComputeManager>>,
+    ) -> Json<decentraai_distributed::ComputeMetricsReport> {
+        Json(cm.metrics_report().await)
+    }
+
+    let app = Router::new()
+        .route("/v1/compute", get(compute_metrics_handler))
+        .with_state(compute_manager);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(%addr, endpoint = "/v1/compute", "serving live compute metrics");
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

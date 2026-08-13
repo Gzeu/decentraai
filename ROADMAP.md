@@ -145,12 +145,48 @@ Issues found and fixed during verification:
   accessors and would panic on a multithreaded runtime; switched to the async
   accessors (queue depth / TPS / latency now report real values).
 
-### Next: M15–M17 (agreed direction)
-- M15: reservation enforcement on the worker (reject when a request exceeds
-  advertised free capacity)
+### Next: M16–M17 (agreed direction)
 - M16: compute metrics in the dashboard (workers, load, VRAM, placements)
 - M17: contribution-based tier suggestions driven by compute served
   (hardware × hours × verified requests)
+
+### M15: Worker-side reservation enforcement — DONE
+
+The worker enforces its own reservation ledger so that a request exceeding
+the currently advertised free capacity is rejected on arrival rather than
+over-committing resources. This closes the gap where the coordinator's
+placement decisions and the worker's actual bookings could drift.
+
+- `ReservationLedger` is shared worker-side; each in-flight request books
+  capacity and is released on a terminal event (success, backend error, or
+  cancellation).
+- A request that would exceed free capacity is answered with `InferFailed`
+  (`retryable = true`), so the coordinator falls back to a different worker.
+- Key updates now also update the worker's advertised `queue_depth`, keeping
+  advertisements honest for subsequent placement decisions.
+- E2E: `worker_rejects_request_exceeding_advertised_capacity` proves the
+  rejection + coordinator fallback path.
+
+### M16: Live compute metrics — DONE
+
+The coordinator now exposes a live, serde-friendly snapshot of the whole mesh
+from *real* inference traffic, not synthetic probes. Advertisements carry
+measured throughput/latency so scheduling weights real performance.
+
+- `RuntimeMetrics` (atomics, lock-free): an EWMA of tokens/sec and latency
+  smoothed from each completed request, plus live `queue_depth` and lifetime
+  totals. Written by the worker's streaming task and the queue path.
+- `build_advertisement` now embeds a `LivePerf` snapshot, so each periodic
+  advertisement reflects measured throughput/latency/queue load; the scheduler
+  can weigh those alongside raw capacity.
+- `ComputeManager::metrics_report` builds a coordinator-side view: every
+  worker's load, queue, tokens/sec, latency, free capacity, current in-flight
+  count and reserved RAM.
+- `decentraai distributed start --metrics-port <P>` serves
+  `GET /v1/compute` with that JSON on `127.0.0.1` (loopback only; never
+  leaks capacity over the LAN).
+- Tests: EWMA throughput/latency tracking, perf-in-advertisement, and
+  `metrics_report` reflecting the registry + reservations.
 
 ### M14: On-demand model provisioning — DONE
 

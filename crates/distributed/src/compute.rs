@@ -12,6 +12,7 @@
 //! serving nodes that have not opted in to compute sharing yet.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use libp2p::PeerId;
@@ -43,6 +44,91 @@ pub const DEFAULT_STALE_AFTER_MS: u64 = 30_000;
 /// advertisement reports).
 pub const ENGINE_LLAMA_SERVER: &str = "llama_server";
 
+/// Leaf snapshot of live per-node performance placed into advertisements so
+/// the coordinator's scheduler weighs real throughput/latency/queue load when
+/// picking a worker (M16). Mirrors the time-varying fields of
+/// [`ComputeAvailability`] and is produced by [`RuntimeMetrics::snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LivePerf {
+    pub queue_depth: u32,
+    pub tokens_per_second: u32,
+    pub current_latency_ms: u32,
+}
+
+/// Live performance metrics captured from the *real* inference path (M16).
+///
+/// Written by the worker's streaming task as each request reaches a terminal
+/// event, and by the on_infer/queue paths as the queue depth changes. Only
+/// atomics, so both the synchronous `on_infer` callback and the async
+/// streaming task can update it without a lock. The EWMA keeps `snapshot()`
+/// immune to single slow/fast outliers so scheduler rankings stay stable.
+#[derive(Debug, Default)]
+pub struct RuntimeMetrics {
+    tokens_per_second: AtomicU32,
+    current_latency_ms: AtomicU32,
+    queue_depth: AtomicU32,
+    requests_completed: AtomicU64,
+    requests_failed: AtomicU64,
+    tokens_total: AtomicU64,
+}
+
+impl RuntimeMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Smooths one measured sample into the running estimate (M16).
+    fn ewma(prev: u32, measured: u32) -> u32 {
+        (prev as f32 * 0.8 + measured as f32 * 0.2).round() as u32
+    }
+
+    /// Records one completed request: tokens/sec derived from its true token
+    /// count and wall time, plus its true latency.
+    pub fn record_completion(&self, tokens: u64, latency_ms: u64) {
+        let secs = (latency_ms.max(1) as f64) / 1000.0;
+        let tps = (tokens as f64 / secs) as u32;
+        let prev_tps = self.tokens_per_second.load(Ordering::Relaxed);
+        self.tokens_per_second
+            .store(Self::ewma(prev_tps, tps), Ordering::Relaxed);
+
+        let prev_lat = self.current_latency_ms.load(Ordering::Relaxed);
+        let lat = latency_ms.min(u32::MAX as u64) as u32;
+        self.current_latency_ms
+            .store(Self::ewma(prev_lat, lat), Ordering::Relaxed);
+
+        self.requests_completed.fetch_add(1, Ordering::Relaxed);
+        self.tokens_total.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    /// Records one failed request (does not move the perf EWMA).
+    pub fn record_failure(&self) {
+        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reflects the current worker queue depth.
+    pub fn set_queue_depth(&self, depth: u32) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Live perf values for this node's advertisements.
+    pub fn snapshot(&self) -> LivePerf {
+        LivePerf {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            tokens_per_second: self.tokens_per_second.load(Ordering::Relaxed),
+            current_latency_ms: self.current_latency_ms.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Lifetime request/token totals for observability.
+    pub fn totals(&self) -> (u64, u64, u64) {
+        (
+            self.requests_completed.load(Ordering::Relaxed),
+            self.requests_failed.load(Ordering::Relaxed),
+            self.tokens_total.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Pure builder: turns a real hardware probe into a `ComputeAdvertisement`.
 ///
 /// Kept as a free function so unit tests can drive it with synthetic
@@ -59,6 +145,7 @@ pub fn build_advertisement(
     served_models: Vec<ServedModel>,
     can_provision: bool,
     announced_at_ms: u64,
+    perf: LivePerf,
 ) -> ComputeAdvertisement {
     let (gpu_spec, free_vram_mib) = match &gpu {
         GpuProbeStatus::Nvidia(info) => (
@@ -89,9 +176,9 @@ pub fn build_advertisement(
             available_ram_mb: snapshot.available_memory_bytes / MIB,
             available_vram_mb: free_vram_mib,
             load_percent,
-            queue_depth: 0,
-            tokens_per_second: 0,
-            current_latency_ms: 0,
+            queue_depth: perf.queue_depth,
+            tokens_per_second: perf.tokens_per_second,
+            current_latency_ms: perf.current_latency_ms,
             status: WorkerHealth::Ready,
         },
         announced_at_ms,
@@ -105,6 +192,15 @@ pub struct ComputeManager {
     engine: String,
     advertisement_interval_ms: u64,
     scheduler: Mutex<ComputeScheduler>,
+    /// The most recent advertisement this node built and broadcast. The
+    /// worker's on-demand admission gate (M15) enforces against this exact
+    /// snapshot, so it must be readable synchronously from the P2P on_infer
+    /// callback. Held by a std mutex with no await under lock.
+    last_local_ad: std::sync::Mutex<Option<ComputeAdvertisement>>,
+    /// Live performance metrics captured from real inference (M16). Shared
+    /// so the worker's streaming task and the periodic advertiser both see
+    /// the same throughput/latency/queue state.
+    metrics: std::sync::Arc<RuntimeMetrics>,
 }
 
 impl ComputeManager {
@@ -129,6 +225,8 @@ impl ComputeManager {
             engine: ENGINE_LLAMA_SERVER.to_string(),
             advertisement_interval_ms: DEFAULT_ADVERTISEMENT_INTERVAL_MS,
             scheduler: Mutex::new(scheduler),
+            last_local_ad: std::sync::Mutex::new(None),
+            metrics: std::sync::Arc::new(RuntimeMetrics::new()),
         }
     }
 
@@ -253,9 +351,26 @@ impl ComputeManager {
             served_models,
             can_provision,
             now,
+            self.metrics.snapshot(),
         );
         self.scheduler.lock().await.upsert(adv.clone());
+        *self.last_local_ad.lock().unwrap() = Some(adv.clone());
         adv
+    }
+
+    /// The advertisement this node most recently built and broadcast (the
+    /// capacity it committed to the network). Synchronous, for the worker's
+    /// on_infer admission gate. `None` until the first `advertise_local`.
+    pub fn last_local_advertisement_sync(&self) -> Option<ComputeAdvertisement> {
+        self.last_local_ad.lock().unwrap().clone()
+    }
+
+    /// Shared handle to the node's live perf metrics. The worker's streaming
+    /// task records real completions into it so subsequent advertisements
+    /// (and therefore coordinator scheduling) reflect measured throughput and
+    /// latency (M16).
+    pub fn runtime_metrics(&self) -> std::sync::Arc<RuntimeMetrics> {
+        self.metrics.clone()
     }
 }
 
@@ -269,6 +384,89 @@ pub fn gpu_from_snapshot(info: &GpuSnapshot) -> (Option<GpuSpec>, Option<u64>) {
         }),
         Some(info.free_vram_mib),
     )
+}
+
+/// One worker row for the compute metrics report (M16). Built entirely from
+/// the real [`ComputeManager`] state: the last advertisement's live
+/// availability plus the scheduler's reservation bookkeeping.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkerMetricRow {
+    pub peer_id: String,
+    pub node_name: String,
+    pub status: String,
+    pub load_percent: u8,
+    pub queue_depth: u32,
+    pub tokens_per_second: u32,
+    pub current_latency_ms: u32,
+    pub available_ram_mb: u64,
+    pub available_vram_mb: Option<u64>,
+    pub in_flight: usize,
+    pub reserved_ram_mb: u64,
+}
+
+/// Coordinator-side view of the whole mesh for observability (M16).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComputeMetricsReport {
+    pub workers: Vec<WorkerMetricRow>,
+    pub local_peer: String,
+    pub local_perf: LivePerfSnapshot,
+    pub totals: TotalsSnapshot,
+}
+
+/// Serializable snapshot of the local node's live perf.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LivePerfSnapshot {
+    pub queue_depth: u32,
+    pub tokens_per_second: u32,
+    pub current_latency_ms: u32,
+}
+
+/// Serializable lifetime totals.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TotalsSnapshot {
+    pub requests_completed: u64,
+    pub requests_failed: u64,
+    pub tokens_total: u64,
+}
+
+impl ComputeManager {
+    /// Builds a serde-friendly snapshot of the mesh for the metrics API /
+    /// dashboard (M16).
+    pub async fn metrics_report(&self) -> ComputeMetricsReport {
+        let workers = self.scheduler.lock().await.registry().list();
+        let mut rows = Vec::with_capacity(workers.len());
+        for adv in workers {
+            rows.push(WorkerMetricRow {
+                peer_id: adv.peer_id.to_string(),
+                node_name: adv.node_name.clone(),
+                status: format!("{:?}", adv.availability.status),
+                load_percent: adv.availability.load_percent,
+                queue_depth: adv.availability.queue_depth,
+                tokens_per_second: adv.availability.tokens_per_second,
+                current_latency_ms: adv.availability.current_latency_ms,
+                available_ram_mb: adv.availability.available_ram_mb,
+                available_vram_mb: adv.availability.available_vram_mb,
+                in_flight: self.in_flight(&adv.peer_id).await,
+                reserved_ram_mb: self.reserved_ram(&adv.peer_id).await,
+            });
+        }
+        let perf = self.metrics.snapshot();
+        let (completed, failed, tokens) = self.metrics.totals();
+        ComputeMetricsReport {
+            workers: rows,
+            local_peer: self.local_peer.to_string(),
+            local_perf: LivePerfSnapshot {
+                queue_depth: perf.queue_depth,
+                tokens_per_second: perf.tokens_per_second,
+                current_latency_ms: perf.current_latency_ms,
+            },
+            totals: TotalsSnapshot {
+                requests_completed: completed,
+                requests_failed: failed,
+                tokens_total: tokens,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +523,7 @@ mod tests {
             vec![model()],
             false,
             1_700_000_000_000,
+            LivePerf::default(),
         );
         assert_eq!(adv.peer_id, p);
         assert_eq!(adv.node_name, "gpu-rig");
@@ -352,6 +551,7 @@ mod tests {
             vec![model()],
             false,
             0,
+            LivePerf::default(),
         );
         assert!(adv.capability.gpu.is_none());
         assert_eq!(adv.availability.available_vram_mb, None);
@@ -361,7 +561,7 @@ mod tests {
     async fn selects_and_releases_via_manager() {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
-        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0);
+        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
         manager.process_advertisement(adv).await;
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
@@ -376,7 +576,7 @@ mod tests {
     async fn requirements_for_accepts_provisioning_workers() {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
-        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], true, 0);
+        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], true, 0, LivePerf::default());
         manager.process_advertisement(adv).await;
 
         let req = manager.requirements_for("zzz-not-served").await.expect("provisioning worker is schedulable");
@@ -386,8 +586,81 @@ mod tests {
         // With no provisioning-capable worker, unknown models are not routable.
         let p2 = peer();
         let manager2 = ComputeManager::new(p2, "coordinator".into(), HashSet::from([p2]));
-        let adv2 = build_advertisement(p2, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], false, 0);
+        let adv2 = build_advertisement(p2, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], false, 0, LivePerf::default());
         manager2.process_advertisement(adv2).await;
         assert!(manager2.requirements_for("zzz-not-served").await.is_none());
+    }
+
+    #[test]
+    fn runtime_metrics_ewma_tracks_throughput_and_latency() {
+        let m = RuntimeMetrics::new();
+        // 100 tokens in 1000ms = 100 tps; 100 tokens in 100ms = 1000 tps.
+        m.record_completion(100, 1000);
+        m.record_completion(100, 100);
+        let snap = m.snapshot();
+        assert!(snap.tokens_per_second > 100, "EWMA should raise TPS, got {}", snap.tokens_per_second);
+        assert!(snap.current_latency_ms > 100 && snap.current_latency_ms < 1000);
+        m.set_queue_depth(4);
+        assert_eq!(m.snapshot().queue_depth, 4);
+        let (completed, failed, tokens) = m.totals();
+        assert_eq!(completed, 2);
+        assert_eq!(failed, 0);
+        assert_eq!(tokens, 200);
+        m.record_failure();
+        assert_eq!(m.totals().1, 1);
+    }
+
+    #[test]
+    fn advertisement_carries_live_perf_metrics() {
+        let p = peer();
+        let perf = LivePerf {
+            queue_depth: 3,
+            tokens_per_second: 150,
+            current_latency_ms: 40,
+        };
+        let adv = build_advertisement(
+            p,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            perf,
+        );
+        assert_eq!(adv.availability.queue_depth, 3);
+        assert_eq!(adv.availability.tokens_per_second, 150);
+        assert_eq!(adv.availability.current_latency_ms, 40);
+    }
+
+    #[tokio::test]
+    async fn metrics_report_reflects_registry_and_bookings() {
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let adv = build_advertisement(
+            p,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf {
+                queue_depth: 2,
+                tokens_per_second: 75,
+                current_latency_ms: 60,
+            },
+        );
+        manager.process_advertisement(adv).await;
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let placement = manager.select(&req).await.expect("eligible");
+        let report = manager.metrics_report().await;
+        assert_eq!(report.workers.len(), 1);
+        assert_eq!(report.workers[0].queue_depth, 2);
+        assert_eq!(report.workers[0].in_flight, 1);
+        assert!(report.workers[0].reserved_ram_mb >= 256);
+        manager.release(placement.reservation.reservation_id).await;
     }
 }

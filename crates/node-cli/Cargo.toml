@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }

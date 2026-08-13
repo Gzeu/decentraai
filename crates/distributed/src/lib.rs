@@ -45,6 +45,30 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use decentraai_compute::{Admission, AdmitReason, ReservationLedger};
+
+/// Default RAM estimate (MiB) for a workload whose model footprint is not yet
+/// known (e.g. a provisioned model before its download completes). Matches
+/// the coordinator's `PROVISION_DEFAULT_RAM_MB`.
+const DEFAULT_EST_RAM_MB: u64 = 1024;
+/// Absolute floor of free RAM/VRAM the worker keeps for itself when deciding
+/// whether an inbound request fits (M15). Mirrors the coordinator's
+/// `CapabilityMatcher` defaults so both ends agree.
+const MIN_FREE_RAM_MB: u64 = 1024;
+const MIN_FREE_VRAM_MB: u64 = 512;
+
+/// Human-readable message for an admission rejection (M15).
+fn describe_admit_reason(reason: AdmitReason) -> String {
+    match reason {
+        AdmitReason::InsufficientRam { available, required } => {
+            format!("{available} MiB free RAM below the required {required} MiB")
+        }
+        AdmitReason::InsufficientVram { available, required } => {
+            format!("{available} MiB free VRAM below the required {required} MiB")
+        }
+    }
+}
+
 pub mod compute;
 pub mod config;
 pub mod fallback;
@@ -54,7 +78,10 @@ pub mod router;
 pub mod tracker;
 pub mod worker;
 
-pub use compute::{ComputeManager, build_advertisement};
+pub use compute::{
+    ComputeManager, ComputeMetricsReport, LivePerf, RuntimeMetrics, WorkerMetricRow,
+    build_advertisement,
+};
 pub use config::InferenceConfig;
 pub use error::DistributedError;
 pub use fallback::FallbackHandler;
@@ -121,6 +148,12 @@ pub struct Provisioner {
     worker_manager: Arc<WorkerManager>,
     provisioned: ProvisionedBackends,
     semaphore: Arc<tokio::sync::Semaphore>,
+    /// Worker-side reservation ledger, passed so provisioned workloads share
+    /// the same queue accounting when their requests are served.
+    reservations: Arc<std::sync::Mutex<ReservationLedger>>,
+    /// Live compute metrics (M16), so provisioned requests also report
+    /// real throughput/latency into the node's advertisements.
+    metrics: Option<std::sync::Arc<crate::compute::RuntimeMetrics>>,
 }
 
 #[derive(Clone)]
@@ -317,13 +350,37 @@ impl DistributedInference {
         };
 
         let local_peer = self.p2p_node.local_peer_id();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<decentraai_protocol::InferRequest>();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(
+                decentraai_protocol::InferRequest,
+                Option<decentraai_compute::ResourceReservation>,
+            )>();
         let tx_clone = tx.clone();
         let p2p_clone = self.p2p_node.clone();
         let queue_mgr = self.queue_manager.clone();
         let backend_clone = backend.clone();
         let worker_manager = self.worker_manager.clone();
         let model_hash_clone = model_hash.clone();
+        let compute_for_closure = self.compute_manager.clone();
+        // M16: real compute metrics. The worker's streaming task records
+        // measured tokens/sec and latency; the queue path keeps depth current.
+        let compute_metrics =
+            self.compute_manager.as_ref().map(|c| c.runtime_metrics());
+
+        // Worker-side reservation enforcement (M15): the worker keeps its own
+        // ledger of in-flight workloads booked against the capacity it
+        // advertised, and refuses to serve a request whose footprint would
+        // exceed the remaining headroom — even if a buggy or malicious
+        // coordinator sent more work than it booked. The TTL is a safety net;
+        // reservations are released explicitly on the terminal event.
+        let local_reservations: Arc<std::sync::Mutex<ReservationLedger>> = Arc::new(
+            std::sync::Mutex::new(ReservationLedger::new(
+                std::time::Duration::from_secs(300),
+                8,
+            )),
+        );
+        let reservations_closure = local_reservations.clone();
+        let reservations_for_task = local_reservations.clone();
 
         // Engines spawned for on-demand-provisioned models, keyed by model
         // hash. Kept for the worker session so the subprocesses stay alive;
@@ -351,6 +408,7 @@ impl DistributedInference {
         let p2p_for_closure = p2p_clone.clone();
         let queue_for_closure = queue_mgr.clone();
         let wm_for_closure = worker_manager.clone();
+        let metrics_for_infer = compute_metrics.clone();
 
         // Register sync on_infer handler that enqueues the request and returns Accept
         self.p2p_node.set_on_infer_request(move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
@@ -373,6 +431,8 @@ impl DistributedInference {
                         worker_manager: wm_for_closure.clone(),
                         provisioned: provisioned_clone.clone(),
                         semaphore: semaphore_clone.clone(),
+                        reservations: reservations_closure.clone(),
+                        metrics: metrics_for_infer.clone(),
                     };
                     tokio::spawn(async move {
                         provision_on_demand(&prov, ctx, req).await;
@@ -394,9 +454,63 @@ impl DistributedInference {
                 return serialize_message(&InferMessage::InferResponse(resp));
             }
 
+            // Worker-side admission gate (M15): book a local reservation for
+            // this workload and refuse to serve it when the request's model
+            // footprint would exceed the free capacity this node advertised.
+            // Skip the gate when no advertisement has been broadcast yet or no
+            // compute manager is attached (nothing was committed to the mesh).
+            let reservation = {
+                let mut ledger = reservations_closure.lock().unwrap_or_else(|e| e.into_inner());
+                let (avail_ram, avail_vram, est_ram, est_vram) =
+                    match compute_for_closure
+                        .as_ref()
+                        .and_then(|c| c.last_local_advertisement_sync())
+                    {
+                        Some(ad) => {
+                            let est = ad
+                                .capability
+                                .served_models
+                                .iter()
+                                .find(|m| m.model_hash == req.model_hash)
+                                .map(|m| (m.est_ram_mb, m.est_vram_mb))
+                                .unwrap_or((DEFAULT_EST_RAM_MB, 0));
+                            (
+                                ad.availability.available_ram_mb,
+                                ad.availability.available_vram_mb,
+                                est.0,
+                                est.1,
+                            )
+                        }
+                        None => (0, None, 0, 0),
+                    };
+                if avail_ram > 0 {
+                    let capacity = Admission {
+                        available_ram_mb: avail_ram,
+                        available_vram_mb: avail_vram,
+                        min_free_ram_mb: MIN_FREE_RAM_MB,
+                        min_free_vram_mb: MIN_FREE_VRAM_MB,
+                    };
+                    if let Err(reason) = ledger.admit(&local_peer, capacity, est_ram, est_vram) {
+                        let failed = InferMessage::InferFailed {
+                            request_id: req.request_id,
+                            worker_peer_id: local_peer,
+                            error: format!(
+                                "worker has insufficient free capacity: {}",
+                                describe_admit_reason(reason)
+                            ),
+                            retryable: true,
+                        };
+                        return serialize_message(&failed);
+                    }
+                    ledger.reserve(local_peer, est_ram, est_vram)
+                } else {
+                    None
+                }
+            };
+
             // Send to processing channel (background task will enqueue). If the
             // channel is gone the worker is shutting down; tell the requester.
-            if tx_clone.send(req.clone()).is_err() {
+            if tx_clone.send((req.clone(), reservation)).is_err() {
                 let failed = InferMessage::InferFailed {
                     request_id: req.request_id,
                     worker_peer_id: local_peer,
@@ -418,10 +532,20 @@ impl DistributedInference {
 
         // Spawn background task to process queued requests and stream
         tokio::spawn(async move {
-            while let Some(req) = rx.recv().await {
+            while let Some((req, reservation)) = rx.recv().await {
                 // Queue the request; a full queue is answered immediately so the
-                // requester is never left hanging.
+                // requester is never left hanging. The local reservation booked
+                // at admission is released — the workload never ran.
                 if !queue_mgr.queue_request(req.clone(), local_peer).await {
+                    if let Some(res) = &reservation {
+                        reservations_for_task
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .release(res.reservation_id);
+                    }
+                    if let Some(m) = &compute_metrics {
+                        m.record_failure();
+                    }
                     if let Ok(bytes) = serialize_message(&InferMessage::InferFailed {
                         request_id: req.request_id,
                         worker_peer_id: local_peer,
@@ -433,13 +557,25 @@ impl DistributedInference {
                     continue;
                 }
 
+                if let Some(m) = &compute_metrics {
+                    m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
+                }
+
                 // Dequeue and process the request to a single terminal event.
                 if let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
+                    if let Some(m) = &compute_metrics {
+                        m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
+                    }
                     stream_request_to_terminal(
-                        &backend_clone,
-                        &p2p_clone,
-                        &queue_mgr,
-                        &worker_manager,
+                        WorkerStreamCtx {
+                            backend: &backend_clone,
+                            p2p: &p2p_clone,
+                            queue: &queue_mgr,
+                            worker_manager: &worker_manager,
+                            reservations: &reservations_for_task,
+                            metrics: compute_metrics.as_ref(),
+                        },
+                        reservation,
                         queued,
                     )
                     .await;
@@ -663,21 +799,52 @@ impl DistributedInference {
 /// errors each send a single `InferFailed` (retryable=false for cancellation,
 /// retryable=true for transient backend failures). The queue is always
 /// `complete_request`ed so the worker's in-flight set stays consistent.
+///
+/// Bundles the worker-side handles (M15/M16) so the free function stays under
+/// clippy's argument cap.
+struct WorkerStreamCtx<'a> {
+    backend: &'a decentraai_inference_adapter::OpenAiCompatibleBackend,
+    p2p: &'a decentraai_p2p::P2PNode,
+    queue: &'a RequestQueueManager,
+    worker_manager: &'a WorkerManager,
+    reservations: &'a Arc<std::sync::Mutex<ReservationLedger>>,
+    metrics: Option<&'a std::sync::Arc<crate::compute::RuntimeMetrics>>,
+}
+
 async fn stream_request_to_terminal(
-    backend: &decentraai_inference_adapter::OpenAiCompatibleBackend,
-    p2p: &decentraai_p2p::P2PNode,
-    queue: &RequestQueueManager,
-    worker_manager: &WorkerManager,
+    ctx: WorkerStreamCtx<'_>,
+    reservation: Option<decentraai_compute::ResourceReservation>,
     queued: QueuedRequest,
 ) {
     use decentraai_inference_adapter::{BackendRequest, InferenceBackend};
     use decentraai_protocol::{InferMessage, InferProgress, InferResponse};
+
+    let WorkerStreamCtx {
+        backend,
+        p2p,
+        queue,
+        worker_manager,
+        reservations,
+        metrics,
+    } = &ctx;
 
     let request_id = queued.request_id;
     let sender = queued.request.sender_peer_id;
     let trace_id = queued.request.trace_id.clone();
     let local_peer = p2p.local_peer_id();
     let started = std::time::Instant::now();
+
+    // Worker-side reservation release (M15): every terminal path below must
+    // free the RAM/VRAM booked at admission so capacity can be reused.
+    let release_reservation = |reservations: &Arc<std::sync::Mutex<ReservationLedger>>,
+                               reservation: &Option<decentraai_compute::ResourceReservation>| {
+        if let Some(res) = reservation {
+            reservations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release(res.reservation_id);
+        }
+    };
 
     // Mark the worker busy for the duration of the request.
     let _ = worker_manager.update_local_capacity(0.0, 0, 0, 0);
@@ -693,6 +860,10 @@ async fn stream_request_to_terminal(
     let stream = match backend.stream(backend_req).await {
         Ok(stream) => stream,
         Err(e) => {
+            release_reservation(reservations, &reservation);
+            if let Some(m) = metrics {
+                m.record_failure();
+            }
             send_infer(
                 p2p,
                 sender,
@@ -767,7 +938,11 @@ async fn stream_request_to_terminal(
         }
     }
 
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     if !terminal_sent {
+        if let Some(m) = metrics {
+            m.record_completion(seq, elapsed_ms);
+        }
         send_infer(
             p2p,
             sender,
@@ -778,15 +953,21 @@ async fn stream_request_to_terminal(
                 completed_at: chrono::Utc::now().to_rfc3339(),
                 output,
                 tokens_used: seq as u32,
-                processing_time_ms: started.elapsed().as_millis() as u32,
+                processing_time_ms: elapsed_ms as u32,
                 success: true,
                 error: None,
             }),
         )
         .await;
+    } else if let Some(m) = metrics {
+        m.record_failure();
     }
 
     let _ = queue.complete_request(request_id).await;
+    if let Some(m) = metrics {
+        m.set_queue_depth(queue.queue_depth(&local_peer).await as u32);
+    }
+    release_reservation(reservations, &reservation);
     let _ = worker_manager.update_local_capacity(1.0, 0, 50, 100);
 }
 
@@ -961,10 +1142,15 @@ async fn serve_provisioned_request(
     }
     if let Some(queued) = ctx.queue_mgr.dequeue_request(&local_peer).await {
         stream_request_to_terminal(
-            backend,
-            p2p,
-            &ctx.queue_mgr,
-            &ctx.worker_manager,
+            WorkerStreamCtx {
+                backend,
+                p2p,
+                queue: &ctx.queue_mgr,
+                worker_manager: &ctx.worker_manager,
+                reservations: &ctx.reservations,
+                metrics: ctx.metrics.as_ref(),
+            },
+            None,
             queued,
         )
         .await;

@@ -366,6 +366,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         vec![served_model()],
         false,
         1_700_000_000_000,
+        decentraai_distributed::LivePerf::default(),
     );
     coord_compute.process_advertisement(ghost_adv).await;
     coord_compute.add_trusted(ghost_peer).await;
@@ -643,4 +644,168 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     // The reservation is released after the request completes.
     assert_eq!(coord_compute.in_flight(&worker_peer).await, 0);
     assert_eq!(coord_compute.reserved_ram(&worker_peer).await, 0);
+}
+
+/// M15 worker-side reservation enforcement: the worker refuses to serve a
+/// request whose model footprint would exceed the free capacity it
+/// advertised — even when the coordinator (or a buggy/malicious sender)
+/// routes it anyway. The gate mirrors the coordinator's CapabilityMatcher
+/// so both ends agree on headroom.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_rejects_request_exceeding_advertised_capacity() {
+    use decentraai_inference_adapter::{BackendConfig, OpenAiCompatibleBackend};
+    use decentraai_protocol::{InferMessage, deserialize_message};
+
+    // A model too large for a worker advertising only 2 GiB free RAM.
+    let big_model = decentraai_compute::ServedModel {
+        model_hash: MODEL_HASH.to_string(),
+        file_name: "big.gguf".into(),
+        size_mb: 8192,
+        est_ram_mb: 8192,
+        est_vram_mb: 0,
+    };
+    let tiny_snapshot = SystemSnapshot {
+        logical_cpus: 8,
+        cpu_usage_percent: 10.0,
+        total_memory_bytes: 8 * 1024 * 1024 * 1024,
+        available_memory_bytes: 2 * 1024 * 1024 * 1024,
+        used_swap_bytes: 0,
+        total_disk_free_bytes: 100 * 1024 * 1024 * 1024,
+    };
+
+    let mock = httpmock::prelude::MockServer::start_async().await;
+    let stream_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let big_mock = mock
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(stream_body);
+        })
+        .await;
+
+    // ---- Worker with a compute manager attached (advertises its capacity).
+    let worker_identity = Identity::generate();
+    let worker_peer = libp2p_peer_id(&worker_identity);
+    let worker_compute = Arc::new(ComputeManager::new(
+        worker_peer,
+        "worker".to_string(),
+        HashSet::new(),
+    ));
+    let worker_manager = Arc::new(WorkerManager::new(
+        worker_peer,
+        InferenceConfig::default(),
+    ));
+    let mut worker_handler =
+        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    worker_handler.set_compute_manager(worker_compute.clone());
+    let worker_node = P2PNode::new(
+        &worker_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(worker_handler)),
+    )
+    .unwrap();
+    let worker_addr = worker_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    let mut worker = DistributedInference::new(
+        worker_node,
+        InferenceConfig::default(),
+        Some(worker_manager.clone()),
+        None,
+    )
+    .unwrap();
+    worker.set_compute_manager(worker_compute.clone());
+    let backend = OpenAiCompatibleBackend::new(BackendConfig {
+        base_url: mock.base_url(),
+        model: "big".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    worker
+        .register_worker_backend(backend, MODEL_HASH.to_string(), None)
+        .unwrap();
+
+    // The worker advertises only 2 GiB free RAM — the big model cannot fit.
+    worker_compute
+        .advertise_local(
+            tiny_snapshot,
+            GpuProbeStatus::Unavailable("no gpu".into()),
+            vec![big_model.clone()],
+            false,
+        )
+        .await;
+
+    // ---- Client that routes the request regardless of headroom.
+    let client_identity = Identity::generate();
+    let client_peer = libp2p_peer_id(&client_identity);
+    let client_node = P2PNode::new(
+        &client_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    client_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    client_node
+        .dial(&format!("{worker_addr}/p2p/{worker_peer}"))
+        .await
+        .unwrap();
+
+    async fn send(
+        client_node: &P2PNode,
+        worker_peer: PeerId,
+        client_peer: PeerId,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut request = InferRequest::new(MODEL_HASH.to_string(), "hello".into(), 64);
+        request = request.with_sender(client_peer);
+        request.timeout_ms = 10_000;
+        let payload = serialize_message(&request)?;
+        client_node.request(worker_peer, payload).await
+    }
+
+    // The worker must reject the oversized workload at the door. Retry only
+    // for the newly dialed connection to settle (per AGENTS.md).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let rejected = loop {
+        match send(&client_node, worker_peer, client_peer).await {
+            Ok(bytes) => break bytes,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("timed out awaiting a connection to the worker: {e}"),
+        }
+    };
+    let reply: InferMessage = deserialize_message(&rejected, rejected.len()).unwrap();
+    match reply {
+        InferMessage::InferFailed { retryable, error, .. } => {
+            assert!(retryable, "capacity rejection must be retryable");
+            assert!(
+                error.contains("insufficient free capacity"),
+                "unexpected rejection message: {error}"
+            );
+        }
+        other => panic!("expected InferFailed, got {other:?}"),
+    }
+    assert_eq!(big_mock.hits(), 0, "the rejected request must never reach the backend");
+
+    // ...and admit the same workload once the advertised free capacity
+    // actually fits it (positive control proving the gate is the cause).
+    worker_compute
+        .advertise_local(snapshot(), gpu(), vec![big_model], false)
+        .await;
+    let admitted = send(&client_node, worker_peer, client_peer).await.unwrap();
+    let reply: InferMessage = deserialize_message(&admitted, admitted.len()).unwrap();
+    assert!(
+        matches!(reply, InferMessage::InferAccepted { .. }),
+        "an ample advertisement must admit the same workload: {reply:?}"
+    );
+
+    // The worker's own ledger must have released the admitted request's
+    // reservation after it completed (the backend stream finished).
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }

@@ -53,7 +53,7 @@ pub use capability::{ComputeCapability, GpuSpec, ServedModel};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};
 pub use registry::ComputeRegistry;
 pub use requirements::WorkloadRequirements;
-pub use reservation::{ReservationLedger, ResourceReservation};
+pub use reservation::{Admission, AdmitReason, ReservationLedger, ResourceReservation};
 pub use scheduler::{ComputeScheduler, Placement};
 
 /// Default heartbeat interval for compute advertisements (ms).
