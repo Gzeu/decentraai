@@ -99,6 +99,29 @@ impl ComputeRegistry {
             .map(|adv| adv.peer_id)
             .collect()
     }
+
+    /// Removes peers that have been offline for longer than `grace` and
+    /// returns the removed records (peer + node name) so the coordinator can
+    /// audit the eviction. This is the operator-facing "automatic removal of
+    /// unhealthy workers" step (M24): first [`prune_stale`](Self::prune_stale)
+    /// flips stale peers offline (they may yet rejoin), then repeated calls to
+    /// this method evict those that stay gone past the grace window.
+    pub fn reap_offline(&mut self, now: Instant, grace: std::time::Duration) -> Vec<(PeerId, String)> {
+        let evicted: Vec<(PeerId, String)> = self
+            .last_seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > self.stale_after + grace)
+            .filter_map(|(peer, _)| {
+                self.workers
+                    .get(peer)
+                    .map(|adv| (*peer, adv.node_name.clone()))
+            })
+            .collect();
+        for (peer, _) in &evicted {
+            self.remove(peer);
+        }
+        evicted
+    }
 }
 
 #[cfg(test)]

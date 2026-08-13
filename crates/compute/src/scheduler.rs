@@ -91,6 +91,22 @@ impl ComputeScheduler {
         self.registry.prune_stale(Instant::now())
     }
 
+    /// Worker-fabric resilience pass (M24): expires reservations whose TTL
+    /// lapsed (capacity held by a vanished worker), flips stale peers offline,
+    /// then evicts peers that stay offline past `grace`. Returns the number of
+    /// expired reservations plus the evicted (peer, node_name) records for
+    /// audit.
+    pub fn reap_offline(
+        &mut self,
+        grace: std::time::Duration,
+    ) -> (usize, Vec<(PeerId, String)>) {
+        let now = Instant::now();
+        let expired = self.ledger.prune_expired(now);
+        self.registry.prune_stale(now);
+        let evicted = self.registry.reap_offline(now, grace);
+        (expired, evicted)
+    }
+
     /// Whether the coordinator trusts `peer` to execute workloads.
     pub fn is_trusted(&self, peer: &PeerId) -> bool {
         self.trusted.contains(peer)
@@ -344,6 +360,27 @@ mod tests {
             winners.windows(2).all(|w| w[0] == w[1]),
             "equal workers must always pick the same PeerId: {winners:?}"
         );
+    }
+
+    #[test]
+    fn reap_offline_expires_reservations_and_evicts_dead_workers() {
+        let p = peer();
+        // Short stale window + short reservation TTL so a brief wait trips both.
+        let mut sched = ComputeScheduler::new(
+            ComputeRegistry::new(Duration::from_millis(5)),
+            ReservationLedger::new(Duration::from_millis(10), 4),
+            CapabilityMatcher::default(),
+            HashSet::from([p]),
+        );
+        sched.upsert(advertisement(p, 12 * 1024, 18 * 1024, 10, 0, 80, 60));
+
+        sched.select(&req(), Instant::now()).expect("fits");
+        std::thread::sleep(Duration::from_millis(30));
+
+        let (expired, evicted) = sched.reap_offline(Duration::from_millis(1));
+        assert!(expired >= 1, "stale reservation released");
+        assert_eq!(evicted.len(), 1, "dead worker removed for audit");
+        assert!(sched.registry().get(&p).is_none(), "peer fully removed");
     }
 
     #[test]

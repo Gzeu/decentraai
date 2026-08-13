@@ -336,6 +336,23 @@ impl ComputeManager {
         self.scheduler.lock().await.mark_offline(peer);
     }
 
+    /// Worker-fabric health maintenance (M24). Runs the coordinator's
+    /// resilient-lifecycle pass:
+    /// 1. expire stale reservations (booked on workers that vanished),
+    /// 2. flip stale (no-heartbeat) workers to `Offline`, returning their ids,
+    /// 3. evict workers that stay offline past `grace`, returning removed
+    ///    records for audit.
+    ///
+    /// This is the coordinator-side half of "detect → remove → recover":
+    /// evicted workers that heartbeated again would have been re-added by a
+    /// fresh advertisement on rejoin (automatic recovery).
+    pub async fn reap_unhealthy(
+        &self,
+        grace: std::time::Duration,
+    ) -> (usize, Vec<(PeerId, String)>) {
+        self.scheduler.lock().await.reap_offline(grace)
+    }
+
     /// Records a measured round-trip time to `peer` (M19). Written by the
     /// periodic `InferPing` network probe; read by the execution planner for
     /// reach-cost-aware selection.

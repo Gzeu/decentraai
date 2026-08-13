@@ -1658,6 +1658,10 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     )
     .await;
 
+    // M24: periodically prune stale reservations and evict dead workers, with
+    // an audit trail for every removal (automatic removal of unhealthy peers).
+    spawn_worker_reaper(compute_manager.clone(), data_dir.join("logs"), default_reap_grace()).await;
+
     // Start worker discovery
     distributed.start_worker_discovery().await?;
 
@@ -1828,6 +1832,43 @@ async fn spawn_network_probe(
                     let rtt_us = start.elapsed().as_micros() as u64;
                     compute_manager.record_rtt(&peer, rtt_us, 0);
                 }
+            }
+        }
+    });
+}
+
+/// How long a worker may stay silently offline before the coordinator evicts
+/// it. Stale detection already trips at 30s; the grace gives a missing worker
+/// a chance to heartbeated back before its advertisement is dropped.
+fn default_reap_grace() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
+}
+
+/// Periodically runs the coordinator's resilient-fabric maintenance (M24):
+/// expire stale reservations, flip no-heartbeat peers offline, and evict
+/// peers that stay gone past the grace window. Every eviction is an audit
+/// event (`worker_evicted`), so the removal of unhealthy workers is
+/// attributable.
+async fn spawn_worker_reaper(
+    compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
+    logs_dir: std::path::PathBuf,
+    grace: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let (expired, evicted) = compute_manager.reap_unhealthy(grace).await;
+            if expired > 0 {
+                tracing::warn!(expired, "released expired reservations");
+            }
+            for (peer, name) in evicted {
+                tracing::warn!(%peer, node = %name, "evicting unhealthy worker");
+                decentraai_audit::record_best_effort(
+                    &logs_dir,
+                    "worker_evicted",
+                    serde_json::json!({ "peer_id": peer.to_string(), "node_name": name }),
+                );
             }
         }
     });
