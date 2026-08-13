@@ -1354,7 +1354,7 @@ fn persist_contributions(
 async fn distributed_command(args: DistributedArgs) -> Result<()> {
     use decentraai_distributed::{DistributedInference, InferenceConfig};
     use decentraai_identity::Identity;
-    use decentraai_inference_adapter::{BackendConfig, OpenAiCompatibleBackend};
+    use decentraai_inference_adapter::{BackendConfig, EngineKind, OpenAiCompatibleBackend};
     use decentraai_p2p::{
         ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer,
     };
@@ -1443,7 +1443,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let url = server.base_url();
         maybe_server = Some(server);
 
-        // Create inference backend pointing at the chosen base URL
+        // Create inference backend pointing at the chosen base URL.
+        // M22: this node runs llama-server, so advertise that engine kind.
         let backend_config = BackendConfig {
             base_url: url,
             model: model_name.clone(),
@@ -1452,6 +1453,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             request_timeout: std::time::Duration::from_secs(300),
             max_prompt_bytes: 200_000,
             max_output_tokens: 8192,
+            engine: EngineKind::LlamaServer,
         };
 
         let backend = OpenAiCompatibleBackend::new(backend_config)
@@ -1484,6 +1486,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                     request_timeout: std::time::Duration::from_secs(300),
                     max_prompt_bytes: 200_000,
                     max_output_tokens: 8192,
+                    engine: EngineKind::LlamaServer,
                 };
                 let backend = OpenAiCompatibleBackend::new(backend_cfg)
                     .map_err(|e| anyhow::anyhow!("failed to create provisioned backend: {e}"))?;

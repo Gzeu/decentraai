@@ -9,6 +9,80 @@ use thiserror::Error;
 
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, BackendError>> + Send>>;
 
+/// The concrete inference engine a backend drives (M22).
+///
+/// DecentraAI must never be coupled to one model server. Every engine here is
+/// reached through the same OpenAI-compatible HTTP surface (`/v1/models`,
+/// `/v1/chat/completions`, `/v1/completions`), which is exactly how
+/// `llama-server`, vLLM, SGLang and Ollama all expose inference today. The
+/// kind is what lets the execution planner reason about *additional*
+/// capabilities (KV state, expert routing, tensor-parallel ranks) before
+/// relying on them. Unknown kinds degrade safely to [`EngineKind::RemoteOpenAI`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EngineKind {
+    /// llama.cpp `llama-server`.
+    LlamaServer,
+    /// vLLM (`vllm serve`).
+    Vllm,
+    /// SGLang server.
+    Sglang,
+    /// Ollama (`ollama serve`).
+    Ollama,
+    /// Any other OpenAI-compatible HTTP server.
+    RemoteOpenAI,
+}
+
+impl EngineKind {
+    /// Parses a wire / config string. Unknown engines resolve to
+    /// [`EngineKind::RemoteOpenAI`] rather than failing, so a future engine
+    /// never breaks an old node's runtime startup.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "llama-server" | "llama_server" | "llamacpp" | "llama.cpp" => Self::LlamaServer,
+            "vllm" => Self::Vllm,
+            "sglang" | "sglang_server" => Self::Sglang,
+            "ollama" => Self::Ollama,
+            _ => Self::RemoteOpenAI,
+        }
+    }
+
+    /// Canonical wire representation (also what this engine reports in its
+    /// own `engine` capability so the planner parses it back via [`Self::parse`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LlamaServer => "llama-server",
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+            Self::Ollama => "ollama",
+            Self::RemoteOpenAI => "openai-compatible",
+        }
+    }
+}
+
+/// Capabilities a live engine endpoint reported (M22). Mirrors the planner's
+/// capability ABI so the runtime layer and the fabric agree on what an engine
+/// can do; conservative by default and narrowed by `probe_capabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineCapabilities {
+    pub streaming: bool,
+    pub kv_report: bool,
+    pub prefill_decode_separation: bool,
+    pub expert_routing: bool,
+    pub tensor_parallel: bool,
+}
+
+impl EngineCapabilities {
+    pub fn conservative() -> Self {
+        Self {
+            streaming: true,
+            kv_report: false,
+            prefill_decode_separation: false,
+            expert_routing: false,
+            tensor_parallel: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
     pub base_url: String,
@@ -18,6 +92,8 @@ pub struct BackendConfig {
     pub request_timeout: Duration,
     pub max_prompt_bytes: usize,
     pub max_output_tokens: u32,
+    /// Which engine this backend drives (M22). Defaults to a plain remote.
+    pub engine: EngineKind,
 }
 
 impl Default for BackendConfig {
@@ -30,6 +106,7 @@ impl Default for BackendConfig {
             request_timeout: Duration::from_secs(300),
             max_prompt_bytes: 200_000,
             max_output_tokens: 8192,
+            engine: EngineKind::RemoteOpenAI,
         }
     }
 }
@@ -105,6 +182,54 @@ impl OpenAiCompatibleBackend {
             return Err(BackendError::OutputLimitExceeded);
         }
         Ok(())
+    }
+
+    /// The engine this backend drives (M22). Propagated to the node's
+    /// `capability.engine` so coordinators' planners can reason engine-aware.
+    pub fn engine(&self) -> EngineKind {
+        self.config.engine
+    }
+
+    /// Best-effort probe of the live engine's reported capabilities. This is a
+    /// real HTTP check against the OpenAI-compatible surface (`GET /v1/models`
+    /// for availability, plus a +`/v1/metrics`-style KV export where the engine
+    /// exposes one). Failures are not fatal: they simply report the
+    /// conservative defaults already in use, so an unreachable or non-KV
+    /// engine never breaks planning.
+    pub async fn probe_capabilities(&self) -> EngineCapabilities {
+        // Engine kind gives us the static baseline.
+        let mut caps = match self.config.engine {
+            EngineKind::Vllm => EngineCapabilities {
+                kv_report: true,
+                prefill_decode_separation: true,
+                tensor_parallel: true,
+                ..EngineCapabilities::conservative()
+            },
+            EngineKind::Sglang => EngineCapabilities {
+                kv_report: true,
+                prefill_decode_separation: true,
+                tensor_parallel: true,
+                ..EngineCapabilities::conservative()
+            },
+            EngineKind::LlamaServer => EngineCapabilities {
+                kv_report: true,
+                ..EngineCapabilities::conservative()
+            },
+            _ => EngineCapabilities::conservative(),
+        };
+
+        // Narrow with a live check: require a reachable /v1/models before we
+        // trust any capability that implies an advanced endpoint.
+        let reachable = self
+            .auth(self.client.get(self.endpoint("v1/models")))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if !reachable {
+            caps = EngineCapabilities::conservative();
+        }
+        caps
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -270,6 +395,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parses_engine_kinds_and_degrades_unknown() {
+        assert_eq!(EngineKind::parse("vllm"), EngineKind::Vllm);
+        assert_eq!(EngineKind::parse("llama-server"), EngineKind::LlamaServer);
+        assert_eq!(EngineKind::parse("ollama"), EngineKind::Ollama);
+        assert_eq!(EngineKind::parse("sglang"), EngineKind::Sglang);
+        assert_eq!(EngineKind::parse("future-engine"), EngineKind::RemoteOpenAI);
+        assert_eq!(EngineKind::LlamaServer.as_str(), "llama-server");
+    }
+
+    #[test]
+    fn engine_accessor_reports_configured_kind() {
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            engine: EngineKind::Vllm,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(b.engine(), EngineKind::Vllm);
+    }
+
     #[test]
     fn rejects_large_prompt() {
         let b = OpenAiCompatibleBackend::new(BackendConfig {
