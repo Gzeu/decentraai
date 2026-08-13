@@ -369,7 +369,7 @@ release.
 
 ---
 
-## 14. Execution Fabric (M18–M23) — DONE
+## 14. Execution Fabric — M18 Foundation — DONE
 
 A new pure crate, `decentraai-fabric`, holds DecentraAI's orchestration
 intelligence — the engine-neutral execution-fabric core that turns a request +
@@ -378,45 +378,68 @@ coordinator path. It is deliberately engine-agnostic (DecentraAI is not a
 marketplace, cloud, or wrapper around one model server) and never fabricates
 behavior the runtime cannot provide.
 
-- [x] **M22 — Multi-engine runtime**: `EngineKind` (llama-server / vLLM /
-  SGLang / Ollama / openai-compatible) + capability ABI on the backend
-  (`decentraai-inference-adapter`), a best-effort `probe_capabilities()`, and
-  the engine string flows into `capability.engine` so the planner reasons
-  engine-aware. All adaptation goes through the same OpenAI-compatible surface.
-- [x] **M18 — Distributed execution engine**: `ExecutionPlan` (Single /
-  Sequential / FanOut) + `ExecutionStage` with fallback order and per-stage
-  reservation budgets; `ComputeScheduler::reserve_worker` lets the planner own
-  *who* while the scheduler enforces capacity; `plan_and_reserve` drives the
-  real `route_request`/`route_request_streamed`.
-- [x] **M19 — Network-aware scheduler**: real `InferPing`/`InferPong` RTT
-  measurement (previously dead protocol surface), a coordinator `NetworkGraph`
-  (link RTT / bandwidth / locality + transfer-cost estimator), and a 5s probe
-  that feeds measured RTT into planning.
-- [x] **M20 — KV-aware inference fabric**: `KVCacheState` / `ContextProfile` /
-  `KvPlanner` steering continuation locality, KV-headroom and prefill/decode
-  split; the coordinator derives prompt tokens from the real prompt and passes
-  them to the planner.
-- [x] **M21 — Distributed MoE / expert fabric**: `ExpertRegistry` /
-  `ExpertRouter` that honestly returns whole-model decisions unless an engine
-  advertises `expert_routing` (none do via OpenAI API today) — the abstraction
-  is live, never mocked.
-- [x] **M23 — Autonomous execution planner**: `ExecutionPlanner` decides local
-  vs remote, single vs staged, worker ordering, fallback path and reservations
-  from model + capabilities + network + KV + reliability; the user never
-  configures topology.
+**M18 — Distributed Execution Fabric Foundation — DONE**
 
-Tests: 25 fabric unit tests (engine, plan, network, KV, expert, planner) +
-planner integration + `reserve_worker` capacity tests. All green, clippy clean.
+Verified on real hardware/LAN (two physical Ubuntu machines, Desktop ↔
+Laptop, both running the single universal `decentraai node`):
 
-## 15. Resilient Fabric (M24) — DONE
+- [x] Multi-node universal runtime (every node is coordinator + worker)
+- [x] P2P discovery / connectivity (mDNS + libp2p on the LAN)
+- [x] Trusted worker admission (`decentraai trust add` → scheduler selects only
+  trusted, eligible workers)
+- [x] Planner-based worker selection (`plan_and_reserve` → `reserve_worker`)
+- [x] Reservation lifecycle (created per request, released after completion)
+- [x] Real remote inference (coordinator → P2P `InferRequest` → remote worker →
+  worker's local llama-server on loopback → streamed `InferProgress` →
+  terminal `InferResponse`)
+- [x] Streaming responses and cooperative cancellation
+- [x] Concurrent requests (separate request IDs, non-colliding reservations,
+  worker capacity respected)
+- [x] Worker reuse (same healthy worker selected again across requests)
+- [x] Bidirectional Desktop ↔ Laptop execution
+- [x] Persistent worker engine lifecycle: the worker's local llama-server stays
+  bound to loopback and is **not** idle-unloaded, so the worker never
+  advertises ready while its engine is dead (`5758e05`).
+- [x] One `decentraai node` process — no separate `decentraai distributed`
+  required for the product flow.
 
-- [x] Worker-fabric maintenance: `ComputeRegistry::reap_offline` +
-  `ComputeScheduler::reap_offline` expire stale reservations, flip
-  no-heartbeat peers offline, and evict long-gone workers; a 10s coordinator
-  reaper (`decentraai distributed`) records a `worker_evicted` audit per
-  removal. Rejoin is automatic via fresh advertisements on the next heartbeat.
+The fabric crate supplies the building blocks (`ExecutionPlan`,
+`ComputeScheduler::reserve_worker`, an `ExecutionPlanner`, a `NetworkGraph`, a
+`KvPlanner`, an `ExpertRegistry`/`ExpertRouter` capability gate). **Only the
+single-worker reservation/streaming path is exercised and production-verified
+today.** Model/layer splitting, KV reuse, MoE distribution, network-aware
+optimization and multi-worker execution planning are **not** claimed to be
+complete — they are the next milestones below.
 
-## 16. Ubuntu UX — Q4 setup wizard — DONE
+## 15. NEXT — M19: Network-Aware Scheduler
+
+- [ ] latency
+- [ ] bandwidth
+- [ ] topology
+- [ ] transfer cost
+- [ ] worker load / capacity
+- [ ] dynamic worker scoring
+
+## 16. NEXT — M20: KV-Aware Inference Fabric
+
+- [ ] KV / cache locality
+- [ ] KV reuse
+- [ ] KV transfer / placement decisions
+
+## 17. NEXT — M21: Distributed MoE / Expert Fabric
+
+## 18. NEXT — M22: Multi-Engine Runtime Abstraction
+
+## 19. NEXT — M23: Autonomous Execution Planner
+
+## 20. NEXT — M24: Resilient Distributed Fabric
+
+- [ ] lifecycle
+- [ ] failure detection
+- [ ] recovery
+- [ ] worker replacement
+
+## 21. Ubuntu UX — Q4 setup wizard — DONE
 
 - [x] `decentraai setup` — one-command fresh-node onboarding: auto-detects
   hardware (CPU/RAM/GPU via the real system probe), generates or reuses an
@@ -426,7 +449,7 @@ planner integration + `reserve_worker` capacity tests. All green, clippy clean.
   real libp2p distributed node off the generated config. Idempotent across
   reruns (same PeerId), model-discovery works, no-model degrades gracefully.
 
-## 17. Installable Application (Productization) — DONE
+## 22. Installable Application (Productization) — DONE
 
 Turn DecentraAI into an installable app; the normal user flow is
 **Download → Install → Open → Ready**, hiding distributed-compute complexity.

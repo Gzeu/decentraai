@@ -5,6 +5,43 @@ Nodes discover each other on the LAN, exchange cryptographically verified model 
 and serve inference through a local OpenAI-compatible endpoint with a live web dashboard.
 Free, contribution-tiered subscriptions gate models and request rates per token.
 
+DecentraAI is a **distributed execution fabric**, not a marketplace, cloud
+marketplace, token/economic product, or centralized server product.
+
+## Verified today (current status)
+
+The execution-fabric foundation (M18) has been verified on **real hardware /
+LAN** — two physical Ubuntu machines (Desktop ↔ Laptop), each running the
+single universal `decentraai node`:
+
+- **Universal node**: every installation is a symmetric coordinator + worker;
+  one process does onboarding, P2P discovery, worker advertisement, model
+  serving and distributed inference. No separate `decentraai distributed`
+  runs in the product flow.
+- **Discovery / transport**: automatic mDNS discovery + libp2p P2P transport
+  on the LAN (no manual topology or addresses).
+- **Trusted admission**: a remote coordinating node only schedules to workers the
+  user has explicitly trusted (`decentraai trust add <peer>`).
+- **Capability-aware fabric planner**: `plan_and_reserve` selects a trusted,
+  eligible worker and holds a resource reservation for the request.
+- **Real remote inference**: the coordinator sends a P2P `InferRequest`; the
+  **remote worker calls its own local llama-server on `127.0.0.1`**; streamed
+  `InferProgress` frames return to the coordinator, ending in a terminal
+  `InferResponse`. The loopback backend URL is **never advertised** as a remote
+  endpoint.
+- **Streaming responses** and cooperative cancellation.
+- **Worker reuse** and correct capacity tracking (concurrent requests use
+  separate request IDs and non-colliding reservations).
+- **Bidirectional execution**: Desktop → Laptop and Laptop → Desktop both work;
+  every node can coordinate and contribute.
+- **Persistent workers**: the worker's local llama-server stays bound to
+  loopback and is **not idle-unloaded**, so a node never advertises ready while
+  its engine is dead (`5758e05`).
+
+Verified: worker selection, reservation create/release, P2P execution,
+streaming, worker health, and two-machine sequential + concurrent + reuse
+requests — all on real hardware, no mocks.
+
 ## What exists today
 
 | Milestone | Scope | Status |
@@ -21,6 +58,13 @@ Free, contribution-tiered subscriptions gate models and request rates per token.
 | P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
 | P6 | Zero-touch sharing: `swarm start` auto-downloads announced models (mDNS + consent modes) | Done |
 | P2 | Chat UI in the dashboard | Next |
+| M18 | **Distributed execution fabric foundation** — universal node, mDNS/libp2p discovery, trusted admission, fabric planner, reservations, real remote inference, streaming, worker reuse, bidirectional Desktop ↔ Laptop (verified on real LAN) | **Done** |
+| M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) | Next |
+| M20 | KV-aware inference fabric | Next |
+| M21 | Distributed MoE / expert fabric | Next |
+| M22 | Multi-engine runtime abstraction | Next |
+| M23 | Autonomous execution planner | Next |
+| M24 | Resilient distributed fabric (lifecycle, failure detection, recovery) | Next |
 
 ## Using DecentraAI today
 
@@ -57,6 +101,35 @@ bash scripts/install-app.sh          # build + onboard + service + launcher
 
 Two machines with DecentraAI installed on the same LAN discover each other
 automatically (mDNS + verified auto-share); no one configures topology.
+
+### 0b. One universal node, bidirectional execution (verified)
+
+Each machine runs ONE process — `decentraai node` — which is simultaneously a
+coordinator and a worker. Install the same app on both machines, trust each
+other's PeerId, and either side can route inference to the other:
+
+```bash
+# On both machines: install + run the universal node (systemd keeps it up)
+#   DESKTOP   (PeerId 12D3KooW…A)  →  LAPTOP    (PeerId 12D3KooW…B)
+decentraai trust add --peer 12D3KooW…B     # on the Desktop, trust the Laptop
+decentraai trust add --peer 12D3KooW…A     # on the Laptop,  trust the Desktop
+
+# Desktop → Laptop: a request routed by the fabric planner to the Laptop worker
+decentraai node --prompt "Explain what DecentraAI is."
+#   fabric planner selected worker (12D3KooW…B  reservation_id=…)
+#   P2P InferRequest → Laptop → its local llama-server → streamed → done
+
+# Laptop → Desktop: the symmetric direction (run on the Laptop)
+decentraai node --prompt "Explain what DecentraAI is."
+```
+
+For every routed request the coordinator: selects a trusted worker via the
+fabric planner → holds a reservation → sends a P2P `InferRequest` → the remote
+worker executes on its **own local llama-server (loopback)** → streams chunks
+back → releases the reservation. The worker's engine is kept alive (never
+idle-unloaded) so it stays selectable. This has been verified on real
+hardware (two Ubuntu machines on one LAN), including sequential, concurrent,
+worker-reuse and both directions — not mocks.
 
 ### 1. Index your local models
 
@@ -217,17 +290,25 @@ to logical CPUs minus the configured reserve, `--flash-attn on`,
 - Dashboard binds to loopback only (no LAN exposure yet)
 - Auto-share downloads are serialized on one worker (reputation writes are
   not concurrent); large bursts of announcements queue up
-- Remote inference between nodes is partially enabled via distributed mode (see below)
+- Remote inference between nodes runs through the universal node's fabric
+  planner (P2P `InferRequest` → remote worker → its own local llama-server);
+  the lower-level `decentraai distributed` mode is not required for the
+  product flow
 - After idle unload, restart `serve` to reload the model
 - Token usage counters are in-memory (persistence lands with P3)
 
-### M9: Distributed Inference (P2P request routing)
+### M9: Distributed Inference (low-level P2P routing mode)
 
-DecentraAI now supports distributed inference across the P2P network. Nodes can
-register as workers to serve models and route inference requests to peer GPUs.
-Work is compensated in reputation.
+Distributed inference across the P2P network is built into the **universal
+`decentraai node`** (every node is a coordinator and a worker; see "0b. One
+universal node, bidirectional execution"). Below is the lower-level
+`decentraai distributed` command that underlies worker registration, request
+routing, queueing and streaming. The product flow does **not** require running
+`decentraai distributed` separately — it is provided for low-level use and
+validation. Reputation-based compensation for workers (M9-9) is not yet
+implemented.
 
-**Start a distributed node** (acts as both worker and client):
+**Start a low-level distributed node** (acts as both worker and client):
 
 ```bash
 decentraai distributed start --model tinyllama.gguf
@@ -325,8 +406,12 @@ decentraai swarm start --config <path>          # serve + announce models; auto-
 decentraai pull --from <multiaddr> --list       # browse a peer's catalog
 decentraai pull --from <multiaddr> --model <f>  # verified download from a peer
 decentraai serve start --model <name>           # gated inference + dashboard :8080
-decentraai distributed --model <name>           # distributed inference node (worker mode)
-decentraai distributed                          # distributed inference node (client mode)
+decentraai node --config <path>                 # universal node (coordinator + worker); primary product process
+decentraai node --config <path> --prompt "..."  # universal node: run one routed inference, then exit
+decentraai open                                 # open the running node's dashboard
+decentraai trust add --peer <PeerId> --name <n> # trust a peer (enables scheduler to select it)
+decentraai distributed --model <name>           # low-level distributed node (worker mode)
+decentraai distributed                          # low-level distributed node (client mode)
 decentraai token create --name <n> --tier 1..3  # issue a subscription token
 decentraai token list                           # show issued tokens
 decentraai token revoke --name <n>              # revoke (effective next request)

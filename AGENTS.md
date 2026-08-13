@@ -150,23 +150,31 @@ contribution**. Admin-only token issuance from a dashboard.
 - **P5 — Invites & join**: admin generates an invite (bootstrap
   multiaddr + Tier-1 token); `decentraai join <invite>` bootstraps a
   fresh node.
-- **M9 (later) — Distributed inference**: route requests to peer GPUs,
-  paid in reputation. v1 stays hub-and-spoke on the admin's machine.
+- **M9 / M18 — Distributed inference**: real P2P routing of inference between
+  universal nodes (see the M18 foundation above). Reputation-based
+  compensation for workers (M9-9) is not yet implemented.
 
-### Execution Fabric (M18–M24) — DONE
+### Execution Fabric — M18 Foundation (verified-DONE); M19–M24 NEXT
 
 `decentraai-fabric` (pure, no I/O): the engine-neutral execution planner.
 `ExecutionPlan` (single/sequential/fan-out) + fallback; `reserve_worker`
-(planner owns *who*, scheduler enforces capacity); real `InferPing/Pong` RTT
-into a `NetworkGraph` (M19); `KvPlanner` + `ContextProfile` (M20); honest
-expert router wired behind `expert_routing` capability (M21, none advertise it
-— whole-model fallback is the correct result, never mocked); `EngineKind` +
-capability probe in `decentraai-inference-adapter` (M22). Integrated into
-`route_request`/`route_request_streamed` via `plan_and_reserve`.
+(planner owns *who*, scheduler enforces capacity); `plan_and_reserve`
+integrated into `route_request`/`route_request_streamed`. The **M18 foundation
+is verified on real LAN hardware (Desktop ↔ Laptop universal nodes):** trusted
+admission → fabric planner → reservation → P2P `InferRequest` → remote worker's
+local llama-server (loopback, kept alive — never idle-unloaded) → streamed
+response → reservation release. Worker reuse, concurrent requests and
+bidirectional execution all proven; the loopback backend URL is never
+advertised as a remote endpoint.
 
-M24: coordinator reaper (`reap_unhealthy`) expires stale reservations, flips
-no-heartbeat peers offline, evicts long-gone workers with `worker_evicted`
-audits; rejoin is automatic on the next heartbeat.
+The crate also holds building blocks that are **parked as NEXT milestones
+(M19–M24), not claimed complete**: a `NetworkGraph` + `InferPing/Pong` RTT
+(M19 network-aware scheduler), `KvPlanner` + `ContextProfile` (M20 KV-aware
+fabric), honest `ExpertRegistry`/`ExpertRouter` behind `expert_routing`
+(M21 — none advertise it; whole-model fallback is correct, never mocked),
+`EngineKind` + capability probe (M22 multi-engine), an `ExecutionPlanner`
+(M23), and the coordinator reaper `reap_unhealthy` (M24). Do NOT mark M19–M24
+as done in documentation until their behaviors are production-verified.
 
 Q4: `decentraai setup` — detect hardware → identity → auto-select model →
 write validated config → READY. Idempotent; verified end-to-end on Ubuntu.
