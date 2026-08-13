@@ -351,6 +351,107 @@ impl ComputeManager {
         self.scheduler.lock().await.select(req, Instant::now())
     }
 
+    /// Planner over the live worker registry (M18 net) → fabric planner (M23).
+    ///
+    /// Builds a fabric [`WorkerFacts`] set from the current advertisements for
+    /// the given `model_hash` and runs the autonomous [`ExecutionPlanner`] to
+    /// choose the best worker. This is the *integration point* for the
+    /// execution-fabric: how worker ordering accounts for engine capability
+    /// (M22), network cost (M19) and KV state (M20) before capacity is
+    /// enforced by the scheduler.
+    pub async fn fabric_facts(
+        &self,
+        model_hash: &str,
+    ) -> Vec<decentraai_fabric::WorkerFacts> {
+        let scheduler = self.scheduler.lock().await;
+        scheduler
+            .registry()
+            .list()
+            .into_iter()
+            .map(|adv| {
+                let a = &adv.availability;
+                let cap = &adv.capability;
+                decentraai_fabric::WorkerFacts {
+                    peer_id: adv.peer_id.to_string(),
+                    trusted: scheduler.is_trusted(&adv.peer_id),
+                    healthy: a.healthy(),
+                    engine: decentraai_fabric::EngineKind::parse(&cap.engine),
+                    tokens_per_second: a.tokens_per_second,
+                    latency_ms: a.current_latency_ms,
+                    queue_depth: a.queue_depth,
+                    load_percent: a.load_percent,
+                    available_ram_mb: a.available_ram_mb,
+                    available_vram_mb: a.available_vram_mb.unwrap_or(0),
+                    serves_model: cap.serves_or_provisions(model_hash),
+                    capabilities: decentraai_fabric::EngineKind::parse(&cap.engine)
+                        .advertised_capabilities(),
+                    kv: decentraai_fabric::KVCacheState::Unknown,
+                }
+            })
+            .collect()
+    }
+
+    /// Builds an `ExecutionPlan` for `req` using the fabric planner and books
+    /// the reservation on the planned worker. Returns the plan and the
+    /// reserved placement, or `None` when the fabric finds no eligible worker.
+    ///
+    /// This replaces the pure scheduler `select` as the coordinator's first
+    /// choice: the planner computes *whom* (engine/network-aware), the
+    /// scheduler then enforces capacity via `reserve_worker` (M18). If the
+    /// planner's top worker cannot be reserved (became full / dropped / is the
+    /// local node), we fall back to the plain scheduler `select` so a request
+    /// is never stranded by planner optimism.
+    pub async fn plan_and_reserve(
+        &self,
+        req: &WorkloadRequirements,
+    ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
+        let planner = decentraai_fabric::ExecutionPlanner::new();
+        let facts = self.fabric_facts(&req.model_hash).await;
+        if facts.is_empty() {
+            return None;
+        }
+
+        let rfacts = decentraai_fabric::RequestFacts {
+            model_hash: req.model_hash.clone(),
+            est_ram_mb: req.est_ram_mb,
+            est_vram_mb: req.est_vram_mb,
+            context: decentraai_fabric::ContextProfile {
+                prompt_tokens: 0,
+                max_output_tokens: req.max_tokens,
+                is_continuation: false,
+                prefix_resident_on: None,
+            },
+            transfer_mib: 0,
+            local_peer: Some(self.local_peer.to_string()),
+        };
+
+        let result = planner.plan(&rfacts, &facts);
+        let workers = result.plan.workers();
+        let first = workers.first()?;
+
+        // The planner may pick the local node's self-advertisement; the
+        // coordinator never schedules a remote request onto itself via P2P.
+        let peer: libp2p::PeerId = match first.parse() {
+            Ok(p) if p != self.local_peer => p,
+            _ => return self.select_pub(req).await.map(|p| (result.plan, p)),
+        };
+
+        let placement = self
+            .scheduler
+            .lock()
+            .await
+            .reserve_worker(&peer, req, Instant::now());
+        match placement {
+            Some(p) => Some((result.plan, p)),
+            // Planner's top worker is full/unreservable → scheduler fallback.
+            None => self.select_pub(req).await.map(|p| (result.plan, p)),
+        }
+    }
+
+    async fn select_pub(&self, req: &WorkloadRequirements) -> Option<Placement> {
+        self.scheduler.lock().await.select(req, Instant::now())
+    }
+
     /// Releases a reservation (call on workload completion or failure).
     pub async fn release(&self, reservation_id: uuid::Uuid) {
         self.scheduler.lock().await.release(reservation_id);

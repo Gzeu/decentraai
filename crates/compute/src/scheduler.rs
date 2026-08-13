@@ -147,6 +147,39 @@ impl ComputeScheduler {
         self.ledger.release(reservation_id);
     }
 
+    /// Books a reservation on a *specific* worker the execution planner chose,
+    /// after validating that it is trusted and can actually run the request
+    /// right now (capacity gate). Returns `None` if the worker is not trusted,
+    /// unserved, or full. This lets the fabric planner (M18/M23) decide *who*
+    /// while the scheduler keeps sole authority over capacity — the two are
+    /// composed, never contradicted.
+    pub fn reserve_worker(
+        &mut self,
+        worker: &libp2p::PeerId,
+        req: &WorkloadRequirements,
+        now: Instant,
+    ) -> Option<Placement> {
+        self.ledger.prune_expired(now);
+        let adv = self.registry.get(worker)?;
+        if !self.trusted.contains(&adv.peer_id) {
+            return None;
+        }
+        if !matches!(
+            self.matcher.matches(adv, req, &self.ledger, true),
+            MatchOutcome::Eligible
+        ) {
+            return None;
+        }
+        let reservation = self
+            .ledger
+            .reserve(*worker, req.est_ram_mb, req.est_vram_mb)?;
+        Some(Placement {
+            worker: *worker,
+            reservation,
+            confidence: self.confidence(adv, req),
+        })
+    }
+
     /// Deterministic 0.0..1.0 score: lower load, less backlogged queue,
     /// higher throughput, lower latency, and more headroom than the
     /// workload requires all score better.
@@ -321,5 +354,45 @@ mod tests {
         let adv = advertisement(p, 12 * 1024, 1024, 10, 0, 80, 60);
         sched.upsert(adv);
         assert!(sched.select(&req(), Instant::now()).is_none(), "3 GiB workload needs more VRAM");
+    }
+
+    #[test]
+    fn reserve_worker_books_a_planner_chosen_worker() {
+        let p1 = peer();
+        let p2 = peer();
+        let mut sched = scheduler(HashSet::from([p1, p2]));
+        sched.upsert(advertisement(p1, 12 * 1024, 18 * 1024, 80, 5, 40, 400));
+        sched.upsert(advertisement(p2, 12 * 1024, 18 * 1024, 10, 0, 80, 60));
+
+        // Planner (in production) picked p2; reserve it specifically.
+        let placement = sched
+            .reserve_worker(&p2, &req(), Instant::now())
+            .expect("planner-chosen worker is eligible");
+        assert_eq!(placement.worker, p2);
+        assert_eq!(sched.ledger().in_flight(&p2), 1);
+    }
+
+    #[test]
+    fn reserve_worker_refuses_uneligible_worker() {
+        let p1 = peer();
+        let p2 = peer();
+        let mut sched = scheduler(HashSet::from([p1, p2]));
+        sched.upsert(advertisement(p1, 12 * 1024, 18 * 1024, 10, 0, 80, 60));
+        // p2 has no VRAM for the 3 GiB GPU workload.
+        sched.upsert(advertisement(p2, 12 * 1024, 512, 10, 0, 80, 60));
+
+        assert!(sched.reserve_worker(&p2, &req(), Instant::now()).is_none(), "must not reserve an incapable worker");
+        assert!(sched.reserve_worker(&p1, &req(), Instant::now()).is_some());
+    }
+
+    #[test]
+    fn reserve_worker_respects_capacity_ledger() {
+        let p = peer();
+        let mut sched = scheduler(HashSet::from([p]));
+        sched.upsert(advertisement(p, 3072, 3072 + 512, 0, 0, 80, 60));
+        let first = sched.reserve_worker(&p, &req(), Instant::now()).expect("first fits");
+        assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_none(), "double-booking refused");
+        sched.release(first.reservation.reservation_id);
+        assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_some(), "release frees the slot");
     }
 }

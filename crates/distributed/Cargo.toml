@@ -24,6 +24,7 @@ chrono.workspace = true
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }
+decentraai-fabric = { path = "../fabric" }
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }

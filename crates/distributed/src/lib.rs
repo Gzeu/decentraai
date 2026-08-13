@@ -612,7 +612,7 @@ impl DistributedInference {
         // the request.
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
-                if let Some(placement) = compute.select(&req).await {
+                if let Some((plan, placement)) = compute.plan_and_reserve(&req).await {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -624,7 +624,9 @@ impl DistributedInference {
                         model_hash = %request.model_hash,
                         worker_peer_id = %placement.worker,
                         reservation_id = %placement.reservation.reservation_id,
-                        "capability-aware scheduler selected worker"
+                        plan_id = %plan.plan_id,
+                        stages = %plan.stage_count(),
+                        "fabric planner selected worker"
                     );
                     let result = self
                         .request_router
@@ -642,7 +644,7 @@ impl DistributedInference {
                     tracing::warn!(
                         worker_peer_id = %placement.worker,
                         error = %result.as_ref().err().unwrap(),
-                        "compute-selected worker failed; falling back to legacy router"
+                        "fabric-planned worker failed; falling back to legacy router"
                     );
                 }
             }
@@ -670,7 +672,7 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
-                if let Some(placement) = compute.select(&req).await {
+                if let Some((plan, placement)) = compute.plan_and_reserve(&req).await {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -682,7 +684,9 @@ impl DistributedInference {
                         model_hash = %request.model_hash,
                         worker_peer_id = %placement.worker,
                         reservation_id = %placement.reservation.reservation_id,
-                        "capability-aware scheduler selected worker"
+                        plan_id = %plan.plan_id,
+                        stages = %plan.stage_count(),
+                        "fabric planner selected worker"
                     );
                     let result = self
                         .request_router
@@ -703,7 +707,7 @@ impl DistributedInference {
                     tracing::warn!(
                         worker_peer_id = %placement.worker,
                         error = %result.as_ref().err().unwrap(),
-                        "compute-selected worker failed; falling back to legacy router"
+                        "fabric-planned worker failed; falling back to legacy router"
                     );
                 }
             }
