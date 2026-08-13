@@ -19,6 +19,7 @@ Free, contribution-tiered subscriptions gate models and request rates per token.
 | M8 | Packaging: `scripts/install.sh` + [deployment guide](docs/deployment.md) | Done |
 | M9 | Distributed inference: route requests to peer GPUs, paid in reputation | Done |
 | P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
+| P6 | Zero-touch sharing: `swarm start` auto-downloads announced models (mDNS + consent modes) | Done |
 | P2 | Chat UI in the dashboard | Next |
 
 ## Using DecentraAI today
@@ -54,11 +55,23 @@ decentraai registry scan --directory ~/models
 decentraai swarm start
 # prints: Listening: /ip4/0.0.0.0/tcp/<PORT>/p2p/<PEER_ID>
 #         Serving: N model(s) announced (signed with the node identity)
+#         Sharing: auto — downloading announced models as they appear
 ```
 
-On the machine that **wants** a model — copy the address the server printed
-(replace the interface IP with the server's LAN IP if needed):
+On the machine that **wants** the models, just run the same:
+```bash
+decentraai swarm start
+# mDNS discovers the peer, and `sharing.mode: auto` downloads and verifies
+# every announced model into ~/.decentraai/models automatically.
+```
 
+Zero manual steps: mDNS discovery auto-dials LAN peers, and `swarm start`
+reacts to model announcements. Each downloaded artifact is verified
+(per-chunk BLAKE3 + Merkle root) before it is indexed and re-announced to
+the rest of the swarm. Set `sharing.mode: ask` in the config to be
+prompted per model, or `off` to ignore announcements.
+
+The manual `pull` path still works (e.g. to pick one model or one peer):
 ```bash
 # browse what the peer serves:
 decentraai pull --from /ip4/192.168.0.113/tcp/37079/p2p/12D3KooW... --list
@@ -182,6 +195,8 @@ to logical CPUs minus the configured reserve, `--flash-attn on`,
 
 - GGUF models only (matches the verification capability)
 - Dashboard binds to loopback only (no LAN exposure yet)
+- Auto-share downloads are serialized on one worker (reputation writes are
+  not concurrent); large bursts of announcements queue up
 - Remote inference between nodes is partially enabled via distributed mode (see below)
 - After idle unload, restart `serve` to reload the model
 - Token usage counters are in-memory (persistence lands with P3)
@@ -249,6 +264,34 @@ The distributed node exposes the same dashboard at `http://127.0.0.1:8080/` with
 additional distributed inference metrics including worker count, queued requests,
 and routing statistics.
 
+### 7. Compute sharing: capability-aware routing (M11–M13)
+
+DecentraAI's core product is sharing **compute/GPU capacity**, not only model
+files. Since M11, distributed nodes advertise real hardware
+(`decentraai-compute`): GPU model/VRAM, RAM, CPU cores, load, health, and the
+models each node serves. The coordinator picks a worker only when it serves
+the requested model **and** has RAM/VRAM headroom, and books a resource
+reservation that is released when the request finishes — two workloads can
+never double-book the same VRAM.
+
+```bash
+# A node offering its GPU as a compute worker:
+decentraai distributed start --name gpu-rig --model tinyllama.gguf
+
+# A coordinator routing by capability (fallback to legacy capacity routing):
+decentraai distributed start --name coordinator --prompt "Tell me a haiku"
+```
+
+**How it works:**
+- `ComputeAdvertisement` frames are broadcast on the heartbeat interval and
+  processed by every node's P2P handler into a local compute registry
+- The `ComputeScheduler` ranks eligible workers deterministically (score
+  desc, PeerId asc) and returns a `Placement` with a held reservation
+- `route_request` selects via the compute path first; the legacy
+  announcement-based router remains the fallback
+- Compute workers are only trusted after pairing (`trust.db`), mirroring the
+  existing trust model; an empty trust set disables compute selection
+
 ## CLI quick reference
 
 ```bash
@@ -257,7 +300,7 @@ decentraai doctor --config <path>               # budgets, GPU, PeerId, admissio
 decentraai config validate --file <path>        # strict config check
 decentraai registry scan --directory <path>     # index local GGUF models
 decentraai registry list                        # show registered models
-decentraai swarm start --config <path>          # serve + announce models on the LAN
+decentraai swarm start --config <path>          # serve + announce models; auto-share (sharing.mode)
 decentraai pull --from <multiaddr> --list       # browse a peer's catalog
 decentraai pull --from <multiaddr> --model <f>  # verified download from a peer
 decentraai serve start --model <name>           # gated inference + dashboard :8080

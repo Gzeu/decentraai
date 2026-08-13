@@ -13,11 +13,13 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 decentraai-audit = { path = "../audit" }
+decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }
 decentraai-distributed = { path = "../distributed" }
 decentraai-identity = { path = "../identity" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
+decentraai-manifest = { path = "../manifest" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-registry = { path = "../registry" }

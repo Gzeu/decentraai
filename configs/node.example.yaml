@@ -70,6 +70,14 @@ security:
   ban_duration_minutes: 60
   max_invalid_chunks_per_peer: 2
 
+# Automatic sharing (swarm start): what to do with model announcements
+# from peers on the LAN. `auto` downloads and verifies every announced
+# model (per-chunk BLAKE3 + Merkle gate, quarantine on corruption);
+# `ask` prompts before each download; `off` ignores announcements.
+sharing:
+  mode: "auto"
+  max_concurrent_downloads: 2
+
 # Subscription tiers (P1): everything is free; your tier reflects your
 # contribution. `models` is an allowlist of model file names; an empty
 # list means "all models the node serves". Delete this section to run

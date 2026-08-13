@@ -24,6 +24,8 @@ pub struct DistributedP2PHandler {
     infer_handler: Option<InferHandler>,
     /// Optional tracker to deliver progress / final messages back to waiting coordinators
     tracker: Option<Arc<crate::tracker::RequestTracker>>,
+    /// Optional compute manager to process ComputeAdvertisement frames
+    compute_manager: Option<Arc<crate::compute::ComputeManager>>,
 }
 
 impl DistributedP2PHandler {
@@ -33,6 +35,7 @@ impl DistributedP2PHandler {
             worker_manager: None,
             infer_handler: None,
             tracker: None,
+            compute_manager: None,
         }
     }
 
@@ -42,6 +45,7 @@ impl DistributedP2PHandler {
             worker_manager: Some(worker_manager),
             infer_handler: None,
             tracker: None,
+            compute_manager: None,
         }
     }
 
@@ -53,6 +57,7 @@ impl DistributedP2PHandler {
             worker_manager: None,
             infer_handler: Some(Arc::new(infer_handler)),
             tracker: None,
+            compute_manager: None,
         }
     }
 
@@ -65,12 +70,19 @@ impl DistributedP2PHandler {
             worker_manager: Some(worker_manager),
             infer_handler: Some(Arc::new(infer_handler)),
             tracker: None,
+            compute_manager: None,
         }
     }
 
     /// Attach a RequestTracker so progress messages are delivered to waiting coordinators
     pub fn set_tracker(&mut self, tracker: Arc<crate::tracker::RequestTracker>) {
         self.tracker = Some(tracker);
+    }
+
+    /// Attach a ComputeManager so ComputeAdvertisement frames are recorded
+    /// into the compute registry and peers can be selected as workers.
+    pub fn set_compute_manager(&mut self, compute_manager: Arc<crate::compute::ComputeManager>) {
+        self.compute_manager = Some(compute_manager);
     }
 }
 
@@ -83,6 +95,21 @@ impl Default for DistributedP2PHandler {
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::{InferMessage, deserialize_message};
+
+        // Try to deserialize as a compute advertisement
+        if let Ok(adv) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
+            request,
+            request.len(),
+        ) {
+            if let Some(manager) = &self.compute_manager {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager.process_advertisement(adv).await;
+                });
+                return Ok(Vec::new()); // No response for advertisements
+            }
+            anyhow::bail!("No compute manager configured");
+        }
 
         // Try to deserialize as WorkerAnnouncement
         if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, request.len())
@@ -149,7 +176,6 @@ mod tests {
         let worker_manager = Arc::new(WorkerManager::new(peer_id, config));
 
         let handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
-
         let announcement = WorkerAnnouncement {
             peer_id: create_test_peer_id(),
             node_name: "test-worker".to_string(),
@@ -427,5 +453,64 @@ mod tests {
         // Response should indicate failure
         assert!(!response.success);
         assert_eq!(response.error, Some("Backend timeout".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_compute_advertisement_handling() {
+        use decentraai_compute::{GpuSpec, ServedModel};
+
+        let peer_id = create_test_peer_id();
+        let manager = Arc::new(crate::compute::ComputeManager::new(
+            peer_id,
+            "coordinator".into(),
+            std::collections::HashSet::new(),
+        ));
+
+        let mut handler = DistributedP2PHandler::new();
+        handler.set_compute_manager(manager.clone());
+        handler.set_tracker(Arc::new(crate::tracker::RequestTracker::new()));
+
+        let adv = decentraai_compute::ComputeAdvertisement {
+            peer_id: create_test_peer_id(),
+            node_name: "gpu-rig".into(),
+            capability: decentraai_compute::ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 32 * 1024,
+                gpu: Some(GpuSpec {
+                    name: "RTX 4090".into(),
+                    vram_mb: 24 * 1024,
+                    driver: "565".into(),
+                }),
+                engine: "llama_server".into(),
+                served_models: vec![ServedModel {
+                    model_hash: "abc".into(),
+                    file_name: "model.gguf".into(),
+                    size_mb: 2048,
+                    est_ram_mb: 256,
+                    est_vram_mb: 3072,
+                }],
+            },
+            availability: decentraai_compute::ComputeAvailability {
+                available_ram_mb: 16 * 1024,
+                available_vram_mb: Some(18 * 1024),
+                load_percent: 10,
+                queue_depth: 0,
+                tokens_per_second: 60,
+                current_latency_ms: 90,
+                status: decentraai_compute::WorkerHealth::Ready,
+            },
+            announced_at_ms: 1_700_000_000_000,
+        };
+
+        let payload = serialize_message(&adv).unwrap();
+        let result = handler.handle(&payload);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+
+        // The advertisement is processed on a spawned task; yield so it runs.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let workers = manager.workers().await;
+        assert_eq!(workers.len(), 1, "advertisement lands in the compute registry");
+        assert_eq!(workers[0].node_name, "gpu-rig");
     }
 }

@@ -72,7 +72,57 @@
 - [x] M9-8: Real-time capacity updates from runtime
 - [ ] M9-9: Reputation-based compensation for workers
 
-## 10. Complete End-to-End Flow (M10)
+## 10. Zero-Touch Swarm Sharing (DONE)
+
+- [x] P6-1: `sharing` config section (`mode: auto | ask | off`,
+  `max_concurrent_downloads`) with validation and defaults (`auto`)
+- [x] P6-2: p2p manifest-announcement callback (peer, manifest), invoked
+  by the swarm event loop without blocking it
+- [x] P6-3: `swarm start` auto-share worker: downloads announced models
+  with full verification (per-chunk BLAKE3 + Merkle gate), registers them
+  in the local registry, and re-announces them signed by the node identity
+- [x] P6-4: E2E tests: announcement fires the callback; announced model
+  is auto-downloaded and verified byte-for-byte
+
+With mDNS discovery already auto-dialing LAN peers, two nodes that both
+run `decentraai swarm start` now exchange models with zero manual steps.
+
+## 12. Compute Sharing (M11–M13, DONE)
+
+DecentraAI's core product is people sharing **compute/GPU capacity**, not
+just model files. These milestones make the swarm capability-aware: nodes
+advertise real hardware, the coordinator answers "which node runs this
+workload?" with hardware matching + resource reservations, and model files
+stay a *supporting* artifact served by nodes that already hold them.
+
+- [x] M11: `decentraai-compute` crate (pure, no I/O, serde-serializable):
+  `WorkerCapability` (GPU/VRAM/RAM/CPU/engine/served models),
+  `ComputeAvailability`, `ComputeAdvertisement`, `WorkloadRequirements`,
+  `ResourceReservation`/`ReservationLedger` (TTL + per-worker cap),
+  `CapabilityMatcher` (trust, health, model, RAM/VRAM headroom, load,
+  queue, reservation cap), `ComputeRegistry` (stale → offline),
+  `ComputeScheduler` (deterministic scoring + reservation booking)
+- [x] M12: `ComputeManager` in `decentraai-distributed`: builds the local
+  advertisement from the real system probe (`SystemSnapshot` +
+  `nvidia-smi`), processes inbound advertisements via `DistributedP2PHandler`,
+  and keeps a coordinator-side registry. `decentraai distributed start`
+  advertises real hardware and re-broadcasts it on the heartbeat interval
+- [x] M13: capability-aware routing — `DistributedInference.route_request`
+  selects through the compute scheduler (model + RAM/VRAM matching, booking
+  a reservation held for the request duration, always released afterwards)
+  and falls back to the legacy announcement-based router
+
+### Next: M14–M17 (agreed direction)
+- M14: on-demand model provisioning — worker auto-downloads the required
+  model when a workload demands it and policy allows (uses the existing
+  verified-transfer pipeline)
+- M15: reservation enforcement on the worker (reject when a request exceeds
+  advertised free capacity)
+- M16: compute metrics in the dashboard (workers, load, VRAM, placements)
+- M17: contribution-based tier suggestions driven by compute served
+  (hardware × hours × verified requests)
+
+## 13. Complete End-to-End Flow (M10)
 
 ### Acceptance Criteria
 - [ ] Node starts with `decentraai init` and validated configuration

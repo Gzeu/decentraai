@@ -51,6 +51,12 @@ Current state: ROADMAP.md is fully done (M0–M8). The next roadmap
   (`logs/audit.jsonl`): peer bans, chunk verification failures,
   admission rejections, inference starts. Prompts and outputs are never
   audit material.
+- `crates/compute` — pure compute-sharing domain (M11): `ComputeCapability`,
+  `ComputeAvailability`/`ComputeAdvertisement`, `WorkloadRequirements`,
+  `ResourceReservation`/`ReservationLedger`, `CapabilityMatcher`,
+  `ComputeRegistry`, `ComputeScheduler`. No I/O, no async; all types
+  serde-serializable for P2P transport. The scheduler answers "which node
+  executes this workload?"; reservations are coordinator-side and TTL-bounded.
 - `crates/system-probe` — hardware snapshots and admission decisions
   (RAM reserve is a hard floor, GPU temperature is a hard stop).
 - `crates/node-cli` — the `decentraai` binary: `init`, `doctor`,

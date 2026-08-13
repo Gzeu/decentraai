@@ -43,6 +43,7 @@
 
 use std::sync::Arc;
 
+pub mod compute;
 pub mod config;
 pub mod fallback;
 pub mod p2p_handler;
@@ -51,6 +52,7 @@ pub mod router;
 pub mod tracker;
 pub mod worker;
 
+pub use compute::{ComputeManager, build_advertisement};
 pub use config::InferenceConfig;
 pub use error::DistributedError;
 pub use fallback::FallbackHandler;
@@ -104,6 +106,7 @@ pub struct DistributedInference {
     request_router: RequestRouter,
     fallback_handler: FallbackHandler,
     queue_manager: Arc<RequestQueueManager>,
+    compute_manager: Option<Arc<crate::compute::ComputeManager>>,
     config: InferenceConfig,
 }
 
@@ -137,8 +140,22 @@ impl DistributedInference {
             request_router,
             fallback_handler,
             queue_manager,
+            compute_manager: None,
             config,
         })
+    }
+
+    /// Attaches a [`crate::compute::ComputeManager`] so routing can select
+    /// workers from the capability-aware compute registry (hardware + model
+    /// matching + resource reservations). The legacy announcement-based
+    /// routing remains as a fallback.
+    pub fn set_compute_manager(&mut self, compute_manager: Arc<crate::compute::ComputeManager>) {
+        self.compute_manager = Some(compute_manager);
+    }
+
+    /// Returns the attached compute manager, if any.
+    pub fn compute_manager(&self) -> Option<&Arc<crate::compute::ComputeManager>> {
+        self.compute_manager.as_ref()
     }
 
     /// Returns a reference to the underlying P2P node
@@ -320,7 +337,8 @@ impl DistributedInference {
     /// Routes an inference request to the best available worker
     ///
     /// This will:
-    /// 1. Select the best worker using the scheduler
+    /// 1. Select the best worker (capability-aware when a compute manager is
+    ///    attached, otherwise the legacy capacity scheduler)
     /// 2. Send the request to that worker
     /// 3. Handle the response or trigger fallback on failure
     ///
@@ -335,7 +353,30 @@ impl DistributedInference {
         &self,
         request: InferRequest,
     ) -> Result<InferResponse, DistributedError> {
-        // Get the current worker list from the manager (async, never blocks the runtime)
+        // Capability-aware compute path: pick a worker that serves the model
+        // and has RAM/VRAM headroom, and hold a reservation for the duration.
+        if let Some(compute) = &self.compute_manager {
+            if let Some(req) = compute.requirements_for(&request.model_hash).await {
+                if let Some(placement) = compute.select(&req).await {
+                    let task_placement = TaskPlacement {
+                        selected_worker: placement.worker,
+                        estimated_wait_ms: 10,
+                        estimated_time_ms: 0,
+                        confidence: placement.confidence,
+                    };
+                    let result = self
+                        .request_router
+                        .send_request(&self.p2p_node, request, task_placement)
+                        .await;
+                    // Release the booking whether or not the request succeeded.
+                    compute.release(placement.reservation.reservation_id).await;
+                    return result;
+                }
+            }
+        }
+
+        // Legacy path: get the current worker list from the manager (async,
+        // never blocks the runtime).
         let workers = self.worker_manager.get_workers().await;
 
         // Select the best worker for this request
@@ -354,6 +395,25 @@ impl DistributedInference {
         request: InferRequest,
         progress: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<InferResponse, DistributedError> {
+        if let Some(compute) = &self.compute_manager {
+            if let Some(req) = compute.requirements_for(&request.model_hash).await {
+                if let Some(placement) = compute.select(&req).await {
+                    let task_placement = TaskPlacement {
+                        selected_worker: placement.worker,
+                        estimated_wait_ms: 10,
+                        estimated_time_ms: 0,
+                        confidence: placement.confidence,
+                    };
+                    let result = self
+                        .request_router
+                        .send_request_streamed(&self.p2p_node, request, task_placement, progress)
+                        .await;
+                    compute.release(placement.reservation.reservation_id).await;
+                    return result;
+                }
+            }
+        }
+
         let workers = self.worker_manager.get_workers().await;
         let placement = self.request_router.select_worker(&request, &workers).await?;
         self.request_router

@@ -21,9 +21,11 @@ uuid.workspace = true
 chrono.workspace = true
 
 # Internal dependencies
+decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
+decentraai-system-probe = { path = "../system-probe" }

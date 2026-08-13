@@ -275,6 +275,12 @@ type InferHandler = Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Res
 /// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
 type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
 
+/// Handler for inbound manifest announcements, called with the announcing
+/// peer and the announced manifest. MUST be non-blocking: the swarm event
+/// loop invokes it inline, so downloads belong in a spawned task.
+type ManifestAnnouncementHandler =
+    Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
+
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
 
@@ -290,6 +296,8 @@ pub struct P2PNode {
     /// worker registers this to mark in-flight requests as cancelled in the
     /// queue manager, which the streaming loop observes to abort promptly.
     on_cancel: SharedHandler<CancelHandler>,
+    /// Optional callback invoked for inbound manifest announcements.
+    on_manifest: SharedHandler<ManifestAnnouncementHandler>,
 }
 
 impl P2PNode {
@@ -321,6 +329,17 @@ impl P2PNode {
         F: Fn(uuid::Uuid) + Send + Sync + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_cancel.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
+    /// Sets a callback for inbound manifest announcements (peer, manifest).
+    /// The callback is invoked inline by the swarm task and MUST NOT block;
+    /// spawn a background task to download the announced model.
+    pub fn set_on_manifest_announcement<F>(&mut self, callback: F)
+    where
+        F: Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_manifest.lock());
         *guard = Some(std::sync::Arc::new(callback));
     }
 
@@ -366,6 +385,9 @@ impl P2PNode {
         let on_infer_clone = on_infer.clone();
         let on_cancel: SharedHandler<CancelHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_cancel_clone = on_cancel.clone();
+        let on_manifest: SharedHandler<ManifestAnnouncementHandler> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let on_manifest_clone = on_manifest.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -456,13 +478,22 @@ impl P2PNode {
                                 request_response::Message::Request {
                                     request, channel, ..
                                 } => {
-                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
+                                    if let Ok(announcement) = decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
                                         &request,
                                         request.len(),
-                                    )
-                                    .is_ok()
-                                    {
-                                        info!(%peer, bytes = request.len(), "received manifest announcement");
+                                    ) {
+                                        info!(
+                                            %peer,
+                                            model = %announcement.manifest.file_name,
+                                            "received manifest announcement"
+                                        );
+                                        // Announcements are fire-and-forget but a handler may
+                                        // want to act (e.g. auto-download). The callback must
+                                        // not block the event loop; it spawns its own task.
+                                        let guard = on_manifest_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            cb(peer, announcement.manifest);
+                                        }
                                         continue;
                                     }
                                     // Check for InferRequest
@@ -576,6 +607,7 @@ impl P2PNode {
             peer_id,
             on_infer,
             on_cancel,
+            on_manifest,
         })
     }
 

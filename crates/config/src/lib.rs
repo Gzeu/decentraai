@@ -23,6 +23,10 @@ pub struct NodeConfig {
     pub inference: InferenceSection,
     pub privacy: PrivacySection,
     pub security: SecuritySection,
+    /// How inbound model announcements are handled (`swarm start`).
+    /// Absent = Auto (download announced models with verification).
+    #[serde(default)]
+    pub sharing: SharingSection,
     /// Subscription tiers (P1). Absent = admin-token-only, which keeps
     /// existing installs unchanged.
     #[serde(default)]
@@ -73,6 +77,37 @@ pub enum InferenceRuntime {
 pub enum TrustMode {
     Private,
     Open,
+}
+
+/// How a `swarm start` node reacts to manifest announcements from peers.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareMode {
+    /// Download every announced model immediately. Every artifact is
+    /// still verified (per-chunk BLAKE3 + Merkle gate) before use.
+    Auto,
+    /// Ask on stdin before downloading each announced model.
+    Ask,
+    /// Ignore announcements entirely.
+    Off,
+}
+
+/// Automatic model sharing across the LAN swarm.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharingSection {
+    pub mode: ShareMode,
+    /// Upper bound on simultaneous auto downloads (disk/CPU guard).
+    pub max_concurrent_downloads: u32,
+}
+
+impl Default for SharingSection {
+    fn default() -> Self {
+        Self {
+            mode: ShareMode::Auto,
+            max_concurrent_downloads: 2,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +266,11 @@ impl NodeConfig {
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(
                 "network.max_connections must be greater than zero".into(),
+            ));
+        }
+        if self.sharing.max_concurrent_downloads == 0 {
+            return Err(ConfigError::Validation(
+                "sharing.max_concurrent_downloads must be greater than zero".into(),
             ));
         }
         if !(1..=64).contains(&self.storage.chunk_size_mb) {
@@ -456,6 +496,63 @@ security:
         std::fs::write(file.path(), bad).unwrap();
         let err = NodeConfig::load(file.path()).unwrap_err();
         assert!(err.to_string().contains("api_port"));
+    }
+
+    #[test]
+    fn example_sharing_section_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Auto);
+        assert_eq!(config.sharing.max_concurrent_downloads, 2);
+    }
+
+    #[test]
+    fn missing_sharing_section_defaults_to_auto() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let stripped = raw
+            .replace(
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n",
+                "",
+            )
+            .replace(
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n\n",
+                "",
+            );
+        std::fs::write(file.path(), stripped).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Auto);
+    }
+
+    #[test]
+    fn ask_mode_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace("mode: \"auto\"", "mode: \"ask\"");
+        std::fs::write(file.path(), bad).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Ask);
+    }
+
+    #[test]
+    fn zero_max_concurrent_downloads_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace(
+            "max_concurrent_downloads: 2",
+            "max_concurrent_downloads: 0",
+        );
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_downloads"));
     }
 }
 

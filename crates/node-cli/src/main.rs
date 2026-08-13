@@ -7,7 +7,7 @@ use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot,
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -122,6 +122,9 @@ struct DistributedArgs {
     /// coordinator (or worker) node.
     #[arg(long)]
     prompt: Option<String>,
+    /// Human-readable node name advertised in compute advertisements.
+    #[arg(long, default_value = "decentraai-node")]
+    name: String,
 }
 #[derive(Debug, Args)]
 struct PullArgs {
@@ -355,8 +358,9 @@ fn list_registry(registry: String) -> Result<()> {
 }
 
 /// Runs the swarm: loads identity and config, serves every model in the
-/// local registry to LAN peers, broadcasts signed announcements, and
-/// drives the event loop until interrupted.
+/// local registry to LAN peers, broadcasts signed announcements, reacts to
+/// announcements from peers (auto-share), and drives the event loop until
+/// interrupted.
 async fn swarm_start(config_path: PathBuf) -> Result<()> {
     use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer};
     use std::sync::Arc;
@@ -384,7 +388,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         None
     };
 
-    let node = P2PNode::new(
+    let mut node = P2PNode::new(
         &identity,
         config.network.max_message_bytes as usize,
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
@@ -408,6 +412,42 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Auto-share worker: reactions to peer announcements run here so the
+    // swarm event loop never blocks on a download. mDNS already auto-dials
+    // peers on the same LAN, so two `swarm start` nodes exchange models
+    // with no manual multiaddr handling. Every artifact is still verified
+    // (per-chunk BLAKE3 + Merkle gate) before it becomes usable.
+    let (ann_tx, ann_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let tx = ann_tx.clone();
+        node.set_on_manifest_announcement(move |peer, manifest| {
+            let _ = tx.send((peer, manifest));
+        });
+    }
+    let share_mode = config.sharing.mode;
+    let max_concurrent = config.sharing.max_concurrent_downloads as usize;
+    let max_invalid_chunks = config.security.max_invalid_chunks_per_peer;
+    let ban_duration =
+        Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60);
+    let worker = run_share_worker(
+        ann_rx,
+        node.clone(),
+        ShareWorkerConfig {
+            data_dir: data_dir.clone(),
+            identity_path: identity_path.clone(),
+            registry_path,
+            share_mode,
+            max_invalid_chunks,
+            ban_duration,
+        },
+        max_concurrent,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = worker.await {
+            warn!(error = %e, "share worker stopped");
+        }
+    });
+
     println!(
         "DecentraAI swarm running\n  PeerId (identity): {}\n  PeerId (libp2p): {}\n  Listening: {}/p2p/{}\n  Serving: {} model(s) announced\n  Press Ctrl+C to stop",
         identity.peer_id(),
@@ -418,6 +458,131 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     );
     tokio::signal::ctrl_c().await?;
     node.shutdown();
+    Ok(())
+}
+
+/// Parameters for the auto-share worker, gathered from the node config.
+struct ShareWorkerConfig {
+    data_dir: PathBuf,
+    identity_path: PathBuf,
+    registry_path: PathBuf,
+    share_mode: decentraai_config::ShareMode,
+    max_invalid_chunks: u8,
+    ban_duration: Duration,
+}
+
+/// Background worker for `swarm start` auto-sharing: consumes manifest
+/// announcements and downloads the announced models with full verification.
+/// Runs as its own task so the swarm event loop never blocks on a transfer.
+/// Downloads are serialized on one worker (reputation writes are not
+/// concurrent), so `max_concurrent` caps the queue it drains per peer.
+async fn run_share_worker(
+    mut ann_rx: tokio::sync::mpsc::UnboundedReceiver<(decentraai_p2p::PeerId, decentraai_manifest::Manifest)>,
+    node: decentraai_p2p::P2PNode,
+    cfg: ShareWorkerConfig,
+    max_concurrent: usize,
+) -> Result<()> {
+    use decentraai_config::ShareMode;
+    use decentraai_p2p::reputation::ReputationStore;
+    use decentraai_p2p::transfer::download_multi;
+    use std::collections::HashSet;
+
+    let ShareWorkerConfig {
+        data_dir,
+        identity_path,
+        registry_path,
+        share_mode,
+        max_invalid_chunks,
+        ban_duration,
+    } = cfg;
+    let models_dir = data_dir.join("models");
+    let reputation = ReputationStore::load(
+        &data_dir.join("db/reputation.json"),
+        max_invalid_chunks,
+        ban_duration,
+    )?;
+    let reputation = tokio::sync::Mutex::new(reputation);
+    let mut registry = if registry_path.exists() {
+        ModelRegistry::load(&registry_path)?
+    } else {
+        ModelRegistry::new(models_dir.clone())?
+    };
+    let mut in_flight: HashSet<String> = HashSet::new();
+    // Downloads stay serialized by the reputation mutex; the semaphore is a
+    // per-peer headroom guard for bursts of announcements.
+    let semaphore = tokio::sync::Semaphore::new(max_concurrent);
+
+    while let Some((peer, manifest)) = ann_rx.recv().await {
+        if in_flight.contains(&manifest.model_id) {
+            continue;
+        }
+        if models_dir.join(&manifest.file_name).exists() {
+            info!(model = %manifest.file_name, "already present; skipping auto-download");
+            continue;
+        }
+        let proceed = match share_mode {
+            ShareMode::Auto => true,
+            ShareMode::Ask => {
+                use std::io::Write;
+                print!(
+                    "Peer {peer} shares '{}' ({} MiB). Download? [y/N] ",
+                    manifest.file_name,
+                    manifest.file_size / (1024 * 1024)
+                );
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).unwrap_or_default();
+                matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+            }
+            ShareMode::Off => continue,
+        };
+        if !proceed {
+            continue;
+        }
+        in_flight.insert(manifest.model_id.clone());
+        let _permit = semaphore.acquire().await;
+        info!(peer = %peer, model = %manifest.file_name, "auto-downloading announced model");
+        let result = {
+            let mut guard = reputation.lock().await;
+            download_multi(
+                &node,
+                &[peer],
+                &manifest.model_id,
+                &data_dir,
+                &mut guard,
+            )
+            .await
+        };
+        in_flight.remove(&manifest.model_id);
+        match result {
+            Ok(path) => {
+                info!(path = %path.display(), "auto-downloaded and verified");
+                if let Err(e) = registry.scan_directory(&models_dir) {
+                    warn!(error = %e, "failed to index auto-downloaded model");
+                } else if let Err(e) = registry.save(&registry_path) {
+                    warn!(error = %e, "failed to persist registry");
+                }
+                // Re-announce the downloaded model, now signed by our
+                // identity, so other peers can pull it from us too.
+                if let Ok(identity) = Identity::load(&identity_path) {
+                    let signature = decentraai_protocol::sign_manifest(&identity, &manifest);
+                    if let Ok(payload) = decentraai_protocol::announcement_bytes(
+                        &manifest,
+                        Some(signature.to_bytes().to_vec()),
+                    ) {
+                        node.announce(payload);
+                        info!(model = %manifest.file_name, "re-announced");
+                    }
+                }
+            }
+            Err(e) => warn!(
+                peer = %peer,
+                model = %manifest.file_name,
+                error = %e,
+                "auto-download failed"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1009,19 +1174,46 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         decentraai_distributed::InferenceConfig::default(),
     ));
 
+    // Compute sharing (M11–M13): the coordinator trusts peers it has paired
+    // with (the P5 pairing flow records them in trust.db). A node that has
+    // never paired anyone starts with an empty trust set, so compute
+    // selection stays off until operators explicitly trust workers.
+    let mut compute_trusted = std::collections::HashSet::new();
+    let trust_db_path = data_dir.join("trust.db");
+    if trust_db_path.exists() {
+        use decentraai_discovery::TrustStore;
+        match TrustStore::new(&trust_db_path) {
+            Ok(store) => {
+                for record in store.list_trusted().unwrap_or_default() {
+                    if let Ok(peer) = record.worker_peer_id.parse::<libp2p::PeerId>() {
+                        compute_trusted.insert(peer);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to open trust.db; compute trust set is empty"),
+        }
+    }
+    let compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
+        local_peer_id,
+        args.name.clone(),
+        compute_trusted,
+    ));
+
     // Create a shared request tracker for streaming progress
     let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
 
-    // Create distributed P2P handler: worker announcements are processed
-    // here on every node (worker or coordinator). Inference serving is NOT
-    // handled through this chain anymore — worker mode registers a streaming
-    // backend via `register_worker_backend`, which installs the P2P-level
-    // on_infer callback that enqueues + streams (queue → backend → progress).
+    // Create distributed P2P handler: worker announcements AND compute
+    // advertisements are processed here on every node (worker or
+    // coordinator). Inference serving is NOT handled through this chain
+    // anymore — worker mode registers a streaming backend via
+    // `register_worker_backend`, which installs the P2P-level on_infer
+    // callback that enqueues + streams (queue → backend → progress).
     let mut distributed_handler =
         decentraai_distributed::DistributedP2PHandler::with_worker_manager(
             worker_manager.clone(),
         );
     distributed_handler.set_tracker(tracker.clone());
+    distributed_handler.set_compute_manager(compute_manager.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 
     // Add registry handler if registry exists
@@ -1047,6 +1239,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         Some(worker_manager.clone()),
         Some(tracker.clone()),
     )?;
+    distributed.set_compute_manager(compute_manager.clone());
     // If we have a model specified, register as a worker
     if will_be_worker {
         let model_hash = model_hash.expect("model_hash must be set for worker");
@@ -1063,6 +1256,22 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         if let Some(backend) = &backend {
             distributed.register_worker_backend(backend.clone(), model_hash.clone())?;
         }
+
+        // Advertise compute capability from a real hardware probe so this
+        // node can be selected through the capability-aware scheduler.
+        let served_models = build_served_models(&registry_path, &model_hash, &model_name)?;
+        let snapshot = SystemSnapshot::collect();
+        let gpu = decentraai_system_probe::probe_gpu();
+        let adv = compute_manager
+            .advertise_local(snapshot, gpu, served_models)
+            .await;
+        info!(
+            peer_id = %local_peer_id,
+            node_name = %adv.node_name,
+            models = ?adv.capability.served_models.iter().map(|m| &m.model_hash).collect::<Vec<_>>(),
+            "registered as distributed compute worker"
+        );
+        spawn_compute_broadcaster(compute_manager.clone(), distributed.p2p_node().clone()).await?;
 
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
@@ -1095,6 +1304,88 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     }
 
     distributed.shutdown();
+    Ok(())
+}
+
+/// Builds the `ServedModel` list for compute advertising from the local
+/// registry. Only the model chosen with `--model` is advertised, matching
+/// what the worker actually loaded into llama-server.
+///
+/// Memory estimates are conservative: RAM ≈ model bytes/4 + 1 GiB (working
+/// set + KV cache), VRAM ≈ full model bytes when a GPU is present, else 0.
+/// Overestimating never risks double-booking; it only tightens eligibility.
+fn build_served_models(
+    registry_path: &std::path::Path,
+    model_hash: &str,
+    model_name: &str,
+) -> Result<Vec<decentraai_compute::ServedModel>> {
+    use decentraai_registry::ModelRegistry;
+
+    if !registry_path.exists() {
+        return Ok(vec![]);
+    }
+    let registry = ModelRegistry::load(registry_path)?;
+    let record = registry
+        .models
+        .values()
+        .find(|r| r.relative_path == model_name)
+        .or_else(|| registry.models.values().find(|r| r.relative_path.ends_with(model_name)));
+    let size_mb = match record {
+        Some(record) => (record.size_bytes / (1024 * 1024)).max(1),
+        None => {
+            std::fs::metadata(std::path::Path::new(model_name))
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0)
+                .max(1)
+        }
+    };
+    let gpu_present = matches!(
+        decentraai_system_probe::probe_gpu(),
+        decentraai_system_probe::GpuProbeStatus::Nvidia(_)
+    );
+    Ok(vec![decentraai_compute::ServedModel {
+        model_hash: model_hash.to_string(),
+        file_name: model_name.to_string(),
+        size_mb,
+        est_ram_mb: size_mb / 4 + 1024,
+        est_vram_mb: if gpu_present { size_mb } else { 0 },
+    }])
+}
+
+/// Re-probes this node's hardware and re-broadcasts the compute
+/// advertisement on the heartbeat interval, so coordinators never see this
+/// worker go stale. Fire-and-forget; a failing probe just skips a beat.
+async fn spawn_compute_broadcaster(
+    compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
+    p2p_node: decentraai_p2p::P2PNode,
+) -> Result<()> {
+    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+    use decentraai_protocol::serialize_message;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            compute_manager.advertisement_interval_ms(),
+        ));
+        loop {
+            interval.tick().await;
+            let snapshot = SystemSnapshot::collect();
+            let gpu = probe_gpu();
+            // Advertise the latest probe; served_models come from the last
+            // full advertisement stored in the manager.
+            let workers = compute_manager.workers().await;
+            let served_models = workers
+                .iter()
+                .find(|w| w.peer_id == compute_manager.local_peer())
+                .map(|w| w.capability.served_models.clone())
+                .unwrap_or_default();
+            let adv = compute_manager
+                .advertise_local(snapshot, gpu, served_models)
+                .await;
+            if let Ok(bytes) = serialize_message(&adv) {
+                p2p_node.announce(bytes);
+            }
+        }
+    });
     Ok(())
 }
 

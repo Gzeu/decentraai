@@ -12,7 +12,7 @@ use decentraai_p2p::{
 };
 use decentraai_protocol::{
     CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest, ChunkResponse,
-    ManifestRequest, ManifestResponse, deserialize_message, serialize_message,
+    ManifestRequest, ManifestResponse, announcement_bytes, deserialize_message, serialize_message,
 };
 use libp2p::PeerId;
 use std::path::{Path, PathBuf};
@@ -555,5 +555,124 @@ async fn multi_provider_falls_back_after_corruption() {
     assert!(
         reputation.successes(&honest.local_peer_id()) >= 1,
         "the honest provider must serve the fallback chunks"
+    );
+}
+
+#[tokio::test]
+async fn manifest_announcement_fires_callback() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    std::fs::write(&source_path, test_bytes(CHUNK_SIZE + 1)).unwrap();
+    let manifest = scan(&source_path).unwrap();
+
+    let (server, mut client) = node_pair(None).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_on_manifest_announcement(move |peer, m| {
+        let _ = tx.send((peer, m.file_name));
+    });
+
+    // The dial needs a moment to settle before the server sees the client
+    // as connected; broadcast only reaches connected peers. Re-announce
+    // until the callback fires.
+    let payload = announcement_bytes(&manifest, None).unwrap();
+    let mut seen = None;
+    for _ in 0..50 {
+        server.announce(payload.clone());
+        if let Ok(item) = rx.try_recv() {
+            seen = Some(item);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (peer, name) = seen.expect("announcement callback must fire");
+    assert_eq!(peer, server.local_peer_id());
+    assert_eq!(name, "model.gguf");
+}
+
+#[tokio::test]
+async fn announced_model_auto_downloads_and_verifies() {
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    let data = test_bytes(CHUNK_SIZE + 123);
+    std::fs::write(&source_path, &data).unwrap();
+
+    let manifest = scan(&source_path).unwrap();
+    let handler = Arc::new(StaticFileServer::new(
+        manifest_bytes(manifest.clone()),
+        source_path.clone(),
+        CHUNK_SIZE as u64,
+    ));
+
+    let server = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(handler),
+    )
+    .unwrap();
+    let addr = server.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    let mut client = P2PNode::new(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    client
+        .dial(&format!("{addr}/p2p/{}", server.local_peer_id()))
+        .await
+        .unwrap();
+
+    let out_dir = dir.path().join("client");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out_dir_for_cb = out_dir.clone();
+    let rep_path = dir.path().join("reputation.json");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let client_handle = client.clone();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_for_cb = started.clone();
+    client.set_on_manifest_announcement(move |peer, m| {
+        // Only the first delivery spawns a download; re-announcements while
+        // the connection settles must not start duplicate transfers.
+        if started_for_cb.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let client_handle = client_handle.clone();
+        let out_dir = out_dir_for_cb.clone();
+        let rep_path = rep_path.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut reputation =
+                ReputationStore::load(&rep_path, 100, Duration::from_secs(300)).unwrap();
+            let result = download(&client_handle, peer, &m.model_id, &out_dir, &mut reputation)
+                .await;
+            let _ = tx.send(result);
+        });
+    });
+
+    // Re-announce until the connection settles and the first callback fires.
+    let payload = announcement_bytes(&manifest, None).unwrap();
+    for _ in 0..50 {
+        if started.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        server.announce(payload.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("auto-download must complete")
+        .expect("download must return a path")
+        .expect("download must succeed");
+    assert_eq!(
+        outcome.file_name().unwrap().to_string_lossy(),
+        "model.gguf"
+    );
+    assert_eq!(
+        std::fs::read(&outcome).unwrap(),
+        data,
+        "the announced model must match its source byte-for-byte"
     );
 }

@@ -950,11 +950,13 @@ dependencies = [
  "chrono",
  "clap",
  "decentraai-audit",
+ "decentraai-compute",
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-distributed",
  "decentraai-identity",
  "decentraai-inference-adapter",
+ "decentraai-manifest",
  "decentraai-p2p",
  "decentraai-protocol",
  "decentraai-registry",
@@ -966,6 +968,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "decentraai-compute"
+version = "0.1.0"
+dependencies = [
+ "libp2p",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -1004,12 +1017,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "decentraai-compute",
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-identity",
  "decentraai-inference-adapter",
  "decentraai-p2p",
  "decentraai-protocol",
+ "decentraai-system-probe",
  "futures",
  "libp2p",
  "serde",
