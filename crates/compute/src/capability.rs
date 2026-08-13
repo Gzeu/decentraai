@@ -42,6 +42,11 @@ pub struct ComputeCapability {
     /// Models this node can execute (already local — compute nodes serve
     /// what they hold; model download is a separate policy-gated step).
     pub served_models: Vec<ServedModel>,
+    /// Whether this worker will fetch a missing model on demand when a
+    /// workload demands it and the coordinator routes to it (M14). Such a
+    /// worker is eligible for a workload it does not yet serve, subject to
+    /// the coordinator's `allow_provisioning` policy.
+    pub can_provision: bool,
 }
 
 impl ComputeCapability {
@@ -50,6 +55,12 @@ impl ComputeCapability {
         self.served_models
             .iter()
             .any(|m| m.model_hash == model_hash)
+    }
+
+    /// Whether this worker can handle `model_hash` either because it serves
+    /// it today or because it will provision it on demand.
+    pub fn serves_or_provisions(&self, model_hash: &str) -> bool {
+        self.has_model(model_hash) || self.can_provision
     }
 
     /// The served model matching `model_hash`, if any.
@@ -81,6 +92,7 @@ mod tests {
                 est_ram_mb: 256,
                 est_vram_mb: 3072,
             }],
+            can_provision: false,
         }
     }
 
@@ -89,6 +101,15 @@ mod tests {
         let cap = capability();
         assert!(cap.has_model("abc"));
         assert!(!cap.has_model("nope"));
+    }
+
+    #[test]
+    fn serves_or_provisions_accepts_provisioning_workers() {
+        let mut cap = capability();
+        assert!(!cap.serves_or_provisions("nope"));
+        cap.can_provision = true;
+        assert!(cap.serves_or_provisions("nope"));
+        assert!(cap.serves_or_provisions("abc"));
     }
 
     #[test]

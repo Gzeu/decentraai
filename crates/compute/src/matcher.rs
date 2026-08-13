@@ -39,6 +39,10 @@ pub struct CapabilityMatcher {
     pub min_free_vram_mb: u64,
     pub max_queue_depth: u32,
     pub max_load_percent: u8,
+    /// When true, a worker that does not serve `model_hash` today but
+    /// advertises `can_provision` is still eligible (it will fetch the model
+    /// on demand once the workload lands, M14).
+    pub allow_provisioning: bool,
 }
 
 impl Default for CapabilityMatcher {
@@ -48,6 +52,7 @@ impl Default for CapabilityMatcher {
             min_free_vram_mb: 512,
             max_queue_depth: 8,
             max_load_percent: 95,
+            allow_provisioning: false,
         }
     }
 }
@@ -68,7 +73,9 @@ impl CapabilityMatcher {
         if !adv.availability.healthy() {
             return MatchOutcome::Rejected(MatchReason::NotHealthy);
         }
-        if !adv.capability.has_model(&req.model_hash) {
+        if !adv.capability.has_model(&req.model_hash)
+            && !(self.allow_provisioning && adv.capability.can_provision)
+        {
             return MatchOutcome::Rejected(MatchReason::ModelNotServed);
         }
 
@@ -155,6 +162,49 @@ mod tests {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
+        assert_eq!(
+            matcher.matches(&adv, &other, &ledger, true),
+            MatchOutcome::Rejected(MatchReason::ModelNotServed)
+        );
+    }
+
+    #[test]
+    fn provisioning_worker_eligible_when_policy_allows() {
+        let matcher = CapabilityMatcher {
+            allow_provisioning: true,
+            ..CapabilityMatcher::default()
+        };
+        let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
+        let mut adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
+        adv.capability.can_provision = true;
+        let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
+        assert_eq!(
+            matcher.matches(&adv, &other, &ledger, true),
+            MatchOutcome::Eligible
+        );
+    }
+
+    #[test]
+    fn provisioning_worker_rejected_when_policy_forbids() {
+        let matcher = CapabilityMatcher::default();
+        let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
+        let mut adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
+        adv.capability.can_provision = true;
         let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
         assert_eq!(
             matcher.matches(&adv, &other, &ledger, true),

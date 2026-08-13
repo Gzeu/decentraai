@@ -145,15 +145,48 @@ Issues found and fixed during verification:
   accessors and would panic on a multithreaded runtime; switched to the async
   accessors (queue depth / TPS / latency now report real values).
 
-### Next: M14–M17 (agreed direction)
-- M14: on-demand model provisioning — worker auto-downloads the required
-  model when a workload demands it and policy allows (uses the existing
-  verified-transfer pipeline)
+### Next: M15–M17 (agreed direction)
 - M15: reservation enforcement on the worker (reject when a request exceeds
   advertised free capacity)
 - M16: compute metrics in the dashboard (workers, load, VRAM, placements)
 - M17: contribution-based tier suggestions driven by compute served
   (hardware × hours × verified requests)
+
+### M14: On-demand model provisioning — DONE
+
+The worker auto-downloads a requested model through the existing
+verified-transfer pipeline when it does not already hold it, then serves the
+request. Coordinators hold the model (e.g. after a `pull`) and serve
+manifests + chunks via `RegistryServer`; policy gates both sides.
+
+- **Policy**: new `sharing.provision_models_on_demand` config (default
+  `true`). `ComputeCapability` gains `can_provision`; the scheduler only
+  routes to provisioning-capable workers for unserved models when
+  `ComputeManager::set_allow_provisioning(true)`.
+- **Worker flow**: on a model mismatch with provisioning enabled, the worker
+  replies `InferAccepted` immediately, sends an empty keepalive progress
+  frame (so the coordinator's request clock keeps running during the
+  download), then `transfer::download` → registry index → engine load →
+  streamed completion. Failures send a terminal `InferFailed`.
+- **Engine lifecycle**: a `ProvisioningFactory` (`Arc<dyn Fn(PathBuf) ->
+  BoxFuture<(Box<dyn Any + Send>, OpenAiCompatibleBackend)>`) loads the
+  downloaded model; the engine handle stays alive in a per-node
+  `ProvisionedBackends` map and is dropped with the node. In the CLI the
+  factory spawns a real `llama-server` per model.
+- **Fresh-node indexing fix**: a node with no registry file previously never
+  indexed provisioned models (`load` failed silently). Provisioning now
+  creates the registry (and its parent dir) on first download.
+- **Scheduling**: `requirements_for` returns `Some` (with a default 1024 MiB
+  RAM budget) whenever only provisioning-capable workers can serve, so the
+  workload stays schedulable; the real footprint is re-advertised after the
+  download completes.
+
+E2E coverage (`on_demand_provisioning_downloads_verifies_and_serves`):
+coordinator serves a real GGUF file via `ChainedHandler(distributed +
+RegistryServer)`; the worker advertises `can_provision`, is trusted, and
+provisions the requested (different) model — asserting byte-for-byte BLAKE3
+of the downloaded file, registry indexing, streamed output, and reservation
+release.
 
 ## 13. Complete End-to-End Flow (M10)
 

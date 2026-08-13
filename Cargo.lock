@@ -1016,6 +1016,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "chrono",
  "decentraai-compute",
  "decentraai-config",
@@ -1024,6 +1025,7 @@ dependencies = [
  "decentraai-inference-adapter",
  "decentraai-p2p",
  "decentraai-protocol",
+ "decentraai-registry",
  "decentraai-system-probe",
  "futures",
  "httpmock",

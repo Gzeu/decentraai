@@ -13,14 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use decentraai_distributed::{
-    ComputeManager, DistributedInference, DistributedP2PHandler, InferenceConfig, RequestTracker,
-    WorkerManager,
+    ComputeManager, DistributedInference, DistributedP2PHandler, InferenceConfig, ProvisioningConfig,
+    ProvisioningFactory, RequestTracker, WorkerManager,
 };
 use decentraai_identity::Identity;
 use decentraai_p2p::{
-    DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode,
+    ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode,
+    RegistryServer,
 };
 use decentraai_protocol::{InferRequest, serialize_message};
+use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{GpuProbeStatus, GpuSnapshot, SystemSnapshot};
 use libp2p::identity::Keypair;
 use libp2p::PeerId;
@@ -122,7 +124,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     )
     .unwrap();
     worker
-        .register_worker_backend(backend, MODEL_HASH.to_string())
+        .register_worker_backend(backend, MODEL_HASH.to_string(), None)
         .unwrap();
 
     // ---- Coordinator node: aggregates advertisements and routes requests.
@@ -170,7 +172,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let adv = worker_compute
-            .advertise_local(snapshot(), gpu(), vec![served_model()])
+            .advertise_local(snapshot(), gpu(), vec![served_model()], false)
             .await;
         worker
             .p2p_node()
@@ -310,7 +312,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         },
     )
     .unwrap();
-    w2.register_worker_backend(w2_backend, MODEL_HASH.to_string())
+    w2.register_worker_backend(w2_backend, MODEL_HASH.to_string(), None)
         .unwrap();
 
     // ---- Coordinator.
@@ -362,6 +364,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         snapshot(),
         gpu(),
         vec![served_model()],
+        false,
         1_700_000_000_000,
     );
     coord_compute.process_advertisement(ghost_adv).await;
@@ -415,4 +418,229 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
     );
     assert_eq!(response.output, "fallback");
     assert_eq!(coord_compute.in_flight(&ghost_peer).await, 0, "ghost reservation released");
+}
+/// M14 on-demand provisioning: a worker that does not hold the requested
+/// model fetches it from the requester through the verified transfer
+/// pipeline (per-chunk BLAKE3 + Merkle root), indexes it, and serves the
+/// request. The coordinator routes to the worker because it advertises
+/// `can_provision` and the coordinator's scheduler permits provisioning.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_demand_provisioning_downloads_verifies_and_serves() {
+    use decentraai_inference_adapter::{BackendConfig, OpenAiCompatibleBackend};
+
+    // ---- Coordinator holds a model in its registry (served via RegistryServer).
+    let coord_dir = tempfile::TempDir::new().unwrap();
+    let coord_models = coord_dir.path().join("models");
+    std::fs::create_dir_all(&coord_models).unwrap();
+    let model_bytes = b"GGUF fake tiny model content for on-demand provisioning".to_vec();
+    std::fs::write(coord_models.join("provisioned.gguf"), &model_bytes).unwrap();
+    let mut coord_registry = ModelRegistry::new(coord_models.clone()).unwrap();
+    coord_registry.scan_directory(&coord_models).unwrap();
+    std::fs::create_dir_all(coord_dir.path().join("db")).unwrap();
+    coord_registry.save(&coord_dir.path().join("db/registry.json")).unwrap();
+    let provisioned_hash = blake3::hash(&model_bytes).to_hex().to_string();
+
+    // Mock engine for the provisioned model.
+    let mock = httpmock::prelude::MockServer::start_async().await;
+    let stream_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"provisioned\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    mock.mock_async(|when, then| {
+        when.method(httpmock::Method::POST).path("/v1/chat/completions");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(stream_body);
+    })
+    .await;
+
+    // ---- Worker: bound to a DIFFERENT model, but provisions on demand.
+    let worker_identity = Identity::generate();
+    let worker_peer = libp2p_peer_id(&worker_identity);
+    let worker_compute = Arc::new(ComputeManager::new(
+        worker_peer,
+        "worker".to_string(),
+        HashSet::new(),
+    ));
+    let worker_manager = Arc::new(WorkerManager::new(
+        worker_peer,
+        InferenceConfig::default(),
+    ));
+    let mut worker_handler =
+        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    worker_handler.set_compute_manager(worker_compute.clone());
+    let worker_node = P2PNode::new(
+        &worker_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(worker_handler)),
+    )
+    .unwrap();
+    let worker_addr = worker_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    let mut worker = DistributedInference::new(
+        worker_node,
+        InferenceConfig::default(),
+        Some(worker_manager.clone()),
+        None,
+    )
+    .unwrap();
+    worker.set_compute_manager(worker_compute.clone());
+
+    let bound_backend = OpenAiCompatibleBackend::new(BackendConfig {
+        base_url: mock.base_url(),
+        model: "bound".into(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // The provisioning factory "loads" the downloaded model into the mock
+    // engine. The engine handle is opaque; the worker keeps it alive.
+    let worker_dir = tempfile::TempDir::new().unwrap();
+    let worker_registry_path = worker_dir.path().join("db/registry.json");
+    let provision_base_url = mock.base_url();
+    let factory: ProvisioningFactory = Arc::new(move |_model_path| {
+        let base = provision_base_url.clone();
+        Box::pin(async move {
+            let backend = OpenAiCompatibleBackend::new(BackendConfig {
+                base_url: base,
+                model: "provisioned".into(),
+                ..Default::default()
+            })
+            .map_err(|e| anyhow::anyhow!("backend: {e}"))?;
+            Ok((Box::new(()) as Box<dyn std::any::Any + Send>, backend))
+        })
+    });
+    let provisioning = ProvisioningConfig {
+        data_dir: worker_dir.path().to_path_buf(),
+        registry_path: worker_registry_path.clone(),
+        reputation_path: worker_dir.path().join("db/reputation.json"),
+        max_concurrent_downloads: 2,
+        max_invalid_chunks: 3,
+        ban_duration: Duration::from_secs(60),
+        backend_factory: factory,
+    };
+    worker
+        .register_worker_backend(bound_backend, MODEL_HASH.to_string(), Some(provisioning))
+        .unwrap();
+
+    // ---- Coordinator: chained handler (distributed + registry server).
+    let coord_identity = Identity::generate();
+    let coord_peer = libp2p_peer_id(&coord_identity);
+    let coord_compute = Arc::new(ComputeManager::new(
+        coord_peer,
+        "coordinator".to_string(),
+        HashSet::new(),
+    ));
+    coord_compute.set_allow_provisioning(true).await;
+    let coord_worker_manager = Arc::new(WorkerManager::new(
+        coord_peer,
+        InferenceConfig::default(),
+    ));
+    let tracker = Arc::new(RequestTracker::new());
+    let mut coord_handler =
+        DistributedP2PHandler::with_worker_manager(coord_worker_manager.clone());
+    coord_handler.set_compute_manager(coord_compute.clone());
+    coord_handler.set_tracker(tracker.clone());
+    let chained = ChainedHandler::new()
+        .add_handler(Arc::new(coord_handler))
+        .add_handler(Arc::new(RegistryServer::new(coord_registry)));
+    let coord_node = P2PNode::new(
+        &coord_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained)),
+    )
+    .unwrap();
+    coord_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    coord_node
+        .dial(&format!("{worker_addr}/p2p/{worker_peer}"))
+        .await
+        .unwrap();
+
+    let mut coordinator = DistributedInference::new(
+        coord_node,
+        InferenceConfig::default(),
+        Some(coord_worker_manager.clone()),
+        Some(tracker),
+    )
+    .unwrap();
+    coordinator.set_compute_manager(coord_compute.clone());
+
+    // The worker advertises `can_provision = true` over the wire until the
+    // coordinator's registry sees it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let adv = worker_compute
+            .advertise_local(snapshot(), gpu(), vec![served_model()], true)
+            .await;
+        worker
+            .p2p_node()
+            .announce(serialize_message(&adv).unwrap());
+        if !coord_compute.workers().await.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the provisioning advertisement to propagate"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The scheduler must accept the worker for a model it does NOT serve.
+    coord_compute.add_trusted(worker_peer).await;
+    let req = coord_compute
+        .requirements_for(&provisioned_hash)
+        .await
+        .expect("a provisioning worker makes the workload schedulable");
+    let placement = coord_compute
+        .select(&req)
+        .await
+        .expect("trusted provisioning worker must be selected");
+    assert_eq!(placement.worker, worker_peer);
+    coord_compute.release(placement.reservation.reservation_id).await;
+
+    // Route a request for the not-yet-local model; the worker must fetch,
+    // verify, and serve it.
+    let mut request = InferRequest::new(provisioned_hash.clone(), "serve it".into(), 64);
+    request = request.with_sender(coord_peer);
+    request = request.with_streaming(true);
+    request.timeout_ms = 20_000;
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        coordinator.route_request_streamed(request, progress_tx),
+    )
+    .await
+    .expect("provisioned request must complete")
+    .expect("provisioning route must succeed");
+
+    assert!(response.success, "provisioned inference must succeed: {:?}", response.error);
+    assert_eq!(response.worker_peer_id, worker_peer);
+    assert_eq!(response.output, "provisioned");
+    assert_eq!(response.tokens_used, 2, "one content chunk plus the terminal chunk");
+
+    let mut streamed = String::new();
+    while let Ok(chunk) = progress_rx.try_recv() {
+        streamed.push_str(&chunk);
+    }
+    assert_eq!(streamed, "provisioned", "streamed chunks must match the output");
+
+    // The model was downloaded through the verified pipeline, then indexed
+    // into the worker's registry.
+    let downloaded = worker_dir.path().join("models/provisioned.gguf");
+    assert!(downloaded.is_file(), "provisioned model must land in the worker's models dir");
+    assert_eq!(
+        blake3::hash(&std::fs::read(&downloaded).unwrap()).to_hex().to_string(),
+        provisioned_hash,
+        "the provisioned file must verify byte-for-byte"
+    );
+    let registry = ModelRegistry::load(&worker_registry_path).unwrap();
+    assert_eq!(registry.models.len(), 1, "provisioned model must be indexed");
+
+    // The reservation is released after the request completes.
+    assert_eq!(coord_compute.in_flight(&worker_peer).await, 0);
+    assert_eq!(coord_compute.reserved_ram(&worker_peer).await, 0);
 }

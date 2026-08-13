@@ -41,6 +41,8 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod compute;
@@ -66,6 +68,78 @@ pub use worker::WorkerManager;
 pub use decentraai_protocol::{
     InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
 };
+
+/// Builds a serving backend for a downloaded model file (M14 on-demand
+/// provisioning). Returns the opaque engine handle — kept alive for the
+/// worker session so the subprocess (e.g. llama-server) is not reaped —
+/// plus the OpenAI-compatible backend that talks to it. The handle is
+/// `dyn Any` because the engine type lives in the node CLI crate (which
+/// depends on both `decentraai-distributed` and `decentraai-runtime`);
+/// keeping it untyped avoids an orphan-rule impl or a runtime dependency
+/// here just to hold a process alive.
+pub type ProvisionFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = anyhow::Result<(
+                    Box<dyn std::any::Any + Send>,
+                    decentraai_inference_adapter::OpenAiCompatibleBackend,
+                )>,
+            > + Send,
+    >,
+>;
+pub type ProvisioningFactory = Arc<dyn Fn(PathBuf) -> ProvisionFuture + Send + Sync>;
+
+/// Policy + I/O paths a worker needs to fetch models on demand (M14).
+///
+/// A worker that carries this (via [`DistributedInference::register_worker_backend`])
+/// answers a workload for a model it does not yet hold by downloading it
+/// from the requester through the verified-transfer pipeline, indexing it in
+/// the local registry, loading it into an inference engine, and only then
+/// serving the request. The coordinator must have routed the request knowing
+/// the worker advertises `can_provision` (see the compute matcher).
+/// Backends loaded for on-demand-provisioned models, keyed by model hash.
+/// The engine handle keeps the subprocess alive for the worker session; the
+/// backend streams inference through it. All dropped together on shutdown.
+pub type ProvisionedBackends = Arc<
+    tokio::sync::Mutex<
+        HashMap<
+            String,
+            (
+                Box<dyn std::any::Any + Send>,
+                decentraai_inference_adapter::OpenAiCompatibleBackend,
+            ),
+        >,
+    >,
+>;
+
+/// Everything a provisioning task needs to reach the network and the worker
+/// loop. Bundled so [`provision_on_demand`] stays under clippy's argument cap.
+#[derive(Clone)]
+pub struct Provisioner {
+    p2p: decentraai_p2p::P2PNode,
+    queue_mgr: Arc<RequestQueueManager>,
+    worker_manager: Arc<WorkerManager>,
+    provisioned: ProvisionedBackends,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct ProvisioningConfig {
+    /// Node data dir; the model lands in `<data_dir>/models` and staging in
+    /// `<data_dir>/staging`.
+    pub data_dir: PathBuf,
+    /// `db/registry.json` path to index the provisioned model into.
+    pub registry_path: PathBuf,
+    /// `db/reputation.json` path for the verified-transfer reputation store.
+    pub reputation_path: PathBuf,
+    /// Cap on simultaneous on-demand downloads (from `sharing` config).
+    pub max_concurrent_downloads: usize,
+    /// Reputation ban parameters passed through to the transfer pipeline.
+    pub max_invalid_chunks: u8,
+    pub ban_duration: std::time::Duration,
+    /// Loads a downloaded model into an engine and returns a serving backend.
+    pub backend_factory: ProvisioningFactory,
+}
 
 /// Module for error types
 mod error {
@@ -236,6 +310,7 @@ impl DistributedInference {
         &mut self,
         backend: decentraai_inference_adapter::OpenAiCompatibleBackend,
         model_hash: String,
+        provisioning: Option<ProvisioningConfig>,
     ) -> anyhow::Result<()> {
         use decentraai_protocol::{
             InferMessage, InferResponse, serialize_message,
@@ -250,6 +325,17 @@ impl DistributedInference {
         let worker_manager = self.worker_manager.clone();
         let model_hash_clone = model_hash.clone();
 
+        // Engines spawned for on-demand-provisioned models, keyed by model
+        // hash. Kept for the worker session so the subprocesses stay alive;
+        // they are reaped when the node drops.
+        let provisioned: ProvisionedBackends = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let provisioned_clone = provisioned.clone();
+        let provisioning_clone = provisioning.clone();
+        let provision_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            provisioning.as_ref().map(|p| p.max_concurrent_downloads).unwrap_or(0).max(1),
+        ));
+        let semaphore_clone = provision_semaphore.clone();
+
         // Map inbound InferCancel frames to the queue manager so in-flight
         // requests are marked cancelled and the streaming loop aborts.
         let cancel_queue = self.queue_manager.clone();
@@ -260,10 +346,40 @@ impl DistributedInference {
             });
         });
 
+        // Clones reserved for the on_infer closure so the background worker
+        // loop below keeps its own untouched copies.
+        let p2p_for_closure = p2p_clone.clone();
+        let queue_for_closure = queue_mgr.clone();
+        let wm_for_closure = worker_manager.clone();
+
         // Register sync on_infer handler that enqueues the request and returns Accept
         self.p2p_node.set_on_infer_request(move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
-            // Only accept requests for the configured model
+            // Only accept requests for the configured model.
             if req.model_hash != model_hash_clone {
+                // On-demand provisioning (M14): a workload for a model we do
+                // not hold yet is answered with InferAccepted immediately
+                // (the requester keeps waiting on the tracker) while a
+                // background task downloads, verifies, and serves the model.
+                if let Some(prov) = &provisioning_clone {
+                    let accepted = serialize_message(&InferMessage::InferAccepted {
+                        request_id: req.request_id,
+                        worker_peer_id: local_peer,
+                        estimated_wait_ms: 10,
+                    })?;
+                    let prov = prov.clone();
+                    let ctx = Provisioner {
+                        p2p: p2p_for_closure.clone(),
+                        queue_mgr: queue_for_closure.clone(),
+                        worker_manager: wm_for_closure.clone(),
+                        provisioned: provisioned_clone.clone(),
+                        semaphore: semaphore_clone.clone(),
+                    };
+                    tokio::spawn(async move {
+                        provision_on_demand(&prov, ctx, req).await;
+                    });
+                    return Ok(accepted);
+                }
+
                 let resp = InferResponse {
                     request_id: req.request_id,
                     trace_id: req.trace_id.clone(),
@@ -677,6 +793,184 @@ async fn stream_request_to_terminal(
 /// Sends one InferMessage frame to `sender` via the P2P request/response
 /// channel. Errors are logged, never fatal: a dropped requester must not
 /// take down the worker loop.
+/// Serves a workload for a model the worker does not yet hold (M14).
+///
+/// Downloads `req.model_hash` from the requester through the verified
+/// transfer pipeline (per-chunk BLAKE3 + Merkle root + atomic rename),
+/// indexes the verified model into the local registry, loads it into an
+/// inference engine, and only then streams the request to a terminal
+/// event. Any failure is reported as a terminal `InferFailed`; this
+/// function never panics or takes down the node.
+async fn provision_on_demand(
+    prov: &ProvisioningConfig,
+    ctx: Provisioner,
+    req: InferRequest,
+) {
+    use decentraai_protocol::{InferMessage, InferProgress};
+
+    let p2p = &ctx.p2p;
+    let local_peer = p2p.local_peer_id();
+    let sender = req.sender_peer_id;
+    let model_hash = req.model_hash.clone();
+    let request_id = req.request_id;
+
+    // Already provisioned earlier in this session? Serve straight away.
+    let cached = ctx
+        .provisioned
+        .lock()
+        .await
+        .get(&model_hash)
+        .map(|(_, b)| b.clone());
+    if let Some(backend) = cached {
+        serve_provisioned_request(&backend, &ctx, local_peer, req).await;
+        return;
+    }
+
+    // Bound concurrent downloads (config `sharing.max_concurrent_downloads`).
+    let permit = match ctx.semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return, // semaphore closed during shutdown
+    };
+
+    // Keepalive: an empty progress frame resets the requester's wait clock
+    // so a slow transfer does not trip the coordinator timeout mid-download.
+    send_infer(
+        p2p,
+        sender,
+        InferMessage::InferProgress(InferProgress {
+            request_id,
+            worker_peer_id: local_peer,
+            tokens_generated: 0,
+            partial_output: String::new(),
+            percent_complete: 0.0,
+        }),
+    )
+    .await;
+
+    // Download + verify through the existing transfer pipeline.
+    let mut reputation = match decentraai_p2p::reputation::ReputationStore::load(
+        &prov.reputation_path,
+        prov.max_invalid_chunks,
+        prov.ban_duration,
+    ) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open reputation store for provisioning");
+            return;
+        }
+    };
+    let model_path = match decentraai_p2p::transfer::download(
+        p2p,
+        sender,
+        &model_hash,
+        &prov.data_dir,
+        &mut reputation,
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!(peer = %sender, error = %e, "on-demand model provisioning failed");
+            send_infer(
+                p2p,
+                sender,
+                InferMessage::InferFailed {
+                    request_id,
+                    worker_peer_id: local_peer,
+                    error: format!("model provisioning failed: {e}"),
+                    retryable: false,
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Index the verified model into the local registry, creating the
+    // registry file on first provisioning (a fresh node has none yet).
+    let models_dir = prov.data_dir.join("models");
+    match decentraai_registry::ModelRegistry::load(&prov.registry_path) {
+        Ok(mut registry) => {
+            let _ = registry.scan_directory(&models_dir);
+            let _ = registry.save(&prov.registry_path);
+        }
+        Err(_) => {
+            if let Ok(mut registry) = decentraai_registry::ModelRegistry::new(models_dir.clone()) {
+                if let Some(parent) = prov.registry_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = registry.scan_directory(&models_dir);
+                let _ = registry.save(&prov.registry_path);
+            }
+        }
+    }
+
+    // Load it into an engine, keeping the engine alive for the session.
+    let (engine, backend) = match (prov.backend_factory)(model_path).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start engine for provisioned model");
+            send_infer(
+                p2p,
+                sender,
+                InferMessage::InferFailed {
+                    request_id,
+                    worker_peer_id: local_peer,
+                    error: format!("provisioned engine failed to start: {e}"),
+                    retryable: true,
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    {
+        let mut map = ctx.provisioned.lock().await;
+        let entry = map
+            .entry(model_hash)
+            .or_insert_with(|| (engine, backend.clone()));
+        let backend = entry.1.clone();
+        drop(map);
+        serve_provisioned_request(&backend, &ctx, local_peer, req).await;
+    }
+    drop(permit);
+}
+
+/// Queues a request and streams it through an already-running backend to a
+/// terminal event. Mirrors the bound-model worker loop so provisioned
+/// models behave exactly like the worker's own model.
+async fn serve_provisioned_request(
+    backend: &decentraai_inference_adapter::OpenAiCompatibleBackend,
+    ctx: &Provisioner,
+    local_peer: libp2p::PeerId,
+    req: InferRequest,
+) {
+    use decentraai_protocol::InferMessage;
+
+    let p2p = &ctx.p2p;
+    if !ctx.queue_mgr.queue_request(req.clone(), local_peer).await {
+        if let Ok(bytes) = decentraai_protocol::serialize_message(&InferMessage::InferFailed {
+            request_id: req.request_id,
+            worker_peer_id: local_peer,
+            error: "worker queue is full".to_string(),
+            retryable: true,
+        }) {
+            let _ = p2p.request(req.sender_peer_id, bytes).await;
+        }
+        return;
+    }
+    if let Some(queued) = ctx.queue_mgr.dequeue_request(&local_peer).await {
+        stream_request_to_terminal(
+            backend,
+            p2p,
+            &ctx.queue_mgr,
+            &ctx.worker_manager,
+            queued,
+        )
+        .await;
+    }
+}
+
 async fn send_infer(p2p: &decentraai_p2p::P2PNode, sender: libp2p::PeerId, msg: InferMessage) {
     if let Ok(bytes) = decentraai_protocol::serialize_message(&msg) {
         if let Err(e) = p2p.request(sender, bytes).await {

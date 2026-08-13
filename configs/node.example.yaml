@@ -74,9 +74,13 @@ security:
 # from peers on the LAN. `auto` downloads and verifies every announced
 # model (per-chunk BLAKE3 + Merkle gate, quarantine on corruption);
 # `ask` prompts before each download; `off` ignores announcements.
+# `provision_models_on_demand` lets a distributed worker fetch a model it
+# does not yet hold when a workload demands it (M14), reusing the verified
+# transfer pipeline. It is advertised to coordinators as `can_provision`.
 sharing:
   mode: "auto"
   max_concurrent_downloads: 2
+  provision_models_on_demand: true
 
 # Subscription tiers (P1): everything is free; your tier reflects your
 # contribution. `models` is an allowlist of model file names; an empty

@@ -66,6 +66,12 @@ impl ComputeScheduler {
         &self.matcher
     }
 
+    /// Toggles whether workers that advertise `can_provision` are eligible
+    /// for workloads they do not yet serve (M14).
+    pub fn set_allow_provisioning(&mut self, allow: bool) {
+        self.matcher.allow_provisioning = allow;
+    }
+
     pub fn ledger(&self) -> &ReservationLedger {
         &self.ledger
     }

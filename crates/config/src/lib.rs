@@ -99,6 +99,11 @@ pub struct SharingSection {
     pub mode: ShareMode,
     /// Upper bound on simultaneous auto downloads (disk/CPU guard).
     pub max_concurrent_downloads: u32,
+    /// When true, a distributed worker that receives a workload for a model
+    /// it does not yet hold fetches that model on demand from the requester
+    /// through the verified-transfer pipeline (M14). The worker advertises
+    /// `can_provision` only when this is set.
+    pub provision_models_on_demand: bool,
 }
 
 impl Default for SharingSection {
@@ -106,6 +111,7 @@ impl Default for SharingSection {
         Self {
             mode: ShareMode::Auto,
             max_concurrent_downloads: 2,
+            provision_models_on_demand: true,
         }
     }
 }
@@ -506,6 +512,7 @@ security:
         let config = NodeConfig::load(file.path()).unwrap();
         assert_eq!(config.sharing.mode, ShareMode::Auto);
         assert_eq!(config.sharing.max_concurrent_downloads, 2);
+        assert!(config.sharing.provision_models_on_demand);
     }
 
     #[test]
@@ -516,16 +523,32 @@ security:
         let raw = std::fs::read_to_string(file.path()).unwrap();
         let stripped = raw
             .replace(
-                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n",
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n  provision_models_on_demand: true\n",
                 "",
             )
             .replace(
-                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n\n",
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n  provision_models_on_demand: true\n\n",
                 "",
             );
         std::fs::write(file.path(), stripped).unwrap();
         let config = NodeConfig::load(file.path()).unwrap();
         assert_eq!(config.sharing.mode, ShareMode::Auto);
+        assert!(config.sharing.provision_models_on_demand);
+    }
+
+    #[test]
+    fn provision_off_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace(
+            "provision_models_on_demand: true",
+            "provision_models_on_demand: false",
+        );
+        std::fs::write(file.path(), bad).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(!config.sharing.provision_models_on_demand);
     }
 
     #[test]

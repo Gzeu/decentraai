@@ -1194,6 +1194,11 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Optional running llama-server handle (spawned only when acting as a worker)
     let mut maybe_server: Option<decentraai_runtime::LlamaServer> = None;
 
+    // Factory that loads a downloaded model into its own llama-server and
+    // returns a serving backend (M14 on-demand provisioning). Set only when
+    // worker mode finds a real llama-server binary.
+    let mut provision_factory: Option<decentraai_distributed::ProvisioningFactory> = None;
+
     // Pre-load registry and prepare inference backend if we're a worker
     let (registry, model_hash, model_name, backend) = if will_be_worker {
         if !registry_path.exists() {
@@ -1256,6 +1261,40 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let backend = OpenAiCompatibleBackend::new(backend_config)
             .map_err(|e| anyhow::anyhow!("Failed to create inference backend: {}", e))?;
 
+        // Build the provisioning factory (M14): each downloaded model gets its
+        // own llama-server instance, kept alive for the worker session.
+        let max_ctx = config.inference.max_context_tokens;
+        let parallel = config.inference.max_concurrent_requests;
+        let reserve_cores = config.resources.reserve_cpu_cores;
+        let binary_for_factory = binary.clone();
+        provision_factory = Some(std::sync::Arc::new(move |model_path: PathBuf| {
+            let binary = binary_for_factory.clone();
+            Box::pin(async move {
+                let mut cfg = RuntimeConfig::new(model_path);
+                cfg.ctx_size = max_ctx;
+                cfg.parallel = parallel;
+                cfg.threads = Some(
+                    SystemSnapshot::collect()
+                        .logical_cpus
+                        .saturating_sub(usize::from(reserve_cores))
+                        .max(1),
+                );
+                let server = LlamaServer::spawn(&binary, &cfg).await?;
+                let backend_cfg = BackendConfig {
+                    base_url: server.base_url(),
+                    model: "provisioned".to_string(),
+                    api_key: None,
+                    connect_timeout: std::time::Duration::from_secs(3),
+                    request_timeout: std::time::Duration::from_secs(300),
+                    max_prompt_bytes: 200_000,
+                    max_output_tokens: 8192,
+                };
+                let backend = OpenAiCompatibleBackend::new(backend_cfg)
+                    .map_err(|e| anyhow::anyhow!("failed to create provisioned backend: {e}"))?;
+                Ok((Box::new(server) as Box<dyn std::any::Any + Send>, backend))
+            })
+        }));
+
         (
             Some(registry),
             Some(model_hash),
@@ -1305,6 +1344,12 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         args.name.clone(),
         compute_trusted,
     ));
+    // Coordinator-side policy: when the node permits on-demand provisioning,
+    // the scheduler may route workloads to workers that will fetch the model
+    // instead of only to workers that already serve it (M14).
+    compute_manager
+        .set_allow_provisioning(config.sharing.provision_models_on_demand)
+        .await;
 
     // Create a shared request tracker for streaming progress
     let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
@@ -1359,9 +1404,26 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             1.0, // Full capacity initially
         )?;
 
-        // Register the local backend to handle inference and streaming
+        // Register the local backend to handle inference and streaming. When
+        // on-demand provisioning is enabled and a real llama-server binary is
+        // available, the worker also answers workloads for models it does not
+        // hold yet by fetching them through the verified-transfer pipeline.
+        let can_provision = config.sharing.provision_models_on_demand && provision_factory.is_some();
+        let provisioning = if can_provision {
+            Some(decentraai_distributed::ProvisioningConfig {
+                data_dir: data_dir.clone(),
+                registry_path: registry_path.clone(),
+                reputation_path: data_dir.join("db/reputation.json"),
+                max_concurrent_downloads: config.sharing.max_concurrent_downloads as usize,
+                max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
+                ban_duration: Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+                backend_factory: provision_factory.take().expect("factory built above"),
+            })
+        } else {
+            None
+        };
         if let Some(backend) = &backend {
-            distributed.register_worker_backend(backend.clone(), model_hash.clone())?;
+            distributed.register_worker_backend(backend.clone(), model_hash.clone(), provisioning)?;
         }
 
         // Advertise compute capability from a real hardware probe so this
@@ -1370,15 +1432,21 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models)
+            .advertise_local(snapshot, gpu, served_models, can_provision)
             .await;
         info!(
             peer_id = %local_peer_id,
             node_name = %adv.node_name,
             models = ?adv.capability.served_models.iter().map(|m| &m.model_hash).collect::<Vec<_>>(),
+            can_provision,
             "registered as distributed compute worker"
         );
-        spawn_compute_broadcaster(compute_manager.clone(), distributed.p2p_node().clone()).await?;
+        spawn_compute_broadcaster(
+            compute_manager.clone(),
+            distributed.p2p_node().clone(),
+            can_provision,
+        )
+        .await?;
 
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
@@ -1465,6 +1533,7 @@ fn build_served_models(
 async fn spawn_compute_broadcaster(
     compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
     p2p_node: decentraai_p2p::P2PNode,
+    can_provision: bool,
 ) -> Result<()> {
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
     use decentraai_protocol::serialize_message;
@@ -1486,7 +1555,7 @@ async fn spawn_compute_broadcaster(
                 .map(|w| w.capability.served_models.clone())
                 .unwrap_or_default();
             let adv = compute_manager
-                .advertise_local(snapshot, gpu, served_models)
+                .advertise_local(snapshot, gpu, served_models, can_provision)
                 .await;
             if let Ok(bytes) = serialize_message(&adv) {
                 p2p_node.announce(bytes);

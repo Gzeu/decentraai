@@ -29,6 +29,11 @@ use decentraai_system_probe::{GpuProbeStatus, GpuSnapshot, SystemSnapshot};
 
 const MIB: u64 = 1024 * 1024;
 
+/// Conservative RAM footprint (MiB) assumed for a workload whose model is
+/// not yet on any worker, used only to make provisioning-capable workers
+/// schedulable before the model lands (M14).
+const PROVISION_DEFAULT_RAM_MB: u64 = 1024;
+
 /// Interval between local compute advertisement broadcasts.
 pub const DEFAULT_ADVERTISEMENT_INTERVAL_MS: u64 = 5_000;
 /// Heartbeat gap after which a peer's advertisement is treated as stale.
@@ -41,7 +46,10 @@ pub const ENGINE_LLAMA_SERVER: &str = "llama_server";
 /// Pure builder: turns a real hardware probe into a `ComputeAdvertisement`.
 ///
 /// Kept as a free function so unit tests can drive it with synthetic
-/// snapshots and GPU states without touching `nvidia-smi` or sysinfo.
+/// snapshots and GPU states without touching `nvidia-smi` or sysinfo. The
+/// argument list is long by design (each maps to one advertisement field);
+/// building a struct would only obscure the field correspondence.
+#[allow(clippy::too_many_arguments)]
 pub fn build_advertisement(
     local_peer: PeerId,
     node_name: &str,
@@ -49,6 +57,7 @@ pub fn build_advertisement(
     snapshot: SystemSnapshot,
     gpu: GpuProbeStatus,
     served_models: Vec<ServedModel>,
+    can_provision: bool,
     announced_at_ms: u64,
 ) -> ComputeAdvertisement {
     let (gpu_spec, free_vram_mib) = match &gpu {
@@ -74,6 +83,7 @@ pub fn build_advertisement(
             gpu: gpu_spec,
             engine: engine.to_string(),
             served_models,
+            can_provision,
         },
         availability: ComputeAvailability {
             available_ram_mb: snapshot.available_memory_bytes / MIB,
@@ -184,20 +194,41 @@ impl ComputeManager {
     /// footprint so the coordinator never under-reserves). Returns `None`
     /// when no known worker serves the model — the compute path cannot
     /// schedule it.
+    ///
+    /// When no worker serves the model but at least one trusted worker
+    /// advertises `can_provision`, the requirements are still returned so
+    /// the scheduler can route to a worker that will fetch the model on
+    /// demand (M14). Until the model is provisioned nobody knows its real
+    /// footprint, so a conservative default is used; the worker re-advertises
+    /// the true model footprint after it downloads it.
     pub async fn requirements_for(&self, model_hash: &str) -> Option<WorkloadRequirements> {
         let workers = self.scheduler.lock().await.registry().list();
         let mut ram: u64 = 0;
         let mut vram: u64 = 0;
+        let mut can_provision = false;
         for adv in &workers {
             if let Some(model) = adv.capability.model(model_hash) {
                 ram = ram.max(model.est_ram_mb);
                 vram = vram.max(model.est_vram_mb);
             }
+            if adv.capability.can_provision {
+                can_provision = true;
+            }
         }
         if ram == 0 && vram == 0 {
-            return None;
+            if !can_provision {
+                return None;
+            }
+            ram = PROVISION_DEFAULT_RAM_MB;
         }
         Some(WorkloadRequirements::new(model_hash.to_string(), ram, vram))
+    }
+
+    /// Sets the local policy: when true, the scheduler may route workloads
+    /// to workers that will fetch the model on demand instead of only to
+    /// workers that already serve it (M14).
+    pub async fn set_allow_provisioning(&self, allow: bool) {
+        self.scheduler.lock().await.set_allow_provisioning(allow);
     }
 
     /// Builds this node's own advertisement from a real probe and records it
@@ -207,6 +238,7 @@ impl ComputeManager {
         snapshot: SystemSnapshot,
         gpu: GpuProbeStatus,
         served_models: Vec<ServedModel>,
+        can_provision: bool,
     ) -> ComputeAdvertisement {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -219,6 +251,7 @@ impl ComputeManager {
             snapshot,
             gpu,
             served_models,
+            can_provision,
             now,
         );
         self.scheduler.lock().await.upsert(adv.clone());
@@ -290,6 +323,7 @@ mod tests {
             snapshot(),
             gpu(),
             vec![model()],
+            false,
             1_700_000_000_000,
         );
         assert_eq!(adv.peer_id, p);
@@ -300,6 +334,7 @@ mod tests {
         assert_eq!(adv.availability.available_vram_mb, Some(20000));
         assert_eq!(adv.availability.load_percent, 25);
         assert!(adv.capability.has_model("abc"));
+        assert!(!adv.capability.can_provision);
         let spec = adv.capability.gpu.unwrap();
         assert_eq!(spec.name, "RTX 4090");
         assert_eq!(spec.vram_mb, 24564);
@@ -315,6 +350,7 @@ mod tests {
             snapshot(),
             GpuProbeStatus::Unavailable("nvidia-smi not found".into()),
             vec![model()],
+            false,
             0,
         );
         assert!(adv.capability.gpu.is_none());
@@ -325,7 +361,7 @@ mod tests {
     async fn selects_and_releases_via_manager() {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
-        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], 0);
+        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0);
         manager.process_advertisement(adv).await;
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
@@ -334,5 +370,24 @@ mod tests {
         assert!(manager.select(&req).await.is_some(), "only one reservation tracked per select");
         manager.release(placement.reservation.reservation_id).await;
         assert!(manager.select(&req).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn requirements_for_accepts_provisioning_workers() {
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], true, 0);
+        manager.process_advertisement(adv).await;
+
+        let req = manager.requirements_for("zzz-not-served").await.expect("provisioning worker is schedulable");
+        assert_eq!(req.model_hash, "zzz-not-served");
+        assert!(req.est_ram_mb > 0);
+
+        // With no provisioning-capable worker, unknown models are not routable.
+        let p2 = peer();
+        let manager2 = ComputeManager::new(p2, "coordinator".into(), HashSet::from([p2]));
+        let adv2 = build_advertisement(p2, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], false, 0);
+        manager2.process_advertisement(adv2).await;
+        assert!(manager2.requirements_for("zzz-not-served").await.is_none());
     }
 }

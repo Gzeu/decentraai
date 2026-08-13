@@ -168,6 +168,7 @@ mod tests {
                     est_ram_mb: 1000,
                     est_vram_mb: 0,
                 }],
+                can_provision: false,
             },
             availability: ComputeAvailability {
                 available_ram_mb: 4 * 1024,
