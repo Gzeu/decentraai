@@ -612,6 +612,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         },
         "backend": state.backend_url,
         "api_port": state.info.api_port,
+        "node": node_info(&state.compute),
         "recent_events": recent_audit_events(&state.info.repo_root),
     });
     (
@@ -991,6 +992,36 @@ ol{padding-left:20px} li{margin:6px 0}
   <tbody id="execution"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
 </div>
 <div class="card">
+  <h2>Models</h2>
+  <table><thead><tr><th>Model</th><th>Engine</th><th>Context</th><th>RAM</th><th>VRAM</th><th>Active</th></tr></thead>
+  <tbody id="models"><tr><td colspan="6" class="off">loading&hellip;</td></tr></tbody></table>
+  <div class="small" id="models-status"></div>
+</div>
+<div class="card">
+  <h2>Settings</h2>
+  <table>
+    <tr><td>Node name</td><td id="set-name">&mdash;</td></tr>
+    <tr><td>Dashboard port</td><td id="set-port">&mdash;</td></tr>
+    <tr><td>Discovery</td><td id="set-discovery">&mdash;</td></tr>
+    <tr><td>Trusted workers</td><td id="set-trust">&mdash;</td></tr>
+    <tr><td>Model / engine</td><td id="set-model">&mdash;</td></tr>
+    <tr><td>CPU cores</td><td id="set-cpu">&mdash;</td></tr>
+    <tr><td>RAM</td><td id="set-ram">&mdash;</td></tr>
+    <tr><td>GPU</td><td id="set-gpu">&mdash;</td></tr>
+  </table>
+</div>
+<div class="card">
+  <h2>Diagnostics</h2>
+  <table>
+    <tr><td>Node health</td><td id="diag-health">&mdash;</td></tr>
+    <tr><td>Engine</td><td id="diag-engine">&mdash;</td></tr>
+    <tr><td>P2P / network</td><td id="diag-p2p">&mdash;</td></tr>
+    <tr><td>Workers</td><td id="diag-workers">&mdash;</td></tr>
+    <tr><td>Engine restarts (recovery)</td><td id="diag-restarts">&mdash;</td></tr>
+    <tr><td>Active sessions (KV)</td><td id="diag-sessions">&mdash;</td></tr>
+  </table>
+</div>
+<div class="card">
   <h2>Recent security events (audit log)</h2>
   <table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead>
   <tbody id="events"><tr><td colspan="3" class="off">loading&hellip;</td></tr></tbody></table>
@@ -1139,9 +1170,95 @@ async function refresh() {
     ).join('');
     document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="9" class="off">no executions yet</td></tr>';
   } catch (e) {}
+  // ---- Models / Settings / Diagnostics (from /status node+system + real manager state) ----
+  let trustList = '';
+  try { const tp = await (await fetch('/v1/peers', { headers })).json(); trustList = tp.length + ' tracked peer(s)'; } catch (e) {}
+  const s = await (await fetch('/status')).json().catch(() => null);
+  if (s) {
+    const mrows = (s.node && s.node.served_models || []).map(m =>
+      '<tr><td>' + esc(m.name || '') + '</td><td>' + esc(s.node.engine || '') + '</td><td>' + (m.context_tokens || '&mdash;') + ' tok</td><td>' + Math.round((m.est_ram_mb||0)/1024) + ' GiB</td><td>' + (m.est_vram_mb ? Math.round((m.est_vram_mb||0)/1024)+' GiB' : '&mdash;') + '</td><td>' + (s.model === m.name ? '<span class="ok">loaded</span>' : '<span class="off">-</span>') + '</td></tr>'
+    ).join('');
+    document.getElementById('models').innerHTML = mrows || '<tr><td colspan="6" class="off">no served models advertised</td></tr>';
+    document.getElementById('models-status').textContent = 'active model: ' + esc(s.model || '') + (s.model_loaded ? ' &middot; <span class="ok">loaded</span>' : ' &middot; <span class="off">unloaded</span>');
+
+    document.getElementById('set-name').textContent = (s.node && s.node.name) || esc(s.model) || '';
+    document.getElementById('set-port').textContent = s.api_port;
+    document.getElementById('set-discovery').textContent = 'mDNS / LAN (auto)';
+    document.getElementById('set-trust').textContent = trustList ? trustList : 'not loaded';
+    document.getElementById('set-model').textContent = esc(s.model || '') + ' / ' + esc((s.node && s.node.engine) || '');
+    const sys = s.system || {};
+    document.getElementById('set-cpu').textContent = sys.cpu_threads ? sys.cpu_threads + ' threads' : '&mdash;';
+    document.getElementById('set-ram').textContent = (sys.ram_total_gib ? Math.round(sys.ram_total_gib) + ' GiB total' : '&mdash;');
+    document.getElementById('set-gpu').textContent = sys.gpu ? (sys.gpu.name || 'GPU') + ' @ ' + sys.gpu.utilization_percent + '%' : '<span class="off">none</span>';
+
+    const ok = (cond) => cond ? '<span class="ok">ok</span>' : '<span class="off">stale/unknown</span>';
+    document.getElementById('diag-health').innerHTML = s.model_loaded ? '<span class="ok">model loaded, node up</span>' : '<span class="off">model not loaded</span>';
+    document.getElementById('diag-engine').innerHTML = s.backend ? '<code>' + esc(s.backend) + '</code>' : '<span class="off">none</span>';
+  }
+  if (c) {
+    document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
+    document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
+  }
+  document.getElementById('diag-restarts').innerHTML = 'see audit / recovery events below';
+  if (n) {
+    document.getElementById('diag-p2p').innerHTML = (n.connected || []).length + ' connected, ' + (n.links || []).length + ' measured link(s)';
+  }
 }
 refresh(); setInterval(refresh, 3000);
 "#;
+
+/// Real node + engine info derived from the local compute advertisement when a
+/// compute manager is attached. Falls back to empty markers otherwise — never
+/// mock data.
+fn node_info(compute: &Option<Arc<decentraai_distributed::ComputeManager>>) -> serde_json::Value {
+    let Some(compute) = compute else {
+        return serde_json::json!({ "name": "", "engine": "", "served_models": [], "attached": false });
+    };
+    let NodeProfile {
+        name,
+        engine,
+        served_models,
+    } = node_profile(compute);
+    serde_json::json!({
+        "name": name,
+        "engine": engine,
+        "served_models": served_models,
+        "attached": true,
+    })
+}
+
+/// Extracts the local node's real name, engine kind and served models (with
+/// model file, RAM/VRAM footprint and context window) from the last
+/// advertisement this node broadcast.
+fn node_profile(compute: &decentraai_distributed::ComputeManager) -> NodeProfile {
+    let mut profile = NodeProfile::default();
+    if let Some(adv) = compute.last_local_advertisement_sync() {
+        profile.name = adv.node_name;
+        profile.engine = adv.capability.engine;
+        profile.served_models = adv
+            .capability
+            .served_models
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "name": m.file_name,
+                    "size_mb": m.size_mb,
+                    "est_ram_mb": m.est_ram_mb,
+                    "est_vram_mb": m.est_vram_mb,
+                    "context_tokens": m.context_tokens,
+                })
+            })
+            .collect();
+    }
+    profile
+}
+
+#[derive(Default)]
+struct NodeProfile {
+    name: String,
+    engine: String,
+    served_models: Vec<serde_json::Value>,
+}
 
 /// Loads the local API token or generates a fresh one with 0600
 /// permissions. The token never leaves the machine: it only guards the
@@ -1176,6 +1293,14 @@ mod tests {
     use super::*;
     use crate::{LlamaServer, RuntimeConfig};
     use decentraai_config::{TierPolicy, TiersSection};
+
+    #[test]
+    fn node_info_without_compute_is_not_attached() {
+        let info = node_info(&None);
+        assert_eq!(info["attached"], false);
+        assert_eq!(info["name"], "");
+        assert!(info["served_models"].as_array().unwrap().is_empty());
+    }
 
     #[cfg(unix)]
     fn write_fake_server(dir: &Path) -> std::path::PathBuf {
