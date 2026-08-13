@@ -59,7 +59,7 @@ requests — all on real hardware, no mocks.
 | P6 | Zero-touch sharing: `swarm start` auto-downloads announced models (mDNS + consent modes) | Done |
 | P2 | Chat UI in the dashboard | Next |
 | M18 | **Distributed execution fabric foundation** — universal node, mDNS/libp2p discovery, trusted admission, fabric planner, reservations, real remote inference, streaming, worker reuse, bidirectional Desktop ↔ Laptop (verified on real LAN) | **Done** |
-| M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) | Next |
+| M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) — real RTT via InferPing/InferPong, fold reach cost into planner scoring | Done |
 | M20 | KV-aware inference fabric | Next |
 | M21 | Distributed MoE / expert fabric | Next |
 | M22 | Multi-engine runtime abstraction | Next |

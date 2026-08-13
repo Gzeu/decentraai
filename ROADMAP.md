@@ -405,20 +405,40 @@ Laptop, both running the single universal `decentraai node`):
 
 The fabric crate supplies the building blocks (`ExecutionPlan`,
 `ComputeScheduler::reserve_worker`, an `ExecutionPlanner`, a `NetworkGraph`, a
-`KvPlanner`, an `ExpertRegistry`/`ExpertRouter` capability gate). **Only the
-single-worker reservation/streaming path is exercised and production-verified
-today.** Model/layer splitting, KV reuse, MoE distribution, network-aware
-optimization and multi-worker execution planning are **not** claimed to be
-complete — they are the next milestones below.
+`KvPlanner`, an `ExpertRegistry`/`ExpertRouter` capability gate). **The
+single-worker reservation/streaming path is production-verified, and the
+execution planner now weighs real network cost (M19) when it selects a worker.**
+Model/layer splitting, KV reuse, MoE distribution and multi-worker execution
+planning are still the milestones below.
 
-## 15. NEXT — M19: Network-Aware Scheduler
+## 15. M19: Network-Aware Scheduler — DONE
 
-- [ ] latency
-- [ ] bandwidth
-- [ ] topology
-- [ ] transfer cost
-- [ ] worker load / capacity
-- [ ] dynamic worker scoring
+The execution planner no longer ranks workers in isolation: it reads a live
+inter-node link graph and folds reach cost into its score. The coordinator
+measures real round-trip latency by pinging every known *remote* worker over
+the P2P request/response channel (`InferPing`/`InferPong`) every 5s, and writes
+the measured RTT into the graph the planner reads. The local node is never
+pinged (libp2p refuses self-dial).
+
+- [x] latency — real RTT measured via `InferPing`/`InferPong` over the P2P
+  request/response channel; `spawn_network_probe` times each round trip and
+  feeds `ComputeManager::record_rtt` into the coordinator's `NetworkGraph`.
+- [x] bandwidth — per-peer `bandwidth_mbps` in `LinkMetrics`, with soft priors
+  per locality and a measured field; feeds the transfer-cost estimator.
+- [x] topology / connection quality — `Locality` (Local / SameHost / Lan /
+  Remote) with prior RTT + bandwidth, folded into link scoring.
+- [x] transfer cost — deterministic `transfer_ms_per_mib` estimator and
+  `reach_cost_ms` (RTT + transfer time) consulted by the planner.
+- [x] worker load / capacity — `load_percent`, `queue_depth`, RAM/VRAM headroom
+  are first-class scoring terms in the planner.
+- [x] dynamic worker scoring — `ExecutionPlanner::score` combines throughput,
+  latency, load, queue, headroom, network reach cost and KV headroom; ranks
+  deterministically (score desc, PeerId asc) with deterministic fallbacks.
+- [x] preserves trust → planner → reservation → P2P → worker path (M18);
+  the loopback-backend guarantee is untouched (no llama-server LAN exposure);
+  no mocks on the production path.
+
+Related commit: `c5d2b44` (plus the probe wiring in `node-cli`).
 
 ## 16. NEXT — M20: KV-Aware Inference Fabric
 
