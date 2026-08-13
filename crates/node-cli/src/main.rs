@@ -357,9 +357,11 @@ fn setup(args: SetupArgs) -> Result<()> {
         }
         _ => "no NVIDIA GPU detected (CPU-only)".to_string(),
     };
-    println!("Hardware detected: {} logical cores, {:.1} GiB RAM available",
+    println!(
+        "Hardware detected: {} logical cores, {:.1} GiB RAM available",
         snapshot.logical_cpus,
-        snapshot.available_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+        snapshot.available_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     println!("GPU: {gpu_line}");
 
     // 4. Auto-select a model: first GGUF under the models dir (or explicit
@@ -384,7 +386,14 @@ fn setup(args: SetupArgs) -> Result<()> {
         "off"
     };
 
-    let yaml = setup_yaml(&node_name, &data_dir, max_context, api_port, gpu_policy, snapshot.logical_cpus);
+    let yaml = setup_yaml(
+        &node_name,
+        &data_dir,
+        max_context,
+        api_port,
+        gpu_policy,
+        snapshot.logical_cpus,
+    );
 
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
@@ -392,8 +401,12 @@ fn setup(args: SetupArgs) -> Result<()> {
     std::fs::write(&config_path, yaml)?;
 
     // 6. Validate the generated config actually parses (self-check).
-    NodeConfig::load(&config_path)
-        .with_context(|| format!("generated config failed validation: {}", config_path.display()))?;
+    NodeConfig::load(&config_path).with_context(|| {
+        format!(
+            "generated config failed validation: {}",
+            config_path.display()
+        )
+    })?;
 
     println!("\n=== DecentraAI node is READY ===");
     println!("  PeerId : {peer_id}");
@@ -403,8 +416,14 @@ fn setup(args: SetupArgs) -> Result<()> {
     println!("  Config : {}", config_path.display());
     println!();
     println!("Next steps (all auto-discover, no manual config):");
-    println!("  decentraai swarm start --config {conf}", conf = config_path.display());
-    println!("  decentraai distributed start --config {conf}", conf = config_path.display());
+    println!(
+        "  decentraai swarm start --config {conf}",
+        conf = config_path.display()
+    );
+    println!(
+        "  decentraai distributed start --config {conf}",
+        conf = config_path.display()
+    );
     Ok(())
 }
 
@@ -419,7 +438,10 @@ fn detect_model_label(models_dir: &std::path::Path, model_name: &str) -> (String
             None,
         )
     } else {
-        (model_name.to_string(), Some(models_dir.join(model_name).display().to_string()))
+        (
+            model_name.to_string(),
+            Some(models_dir.join(model_name).display().to_string()),
+        )
     }
 }
 
@@ -580,11 +602,19 @@ fn open_dashboard(args: OpenArgs) -> Result<()> {
 /// same LAN discover each other automatically. Shuts down cleanly on
 /// SIGINT/SIGTERM (which is what Ctrl+C and systemd send).
 async fn node_start(args: NodeArgs) -> Result<()> {
+    use PathBuf;
+    use decentraai_distributed::{DistributedInference, InferenceConfig};
+    use decentraai_inference_adapter::{BackendConfig, EngineKind, OpenAiCompatibleBackend};
+    use decentraai_p2p::{
+        ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer,
+    };
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::queue::InferenceQueue;
     use decentraai_runtime::{
-        LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
+        LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server,
     };
+    use libp2p::PeerId as Libp2pPeerId;
+    use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -607,8 +637,6 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     ensure_admitted(&config)?;
 
     let data_dir = expand_tilde(&config.node.data_dir);
-    // Copy the values the outer loop needs before moving `config` into the
-    // serving task.
     let node_name = config.node.name.clone();
     let api_port = config.inference.api_port;
     let bind_address = config.inference.bind_address.clone();
@@ -621,50 +649,56 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         identity.save(&identity_path)?;
         identity
     };
-    info!(peer_id = %identity.peer_id(), "node identity ready");
 
-    // A shared shutdown signal so discovery and serving stop together.
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    // The libp2p peer_id is derived from the identity signing key, exactly as
+    // the standalone `distributed` node does, so the transport PeerId is
+    // stable and matches `identity.peer_id()`.
+    let libp2p_keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
+        .context("libp2p keypair from identity")?;
+    let local_peer_id = Libp2pPeerId::from(libp2p_keypair.public());
+    info!(peer_id = %identity.peer_id(), p2p_peer_id = %local_peer_id, "node identity ready");
 
-    // 2 + 3. Serving: automatically load a detected model and serve the
-    // dashboard. If no model is present the node still runs (discovery +
-    // status) and shows onboarding guidance in the dashboard.
-    let serve_handle = {
-        let data_dir = data_dir.clone();
-        let serve_shutdown = shutdown_tx.clone();
-        let mut shutdown_rx = serve_shutdown.subscribe();
-        let model_name = auto_detect_model(&data_dir.join("models")).unwrap_or_default();
-        tokio::spawn(async move {
-            if model_name.is_empty() {
-                info!("no local model found; running status-only mode (add a .gguf to models/)");
-                return;
+    // 2. Detect a local model. If present, this node is BOTH a worker (serves
+    // the model over P2P) and a coordinator (routes/streams to other workers);
+    // if absent it is a coordinator-only discovery node.
+    let models_dir = data_dir.join("models");
+    let model_name = auto_detect_model(&models_dir).unwrap_or_default();
+    let detected_model = if model_name.is_empty() {
+        None
+    } else {
+        let model = models_dir.join(&model_name);
+        if model.is_file() {
+            Some((model, model_name.clone()))
+        } else {
+            None
+        }
+    };
+
+    // Optional local llama-server handle: owned by the dashboard (ServeManager)
+    // for idle-unload/status, while the worker backend is an HTTP client to the
+    // same address. One runtime, two consumers.
+    let mut maybe_server: Option<LlamaServer> = None;
+    let mut provision_factory: Option<decentraai_distributed::ProvisioningFactory> = None;
+    let mut worker_backend: Option<OpenAiCompatibleBackend> = None;
+    let mut model_hash = String::new();
+    let mut model_size_bytes: u64 = 0;
+    let mut backend_url = String::new();
+
+    if let Some((model, model_name)) = detected_model.as_ref() {
+        model_size_bytes = metadata_size(model);
+        model_hash = blake3::hash(std::fs::read(model).ok().as_deref().unwrap_or_default())
+            .to_hex()
+            .to_string();
+
+        let binary = match find_llama_server(None) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                warn!(error = %e, "llama-server not found; node runs without serving (discovery/coordinator only)");
+                None
             }
-            let registry = ModelRegistry::new(data_dir.join("models"));
-            let registry = match registry {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "could not create model registry");
-                    return;
-                }
-            };
-            let models_dir = data_dir.join("models");
-            let model = match resolve_model(
-                &registry,
-                &model_path(&models_dir, &model_name),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, "detected model not usable");
-                    return;
-                }
-            };
-            let binary = match find_llama_server(None) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "llama-server not found; dashboard will run without a backend model");
-                    return;
-                }
-            };
+        };
+
+        if let Some(binary) = binary {
             let mut runtime = RuntimeConfig::new(model.clone());
             runtime.ctx_size = config.inference.max_context_tokens;
             runtime.parallel = config.inference.max_concurrent_requests;
@@ -674,101 +708,289 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
                     .max(1),
             );
-            let server = match LlamaServer::start(&binary, &runtime) {
-                Ok(s) => s,
+            match LlamaServer::start(&binary, &runtime) {
+                Ok(server) => {
+                    backend_url = server.base_url();
+                    let backend = OpenAiCompatibleBackend::new(BackendConfig {
+                        base_url: backend_url.clone(),
+                        model: model_name.clone(),
+                        api_key: None,
+                        connect_timeout: Duration::from_secs(3),
+                        request_timeout: Duration::from_secs(300),
+                        max_prompt_bytes: 200_000,
+                        max_output_tokens: 8192,
+                        engine: EngineKind::LlamaServer,
+                    })
+                    .ok();
+                    worker_backend = backend;
+                    // Provisioning factory (M14): a downloaded model gets its
+                    // own llama-server instance, kept alive for the session.
+                    let max_ctx = config.inference.max_context_tokens;
+                    let parallel = config.inference.max_concurrent_requests;
+                    let reserve_cores = config.resources.reserve_cpu_cores;
+                    let binary_for_factory = binary.clone();
+                    provision_factory = Some(Arc::new(move |model_path: PathBuf| {
+                        let binary = binary_for_factory.clone();
+                        Box::pin(async move {
+                            let mut cfg = RuntimeConfig::new(model_path);
+                            cfg.ctx_size = max_ctx;
+                            cfg.parallel = parallel;
+                            cfg.threads = Some(
+                                SystemSnapshot::collect()
+                                    .logical_cpus
+                                    .saturating_sub(usize::from(reserve_cores))
+                                    .max(1),
+                            );
+                            let server = LlamaServer::spawn(&binary, &cfg).await?;
+                            let backend_cfg = BackendConfig {
+                                base_url: server.base_url(),
+                                model: "provisioned".to_string(),
+                                api_key: None,
+                                connect_timeout: Duration::from_secs(3),
+                                request_timeout: Duration::from_secs(300),
+                                max_prompt_bytes: 200_000,
+                                max_output_tokens: 8192,
+                                engine: EngineKind::LlamaServer,
+                            };
+                            let backend = OpenAiCompatibleBackend::new(backend_cfg)
+                                .map_err(|e| anyhow::anyhow!("provisioned backend: {e}"))?;
+                            Ok((Box::new(server) as Box<dyn std::any::Any + Send>, backend))
+                        })
+                    }));
+                    maybe_server = Some(server);
+                }
                 Err(e) => {
-                    warn!(error = %e, "failed to start llama-server");
-                    return;
+                    warn!(error = %e, "failed to start llama-server; continuing as coordinator-only")
                 }
-            };
-            let backend_url = server.base_url();
-            let idle_timeout = Duration::from_secs(
-                u64::from(config.inference.idle_model_unload_minutes) * 60,
-            );
-            let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));
-            let watcher = manager.clone();
-            let mut watcher_shutdown = serve_shutdown.subscribe();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    tick.tick().await;
-                    if watcher_shutdown.try_recv().is_ok() {
-                        break;
+            }
+        }
+    }
+
+    let is_worker = worker_backend.is_some();
+    if is_worker {
+        info!(model = %model_name, hash = %model_hash, "node will act as a remote worker");
+    } else {
+        info!("node running as a coordinator/discovery node (no servable model)");
+    }
+
+    // ---- Distributed stack (the exact wiring `decentraai distributed` uses) ----
+
+    // Trust set from the pairing/trust store; empty until operators trust peers.
+    let mut compute_trusted = std::collections::HashSet::new();
+    let trust_db_path = data_dir.join("trust.db");
+    if trust_db_path.exists() {
+        use decentraai_discovery::TrustStore;
+        match TrustStore::new(&trust_db_path) {
+            Ok(store) => {
+                for record in store.list_trusted().unwrap_or_default() {
+                    if let Ok(peer) = record.worker_peer_id.parse::<libp2p::PeerId>() {
+                        compute_trusted.insert(peer);
                     }
-                    let _ = watcher.lock().await.unload_if_idle().await;
                 }
-            });
-            let token = if config.inference.api_auth_required {
-                ensure_api_token(&data_dir.join("runtime/api.token")).ok()
-            } else {
-                None
-            };
-            let info = DashboardInfo {
-                repo_root: data_dir.clone(),
-                reputation_path: Some(data_dir.join("db/reputation.json")),
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open trust.db; compute trust set empty")
+            }
+        }
+    }
+
+    let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
+        local_peer_id,
+        InferenceConfig::default(),
+    ));
+    let compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
+        local_peer_id,
+        node_name.clone(),
+        compute_trusted,
+    ));
+    compute_manager
+        .set_allow_provisioning(config.sharing.provision_models_on_demand)
+        .await;
+
+    let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
+
+    let mut distributed_handler =
+        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    distributed_handler.set_tracker(tracker.clone());
+    distributed_handler.set_compute_manager(compute_manager.clone());
+    let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
+
+    // Serve manifests/chunks off the registry if one exists (model sharing).
+    let registry_path = data_dir.join("db/registry.json");
+    if registry_path.exists() {
+        if let Ok(reg) = ModelRegistry::load(&registry_path) {
+            chained_handler = chained_handler.add_handler(Arc::new(RegistryServer::new(reg)));
+        }
+    }
+
+    let p2p_node = P2PNode::new(
+        &identity,
+        config.network.max_message_bytes as usize,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained_handler)),
+    )?;
+    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
+
+    let mut distributed = DistributedInference::new(
+        p2p_node,
+        InferenceConfig::default(),
+        Some(worker_manager.clone()),
+        Some(tracker.clone()),
+    )?;
+    distributed.set_compute_manager(compute_manager.clone());
+
+    if is_worker {
+        let model_name = model_name.clone();
+        distributed.register_as_worker(model_name.clone(), vec![model_hash.clone()], 1.0)?;
+
+        let can_provision =
+            config.sharing.provision_models_on_demand && provision_factory.is_some();
+        let provisioning = if can_provision {
+            Some(decentraai_distributed::ProvisioningConfig {
+                data_dir: data_dir.clone(),
+                registry_path: registry_path.clone(),
+                reputation_path: data_dir.join("db/reputation.json"),
+                max_concurrent_downloads: config.sharing.max_concurrent_downloads as usize,
                 max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
                 ban_duration: Duration::from_secs(
                     u64::from(config.security.ban_duration_minutes) * 60,
                 ),
-                api_port: config.inference.api_port,
-                model_name,
-                model_size_bytes: metadata_size(&model),
-                generation: config.inference.generation.clone(),
-            };
-            let token_store_path = config
-                .tiers
-                .as_ref()
-                .map(|_| data_dir.join("db/tokens.json"));
-            let queue = InferenceQueue::new(
-                usize::from(config.inference.queue_max_requests),
-                Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
-            );
-            let state = ApiState::new(
-                backend_url,
-                token.clone(),
-                manager.clone(),
-                info,
-                token_store_path,
-                config.tiers.clone(),
-                queue,
-            );
-            let addr = serve_api(
-                state,
-                &config.inference.bind_address,
-                config.inference.api_port,
-            )
-            .await;
-            match addr {
-                Ok(a) => info!(address = %a, "dashboard serving"),
-                Err(e) => warn!(error = %e, "dashboard failed to bind"),
-            }
-            let _ = shutdown_rx.recv().await;
-            let _ = manager.lock().await.shutdown().await;
-        })
-    };
+                backend_factory: provision_factory.take().expect("factory built above"),
+            })
+        } else {
+            None
+        };
+        if let Some(backend) = worker_backend {
+            distributed.register_worker_backend(backend, model_hash.clone(), provisioning)?;
+        }
 
-    // 4. Node/watch loop: hold the daemon open and print status until stopped.
-    let mut shutdown_rx = shutdown_tx.subscribe();
+        // Advertise real compute + hardware so the capability scheduler can
+        // select this node and coordinators see it as a ready worker.
+        let served_models = vec![decentraai_compute::ServedModel {
+            model_hash: model_hash.clone(),
+            file_name: model_name.clone(),
+            size_mb: (model_size_bytes / (1024 * 1024)).max(1),
+            est_ram_mb: model_size_bytes / (1024 * 1024) / 4 + 1024,
+            est_vram_mb: 0,
+        }];
+        let snapshot = SystemSnapshot::collect();
+        let gpu = decentraai_system_probe::probe_gpu();
+        let adv = compute_manager
+            .advertise_local(snapshot, gpu, served_models, can_provision)
+            .await;
+        info!(
+            peer_id = %local_peer_id,
+            node_name = %adv.node_name,
+            model = %model_name,
+            models = ?adv.capability.served_models.iter().map(|m| &m.model_hash).collect::<Vec<_>>(),
+            can_provision,
+            "registered as distributed compute worker"
+        );
+        spawn_compute_broadcaster(
+            compute_manager.clone(),
+            distributed.p2p_node().clone(),
+            can_provision,
+        )
+        .await?;
+    }
+
+    // M19: RTT probing to known workers for network-aware planning.
+    spawn_network_probe(compute_manager.clone(), distributed.p2p_node().clone()).await;
+    // M24: reap stale reservations / evict dead workers with audit.
+    spawn_worker_reaper(
+        compute_manager.clone(),
+        data_dir.join("logs"),
+        default_reap_grace(),
+    )
+    .await;
+
+    // mDNS / LAN worker discovery + heartbeats.
+    distributed.start_worker_discovery().await?;
+
+    // ---- Dashboard / OpenAI-compatible API (local serving + status) ----
+    // The dashboard owns the llama-server lifecycle (idle-unload); the worker
+    // backend points at the same address. When a node has a model it is fully
+    // usable standalone (local inference + dashboard) even with no peers.
+    if is_worker && !backend_url.is_empty() {
+        let idle_timeout =
+            Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+        let manager = Arc::new(Mutex::new(ServeManager::new(
+            maybe_server.take().expect("server started"),
+            idle_timeout,
+        )));
+        let watcher = manager.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let _ = watcher.lock().await.unload_if_idle().await;
+            }
+        });
+        let token = if config.inference.api_auth_required {
+            ensure_api_token(&data_dir.join("runtime/api.token")).ok()
+        } else {
+            None
+        };
+        let info = DashboardInfo {
+            repo_root: data_dir.clone(),
+            reputation_path: Some(data_dir.join("db/reputation.json")),
+            max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
+            ban_duration: Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+            api_port: config.inference.api_port,
+            model_name: model_name.clone(),
+            model_size_bytes,
+            generation: config.inference.generation.clone(),
+        };
+        let token_store_path = config
+            .tiers
+            .as_ref()
+            .map(|_| data_dir.join("db/tokens.json"));
+        let queue = InferenceQueue::new(
+            usize::from(config.inference.queue_max_requests),
+            Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
+        );
+        let state = ApiState::new(
+            backend_url.clone(),
+            token.clone(),
+            manager.clone(),
+            info,
+            token_store_path,
+            config.tiers.clone(),
+            queue,
+        );
+        match serve_api(state, &bind_address, api_port).await {
+            Ok(addr) => info!(address = %addr, "dashboard serving"),
+            Err(e) => warn!(error = %e, "dashboard failed to bind"),
+        }
+    } else {
+        info!(
+            "no local model/runtime; running as a coordinator/discovery node (dashboard skipped)"
+        );
+    }
+
     println!(
-        "DecentraAI node running\n  Node   : {node_name}\n  PeerId : {pid}\n  Config : {conf}\n  Dashboard/API: http://{bind}:{port}/  (dashboard + OpenAI-compatible API)\n  Press Ctrl+C to stop",
+        "DecentraAI node running\n  Node      : {node_name}\n  PeerId    : {pid}\n  P2P PeerId: {p2p}\n  Listening : {bound}/p2p/{p2p}\n  Dashboard : http://{bind}:{port}/  (dashboard + OpenAI-compatible API)\n  Worker    : {worker}\n  Press Ctrl+C to stop",
         node_name = node_name,
         pid = identity.peer_id(),
-        conf = config_path.display(),
+        p2p = local_peer_id,
+        bound = bound,
         bind = bind_address,
-        port = api_port
+        port = api_port,
+        worker = if is_worker {
+            "yes (serving model)"
+        } else {
+            "no (coordinator-only)"
+        }
     );
-    tokio::select! {
-        _ = shutdown_rx.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
-    let _ = shutdown_tx.send(());
-    let _ = serve_handle.await;
-    Ok(())
-}
 
-/// Joins the models dir with a detected model filename.
-fn model_path(models_dir: &std::path::Path, name: &str) -> String {
-    models_dir.join(name).display().to_string()
+    tokio::signal::ctrl_c().await?;
+
+    // Clean shutdown: stop the llama-server we own and the distributed node.
+    if let Some(server) = maybe_server.take() {
+        let _ = server.stop().await;
+    }
+    distributed.shutdown();
+    Ok(())
 }
 
 /// Best-effort file size (MiB-in bytes); 0 when unknown.
@@ -1001,8 +1223,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     let share_mode = config.sharing.mode;
     let max_concurrent = config.sharing.max_concurrent_downloads as usize;
     let max_invalid_chunks = config.security.max_invalid_chunks_per_peer;
-    let ban_duration =
-        Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60);
+    let ban_duration = Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60);
     let worker = run_share_worker(
         ann_rx,
         node.clone(),
@@ -1051,7 +1272,10 @@ struct ShareWorkerConfig {
 /// Downloads are serialized on one worker (reputation writes are not
 /// concurrent), so `max_concurrent` caps the queue it drains per peer.
 async fn run_share_worker(
-    mut ann_rx: tokio::sync::mpsc::UnboundedReceiver<(decentraai_p2p::PeerId, decentraai_manifest::Manifest)>,
+    mut ann_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        decentraai_p2p::PeerId,
+        decentraai_manifest::Manifest,
+    )>,
     node: decentraai_p2p::P2PNode,
     cfg: ShareWorkerConfig,
     max_concurrent: usize,
@@ -1118,14 +1342,7 @@ async fn run_share_worker(
         info!(peer = %peer, model = %manifest.file_name, "auto-downloading announced model");
         let result = {
             let mut guard = reputation.lock().await;
-            download_multi(
-                &node,
-                &[peer],
-                &manifest.model_id,
-                &data_dir,
-                &mut guard,
-            )
-            .await
+            download_multi(&node, &[peer], &manifest.model_id, &data_dir, &mut guard).await
         };
         in_flight.remove(&manifest.model_id);
         match result {
@@ -1573,8 +1790,8 @@ fn trust_command(command: TrustCommand) -> Result<()> {
         Remove,
     }
 
-    let node_config = NodeConfig::load(config)
-        .with_context(|| format!("loading {}", config.display()))?;
+    let node_config =
+        NodeConfig::load(config).with_context(|| format!("loading {}", config.display()))?;
     let data_dir = expand_tilde(&node_config.node.data_dir);
     let trust_db_path = data_dir.join("trust.db");
     let store = TrustStore::new(&trust_db_path)
@@ -1715,12 +1932,13 @@ fn tier_command(command: TierCommand) -> Result<()> {
 /// Reads the contribution report written by a running coordinator (M17).
 /// A missing report is not an error: it prints guidance and returns `None`'s
 /// empty list.
-fn load_contribution_report(data_dir: &Path) -> Result<Vec<decentraai_distributed::ContributionRow>> {
+fn load_contribution_report(
+    data_dir: &Path,
+) -> Result<Vec<decentraai_distributed::ContributionRow>> {
     let path = data_dir.join("db/contributions.json");
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
-            format!("reading contribution report from {}", path.display())
-        }),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("reading contribution report from {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!(
                 "No contribution report at {}.\n\
@@ -1812,9 +2030,9 @@ fn apply_tier_changes(
     let logs_dir = data_dir.join("logs");
     let mut store = store;
     for TierChange { name, to, .. } in &changes {
-        let _from = store.set_tier(name, Tier(*to)).with_context(|| {
-            format!("reassigning tier of token '{name}'")
-        })?;
+        let _from = store
+            .set_tier(name, Tier(*to))
+            .with_context(|| format!("reassigning tier of token '{name}'"))?;
         decentraai_audit::record_best_effort(
             &logs_dir,
             "tier_changed",
@@ -1932,9 +2150,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         // inference. The binary is found via --binary, the DECENTRAAI_LLAMA_SERVER
         // env var, PATH, or common build/install locations.
         use decentraai_runtime::{LlamaServer, RuntimeConfig, find_llama_server};
-        let binary = find_llama_server(args.binary.as_deref()).with_context(|| {
-            "worker mode requires llama-server; pass --binary <path> or install llama.cpp"
-        })?;
+        let binary = find_llama_server(args.binary.as_deref()).with_context(
+            || "worker mode requires llama-server; pass --binary <path> or install llama.cpp",
+        )?;
 
         // Spawn the server and wait until ready
         let mut runtime_cfg = RuntimeConfig::new(model_path.clone());
@@ -2042,7 +2260,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "failed to open trust.db; compute trust set is empty"),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open trust.db; compute trust set is empty")
+            }
         }
     }
     let compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
@@ -2067,9 +2287,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // `register_worker_backend`, which installs the P2P-level on_infer
     // callback that enqueues + streams (queue → backend → progress).
     let mut distributed_handler =
-        decentraai_distributed::DistributedP2PHandler::with_worker_manager(
-            worker_manager.clone(),
-        );
+        decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     distributed_handler.set_tracker(tracker.clone());
     distributed_handler.set_compute_manager(compute_manager.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
@@ -2114,7 +2332,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         // on-demand provisioning is enabled and a real llama-server binary is
         // available, the worker also answers workloads for models it does not
         // hold yet by fetching them through the verified-transfer pipeline.
-        let can_provision = config.sharing.provision_models_on_demand && provision_factory.is_some();
+        let can_provision =
+            config.sharing.provision_models_on_demand && provision_factory.is_some();
         let provisioning = if can_provision {
             Some(decentraai_distributed::ProvisioningConfig {
                 data_dir: data_dir.clone(),
@@ -2122,14 +2341,20 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 reputation_path: data_dir.join("db/reputation.json"),
                 max_concurrent_downloads: config.sharing.max_concurrent_downloads as usize,
                 max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
-                ban_duration: Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
+                ban_duration: Duration::from_secs(
+                    u64::from(config.security.ban_duration_minutes) * 60,
+                ),
                 backend_factory: provision_factory.take().expect("factory built above"),
             })
         } else {
             None
         };
         if let Some(backend) = &backend {
-            distributed.register_worker_backend(backend.clone(), model_hash.clone(), provisioning)?;
+            distributed.register_worker_backend(
+                backend.clone(),
+                model_hash.clone(),
+                provisioning,
+            )?;
         }
 
         // Advertise compute capability from a real hardware probe so this
@@ -2159,15 +2384,16 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     // M19: periodically measure RTT to each known remote worker so the
     // execution planner weights reach cost, not just nominal performance.
-    spawn_network_probe(
-        compute_manager.clone(),
-        distributed.p2p_node().clone(),
-    )
-    .await;
+    spawn_network_probe(compute_manager.clone(), distributed.p2p_node().clone()).await;
 
     // M24: periodically prune stale reservations and evict dead workers, with
     // an audit trail for every removal (automatic removal of unhealthy peers).
-    spawn_worker_reaper(compute_manager.clone(), data_dir.join("logs"), default_reap_grace()).await;
+    spawn_worker_reaper(
+        compute_manager.clone(),
+        data_dir.join("logs"),
+        default_reap_grace(),
+    )
+    .await;
 
     // Start worker discovery
     distributed.start_worker_discovery().await?;
@@ -2175,10 +2401,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     let mode = if will_be_worker { "worker" } else { "client" };
     println!(
         "DecentraAI distributed node running\n  PeerId: {}\n  Listening: {}/p2p/{}\n  Mode: {}",
-        local_peer_id,
-        bound,
-        local_peer_id,
-        mode
+        local_peer_id, bound, local_peer_id, mode
     );
 
     // One-shot client mode: route the prompt to the best available worker,
@@ -2246,15 +2469,18 @@ fn build_served_models(
         .models
         .values()
         .find(|r| r.relative_path == model_name)
-        .or_else(|| registry.models.values().find(|r| r.relative_path.ends_with(model_name)));
+        .or_else(|| {
+            registry
+                .models
+                .values()
+                .find(|r| r.relative_path.ends_with(model_name))
+        });
     let size_mb = match record {
         Some(record) => (record.size_bytes / (1024 * 1024)).max(1),
-        None => {
-            std::fs::metadata(std::path::Path::new(model_name))
-                .map(|m| m.len() / (1024 * 1024))
-                .unwrap_or(0)
-                .max(1)
-        }
+        None => std::fs::metadata(std::path::Path::new(model_name))
+            .map(|m| m.len() / (1024 * 1024))
+            .unwrap_or(0)
+            .max(1),
     };
     let gpu_present = matches!(
         decentraai_system_probe::probe_gpu(),
@@ -2277,8 +2503,8 @@ async fn spawn_compute_broadcaster(
     p2p_node: decentraai_p2p::P2PNode,
     can_provision: bool,
 ) -> Result<()> {
-    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
     use decentraai_protocol::serialize_message;
+    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -2390,10 +2616,10 @@ async fn spawn_compute_metrics_server(
     compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
     port: u16,
 ) -> anyhow::Result<()> {
+    use axum::Json;
     use axum::Router;
     use axum::extract::State;
     use axum::routing::get;
-    use axum::Json;
 
     async fn compute_metrics_handler(
         State(cm): State<std::sync::Arc<decentraai_distributed::ComputeManager>>,
@@ -2449,7 +2675,9 @@ async fn run_distributed_ask(
     // Spawn a printer for streamed chunks and route the request.
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
     let ask = async move {
-        distributed.route_request_streamed(request, progress_tx).await
+        distributed
+            .route_request_streamed(request, progress_tx)
+            .await
     };
 
     let printing = tokio::spawn(async move {
@@ -2467,10 +2695,7 @@ async fn run_distributed_ask(
             reason: "user abort".to_string(),
         };
         if let Ok(bytes) = serialize_message(&msg) {
-            let _ = distributed
-                .p2p_node()
-                .request(worker.peer_id, bytes)
-                .await;
+            let _ = distributed.p2p_node().request(worker.peer_id, bytes).await;
         }
     };
 
@@ -2490,9 +2715,7 @@ async fn run_distributed_ask(
         Ok(resp) => {
             println!(
                 "--- done (tokens={} elapsed_ms={} worker={}) ---",
-                resp.tokens_used,
-                resp.processing_time_ms,
-                resp.worker_peer_id
+                resp.tokens_used, resp.processing_time_ms, resp.worker_peer_id
             );
             Ok(())
         }
@@ -2652,7 +2875,11 @@ mod tests {
         std::fs::write(dir.path().join("tiny.gguf"), b"gguf").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"not a model").unwrap();
         assert_eq!(auto_detect_model(dir.path()).unwrap(), "tiny.gguf");
-        assert!(auto_detect_model(&dir.path().join("missing")).unwrap().is_empty());
+        assert!(
+            auto_detect_model(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
