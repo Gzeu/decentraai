@@ -89,6 +89,12 @@ struct SetupArgs {
 struct NodeArgs {
     #[arg(long, default_value = "~/.decentraai/node.yaml")]
     config: PathBuf,
+    /// Run a single routed inference through this node's fabric planner, then
+    /// exit. The node still brings up identity/config/distributed first, so
+    /// the request takes the real scheduler → reservation → P2P → worker path
+    /// (executing locally only if that is the planner's decision).
+    #[arg(long)]
+    prompt: Option<String>,
 }
 #[derive(Debug, Args)]
 struct OpenArgs {
@@ -984,6 +990,19 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             "no (coordinator-only)"
         }
     );
+
+    // Product ingress: `decentraai node --prompt "…"` runs one routed request
+    // through THIS node's existing fabric planner → reservation → P2P → worker
+    // path, then shuts down. The planner decides local vs remote automatically.
+    if let Some(prompt) = args.prompt {
+        let result = node_ingress_ask(&distributed, &compute_manager, prompt, local_peer_id).await;
+        // Stop the local llama-server we own before exiting (if any).
+        if let Some(server) = maybe_server.take() {
+            let _ = server.stop().await;
+        }
+        distributed.shutdown();
+        return result;
+    }
 
     tokio::signal::ctrl_c().await?;
 
@@ -2711,6 +2730,83 @@ async fn run_distributed_ask(
         }
     };
 
+    let _ = printing.await;
+    println!();
+    match result {
+        Ok(resp) => {
+            println!(
+                "--- done (tokens={} elapsed_ms={} worker={}) ---",
+                resp.tokens_used, resp.processing_time_ms, resp.worker_peer_id
+            );
+            Ok(())
+        }
+        Err(e) => {
+            println!("--- failed: {e} ---");
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// Product ingress for `decentraai node --prompt`: runs ONE routed request
+/// through the node's own fabric planner (existing `route_request_streamed`),
+/// letting the planner decide the target worker from the live compute registry
+/// (trusted, eligible remote worker) — never forcing self-dial or the legacy
+/// announcement pre-selection. Streams the response and reports completion.
+async fn node_ingress_ask(
+    distributed: &decentraai_distributed::DistributedInference,
+    compute_manager: &std::sync::Arc<decentraai_distributed::ComputeManager>,
+    prompt: String,
+    local_peer_id: libp2p::PeerId,
+) -> Result<()> {
+    use decentraai_protocol::InferRequest;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+
+    // Wait (up to 15s) for a trusted REMOTE worker to advertise a served model,
+    // so routing has a candidate and the fabric planner can weigh eligibility.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let model_hash = loop {
+        let candidate: Option<String> = {
+            let mut found = None;
+            for adv in compute_manager.workers().await {
+                if adv.peer_id == local_peer_id || !compute_manager.is_trusted(&adv.peer_id).await {
+                    continue;
+                }
+                if let Some(m) = adv.capability.served_models.first() {
+                    found = Some(m.model_hash.clone());
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(h) = candidate {
+            break h;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "no trusted remote worker advertising a served model discovered within 15s"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    info!(model_hash = %model_hash, "node ingress: routing via fabric planner");
+
+    let mut request = InferRequest::new(model_hash, prompt, 512);
+    request = request.with_sender(local_peer_id);
+    request = request.with_streaming(true);
+    request.timeout_ms = 120_000;
+
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+    let ask = distributed.route_request_streamed(request, progress_tx);
+    let printing = tokio::spawn(async move {
+        while let Some(chunk) = progress_rx.recv().await {
+            print!("{chunk}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    });
+
+    let result = ask.await;
     let _ = printing.await;
     println!();
     match result {
