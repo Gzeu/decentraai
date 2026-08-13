@@ -38,6 +38,26 @@ The installer checks the Rust toolchain (installs rustup when missing),
 (systemd, firewall, security checklist) see
 [docs/deployment.md](docs/deployment.md).
 
+### 0. Install as a desktop application (Ubuntu)
+
+For a normal-user "Download → Install → Open → Ready" experience, use the
+app installer instead: it auto-detects hardware, creates the node identity,
+auto-selects a model, installs a systemd user service (auto-start on login +
+reboot) and a desktop launcher — no manual config, ports or topology:
+
+```bash
+bash scripts/install-app.sh          # build + onboard + service + launcher
+```
+
+- Dashboard: `http://127.0.0.1:8080/` (or `decentraai open`)
+- Node status / start / stop / restart / logs:
+  `systemctl --user status|start|stop|restart decentraai-node`,
+  `journalctl --user -u decentraai-node -f`
+- Uninstall: `bash scripts/uninstall-app.sh` (`--purge` also removes data)
+
+Two machines with DecentraAI installed on the same LAN discover each other
+automatically (mDNS + verified auto-share); no one configures topology.
+
 ### 1. Index your local models
 
 ```bash

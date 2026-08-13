@@ -171,6 +171,16 @@ audits; rejoin is automatic on the next heartbeat.
 Q4: `decentraai setup` — detect hardware → identity → auto-select model →
 write validated config → READY. Idempotent; verified end-to-end on Ubuntu.
 
+Productization (installable app): `decentraai node` is the one-process
+background daemon (auto-provision identity/config, LAN/P2P discovery +
+verified auto-share, auto-select + serve model, dashboard/API bound
+immediately — control plane up even while the model loads or faults).
+`decentraai open` launches the dashboard. `deploy/decentraai-node.service`
+(systemd *user* unit, auto-start + restart) + `scripts/install-app.sh` /
+`scripts/uninstall-app.sh` + `deploy/decentraai.desktop` install a normal-user
+app. Run/stop: `systemctl --user {start,stop,restart,status} decentraai-node`;
+logs: `journalctl --user -u decentraai-node -f`.
+
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core
 (shares large/multiple models, clean reputation). Tiers are earned by

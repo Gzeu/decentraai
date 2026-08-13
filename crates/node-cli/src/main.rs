@@ -549,13 +549,16 @@ sharing:
 fn open_dashboard(args: OpenArgs) -> Result<()> {
     use std::process::Command as StdCommand;
     let url = format!("http://127.0.0.1:{}/", args.port);
-    let tried: &[(&str, &[&str])] = &[
-        ("xdg-open", &["--", &url]),
-        ("xdg-open", &[&url]),
-        ("open", &[&url]),
+    let tried: &[(&str, Vec<String>)] = &[
+        // Most launchers (xdg-open) take the URL directly.
+        ("xdg-open", vec![url.clone()]),
+        ("gvfs-open", vec![url.clone()]),
+        ("open", vec![url.clone()]), // macOS
+        // Some xdg-open builds choke on a bare URL; keep -- as a fallback.
+        ("xdg-open", vec!["--".to_string(), url.clone()]),
     ];
     for (bin, argv) in tried {
-        if let Ok(mut child) = StdCommand::new(bin).args(*argv).spawn() {
+        if let Ok(mut child) = StdCommand::new(bin).args(argv).spawn() {
             let _ = child.wait();
             println!("Opened dashboard at {url}");
             return Ok(());

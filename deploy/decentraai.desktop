@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=DecentraAI
+Comment=Decentralized AI compute node — dashboard
+# Rendered by scripts/install-app.sh with the real @HOME@ substituted.
+Exec=@HOME@/.cargo/bin/decentraai open --port 8080
+Icon=decentraai
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+Keywords=ai;llm;node;distributed;decentralized;
+StartupNotify=false
