@@ -30,6 +30,14 @@ pub const LLAMA_SERVER_ENV: &str = "DECENTRAAI_LLAMA_SERVER";
 /// Candidate binary names searched on PATH.
 const BINARY_NAMES: [&str; 2] = ["llama-server", "llama-server.exe"];
 
+/// Extra non-PATH locations probed for llama-server, relative to $HOME.
+/// Builds produced by `git clone https://github.com/ggerganov/llama.cpp &&
+/// cmake -B build && cmake --build build` land here; distro packages put
+/// the binary in /usr/lib/ollama. We probe these so `distributed --model`
+/// works out of the box instead of silently falling back to a mock.
+const HOME_BINARY_PATHS: [&str; 2] = ["llama.cpp/build/bin/llama-server", "llama.cpp/build/bin/Release/llama-server"];
+const ABSOLUTE_BINARY_PATHS: [&str; 1] = ["/usr/lib/ollama/llama-server"];
+
 /// How long a single health probe may take before it is abandoned.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -130,7 +138,33 @@ pub fn find_llama_server(explicit: Option<&Path>) -> Result<PathBuf> {
             }
         }
     }
+    if let Some(candidate) = probe_common_locations(std::env::var_os("HOME")) {
+        return Ok(candidate);
+    }
     bail!("llama-server not found on PATH; install llama.cpp or set {LLAMA_SERVER_ENV}")
+}
+
+/// Probes non-PATH install locations for llama-server. Pure so tests can
+/// drive it with a synthetic $HOME.
+fn probe_common_locations(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        for rel in HOME_BINARY_PATHS {
+            let candidate = home.join(rel);
+            if candidate.is_file() {
+                info!(path = %candidate.display(), "found llama-server in common build location");
+                return Some(candidate);
+            }
+        }
+    }
+    for path in ABSOLUTE_BINARY_PATHS {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            info!(path = %candidate.display(), "found llama-server in common install location");
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Allocates an ephemeral port by binding and releasing port 0.
@@ -437,6 +471,39 @@ mod tests {
     fn explicit_missing_binary_is_rejected() {
         let err = find_llama_server(Some(Path::new("/definitely/not/here"))).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_common_locations_finds_home_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("llama.cpp/build/bin/llama-server");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms).unwrap();
+        let found =
+            probe_common_locations(Some(dir.path().as_os_str().to_os_string())).unwrap();
+        assert_eq!(found, target);
+    }
+
+    #[test]
+    fn probe_common_locations_ignores_empty_home_dir() {
+        // An empty $HOME must never produce a hit by itself. A Some value may
+        // only come from a system-wide install (e.g. /usr/lib/ollama on hosts
+        // with that package), so the found path must not live under the temp
+        // dir used as $HOME.
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            probe_common_locations(Some(dir.path().as_os_str().to_os_string()));
+        if let Some(found) = result {
+            assert!(
+                !found.starts_with(dir.path()),
+                "home probe must not match inside the empty temp dir"
+            );
+        }
     }
 
     #[test]

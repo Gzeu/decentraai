@@ -12,6 +12,12 @@ pub struct RequestTracker {
     inner: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<InferMessage>>>>,
 }
 
+impl Default for RequestTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RequestTracker {
     pub fn new() -> Self {
         Self {
@@ -31,7 +37,7 @@ impl RequestTracker {
     /// Deliver an incoming message to any registered receiver. Returns true
     /// if delivered, false if no receiver exists for the request.
     pub async fn deliver(&self, msg: InferMessage) -> bool {
-        let mut guard = self.inner.lock().await;
+        let guard = self.inner.lock().await;
         let id = msg.request_id();
         if let Some(tx) = guard.get(&id) {
             // ignore send errors (receiver dropped)

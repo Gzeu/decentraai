@@ -1096,6 +1096,25 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "decentraai-p2p-invoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "decentraai-identity",
+ "decentraai-p2p",
+ "decentraai-protocol",
+ "libp2p",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -203,14 +203,36 @@ decentraai distributed start --model tinyllama.gguf
 ```
 
 **Distributed node modes:**
-- **worker**: Serves models for inference (requires `--model`)
-- **client**: Routes requests to other workers (no `--model`)
+- **worker**: Serves models for inference (requires `--model`); spawns a real
+  `llama-server` subprocess, streams tokens back to the requester, and aborts
+  generation on `InferCancel`
+- **client**: Routes requests to other workers (no `--model`); pass `--prompt`
+  to run one request against the best discovered worker and stream the answer
+
+**One-shot prompt from the coordinator:**
+
+```bash
+decentraai distributed --config configs/node.coord.yaml --prompt "Tell me a haiku"
+```
+
+**Standalone client (`decentraai-p2p-invoke`)**: exercises the real path
+(dial worker -> InferRequest -> queue -> llama-server -> streamed progress) for
+validation and scripting:
+
+```bash
+decentraai-p2p-invoke \
+  --peer /ip4/127.0.0.1/tcp/<PORT>/p2p/12D3KooW... \
+  --model /path/to/tinyllama.gguf \
+  --prompt "Hello"
+# or pass --model-hash <blake3> instead of --model; Ctrl-C cancels generation
+```
 
 **Key features:**
-- Worker discovery and real-time capacity reporting
+- Worker discovery and real-time capacity reporting (periodic announcement broadcasts)
 - Intelligent request routing based on worker capacity, latency, and throughput
 - Automatic fallback to alternative workers when primary workers fail
-- Request queue management with FIFO processing and timeout handling
+- Request queue management with FIFO processing, cancellation and timeout handling
+- Streaming `InferProgress` frames and cooperative cancellation (`InferCancel`)
 - Reputation-based compensation for worker contributions
 
 **Configuration options:**
@@ -255,6 +277,11 @@ decentraai token revoke --name <n>              # revoke (effective next request
   catalog messages for peer browsing
 - **Manifests** (`crates/manifest`): GGUF magic validation, 4 MiB chunks, BLAKE3,
   deterministic Merkle root over raw digests, atomic JSON writes
+- **Distributed inference** (`crates/distributed`, `crates/p2p-invoke`): worker
+  registration + periodic announcement broadcasts, capacity-aware router, FIFO
+  queue with cancellation, `register_worker_backend` streaming (queue ->
+  OpenAiCompatibleBackend -> streamed `InferProgress` -> terminal `InferResponse`),
+  and a standalone `decentraai-p2p-invoke` client for the real end-to-end path
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted

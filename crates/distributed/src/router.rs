@@ -107,17 +107,14 @@ impl RequestRouter {
     /// # Returns
     ///
     /// A TaskPlacement with the selected worker and estimates, or an error
-    pub fn select_worker(
+    pub async fn select_worker(
         &self,
         request: &InferRequest,
         workers: &[WorkerAnnouncement],
     ) -> Result<TaskPlacement, DistributedError> {
-        // Update the scheduler with current workers
-        // Note: This is synchronous, so we use a blocking lock
-        // In a real implementation, we'd want to maintain the worker list
-        // separately or use an async-friendly approach
-
-        let mut scheduler = self.scheduler.blocking_lock();
+        // Uses an async lock so it is safe to call from inside the Tokio
+        // runtime; blocking_lock would panic on a worker thread.
+        let mut scheduler = self.scheduler.lock().await;
 
         // Clear and re-register workers
         // This is a simplification for now
@@ -153,6 +150,31 @@ impl RequestRouter {
         request: InferRequest,
         placement: TaskPlacement,
     ) -> Result<InferResponse, DistributedError> {
+        self.send_request_inner(p2p_node, request, placement, None)
+            .await
+    }
+
+    /// Like [`send_request`](Self::send_request) but streams each received
+    /// `InferProgress` chunk into `progress` as it arrives, so callers can
+    /// surface live tokens to a user.
+    pub async fn send_request_streamed(
+        &self,
+        p2p_node: &P2PNode,
+        request: InferRequest,
+        placement: TaskPlacement,
+        progress: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<InferResponse, DistributedError> {
+        self.send_request_inner(p2p_node, request, placement, Some(progress))
+            .await
+    }
+
+    async fn send_request_inner(
+        &self,
+        p2p_node: &P2PNode,
+        request: InferRequest,
+        placement: TaskPlacement,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<InferResponse, DistributedError> {
         // Increment counters
         self.increment_total().await;
         self.increment_pending().await;
@@ -166,6 +188,16 @@ impl RequestRouter {
             "sending request to worker"
         );
 
+        // Register the tracker BEFORE sending so no early progress frames are
+        // dropped by the P2P handler (a race that silently lost streamed tokens).
+        let tracker_registration = match &self.tracker {
+            Some(tracker) => {
+                let rx = tracker.register(request.request_id).await;
+                Some((tracker.clone(), rx))
+            }
+            None => None,
+        };
+
         // Serialize the request
         let payload = Self::serialize_request(&request)?;
 
@@ -173,6 +205,9 @@ impl RequestRouter {
         let response_bytes = match p2p_node.request(worker_peer_id, payload).await {
             Ok(bytes) => bytes,
             Err(e) => {
+                if let Some((tracker, _)) = &tracker_registration {
+                    tracker.remove(&request.request_id).await;
+                }
                 self.increment_failed().await;
                 self.decrement_pending().await;
                 return Err(DistributedError::P2PError(e));
@@ -184,6 +219,9 @@ impl RequestRouter {
         if let Ok(infer_resp) =
             deserialize_message::<InferResponse>(&response_bytes, response_bytes.len())
         {
+            if let Some((tracker, _)) = &tracker_registration {
+                tracker.remove(&request.request_id).await;
+            }
             self.decrement_pending().await;
             self.increment_success().await;
             info!(
@@ -201,8 +239,7 @@ impl RequestRouter {
             .map_err(|e| DistributedError::SerializationError(e.to_string()))?;
 
         // If we have a tracker registered, wait for progress/final messages
-        if let Some(tracker) = &self.tracker {
-            let mut rx = tracker.register(request.request_id).await;
+        if let Some((tracker, mut rx)) = tracker_registration {
             let mut accumulated = String::new();
             let mut final_response: Option<InferResponse> = None;
 
@@ -210,16 +247,15 @@ impl RequestRouter {
             match first_msg {
                 InferMessage::InferProgress(p) => {
                     accumulated.push_str(&p.partial_output);
+                    if let Some(tx) = &progress {
+                        let _ = tx.send(p.partial_output);
+                    }
                 }
                 InferMessage::InferResponse(resp) => {
                     final_response = Some(resp);
                 }
-                InferMessage::InferFailed {
-                    request_id: _,
-                    worker_peer_id: _,
-                    error,
-                    ..
-                } => {
+                InferMessage::InferFailed { error, .. } => {
+                    tracker.remove(&request.request_id).await;
                     self.decrement_pending().await;
                     self.increment_failed().await;
                     return Err(DistributedError::AllWorkersFailed(error));
@@ -227,22 +263,26 @@ impl RequestRouter {
                 _ => {}
             }
 
+            // Wait at least 5s (queue/scheduling headroom) but respect the
+            // caller's timeout for long generations.
+            let wait_timeout =
+                std::time::Duration::from_millis(u64::from(request.timeout_ms).max(5000));
+
             // Loop until final response
             while final_response.is_none() {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                match tokio::time::timeout(wait_timeout, rx.recv()).await {
                     Ok(Some(msg)) => match msg {
                         InferMessage::InferProgress(p) => {
                             accumulated.push_str(&p.partial_output);
+                            if let Some(tx) = &progress {
+                                let _ = tx.send(p.partial_output);
+                            }
                         }
                         InferMessage::InferResponse(resp) => {
                             final_response = Some(resp);
                         }
-                        InferMessage::InferFailed {
-                            request_id: _,
-                            worker_peer_id: _,
-                            error,
-                            ..
-                        } => {
+                        InferMessage::InferFailed { error, .. } => {
+                            tracker.remove(&request.request_id).await;
                             self.decrement_pending().await;
                             self.increment_failed().await;
                             return Err(DistributedError::AllWorkersFailed(error));
@@ -252,9 +292,12 @@ impl RequestRouter {
                     Ok(None) => break, // channel closed
                     Err(_) => {
                         // timeout
+                        tracker.remove(&request.request_id).await;
                         self.decrement_pending().await;
                         self.increment_failed().await;
-                        return Err(DistributedError::RequestTimeout(request.timeout_ms as u64));
+                        return Err(DistributedError::RequestTimeout(
+                            request.timeout_ms as u64,
+                        ));
                     }
                 }
             }
@@ -263,6 +306,14 @@ impl RequestRouter {
                 // attach accumulated output if needed
                 if resp.output.is_empty() {
                     resp.output = accumulated.clone();
+                }
+                tracker.remove(&request.request_id).await;
+                if !resp.success {
+                    self.decrement_pending().await;
+                    self.increment_failed().await;
+                    return Err(DistributedError::AllWorkersFailed(
+                        resp.error.unwrap_or_else(|| "worker reported failure".to_string()),
+                    ));
                 }
                 self.decrement_pending().await;
                 self.increment_success().await;
@@ -301,7 +352,7 @@ impl RequestRouter {
         self.update_workers(workers.clone()).await;
 
         // Select the best worker
-        let placement = self.select_worker(&request, &workers)?;
+        let placement = self.select_worker(&request, &workers).await?;
 
         // Send the request
         self.send_request(p2p_node, request, placement).await
@@ -312,14 +363,6 @@ impl RequestRouter {
         use decentraai_protocol::serialize_message;
 
         serialize_message(request).map_err(|e| DistributedError::SerializationError(e.to_string()))
-    }
-
-    /// Deserializes an inference response from bytes
-    fn deserialize_response(bytes: &[u8]) -> Result<InferResponse, DistributedError> {
-        use decentraai_protocol::deserialize_message;
-
-        deserialize_message::<InferResponse>(bytes, bytes.len())
-            .map_err(|e| DistributedError::SerializationError(e.to_string()))
     }
 
     /// Increment total request counter
@@ -483,7 +526,8 @@ mod tests {
         }];
 
         let request = create_test_request();
-        let placement = router.select_worker(&request, &workers).unwrap();
+        let placement = futures::executor::block_on(router.select_worker(&request, &workers))
+            .unwrap();
 
         assert_eq!(placement.selected_worker, worker_peer_id);
     }
@@ -505,7 +549,7 @@ mod tests {
         }];
 
         let request = create_test_request(); // Requests "test-model-hash"
-        let result = router.select_worker(&request, &workers);
+        let result = futures::executor::block_on(router.select_worker(&request, &workers));
 
         assert!(matches!(
             result,

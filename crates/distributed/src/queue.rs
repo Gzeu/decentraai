@@ -259,7 +259,7 @@ impl RequestQueueManager {
             queue_lock.set_processing(true);
             // Register in-flight
             let mut in_flight = self.in_flight.lock().await;
-            in_flight.insert(req.request_id, worker_peer_id.clone());
+            in_flight.insert(req.request_id, *worker_peer_id);
             Some(req)
         } else {
             None
@@ -301,7 +301,7 @@ impl RequestQueueManager {
         }
 
         // If not queued, mark as cancelled if in-flight
-        let mut in_flight = self.in_flight.lock().await;
+        let in_flight = self.in_flight.lock().await;
         if in_flight.contains_key(&request_id) {
             let mut cancelled = self.cancelled.lock().await;
             cancelled.insert(request_id);

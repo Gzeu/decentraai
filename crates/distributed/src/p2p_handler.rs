@@ -4,9 +4,15 @@
 //! - WorkerAnnouncement: Register remote workers
 //! - InferRequest: Process inference requests (if this node is a worker)
 
-use anyhow::{Context, Result};
-use decentraai_protocol::{InferRequest, InferResponse, WorkerAnnouncement};
+use anyhow::Result;
+use decentraai_protocol::{InferRequest, WorkerAnnouncement};
 use std::sync::Arc;
+
+/// Inference request handler used by the legacy sync serving path. The
+/// streaming worker path (queue → backend → progress) lives in
+/// `DistributedInference::register_worker_backend` and is wired through the
+/// P2PNode's `on_infer` callback instead.
+type InferHandler = Arc<dyn Fn(InferRequest) -> Result<Vec<u8>> + Send + Sync>;
 
 /// P2P RequestHandler for distributed inference
 ///
@@ -15,7 +21,7 @@ pub struct DistributedP2PHandler {
     /// Worker manager for processing announcements
     worker_manager: Option<Arc<crate::worker::WorkerManager>>,
     /// Inference request handler function (synchronous callback that may spawn async work)
-    infer_handler: Option<Arc<dyn Fn(InferRequest) -> Result<Vec<u8>> + Send + Sync>>,
+    infer_handler: Option<InferHandler>,
     /// Optional tracker to deliver progress / final messages back to waiting coordinators
     tracker: Option<Arc<crate::tracker::RequestTracker>>,
 }
@@ -113,14 +119,6 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     }
 }
 
-impl DistributedP2PHandler {
-    /// Serializes an InferResponse to bytes
-    fn serialize_response(response: &InferResponse) -> Result<Vec<u8>> {
-        use decentraai_protocol::serialize_message;
-        serialize_message(response).context("Failed to serialize InferResponse")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,12 +126,20 @@ mod tests {
     use crate::worker::WorkerManager;
     use chrono::Utc;
     use decentraai_p2p::RequestHandler;
-    use decentraai_protocol::{WorkerAnnouncement, deserialize_message, serialize_message};
+    use decentraai_protocol::{
+        InferResponse, WorkerAnnouncement, deserialize_message, serialize_message,
+    };
     use libp2p::identity::Keypair;
 
     fn create_test_peer_id() -> libp2p::PeerId {
         let keypair = Keypair::generate_ed25519();
         libp2p::PeerId::from(keypair.public())
+    }
+
+    /// Serializes an InferResponse for the legacy sync handler closures,
+    /// which are typed `Fn(InferRequest) -> Result<Vec<u8>>`.
+    fn resp_bytes(resp: InferResponse) -> anyhow::Result<Vec<u8>> {
+        decentraai_protocol::serialize_message(&resp)
     }
 
     #[test]
@@ -216,7 +222,7 @@ mod tests {
         let handler = DistributedP2PHandler::with_both(
             worker_manager.clone(),
             move |request: InferRequest| {
-                Ok(InferResponse {
+                resp_bytes(InferResponse {
                     request_id: request.request_id,
                     trace_id: request.trace_id.clone(),
                     worker_peer_id: peer_id,
@@ -271,7 +277,7 @@ mod tests {
             // 3. Request processed
             // 4. Response completed
 
-            Ok(InferResponse {
+            resp_bytes(InferResponse {
                 request_id: request.request_id,
                 trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
@@ -311,7 +317,7 @@ mod tests {
             if request.model_hash != "expected-hash" {
                 anyhow::bail!("Model not available on this worker");
             }
-            Ok(InferResponse {
+            resp_bytes(InferResponse {
                 request_id: request.request_id,
                 trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
@@ -348,7 +354,7 @@ mod tests {
             if request.prompt.is_empty() {
                 anyhow::bail!("Prompt cannot be empty");
             }
-            Ok(InferResponse {
+            resp_bytes(InferResponse {
                 request_id: request.request_id,
                 trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,
@@ -383,7 +389,7 @@ mod tests {
         let handler = DistributedP2PHandler::with_infer_handler(move |request: InferRequest| {
             // Simulate a backend error that returns an error response
             if request.model_hash == "error-model" {
-                return Ok(InferResponse {
+                return resp_bytes(InferResponse {
                     request_id: request.request_id,
                     trace_id: request.trace_id.clone(),
                     worker_peer_id: peer_id,
@@ -395,7 +401,7 @@ mod tests {
                     error: Some("Backend timeout".to_string()),
                 });
             }
-            Ok(InferResponse {
+            resp_bytes(InferResponse {
                 request_id: request.request_id,
                 trace_id: request.trace_id.clone(),
                 worker_peer_id: peer_id,

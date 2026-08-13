@@ -6,6 +6,7 @@ use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -111,6 +112,16 @@ struct DistributedArgs {
     model: Option<String>,
     #[arg(long, default_value = "configs/node.example.yaml")]
     config: PathBuf,
+    /// Explicit llama-server binary path (overrides env, PATH and common
+    /// install locations). Required for worker mode when llama-server
+    /// cannot be located automatically.
+    #[arg(long)]
+    binary: Option<PathBuf>,
+    /// One-shot client mode: route this prompt to the best available worker
+    /// and stream the response, then exit. Omit it to run as a persistent
+    /// coordinator (or worker) node.
+    #[arg(long)]
+    prompt: Option<String>,
 }
 #[derive(Debug, Args)]
 struct PullArgs {
@@ -875,16 +886,13 @@ fn token_command(command: TokenCommand) -> Result<()> {
 async fn distributed_command(args: DistributedArgs) -> Result<()> {
     use decentraai_distributed::{DistributedInference, InferenceConfig};
     use decentraai_identity::Identity;
-    use decentraai_inference_adapter::{
-        BackendConfig, BackendRequest, BackendResponse, InferenceBackend, OpenAiCompatibleBackend,
-    };
+    use decentraai_inference_adapter::{BackendConfig, OpenAiCompatibleBackend};
     use decentraai_p2p::{
         ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, P2PNode, RegistryServer,
     };
     use libp2p::PeerId as Libp2pPeerId;
     use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
-    use std::time::Instant;
 
     let config = NodeConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
@@ -938,43 +946,33 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             .to_hex()
             .to_string();
 
-        // Attempt to start a local llama-server for real inference. If the
-        // binary is not available, fall back to a default base URL so tests
-        // and environments without llama-server continue to work.
+        // Attempt to start a local llama-server for real inference. Worker
+        // mode REQUIRES a real llama-server binary: no silent fallback to a
+        // mock backend URL, so the distributed path always exercises real
+        // inference. The binary is found via --binary, the DECENTRAAI_LLAMA_SERVER
+        // env var, PATH, or common build/install locations.
         use decentraai_runtime::{LlamaServer, RuntimeConfig, find_llama_server};
-        let backend_base = match find_llama_server(None) {
-            Ok(binary) => {
-                // Spawn the server and wait until ready
-                let mut runtime_cfg = RuntimeConfig::new(model_path.clone());
-                runtime_cfg.ctx_size = config.inference.max_context_tokens;
-                runtime_cfg.parallel = config.inference.max_concurrent_requests;
-                runtime_cfg.threads = Some(
-                    SystemSnapshot::collect()
-                        .logical_cpus
-                        .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
-                        .max(1),
-                );
-                match LlamaServer::spawn(&binary, &runtime_cfg).await {
-                    Ok(server) => {
-                        let url = server.base_url();
-                        maybe_server = Some(server);
-                        url
-                    }
-                    Err(e) => {
-                        info!(error = %e, "failed to spawn llama-server, falling back to default backend URL");
-                        "http://127.0.0.1:8081".to_string()
-                    }
-                }
-            }
-            Err(e) => {
-                info!(error = %e, "llama-server not found on PATH; using default backend URL");
-                "http://127.0.0.1:8081".to_string()
-            }
-        };
+        let binary = find_llama_server(args.binary.as_deref()).with_context(|| {
+            "worker mode requires llama-server; pass --binary <path> or install llama.cpp"
+        })?;
+
+        // Spawn the server and wait until ready
+        let mut runtime_cfg = RuntimeConfig::new(model_path.clone());
+        runtime_cfg.ctx_size = config.inference.max_context_tokens;
+        runtime_cfg.parallel = config.inference.max_concurrent_requests;
+        runtime_cfg.threads = Some(
+            SystemSnapshot::collect()
+                .logical_cpus
+                .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
+                .max(1),
+        );
+        let server = LlamaServer::spawn(&binary, &runtime_cfg).await?;
+        let url = server.base_url();
+        maybe_server = Some(server);
 
         // Create inference backend pointing at the chosen base URL
         let backend_config = BackendConfig {
-            base_url: backend_base,
+            base_url: url,
             model: model_name.clone(),
             api_key: None,
             connect_timeout: std::time::Duration::from_secs(3),
@@ -1011,106 +1009,20 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         decentraai_distributed::InferenceConfig::default(),
     ));
 
-    // Create inference handler if we're a worker
-    let infer_handler: Option<
-        Arc<
-            dyn Fn(
-                    decentraai_protocol::InferRequest,
-                ) -> anyhow::Result<decentraai_protocol::InferResponse>
-                + Send
-                + Sync,
-        >,
-    > = if let (Some(backend), Some(model_hash)) = (&backend, &model_hash) {
-        let local_peer_id_clone = local_peer_id;
-        let model_hash_clone = model_hash.clone();
-        let backend_clone = backend.clone();
-
-        let handler = move |request: decentraai_protocol::InferRequest|
-            -> anyhow::Result<decentraai_protocol::InferResponse> {
-            // Check if we can serve this model
-            if request.model_hash != model_hash_clone {
-                anyhow::bail!("Model not available on this worker");
-            }
-
-            // Create start time for metrics
-            let start_time = Instant::now();
-
-            // Convert InferRequest to BackendRequest
-            let backend_request = BackendRequest {
-                request_id: request.request_id.to_string(),
-                prompt: request.prompt.clone(),
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-                top_p: request.top_p,
-            };
-
-            // Validate the request
-            if let Err(e) = backend_clone.validate(&backend_request) {
-                anyhow::bail!("Request validation failed: {}", e);
-            }
-
-            // Call the backend synchronously (blocking)
-            // Note: In production, this should be async, but we're in a sync closure
-            // For now, we'll use a blocking call to the backend
-            let runtime = tokio::runtime::Handle::current();
-            let response: BackendResponse = runtime.block_on(async {
-                backend_clone.complete(backend_request).await
-            })
-            .map_err(|e| anyhow::anyhow!("Backend inference failed: {}", e))?;
-
-            // Calculate elapsed time
-            let elapsed_ms = start_time.elapsed().as_millis() as u32;
-
-            // Build successful response
-            Ok(decentraai_protocol::InferResponse {
-                request_id: request.request_id,
-                trace_id: request.trace_id.clone(),
-                worker_peer_id: local_peer_id_clone,
-                completed_at: chrono::Utc::now().to_rfc3339(),
-                output: response.output,
-                tokens_used: response.tokens_used.unwrap_or(0),
-                processing_time_ms: elapsed_ms,
-                success: true,
-                error: None,
-            })
-        };
-
-        Some(Arc::new(handler))
-    } else {
-        None
-    };
-
     // Create a shared request tracker for streaming progress
     let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
 
-    // Create distributed P2P handler with appropriate configuration
-    let distributed_handler = if let Some(infer_handler) = infer_handler {
-        // Wrap the sync infer_handler so it returns serialized bytes
-        let wrapped = move |request: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
-            let resp = infer_handler(request)?;
-            let bytes = decentraai_protocol::serialize_message(&resp)
-                .map_err(|e| anyhow::anyhow!("serialize error: {}", e))?;
-            Ok(bytes)
-        };
-        let mut h = decentraai_distributed::DistributedP2PHandler::with_both(
-            worker_manager.clone(),
-            wrapped,
-        );
-        h.set_tracker(tracker.clone());
-        h
-    } else {
-        let mut h = decentraai_distributed::DistributedP2PHandler::with_worker_manager(
+    // Create distributed P2P handler: worker announcements are processed
+    // here on every node (worker or coordinator). Inference serving is NOT
+    // handled through this chain anymore — worker mode registers a streaming
+    // backend via `register_worker_backend`, which installs the P2P-level
+    // on_infer callback that enqueues + streams (queue → backend → progress).
+    let mut distributed_handler =
+        decentraai_distributed::DistributedP2PHandler::with_worker_manager(
             worker_manager.clone(),
         );
-        h.set_tracker(tracker.clone());
-        h
-    };
-
-    // Create a chained handler for manifest, distributed, and other messages
-    let mut chained_handler = ChainedHandler::new();
-
-    // Add distributed handler first (for worker announcements and inference requests)
-    chained_handler = chained_handler.add_handler(Arc::new(distributed_handler));
+    distributed_handler.set_tracker(tracker.clone());
+    let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 
     // Add registry handler if registry exists
     if let Some(registry) = registry {
@@ -1158,16 +1070,24 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Start worker discovery
     distributed.start_worker_discovery().await?;
 
+    let mode = if will_be_worker { "worker" } else { "client" };
     println!(
         "DecentraAI distributed node running\n  PeerId: {}\n  Listening: {}/p2p/{}\n  Mode: {}",
         local_peer_id,
         bound,
         local_peer_id,
-        if will_be_worker { "worker" } else { "client" }
+        mode
     );
 
-    // Keep running until interrupted
-    tokio::signal::ctrl_c().await?;
+    // One-shot client mode: route the prompt to the best available worker,
+    // stream the response, then exit. This exercises the REAL path end-to-end:
+    // coordinator router → P2P InferRequest → worker queue → llama-server.
+    if let Some(prompt) = args.prompt {
+        run_distributed_ask(&distributed, prompt, &worker_manager, local_peer_id).await?;
+    } else {
+        // Persistent coordinator / worker: keep running until interrupted.
+        tokio::signal::ctrl_c().await?;
+    }
 
     // If we spawned a local llama-server for worker mode, stop it cleanly.
     if let Some(server) = maybe_server.take() {
@@ -1176,6 +1096,121 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
     distributed.shutdown();
     Ok(())
+}
+
+/// Waits for at least one worker announcement, routes `prompt` to the best
+/// available worker, prints the streamed response, and cancels the request on
+/// Ctrl-C. Returns when a terminal InferResponse/InferFailed arrives.
+async fn run_distributed_ask(
+    distributed: &decentraai_distributed::DistributedInference,
+    prompt: String,
+    worker_manager: &decentraai_distributed::WorkerManager,
+    local_peer_id: libp2p::PeerId,
+) -> Result<()> {
+    use decentraai_protocol::{InferMessage, InferRequest, serialize_message};
+    use tokio::sync::mpsc;
+
+    // Give the swarm a moment to settle and announcements to arrive via mDNS.
+    let workers = wait_for_workers(worker_manager, Duration::from_secs(15)).await?;
+    let worker = workers
+        .into_iter()
+        .find(|w| !w.loaded_models.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no worker with a loaded model discovered"))?;
+    let model_hash = worker
+        .loaded_models
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("discovered worker has no loaded model"))?
+        .clone();
+    info!(
+        worker_peer_id = %worker.peer_id,
+        node_name = %worker.node_name,
+        "routing prompt to discovered worker"
+    );
+
+    let mut request = InferRequest::new(model_hash, prompt, 512);
+    request = request.with_sender(local_peer_id);
+    request = request.with_streaming(true);
+    request.timeout_ms = 120_000;
+    let request_id = request.request_id;
+
+    // Spawn a printer for streamed chunks and route the request.
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+    let ask = async move {
+        distributed.route_request_streamed(request, progress_tx).await
+    };
+
+    let printing = tokio::spawn(async move {
+        while let Some(chunk) = progress_rx.recv().await {
+            print!("{chunk}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    });
+
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!(%request_id, "user cancelled; sending InferCancel to worker");
+        let msg = InferMessage::InferCancel {
+            request_id,
+            reason: "user abort".to_string(),
+        };
+        if let Ok(bytes) = serialize_message(&msg) {
+            let _ = distributed
+                .p2p_node()
+                .request(worker.peer_id, bytes)
+                .await;
+        }
+    };
+
+    let result = tokio::select! {
+        r = ask => r,
+        _ = cancel => {
+            printing.abort();
+            println!();
+            println!("--- cancelled by user ---");
+            return Ok(());
+        }
+    };
+
+    let _ = printing.await;
+    println!();
+    match result {
+        Ok(resp) => {
+            println!(
+                "--- done (tokens={} elapsed_ms={} worker={}) ---",
+                resp.tokens_used,
+                resp.processing_time_ms,
+                resp.worker_peer_id
+            );
+            Ok(())
+        }
+        Err(e) => {
+            println!("--- failed: {e} ---");
+            Err(anyhow::anyhow!("{e}"))
+        }
+    }
+}
+
+/// Polls the worker manager until at least one worker announcement arrives
+/// (from a periodic broadcast) or `timeout` elapses.
+async fn wait_for_workers(
+    worker_manager: &decentraai_distributed::WorkerManager,
+    timeout: Duration,
+) -> Result<Vec<decentraai_protocol::WorkerAnnouncement>> {
+    use std::time::Instant;
+    let start = Instant::now();
+    loop {
+        let workers = worker_manager.get_workers().await;
+        if !workers.is_empty() {
+            return Ok(workers);
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out waiting {}s for a worker announcement; is a worker node running?",
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[cfg(test)]

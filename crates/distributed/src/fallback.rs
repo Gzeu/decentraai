@@ -345,7 +345,7 @@ impl RequestRouterWithFallback {
         workers: Vec<WorkerAnnouncement>,
     ) -> Result<InferResponse, DistributedError> {
         // Select the primary worker
-        let placement = self.router.select_worker(&request, &workers)?;
+        let placement = self.router.select_worker(&request, &workers).await?;
 
         // Try with fallback
         self.fallback_handler

@@ -9,7 +9,7 @@
 use libp2p::PeerId;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -180,22 +180,35 @@ impl WorkerManager {
         Ok(())
     }
 
-    /// Starts the worker discovery process
+    /// Starts the worker discovery process.
     ///
-    /// For now, this just logs the start. In a full implementation,
-    /// this would spawn background tasks for:
-    /// - Broadcasting worker announcements (if this node is a worker)
-    /// - Listening for worker announcements from peers
-    /// - Managing worker heartbeat and stale detection
-    ///
-    /// The current implementation relies on explicit calls to broadcast_status()
-    /// for worker announcements, and manual processing of incoming announcements.
+    /// Spawns a background task that, while this node is registered as a
+    /// worker, broadcasts the local `WorkerAnnouncement` to every connected
+    /// peer every `announcement_interval_ms` (immediately first). This is
+    /// what makes workers visible to coordinators: without it the scheduler
+    /// always reports "No workers available".
     pub async fn start_discovery(
-        &self,
-        _p2p_node: &P2PNode,
-        _announcement_interval_ms: u64,
+        self: &Arc<Self>,
+        p2p_node: &P2PNode,
+        announcement_interval_ms: u64,
     ) -> anyhow::Result<()> {
         info!(peer_id = %self.local_peer_id, "worker discovery started");
+        if announcement_interval_ms == 0 {
+            return Ok(());
+        }
+        let interval = Duration::from_millis(announcement_interval_ms);
+        let p2p_node = p2p_node.clone();
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if me.is_registered().await {
+                    if let Err(e) = me.broadcast_status(&p2p_node).await {
+                        debug!(error = %e, "failed to broadcast worker status");
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
         Ok(())
     }
 
@@ -314,11 +327,13 @@ impl WorkerManager {
         tokens_per_second: u32,
         current_latency_ms: u32,
     ) -> anyhow::Result<()> {
-        if !self.is_registered_sync() {
-            return Err(anyhow::anyhow!("Node is not registered as a worker"));
-        }
+        // All blocking_lock calls must live inside block_in_place so this is
+        // safe from both sync callers and the async streaming task.
+        let loaded_models = tokio::task::block_in_place(|| {
+            if !*self.is_worker.blocking_lock() {
+                return Err(anyhow::anyhow!("Node is not registered as a worker"));
+            }
 
-        tokio::task::block_in_place(|| {
             let mut local_status = self.local_status.blocking_lock();
             let mut local_announcement = self.local_announcement.blocking_lock();
 
@@ -334,19 +349,16 @@ impl WorkerManager {
                 announcement.queue_depth = queue_depth;
                 announcement.tokens_per_second = tokens_per_second;
                 announcement.current_latency_ms = current_latency_ms;
+                Ok(announcement.loaded_models.clone())
+            } else {
+                Ok(Vec::new())
             }
+        })?;
 
-            // Also update in the worker registry
-            if let Some(announcement) = local_announcement.as_ref() {
-                // Call add_worker which itself uses block_in_place
-                // so call it outside to avoid nested block_in_place where possible
-            }
-        });
-
-        if let Some(announcement) = self.local_announcement.blocking_lock().as_ref() {
+        if !loaded_models.is_empty() {
             self.add_worker(
                 self.local_peer_id,
-                announcement.loaded_models.clone(),
+                loaded_models,
                 available_capacity,
                 queue_depth,
                 tokens_per_second,
@@ -366,13 +378,17 @@ impl WorkerManager {
         Ok(())
     }
 
-    /// Broadcasts the current worker status to all connected peers
+    /// Broadcasts the current worker status to all connected peers.
+    ///
+    /// Uses async locks so it is safe to call from inside the Tokio runtime
+    /// (e.g. the discovery task); `blocking_lock` would panic on a worker
+    /// thread.
     pub async fn broadcast_status(&self, p2p_node: &P2PNode) -> anyhow::Result<()> {
-        if !self.is_registered_sync() {
+        if !self.is_registered().await {
             return Err(anyhow::anyhow!("Node is not registered as a worker"));
         }
 
-        let local_announcement = self.local_announcement.blocking_lock();
+        let local_announcement = self.local_announcement.lock().await;
 
         if let Some(announcement) = local_announcement.as_ref() {
             let payload = Self::serialize_announcement(announcement)?;

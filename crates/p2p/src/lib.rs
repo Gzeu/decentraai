@@ -25,7 +25,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Request/response protocol carrying serialized decentraai-protocol messages.
 pub const MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/decentraai/message/1");
@@ -269,6 +269,15 @@ enum Command {
     Shutdown,
 }
 
+/// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
+type InferHandler = Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+
+/// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
+type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
+
+/// Shared, swappable handler slot read by the swarm task.
+type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
+
 /// Handle to the background swarm task.
 #[derive(Clone)]
 pub struct P2PNode {
@@ -276,17 +285,11 @@ pub struct P2PNode {
     peer_id: PeerId,
     /// Optional callback invoked for inbound InferRequest messages. Stored
     /// here so callers can register a handler after the node is created.
-    on_infer: std::sync::Arc<
-        tokio::sync::Mutex<
-            Option<
-                std::sync::Arc<
-                    dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
-                        + Send
-                        + Sync,
-                >,
-            >,
-        >,
-    >,
+    on_infer: SharedHandler<InferHandler>,
+    /// Optional callback invoked for inbound InferCancel messages. The
+    /// worker registers this to mark in-flight requests as cancelled in the
+    /// queue manager, which the streaming loop observes to abort promptly.
+    on_cancel: SharedHandler<CancelHandler>,
 }
 
 impl P2PNode {
@@ -308,6 +311,16 @@ impl P2PNode {
         F: Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_infer.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
+    /// Sets a callback for inbound cancellation requests. Called with the
+    /// request id whenever an InferCancel message arrives from a peer.
+    pub fn set_on_cancel_request<F>(&mut self, callback: F)
+    where
+        F: Fn(uuid::Uuid) + Send + Sync + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_cancel.lock());
         *guard = Some(std::sync::Arc::new(callback));
     }
 
@@ -349,18 +362,10 @@ impl P2PNode {
 
         let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
         // Shared on_infer callback storage for runtime registration
-        let on_infer: std::sync::Arc<
-            tokio::sync::Mutex<
-                Option<
-                    std::sync::Arc<
-                        dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
-                            + Send
-                            + Sync,
-                    >,
-                >,
-            >,
-        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let on_infer: SharedHandler<InferHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_infer_clone = on_infer.clone();
+        let on_cancel: SharedHandler<CancelHandler> = Arc::new(tokio::sync::Mutex::new(None));
+        let on_cancel_clone = on_cancel.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -391,8 +396,21 @@ impl P2PNode {
                                 pending.insert(id, reply);
                             }
                             Command::Broadcast { payload } => {
-                                for peer in &connected {
-                                    swarm.behaviour_mut().messages.send_request(peer, payload.clone());
+                                // Send to connected peers plus every peer whose
+                                // address we know (e.g. from mDNS) even if the
+                                // connection is not established yet —
+                                // request_response auto-dials in that case.
+                                let mut peers = connected.clone();
+                                for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
+                                    if !peers.contains(peer) {
+                                        peers.push(*peer);
+                                    }
+                                }
+                                for peer in peers {
+                                    swarm
+                                        .behaviour_mut()
+                                        .messages
+                                        .send_request(&peer, payload.clone());
                                 }
                             }
                             Command::Shutdown => break,
@@ -421,7 +439,15 @@ impl P2PNode {
                             )) => {
                                 for (peer, addr) in list {
                                     info!(%peer, %addr, "mDNS discovered peer");
-                                    swarm.add_peer_address(peer, addr);
+                                    swarm.add_peer_address(peer, addr.clone());
+                                    // mDNS discovery is passive: it only adds
+                                    // addresses to the peerstore. Dial so the
+                                    // connection is actually established and
+                                    // request/response streaming can reach
+                                    // this peer.
+                                    if let Err(e) = swarm.dial(addr) {
+                                        debug!(%peer, error = %e, "mDNS auto-dial deferred");
+                                    }
                                 }
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
@@ -437,18 +463,6 @@ impl P2PNode {
                                     .is_ok()
                                     {
                                         info!(%peer, bytes = request.len(), "received manifest announcement");
-                                        continue;
-                                    }
-                                    // Check for WorkerAnnouncement
-                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::WorkerAnnouncement>(
-                                        &request,
-                                        request.len(),
-                                    )
-                                    .is_ok()
-                                    {
-                                        info!(%peer, bytes = request.len(), "received worker announcement");
-                                        // Worker announcements don't require responses
-                                        // They are processed by the distributed handler if configured
                                         continue;
                                     }
                                     // Check for InferRequest
@@ -478,6 +492,26 @@ impl P2PNode {
                                             continue;
                                         }
                                         // else fallthrough to normal handler
+                                    }
+                                    // Check for InferCancel (single request id in the message, no
+                                    // request/response payload semantics)
+                                    if let Ok(decentraai_protocol::InferMessage::InferCancel {
+                                        request_id,
+                                        ..
+                                    }) = decentraai_protocol::deserialize_message::<
+                                        decentraai_protocol::InferMessage,
+                                    >(&request, request.len())
+                                    {
+                                        info!(%peer, %request_id, "received inference cancel");
+                                        let guard = on_cancel_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            cb(request_id);
+                                        }
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, Vec::new());
+                                        continue;
                                     }
                                     let response = match &handler {
                                         Some(h) => match h.handle(&request) {
@@ -541,6 +575,7 @@ impl P2PNode {
             commands,
             peer_id,
             on_infer,
+            on_cancel,
         })
     }
 

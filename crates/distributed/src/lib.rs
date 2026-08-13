@@ -29,7 +29,7 @@
 //!
 //! let config = InferenceConfig::default();
 //! let worker_manager = Arc::new(WorkerManager::new(p2p_node.local_peer_id(), config.clone()));
-//! let mut distributed = DistributedInference::new(p2p_node, config, Some(worker_manager))?;
+//! let mut distributed = DistributedInference::new(p2p_node, config, Some(worker_manager), None)?;
 //!
 //! // Start worker discovery
 //! distributed.start_worker_discovery().await?;
@@ -62,7 +62,7 @@ pub use worker::WorkerManager;
 
 /// Re-export protocol types for convenience
 pub use decentraai_protocol::{
-    InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
+    InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
 };
 
 /// Module for error types
@@ -105,7 +105,6 @@ pub struct DistributedInference {
     fallback_handler: FallbackHandler,
     queue_manager: Arc<RequestQueueManager>,
     config: InferenceConfig,
-    tracker: Option<Arc<RequestTracker>>,
 }
 
 impl DistributedInference {
@@ -139,7 +138,6 @@ impl DistributedInference {
             fallback_handler,
             queue_manager,
             config,
-            tracker,
         })
     }
 
@@ -175,7 +173,7 @@ impl DistributedInference {
 
     /// Returns a reference to the queue manager
     pub fn queue_manager(&self) -> &RequestQueueManager {
-        &*self.queue_manager
+        &self.queue_manager
     }
 
     /// Starts the worker discovery process
@@ -185,7 +183,8 @@ impl DistributedInference {
     /// - Listening for worker announcements from peers
     /// - Managing worker heartbeat and stale detection
     pub async fn start_worker_discovery(&mut self) -> anyhow::Result<()> {
-        self.worker_manager
+        let manager = self.worker_manager.clone();
+        manager
             .start_discovery(&self.p2p_node, self.config.announcement_interval_ms)
             .await
     }
@@ -211,13 +210,19 @@ impl DistributedInference {
     /// P2P on_infer handler that accepts requests, enqueues them, and streams
     /// progress back to the requester. This method must be called after the
     /// DistributedInference is constructed and takes ownership of the backend.
+    ///
+    /// The request lifecycle guarantees exactly ONE terminal event per request:
+    /// either an `InferResponse` (success) or an `InferFailed` (cancellation or
+    /// backend error) — never both, never zero (queue-full is answered
+    /// immediately with `InferFailed`).
     pub fn register_worker_backend(
         &mut self,
         backend: decentraai_inference_adapter::OpenAiCompatibleBackend,
         model_hash: String,
     ) -> anyhow::Result<()> {
-        use decentraai_inference_adapter::InferenceBackend;
-        use decentraai_protocol::{InferProgress, InferMessage, InferResponse, serialize_message};
+        use decentraai_protocol::{
+            InferMessage, InferResponse, serialize_message,
+        };
 
         let local_peer = self.p2p_node.local_peer_id();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<decentraai_protocol::InferRequest>();
@@ -225,7 +230,18 @@ impl DistributedInference {
         let p2p_clone = self.p2p_node.clone();
         let queue_mgr = self.queue_manager.clone();
         let backend_clone = backend.clone();
+        let worker_manager = self.worker_manager.clone();
         let model_hash_clone = model_hash.clone();
+
+        // Map inbound InferCancel frames to the queue manager so in-flight
+        // requests are marked cancelled and the streaming loop aborts.
+        let cancel_queue = self.queue_manager.clone();
+        self.p2p_node.set_on_cancel_request(move |request_id| {
+            let cancel_queue = cancel_queue.clone();
+            tokio::spawn(async move {
+                let _ = cancel_queue.cancel_request(request_id).await;
+            });
+        });
 
         // Register sync on_infer handler that enqueues the request and returns Accept
         self.p2p_node.set_on_infer_request(move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
@@ -242,98 +258,58 @@ impl DistributedInference {
                     success: false,
                     error: Some("Model not available on this worker".to_string()),
                 };
-                return Ok(serialize_message(&InferMessage::InferResponse(resp))?);
+                return serialize_message(&InferMessage::InferResponse(resp));
             }
 
-            // Send to processing channel (background task will enqueue)
-            tx_clone.send(req).map_err(|e| anyhow::anyhow!("failed to enqueue infer request: {}", e))?;
+            // Send to processing channel (background task will enqueue). If the
+            // channel is gone the worker is shutting down; tell the requester.
+            if tx_clone.send(req.clone()).is_err() {
+                let failed = InferMessage::InferFailed {
+                    request_id: req.request_id,
+                    worker_peer_id: local_peer,
+                    error: "worker is shutting down".to_string(),
+                    retryable: false,
+                };
+                return serialize_message(&failed);
+            }
 
-            // Respond with InferAccepted (use the original request_id)
+            // Respond with InferAccepted echoing the ORIGINAL request id so the
+            // requester can correlate subsequent progress frames.
             let msg = InferMessage::InferAccepted {
-                request_id: uuid::Uuid::new_v4(),
+                request_id: req.request_id,
                 worker_peer_id: local_peer,
                 estimated_wait_ms: 10,
             };
-            Ok(serialize_message(&msg)?)
+            serialize_message(&msg)
         });
 
         // Spawn background task to process queued requests and stream
         tokio::spawn(async move {
-            use futures::StreamExt;
             while let Some(req) = rx.recv().await {
-                // Queue the request
-                let _ = queue_mgr.queue_request(req.clone(), local_peer).await;
-
-                // Try to dequeue and process
-                while let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
-                    let request_id = queued.request_id;
-                    let backend_req = decentraai_inference_adapter::BackendRequest {
-                        request_id: request_id.to_string(),
-                        prompt: queued.request.prompt.clone(),
-                        max_tokens: queued.request.max_tokens,
-                        temperature: queued.request.temperature,
-                        top_p: queued.request.top_p,
-                    };
-
-                    match backend_clone.stream(backend_req).await {
-                        Ok(mut stream) => {
-                            let mut seq: u64 = 0;
-                            while let Some(chunk_res) = stream.next().await {
-                                match chunk_res {
-                                    Ok(chunk) => {
-                                        seq += 1;
-                                        let progress = InferProgress {
-                                            request_id,
-                                            worker_peer_id: local_peer,
-                                            tokens_generated: seq as u32,
-                                            partial_output: chunk.text.clone(),
-                                            percent_complete: 0.0,
-                                        };
-                                        if let Ok(bytes) = serialize_message(&InferMessage::InferProgress(progress.clone())) {
-                                            let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
-                                        }
-
-                                        // Check cancellation
-                                        if queue_mgr.is_cancelled(request_id).await {
-                                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id, worker_peer_id: local_peer, error: "cancelled".to_string(), retryable: false }) {
-                                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id, worker_peer_id: local_peer, error: format!("backend error: {}", e), retryable: false }) {
-                                            let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // On completion send final InferResponse
-                            let final_resp = InferResponse {
-                                request_id,
-                                trace_id: queued.request.trace_id.clone(),
-                                worker_peer_id: local_peer,
-                                completed_at: chrono::Utc::now().to_rfc3339(),
-                                output: "".to_string(),
-                                tokens_used: 0,
-                                processing_time_ms: 0,
-                                success: true,
-                                error: None,
-                            };
-                            if let Ok(bytes) = serialize_message(&InferMessage::InferResponse(final_resp)) {
-                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
-                            }
-                            let _ = queue_mgr.complete_request(request_id).await;
-                        }
-                        Err(e) => {
-                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed { request_id: queued.request.request_id, worker_peer_id: local_peer, error: format!("backend error: {}", e), retryable: false }) {
-                                let _ = p2p_clone.request(queued.request.sender_peer_id.clone(), bytes).await;
-                            }
-                            let _ = queue_mgr.complete_request(queued.request.request_id).await;
-                        }
+                // Queue the request; a full queue is answered immediately so the
+                // requester is never left hanging.
+                if !queue_mgr.queue_request(req.clone(), local_peer).await {
+                    if let Ok(bytes) = serialize_message(&InferMessage::InferFailed {
+                        request_id: req.request_id,
+                        worker_peer_id: local_peer,
+                        error: "worker queue is full".to_string(),
+                        retryable: true,
+                    }) {
+                        let _ = p2p_clone.request(req.sender_peer_id, bytes).await;
                     }
+                    continue;
+                }
+
+                // Dequeue and process the request to a single terminal event.
+                if let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
+                    stream_request_to_terminal(
+                        &backend_clone,
+                        &p2p_clone,
+                        &queue_mgr,
+                        &worker_manager,
+                        queued,
+                    )
+                    .await;
                 }
             }
         });
@@ -359,16 +335,49 @@ impl DistributedInference {
         &self,
         request: InferRequest,
     ) -> Result<InferResponse, DistributedError> {
-        // Get the current worker list from the manager (sync version for now)
-        let workers = self.worker_manager.get_workers_sync();
+        // Get the current worker list from the manager (async, never blocks the runtime)
+        let workers = self.worker_manager.get_workers().await;
 
         // Select the best worker for this request
-        let placement = self.request_router.select_worker(&request, &workers)?;
+        let placement = self.request_router.select_worker(&request, &workers).await?;
 
         // Send the request and handle the response
         self.request_router
             .send_request(&self.p2p_node, request, placement)
             .await
+    }
+
+    /// Like [`route_request`](Self::route_request) but streams each received
+    /// `InferProgress` chunk into `progress` as it arrives.
+    pub async fn route_request_streamed(
+        &self,
+        request: InferRequest,
+        progress: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<InferResponse, DistributedError> {
+        let workers = self.worker_manager.get_workers().await;
+        let placement = self.request_router.select_worker(&request, &workers).await?;
+        self.request_router
+            .send_request_streamed(&self.p2p_node, request, placement, progress)
+            .await
+    }
+
+    /// Cancels an in-flight request on a worker by sending an `InferCancel`
+    /// frame. The worker aborts generation and replies with
+    /// `InferFailed(cancelled)`, which the router reports as an error to the
+    /// caller that is still awaiting the request.
+    pub async fn cancel_request(
+        &self,
+        worker_peer_id: libp2p::PeerId,
+        request_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        use decentraai_protocol::{InferMessage, serialize_message};
+        let msg = InferMessage::InferCancel {
+            request_id,
+            reason: "cancelled by coordinator".to_string(),
+        };
+        let bytes = serialize_message(&msg)?;
+        self.p2p_node.request(worker_peer_id, bytes).await?;
+        Ok(())
     }
 
     /// Broadcasts this worker's current status to all connected peers
@@ -432,6 +441,191 @@ impl DistributedInference {
     /// Shuts down the underlying P2P node
     pub fn shutdown(self) {
         self.p2p_node.shutdown();
+    }
+}
+
+/// Drives one queued request through the backend stream to exactly ONE
+/// terminal event. Normal completion sends a single `InferResponse` with the
+/// accumulated output, token count and wall time; cancellation and backend
+/// errors each send a single `InferFailed` (retryable=false for cancellation,
+/// retryable=true for transient backend failures). The queue is always
+/// `complete_request`ed so the worker's in-flight set stays consistent.
+async fn stream_request_to_terminal(
+    backend: &decentraai_inference_adapter::OpenAiCompatibleBackend,
+    p2p: &decentraai_p2p::P2PNode,
+    queue: &RequestQueueManager,
+    worker_manager: &WorkerManager,
+    queued: QueuedRequest,
+) {
+    use decentraai_inference_adapter::{BackendRequest, InferenceBackend};
+    use decentraai_protocol::{InferMessage, InferProgress, InferResponse};
+
+    let request_id = queued.request_id;
+    let sender = queued.request.sender_peer_id;
+    let trace_id = queued.request.trace_id.clone();
+    let local_peer = p2p.local_peer_id();
+    let started = std::time::Instant::now();
+
+    // Mark the worker busy for the duration of the request.
+    let _ = worker_manager.update_local_capacity(0.0, 0, 0, 0);
+
+    let backend_req = BackendRequest {
+        request_id: request_id.to_string(),
+        prompt: queued.request.prompt.clone(),
+        max_tokens: queued.request.max_tokens,
+        temperature: queued.request.temperature,
+        top_p: queued.request.top_p,
+    };
+
+    let stream = match backend.stream(backend_req).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            send_infer(
+                p2p,
+                sender,
+                InferMessage::InferFailed {
+                    request_id,
+                    worker_peer_id: local_peer,
+                    error: format!("backend error: {e}"),
+                    retryable: true,
+                },
+            )
+            .await;
+            let _ = queue.complete_request(request_id).await;
+            let _ = worker_manager.update_local_capacity(1.0, 0, 50, 100);
+            return;
+        }
+    };
+
+    let mut stream = stream;
+    let mut seq: u64 = 0;
+    let mut output = String::new();
+    let mut terminal_sent = false;
+
+    while let Some(next) = next_stream_item(&mut stream, queue, request_id).await {
+        match next {
+            NextItem::Chunk(Ok(chunk)) => {
+                seq += 1;
+                output.push_str(&chunk.text);
+                send_infer(
+                    p2p,
+                    sender,
+                    InferMessage::InferProgress(InferProgress {
+                        request_id,
+                        worker_peer_id: local_peer,
+                        tokens_generated: seq as u32,
+                        partial_output: chunk.text.clone(),
+                        percent_complete: 0.0,
+                    }),
+                )
+                .await;
+            }
+            NextItem::Chunk(Err(e)) => {
+                terminal_sent = true;
+                send_infer(
+                    p2p,
+                    sender,
+                    InferMessage::InferFailed {
+                        request_id,
+                        worker_peer_id: local_peer,
+                        error: format!("backend error: {e}"),
+                        retryable: true,
+                    },
+                )
+                .await;
+                break;
+            }
+            NextItem::Cancelled => {
+                terminal_sent = true;
+                send_infer(
+                    p2p,
+                    sender,
+                    InferMessage::InferFailed {
+                        request_id,
+                        worker_peer_id: local_peer,
+                        error: "cancelled".to_string(),
+                        retryable: false,
+                    },
+                )
+                .await;
+                break;
+            }
+            NextItem::End => break, // normal completion, terminal below
+        }
+    }
+
+    if !terminal_sent {
+        send_infer(
+            p2p,
+            sender,
+            InferMessage::InferResponse(InferResponse {
+                request_id,
+                trace_id,
+                worker_peer_id: local_peer,
+                completed_at: chrono::Utc::now().to_rfc3339(),
+                output,
+                tokens_used: seq as u32,
+                processing_time_ms: started.elapsed().as_millis() as u32,
+                success: true,
+                error: None,
+            }),
+        )
+        .await;
+    }
+
+    let _ = queue.complete_request(request_id).await;
+    let _ = worker_manager.update_local_capacity(1.0, 0, 50, 100);
+}
+
+/// Sends one InferMessage frame to `sender` via the P2P request/response
+/// channel. Errors are logged, never fatal: a dropped requester must not
+/// take down the worker loop.
+async fn send_infer(p2p: &decentraai_p2p::P2PNode, sender: libp2p::PeerId, msg: InferMessage) {
+    if let Ok(bytes) = decentraai_protocol::serialize_message(&msg) {
+        if let Err(e) = p2p.request(sender, bytes).await {
+            tracing::debug!(%sender, error = %e, "failed to deliver infer frame");
+        }
+    }
+}
+
+/// One unit of a streamed backend response, enriched with the cancellation
+/// signal so the caller can distinguish stream end from an abort.
+enum NextItem {
+    Chunk(Result<decentraai_inference_adapter::StreamChunk, decentraai_inference_adapter::BackendError>),
+    End,
+    Cancelled,
+}
+
+/// Awaits the next streamed chunk OR a cancellation signal, whichever fires
+/// first. The cancellation poll makes aborts prompt even while the backend
+/// is between chunks (token generation is CPU-bound and may stall briefly).
+async fn next_stream_item<S>(
+    stream: &mut S,
+    queue: &RequestQueueManager,
+    request_id: uuid::Uuid,
+) -> Option<NextItem>
+where
+    S: futures::Stream<Item = Result<decentraai_inference_adapter::StreamChunk, decentraai_inference_adapter::BackendError>>
+        + Unpin
+        + Send,
+{
+    use futures::StreamExt;
+    tokio::select! {
+        item = stream.next() => match item {
+            Some(r) => Some(NextItem::Chunk(r)),
+            None => Some(NextItem::End),
+        },
+        _ = cancel_poll(queue, request_id) => Some(NextItem::Cancelled),
+    }
+}
+
+/// Polls the queue's cancellation flag until it is set.
+async fn cancel_poll(queue: &RequestQueueManager, request_id: uuid::Uuid) {
+    loop {
+        if queue.is_cancelled(request_id).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

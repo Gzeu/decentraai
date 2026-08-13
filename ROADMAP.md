@@ -67,9 +67,9 @@
 - [x] M9-3: Add request routing to peer GPUs based on capacity
 - [x] M9-4: Implement fallback mechanism when workers fail
 - [x] M9-5: Queue management with FIFO processing and timeout support
-- [ ] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
-- [ ] M9-7: Inference request handler for workers (real llama-server adapter)
-- [ ] M9-8: Real-time capacity updates from runtime
+- [x] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
+- [x] M9-7: Inference request handler for workers (real llama-server adapter)
+- [x] M9-8: Real-time capacity updates from runtime
 - [ ] M9-9: Reputation-based compensation for workers
 
 ## 10. Complete End-to-End Flow (M10)
@@ -77,13 +77,13 @@
 ### Acceptance Criteria
 - [ ] Node starts with `decentraai init` and validated configuration
 - [ ] Worker is paired via QR or token and approved from dashboard
-- [ ] Worker publishes models, capacity and real-time status
-- [ ] Client sends prompt from frontend
-- [ ] Router selects eligible worker
-- [ ] Request transmitted via authenticated P2P
-- [ ] Worker calls real llama-server (not mock handler)
-- [ ] Streaming response to frontend via SSE/WebSocket
-- [ ] Timeout, retry and fallback work correctly
+- [x] Worker publishes models, capacity and real-time status
+- [x] Client sends prompt (CLI `distributed --prompt`, `decentraai-p2p-invoke`)
+- [x] Router selects eligible worker
+- [x] Request transmitted via authenticated P2P
+- [x] Worker calls real llama-server (not mock handler)
+- [x] Streaming response to client, with cancellation via `InferCancel`
+- [x] Timeout, retry and fallback work correctly
 - [ ] Queue depth, latency, P50/P95/P99 and success rate in dashboard
 - [ ] Each request produces audit event with request ID, worker ID, model hash, status
 - [ ] Offline worker detected and excluded from routing
