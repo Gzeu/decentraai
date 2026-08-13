@@ -480,12 +480,21 @@ no multi-worker contention) — the logic is unit/integration-proven.
 
 ## 19. NEXT — M23: Autonomous Execution Planner
 
-## 20. NEXT — M24: Resilient Distributed Fabric
+## 20. M24: Resilient Distributed Fabric — IN PROGRESS
 
-- [ ] lifecycle
-- [ ] failure detection
-- [ ] recovery
-- [ ] worker replacement
+- [x] worker health monitoring + stale detection (coordinator reaper, heartbeat
+      staleness, worker eviction with audit)
+- [x] reservation timeout / expiry and release on completion/failure
+- [x] graceful shutdown, mDNS discovery/recovery, startup recovery (systemd
+      restart + identity/config auto-provision)
+- [x] **false-ready prevention** — node admission: the compute broadcaster now
+      gates worker advertisement on live engine health (TCP probe), so a node
+      with a crashed engine never advertises a ready worker (7b22dbf)
+- [x] **engine crash recovery** — the universal node's runtime auto-restarts a
+      crashed llama-server from a stored restart spec via a 5s supervisor
+      loop (`ServeManager::ensure_healthy`)
+- [ ] request-level retry in the route path (FallbackHandler not yet wired)
+- [ ] P2P reconnect loop to known peers (passive mDNS re-dial today)
 
 ## 21. Ubuntu UX — Q4 setup wizard — DONE
 

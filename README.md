@@ -99,6 +99,16 @@ bash scripts/install-app.sh          # build + onboard + service + launcher
   `journalctl --user -u decentraai-node -f`
 - Uninstall: `bash scripts/uninstall-app.sh` (`--purge` also removes data)
 
+Upgrade: re-running `bash scripts/install-app.sh` reinstalls the latest binary
+(`cargo install --force`) and restarts the service, **keeping your existing
+config and identity** under `~/.decentraai`. Use it as the documented upgrade
+path.
+
+> Note: `scripts/install.sh` is the older **developer** bootstrap (`cargo
+> install` + `init` only — no service, no launcher, no uninstall). Normal
+> users should use `scripts/install-app.sh` (section 0) — the production
+> install path.
+
 Two machines with DecentraAI installed on the same LAN discover each other
 automatically (mDNS + verified auto-share); no one configures topology.
 
