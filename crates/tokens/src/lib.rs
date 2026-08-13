@@ -9,6 +9,10 @@
 //! BLAKE3 hashes, so a leaked `tokens.json` reveals nothing usable —
 //! the same posture as the reputation store and the API token file.
 
+mod tiers;
+
+pub use tiers::{SuggestedTier, TierChange, plan_tier_changes};
+
 use anyhow::{Context, Result, bail};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
@@ -152,6 +156,22 @@ impl TokenStore {
         self.save()
     }
 
+    /// Reassigns an active token's tier (P4). Returns the previous tier so the
+    /// caller can audit the change. No-ops if already at `tier`.
+    pub fn set_tier(&mut self, name: &str, tier: Tier) -> Result<u8> {
+        let entry = self
+            .tokens
+            .values_mut()
+            .find(|r| r.name == name && !r.revoked)
+            .with_context(|| format!("no active token named '{name}'"))?;
+        let from = entry.tier;
+        if from != tier.0 {
+            entry.tier = tier.0;
+            self.save()?;
+        }
+        Ok(from)
+    }
+
     /// Resolves a plaintext token to its record, if active.
     pub fn lookup(&self, plaintext: &str) -> Option<&TokenRecord> {
         self.tokens
@@ -215,6 +235,18 @@ mod tests {
         assert!(listed[0].revoked);
         // A revoked name can be reused.
         store.create("bob", Tier::CORE).unwrap();
+    }
+
+    #[test]
+    fn set_tier_reassigns_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        let plaintext = store.create("dana", Tier::GUEST).unwrap();
+        store.set_tier("dana", Tier::CORE).unwrap();
+
+        let reloaded = open(dir.path());
+        let record = reloaded.lookup(&plaintext).unwrap();
+        assert_eq!(record.tier, 3);
     }
 
     #[test]

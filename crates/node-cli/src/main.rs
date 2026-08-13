@@ -5,7 +5,7 @@ use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -175,6 +175,19 @@ enum TierCommand {
     Suggest {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
+    },
+    /// Apply contribution-suggested tiers to the token registry (P4). Pairs
+    /// each worker's suggested tier to the token of the same name, so a token
+    /// `name` must equal the worker's `node_name`. Dry-run by default; pass
+    /// `--yes` to actually reassign tiers (each change records a
+    /// `tier_changed` audit event).
+    Apply {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Execute the changes (records `tier_changed` audit events). Without
+        /// it, only prints what would change.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1173,23 +1186,34 @@ fn token_command(command: TokenCommand) -> Result<()> {
 }
 
 /// Reads the persisted contribution report and prints each worker's computed
-/// contribution score and suggested subscription tier (M17). Read-only: it
-/// never mutates state. The report is written by `distributed start` /
-/// `swarm start` while a coordinator is online; an empty/missing report
-/// simply prints an empty table with guidance.
+/// `decentraai tier` — subscription tiers driven by measured contribution
+/// (M17 suggest / P4 apply). Reads the report a coordinator wrote while
+/// `distributed start` served requests; read-only in every mode.
 fn tier_command(command: TierCommand) -> Result<()> {
-    let config = match &command {
-        TierCommand::Suggest { config } => config,
+    let config_path = match &command {
+        TierCommand::Suggest { config } | TierCommand::Apply { config, .. } => config,
     };
-    let node_config = NodeConfig::load(config)
-        .with_context(|| format!("loading {}", config.display()))?;
+    let node_config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
     let data_dir = expand_tilde(&node_config.node.data_dir);
-    let path = data_dir.join("db/contributions.json");
 
-    let rows: Vec<decentraai_distributed::ContributionRow> = match std::fs::read(&path) {
+    let rows = load_contribution_report(&data_dir)?;
+
+    match command {
+        TierCommand::Suggest { .. } => print_tier_suggestions(&rows),
+        TierCommand::Apply { yes, .. } => apply_tier_changes(&rows, &data_dir, yes),
+    }
+}
+
+/// Reads the contribution report written by a running coordinator (M17).
+/// A missing report is not an error: it prints guidance and returns `None`'s
+/// empty list.
+fn load_contribution_report(data_dir: &Path) -> Result<Vec<decentraai_distributed::ContributionRow>> {
+    let path = data_dir.join("db/contributions.json");
+    match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
             format!("reading contribution report from {}", path.display())
-        })?,
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!(
                 "No contribution report at {}.\n\
@@ -1197,11 +1221,14 @@ fn tier_command(command: TierCommand) -> Result<()> {
                  and let it serve a few requests, then re-run this command.",
                 path.display()
             );
-            return Ok(());
+            Ok(Vec::new())
         }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
 
+/// Prints the raw contribution report (M17 `tier suggest`), read-only.
+fn print_tier_suggestions(rows: &[decentraai_distributed::ContributionRow]) -> Result<()> {
     if rows.is_empty() {
         println!("No contributing workers recorded yet.");
         return Ok(());
@@ -1210,7 +1237,7 @@ fn tier_command(command: TierCommand) -> Result<()> {
         "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8}  {:>16}",
         "tier", "node", "cpu", "ram_mb", "vram_mb", "score", "verified (hours, failed)"
     );
-    for r in &rows {
+    for r in rows {
         println!(
             "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8.2}  {} ({}h, {} failed)",
             r.suggested_tier,
@@ -1225,7 +1252,77 @@ fn tier_command(command: TierCommand) -> Result<()> {
         );
     }
     println!(
-        "Suggested tiers: 1=guest 2=contributor 3=core. Reflects measured compute served."
+        "Suggested tiers: 1=guest 2=contributor 3=core. Reflects measured compute served.\n\
+         Review with `decentraai tier apply` (dry-run), then `--yes` to write them."
+    );
+    Ok(())
+}
+
+/// Applies contribution-suggested tiers to the token registry (P4). Pairs each
+/// worker's suggested tier to the active token of the same name. Dry-run by
+/// default; with `yes` it reassigns tiers and records `tier_changed` audits.
+fn apply_tier_changes(
+    rows: &[decentraai_distributed::ContributionRow],
+    data_dir: &Path,
+    yes: bool,
+) -> Result<()> {
+    use decentraai_tokens::{Tier, TierChange, TokenStore, plan_tier_changes};
+
+    let registry_path = data_dir.join("db/tokens.json");
+    let store = TokenStore::load(&registry_path)
+        .with_context(|| format!("loading token registry from {}", registry_path.display()))?;
+
+    let suggestions: Vec<decentraai_tokens::SuggestedTier> = rows
+        .iter()
+        .map(|r| decentraai_tokens::SuggestedTier {
+            name: r.node_name.clone(),
+            suggested: r.suggested_tier,
+        })
+        .collect();
+    let tokens = store.list();
+    let changes = plan_tier_changes(&suggestions, &tokens);
+
+    if changes.is_empty() {
+        println!("No tier changes to apply (tokens already match their contribution).");
+        return Ok(());
+    }
+
+    if !yes {
+        println!("Planned tier changes (dry-run; add --yes to apply):");
+        for c in &changes {
+            println!(
+                "  {}: tier {} → {} ({})",
+                c.name,
+                c.from,
+                c.to,
+                Tier(c.to).name()
+            );
+        }
+        println!("Run again with --yes to write these and record tier_changed audit events.");
+        return Ok(());
+    }
+
+    let logs_dir = data_dir.join("logs");
+    let mut store = store;
+    for TierChange { name, to, .. } in &changes {
+        let _from = store.set_tier(name, Tier(*to)).with_context(|| {
+            format!("reassigning tier of token '{name}'")
+        })?;
+        decentraai_audit::record_best_effort(
+            &logs_dir,
+            "tier_changed",
+            serde_json::json!({
+                "name": name,
+                "tier": to,
+            }),
+        );
+    }
+    println!("Applied {} tier change(s):", changes.len());
+    for c in &changes {
+        println!("  {}: tier {} → {}", c.name, c.from, c.to);
+    }
+    println!(
+        "Tokens now reflect measured contribution; new tiers gate the proxy at the next request."
     );
     Ok(())
 }

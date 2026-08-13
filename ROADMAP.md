@@ -45,7 +45,7 @@
   rate limit, usage counters, audits)
 - [ ] P2: chat UI in the dashboard (model selector filtered by tier)
 - [ ] P3: admin dashboard (create/revoke tokens, usage per token)
-- [ ] P4: contribution-based tier suggestions from catalog + reputation
+- [x] P4: contribution-based tier suggestions from catalog + reputation
 - [ ] P5: invites (`decentraai join <invite>`)
 
 ## 8. Operations and scale (in progress)
@@ -175,6 +175,35 @@ real measurement to hang on. A pure, I/O-free scoring engine in
 Tests (all green, no mocks): pure scoring (verified-work gating, failure
 demotion, tier monotonicity, empty profile) and manager-level accounting
 (workings accrue and push the tier up).
+
+### P4: Contribution-suggested tiers written to the token registry — DONE
+
+M17 *measures* contribution and *suggests* a tier per worker; the subscription
+model only fulfills its promise ("your tier reflects your contribution") when
+those suggestions can become the tiers that actually gate the proxy. P4 bridges
+headless measurement to enforced policy, with an explicit admin confirmation
+step and a persistent audit trail.
+
+- `decentraai-tokens::tiers`: pure, I/O-free `plan_tier_changes` maps each
+  worker's `suggested_tier` to the **active token of the same name**
+  (`token.name == node_name`), emitting only real changes, skipping revoked
+  tokens / unknown names / out-of-range tiers, sorted deterministically so a
+  dry-run byte-matches a later apply. `TokenStore::set_tier` reassigns an
+  active token's tier atomically (tmp + sync + rename) and returns the previous
+  tier for audit.
+- `decentraai tier apply --config <c>`: connects the coordinator's persisted
+  `db/contributions.json` (M17) to `db/tokens.json`. **Dry-run by default** —
+  prints exactly which tokens would move (`name: tier X → Y`) without touching
+  state; pass **`--yes`** to write them. Each actual reassignment records a
+  `tier_changed` audit event `{name, tier}` in `logs/audit.jsonl`, and is
+  idempotent (already-matching tokens are never rewritten).
+- `decentraai tier suggest` remains purely read-only (the raw report); `tier
+  apply` is the admin-confirm (`--dry-run`) or rule-auto-promote (`--yes`)
+  step the roadmap called for.
+
+Tests (all green): pairing by name, no-change when already at tier, skip
+revoked/unknown/out-of-range, first-active-match across reissued names,
+deterministic ordering, and registry persistence of `set_tier`.
 
 ### M15: Worker-side reservation enforcement — DONE
 

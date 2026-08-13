@@ -142,9 +142,11 @@ contribution**. Admin-only token issuance from a dashboard.
 - **P3 — Admin dashboard**: `/admin` behind the master token; create /
   revoke tokens, set tiers, usage per token, peer catalogs; everything
   audited.
-- **P4 — Contribution-based tiers**: periodic job computes suggested
-  tier from models shared × verified chunks − failures; admin confirms
-  or rules auto-promote; `tier_changed` audit event.
+- **P4 — Contribution-based tiers (done)**: `decentraai tier apply`
+  writes M17's measured contribution suggestions into `db/tokens.json`,
+  pairing each token to the worker of the same name. Dry-run by default,
+  `--yes` to apply; each change records a `tier_changed` audit event.
+  `tier suggest` stays read-only.
 - **P5 — Invites & join**: admin generates an invite (bootstrap
   multiaddr + Tier-1 token); `decentraai join <invite>` bootstraps a
   fresh node.
