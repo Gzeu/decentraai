@@ -57,7 +57,7 @@ requests — all on real hardware, no mocks.
 | M9 | Distributed inference: route requests to peer GPUs, paid in reputation | Done |
 | P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
 | P6 | Zero-touch sharing: `swarm start` auto-downloads announced models (mDNS + consent modes) | Done |
-| P2 | Chat UI in the dashboard | Next |
+| P2 | Chat UI in the dashboard (single embedded dashboard: normal-user view + opt-in advanced block) | Done |
 | M18 | **Distributed execution fabric foundation** — universal node, mDNS/libp2p discovery, trusted admission, fabric planner, reservations, real remote inference, streaming, worker reuse, bidirectional Desktop ↔ Laptop (verified on real LAN) | **Done** |
 | M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) — real RTT via InferPing/InferPong, fold reach cost into planner scoring | Done |
 | M20 | KV-aware inference fabric — coordinator-side KV/session accounting, continuation affinity, KV headroom/locality (llama-server live-KV occupancy not claimed) | Done |

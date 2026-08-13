@@ -919,7 +919,10 @@ ol{padding-left:20px} li{margin:6px 0}
 </style>
 </head>
 <body>
-<h1>DecentraAI node</h1>
+  <h1>DecentraAI node</h1>
+<div style="text-align:right;margin:-4px 0 0">
+  <button id="adv-toggle" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:6px 12px;cursor:pointer">Show advanced</button>
+</div>
 <div class="card">
   <h2>Model</h2>
   <div class="bignum" id="model-name">&hellip;</div>
@@ -970,6 +973,7 @@ ol{padding-left:20px} li{margin:6px 0}
     <tr><td>GPU</td><td id="gpu">&mdash;</td></tr>
   </table>
 </div>
+<div id="advanced" hidden>
 <div class="card">
   <h2>Tracked peers (reputation)</h2>
   <table><thead><tr><th>Peer</th><th>Verified chunks</th><th>Failed</th><th>Score</th><th>Status</th></tr></thead>
@@ -1030,6 +1034,7 @@ ol{padding-left:20px} li{margin:6px 0}
   <h2>Share a model with another machine</h2>
   <div id="share"></div>
 </div>
+</div>
 <p class="small">Refreshes every 3s from /status and /v1/peers only &mdash; watching this page never touches the inference backend. Loopback only.</p>
 <script type="module">
 /*__JS__*/
@@ -1047,6 +1052,18 @@ const JS_TEMPLATE: &str = r#"
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 document.getElementById('share').innerHTML = "__SHARE__";
 document.getElementById('model-name').textContent = "__MODEL__";
+const advEl = document.getElementById('advanced');
+const advBtn = document.getElementById('adv-toggle');
+const setAdv = (show) => {
+  advEl.hidden = !show;
+  advBtn.textContent = show ? 'Hide advanced' : 'Show advanced';
+};
+setAdv((localStorage.getItem('decentraai.advanced') || '0') === '1');
+advBtn.addEventListener('click', () => {
+  const show = advEl.hidden;
+  try { localStorage.setItem('decentraai.advanced', show ? '1' : '0'); } catch (e) {}
+  setAdv(show);
+});
 let token = '';
 try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
@@ -1146,8 +1163,9 @@ async function refresh() {
     ).join('');
     document.getElementById('peers').innerHTML = rows || '<tr><td colspan="5" class="off">no peers tracked yet</td></tr>';
   } catch (e) {}
+  let c = null, n = null;
   try {
-    const c = await (await fetch('/v1/compute', { headers })).json();
+    c = await (await fetch('/v1/compute', { headers })).json();
     const wrows = (c.workers || []).map(w =>
       '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
       (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' + w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb||0)/1024) + ' GiB</td><td>' + w.in_flight + '</td></tr>'
@@ -1155,7 +1173,7 @@ async function refresh() {
     document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="9" class="off">no workers yet (compute not attached)</td></tr>';
   } catch (e) {}
   try {
-    const n = await (await fetch('/v1/network', { headers })).json();
+    n = await (await fetch('/v1/network', { headers })).json();
     const nrows = (n.links || []).map(l =>
       '<tr><td><code>' + esc(l.peer.slice(0, 16)) + '&hellip;</code></td><td>' + l.rtt_ms + ' ms</td><td>' + (l.bandwidth_mbps || '&mdash;') + ' Mbps</td><td>' + esc(l.locality || '') + '</td></tr>'
     ).join('');
@@ -1706,6 +1724,53 @@ mod tests {
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
         }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_hides_advanced_compute_internals_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let body = client
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // Normal-user essentials are always present.
+        for needle in [
+            "id=\"adv-toggle\"",
+            "id=\"chat-history\"",
+            "id=\"recent\"",
+            "id=\"ram\"",
+        ] {
+            assert!(body.contains(needle), "normal view must include {needle}");
+        }
+        // Distributed-compute internals live behind the opt-in advanced block.
+        assert!(
+            body.contains("<div id=\"advanced\" hidden>"),
+            "advanced compute cards must be hidden by default"
+        );
+        for needle in [
+            "Tracked peers (reputation)",
+            "Workers (compute registry)",
+            "Execution (planner decisions)",
+            "Diagnostics",
+            "Recent security events",
+        ] {
+            let idx = body.find(needle).expect("advanced card present");
+            let open = body
+                .find("<div id=\"advanced\"")
+                .expect("advanced container");
+            assert!(idx > open, "{needle} must be inside the advanced container");
+        }
+        // The toggle must drive the advanced container from real state (no mocks).
+        assert!(body.contains("document.getElementById('advanced')"));
+        assert!(body.contains("localStorage.setItem('decentraai.advanced'"));
         manager.lock().await.shutdown().await.unwrap();
     }
 

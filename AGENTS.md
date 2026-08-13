@@ -229,6 +229,11 @@ Diagnostics in the embedded HTML, all from real runtime state surfaced by
 `/status`, `/v1/compute`, `/v1/network`, `/v1/execution` and `/v1/peers` — no
 mock data, watching the page never touches the backend. Chat history is kept
 in-page for the session (server-side conversation persistence is not wired).
+The dashboard is split into a normal-user view (Model, Inference, Chat, Queue,
+Recent inference, System) and an opt-in "Show advanced" block (reputation,
+Workers, Network, Execution, Models, Settings, Diagnostics, audit events, share
+guide), so distributed-compute complexity is hidden unless the operator wants
+it.
 
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core

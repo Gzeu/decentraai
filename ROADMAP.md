@@ -43,8 +43,9 @@
 - [x] P1: token registry (`db/tokens.json`, hashed) + `decentraai token`
   CLI + tiered auth in the proxy (per-tier model allowlist, sliding-window
   rate limit, usage counters, audits)
-- [ ] P2: chat UI in the dashboard (model selector filtered by tier)
-- [ ] P3: admin dashboard (create/revoke tokens, usage per token)
+- [x] P2: chat UI in the single embedded dashboard (non-streaming `/v1/chat/completions`, real worker routing); tier-filtered model selector folded into the single-dashboard approach — chat uses the node's active model and shows what it is
+- [x] P3: admin actions in the single embedded dashboard (`/admin` + `/api/admin/token/*` create/revoke tokens, usage per token)
+- [x] P6: dashboard views — Models, Settings, Diagnostics, Execution, Workers, Network (advanced) + normal-user view (Model, Inference, Chat, Queue, Recent, System), all from real runtime state, no mock data
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [ ] P5: invites (`decentraai join <invite>`)
 
