@@ -2585,6 +2585,15 @@ async fn spawn_network_probe(
                 if p2p_node.request(peer, bytes).await.is_ok() {
                     let rtt_us = start.elapsed().as_micros() as u64;
                     compute_manager.record_rtt(&peer, rtt_us, 0);
+                    let link = compute_manager.network_graph().get(&peer.to_string());
+                    info!(
+                        peer = %peer,
+                        measured_rtt_us = rtt_us,
+                        graph_rtt_us = link.rtt_us,
+                        graph_locality = ?link.locality,
+                        graph_peers = compute_manager.network_graph().measured_len(),
+                        "M19 network probe: measured RTT recorded, planner reads via NetworkGraph"
+                    );
                 }
             }
         }
