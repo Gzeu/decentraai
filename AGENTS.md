@@ -168,12 +168,25 @@ bidirectional execution all proven; the loopback backend URL is never
 advertised as a remote endpoint.
 
 The crate also holds building blocks that are **parked as NEXT milestones
-(M20–M24), not claimed complete**: `KvPlanner` + `ContextProfile` (M20 KV-aware
-fabric), honest `ExpertRegistry`/`ExpertRouter` behind `expert_routing`
-(M21 — none advertise it; whole-model fallback is correct, never mocked),
-`EngineKind` + capability probe (M22 multi-engine), an `ExecutionPlanner`
-(M23), and the coordinator reaper `reap_unhealthy` (M24). Do NOT mark M20–M24
-as done in documentation until their behaviors are production-verified.
+(M21–M24), not claimed complete**: honest `ExpertRegistry`/`ExpertRouter`
+behind `expert_routing` (M21 — none advertise it; whole-model fallback is
+correct, never mocked), `EngineKind` + capability probe (M22 multi-engine), an
+`ExecutionPlanner` (M23), and the coordinator reaper `reap_unhealthy` (M24).
+Do NOT mark M21–M24 as done in documentation until their behaviors are
+production-verified.
+
+**M20 (KV-aware inference fabric) is IN PROGRESS**: coordinator-side KV/session
+accounting (`SessionAccount`), continuation affinity, and KV-aware planner
+inputs (`ServedModel.context_tokens` → `KVCacheState`, `is_continuation` /
+`prefix_resident_on`) are implemented and wired into the real `plan_and_reserve`
+route path; live Desktop → Laptop requests confirm the planner consumes real
+KV state, with reservations/streaming/release intact. It is **not claimed
+DONE**: non-empty KV-headroom / long-context steering is only unit- and
+integration-proven, not yet observed on the live link (the running Laptop
+worker advertises unknown `context_tokens` and there is no multi-worker
+contention), and prefill/decode split stays gated behind
+`prefill_decode_separation` which no real engine advertises. Do not mark M20
+done until that production behavior is observed.
 
 **M19 (network-aware scheduler) is verified-DONE** on real Desktop ↔ Laptop
 LAN hardware: the `NetworkGraph` + `InferPing/Pong` RTT probe measures live

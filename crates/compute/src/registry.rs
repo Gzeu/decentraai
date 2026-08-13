@@ -106,7 +106,11 @@ impl ComputeRegistry {
     /// unhealthy workers" step (M24): first [`prune_stale`](Self::prune_stale)
     /// flips stale peers offline (they may yet rejoin), then repeated calls to
     /// this method evict those that stay gone past the grace window.
-    pub fn reap_offline(&mut self, now: Instant, grace: std::time::Duration) -> Vec<(PeerId, String)> {
+    pub fn reap_offline(
+        &mut self,
+        now: Instant,
+        grace: std::time::Duration,
+    ) -> Vec<(PeerId, String)> {
         let evicted: Vec<(PeerId, String)> = self
             .last_seen
             .iter()
@@ -154,7 +158,10 @@ mod tests {
     fn mark_offline_keeps_advertisement() {
         let mut reg = ComputeRegistry::new(std::time::Duration::from_secs(30));
         let p = test_peer();
-        reg.upsert(test_advertisement(p, 1024, Some(2048), 10, 0, WorkerHealth::Ready), now());
+        reg.upsert(
+            test_advertisement(p, 1024, Some(2048), 10, 0, WorkerHealth::Ready),
+            now(),
+        );
         reg.mark_offline(&p);
         let adv = reg.get(&p).unwrap();
         assert_eq!(adv.availability.status, WorkerHealth::Offline);
@@ -166,11 +173,17 @@ mod tests {
         let stale_after = std::time::Duration::from_millis(10);
         let mut reg = ComputeRegistry::new(stale_after);
         let p = test_peer();
-        reg.upsert(test_advertisement(p, 1024, Some(2048), 10, 0, WorkerHealth::Ready), now());
+        reg.upsert(
+            test_advertisement(p, 1024, Some(2048), 10, 0, WorkerHealth::Ready),
+            now(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(30));
         let stale = reg.prune_stale(now());
         assert_eq!(stale, vec![p]);
-        assert_eq!(reg.get(&p).unwrap().availability.status, WorkerHealth::Offline);
+        assert_eq!(
+            reg.get(&p).unwrap().availability.status,
+            WorkerHealth::Offline
+        );
     }
 
     #[test]
@@ -190,6 +203,7 @@ mod tests {
                     size_mb: 500,
                     est_ram_mb: 1000,
                     est_vram_mb: 0,
+                    context_tokens: 0,
                 }],
                 can_provision: false,
             },

@@ -26,6 +26,13 @@ pub struct ServedModel {
     pub est_ram_mb: u64,
     /// Estimated VRAM footprint when loaded on GPU (MiB). `0` = CPU-only.
     pub est_vram_mb: u64,
+    /// Real KV-cache context window (tokens) this worker allocates for the
+    /// model (`--ctx-size` on llama-server). `0` = unknown. Coordinator uses
+    /// this as the honest capacity for KV-headroom accounting (M20).
+    /// Backward-compatible: older workers that predate M20 omit the field,
+    /// which deserializes to `0` (unknown capacity).
+    #[serde(default)]
+    pub context_tokens: u32,
 }
 
 /// Immutable capability of a worker. Advertised on registration and changes
@@ -91,6 +98,7 @@ mod tests {
                 size_mb: 2048,
                 est_ram_mb: 256,
                 est_vram_mb: 3072,
+                context_tokens: 0,
             }],
             can_provision: false,
         }

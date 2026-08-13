@@ -440,27 +440,41 @@ pinged (libp2p refuses self-dial).
 
 Related commit: `c5d2b44` (plus the probe wiring in `node-cli`).
 
-## 16. NEXT — M20: KV-Aware Inference Fabric — NOT STARTED
+## 16. NEXT — M20: KV-Aware Inference Fabric — IN PROGRESS
 
-KV-aware placement is the next milestone after the M19 network-aware
-scheduler. The fabric crate already contains the pure KV building blocks
-(`KvPlanner`, `ContextProfile`, `KVCacheState`); wiring them into the real
-coordinator route path and validating on real Desktop ↔ Laptop hardware is
-left to M20. **M20 implementation is not claimed complete.**
+KV-aware placement builds on the M19 network-aware scheduler. Coordinator-side
+KV/session accounting, continuation affinity, and KV-aware planner inputs are
+implemented and wired into the real `plan_and_reserve` route path. Live
+Desktop → Laptop requests confirm the planner is fed real per-worker
+`KVCacheState` and continuation state, and reservations/streaming/release stay
+correct. **Remaining to production-prove:** non-empty KV-headroom steering and
+cross-machine long-context placement, which require a worker to advertise a
+real `n_ctx` (and multi-worker topology). See the gaps below.
 
-Scope (explicit, checked off as M20 lands):
-- [ ] KV locality — prefer a worker that already holds the conversation's
-      cache for this model (continuation affinity).
-- [ ] context / KV state — the planner sees each worker's real cache
-      occupancy (headroom in tokens) for the requested model + context.
-- [ ] continuation affinity — route a multi-turn continuation to the worker
-      that already has the prefix resident, not to a cold one.
-- [ ] KV headroom — only place a request on a worker whose cache can
-      accommodate the full context budget.
-- [ ] long-context placement — weight placement so long prompts/decode land
-      where KV capacity + bandwidth (M19) allow it.
-- [ ] prefill / decode considerations — prefill-heavy (prompt) vs
-      decode-heavy (generation) requests steered to suitable workers.
+Scope (checked as each is *genuinely* production-verified):
+- [x] KV locality / continuation affinity — coordinator-side session→worker
+      residency (`SessionAccount`); a continuation with a known session is
+      steered to the worker holding the KV prefix, with deterministic fallback
+      when residency is unknown/stale. Wired into `RequestFacts`
+      (`is_continuation`, `prefix_resident_on`).
+- [x] context / KV state — `ServedModel.context_tokens` advertises a worker's
+      real `n_ctx`; `fabric_facts` now reports each worker's `KVCacheState`
+      (was hardcoded `Unknown`) from real capacity + accounted usage.
+- [x] KV headroom logic — `KvPlanner` + `KVCacheState` headroom consumed in the
+      planner; honest coordinator-side accounting (`record_session_usage`)
+      derived from real `tokens_used` and advertised `n_ctx` — no invented
+      telemetry.
+- [ ] KV headroom / long-context *production* steering — not yet shown live on
+      real cross-machine traffic: the running Laptop worker advertises unknown
+      `context_tokens` (pre-M20 binary) and the coordinators have no
+      multi-worker contention yet, so no non-empty `Partial`/`Full` headroom
+      decision has been observed in E2E. Logic is unit/integration-proven.
+- [ ] prefill / decode considerations — gated behind
+      `EngineCapabilities::prefill_decode_separation`, which no real engine
+      advertises; llama-server stays conservative. **Not claimed.**
+
+**M20 is not marked DONE until real worker advertises a real n_ctx and
+non-empty KV-headroom steering is observed on the live link.**
 
 ## 17. NEXT — M21: Distributed MoE / Expert Fabric
 

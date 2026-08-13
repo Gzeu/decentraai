@@ -33,6 +33,13 @@ pub struct InferRequest {
     pub stream: bool,
     /// Request priority (0-255, higher = more urgent)
     pub priority: u8,
+    /// Optional session identifier (M20). Continuation requests carry the
+    /// same `session_id` as an earlier request so the coordinator can prefer
+    /// the worker that already holds the KV prefix (cache locality). `None`
+    /// for a cold / stateless request. Backward-compatible: older requests
+    /// without the field deserialize to `None`.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl InferRequest {
@@ -53,11 +60,17 @@ impl InferRequest {
             timeout_ms: 30000,
             stream: false,
             priority: 128,
+            session_id: None,
         }
     }
 
     pub fn with_sender(mut self, peer_id: PeerId) -> Self {
         self.sender_peer_id = peer_id;
+        self
+    }
+
+    pub fn with_session(mut self, session_id: String) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 

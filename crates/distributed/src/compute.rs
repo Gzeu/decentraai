@@ -18,12 +18,10 @@ use std::time::Instant;
 use libp2p::PeerId;
 use tokio::sync::Mutex;
 
+use decentraai_compute::{CapabilityMatcher, ComputeRegistry, ComputeScheduler, Placement};
 pub use decentraai_compute::{
     ComputeAdvertisement, ComputeAvailability, ComputeCapability, GpuSpec, ResourceReservation,
-    ServedModel, WorkloadRequirements, WorkerHealth,
-};
-use decentraai_compute::{
-    CapabilityMatcher, ComputeRegistry, ComputeScheduler, Placement,
+    ServedModel, WorkerHealth, WorkloadRequirements,
 };
 
 use decentraai_system_probe::{GpuProbeStatus, GpuSnapshot, SystemSnapshot};
@@ -163,12 +161,7 @@ impl ContributionTracker {
         self.last_announce = Some(now);
         self.profile.cpu_cores = adv.capability.cpu_cores;
         self.profile.ram_mb = adv.capability.ram_mb;
-        self.profile.vram_mb = adv
-            .capability
-            .gpu
-            .as_ref()
-            .map(|g| g.vram_mb)
-            .unwrap_or(0);
+        self.profile.vram_mb = adv.capability.gpu.as_ref().map(|g| g.vram_mb).unwrap_or(0);
     }
 }
 
@@ -251,24 +244,21 @@ pub struct ComputeManager {
     /// to each peer, fed by a periodic `InferPing` probe and read by the
     /// execution planner to weight reach cost.
     network: std::sync::Mutex<decentraai_fabric::NetworkGraph>,
+    /// Coordinator-side KV-cache / session accounting (M20): which worker
+    /// holds each conversation's KV prefix and the honest per-worker KV
+    /// occupancy derived from real routed requests + advertised `n_ctx`.
+    sessions: std::sync::Mutex<crate::session::SessionAccount>,
 }
 
 impl ComputeManager {
     /// Creates a manager with a fresh scheduler over the given trusted set.
     pub fn new(local_peer: PeerId, node_name: String, trusted: HashSet<PeerId>) -> Self {
-        let registry = ComputeRegistry::new(std::time::Duration::from_millis(
-            DEFAULT_STALE_AFTER_MS,
-        ));
-        let ledger = decentraai_compute::ReservationLedger::new(
-            std::time::Duration::from_secs(60),
-            4,
-        );
-        let scheduler = ComputeScheduler::new(
-            registry,
-            ledger,
-            CapabilityMatcher::default(),
-            trusted,
-        );
+        let registry =
+            ComputeRegistry::new(std::time::Duration::from_millis(DEFAULT_STALE_AFTER_MS));
+        let ledger =
+            decentraai_compute::ReservationLedger::new(std::time::Duration::from_secs(60), 4);
+        let scheduler =
+            ComputeScheduler::new(registry, ledger, CapabilityMatcher::default(), trusted);
         Self {
             local_peer,
             node_name,
@@ -279,6 +269,7 @@ impl ComputeManager {
             metrics: std::sync::Arc::new(RuntimeMetrics::new()),
             contribution: std::sync::Mutex::new(BTreeMap::new()),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
+            sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
         }
     }
 
@@ -325,8 +316,7 @@ impl ComputeManager {
                 tracker.profile.verified_requests =
                     tracker.profile.verified_requests.saturating_add(1);
             } else {
-                tracker.profile.failed_requests =
-                    tracker.profile.failed_requests.saturating_add(1);
+                tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
             }
         }
     }
@@ -359,11 +349,12 @@ impl ComputeManager {
     pub fn record_rtt(&self, peer: &PeerId, rtt_us: u64, bandwidth_mbps: u32) {
         let mut graph = self.network.lock().unwrap();
         let prior = graph.get(&peer.to_string());
-        let measured_rtt_us = if rtt_us > 0 { Some(rtt_us as u32) } else { None };
-        let link = decentraai_fabric::LinkMetrics::prior(
-            prior.locality,
-            measured_rtt_us,
-        );
+        let measured_rtt_us = if rtt_us > 0 {
+            Some(rtt_us as u32)
+        } else {
+            None
+        };
+        let link = decentraai_fabric::LinkMetrics::prior(prior.locality, measured_rtt_us);
         if bandwidth_mbps > 0 {
             let link = decentraai_fabric::LinkMetrics {
                 bandwidth_mbps,
@@ -378,6 +369,87 @@ impl ComputeManager {
     /// The current network graph snapshot (coordinator-centric link metrics).
     pub fn network_graph(&self) -> decentraai_fabric::NetworkGraph {
         self.network.lock().unwrap().clone()
+    }
+
+    /// Records where a session's KV prefix lives after a routed request
+    /// completed (M20). `tokens_used` is the real input+output tokens the
+    /// worker reported; `capacity` is the worker's advertised `n_ctx` for the
+    /// model (0 = unknown). This is honest coordinator-side accounting — no
+    /// fabricated engine telemetry.
+    pub async fn record_session_usage(
+        &self,
+        session_id: &str,
+        worker: &PeerId,
+        model_hash: &str,
+        tokens_used: u32,
+    ) {
+        // Real advertised KV capacity (n_ctx) for the model on that worker, or
+        // 0 when unknown/unadvertised.
+        let capacity = self
+            .scheduler
+            .lock()
+            .await
+            .registry()
+            .get(worker)
+            .and_then(|adv| adv.capability.model(model_hash))
+            .map(|m| m.context_tokens)
+            .unwrap_or(0);
+        self.sessions.lock().unwrap().record(
+            session_id,
+            *worker,
+            model_hash,
+            tokens_used,
+            capacity,
+        );
+    }
+
+    /// The worker holding a session's KV prefix, if any (M20 continuation
+    /// affinity). `None` for unknown/stale sessions → deterministic fallback.
+    pub fn session_residency(&self, session_id: &str) -> Option<PeerId> {
+        self.sessions.lock().unwrap().residency(session_id)
+    }
+
+    /// Derives the honest KV-cache state the planner should use for `worker`
+    /// serving `model_hash` (M20): `Partial { used, capacity }` when the
+    /// worker advertises a real `n_ctx` and the coordinator has accounted
+    /// resident sessions, otherwise the conservative `Empty`/`Unknown`.
+    pub fn kv_state_for(
+        &self,
+        worker: &PeerId,
+        model_hash: &str,
+    ) -> decentraai_fabric::KVCacheState {
+        use decentraai_fabric::KVCacheState;
+        let used = self
+            .sessions
+            .lock()
+            .unwrap()
+            .worker_kv_used(worker, model_hash);
+        match used {
+            Some((used_tokens, capacity)) if capacity > 0 => {
+                if used_tokens >= capacity {
+                    KVCacheState::Full
+                } else {
+                    KVCacheState::Partial {
+                        used: used_tokens.min(capacity),
+                        capacity,
+                    }
+                }
+            }
+            // No advertised capacity: unbounded from the account's view.
+            _ => KVCacheState::Empty,
+        }
+    }
+
+    /// Drops all KV/session accounting for `worker` (called when a worker is
+    /// evicted/offline so stale residency never steers routing to a dead
+    /// node). Returns the number of sessions removed.
+    pub fn drop_worker_sessions(&self, worker: &PeerId) -> usize {
+        self.sessions.lock().unwrap().drop_worker(worker)
+    }
+
+    /// Number of coordinator-tracked sessions (observability).
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
     }
 
     /// Snapshot of live workers, newest-advertisement first.
@@ -408,10 +480,7 @@ impl ComputeManager {
     /// execution-fabric: how worker ordering accounts for engine capability
     /// (M22), network cost (M19) and KV state (M20) before capacity is
     /// enforced by the scheduler.
-    pub async fn fabric_facts(
-        &self,
-        model_hash: &str,
-    ) -> Vec<decentraai_fabric::WorkerFacts> {
+    pub async fn fabric_facts(&self, model_hash: &str) -> Vec<decentraai_fabric::WorkerFacts> {
         let scheduler = self.scheduler.lock().await;
         scheduler
             .registry()
@@ -434,7 +503,7 @@ impl ComputeManager {
                     serves_model: cap.serves_or_provisions(model_hash),
                     capabilities: decentraai_fabric::EngineKind::parse(&cap.engine)
                         .advertised_capabilities(),
-                    kv: decentraai_fabric::KVCacheState::Unknown,
+                    kv: self.kv_state_for(&adv.peer_id, model_hash),
                 }
             })
             .collect()
@@ -455,6 +524,7 @@ impl ComputeManager {
         &self,
         req: &WorkloadRequirements,
         prompt_tokens: u32,
+        session_id: Option<&str>,
     ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
         let facts = self.fabric_facts(&req.model_hash).await;
         if facts.is_empty() {
@@ -485,6 +555,18 @@ impl ComputeManager {
             allow_multi_stage: true,
         };
 
+        // M20: continuation affinity. If this session already ran on a worker
+        // (its KV prefix is resident there), mark the bundle as a continuation
+        // and tell the planner where the prefix lives so it can steer back to
+        // that worker (cache locality). Unknown/stale sessions fall back to a
+        // plain cold routing decision (deterministic, no dead-worker steer).
+        let (is_continuation, prefix_resident_on) = match session_id {
+            Some(sid) => match self.session_residency(sid) {
+                Some(w) => (true, Some(w.to_string())),
+                None => (false, None),
+            },
+            None => (false, None),
+        };
         let rfacts = decentraai_fabric::RequestFacts {
             model_hash: req.model_hash.clone(),
             est_ram_mb: req.est_ram_mb,
@@ -492,8 +574,8 @@ impl ComputeManager {
             context: decentraai_fabric::ContextProfile {
                 prompt_tokens,
                 max_output_tokens: req.max_tokens,
-                is_continuation: false,
-                prefix_resident_on: None,
+                is_continuation,
+                prefix_resident_on,
             },
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
@@ -502,6 +584,35 @@ impl ComputeManager {
         let result = planner.plan(&rfacts, &facts);
         let workers = result.plan.workers();
         let first = workers.first()?;
+
+        // M20 observability: surface the KV-aware inputs that shaped the
+        // planner decision — continuation affinity and every eligible worker's
+        // derived KV-cache state (from real n_ctx + accounted usage).
+        {
+            use decentraai_fabric::KVCacheState;
+            let kv_view: Vec<String> = facts
+                .iter()
+                .map(|f| {
+                    let s = match &f.kv {
+                        KVCacheState::Empty => "empty".to_string(),
+                        KVCacheState::Full => "full".to_string(),
+                        KVCacheState::Partial { used, capacity } => {
+                            format!("{used}/{capacity}")
+                        }
+                        KVCacheState::Unknown => "unknown".to_string(),
+                    };
+                    format!("{}:{}", &f.peer_id[..f.peer_id.len().min(12)], s)
+                })
+                .collect();
+            tracing::info!(
+                session_id = session_id.unwrap_or(""),
+                is_continuation,
+                prefix_worker = rfacts.context.prefix_resident_on.as_deref().unwrap_or(""),
+                kv_states = ?kv_view,
+                elidable_sessions = self.session_count(),
+                "M20 KV-aware planner inputs"
+            );
+        }
 
         // The planner may pick the local node's self-advertisement; the
         // coordinator never schedules a remote request onto itself via P2P.
@@ -818,6 +929,7 @@ mod tests {
             size_mb: 2048,
             est_ram_mb: 256,
             est_vram_mb: 3072,
+            context_tokens: 0,
         }
     }
 
@@ -871,13 +983,26 @@ mod tests {
     async fn selects_and_releases_via_manager() {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
-        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
+        let adv = build_advertisement(
+            p,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        );
         manager.process_advertisement(adv).await;
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         let placement = manager.select(&req).await.expect("eligible worker");
         assert_eq!(placement.worker, p);
-        assert!(manager.select(&req).await.is_some(), "only one reservation tracked per select");
+        assert!(
+            manager.select(&req).await.is_some(),
+            "only one reservation tracked per select"
+        );
         manager.release(placement.reservation.reservation_id).await;
         assert!(manager.select(&req).await.is_some());
     }
@@ -887,21 +1012,39 @@ mod tests {
         let local = peer();
         let worker = peer();
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
-        let adv = build_advertisement(worker, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
+        let adv = build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        );
         manager.process_advertisement(adv).await;
         manager.record_rtt(&worker, 2_000, 1_000);
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         let (plan, placement) = manager
-            .plan_and_reserve(&req, 200)
+            .plan_and_reserve(&req, 200, None)
             .await
             .expect("fabric planner finds the worker");
-        assert_eq!(plan.stage_count(), 1, "single GPU worker -> single-stage plan");
+        assert_eq!(
+            plan.stage_count(),
+            1,
+            "single GPU worker -> single-stage plan"
+        );
         assert_eq!(placement.worker, worker, "planner books the remote worker");
         assert_eq!(manager.in_flight(&worker).await, 1);
 
         manager.release(placement.reservation.reservation_id).await;
-        assert_eq!(manager.in_flight(&worker).await, 0, "release frees the booking");
+        assert_eq!(
+            manager.in_flight(&worker).await,
+            0,
+            "release frees the booking"
+        );
     }
 
     #[tokio::test]
@@ -909,31 +1052,215 @@ mod tests {
         let local = peer();
         // Only the local node advertises; the planner must not self-schedule.
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([local]));
-        let adv = build_advertisement(local, "self", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()], false, 0, LivePerf::default());
+        let adv = build_advertisement(
+            local,
+            "self",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        );
         manager.process_advertisement(adv).await;
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         assert!(
-            manager.plan_and_reserve(&req, 10).await.is_none(),
+            manager.plan_and_reserve(&req, 10, None).await.is_none(),
             "coordinator must not route a remote request to itself"
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_is_steered_back_to_prefix_worker() {
+        let local = peer();
+        let worker_a = peer();
+        let worker_b = peer();
+        let manager = ComputeManager::new(
+            local,
+            "coordinator".into(),
+            HashSet::from([worker_a, worker_b]),
+        );
+        // Both workers serve the same model with a real 2048-token context.
+        let ctx_model = ServedModel {
+            context_tokens: 2048,
+            ..model()
+        };
+        let adv_a = build_advertisement(
+            worker_a,
+            "a",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![ctx_model.clone()],
+            false,
+            0,
+            LivePerf::default(),
+        );
+        let adv_b = build_advertisement(
+            worker_b,
+            "b",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![ctx_model.clone()],
+            false,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv_a).await;
+        manager.process_advertisement(adv_b).await;
+
+        // Cold request with a session id -> arbitrary (a or b).
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let cold = manager
+            .plan_and_reserve(&req, 100, Some("s1"))
+            .await
+            .expect("workers eligible");
+        let (plan_cold, placement_cold) = cold;
+        assert_eq!(plan_cold.stage_count(), 1);
+
+        // Account the session as resident on that worker (real tokens_used).
+        manager
+            .record_session_usage("s1", &placement_cold.worker, "abc", 200)
+            .await;
+
+        // Continuation with the same session must be steered back to that
+        // same worker (cache locality), deterministically.
+        let cont = manager
+            .plan_and_reserve(&req, 50, Some("s1"))
+            .await
+            .expect("continuation routable");
+        assert_eq!(
+            cont.1.worker, placement_cold.worker,
+            "continuation reuses prefix worker"
+        );
+        assert_eq!(cont.0.workers(), vec![placement_cold.worker.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn kv_state_reflects_accounted_usage() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let ctx_model = ServedModel {
+            context_tokens: 2048,
+            ..model()
+        };
+        let adv = build_advertisement(
+            worker,
+            "w",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![ctx_model],
+            false,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+
+        use decentraai_fabric::KVCacheState;
+        // No sessions yet -> empty (unbounded, no known usage).
+        assert_eq!(manager.kv_state_for(&worker, "abc"), KVCacheState::Empty);
+
+        manager
+            .record_session_usage("s1", &worker, "abc", 300)
+            .await;
+        manager
+            .record_session_usage("s2", &worker, "abc", 500)
+            .await;
+        // 800 of 2048 used.
+        assert_eq!(
+            manager.kv_state_for(&worker, "abc"),
+            KVCacheState::Partial {
+                used: 800,
+                capacity: 2048
+            }
+        );
+
+        // A request sized to need more headroom than remains should not be
+        // placed on a nearly-full worker when capacity is known (the fabric
+        // planner only books it if it can accommodate via headroom).
+        manager
+            .record_session_usage("s3", &worker, "abc", 2000)
+            .await;
+        assert_eq!(manager.kv_state_for(&worker, "abc"), KVCacheState::Full);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_falls_back_to_cold_routing() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let ctx_model = ServedModel {
+            context_tokens: 2048,
+            ..model()
+        };
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![ctx_model],
+                false,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        // Unknown session -> not a continuation; must still route to the
+        // (only) eligible worker deterministically.
+        let (plan, placement) = manager
+            .plan_and_reserve(&req, 100, Some("never-seen"))
+            .await
+            .expect("routes");
+        assert_eq!(placement.worker, worker);
+        assert_eq!(plan.workers(), vec![worker.to_string()]);
     }
 
     #[tokio::test]
     async fn requirements_for_accepts_provisioning_workers() {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
-        let adv = build_advertisement(p, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], true, 0, LivePerf::default());
+        let adv = build_advertisement(
+            p,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![],
+            true,
+            0,
+            LivePerf::default(),
+        );
         manager.process_advertisement(adv).await;
 
-        let req = manager.requirements_for("zzz-not-served").await.expect("provisioning worker is schedulable");
+        let req = manager
+            .requirements_for("zzz-not-served")
+            .await
+            .expect("provisioning worker is schedulable");
         assert_eq!(req.model_hash, "zzz-not-served");
         assert!(req.est_ram_mb > 0);
 
         // With no provisioning-capable worker, unknown models are not routable.
         let p2 = peer();
         let manager2 = ComputeManager::new(p2, "coordinator".into(), HashSet::from([p2]));
-        let adv2 = build_advertisement(p2, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], false, 0, LivePerf::default());
+        let adv2 = build_advertisement(
+            p2,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![],
+            false,
+            0,
+            LivePerf::default(),
+        );
         manager2.process_advertisement(adv2).await;
         assert!(manager2.requirements_for("zzz-not-served").await.is_none());
     }
@@ -978,7 +1305,10 @@ mod tests {
         assert_eq!(row.verified_requests, 5000);
         assert_eq!(row.failed_requests, 1);
         assert!(row.score > 0.0);
-        assert!(row.suggested_tier >= 2, "served worker should be a contributor+");
+        assert!(
+            row.suggested_tier >= 2,
+            "served worker should be a contributor+"
+        );
     }
 
     #[test]
@@ -988,7 +1318,11 @@ mod tests {
         m.record_completion(100, 1000);
         m.record_completion(100, 100);
         let snap = m.snapshot();
-        assert!(snap.tokens_per_second > 100, "EWMA should raise TPS, got {}", snap.tokens_per_second);
+        assert!(
+            snap.tokens_per_second > 100,
+            "EWMA should raise TPS, got {}",
+            snap.tokens_per_second
+        );
         assert!(snap.current_latency_ms > 100 && snap.current_latency_ms < 1000);
         m.set_queue_depth(4);
         assert_eq!(m.snapshot().queue_depth, 4);

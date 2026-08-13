@@ -95,6 +95,11 @@ struct NodeArgs {
     /// (executing locally only if that is the planner's decision).
     #[arg(long)]
     prompt: Option<String>,
+    /// Optional session id (M20). Reusing the same session across invocations
+    /// exercises continuation affinity: the coordinator steers the request
+    /// back to the worker that already holds that session's KV prefix.
+    #[arg(long)]
+    session: Option<String>,
 }
 #[derive(Debug, Args)]
 struct OpenArgs {
@@ -878,6 +883,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             size_mb: (model_size_bytes / (1024 * 1024)).max(1),
             est_ram_mb: model_size_bytes / (1024 * 1024) / 4 + 1024,
             est_vram_mb: 0,
+            context_tokens: config.inference.max_context_tokens,
         }];
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
@@ -995,7 +1001,14 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // through THIS node's existing fabric planner → reservation → P2P → worker
     // path, then shuts down. The planner decides local vs remote automatically.
     if let Some(prompt) = args.prompt {
-        let result = node_ingress_ask(&distributed, &compute_manager, prompt, local_peer_id).await;
+        let result = node_ingress_ask(
+            &distributed,
+            &compute_manager,
+            prompt,
+            local_peer_id,
+            args.session,
+        )
+        .await;
         // Stop the local llama-server we own before exiting (if any).
         if let Some(server) = maybe_server.take() {
             let _ = server.stop().await;
@@ -2380,7 +2393,12 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
         // Advertise compute capability from a real hardware probe so this
         // node can be selected through the capability-aware scheduler.
-        let served_models = build_served_models(&registry_path, &model_hash, &model_name)?;
+        let served_models = build_served_models(
+            &registry_path,
+            &model_hash,
+            &model_name,
+            config.inference.max_context_tokens,
+        )?;
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
@@ -2479,6 +2497,7 @@ fn build_served_models(
     registry_path: &std::path::Path,
     model_hash: &str,
     model_name: &str,
+    context_tokens: u32,
 ) -> Result<Vec<decentraai_compute::ServedModel>> {
     use decentraai_registry::ModelRegistry;
 
@@ -2513,6 +2532,7 @@ fn build_served_models(
         size_mb,
         est_ram_mb: size_mb / 4 + 1024,
         est_vram_mb: if gpu_present { size_mb } else { 0 },
+        context_tokens,
     }])
 }
 
@@ -2766,6 +2786,7 @@ async fn node_ingress_ask(
     compute_manager: &std::sync::Arc<decentraai_distributed::ComputeManager>,
     prompt: String,
     local_peer_id: libp2p::PeerId,
+    session_id: Option<String>,
 ) -> Result<()> {
     use decentraai_protocol::InferRequest;
     use std::time::Instant;
@@ -2804,6 +2825,9 @@ async fn node_ingress_ask(
     let mut request = InferRequest::new(model_hash, prompt, 512);
     request = request.with_sender(local_peer_id);
     request = request.with_streaming(true);
+    if let Some(sid) = &session_id {
+        request = request.with_session(sid.clone());
+    }
     request.timeout_ms = 120_000;
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();

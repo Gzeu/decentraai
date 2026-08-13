@@ -60,7 +60,7 @@ requests — all on real hardware, no mocks.
 | P2 | Chat UI in the dashboard | Next |
 | M18 | **Distributed execution fabric foundation** — universal node, mDNS/libp2p discovery, trusted admission, fabric planner, reservations, real remote inference, streaming, worker reuse, bidirectional Desktop ↔ Laptop (verified on real LAN) | **Done** |
 | M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) — real RTT via InferPing/InferPong, fold reach cost into planner scoring | Done |
-| M20 | KV-aware inference fabric (KV locality, continuation affinity, KV headroom, long-context + prefill/decode placement) | Next (not started) |
+| M20 | KV-aware inference fabric (KV locality, continuation affinity, KV headroom, long-context + prefill/decode placement) | In progress |
 | M21 | Distributed MoE / expert fabric | Next |
 | M22 | Multi-engine runtime abstraction | Next |
 | M23 | Autonomous execution planner | Next |

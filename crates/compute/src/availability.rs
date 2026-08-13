@@ -96,6 +96,7 @@ mod tests {
                     size_mb: 2048,
                     est_ram_mb: 256,
                     est_vram_mb: 3072,
+                    context_tokens: 0,
                 }],
                 can_provision: false,
             },

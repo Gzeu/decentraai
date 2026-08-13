@@ -97,10 +97,9 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         use decentraai_protocol::{InferMessage, deserialize_message, serialize_message};
 
         // Try to deserialize as a compute advertisement
-        if let Ok(adv) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
-            request,
-            request.len(),
-        ) {
+        if let Ok(adv) =
+            deserialize_message::<decentraai_compute::ComputeAdvertisement>(request, request.len())
+        {
             if let Some(manager) = &self.compute_manager {
                 let manager = manager.clone();
                 tokio::spawn(async move {
@@ -517,6 +516,7 @@ mod tests {
                     size_mb: 2048,
                     est_ram_mb: 256,
                     est_vram_mb: 3072,
+                    context_tokens: 0,
                 }],
                 can_provision: false,
             },
@@ -540,7 +540,11 @@ mod tests {
         // The advertisement is processed on a spawned task; yield so it runs.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let workers = manager.workers().await;
-        assert_eq!(workers.len(), 1, "advertisement lands in the compute registry");
+        assert_eq!(
+            workers.len(),
+            1,
+            "advertisement lands in the compute registry"
+        );
         assert_eq!(workers[0].node_name, "gpu-rig");
     }
 }
