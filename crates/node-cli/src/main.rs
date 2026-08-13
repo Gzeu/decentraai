@@ -914,18 +914,20 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     if is_worker && !backend_url.is_empty() {
         let idle_timeout =
             Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+        // NO idle-unload for the universal node. This daemon is a distributed
+        // worker whenever a model is present: it advertises capacity and answers
+        // remote InferRequests at any time. Enabling idle-unload would stop the
+        // shared llama-server (which `ServeManager::unload_if_idle` drops, with
+        // no reload path), leaving the node advertising as a worker while its
+        // engine is dead — a false-ready state (real bug found in the two-machine
+        // trust/reservation test). The daemon must stay ready for remote
+        // inference; interactive single-user idle-unload only belongs to the
+        // `decentraai serve` path. `ServeManager` still owns the server so it
+        // stops cleanly on shutdown below.
         let manager = Arc::new(Mutex::new(ServeManager::new(
             maybe_server.take().expect("server started"),
             idle_timeout,
         )));
-        let watcher = manager.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tick.tick().await;
-                let _ = watcher.lock().await.unload_if_idle().await;
-            }
-        });
         let token = if config.inference.api_auth_required {
             ensure_api_token(&data_dir.join("runtime/api.token")).ok()
         } else {
