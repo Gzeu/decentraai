@@ -691,6 +691,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let mut maybe_server: Option<LlamaServer> = None;
     let mut provision_factory: Option<decentraai_distributed::ProvisioningFactory> = None;
     let mut worker_backend: Option<OpenAiCompatibleBackend> = None;
+    // M24 engine supervisor restart spec: captured so the ServeManager can
+    // respawn llama-server if it crashes while the node stays up.
+    let mut restart_binary: Option<std::path::PathBuf> = None;
+    let mut restart_runtime: Option<RuntimeConfig> = None;
     let mut model_hash = String::new();
     let mut model_size_bytes: u64 = 0;
     let mut backend_url = String::new();
@@ -719,6 +723,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
                     .max(1),
             );
+            restart_binary = Some(binary.clone());
+            restart_runtime = Some(runtime.clone());
             match LlamaServer::start(&binary, &runtime) {
                 Ok(server) => {
                     backend_url = server.base_url();
@@ -941,6 +947,25 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             maybe_server.take().expect("server started"),
             idle_timeout,
         )));
+        // M24 engine supervisor: give the manager the restart spec and probe
+        // the engine periodically, auto-restarting llama-server on crash.
+        if let (Some(binary), Some(runtime)) = (restart_binary, restart_runtime) {
+            manager.lock().await.set_restart_spec(binary, runtime);
+            let supervisor = manager.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let mut guard = supervisor.lock().await;
+                    if !guard.is_loaded() {
+                        // The ServeManager has no live server (already stopped
+                        // or shut down); stop supervising.
+                        break;
+                    }
+                    let _ = guard.ensure_healthy().await;
+                }
+            });
+        }
         let token = if config.inference.api_auth_required {
             ensure_api_token(&data_dir.join("runtime/api.token")).ok()
         } else {
