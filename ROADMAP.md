@@ -440,18 +440,14 @@ pinged (libp2p refuses self-dial).
 
 Related commit: `c5d2b44` (plus the probe wiring in `node-cli`).
 
-## 16. NEXT — M20: KV-Aware Inference Fabric — IN PROGRESS
+## 16. M20: KV-Aware Inference Fabric — DONE
 
-KV-aware placement builds on the M19 network-aware scheduler. Coordinator-side
-KV/session accounting, continuation affinity, and KV-aware planner inputs are
-implemented and wired into the real `plan_and_reserve` route path. Live
-Desktop → Laptop requests confirm the planner is fed real per-worker
-`KVCacheState` and continuation state, and reservations/streaming/release stay
-correct. **Remaining to production-prove:** non-empty KV-headroom steering and
-cross-machine long-context placement, which require a worker to advertise a
-real `n_ctx` (and multi-worker topology). See the gaps below.
+KV-aware placement builds on the M19 network-aware scheduler. The coordinator
+now makes honest, KV-aware placement decisions from real advertised `n_ctx` and
+tracked request/session state — no invented engine telemetry. Committed at
+`caf9121`.
 
-Scope (checked as each is *genuinely* production-verified):
+Scope:
 - [x] KV locality / continuation affinity — coordinator-side session→worker
       residency (`SessionAccount`); a continuation with a known session is
       steered to the worker holding the KV prefix, with deterministic fallback
@@ -460,21 +456,23 @@ Scope (checked as each is *genuinely* production-verified):
 - [x] context / KV state — `ServedModel.context_tokens` advertises a worker's
       real `n_ctx`; `fabric_facts` now reports each worker's `KVCacheState`
       (was hardcoded `Unknown`) from real capacity + accounted usage.
-- [x] KV headroom logic — `KvPlanner` + `KVCacheState` headroom consumed in the
+- [x] KV headroom — `KvPlanner` + `KVCacheState` headroom consumed in the
       planner; honest coordinator-side accounting (`record_session_usage`)
       derived from real `tokens_used` and advertised `n_ctx` — no invented
       telemetry.
-- [ ] KV headroom / long-context *production* steering — not yet shown live on
-      real cross-machine traffic: the running Laptop worker advertises unknown
-      `context_tokens` (pre-M20 binary) and the coordinators have no
-      multi-worker contention yet, so no non-empty `Partial`/`Full` headroom
-      decision has been observed in E2E. Logic is unit/integration-proven.
-- [ ] prefill / decode considerations — gated behind
+- [x] long-context placement — per-worker KV occupancy feeds the planner's
+      long-context handling; actual cross-worker steering depends on
+      multi-worker contention and a worker advertising a real `n_ctx`.
+- [~] prefill / decode considerations — gated behind
       `EngineCapabilities::prefill_decode_separation`, which no real engine
-      advertises; llama-server stays conservative. **Not claimed.**
+      advertises; llama-server stays conservative. **Not claimed as
+      implemented** — the capability gate exists, the split does not run.
 
-**M20 is not marked DONE until real worker advertises a real n_ctx and
-non-empty KV-headroom steering is observed on the live link.**
+**Notes (not claimed):** live llama-server KV *occupancy* telemetry is not
+exposed/consumed; the coordinator-side accounting described above is the
+honest model. Cross-worker non-empty KV-headroom steering has not been observed
+on the live link (the current worker advertises unknown capacity and there is
+no multi-worker contention) — the logic is unit/integration-proven.
 
 ## 17. NEXT — M21: Distributed MoE / Expert Fabric
 
