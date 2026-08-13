@@ -154,7 +154,7 @@ contribution**. Admin-only token issuance from a dashboard.
   universal nodes (see the M18 foundation above). Reputation-based
   compensation for workers (M9-9) is not yet implemented.
 
-### Execution Fabric — M18 Foundation (verified-DONE); M19–M24 NEXT
+### Execution Fabric — M18 Foundation + M19 Network-Aware Scheduler (verified-DONE); M20–M24 NEXT
 
 `decentraai-fabric` (pure, no I/O): the engine-neutral execution planner.
 `ExecutionPlan` (single/sequential/fan-out) + fallback; `reserve_worker`
@@ -168,13 +168,19 @@ bidirectional execution all proven; the loopback backend URL is never
 advertised as a remote endpoint.
 
 The crate also holds building blocks that are **parked as NEXT milestones
-(M19–M24), not claimed complete**: a `NetworkGraph` + `InferPing/Pong` RTT
-(M19 network-aware scheduler), `KvPlanner` + `ContextProfile` (M20 KV-aware
+(M20–M24), not claimed complete**: `KvPlanner` + `ContextProfile` (M20 KV-aware
 fabric), honest `ExpertRegistry`/`ExpertRouter` behind `expert_routing`
 (M21 — none advertise it; whole-model fallback is correct, never mocked),
 `EngineKind` + capability probe (M22 multi-engine), an `ExecutionPlanner`
-(M23), and the coordinator reaper `reap_unhealthy` (M24). Do NOT mark M19–M24
+(M23), and the coordinator reaper `reap_unhealthy` (M24). Do NOT mark M20–M24
 as done in documentation until their behaviors are production-verified.
+
+**M19 (network-aware scheduler) is verified-DONE** on real Desktop ↔ Laptop
+LAN hardware: the `NetworkGraph` + `InferPing/Pong` RTT probe measures live
+round-trip time to the remote worker every 5s and folds measured reach cost
+into `ExecutionPlanner::score` (`net_score`), steering worker selection on the
+real link. Completion: `5bc0c17`. M19 is the source of the network term in
+planner scoring that M20's KV placement will combine with.
 
 Q4: `decentraai setup` — detect hardware → identity → auto-select model →
 write validated config → READY. Idempotent; verified end-to-end on Ubuntu.

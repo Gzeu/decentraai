@@ -440,11 +440,27 @@ pinged (libp2p refuses self-dial).
 
 Related commit: `c5d2b44` (plus the probe wiring in `node-cli`).
 
-## 16. NEXT — M20: KV-Aware Inference Fabric
+## 16. NEXT — M20: KV-Aware Inference Fabric — NOT STARTED
 
-- [ ] KV / cache locality
-- [ ] KV reuse
-- [ ] KV transfer / placement decisions
+KV-aware placement is the next milestone after the M19 network-aware
+scheduler. The fabric crate already contains the pure KV building blocks
+(`KvPlanner`, `ContextProfile`, `KVCacheState`); wiring them into the real
+coordinator route path and validating on real Desktop ↔ Laptop hardware is
+left to M20. **M20 implementation is not claimed complete.**
+
+Scope (explicit, checked off as M20 lands):
+- [ ] KV locality — prefer a worker that already holds the conversation's
+      cache for this model (continuation affinity).
+- [ ] context / KV state — the planner sees each worker's real cache
+      occupancy (headroom in tokens) for the requested model + context.
+- [ ] continuation affinity — route a multi-turn continuation to the worker
+      that already has the prefix resident, not to a cold one.
+- [ ] KV headroom — only place a request on a worker whose cache can
+      accommodate the full context budget.
+- [ ] long-context placement — weight placement so long prompts/decode land
+      where KV capacity + bandwidth (M19) allow it.
+- [ ] prefill / decode considerations — prefill-heavy (prompt) vs
+      decode-heavy (generation) requests steered to suitable workers.
 
 ## 17. NEXT — M21: Distributed MoE / Expert Fabric
 
