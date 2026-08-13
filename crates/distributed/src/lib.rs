@@ -79,8 +79,8 @@ pub mod tracker;
 pub mod worker;
 
 pub use compute::{
-    ComputeManager, ComputeMetricsReport, LivePerf, RuntimeMetrics, WorkerMetricRow,
-    build_advertisement,
+    ComputeManager, ComputeMetricsReport, ContributionProfile, ContributionRow, LivePerf,
+    RuntimeMetrics, WorkerMetricRow, build_advertisement,
 };
 pub use config::InferenceConfig;
 pub use error::DistributedError;
@@ -632,6 +632,10 @@ impl DistributedInference {
                         .await;
                     // Release the booking whether or not the request succeeded.
                     compute.release(placement.reservation.reservation_id).await;
+                    // M17: account the routed outcome for contribution.
+                    compute
+                        .record_outcome(&placement.worker, result.is_ok())
+                        .await;
                     if result.is_ok() {
                         return result;
                     }
@@ -690,6 +694,9 @@ impl DistributedInference {
                         )
                         .await;
                     compute.release(placement.reservation.reservation_id).await;
+                    compute
+                        .record_outcome(&placement.worker, result.is_ok())
+                        .await;
                     if result.is_ok() {
                         return result;
                     }

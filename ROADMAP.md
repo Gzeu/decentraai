@@ -145,10 +145,36 @@ Issues found and fixed during verification:
   accessors and would panic on a multithreaded runtime; switched to the async
   accessors (queue depth / TPS / latency now report real values).
 
-### Next: M16–M17 (agreed direction)
-- M16: compute metrics in the dashboard (workers, load, VRAM, placements)
-- M17: contribution-based tier suggestions driven by compute served
+### Next: M17 (agreed direction)
+- M17: contribution-based tier recommendations driven by compute served
   (hardware × hours × verified requests)
+
+### M17: Contribution-based tier suggestions — DONE
+
+The subscription model ("your tier reflects your contribution") now has a
+real measurement to hang on. A pure, I/O-free scoring engine in
+`decentraai-compute` turns **compute served** into a suggested tier:
+
+- `contribution.rs`: `ContributionProfile` (CPU cores, RAM, VRAM, online
+  seconds, verified/failed requests) → `contribution_score()` =
+  hardware × availability × verified-work, reliability-adjusted; and
+  `suggest_tier()` → 1/2/3 mirroring the token crate's GUEST/CONTRIBUTOR/
+  CORE. Policy thresholds are named constants; zero verified work always
+  yields Guest.
+- `ComputeManager` now keeps a per-worker **contribution ledger**: online
+  hours accrue from the heartbeat gap between advertisements, and every
+  routed request outcome is counted via `record_outcome(peer, ok)` from
+  both `route_request` and `route_request_streamed`. No mocks — the ledger
+  is fed by real routing traffic.
+- `ComputeMetricsReport.contributions` exposes each worker's raw inputs +
+  score + suggested tier, surfaced live on `/v1/compute`.
+- `decentraai tier suggest` prints the persisted report (`db/
+  contributions.json`, written best-effort at the advertisement interval)
+  as a read-only table; it never mutates state.
+
+Tests (all green, no mocks): pure scoring (verified-work gating, failure
+demotion, tier monotonicity, empty profile) and manager-level accounting
+(workings accrue and push the tier up).
 
 ### M15: Worker-side reservation enforcement — DONE
 

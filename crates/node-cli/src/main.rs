@@ -49,6 +49,10 @@ enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    Tier {
+        #[command(subcommand)]
+        command: TierCommand,
+    },
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -162,6 +166,18 @@ enum TrustCommand {
         config: PathBuf,
     },
 }
+#[derive(Debug, Subcommand)]
+enum TierCommand {
+    /// Suggest a subscription tier for each known worker from its measured
+    /// compute contribution (M17): hardware × online hours × verified
+    /// requests, reliability-adjusted. Reads the live contribution ledger
+    /// the coordinator maintains while `swarm start`/`distributed start` runs.
+    Suggest {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
+
 #[derive(Debug, Args)]
 struct PullArgs {
     /// Peer address, e.g. /ip4/192.168.1.5/tcp/4001/p2p/<PEER_ID>
@@ -237,6 +253,7 @@ async fn main() -> Result<()> {
         Command::Worker(args) => worker_command(args),
         Command::Distributed(args) => distributed_command(args).await,
         Command::Trust { command } => trust_command(command),
+        Command::Tier { command } => tier_command(command),
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -1155,6 +1172,84 @@ fn token_command(command: TokenCommand) -> Result<()> {
     Ok(())
 }
 
+/// Reads the persisted contribution report and prints each worker's computed
+/// contribution score and suggested subscription tier (M17). Read-only: it
+/// never mutates state. The report is written by `distributed start` /
+/// `swarm start` while a coordinator is online; an empty/missing report
+/// simply prints an empty table with guidance.
+fn tier_command(command: TierCommand) -> Result<()> {
+    let config = match &command {
+        TierCommand::Suggest { config } => config,
+    };
+    let node_config = NodeConfig::load(config)
+        .with_context(|| format!("loading {}", config.display()))?;
+    let data_dir = expand_tilde(&node_config.node.data_dir);
+    let path = data_dir.join("db/contributions.json");
+
+    let rows: Vec<decentraai_distributed::ContributionRow> = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+            format!("reading contribution report from {}", path.display())
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "No contribution report at {}.\n\
+                 Start a coordinator ('decentraai distributed start --metrics-port <P>')\n\
+                 and let it serve a few requests, then re-run this command.",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    if rows.is_empty() {
+        println!("No contributing workers recorded yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8}  {:>16}",
+        "tier", "node", "cpu", "ram_mb", "vram_mb", "score", "verified (hours, failed)"
+    );
+    for r in &rows {
+        println!(
+            "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8.2}  {} ({}h, {} failed)",
+            r.suggested_tier,
+            r.node_name,
+            r.cpu_cores,
+            r.ram_mb,
+            r.vram_mb,
+            r.score,
+            r.verified_requests,
+            r.online_seconds / 3600,
+            r.failed_requests,
+        );
+    }
+    println!(
+        "Suggested tiers: 1=guest 2=contributor 3=core. Reflects measured compute served."
+    );
+    Ok(())
+}
+
+/// Persists the coordinator's contribution report (M17) atomically enough for
+/// the CLI to read it back: write + sync + rename. Best-effort; the caller
+/// treats failure as non-fatal.
+fn persist_contributions(
+    path: &std::path::Path,
+    rows: &[decentraai_distributed::ContributionRow],
+) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(rows)?;
+    let tmp = path.with_extension("tmp");
+    let mut out = std::fs::File::create(&tmp)?;
+    out.write_all(content.as_bytes())?;
+    out.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Runs a distributed inference node (M9)
 ///
 /// This command starts a node that can act as both a worker (serving models)
@@ -1483,6 +1578,21 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 }
             });
         }
+        // Persist the contribution report so `decentraai tier suggest` can
+        // read it offline (M17). Best-effort; a write failure just logs.
+        let contributions_path = data_dir.join("db/contributions.json");
+        let cm = compute_manager.clone();
+        let interval_ms = compute_manager.advertisement_interval_ms();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                interval.tick().await;
+                let report = cm.contribution_report().await;
+                if let Err(e) = persist_contributions(&contributions_path, &report) {
+                    tracing::warn!(error = %e, "failed to persist contribution report");
+                }
+            }
+        });
         tokio::signal::ctrl_c().await?;
     }
 

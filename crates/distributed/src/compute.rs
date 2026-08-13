@@ -11,7 +11,7 @@
 //! discovery: new compute peers advertise hardware; the legacy path keeps
 //! serving nodes that have not opted in to compute sharing yet.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -129,6 +129,49 @@ impl RuntimeMetrics {
     }
 }
 
+/// Per-worker cumulative contribution ledger (M17).
+///
+/// The coordinator records how long each worker has been online (from the
+/// heartbeat interval between advertisements) and how many requests it
+/// actually served to a verified, terminal completion. This is the raw
+/// material for the pure [`decentraai_compute::contribution_score`] /
+/// `suggest_tier` engine, and is exposed in the metrics report so the
+/// dashboard and API can show why a worker earned its tier.
+#[derive(Debug, Default)]
+struct ContributionTracker {
+    /// Last time this peer advertised, used to accrue online seconds.
+    last_announce: Option<Instant>,
+    profile: decentraai_compute::ContributionProfile,
+}
+
+pub use decentraai_compute::ContributionProfile;
+
+impl ContributionTracker {
+    /// Accrues online time and refreshes hardware from a fresh advertisement.
+    fn observe(&mut self, adv: &ComputeAdvertisement) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_announce {
+            let gap = now.duration_since(prev).as_secs();
+            // Cap accrued online time at one gap so wildly stale
+            // advertisements (clock drift, offline windows) can't inflate
+            // the score. `saturating_sub` defends against same-tick updates.
+            self.profile.online_seconds = self
+                .profile
+                .online_seconds
+                .saturating_add(gap.clamp(0, 3600));
+        }
+        self.last_announce = Some(now);
+        self.profile.cpu_cores = adv.capability.cpu_cores;
+        self.profile.ram_mb = adv.capability.ram_mb;
+        self.profile.vram_mb = adv
+            .capability
+            .gpu
+            .as_ref()
+            .map(|g| g.vram_mb)
+            .unwrap_or(0);
+    }
+}
+
 /// Pure builder: turns a real hardware probe into a `ComputeAdvertisement`.
 ///
 /// Kept as a free function so unit tests can drive it with synthetic
@@ -201,6 +244,9 @@ pub struct ComputeManager {
     /// so the worker's streaming task and the periodic advertiser both see
     /// the same throughput/latency/queue state.
     metrics: std::sync::Arc<RuntimeMetrics>,
+    /// Per-worker contribution ledger (M17): accrued online time and served
+    /// request counts, feeding the tier-suggestion engine.
+    contribution: std::sync::Mutex<BTreeMap<PeerId, ContributionTracker>>,
 }
 
 impl ComputeManager {
@@ -227,6 +273,7 @@ impl ComputeManager {
             scheduler: Mutex::new(scheduler),
             last_local_ad: std::sync::Mutex::new(None),
             metrics: std::sync::Arc::new(RuntimeMetrics::new()),
+            contribution: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -254,7 +301,29 @@ impl ComputeManager {
 
     /// Records the latest advertisement received from a peer.
     pub async fn process_advertisement(&self, adv: ComputeAdvertisement) {
-        self.scheduler.lock().await.upsert(adv);
+        self.scheduler.lock().await.upsert(adv.clone());
+        self.contribution
+            .lock()
+            .unwrap()
+            .entry(adv.peer_id)
+            .or_default()
+            .observe(&adv);
+    }
+
+    /// Accounts one routing outcome for `peer`: a verified completion or a
+    /// failure. The coordinator calls this from the request path so the
+    /// contribution ledger reflects real served compute, feeding the
+    /// tier-suggestion engine (M17).
+    pub async fn record_outcome(&self, peer: &PeerId, verified: bool) {
+        if let Some(tracker) = self.contribution.lock().unwrap().get_mut(peer) {
+            if verified {
+                tracker.profile.verified_requests =
+                    tracker.profile.verified_requests.saturating_add(1);
+            } else {
+                tracker.profile.failed_requests =
+                    tracker.profile.failed_requests.saturating_add(1);
+            }
+        }
     }
 
     /// Marks a peer offline (stale heartbeat or explicit disconnect).
@@ -404,10 +473,29 @@ pub struct WorkerMetricRow {
     pub reserved_ram_mb: u64,
 }
 
+/// One worker's contribution row for the metrics report (M17): the raw
+/// measurements the tier engine consumes plus the resulting score and
+/// suggested tier, so the admin/dashboard can see *why* a worker earned its
+/// tier.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContributionRow {
+    pub peer_id: String,
+    pub node_name: String,
+    pub cpu_cores: u16,
+    pub ram_mb: u64,
+    pub vram_mb: u64,
+    pub online_seconds: u64,
+    pub verified_requests: u64,
+    pub failed_requests: u64,
+    pub score: f64,
+    pub suggested_tier: u8,
+}
+
 /// Coordinator-side view of the whole mesh for observability (M16).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ComputeMetricsReport {
     pub workers: Vec<WorkerMetricRow>,
+    pub contributions: Vec<ContributionRow>,
     pub local_peer: String,
     pub local_perf: LivePerfSnapshot,
     pub totals: TotalsSnapshot,
@@ -435,7 +523,7 @@ impl ComputeManager {
     pub async fn metrics_report(&self) -> ComputeMetricsReport {
         let workers = self.scheduler.lock().await.registry().list();
         let mut rows = Vec::with_capacity(workers.len());
-        for adv in workers {
+        for adv in &workers {
             rows.push(WorkerMetricRow {
                 peer_id: adv.peer_id.to_string(),
                 node_name: adv.node_name.clone(),
@@ -450,10 +538,12 @@ impl ComputeManager {
                 reserved_ram_mb: self.reserved_ram(&adv.peer_id).await,
             });
         }
+        let contributions = self.contribution_report_locked(workers).await;
         let perf = self.metrics.snapshot();
         let (completed, failed, tokens) = self.metrics.totals();
         ComputeMetricsReport {
             workers: rows,
+            contributions,
             local_peer: self.local_peer.to_string(),
             local_perf: LivePerfSnapshot {
                 queue_depth: perf.queue_depth,
@@ -466,6 +556,44 @@ impl ComputeManager {
                 tokens_total: tokens,
             },
         }
+    }
+
+    /// Coordinator-side contribution snapshot (M17): every known worker's
+    /// accrued online time and served requests, scored through the pure tier
+    /// engine. Kept separate from raw scheduling so the API can surface both
+    /// "how free is it" (metrics) and "what has it earned" (contribution).
+    pub async fn contribution_report(&self) -> Vec<ContributionRow> {
+        let workers = self.scheduler.lock().await.registry().list();
+        self.contribution_report_locked(workers).await
+    }
+
+    /// Builds contribution rows from a live worker list. Needs the node names
+    /// (advertisements) to pair with the per-peer ledger held on
+    /// `self.contribution`.
+    async fn contribution_report_locked(
+        &self,
+        workers: Vec<ComputeAdvertisement>,
+    ) -> Vec<ContributionRow> {
+        use decentraai_compute::{contribution_score, suggest_tier};
+        let ledger = self.contribution.lock().unwrap();
+        let mut rows = Vec::with_capacity(workers.len());
+        for adv in workers {
+            let profile = ledger.get(&adv.peer_id).map(|t| t.profile);
+            let profile = profile.unwrap_or_default();
+            rows.push(ContributionRow {
+                peer_id: adv.peer_id.to_string(),
+                node_name: adv.node_name.clone(),
+                cpu_cores: profile.cpu_cores,
+                ram_mb: profile.ram_mb,
+                vram_mb: profile.vram_mb,
+                online_seconds: profile.online_seconds,
+                verified_requests: profile.verified_requests,
+                failed_requests: profile.failed_requests,
+                score: contribution_score(&profile),
+                suggested_tier: suggest_tier(&profile),
+            });
+        }
+        rows
     }
 }
 
@@ -589,6 +717,49 @@ mod tests {
         let adv2 = build_advertisement(p2, "gpu-rig", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![], false, 0, LivePerf::default());
         manager2.process_advertisement(adv2).await;
         assert!(manager2.requirements_for("zzz-not-served").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn contribution_report_scores_real_accounting() {
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let worker = peer();
+        let adv = build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![],
+            true,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+
+        // Zero work: guest, zero score.
+        let report = manager.contribution_report().await;
+        let row = report
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .expect("worker appears in contribution report");
+        assert_eq!(row.suggested_tier, 1);
+        assert_eq!(row.verified_requests, 0);
+
+        // Servings accrue and push the tier up.
+        for _ in 0..5000 {
+            manager.record_outcome(&worker, true).await;
+        }
+        manager.record_outcome(&worker, false).await; // one failure shouldn't tank it
+        let report = manager.contribution_report().await;
+        let row = report
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .unwrap();
+        assert_eq!(row.verified_requests, 5000);
+        assert_eq!(row.failed_requests, 1);
+        assert!(row.score > 0.0);
+        assert!(row.suggested_tier >= 2, "served worker should be a contributor+");
     }
 
     #[test]
