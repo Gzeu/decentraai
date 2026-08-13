@@ -1041,6 +1041,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-fabric"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "decentraai-identity"
 version = "0.1.0"
 dependencies = [
