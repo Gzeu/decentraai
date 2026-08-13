@@ -912,6 +912,9 @@ ol{padding-left:20px} li{margin:6px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .metric{background:#0a0e13;border-radius:8px;padding:10px 14px}
 .metric .label{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+#chat-history{max-height:280px;overflow-y:auto;margin-bottom:10px}
+#chat-history .msg-user{margin:6px 0;padding:8px 12px;background:#0a0e13;border-radius:8px;border:1px solid #1d4ed8}
+#chat-history .msg-node{margin:6px 0;padding:8px 12px;background:#161d27;border-radius:8px;border-left:3px solid #238636;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -935,6 +938,16 @@ ol{padding-left:20px} li{margin:6px 0}
     <tr><td>Backend (llama-server)</td><td><code id="backend">&mdash;</code></td></tr>
     <tr><td>API</td><td><code>http://127.0.0.1:__API_PORT__/v1</code> (OpenAI-compatible: <code>/v1/models</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/peers</code>)</td></tr>
   </table>
+</div>
+<div class="card">
+  <h2>Chat</h2>
+  <div id="chat-history"><p class="off">Ask the node something. Responses are routed through the fabric planner to a worker.</p></div>
+  <textarea id="chat-input" rows="2" placeholder="Type a message&hellip;" style="width:100%;box-sizing:border-box;background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></textarea>
+  <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+    <button id="chat-send" style="background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer">Send</button>
+    <span id="chat-status" class="small">&mdash;</span>
+    <input id="chat-stream" type="checkbox" style="margin-left:auto"> <label for="chat-stream" class="small">stream</label>
+  </div>
 </div>
 <div class="card">
   <h2>Queue</h2>
@@ -1005,7 +1018,42 @@ document.getElementById('share').innerHTML = "__SHARE__";
 document.getElementById('model-name').textContent = "__MODEL__";
 let token = '';
 try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
-const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+const hist = [];
+const chatbox = document.getElementById('chat-history');
+const addMsg = (role, text) => {
+  const div = document.createElement('div');
+  const who = role === 'user' ? '<b>You</b>' : '<b>Node</b>';
+  div.className = role === 'user' ? 'msg-user' : 'msg-node';
+  div.innerHTML = '<div>' + who + '</div><div>' + esc(text) + '</div>';
+  chatbox.appendChild(div);
+  chatbox.scrollTop = chatbox.scrollHeight;
+};
+document.getElementById('chat-send').addEventListener('click', async () => {
+  const input = document.getElementById('chat-input');
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  input.value = '';
+  addMsg('user', prompt);
+  hist.push({ role: 'user', content: prompt });
+  document.getElementById('chat-status').textContent = 'routing &amp; generating&hellip;';
+  try {
+    const body = JSON.stringify({ model: '__MODEL__', messages: hist, stream: false });
+    const t0 = performance.now();
+    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body });
+    const j = await r.json();
+    const answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
+    addMsg('node', answer || '(empty response)');
+    hist.push({ role: 'assistant', content: answer || '' });
+    const dt = Math.round(performance.now() - t0);
+    document.getElementById('chat-status').textContent = 'done in ' + dt + ' ms';
+    if (hist.length > 24) hist.splice(0, hist.length - 24);
+  } catch (e) {
+    addMsg('node', 'request failed: ' + e);
+    document.getElementById('chat-status').textContent = 'failed';
+  }
+});
+document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chat-send').click(); } });
 const fmtUptime = s => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? h + 'h ' + m + 'm' : (m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's');
