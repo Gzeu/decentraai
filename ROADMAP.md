@@ -112,6 +112,39 @@ stay a *supporting* artifact served by nodes that already hold them.
   a reservation held for the request duration, always released afterwards)
   and falls back to the legacy announcement-based router
 
+### M11–M13 verification notes
+
+All three milestones were verified **live** on the LAN testbed
+(coordinator + worker on `192.168.1.129`):
+
+- Real worker boots `llama-server` and logs
+  `registered as distributed compute worker` with its probe-derived
+  `ComputeAdvertisement` (models hash `d28cd…`, CPU-only — no GPU present)
+- The coordinator trusts the worker (`decentraai trust add`) and the live
+  streamed request logs
+  `capability-aware scheduler selected worker … reservation_id=…`, then
+  completes real inference: `--- done (tokens=8 elapsed_ms=2036 …)`
+- Two-node E2E tests in `crates/distributed/tests/compute_e2e.rs` cover
+  advertisement propagation → selection → reservation → release, and the
+  fallback to the legacy router when the compute-selected worker is down
+
+Issues found and fixed during verification:
+
+- **Trust was never writable at runtime**: nothing populated `trust.db`,
+  so the compute scheduler rejected every worker with `NotTrusted`. Added
+  `decentraai trust add|list|remove` (`crates/node-cli`), backed by
+  `TrustStore`. Also fixed a latent `TrustStore` type bug: `add_trust` bound
+  numeric fields as strings while reads expected `String`, so records were
+  silently dropped by SQLite's column affinity — now typed binds/reads with a
+  round-trip test.
+- **Fallback was dead code**: a compute-path send failure returned the error
+  directly instead of falling through to the legacy router. Fixed in
+  `route_request` / `route_request_streamed`; covered by the E2E fallback
+  test.
+- **Blocking lock inside async**: `get_stats_async` called `blocking_lock`
+  accessors and would panic on a multithreaded runtime; switched to the async
+  accessors (queue depth / TPS / latency now report real values).
+
 ### Next: M14–M17 (agreed direction)
 - M14: on-demand model provisioning — worker auto-downloads the required
   model when a workload demands it and policy allows (uses the existing

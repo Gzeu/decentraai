@@ -329,16 +329,16 @@ impl TrustStore {
              (worker_peer_id, controller_peer_id, node_name, paired_at, last_seen,
               trust_score, total_requests, successful_requests, pairing_token)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            [
-                &record.worker_peer_id,
-                &record.controller_peer_id,
-                &record.node_name,
-                &record.paired_at.to_rfc3339(),
-                &record.last_seen.to_rfc3339(),
-                &record.trust_score.to_string(),
-                &record.total_requests.to_string(),
-                &record.successful_requests.to_string(),
-                &record.pairing_token,
+            rusqlite::params![
+                record.worker_peer_id,
+                record.controller_peer_id,
+                record.node_name,
+                record.paired_at.to_rfc3339(),
+                record.last_seen.to_rfc3339(),
+                record.trust_score as f64,
+                record.total_requests as i64,
+                record.successful_requests as i64,
+                record.pairing_token,
             ],
         )?;
         Ok(())
@@ -364,9 +364,9 @@ impl TrustStore {
         let row = stmt.query_row([&worker_peer_id], |row| {
             let paired_at_str: String = row.get(3)?;
             let last_seen_str: String = row.get(4)?;
-            let trust_score_str: String = row.get(5)?;
-            let total_requests_str: String = row.get(6)?;
-            let successful_requests_str: String = row.get(7)?;
+            let trust_score: f64 = row.get(5)?;
+            let total_requests: i64 = row.get(6)?;
+            let successful_requests: i64 = row.get(7)?;
 
             Ok(TrustRecordPersisted {
                 worker_peer_id: row.get(0)?,
@@ -378,15 +378,9 @@ impl TrustStore {
                 last_seen: last_seen_str
                     .parse()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                trust_score: trust_score_str
-                    .parse()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                total_requests: total_requests_str
-                    .parse()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                successful_requests: successful_requests_str
-                    .parse()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                trust_score: trust_score as f32,
+                total_requests: total_requests as u64,
+                successful_requests: successful_requests as u64,
                 pairing_token: row.get(8)?,
             })
         });
@@ -416,9 +410,9 @@ impl TrustStore {
             .query_map([], |row| {
                 let paired_at_str: String = row.get(3)?;
                 let last_seen_str: String = row.get(4)?;
-                let trust_score_str: String = row.get(5)?;
-                let total_requests_str: String = row.get(6)?;
-                let successful_requests_str: String = row.get(7)?;
+                let trust_score: f64 = row.get(5)?;
+                let total_requests: i64 = row.get(6)?;
+                let successful_requests: i64 = row.get(7)?;
 
                 Ok(TrustRecordPersisted {
                     worker_peer_id: row.get(0)?,
@@ -430,15 +424,9 @@ impl TrustStore {
                     last_seen: last_seen_str
                         .parse()
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    trust_score: trust_score_str
-                        .parse()
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    total_requests: total_requests_str
-                        .parse()
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    successful_requests: successful_requests_str
-                        .parse()
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    trust_score: trust_score as f32,
+                    total_requests: total_requests as u64,
+                    successful_requests: successful_requests as u64,
                     pairing_token: row.get(8)?,
                 })
             })?
@@ -464,5 +452,56 @@ impl TrustStore {
             [&worker_peer_id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn record(worker: &str) -> TrustRecordPersisted {
+        TrustRecordPersisted {
+            worker_peer_id: worker.to_string(),
+            controller_peer_id: "controller".to_string(),
+            node_name: "worker-node".to_string(),
+            paired_at: Utc::now(),
+            last_seen: Utc::now(),
+            trust_score: 1.0,
+            total_requests: 3,
+            successful_requests: 2,
+            pairing_token: "tok".to_string(),
+        }
+    }
+
+    fn store_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("trust.db")
+    }
+
+    #[test]
+    fn trust_record_round_trips_through_sqlite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = store_path(&dir);
+        let store = TrustStore::new(&path).unwrap();
+
+        let worker = "12D3KooWtestpeer000000000000000000000000000000000000";
+        store.add_trust(&record(worker)).unwrap();
+
+        // A fresh store (as a separate CLI invocation would open) must see it.
+        let reopened = TrustStore::new(&path).unwrap();
+        let listed = reopened.list_trusted().unwrap();
+        assert_eq!(listed.len(), 1, "the stored record must round-trip");
+        let got = listed[0].clone();
+        assert_eq!(got.worker_peer_id, worker);
+        assert_eq!(got.node_name, "worker-node");
+        assert!((got.trust_score - 1.0).abs() < f32::EPSILON);
+        assert_eq!(got.total_requests, 3);
+        assert_eq!(got.successful_requests, 2);
+
+        let by_id = reopened.get_trust(worker).unwrap().expect("record by id");
+        assert_eq!(by_id.pairing_token, "tok");
+
+        reopened.remove_trust(worker).unwrap();
+        assert!(reopened.list_trusted().unwrap().is_empty());
     }
 }

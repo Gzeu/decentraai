@@ -45,6 +45,10 @@ enum Command {
     },
     Worker(WorkerArgs),
     Distributed(DistributedArgs),
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -126,6 +130,34 @@ struct DistributedArgs {
     #[arg(long, default_value = "decentraai-node")]
     name: String,
 }
+#[derive(Debug, Subcommand)]
+enum TrustCommand {
+    /// Trust a worker peer so the capability-aware scheduler can route
+    /// workloads to it. Writes the coordinator's trust.db.
+    Add {
+        /// Worker peer id, e.g. 12D3KooW...
+        #[arg(long)]
+        peer: String,
+        /// Human-readable name for the worker.
+        #[arg(long, default_value = "worker")]
+        name: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// List every trusted worker.
+    List {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Stop trusting a worker peer.
+    Remove {
+        /// Worker peer id, e.g. 12D3KooW...
+        #[arg(long)]
+        peer: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
 #[derive(Debug, Args)]
 struct PullArgs {
     /// Peer address, e.g. /ip4/192.168.1.5/tcp/4001/p2p/<PEER_ID>
@@ -200,6 +232,7 @@ async fn main() -> Result<()> {
         Command::Token { command } => token_command(command),
         Command::Worker(args) => worker_command(args),
         Command::Distributed(args) => distributed_command(args).await,
+        Command::Trust { command } => trust_command(command),
     }
 }
 fn init(args: InitArgs) -> Result<()> {
@@ -978,6 +1011,80 @@ fn worker_command(args: WorkerArgs) -> Result<()> {
     println!("Worker '{}' is ready for pairing", args.name);
     println!("Scan the QR code from the controller to complete pairing");
 
+    Ok(())
+}
+
+/// Manages the coordinator-side trust set (`trust.db`) that gates the
+/// capability-aware compute scheduler. Trust is the answer to "which peer
+/// may execute workloads on my behalf"; without a record here the scheduler
+/// rejects every worker with `NotTrusted`.
+fn trust_command(command: TrustCommand) -> Result<()> {
+    use decentraai_discovery::{TrustRecordPersisted, TrustStore};
+
+    let (config, op) = match &command {
+        TrustCommand::Add { config, .. } => (config, Op::Add),
+        TrustCommand::List { config } => (config, Op::List),
+        TrustCommand::Remove { config, .. } => (config, Op::Remove),
+    };
+    enum Op {
+        Add,
+        List,
+        Remove,
+    }
+
+    let node_config = NodeConfig::load(config)
+        .with_context(|| format!("loading {}", config.display()))?;
+    let data_dir = expand_tilde(&node_config.node.data_dir);
+    let trust_db_path = data_dir.join("trust.db");
+    let store = TrustStore::new(&trust_db_path)
+        .with_context(|| format!("opening trust store at {}", trust_db_path.display()))?;
+
+    match op {
+        Op::List => {
+            let records = store.list_trusted()?;
+            for record in records {
+                println!(
+                    "{} {} (trust={:.2} req={})",
+                    record.worker_peer_id,
+                    record.node_name,
+                    record.trust_score,
+                    record.total_requests
+                );
+            }
+            println!("{} trusted worker(s)", store.list_trusted()?.len());
+        }
+        Op::Add => {
+            let (peer, name) = match &command {
+                TrustCommand::Add { peer, name, .. } => (peer, name),
+                _ => unreachable!(),
+            };
+            // Reject malformed peer ids before writing anything.
+            peer.parse::<libp2p::PeerId>()
+                .map_err(|e| anyhow::anyhow!("invalid peer id {peer:?}: {e}"))?;
+            let now = chrono::Utc::now();
+            let record = TrustRecordPersisted {
+                worker_peer_id: peer.clone(),
+                controller_peer_id: String::new(),
+                node_name: name.clone(),
+                paired_at: now,
+                last_seen: now,
+                trust_score: 1.0,
+                total_requests: 0,
+                successful_requests: 0,
+                pairing_token: String::new(),
+            };
+            store.add_trust(&record)?;
+            println!("Trusted {peer} ({name}); capability-aware scheduling is now allowed");
+        }
+        Op::Remove => {
+            let peer = match &command {
+                TrustCommand::Remove { peer, .. } => peer,
+                _ => unreachable!(),
+            };
+            store.remove_trust(peer)?;
+            println!("Removed trust for {peer}");
+        }
+    }
     Ok(())
 }
 

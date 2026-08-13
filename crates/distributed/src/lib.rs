@@ -355,6 +355,9 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         // Capability-aware compute path: pick a worker that serves the model
         // and has RAM/VRAM headroom, and hold a reservation for the duration.
+        // If the selected worker fails (offline, rejection, timeout), fall
+        // through to the legacy announcement-based router instead of failing
+        // the request.
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 if let Some(placement) = compute.select(&req).await {
@@ -364,13 +367,27 @@ impl DistributedInference {
                         estimated_time_ms: 0,
                         confidence: placement.confidence,
                     };
+                    tracing::info!(
+                        request_id = %request.request_id,
+                        model_hash = %request.model_hash,
+                        worker_peer_id = %placement.worker,
+                        reservation_id = %placement.reservation.reservation_id,
+                        "capability-aware scheduler selected worker"
+                    );
                     let result = self
                         .request_router
-                        .send_request(&self.p2p_node, request, task_placement)
+                        .send_request(&self.p2p_node, request.clone(), task_placement)
                         .await;
                     // Release the booking whether or not the request succeeded.
                     compute.release(placement.reservation.reservation_id).await;
-                    return result;
+                    if result.is_ok() {
+                        return result;
+                    }
+                    tracing::warn!(
+                        worker_peer_id = %placement.worker,
+                        error = %result.as_ref().err().unwrap(),
+                        "compute-selected worker failed; falling back to legacy router"
+                    );
                 }
             }
         }
@@ -404,12 +421,31 @@ impl DistributedInference {
                         estimated_time_ms: 0,
                         confidence: placement.confidence,
                     };
+                    tracing::info!(
+                        request_id = %request.request_id,
+                        model_hash = %request.model_hash,
+                        worker_peer_id = %placement.worker,
+                        reservation_id = %placement.reservation.reservation_id,
+                        "capability-aware scheduler selected worker"
+                    );
                     let result = self
                         .request_router
-                        .send_request_streamed(&self.p2p_node, request, task_placement, progress)
+                        .send_request_streamed(
+                            &self.p2p_node,
+                            request.clone(),
+                            task_placement,
+                            progress.clone(),
+                        )
                         .await;
                     compute.release(placement.reservation.reservation_id).await;
-                    return result;
+                    if result.is_ok() {
+                        return result;
+                    }
+                    tracing::warn!(
+                        worker_peer_id = %placement.worker,
+                        error = %result.as_ref().err().unwrap(),
+                        "compute-selected worker failed; falling back to legacy router"
+                    );
                 }
             }
         }
@@ -485,15 +521,16 @@ impl DistributedInference {
     }
 
     /// Gets statistics about the distributed inference system (async)
-    /// Includes queue information which requires async access
+    /// Includes queue information which requires async access. Uses async
+    /// locks throughout so it is safe to call from inside the runtime.
     pub async fn get_stats_async(&self) -> DistributedStats {
         DistributedStats {
-            worker_count: self.worker_manager.worker_count_sync(),
-            local_worker_registered: self.worker_manager.is_registered_sync(),
-            pending_requests: self.request_router.pending_requests_sync(),
-            total_requests: self.request_router.total_requests_sync(),
-            successful_requests: self.request_router.successful_requests_sync(),
-            failed_requests: self.request_router.failed_requests_sync(),
+            worker_count: self.worker_manager.worker_count().await,
+            local_worker_registered: self.worker_manager.is_registered().await,
+            pending_requests: self.request_router.pending_requests().await,
+            total_requests: self.request_router.total_requests().await,
+            successful_requests: self.request_router.successful_requests().await,
+            failed_requests: self.request_router.failed_requests().await,
             queued_requests: self.queue_manager.total_queued().await,
         }
     }

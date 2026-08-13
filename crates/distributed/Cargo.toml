@@ -29,3 +29,8 @@ decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-system-probe = { path = "../system-probe" }
+
+[dev-dependencies]
+tempfile.workspace = true
+httpmock = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

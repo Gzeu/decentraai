@@ -159,6 +159,16 @@ impl ComputeManager {
         self.scheduler.lock().await.registry().list()
     }
 
+    /// Number of workloads currently booked on `peer` (reservations held).
+    pub async fn in_flight(&self, peer: &PeerId) -> usize {
+        self.scheduler.lock().await.ledger().in_flight(peer)
+    }
+
+    /// RAM (MiB) currently booked on `peer` by outstanding reservations.
+    pub async fn reserved_ram(&self, peer: &PeerId) -> u64 {
+        self.scheduler.lock().await.ledger().reserved_ram(peer)
+    }
+
     /// Selects the best eligible worker and books a reservation.
     pub async fn select(&self, req: &WorkloadRequirements) -> Option<Placement> {
         self.scheduler.lock().await.select(req, Instant::now())
