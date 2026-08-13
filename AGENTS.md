@@ -153,6 +153,24 @@ contribution**. Admin-only token issuance from a dashboard.
 - **M9 (later) — Distributed inference**: route requests to peer GPUs,
   paid in reputation. v1 stays hub-and-spoke on the admin's machine.
 
+### Execution Fabric (M18–M24) — DONE
+
+`decentraai-fabric` (pure, no I/O): the engine-neutral execution planner.
+`ExecutionPlan` (single/sequential/fan-out) + fallback; `reserve_worker`
+(planner owns *who*, scheduler enforces capacity); real `InferPing/Pong` RTT
+into a `NetworkGraph` (M19); `KvPlanner` + `ContextProfile` (M20); honest
+expert router wired behind `expert_routing` capability (M21, none advertise it
+— whole-model fallback is the correct result, never mocked); `EngineKind` +
+capability probe in `decentraai-inference-adapter` (M22). Integrated into
+`route_request`/`route_request_streamed` via `plan_and_reserve`.
+
+M24: coordinator reaper (`reap_unhealthy`) expires stale reservations, flips
+no-heartbeat peers offline, evicts long-gone workers with `worker_evicted`
+audits; rejoin is automatic on the next heartbeat.
+
+Q4: `decentraai setup` — detect hardware → identity → auto-select model →
+write validated config → READY. Idempotent; verified end-to-end on Ubuntu.
+
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core
 (shares large/multiple models, clean reputation). Tiers are earned by

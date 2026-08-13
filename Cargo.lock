@@ -966,6 +966,7 @@ dependencies = [
  "decentraai-tokens",
  "libp2p",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

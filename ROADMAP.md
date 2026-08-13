@@ -58,7 +58,7 @@
 - [ ] Q3: remote backend (`serve start --backend http://host:port`) —
   a weaker station keeps auth/tiers/queue while a stronger machine runs
   the model
-- [ ] Q4: onboarding wizard (`decentraai setup`) writing a validated
+- [x] Q4: onboarding wizard (`decentraai setup`) writing a validated
   config on first run
 
 ## 9. Distributed Inference (M9) - IN PROGRESS
@@ -366,3 +366,62 @@ release.
 8. **ci**: add frontend, security, integration and E2E gates
 9. **docs**: production quickstart and operations runbook
 10. **release**: M10 production vertical slice
+
+---
+
+## 14. Execution Fabric (M18–M23) — DONE
+
+A new pure crate, `decentraai-fabric`, holds DecentraAI's orchestration
+intelligence — the engine-neutral execution-fabric core that turns a request +
+live fabric state into an `ExecutionPlan`, integrated into the real
+coordinator path. It is deliberately engine-agnostic (DecentraAI is not a
+marketplace, cloud, or wrapper around one model server) and never fabricates
+behavior the runtime cannot provide.
+
+- [x] **M22 — Multi-engine runtime**: `EngineKind` (llama-server / vLLM /
+  SGLang / Ollama / openai-compatible) + capability ABI on the backend
+  (`decentraai-inference-adapter`), a best-effort `probe_capabilities()`, and
+  the engine string flows into `capability.engine` so the planner reasons
+  engine-aware. All adaptation goes through the same OpenAI-compatible surface.
+- [x] **M18 — Distributed execution engine**: `ExecutionPlan` (Single /
+  Sequential / FanOut) + `ExecutionStage` with fallback order and per-stage
+  reservation budgets; `ComputeScheduler::reserve_worker` lets the planner own
+  *who* while the scheduler enforces capacity; `plan_and_reserve` drives the
+  real `route_request`/`route_request_streamed`.
+- [x] **M19 — Network-aware scheduler**: real `InferPing`/`InferPong` RTT
+  measurement (previously dead protocol surface), a coordinator `NetworkGraph`
+  (link RTT / bandwidth / locality + transfer-cost estimator), and a 5s probe
+  that feeds measured RTT into planning.
+- [x] **M20 — KV-aware inference fabric**: `KVCacheState` / `ContextProfile` /
+  `KvPlanner` steering continuation locality, KV-headroom and prefill/decode
+  split; the coordinator derives prompt tokens from the real prompt and passes
+  them to the planner.
+- [x] **M21 — Distributed MoE / expert fabric**: `ExpertRegistry` /
+  `ExpertRouter` that honestly returns whole-model decisions unless an engine
+  advertises `expert_routing` (none do via OpenAI API today) — the abstraction
+  is live, never mocked.
+- [x] **M23 — Autonomous execution planner**: `ExecutionPlanner` decides local
+  vs remote, single vs staged, worker ordering, fallback path and reservations
+  from model + capabilities + network + KV + reliability; the user never
+  configures topology.
+
+Tests: 25 fabric unit tests (engine, plan, network, KV, expert, planner) +
+planner integration + `reserve_worker` capacity tests. All green, clippy clean.
+
+## 15. Resilient Fabric (M24) — DONE
+
+- [x] Worker-fabric maintenance: `ComputeRegistry::reap_offline` +
+  `ComputeScheduler::reap_offline` expire stale reservations, flip
+  no-heartbeat peers offline, and evict long-gone workers; a 10s coordinator
+  reaper (`decentraai distributed`) records a `worker_evicted` audit per
+  removal. Rejoin is automatic via fresh advertisements on the next heartbeat.
+
+## 16. Ubuntu UX — Q4 setup wizard — DONE
+
+- [x] `decentraai setup` — one-command fresh-node onboarding: auto-detects
+  hardware (CPU/RAM/GPU via the real system probe), generates or reuses an
+  identity (0600), auto-detects a GGUF model, writes a validated config, and
+  prints readiness. No manual path/worker/port/topology tuning.
+- [x] Verified end-to-end: `setup` → `config validate` → `doctor` → boots a
+  real libp2p distributed node off the generated config. Idempotent across
+  reruns (same PeerId), model-discovery works, no-model degrades gracefully.

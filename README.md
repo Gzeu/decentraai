@@ -295,6 +295,7 @@ decentraai distributed start --name coordinator --prompt "Tell me a haiku"
 ## CLI quick reference
 
 ```bash
+decentraai setup --data-dir ~/.decentraai        # one-command onboarding: detect HW → identity → model → validated config → READY
 decentraai init --data-dir ~/.decentraai        # bootstrap dirs + Ed25519 identity
 decentraai doctor --config <path>               # budgets, GPU, PeerId, admission verdict
 decentraai config validate --file <path>        # strict config check
@@ -304,8 +305,8 @@ decentraai swarm start --config <path>          # serve + announce models; auto-
 decentraai pull --from <multiaddr> --list       # browse a peer's catalog
 decentraai pull --from <multiaddr> --model <f>  # verified download from a peer
 decentraai serve start --model <name>           # gated inference + dashboard :8080
-decentraai distributed start --model <name>     # distributed inference node (worker mode)
-decentraai distributed start                    # distributed inference node (client mode)
+decentraai distributed --model <name>           # distributed inference node (worker mode)
+decentraai distributed                          # distributed inference node (client mode)
 decentraai token create --name <n> --tier 1..3  # issue a subscription token
 decentraai token list                           # show issued tokens
 decentraai token revoke --name <n>              # revoke (effective next request)
@@ -325,6 +326,13 @@ decentraai token revoke --name <n>              # revoke (effective next request
   queue with cancellation, `register_worker_backend` streaming (queue ->
   OpenAiCompatibleBackend -> streamed `InferProgress` -> terminal `InferResponse`),
   and a standalone `decentraai-p2p-invoke` client for the real end-to-end path
+- **Execution fabric** (`crates/fabric`): engine-neutral execution planning — an
+  `ExecutionPlan` (single / sequential / fan-out) with fallback, built by an
+  `ExecutionPlanner` that weighs engine capability (M22), network reach/RTT
+  (M19), KV-cache state (M20) and expert-routing capability (M21). Integrated
+  into `route_request` via `plan_and_reserve`; `reserve_worker` keeps capacity
+  authority in the scheduler. A coordinator reaper evicts dead workers with
+  audit (M24).
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted

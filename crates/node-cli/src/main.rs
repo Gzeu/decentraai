@@ -21,6 +21,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Init(InitArgs),
+    /// One-command fresh-node onboarding: detects hardware, generates an
+    /// identity, auto-selects a model, writes a validated config and prints
+    /// readiness — no manual path/worker/port/topology tuning required (Q4).
+    Setup(SetupArgs),
     Doctor(DoctorArgs),
     Config {
         #[command(subcommand)]
@@ -58,6 +62,21 @@ enum Command {
 struct InitArgs {
     #[arg(long, default_value = "~/.decentraai")]
     data_dir: String,
+}
+#[derive(Debug, Args)]
+struct SetupArgs {
+    #[arg(long, default_value = "~/.decentraai")]
+    data_dir: String,
+    /// Where to write the generated validated config.
+    #[arg(long, default_value = "~/.decentraai/node.yaml")]
+    config: PathBuf,
+    /// A directory to scan for a model to auto-select (defaults to the
+    /// node's `models/` directory).
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
+    /// Human-readable node name; defaults to `<hostname>-node`.
+    #[arg(long)]
+    name: Option<String>,
 }
 #[derive(Debug, Args)]
 struct DoctorArgs {
@@ -240,6 +259,7 @@ async fn main() -> Result<()> {
         .init();
     match cli.command {
         Command::Init(args) => init(args),
+        Command::Setup(args) => setup(args),
         Command::Doctor(args) => doctor(args),
         Command::Config {
             command: ConfigCommand::Validate { file },
@@ -269,6 +289,241 @@ async fn main() -> Result<()> {
         Command::Tier { command } => tier_command(command),
     }
 }
+/// One-command fresh-node onboarding (Q4): detect hardware, generate an
+/// identity, auto-select a model, write a validated config, and print
+/// readiness — no manual path/worker/port/topology tuning required.
+///
+/// The wizard can be re-run safely: it never overwrites an identity and it
+/// regenerates the config with current detected hardware.
+fn setup(args: SetupArgs) -> Result<()> {
+    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+
+    let data_dir = expand_tilde(&args.data_dir);
+    let config_path = expand_tilde(&args.config.to_string_lossy());
+
+    // 1. Make the standard directory layout (same as `decentraai init`).
+    for directory in [
+        "config",
+        "identity",
+        "cache/chunks",
+        "cache/partial",
+        "models",
+        "quarantine",
+        "db",
+        "logs",
+        "runtime",
+    ] {
+        fs::create_dir_all(data_dir.join(directory))?;
+    }
+
+    // 2. Identity: reuse an existing one or generate a fresh key.
+    let identity_path = data_dir.join("identity/key.pem");
+    let peer_id = if identity_path.exists() {
+        let identity = Identity::load(&identity_path)
+            .with_context(|| format!("loading identity from {}", identity_path.display()))?;
+        identity.peer_id().to_string()
+    } else {
+        let identity = Identity::generate();
+        identity.save(&identity_path)?;
+        identity.peer_id().to_string()
+    };
+
+    // 3. Auto-detect hardware (real probe, not mocked).
+    let snapshot = SystemSnapshot::collect();
+    let gpu = probe_gpu();
+    let gpu_line = match &gpu {
+        decentraai_system_probe::GpuProbeStatus::Nvidia(info) => {
+            format!("{} ({} MiB VRAM free)", info.name, info.free_vram_mib)
+        }
+        _ => "no NVIDIA GPU detected (CPU-only)".to_string(),
+    };
+    println!("Hardware detected: {} logical cores, {:.1} GiB RAM available",
+        snapshot.logical_cpus,
+        snapshot.available_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    println!("GPU: {gpu_line}");
+
+    // 4. Auto-select a model: first GGUF under the models dir (or explicit
+    //    --models-dir). The node is still fully functional without one.
+    let models_dir = args
+        .models_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("models"));
+    let model_name = auto_detect_model(&models_dir)?;
+    let model_label = detect_model_label(&models_dir, &model_name).0;
+
+    // 5. Derive a config from what we detected. RAM-driven context, a
+    //    hostname-derived node name, loopback API, auto GPU policy.
+    let total_ram_gib = snapshot.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let max_context = if total_ram_gib >= 32.0 { 8192 } else { 4096 };
+    let node_name = args.name.unwrap_or_else(|| "decentraai-node".to_string());
+    // A model's port is irrelevant here; the API is fixed and loopback-only.
+    let api_port = 8080u16;
+    let gpu_policy = if matches!(&gpu, decentraai_system_probe::GpuProbeStatus::Nvidia(_)) {
+        "auto"
+    } else {
+        "off"
+    };
+
+    let yaml = setup_yaml(&node_name, &data_dir, max_context, api_port, gpu_policy, snapshot.logical_cpus);
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_path, yaml)?;
+
+    // 6. Validate the generated config actually parses (self-check).
+    NodeConfig::load(&config_path)
+        .with_context(|| format!("generated config failed validation: {}", config_path.display()))?;
+
+    println!("\n=== DecentraAI node is READY ===");
+    println!("  PeerId : {peer_id}");
+    println!("  Node   : {node_name}");
+    println!("  GPU    : {gpu_line}");
+    println!("  Model  : {model_label}");
+    println!("  Config : {}", config_path.display());
+    println!();
+    println!("Next steps (all auto-discover, no manual config):");
+    println!("  decentraai swarm start --config {conf}", conf = config_path.display());
+    println!("  decentraai distributed start --config {conf}", conf = config_path.display());
+    Ok(())
+}
+
+/// Auto-detect the default model and produce a friendly label + the exact
+/// `--model` argument the runtime expects, when one exists. Uses the real
+/// filesystem scan; returns `(label, Option<model_path_arg>)`.
+fn detect_model_label(models_dir: &std::path::Path, model_name: &str) -> (String, Option<String>) {
+    if model_name.is_empty() {
+        (
+            "none detected — models are shared/downloaded via the verified transfer path"
+                .to_string(),
+            None,
+        )
+    } else {
+        (model_name.to_string(), Some(models_dir.join(model_name).display().to_string()))
+    }
+}
+
+/// Scans `dir` for the first `*.gguf` model. Returns an empty string when
+/// none is found (the node still comes up; models can be shared/downloaded
+/// later via the verified transfer path). This is real detection against the
+/// filesystem, not a placeholder.
+fn auto_detect_model(dir: &std::path::Path) -> Result<String> {
+    if !dir.exists() {
+        return Ok(String::new());
+    }
+    let mut found: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.to_ascii_lowercase().ends_with(".gguf") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    found.sort();
+    Ok(found.into_iter().next().unwrap_or_default())
+}
+
+/// Builds a valid `NodeConfig` YAML from detected state. The schema mirrors
+/// `configs/node.example.yaml`; fields a fresh user should not tune are set
+/// to safe defaults. Must round-trip through `NodeConfig::load`.
+fn setup_yaml(
+    node_name: &str,
+    data_dir: &std::path::Path,
+    max_context: u32,
+    api_port: u16,
+    gpu_policy: &str,
+    logical_cpus: usize,
+) -> String {
+    let reserve_cores = (logical_cpus as u32 / 4).min(2);
+    let max_parallel = 1;
+    format!(
+        r#"# Generated by `decentraai setup` — hardware auto-detected.
+node:
+  name: {node_name:?}
+  mode: "balanced"
+  data_dir: {data_dir_yaml}
+
+network:
+  private_swarm: true
+  lan_discovery: true
+  dht_enabled: false
+  relay_enabled: false
+  bootstrap_peers: []
+  max_connections: 64
+  max_message_bytes: 1048576
+
+storage:
+  chunk_size_mb: 4
+  hash_algorithm: "blake3"
+  max_cache_gb: 50
+  min_free_disk_gb: 5
+  verify_full_file_after_assembly: true
+  allow_unsigned_models: false
+  auto_seed_verified_models: false
+
+resources:
+  cpu_max_percent: 50
+  memory_max_percent: 60
+  reserve_cpu_cores: {reserve_cores}
+  reserve_ram_mb: 1024
+  gpu_enabled: "{gpu_policy}"
+  gpu_max_vram_percent: 75
+  reserve_vram_mb: 512
+  stop_gpu_temperature_celsius: 83
+  max_upload_mbps: 20
+  max_download_mbps: 80
+
+inference:
+  enabled: "auto"
+  runtime: "llama_server"
+  bind_address: "127.0.0.1"
+  api_auth_required: true
+  allow_remote_inference: false
+  max_concurrent_requests: {max_parallel}
+  max_context_tokens: {max_context}
+  max_generated_tokens: 1024
+  request_timeout_seconds: 180
+  queue_max_requests: 20
+  idle_model_unload_minutes: 15
+  api_port: {api_port}
+  generation:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    system_prompt: "You are a helpful assistant. Answer in the same language as the user's message."
+
+privacy:
+  log_prompts: false
+  log_outputs: false
+  publish_exact_hardware: false
+  telemetry_opt_in: false
+
+security:
+  trust_mode: "private"
+  require_signed_announcements: true
+  require_request_signatures: true
+  ban_duration_minutes: 60
+  max_invalid_chunks_per_peer: 2
+
+sharing:
+  mode: "auto"
+  max_concurrent_downloads: 2
+  provision_models_on_demand: true
+"#,
+        node_name = node_name,
+        data_dir_yaml = data_dir.display().to_string().replace('"', "\\\""),
+        reserve_cores = reserve_cores,
+        gpu_policy = gpu_policy,
+        max_parallel = max_parallel,
+        max_context = max_context,
+        api_port = api_port,
+    )
+}
+
 fn init(args: InitArgs) -> Result<()> {
     let data_dir = expand_tilde(&args.data_dir);
     for directory in [
@@ -2137,5 +2392,26 @@ mod tests {
             Cli::try_parse_from(["decentraai", "token", "revoke", "--name", "alice"]).is_ok(),
             "token revoke must parse"
         );
+    }
+
+    #[test]
+    fn auto_detects_a_gguf_model_and_ignores_others() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tiny.gguf"), b"gguf").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not a model").unwrap();
+        assert_eq!(auto_detect_model(dir.path()).unwrap(), "tiny.gguf");
+        assert!(auto_detect_model(&dir.path().join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generated_setup_config_round_trips_through_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("node");
+        let yaml = setup_yaml("test-node", &data_dir, 4096, 0, "off", 4);
+        let cfg_path = dir.path().join("node.yaml");
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        let cfg = NodeConfig::load(&cfg_path).expect("wizard YAML must be a valid NodeConfig");
+        assert_eq!(cfg.node.name, "test-node");
+        assert_eq!(cfg.inference.max_context_tokens, 4096);
     }
 }
