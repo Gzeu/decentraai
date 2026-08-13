@@ -962,6 +962,22 @@ ol{padding-left:20px} li{margin:6px 0}
   <tbody id="peers"><tr><td colspan="5" class="off">loading&hellip;</td></tr></tbody></table>
 </div>
 <div class="card">
+  <h2>Workers (compute registry)</h2>
+  <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th>Load</th><th>Queue</th><th>tok/s</th><th>Latency</th><th>RAM free</th><th>In-flight</th></tr></thead>
+  <tbody id="workers"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Network (measured links)</h2>
+  <table><thead><tr><th>Peer</th><th>RTT</th><th>Bandwidth</th><th>Locality</th></tr></thead>
+  <tbody id="network"><tr><td colspan="4" class="off">loading&hellip;</td></tr></tbody></table>
+  <div class="small" id="connected"></div>
+</div>
+<div class="card">
+  <h2>Execution (planner decisions)</h2>
+  <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Outcome</th><th>Reasoning</th></tr></thead>
+  <tbody id="execution"><tr><td colspan="7" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
   <h2>Recent security events (audit log)</h2>
   <table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead>
   <tbody id="events"><tr><td colspan="3" class="off">loading&hellip;</td></tr></tbody></table>
@@ -1050,6 +1066,30 @@ async function refresh() {
       (peer.banned ? '<span class="bad">banned</span>' : '<span class="ok">ok</span>') + '</td></tr>'
     ).join('');
     document.getElementById('peers').innerHTML = rows || '<tr><td colspan="5" class="off">no peers tracked yet</td></tr>';
+  } catch (e) {}
+  try {
+    const c = await (await fetch('/v1/compute', { headers })).json();
+    const wrows = (c.workers || []).map(w =>
+      '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
+      (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' + w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb||0)/1024) + ' GiB</td><td>' + w.in_flight + '</td></tr>'
+    ).join('');
+    document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="9" class="off">no workers yet (compute not attached)</td></tr>';
+  } catch (e) {}
+  try {
+    const n = await (await fetch('/v1/network', { headers })).json();
+    const nrows = (n.links || []).map(l =>
+      '<tr><td><code>' + esc(l.peer.slice(0, 16)) + '&hellip;</code></td><td>' + l.rtt_ms + ' ms</td><td>' + (l.bandwidth_mbps || '&mdash;') + ' Mbps</td><td>' + esc(l.locality || '') + '</td></tr>'
+    ).join('');
+    document.getElementById('network').innerHTML = nrows || '<tr><td colspan="4" class="off">no measured links yet</td></tr>';
+    document.getElementById('connected').textContent = (n.connected || []).length ? ('connected peers: ' + n.connected.map(p => p.slice(0, 12)).join(', ')) : 'no connected peers';
+  } catch (e) {}
+  try {
+    const x = await (await fetch('/v1/execution', { headers })).json();
+    const xrows = (x.executions || []).slice(0, 12).map(e =>
+      '<tr><td><code>' + esc(e.request_id.slice(0, 8)) + '</code></td><td><code>' + esc(e.selected_worker.slice(0, 12)) + '&hellip;</code></td><td>' + e.score.toFixed(2) + '</td><td>' + e.stages + '</td><td>' +
+      (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
+    ).join('');
+    document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="7" class="off">no executions yet</td></tr>';
   } catch (e) {}
 }
 refresh(); setInterval(refresh, 3000);
