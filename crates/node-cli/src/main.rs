@@ -902,6 +902,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             compute_manager.clone(),
             distributed.p2p_node().clone(),
             can_provision,
+            Some(backend_url.clone()),
         )
         .await?;
     }
@@ -2415,6 +2416,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             compute_manager.clone(),
             distributed.p2p_node().clone(),
             can_provision,
+            None,
         )
         .await?;
 
@@ -2539,13 +2541,25 @@ fn build_served_models(
 /// Re-probes this node's hardware and re-broadcasts the compute
 /// advertisement on the heartbeat interval, so coordinators never see this
 /// worker go stale. Fire-and-forget; a failing probe just skips a beat.
+///
+/// M24 false-ready gate: when `engine_health_url` is set (this node serves a
+/// local inference engine), the advertisement is only broadcast while that
+/// engine is actually alive. A worker must never advertise itself as ready
+/// when its execution engine is unavailable — otherwise coordinators keep
+/// routing to a node whose engine has crashed. The liveness probe is a real
+/// TCP connect to the engine's host:port (dependency-free).
 async fn spawn_compute_broadcaster(
     compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
     p2p_node: decentraai_p2p::P2PNode,
     can_provision: bool,
+    engine_health_url: Option<String>,
 ) -> Result<()> {
     use decentraai_protocol::serialize_message;
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+
+    // Derive the engine's host:port for the liveness probe once.
+    let health_addr = engine_health_url.as_deref().and_then(parse_http_addr);
+    let health_sockaddr = health_addr.map(|(h, p)| format!("{h}:{p}"));
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -2553,6 +2567,17 @@ async fn spawn_compute_broadcaster(
         ));
         loop {
             interval.tick().await;
+            // M24: gate the advertisement on live engine health. A dead
+            // engine means this node is not a usable worker this beat.
+            if let Some(addr) = &health_sockaddr {
+                let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
+                if !alive {
+                    tracing::warn!(
+                        "skipping worker advertisement: local inference engine not reachable at {addr}"
+                    );
+                    continue;
+                }
+            }
             let snapshot = SystemSnapshot::collect();
             let gpu = probe_gpu();
             // Advertise the latest probe; served_models come from the last
@@ -2572,6 +2597,25 @@ async fn spawn_compute_broadcaster(
         }
     });
     Ok(())
+}
+
+/// Parses `http://host:port/...` into `(host, port)`. Returns `None` on an
+/// unrecognised address so the liveness gate degrades to "always advertise"
+/// (never falsely blocks a healthy worker on a malformed URL).
+fn parse_http_addr(url: &str) -> Option<(String, u16)> {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
 }
 
 /// Periodically measures round-trip latency to each known *remote* worker by
@@ -2883,6 +2927,25 @@ async fn wait_for_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_engine_health_addresses() {
+        assert_eq!(
+            parse_http_addr("http://127.0.0.1:45249"),
+            Some(("127.0.0.1".into(), 45249))
+        );
+        assert_eq!(
+            parse_http_addr("http://127.0.0.1:45249/v1"),
+            Some(("127.0.0.1".into(), 45249))
+        );
+        assert_eq!(
+            parse_http_addr("localhost:8080"),
+            Some(("localhost".into(), 8080))
+        );
+        // Unparseable -> None (gate degrades to always-advertise).
+        assert_eq!(parse_http_addr(""), None);
+        assert_eq!(parse_http_addr("http://host:notaport"), None);
+    }
 
     #[test]
     fn parses_registry_scan_command() {
