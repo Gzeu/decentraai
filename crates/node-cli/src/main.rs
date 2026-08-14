@@ -393,33 +393,10 @@ async fn main() -> Result<()> {
 ///
 /// The wizard can be re-run safely: it never overwrites an identity and it
 /// regenerates the config with current detected hardware.
-///
-/// Default fabric identity name: `<hostname>-node` (distinct per machine by
-/// construction), falling back to a neutral name when no hostname is
-/// available in the environment. Operators override it with `setup --name`.
-fn default_node_name() -> String {
-    let host = std::env::var("HOSTNAME").ok();
-    if let Some(h) = host {
-        let clean: String = h
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let trimmed = clean.trim_matches('-').to_string();
-        if !trimmed.is_empty() {
-            return format!("{trimmed}-node");
-        }
-    }
-    "decentraai-node".to_string()
-}
-
 fn setup(args: SetupArgs) -> Result<()> {
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+    use libp2p::PeerId as Libp2pPeerId;
+    use libp2p::identity::Keypair as Libp2pKeypair;
 
     let data_dir = expand_tilde(&args.data_dir);
     let config_path = expand_tilde(&args.config.to_string_lossy());
@@ -439,17 +416,20 @@ fn setup(args: SetupArgs) -> Result<()> {
         fs::create_dir_all(data_dir.join(directory))?;
     }
 
-    // 2. Identity: reuse an existing one or generate a fresh key.
+    // 2. Identity: reuse an existing one or generate a fresh key. The
+    //    identity also produces the node's default name (`dca-…`), so a
+    //    freshly generated node is already distinct on the fabric — no
+    //    manual naming needed.
     let identity_path = data_dir.join("identity/key.pem");
-    let peer_id = if identity_path.exists() {
-        let identity = Identity::load(&identity_path)
-            .with_context(|| format!("loading identity from {}", identity_path.display()))?;
-        identity.peer_id().to_string()
+    let identity = if identity_path.exists() {
+        Identity::load(&identity_path)
+            .with_context(|| format!("loading identity from {}", identity_path.display()))?
     } else {
         let identity = Identity::generate();
         identity.save(&identity_path)?;
-        identity.peer_id().to_string()
+        identity
     };
+    let peer_id = identity.peer_id().to_string();
 
     // 3. Auto-detect hardware (real probe, not mocked).
     let snapshot = SystemSnapshot::collect();
@@ -476,11 +456,20 @@ fn setup(args: SetupArgs) -> Result<()> {
     let model_name = auto_detect_model(&models_dir)?;
     let model_label = detect_model_label(&models_dir, &model_name).0;
 
-    // 5. Derive a config from what we detected. RAM-driven context, a
-    //    hostname-derived node name, loopback API, auto GPU policy.
+    // 5. Derive a config from what we detected. RAM-driven context, an
+    //    identity-derived node name (the node's own `dca-…` ID), loopback
+    //    API, auto GPU policy.
     let total_ram_gib = snapshot.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let max_context = if total_ram_gib >= 32.0 { 8192 } else { 4096 };
-    let node_name = args.name.unwrap_or_else(default_node_name);
+    // Default name = the node's compact ID (`dca-xxxxxx`), derived from the
+    // same identity the fabric already knows it by — operators never have to
+    // invent a name; `setup --name` remains available for a semantic label.
+    let node_name = args.name.unwrap_or_else(|| {
+        let libp2p_keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
+            .expect("ed25519 key bytes are valid");
+        let libp2p_peer = Libp2pPeerId::from(libp2p_keypair.public());
+        decentraai_distributed::short_node_id(&libp2p_peer)
+    });
     // A model's port is irrelevant here; the API is fixed and loopback-only.
     let api_port = 8080u16;
     let gpu_policy = if matches!(&gpu, decentraai_system_probe::GpuProbeStatus::Nvidia(_)) {

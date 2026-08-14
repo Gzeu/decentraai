@@ -76,12 +76,13 @@
   named WORKER pipeline stage (`local`/`remote`), and an identity-first
   Workers view (per-node cards, master-gated Approve/Revoke). All data
   read-only from `/status`, `/v1/compute`, `/v1/network` — nothing faked.
-- [x] P10: Custom node names + compact node IDs — `decentraai setup
-  --name <nume>` (default `<hostname>-node`, so machines differ by
-  construction); every node advertises a stable `dca-xxxxxx` indicator
-  derived from its peer id (`node_id` in the advertisement, `/v1/compute`
-  and `/status`; dashboard shows it on canvas nodes, Fabric nodes cards and
-  Workers cards, with a client-side fallback for pre-`node_id` peers).
+- [x] P10: Node identity = compact ID — a fresh node's default name is its
+  own `dca-xxxxxx` indicator (derived from the identity at `setup` time, no
+  manual naming); every node advertises that stable id (`node_id` in the
+  advertisement, `/v1/compute` and `/status`; dashboard shows it on canvas
+  nodes, Fabric nodes cards and Workers cards, with a client-side fallback
+  for pre-`node_id` peers). `setup --name` stays as an optional semantic
+  label.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join

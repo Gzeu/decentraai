@@ -7,9 +7,11 @@ single version (`1.0.0`) shared by every crate.
 ## [Unreleased] — Multi-node fabric identity
 
 ### Custom node names + compact node IDs (fabric identity)
-- **`decentraai setup --name <nume>`** sets a real per-node name (written to
-  `node.name`); the default is now `<hostname>-node` instead of the literal
-  `decentraai-node`, so machines auto-distinguish themselves on the fabric.
+- **The node's identity IS its ID**: a fresh node's default name is its own
+  compact `dca-xxxxxx` indicator (derived from the identity at `setup`
+  time), so machines are distinct on the fabric by construction — no manual
+  naming needed. `decentraai setup --name <nume>` remains available purely
+  as an optional semantic label.
 - Every node advertises a **compact stable ID** — `dca-` + 6 chars derived
   from its peer id (e.g. `dca-GriBWu`). It travels in every
   `ComputeAdvertisement` (`node_id`, `#[serde(default)]` — old peers
