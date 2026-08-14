@@ -80,6 +80,7 @@ pub mod config;
 pub mod fallback;
 pub mod p2p_handler;
 pub mod queue;
+pub mod replay;
 pub mod router;
 pub mod session;
 pub mod tracker;
@@ -242,6 +243,10 @@ pub struct DistributedInference {
     /// are signed so workers can authenticate them and reject spoofs / unsigned
     /// traffic. `None` sends unsigned (legacy) frames.
     signing_key: Option<[u8; 32]>,
+    /// Monotonic per-worker-outbound nonce source (P4). Each signed request
+    /// gets a unique nonce so the worker's replay guard never sees a duplicate
+    /// for this coordinator.
+    outbound_nonce: std::sync::atomic::AtomicU64,
 }
 
 impl DistributedInference {
@@ -278,6 +283,7 @@ impl DistributedInference {
             config,
             logs_dir: None,
             signing_key: None,
+            outbound_nonce: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -317,6 +323,11 @@ impl DistributedInference {
     /// No-op when no signing key is set (legacy unsigned traffic).
     fn sign_request(&self, request: &mut InferRequest) {
         if let Some(key) = &self.signing_key {
+            // P4: give each outbound request a unique nonce so the receiving
+            // worker's replay guard never confuses it with a replayed frame.
+            request.nonce = self
+                .outbound_nonce
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             decentraai_protocol::sign_infer_request_with_key(key, request);
         }
     }
@@ -477,6 +488,17 @@ impl DistributedInference {
         let queue_for_closure = queue_mgr.clone();
         let wm_for_closure = worker_manager.clone();
         let metrics_for_infer = compute_metrics.clone();
+        // P4: replay guard for inbound requests, keyed by the authenticated
+        // sender peer. TTL wraps the request timeout so a captured frame can't
+        // be replayed after the window; capacity bounds memory per peer.
+        let replay: Arc<std::sync::Mutex<crate::replay::ReplayGuard>> = Arc::new(
+            std::sync::Mutex::new(crate::replay::ReplayGuard::new(
+                std::time::Duration::from_secs(300),
+                4096,
+            )),
+        );
+        let replay_for_closure = replay.clone();
+        let logs_dir_for_infer = self.logs_dir.clone();
 
         // Register sync on_infer handler that enqueues the request and returns Accept
         self.p2p_node.set_on_infer_request(
@@ -500,6 +522,43 @@ impl DistributedInference {
                         error: Some("unauthenticated inference request: bad or missing signature".to_string()),
                     };
                     return serialize_message(&InferMessage::InferResponse(resp));
+                }
+                // P4: replay protection — only *signed* requests (which we just
+                // verified) consult the guard. Replaying an already-seen nonce
+                // from the same authenticated sender is rejected before
+                // admission/queue/backend, so output is never duplicated.
+                if let Ok(mut replay_guard) = replay_for_closure.lock() {
+                    if replay_guard.check_and_mark(
+                        &peer,
+                        req.nonce,
+                        std::time::Instant::now(),
+                    ) == crate::replay::ReplayCheck::Rejected
+                    {
+                        let resp = InferResponse {
+                            request_id: req.request_id,
+                            trace_id: req.trace_id.clone(),
+                            worker_peer_id: local_peer,
+                            completed_at: chrono::Utc::now().to_rfc3339(),
+                            output: "".to_string(),
+                            tokens_used: 0,
+                            processing_time_ms: 0,
+                            success: false,
+                            error: Some(format!(
+                                "replay detected: nonce {} already processed for this peer",
+                                req.nonce
+                            )),
+                        };
+                        decentraai_audit::record_best_effort(
+                            &logs_dir_for_infer.clone().unwrap_or_default(),
+                            "replay_rejected",
+                            serde_json::json!({
+                                "request_id": req.request_id.to_string(),
+                                "peer": peer.to_string(),
+                                "nonce": req.nonce,
+                            }),
+                        );
+                        return serialize_message(&InferMessage::InferResponse(resp));
+                    }
                 }
                 // Only accept requests for the configured model.
                 if req.model_hash != model_hash_clone {

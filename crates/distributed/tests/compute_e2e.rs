@@ -782,11 +782,13 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         client_node: &P2PNode,
         worker_peer: PeerId,
         client_identity: &Identity,
+        nonce: u64,
     ) -> anyhow::Result<Vec<u8>> {
         let client_peer = libp2p_peer_id(client_identity);
         let mut request = InferRequest::new(MODEL_HASH.to_string(), "hello".into(), 64);
         request = request.with_sender(client_peer);
         request.timeout_ms = 10_000;
+        request.nonce = nonce; // P4: distinct nonce per send (replays rejected)
         // P1: sign so the worker authenticates the request before admitting it.
         decentraai_protocol::sign_infer_request_with_key(
             &client_identity.signing_key_bytes(),
@@ -797,15 +799,21 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     }
 
     // The worker must reject the oversized workload at the door. Retry only
-    // for the newly dialed connection to settle (per AGENTS.md).
+    // for the newly dialed connection to settle (per AGENTS.md). Each retry
+    // uses a fresh nonce so the replay guard never flags the connection settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let rejected = loop {
-        match send(&client_node, worker_peer, &client_identity).await {
-            Ok(bytes) => break bytes,
-            Err(_) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let rejected = {
+        let mut n = 0u64;
+        loop {
+            let attempt = send(&client_node, worker_peer, &client_identity, n).await;
+            n += 1;
+            match attempt {
+                Ok(bytes) => break bytes,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("timed out awaiting a connection to the worker: {e}"),
             }
-            Err(e) => panic!("timed out awaiting a connection to the worker: {e}"),
         }
     };
     let reply: InferMessage = deserialize_message(&rejected, rejected.len()).unwrap();
@@ -832,7 +840,9 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     worker_compute
         .advertise_local(snapshot(), gpu(), vec![big_model], false)
         .await;
-    let admitted = send(&client_node, worker_peer, &client_identity).await.unwrap();
+    let admitted = send(&client_node, worker_peer, &client_identity, 5000)
+        .await
+        .unwrap();
     let reply: InferMessage = deserialize_message(&admitted, admitted.len()).unwrap();
     assert!(
         matches!(reply, InferMessage::InferAccepted { .. }),
