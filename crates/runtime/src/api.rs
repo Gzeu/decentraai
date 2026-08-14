@@ -588,9 +588,15 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
 /// Public status snapshot: no secrets, safe without the token. Includes
 /// a fresh hardware probe so the operator sees RAM/GPU pressure live.
 async fn status_handler(State(state): State<ApiState>) -> Response {
-    let (loaded, idle_secs) = {
+    // Resolve the backend URL from the live manager (not the startup-frozen
+    // one) so a M24 engine auto-restart — which re-allocates an ephemeral
+    // port — is reflected here instead of a stale address.
+    let (loaded, idle_secs, backend) = {
         let manager = state.manager.lock().await;
-        (manager.is_loaded(), manager.idle_for().as_secs())
+        let backend = manager
+            .base_url()
+            .unwrap_or_else(|| state.backend_url.clone());
+        (manager.is_loaded(), manager.idle_for().as_secs(), backend)
     };
     let snapshot = decentraai_system_probe::SystemSnapshot::collect();
     let gpu = match decentraai_system_probe::probe_gpu() {
@@ -634,7 +640,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "ram_available_gib": snapshot.available_memory_bytes as f64 / GIB,
             "gpu": gpu,
         },
-        "backend": state.backend_url,
+        "backend": backend,
         "api_port": state.info.api_port,
         "node": node_info(&state.compute),
         "recent_events": recent_audit_events(&state.info.repo_root),
@@ -903,7 +909,15 @@ async fn proxy_handler(
         body.to_vec()
     };
 
-    let url = format!("{}{}", state.backend_url, uri.path());
+    // Resolve the backend URL from the live manager so engine auto-restarts
+    // (M24) are reflected — the port changes on every respawn when ephemeral.
+    let backend_url = {
+        let manager = state.manager.lock().await;
+        manager
+            .base_url()
+            .unwrap_or_else(|| state.backend_url.clone())
+    };
+    let url = format!("{}{}", backend_url, uri.path());
     let mut request = state.client.request(method, &url);
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
