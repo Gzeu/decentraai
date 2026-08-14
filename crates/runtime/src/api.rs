@@ -1538,9 +1538,44 @@ mod tests {
 
     #[cfg(unix)]
     async fn test_manager(dir: &Path) -> Arc<Mutex<ServeManager>> {
+        test_manager_with(dir, generic_fake_engine()).await
+    }
+
+    /// A minimal OpenAI-compatible backend exercising the fields the proxy
+    /// tests assert on (a models list, counted chat completion). The proxy
+    /// resolves the live engine from the manager (M24), so this must be a
+    /// real HTTP listener, not a dead process.
+    #[cfg(unix)]
+    fn generic_fake_engine() -> Router {
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\"}]}" }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":20,\"total_tokens\":40},\"timings\":{\"predicted_per_second\":19.97}}"
+                }),
+            )
+    }
+
+    /// Binds a real, minimal engine (`app`) on an ephemeral loopback port and
+    /// wraps it in a [`ServeManager`] whose `base_url()` points at it. This
+    /// mirrors production: the proxy forwards to the live engine address from
+    /// the manager (M24). The spawned child process only satisfies
+    /// [`LlamaServer`]'s process contract; the actual HTTP server is `app`.
+    #[cfg(unix)]
+    async fn test_manager_with(dir: &Path, app: Router) -> Arc<Mutex<ServeManager>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let binary = write_fake_server(dir);
-        let config = RuntimeConfig::new(dir.join("model.gguf"));
-        let server = LlamaServer::start(&binary, &config).unwrap();
+        let mut config = RuntimeConfig::new(dir.join("model.gguf"));
+        config.port = Some(addr.port());
+        let server = LlamaServer::start(&binary, &config).expect("fake llama-server spawns");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         Arc::new(Mutex::new(ServeManager::new(
             server,
             Duration::from_secs(3600),
@@ -1620,27 +1655,6 @@ mod tests {
     }
 
     /// Backend that echoes the request body, proving what the proxy sent.
-    async fn start_echo_backend() -> SocketAddr {
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(|body: Bytes| async move {
-                (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    format!(
-                        "{{\"echo\":{},\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
-                        String::from_utf8_lossy(&body)
-                    ),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        addr
-    }
-
     async fn start_stateful_api(
         dir: &Path,
         master: Option<String>,
@@ -2162,10 +2176,24 @@ mod tests {
     #[tokio::test]
     async fn proxy_merges_generation_into_outgoing_body() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_echo_backend().await;
-        let manager = test_manager(dir.path()).await;
+        let echo_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: Bytes| async move {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    format!(
+                        "{{\"echo\":{},\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
+                        String::from_utf8_lossy(&body)
+                    ),
+                )
+            }),
+        );
+        // The proxy forwards to the LIVE engine address (M24), so the manager
+        // must own (point at) the echo backend for this test to observe the
+        // merged outgoing body.
+        let manager = test_manager_with(dir.path(), echo_app).await;
         let state = ApiState::new(
-            format!("http://{backend}"),
+            "http://127.0.0.1:0".to_string(),
             None,
             manager.clone(),
             test_info(dir.path(), None),
@@ -2380,7 +2408,7 @@ mod tests {
     async fn proxy_streams_sse_when_requested() {
         // A backend that streams two SSE chunks (each with usage) like
         // llama-server does, proving the proxy forwards event-stream content.
-        let app = Router::new().route(
+        let sse_app = Router::new().route(
             "/v1/chat/completions",
             post(|| async {
                 (
@@ -2393,16 +2421,14 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
 
         let dir = tempfile::tempdir().unwrap();
-        let manager = test_manager(dir.path()).await;
+        // The proxy forwards to the live engine address (M24), so the manager
+        // must own (point at) the SSE backend for this test to observe the
+        // streamed body.
+        let manager = test_manager_with(dir.path(), sse_app).await;
         let state = ApiState::new(
-            format!("http://{addr}"),
+            "http://127.0.0.1:0".to_string(),
             None,
             manager.clone(),
             test_info(dir.path(), None),

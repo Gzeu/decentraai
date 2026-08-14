@@ -256,10 +256,26 @@ every 3 seconds and shows:
   (`GET /v1/peers`, token-guarded)
 - a Chat box that streams model responses (SSE) token-by-token by
   default, with a toggle for a non-streaming single reply; it shows
-  latency and token usage per request
+  latency and token usage per request, and keeps the real conversation
+  history across page reloads (client-side `localStorage`)
 - the latest security events from the audit log (incl. token and
   rate-limit events)
 - a share guide with the exact `swarm start` + `pull` commands for this node
+
+An opt-in **"Show advanced"** block adds the real distributed views, all
+sourced from live runtime state (`/v1/compute`, `/v1/network`, `/v1/execution`,
+`/status`) with no mock data:
+- **Workers** — each worker's status, load, queue, tok/s, latency, free RAM,
+  in-flight requests
+- **Network** — measured per-peer links (RTT, bandwidth, locality) + connected
+  peers
+- **Execution** — recent planner decisions: selected worker, score, stages,
+  continuation, network RTT, KV/session headroom, outcome and reasoning
+- **Models** — served models with engine, context, RAM/VRAM footprint, active/loaded
+- **Settings** — node name, discovery, tracked/trusted peers, model + engine,
+  and the real resource limits/guards from config (CPU/RAM reserve, GPU policy)
+- **Diagnostics** — node health, P2P/network, workers, engine endpoint, engine
+  auto-restart (recovery) count, active KV sessions, and recent audit events
 
 The dashboard reads only `GET /status` and `GET /v1/peers` — watching the
 page never touches the inference backend, so it neither inflates the
@@ -466,11 +482,6 @@ decentraai token revoke --name <n>              # revoke (effective next request
   BLAKE3 hashes only on disk
 - **Audit** (`crates/audit`): append-only `logs/audit.jsonl` for security events
 
-## Layout
-
-- `crates/audit` — append-only security audit log
-- `crates/config` — typed YAML configuration with validation (incl. tiers)
-- `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, f
 ## Layout
 
 - `crates/audit` — append-only security audit log

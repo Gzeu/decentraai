@@ -6,6 +6,7 @@ use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -622,13 +623,12 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::queue::InferenceQueue;
     use decentraai_runtime::{
-        LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server,
+        LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server,
     };
     use libp2p::PeerId as Libp2pPeerId;
     use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Mutex;
 
     let config_path = expand_tilde(&args.config.to_string_lossy());
 
@@ -856,6 +856,53 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     )?;
     distributed.set_compute_manager(compute_manager.clone());
 
+    // The dashboard owns the llama-server lifecycle; the worker advertises in
+    // sync with its LIVE health (see spawn_compute_broadcaster). Create the
+    // ServeManager early so the broadcaster can read the current engine port
+    // every beat — after an M24 respawn on a new port the advertisement gate
+    // must probe the new port, not the startup one.
+    let instance_manager: Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>> =
+        if is_worker && !backend_url.is_empty() {
+            let idle_timeout =
+                Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+            // NO idle-unload for the universal node. This daemon is a distributed
+            // worker whenever a model is present: it advertises capacity and answers
+            // remote InferRequests at any time. Enabling idle-unload would stop the
+            // shared llama-server (which ServeManager::unload_if_idle drops, with no
+            // reload path), leaving the node advertising as a worker while its
+            // engine is dead — a false-ready state (real bug found in the two-machine
+            // trust/reservation test). Interactive single-user idle-unload only
+            // belongs to the `decentraai serve` path.
+            let manager = Arc::new(tokio::sync::Mutex::new(
+                decentraai_runtime::ServeManager::new(
+                    maybe_server.take().expect("server started"),
+                    idle_timeout,
+                ),
+            ));
+            // M24 engine supervisor: give the manager the restart spec and probe
+            // the engine periodically, auto-restarting llama-server on crash.
+            if let (Some(binary), Some(runtime)) = (restart_binary, restart_runtime) {
+                manager.lock().await.set_restart_spec(binary, runtime);
+                let supervisor = manager.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(5));
+                    loop {
+                        tick.tick().await;
+                        let mut guard = supervisor.lock().await;
+                        if !guard.is_loaded() {
+                            // The ServeManager has no live server (already stopped
+                            // or shut down); stop supervising.
+                            break;
+                        }
+                        let _ = guard.ensure_healthy().await;
+                    }
+                });
+            }
+            Some(manager)
+        } else {
+            None
+        };
+
     if is_worker {
         let model_name = model_name.clone();
         distributed.register_as_worker(model_name.clone(), vec![model_hash.clone()], 1.0)?;
@@ -908,7 +955,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             compute_manager.clone(),
             distributed.p2p_node().clone(),
             can_provision,
-            Some(backend_url.clone()),
+            instance_manager.clone(),
         )
         .await?;
     }
@@ -931,41 +978,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // backend points at the same address. When a node has a model it is fully
     // usable standalone (local inference + dashboard) even with no peers.
     if is_worker && !backend_url.is_empty() {
-        let idle_timeout =
-            Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
-        // NO idle-unload for the universal node. This daemon is a distributed
-        // worker whenever a model is present: it advertises capacity and answers
-        // remote InferRequests at any time. Enabling idle-unload would stop the
-        // shared llama-server (which `ServeManager::unload_if_idle` drops, with
-        // no reload path), leaving the node advertising as a worker while its
-        // engine is dead — a false-ready state (real bug found in the two-machine
-        // trust/reservation test). The daemon must stay ready for remote
-        // inference; interactive single-user idle-unload only belongs to the
-        // `decentraai serve` path. `ServeManager` still owns the server so it
-        // stops cleanly on shutdown below.
-        let manager = Arc::new(Mutex::new(ServeManager::new(
-            maybe_server.take().expect("server started"),
-            idle_timeout,
-        )));
-        // M24 engine supervisor: give the manager the restart spec and probe
-        // the engine periodically, auto-restarting llama-server on crash.
-        if let (Some(binary), Some(runtime)) = (restart_binary, restart_runtime) {
-            manager.lock().await.set_restart_spec(binary, runtime);
-            let supervisor = manager.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(5));
-                loop {
-                    tick.tick().await;
-                    let mut guard = supervisor.lock().await;
-                    if !guard.is_loaded() {
-                        // The ServeManager has no live server (already stopped
-                        // or shut down); stop supervising.
-                        break;
-                    }
-                    let _ = guard.ensure_healthy().await;
-                }
-            });
-        }
+        // ServeManager + M24 supervisor are created above (before the compute
+        // broadcaster) so the worker advertises in sync with the LIVE engine
+        // port after any respawn. Reuse the same handle here so the dashboard
+        // and the distributed worker share one engine lifecycle.
+        let manager = instance_manager
+            .clone()
+            .expect("ServeManager created for worker above");
         let token = if config.inference.api_auth_required {
             ensure_api_token(&data_dir.join("runtime/api.token")).ok()
         } else {
@@ -2583,14 +2602,10 @@ async fn spawn_compute_broadcaster(
     compute_manager: std::sync::Arc<decentraai_distributed::ComputeManager>,
     p2p_node: decentraai_p2p::P2PNode,
     can_provision: bool,
-    engine_health_url: Option<String>,
+    manager: Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>>,
 ) -> Result<()> {
     use decentraai_protocol::serialize_message;
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
-
-    // Derive the engine's host:port for the liveness probe once.
-    let health_addr = engine_health_url.as_deref().and_then(parse_http_addr);
-    let health_sockaddr = health_addr.map(|(h, p)| format!("{h}:{p}"));
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -2600,6 +2615,22 @@ async fn spawn_compute_broadcaster(
             interval.tick().await;
             // M24: gate the advertisement on live engine health. A dead
             // engine means this node is not a usable worker this beat.
+            // Resolve the engine's host:port from the *live* ServeManager
+            // every beat — the M24 supervisor may respawn llama-server on a
+            // NEW port, so a frozen startup URL would keep the worker
+            // advertising a dead port (and, worse, wrongly suppress the
+            // advertisement after a respawn). A dead engine (no live server)
+            // suppresses advertisement this beat without blocking the loop.
+            let health_sockaddr = match &manager {
+                Some(m) => m
+                    .lock()
+                    .await
+                    .base_url()
+                    .as_deref()
+                    .and_then(parse_http_addr)
+                    .map(|(h, p)| format!("{h}:{p}")),
+                None => None,
+            };
             if let Some(addr) = &health_sockaddr {
                 let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
                 if !alive {
