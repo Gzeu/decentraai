@@ -867,6 +867,57 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
     }
 
+    // Multi-engine worker (Objective 7): when a remote OpenAI-compatible
+    // backend (e.g. a vLLM/Ollama endpoint) is configured instead of a local
+    // llama-server, register it as a FIRST-CLASS distributed worker — the same
+    // register_worker_backend path a local engine uses — so P2P InferRequests
+    // route to it just like any other worker. Opt-in (only when
+    // inference.backend_url is set and no local engine was built). The model
+    // identity is derived deterministically from the configured engine/model.
+    if worker_backend.is_none() {
+        if let Some(remote) = config.inference.backend_url.clone() {
+            let engine = config
+                .inference
+                .engine
+                .as_deref()
+                .map(EngineKind::parse)
+                .unwrap_or(EngineKind::LlamaServer);
+            if let Ok(backend) = OpenAiCompatibleBackend::new(BackendConfig {
+                base_url: remote.clone(),
+                model: model_name.clone(),
+                api_key: None,
+                connect_timeout: Duration::from_secs(3),
+                request_timeout: Duration::from_secs(300),
+                max_prompt_bytes: 200_000,
+                max_output_tokens: 8192,
+                engine,
+                // Remote URL is a fixed config value; no respawn, static is correct.
+                backend_url_resolver: None,
+            }) {
+                // Deterministic model id/hash for a remote worker (no local GGUF).
+                if model_hash.is_empty() {
+                    model_hash =
+                        blake3::hash(format!("{engine:?}:{model_name}").as_bytes())
+                            .to_hex()
+                            .to_string();
+                }
+                if model_size_bytes == 0 {
+                    model_size_bytes = 1024;
+                }
+                backend_url = remote.clone();
+                *live_engine_url.lock().unwrap() = Some(remote.clone());
+                worker_backend = Some(backend);
+                info!(
+                    engine = %engine.as_str(),
+                    base_url = %remote,
+                    model = %model_name,
+                    hash = %model_hash,
+                    "registered remote OpenAI-compatible engine as a distributed worker"
+                );
+            }
+        }
+    }
+
     let is_worker = worker_backend.is_some();
     if is_worker {
         info!(model = %model_name, hash = %model_hash, "node will act as a remote worker");
