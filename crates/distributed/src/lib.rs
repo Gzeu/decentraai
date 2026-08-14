@@ -430,10 +430,18 @@ impl DistributedInference {
         use decentraai_protocol::{InferMessage, InferResponse, serialize_message};
 
         let local_peer = self.p2p_node.local_peer_id();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+        // Bounded inbound pipeline (data-plane hardening): the worker loop
+        // serves one queued request at a time, so an abusive sender could
+        // otherwise flood the unbounded channel and enqueue without bound.
+        // Capacity is derived from `max_queue_depth` so the number of
+        // requests in the pipeline (buffered + being served) never exceeds
+        // the configured depth. The producer uses `try_send` and rejects the
+        // request when the pipe is already full (see the on_infer handler).
+        let inbound_cap = self.config.max_queue_depth.max(1) as usize;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
             decentraai_protocol::InferRequest,
             Option<decentraai_compute::ResourceReservation>,
-        )>();
+        )>(inbound_cap);
         let tx_clone = tx.clone();
         let p2p_clone = self.p2p_node.clone();
         let queue_mgr = self.queue_manager.clone();
@@ -706,14 +714,34 @@ impl DistributedInference {
                     }
                 };
 
-                // Send to processing channel (background task will enqueue). If the
-                // channel is gone the worker is shutting down; tell the requester.
-                if tx_clone.send((req.clone(), reservation)).is_err() {
+                // Send to processing channel (background task will enqueue).
+                // The channel is bounded (see `inbound_cap` above), so an
+                // abusive sender cannot push unlimited queued work: when the
+                // pipe is already full we reject the request here (a single
+                // terminal `InferFailed`) and release the capacity booked at
+                // admission rather than letting it linger until the TTL. A
+                // channel that is closed means the worker is shutting down.
+                if let Err(send_err) = tx_clone.try_send((req.clone(), reservation)) {
+                    let shutting_down = matches!(
+                        send_err,
+                        tokio::sync::mpsc::error::TrySendError::Closed(_)
+                    );
+                    let (_, reservation) = send_err.into_inner();
+                    if let Some(res) = &reservation {
+                        reservations_closure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .release(res.reservation_id);
+                    }
                     let failed = InferMessage::InferFailed {
                         request_id: req.request_id,
                         worker_peer_id: local_peer,
-                        error: "worker is shutting down".to_string(),
-                        retryable: false,
+                        error: if shutting_down {
+                            "worker is shutting down".to_string()
+                        } else {
+                            "worker queue is full (backpressure)".to_string()
+                        },
+                        retryable: !shutting_down,
                     };
                     return serialize_message(&failed);
                 }
@@ -731,7 +759,57 @@ impl DistributedInference {
 
         // Spawn background task to process queued requests and stream
         tokio::spawn(async move {
-            while let Some((req, reservation)) = rx.recv().await {
+            // Worker-side bookings keyed by request id, mirroring the queue so
+            // a request swept by the timeout sweep can release the capacity
+            // booked at admission (M15). The reservation accompanies the request
+            // through the inbound channel but is not stored in the queue, so we
+            // keep it here until the request is either served or swept.
+            let mut pending_bookings: HashMap<
+                uuid::Uuid,
+                Option<decentraai_compute::ResourceReservation>,
+            > = HashMap::new();
+            // Periodic worker-side timeout sweep. A request may sit in the
+            // worker's own queue (e.g. while an earlier request streams out) and
+            // must be timed out by the worker itself, not only by the requester
+            // (M10 audit: the queue timeout helpers were defined but never wired
+            // into the serving path). Every swept request is answered with a
+            // single terminal `InferFailed` and its reservation is released.
+            let mut sweep =
+                tokio::time::interval(std::time::Duration::from_millis(250));
+
+            loop {
+                let inbound = tokio::select! {
+                    item = rx.recv() => item,
+                    _ = sweep.tick() => {
+                        for swept in queue_mgr.cleanup_timed_out().await {
+                            if let Some(res) = pending_bookings
+                                .remove(&swept.request_id)
+                                .flatten()
+                            {
+                                reservations_for_task
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .release(res.reservation_id);
+                            }
+                            if let Some(m) = &compute_metrics {
+                                m.record_failure();
+                            }
+                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed {
+                                request_id: swept.request_id,
+                                worker_peer_id: local_peer,
+                                error: "request timed out waiting in worker queue".to_string(),
+                                retryable: true,
+                            }) {
+                                let _ = p2p_clone
+                                    .request(swept.request.sender_peer_id, bytes)
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some((req, reservation)) = inbound else { break };
+
                 // Queue the request; a full queue is answered immediately so the
                 // requester is never left hanging. The local reservation booked
                 // at admission is released — the workload never ran.
@@ -756,12 +834,18 @@ impl DistributedInference {
                     continue;
                 }
 
+                // Hold the booking until the request is served or swept; it is
+                // now owned by the queue (indexed by request id).
+                pending_bookings.insert(req.request_id, reservation);
+
                 if let Some(m) = &compute_metrics {
                     m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
                 }
 
                 // Dequeue and process the request to a single terminal event.
                 if let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
+                    // The reservation lives on with the streaming task.
+                    let reservation = pending_bookings.remove(&queued.request_id).flatten();
                     if let Some(m) = &compute_metrics {
                         m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
                     }
