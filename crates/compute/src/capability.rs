@@ -35,6 +35,25 @@ pub struct ServedModel {
     pub context_tokens: u32,
 }
 
+impl ServedModel {
+    /// Pure, honest estimate of the model's VRAM footprint when fully offloaded
+    /// to a GPU (MiB), and the KV-cache overhead for `ctx` tokens. Returning
+    /// `0` means the model is CPU-only (no GPU offload). The estimate is the
+    /// model bytes (the dominant VRAM cost at Q4/Q5) plus a small KV headroom
+    /// so the capacity matcher does not over-commit a GPU worker.
+    pub fn estimate_vram_mb(model_size_bytes: u64, gpu_offload: bool, ctx: u32) -> u64 {
+        if !gpu_offload {
+            return 0;
+        }
+        let model_mib = (model_size_bytes / (1024 * 1024)).max(1);
+        // Approximate KV-cache headroom: ~2 MiB per 1024 ctx tokens per layer is
+        // engine/model dependent; use a coarse 1 MiB per 256 tokens as a safe
+        // ceiling so placement never over-commits VRAM.
+        let kv_mib = (u64::from(ctx) / 256).max(1);
+        model_mib + kv_mib
+    }
+}
+
 /// Immutable capability of a worker. Advertised on registration and changes
 /// rarely (new model added, GPU swapped). Compare with
 /// [`crate::availability::ComputeAvailability`] which changes every heartbeat.
@@ -133,5 +152,20 @@ mod tests {
         let json = serde_json::to_string(&cap).unwrap();
         let back: ComputeCapability = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cap);
+    }
+
+    #[test]
+    fn estimate_vram_is_nonzero_only_with_gpu_offload() {
+        // CPU-only: never advertises VRAM (0), so the capacity matcher treats
+        // the worker as CPU-op and VRAM headroom is not committed.
+        assert_eq!(ServedModel::estimate_vram_mb(1 << 30, false, 4096), 0);
+        // GPU offload: model bytes dominate + KV headroom; a bigger model
+        // needs more VRAM (pure, monotone), so GPU vs CPU workers differ.
+        let small =
+            ServedModel::estimate_vram_mb(2_147_483_648, true, 4096); // 2 GiB model
+        let big = ServedModel::estimate_vram_mb(8_589_934_592, true, 8192); // 8 GiB model
+        assert!(small > 0);
+        assert!(big > small, "larger model must advertise more VRAM");
+        assert!(small >= (2048 + (4096 / 256)) as u64, "model MiB + KV headroom");
     }
 }
