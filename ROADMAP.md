@@ -344,20 +344,29 @@ release.
 - [ ] Streaming incremental tokens
 - [ ] Backpressure and bounded queues
 - [ ] Retry only for transient errors
-- [ ] Circuit breaker for unstable workers
+- [x] Circuit breaker for unstable workers (P5: per-worker breaker trips after
+  consecutive retryable failures; open workers are omitted from the planner feed
+  and re-admitted after a cooldown)
 - [ ] Idempotency for resent requests
 - [ ] Server-side limits for timeout, tokens, prompt size
 
 #### Phase 3: Trust and Security
-- [ ] Verify WorkerAnnouncement signature
-- [ ] Compare announcement.peer_id with transport peer ID
-- [ ] Pairing with expiration and revocation
-- [ ] Replay protection via nonce/sequence number
+- [~] Verify WorkerAnnouncement / compute advertisement signature — P3 signs
+  compute advertisements, verified on receipt (the legacy unsigned path remains
+  as a fallback). (WorkerAnnouncement legacy frame itself is not signed.)
+- [x] Compare announcement.peer_id with transport peer ID — the on_infer path
+  (P2) verifies against the authenticated connected peer; signed advertisements
+  are keyed to the signer's public key mapping to the claimed peer (P3)
+- [ ] Pairing with expiration and revocation (invite/trust grant seats; no TTL)
+- [x] Replay protection via nonce/sequence number — P4: per-sender nonce +
+  bounded TTL ReplayGuard on the worker; outbound monotonic nonces
 - [ ] Capability-based authorization: which models each worker can serve
 - [ ] Rate limiting per token and per peer
 - [ ] Limit prompt size and output size
-- [ ] Secret management without tokens in config or logs
-- [ ] Audit for login, pairing, revoke, routing and inference
+- [x] Secret management without tokens in config or logs (token registry stores
+  hashes; signing keys live only in the node's identity; audit never logs them)
+- [x] Audit for login, pairing, revoke, routing and inference — per-request
+  `inference_completed`/`inference_failed` (M10) and `replay_rejected` (P4)
 - [ ] Role separation: admin, operator, client, worker
 
 #### Phase 4: Control Plane and Frontend

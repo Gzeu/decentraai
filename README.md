@@ -311,23 +311,33 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ### 6. Better answers: model quality and speed
 
-TinyLlama 1.1B is a smoke-test model — it proves the pipeline, but its
-answers are weak and it hallucinates languages. For real conversations
-on a 16 GB / 4-thread CPU node:
+TinyLlama 1.1B / TinyLlama-class models are smoke tests — they prove the
+pipeline but answer weakly and hallucinate languages. For real conversations
+on a 16 GB / 4-thread CPU node, drop a stronger GGUF into the node's `models/`
+dir and it will auto-detect it:
 
 | Model | Size (Q4_K_M) | Why |
 |---|---|---|
-| **Qwen3-4B-Instruct** (2507) | ~2.5 GB | Best multilingual 3–4B tier, includes Romanian; recommended default |
+| **Qwen3-8B** (recommended default) | ~5.0 GB | 8B dense, multilingual (incl. Romanian), much stronger reasoning/code; fits 16–32 GB RAM |
+| **Qwen3-4B-Instruct** (2507) | ~2.5 GB | Best 3–4B tier on weaker/4-thread CPUs; recommended minimum |
 | **Phi-4-mini** (3.8B) | ~2.5 GB | Best reasoning/math at this size (English-first) |
-| Qwen3-8B (stretch) | ~5 GB | Noticeably smarter, ~half the speed; fits in 16 GB RAM |
 
 ```bash
-# download the GGUF (Q4_K_M variant) from Hugging Face into your models dir,
-# e.g. https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507-GGUF
-decentraai registry scan --directory ~/models
-decentraai serve start --model qwen3-4b-instruct-2507-q4_k_m.gguf
-# and add the new file name to the tiers allowlists you want to grant
+# Recommended default — download into the node's models dir, then re-select:
+# Qwen3-8B-Q4_K_M.gguf from https://huggingface.co/Qwen/Qwen3-8B-GGUF
+mkdir -p ~/.decentraai/models
+# ...move/copy Qwen3-8B-Q4_K_M.gguf into ~/.decentraai/models/ ...
+#   (auto-detection picks alphabetically-first, so remove/rename any older
+#    tinyllama.gguf that would sort before it)
+decentraai registry scan --directory ~/.decentraai/models
+decentraai serve start --model Qwen3-8B-Q4_K_M.gguf
+# or let the universal node auto-select it:  decentraai node
+# and add the file name to the tiers allowlists you want to grant
 ```
+
+Context: `decentraai setup` keeps `max_context_tokens` at 4096 on a 16 GB
+node and 8192 on 32 GB — both suit Qwen3-8B. The default generation settings
+(temperature 0.7, top_p 0.9) suit Qwen3 non-thinking mode.
 
 Built-in speed tuning (automatic since this release): `--threads` set
 to logical CPUs minus the configured reserve, `--flash-attn on`,
