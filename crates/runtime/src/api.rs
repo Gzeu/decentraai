@@ -765,7 +765,7 @@ async fn openapi_handler() -> Response {
             "/v1/peers": { "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
             "/v1/compute": { "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
             "/v1/network": { "get": { "operationId": "network", "summary": "Per-peer link metrics (operator+)", "responses": { "200": { "description": "Network" }, "403": { "description": "Forbidden for client tokens" } } } },
-            "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions (operator+)", "responses": { "200": { "description": "Executions" }, "403": { "description": "Forbidden for client tokens" } } } },
+            "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions + autonomous execution decisions (operator+)", "responses": { "200": { "description": "Executions + decisions" }, "403": { "description": "Forbidden for client tokens" } } } },
             "/api/admin/token/create": { "post": { "operationId": "adminCreateToken", "summary": "Create a subscription token (master only)", "responses": { "200": { "description": "Token (shown once)" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/revoke": { "post": { "operationId": "adminRevokeToken", "summary": "Revoke a token (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/list": { "get": { "operationId": "adminListTokens", "summary": "List tokens (master only)", "responses": { "200": { "description": "Token list" }, "401": { "description": "Unauthorized" } } } },
@@ -1117,9 +1117,15 @@ async fn execution_handler(
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
-    let mut body = serde_json::json!({ "attached": false, "executions": [] });
+    let mut body = serde_json::json!({ "attached": false, "executions": [], "decisions": [] });
     if let Some(compute) = &state.compute {
         body["executions"] = serde_json::json!(compute.executions());
+        // M23 Full Autonomy: surface the explainable autonomous execution
+        // decisions (candidates, constraints, score, selected worker, KV
+        // affinity, engine capability, expected mode, reservation/plan/outcome
+        // correlation + lifecycle trace) for the control plane. Safe operational
+        // metadata only — never chain-of-thought or request content.
+        body["decisions"] = serde_json::json!(compute.decisions());
         body["attached"] = serde_json::json!(true);
     }
     (
@@ -1471,6 +1477,8 @@ code{background:#0a0e13;padding:2px 6px;border-radius:6px;font-size:13px}
 .ok{color:#3fb950}.off{color:#8b949e}.bad{color:#f85149}
 .bignum{font-size:26px;font-weight:600}
 .small{color:#8b949e;font-size:12px}
+.tiny{color:#8b949e;font-size:11px;line-height:1.5}
+.reasons{margin:4px 0 0;padding-left:16px;list-style:disc}
 ol{padding-left:20px} li{margin:6px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .metric{background:#0a0e13;border-radius:8px;padding:10px 14px}
@@ -1561,6 +1569,11 @@ ol{padding-left:20px} li{margin:6px 0}
   <h2>Execution (planner decisions)</h2>
   <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Network</th><th>KV</th><th>Outcome</th><th>Reasoning</th></tr></thead>
   <tbody id="execution"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Autonomous decisions (M23 lifecycle)</h2>
+  <table><thead><tr><th>Req</th><th>Workload</th><th>Selected</th><th>Mode</th><th>Priority</th><th>Network</th><th>KV affinity</th><th>Reservation</th><th>Outcome</th><th>Trace / Reasons</th></tr></thead>
+  <tbody id="decisions"><tr><td colspan="10" class="off">loading&hellip;</td></tr></tbody></table>
 </div>
 <div class="card">
   <h2>Models</h2>
@@ -1912,6 +1925,28 @@ async function refresh() {
       (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + e.network_rtt_ms + ' ms</td><td class="small">' + esc(e.kv_headroom || '') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
     ).join('');
     document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="9" class="off">no executions yet</td></tr>';
+    const drows = (x.decisions || []).slice(0, 12).map(d => {
+      const cls = d.workload_class || 'unknown';
+      const sel = d.selected_worker ? '<code>' + esc(d.selected_worker.slice(0, 12)) + '&hellip;</code>' : '<span class="off">none</span>';
+      // Safe operational reasons only: constraints passed, network cost,
+      // queue depth, KV affinity, priority, engine/health. Never chain-of-thought.
+      const reasons = (d.candidates || [])
+        .filter(c => c.constraints && !c.constraints.breaches.length)
+        .map(c =>
+          '<li><code>' + esc(c.peer_id.slice(0, 10)) + '&hellip;</code> score ' +
+          (c.score ? c.score.total.toFixed(2) : '&mdash;') +
+          (c.network_cost_ms ? (' net ' + c.network_cost_ms + 'ms') : '') +
+          (c.kv_prefix_resident ? ' <span class="ok">KV-resident</span>' : '') +
+          '</li>'
+        ).join('');
+      const trace = (d.trace || []).map(t => (t.event || '')).join(' &rarr; ');
+      return '<tr><td><code>' + esc(d.request_id.slice(0, 8)) + '</code></td><td>' + esc(cls) + '</td><td>' + sel + '</td><td>' + esc(d.expected_mode || '') +
+        '</td><td>' + d.priority + '</td><td>' + d.network_cost_ms + ' ms</td><td class="small">' + esc(d.kv_affinity || '') +
+        '</td><td>' + (d.reservation_id ? '<code>' + esc(d.reservation_id.slice(0, 8)) + '</code>' : '<span class="off">pending</span>') +
+        '</td><td>' + (d.outcome === 'succeeded' ? '<span class="ok">succeeded</span>' : d.outcome === 'failed' ? '<span class="bad">failed</span>' : esc(d.outcome || 'in flight')) +
+        '</td><td class="small">' + esc(trace || '') + (reasons ? '<ul class="tiny reasons">' + reasons + '</ul>' : '') + '</td></tr>';
+    }).join('');
+    document.getElementById('decisions').innerHTML = drows || '<tr><td colspan="10" class="off">no autonomous decisions yet</td></tr>';
   } catch (e) {}
   // ---- Models / Settings / Diagnostics (from /status node+system + real manager state) ----
   let trustList = '';
@@ -2362,6 +2397,72 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert!(response.text().await.unwrap().contains("\"list\""));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_webui_openai_surface_round_trips_through_proxy() {
+        // Open WebUI connects to DecentraAI as an OpenAI-compatible backend:
+        // ``/v1/models`` (a list with data[].id) and ``/v1/chat/completions``
+        // (choices[].message.content + usage), both streamed or not. This test
+        // proves the proxy preserves those standard shapes verbatim (no
+        // wrapping, no field loss), so Open WebUI can consume the node as its
+        // Chat engine while the DecentraAI dashboard stays the control plane.
+        let dir = tempfile::tempdir().unwrap();
+        let og = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async {
+                    "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\",\"object\":\"model\"}]}"
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    "{\"object\":\"chat.completion\",\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello from the node\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}"
+                }),
+            );
+        let manager = test_manager_with(dir.path(), og).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // /v1/models: OpenAI list shape Open WebUI's model picker parses.
+        let models = client
+            .get(format!("http://{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        let mj: serde_json::Value = models.json().await.unwrap();
+        assert_eq!(mj["object"], "list");
+        assert_eq!(mj["data"][0]["id"], "tinyllama");
+
+        // /v1/chat/completions: standard chat.completion shape Open WebUI
+        // renders, with the assistant message content preserved.
+        let chat = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"tinyllama\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200);
+        let cj: serde_json::Value = chat.json().await.unwrap();
+        assert_eq!(cj["object"], "chat.completion");
+        assert_eq!(cj["choices"][0]["message"]["content"], "Hello from the node");
+        assert_eq!(cj["usage"]["total_tokens"], 8);
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -2934,6 +3035,7 @@ mod tests {
             .unwrap();
         assert_eq!(exec["attached"], false);
         assert!(exec["executions"].is_array());
+        assert!(exec["decisions"].is_array());
 
         manager.lock().await.shutdown().await.unwrap();
     }

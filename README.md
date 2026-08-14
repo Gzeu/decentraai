@@ -86,6 +86,15 @@ The installer checks the Rust toolchain (installs rustup when missing),
 (systemd, firewall, security checklist) see
 [docs/deployment.md](docs/deployment.md).
 
+### 0.1. Chat with Open WebUI (primary user-facing Chat)
+
+Open WebUI is the primary Chat; the DecentraAI dashboard stays the technical
+control plane (it is not replaced). Connect Open WebUI to a running node as an
+OpenAI-compatible backend — DecentraAI already serves the standard `/v1/models`
+and `/v1/chat/completions` (streaming + non-streaming) that Open WebUI reads.
+See [docs/openwebui.md](docs/openwebui.md) for the exact steps and security
+notes.
+
 ### 0. Install as a desktop application (Ubuntu)
 
 For a normal-user "Download → Install → Open → Ready" experience, use the

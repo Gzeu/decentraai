@@ -606,16 +606,43 @@ narrowed by a live probe. **Only llama-server is actually spawned today**, and
 not a running feature). **Not production-verified** for any second engine;
 this is the abstraction layer only.
 
-## 19. NOT DONE — M23: Autonomous Execution Planner (foundation only)
+## 19. PARTIAL — M23: Autonomous Execution Planner (foundation + live decision core)
 
 `decentraai-fabric::planner::ExecutionPlanner` folds real state into worker
 scoring: throughput, latency, load, queue depth, RAM/VRAM headroom, network
 reach cost (M19) and KV headroom (M20), ranked deterministically. It is deeply
-integrated (the live node routes through `plan_and_reserve`), but that is the
-*scheduler picking the best single worker*. Fully autonomous goals — self-
-healing, multi-objective re-planning mid-request, proactive rebalancing — are
-**not** claimed; the planner today is a capable single-worker selector, not an
-autonomous orchestrator.
+integrated (the live node routes through `plan_and_reserve`).
+
+**M23 Increment B/C** turns the planner's single-worker selection into an
+explicit, observable decision in the real execution path, without replacing the
+M18/M19/M20/M24 planner it extends (a cooperative base with the live decision
+core, decision correlation, event-driven adapt and control-plane surfacing):
+
+- `decentraai-fabric::decision` (`WorkloadClass`/`classify`, `ConstraintKind`/
+  `ConstraintResult`, `CandidateOutcome`, `ExecutionDecision`, `ExecutionEvent`,
+  `adapt`) is now **wired into the live coordinator**, not just an exported API.
+- The coordinator records an explainable decision per routed request via
+  `ComputeManager::record_decision` (DISCOVER → CLASSIFY → CANDIDATES →
+  CONSTRAINTS → SCORE → SELECT), built with the **same live planner** the routing
+  path uses — so scores and per-candidate network cost reflect the real measured
+  network graph (M19) and KV state (M20), never a cold-default planner.
+- Each decision is **correlated** with `reservation_id`, `plan_id` and the
+  observed `outcome` via `ComputeManager::finalize_decision`, and carries a
+  lifecycle trace (Reserved → Executing → Completed/Failed → Released). Safe
+  operational metadata only — no chain-of-thought, no request content.
+- `adapt()` (OBSERVE → ADAPT/RECOVER/REPLAN) now feeds the real retry path in
+  `route_request` with the **actual** remaining eligible-worker count from the
+  live registry (never a fabricated count), preserving the M24 idempotency-safe
+  retry semantics.
+- The control plane (`/v1/execution`) exposes the bounded, concurrency-safe
+  decision ring (`ComputeManager::decisions`, newest-first, cap 64), rendered by
+  the dashboard "Autonomous decisions" view (workload, selected worker, mode,
+  priority, network cost, KV affinity, reservation, outcome, trace, safe reasons).
+
+Fully autonomous goals — self-healing, multi-objective re-planning mid-request,
+proactive rebalancing — are **not** claimed; the planner remains a capable
+single-worker selector, not an autonomous orchestrator. This is `decentraai-fabric::decision`
+integrated into the live execution lifecycle, not M23 Full Autonomy.
 
 ## 20. M24: Resilient Distributed Fabric — DONE
 
