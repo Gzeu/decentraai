@@ -75,6 +75,7 @@ fn describe_admit_reason(reason: AdmitReason) -> String {
     }
 }
 
+pub mod breaker;
 pub mod compute;
 pub mod config;
 pub mod fallback;
@@ -834,6 +835,20 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // P5: feed the per-worker circuit breaker — a success
+                    // resets the run; only a retryable failure counts toward
+                    // tripping (rejections/cancellations are not the worker's
+                    // fault and never trip it).
+                    if result.is_ok() {
+                        compute.record_breaker_success(&placement.worker);
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.is_retryable())
+                        .unwrap_or(false)
+                    {
+                        compute.record_breaker_failure(&placement.worker);
+                    }
                     // M10: per-request audit event tying request, worker and
                     // model hash to the observed outcome.
                     self.audit_routed(
@@ -974,6 +989,17 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // P5: feed the per-worker circuit breaker (streaming path).
+                    if result.is_ok() {
+                        compute.record_breaker_success(&placement.worker);
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.is_retryable())
+                        .unwrap_or(false)
+                    {
+                        compute.record_breaker_failure(&placement.worker);
+                    }
                     // M10: per-request audit event (streaming path).
                     self.audit_routed(&request, &placement.worker, result.is_ok());
                     if result.is_ok() {

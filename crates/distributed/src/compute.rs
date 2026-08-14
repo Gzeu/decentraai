@@ -257,6 +257,10 @@ pub struct ComputeManager {
     /// can authenticate that the advertisement genuinely came from the node
     /// that claims it (anti-spoof). `None` broadcasts unsigned (legacy).
     signing_key: Option<[u8; 32]>,
+    /// Per-worker circuit breaker (P5). Open workers are filtered out of the
+    /// planner feed so a consistently failing worker is not re-selected (and
+    /// no reservation is booked on it) until its cooldown elapses.
+    breaker: std::sync::Mutex<crate::breaker::CircuitBreaker>,
 }
 
 impl ComputeManager {
@@ -281,6 +285,9 @@ impl ComputeManager {
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
             signing_key: None,
+            breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
+                crate::breaker::BreakerConfig::default(),
+            )),
         }
     }
 
@@ -336,6 +343,32 @@ impl ComputeManager {
                 tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
             }
         }
+    }
+
+    /// Records a retryable routing failure for `peer` (P5), possibly tripping
+    /// the circuit breaker so the worker is omitted from planning until its
+    /// cooldown elapses.
+    pub fn record_breaker_failure(&self, peer: &PeerId) {
+        self.breaker
+            .lock()
+            .unwrap()
+            .record_failure(peer, std::time::Instant::now());
+    }
+
+    /// Records a routing success for `peer` (P5), resetting its failure run.
+    pub fn record_breaker_success(&self, peer: &PeerId) {
+        self.breaker
+            .lock()
+            .unwrap()
+            .record_success(peer, std::time::Instant::now());
+    }
+
+    /// Whether a request may currently be routed to `peer` (P5).
+    pub fn breaker_allows(&self, peer: &PeerId) -> bool {
+        self.breaker
+            .lock()
+            .unwrap()
+            .allow(peer, std::time::Instant::now())
     }
 
     /// Marks a peer offline (stale heartbeat or explicit disconnect).
@@ -566,10 +599,15 @@ impl ComputeManager {
     /// enforced by the scheduler.
     pub async fn fabric_facts(&self, model_hash: &str) -> Vec<decentraai_fabric::WorkerFacts> {
         let scheduler = self.scheduler.lock().await;
+        // P5: an open (tripped) worker is omitted entirely, so the planner
+        // never selects it and no reservation is booked on it until cooldown.
+        let now = std::time::Instant::now();
+        let breaker = self.breaker.lock().unwrap();
         scheduler
             .registry()
             .list()
             .into_iter()
+            .filter(|adv| breaker.allow(&adv.peer_id, now))
             .map(|adv| {
                 let a = &adv.availability;
                 let cap = &adv.capability;
@@ -1206,6 +1244,48 @@ mod tests {
             manager.plan_and_reserve(&req, 10, None).await.is_none(),
             "coordinator must not route a remote request to itself"
         );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_omits_a_tripped_worker_from_planning() {
+        let local = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::new());
+        let worker = peer();
+        manager.add_trusted(worker).await;
+        let adv = build_advertisement(
+            worker,
+            "wedged",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+
+        // Before tripping, the worker is routable.
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        assert!(manager.plan_and_reserve(&req, 10, None).await.is_some());
+        assert_eq!(manager.fabric_facts("abc").await.len(), 1);
+
+        // Trip the breaker: repeated retryable failures open it.
+        let cfg = crate::breaker::BreakerConfig::default();
+        for _ in 0..cfg.threshold {
+            manager.record_breaker_failure(&worker);
+        }
+        // An open worker is omitted from the planner feed and never reserved.
+        assert!(!manager.breaker_allows(&worker));
+        assert_eq!(manager.fabric_facts("abc").await.len(), 0);
+        assert!(
+            manager.plan_and_reserve(&req, 10, None).await.is_none(),
+            "must not reserve/open a trip request on an open worker"
+        );
+
+        // A success re-opens eligibility.
+        manager.record_breaker_success(&worker);
+        assert!(manager.breaker_allows(&worker));
     }
 
     #[tokio::test]
