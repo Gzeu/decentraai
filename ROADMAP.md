@@ -331,24 +331,51 @@ release.
 ### Implementation Phases
 
 #### Phase 1: Common Contracts
-- [ ] Stabilize NodeConfig, WorkerAnnouncement, InferRequest, InferResponse
-- [ ] Stabilize WorkerStatus, TaskPlacement
-- [ ] Define error codes and retry semantics
-- [ ] Request lifecycle: received → queued → assigned → running → completed/failed/timeout
-- [ ] Add mandatory request_id, trace_id, created_at, deadline_at, model_hash, sender_peer_id, assigned_worker_id
+- [x] Stabilize NodeConfig, WorkerAnnouncement, InferRequest, InferResponse — all
+  four are stable serde contracts: NodeConfig is `deny_unknown_fields` with
+  strict validation (config:16, validate ~282); WorkerAnnouncement/InferRequest/
+  InferResponse are fully defined serde structs (infer_protocol.rs)
+- [x] Stabilize WorkerStatus, TaskPlacement — WorkerStatus is wire-serializable;
+  TaskPlacement is now serializable too (derive + round-trip test)
+- [~] Define error codes and retry semantics — `DistributedError::is_retryable()`
+  + bounded backoff is defined/tested (only transport retries; rejections/cancels
+  never resend). Machine-readable numeric error *codes* are not present (only
+  string + boolean `retryable`)
+- [~] Request lifecycle received→queued→assigned→running→completed/failed/timeout —
+  the pipeline is fully wired (accepted→queued→dequeue→stream→terminal); there is
+  no distinct observable "assigned" transition and queued-timeout cleanup is
+  requester-side only (`cleanup_timed_out` is defined but not swept on the worker)
+- [~] Mandatory request_id, trace_id, created_at, deadline_at, model_hash,
+  sender_peer_id, assigned_worker_id — 6 of 7 are mandatory fields on
+  InferRequest; `assigned_worker_id` is absent (routing uses
+  `TaskPlacement.selected_worker` instead), and `new()` seeds sender with a
+  placeholder
 
 #### Phase 2: Real Data Plane
-- [ ] Fix queue manager: shared state, not clone
-- [ ] Install effective inference handler in ChainedHandler
-- [ ] Adapter for llama-server/OpenAI-compatible API
-- [ ] Streaming incremental tokens
-- [ ] Backpressure and bounded queues
-- [ ] Retry only for transient errors
+- [x] Fix queue manager: shared state, not clone — `RequestQueueManager` is
+  `Arc<Mutex<HashMap<PeerId, Arc<Mutex<WorkerRequestQueue>>>>>`, shared, not
+  cloned-by-value (queue.rs:185)
+- [x] Install effective inference handler — served via `P2PNode.on_infer`
+  (`register_worker_backend`) rather than inside `ChainedHandler`; the chain
+  dispatches announcements/compute, inference bypasses it (lib.rs:518-730)
+- [x] Adapter for llama-server/OpenAI-compatible API — `OpenAiCompatibleBackend`
+  (complete/stream against /v1/chat/completions, /v1/models, /health)
+- [x] Streaming incremental tokens — `stream()` with `"stream":true` + SSE
+  parse into `StreamChunk`; worker relays as `InferProgress`
+- [~] Backpressure and bounded queues — per-worker queue depth is capped and
+  queue-full is answered terminal, but the ingress channel is unbounded
+  (`mpsc::unbounded_channel`) with no producer suspension
+- [x] Retry only for transient errors — `is_retryable()` returns true only for
+  P2PError/RequestTimeout; bounded backoff; tested (lib.rs:222,915)
 - [x] Circuit breaker for unstable workers (P5: per-worker breaker trips after
   consecutive retryable failures; open workers are omitted from the planner feed
   and re-admitted after a cooldown)
-- [ ] Idempotency for resent requests
-- [ ] Server-side limits for timeout, tokens, prompt size
+- [x] Idempotency for resent requests — `ReplayGuard` (per-auth-peer nonce + TTL)
+  rejects a resent request terminal before admission/queue/backend (replay.rs)
+- [x] Server-side limits for timeout, tokens, prompt size — enforced in
+  `inference-adapter::validate()` on both paths; the local /v1 proxy now also
+  caps prompt bytes + max_tokens and applies a 300s HTTP timeout (runtime proxy
+  hardening), and idle-clock/counters only fire on real inference POSTs
 
 #### Phase 3: Trust and Security
 - [~] Verify WorkerAnnouncement / compute advertisement signature — P3 signs
