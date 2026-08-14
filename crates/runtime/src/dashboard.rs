@@ -781,7 +781,14 @@ const HIST_KEY = 'decentraai.chat.history';
 let hist = [];
 try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
 const chatbox = $('chat-history'), chatModel = $('chat-model'), chatInput = $('chat-input');
-const currentModel = () => chatModel.value || activeModel;
+// `__auto__` = fabric-wide best-model picker; `remote:<node>:<file>` = an
+// explicit remote worker's model (sendChat turns it into worker_hint).
+const currentModel = () => {
+  const v = chatModel.value || '';
+  if (v === '__auto__') return 'auto';
+  if (v.startsWith('remote:')) { const i = v.indexOf(':', 7); return v.slice(i + 1); }
+  return v || activeModel;
+};
 const addMsg = (role, text) => {
   const div = document.createElement('div');
   div.className = 'chat-msg ' + role;
@@ -833,7 +840,10 @@ const sendChat = async (prompt) => {
   chatStatus.textContent = 'routing & generating…';
   const t0 = performance.now();
   try {
-    const body = JSON.stringify({ model: currentModel(), messages: hist, stream });
+    const sel = chatModel.value || '';
+    let workerHint = '';
+    if (sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
+    const body = JSON.stringify({ model: currentModel(), messages: hist, stream, ...(workerHint ? { worker_hint: workerHint } : {}) });
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
     const servedEl = $('chat-served');
     if (servedEl) {
@@ -1774,7 +1784,7 @@ async function refresh(){
       names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; chatModel.appendChild(opt); });
       chatModel.value = activeModel;
     }
-    populateChatModels(c);
+    populateChatModels(s, c);
     renderModels(s);
     renderDiag(s, null, null);
     renderSettings(s);
@@ -1790,31 +1800,43 @@ async function refresh(){
   if (s) renderRecovery(s, c, x);
 }
 setStageVisible(true);
-// Add models advertised by *remote* workers to the chat selector, once, as a
-// grouped "Remote workers" section. Local models win: a file name already
-// served locally is never duplicated. Uses only real /v1/compute data.
-const populateChatModels = (c) => {
+// Build the chat model selector once, from real data only:
+//   Auto (best available)  — fabric-wide best picker (local wins ties)
+//   Local models           — this node's /status available_models
+//   Remote workers         — every model advertised by other workers, even
+//                            when a local copy exists, labelled with its node
+const populateChatModels = (s, c) => {
   if (!c || !c.workers || chatModel.querySelector('optgroup[label="Remote workers"]')) return;
-  const names = new Set([].map.call(chatModel.options, o => o.value));
+  chatModel.innerHTML = '';
+  const auto = document.createElement('option');
+  auto.value = '__auto__';
+  auto.textContent = 'Auto (best available)';
+  chatModel.appendChild(auto);
+  const names = new Set([activeModel]);
+  ((s && s.available_models) || []).forEach(m => { if (m && m.name) names.add(m.name); });
+  if (names.size) {
+    const og = document.createElement('optgroup'); og.label = 'Local models';
+    names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; og.appendChild(opt); });
+    chatModel.appendChild(og);
+  }
   const remote = [];
   (c.workers || []).forEach(w => {
     if (w && w.peer_id === c.local_peer) return;
     (w.served_models || []).forEach(m => {
-      if (m && m.file_name && !names.has(m.file_name)) {
-        remote.push({ file: m.file_name, node: w.node_id || w.node_name || w.peer_id });
-      }
+      if (m && m.file_name) remote.push({ file: m.file_name, node: w.node_id || w.node_name || w.peer_id });
     });
   });
-  if (!remote.length) return;
-  const og = document.createElement('optgroup');
-  og.label = 'Remote workers';
-  remote.forEach(r => {
-    const opt = document.createElement('option');
-    opt.value = r.file;
-    opt.textContent = r.file + '  (remote · ' + r.node + ')';
-    og.appendChild(opt);
-  });
-  chatModel.appendChild(og);
+  if (remote.length) {
+    const og = document.createElement('optgroup'); og.label = 'Remote workers';
+    remote.forEach(r => {
+      const opt = document.createElement('option');
+      opt.value = 'remote:' + r.node + ':' + r.file;
+      opt.textContent = r.file + '  (remote · ' + r.node + ')';
+      og.appendChild(opt);
+    });
+    chatModel.appendChild(og);
+  }
+  chatModel.value = '__auto__';
 };
 refresh(); setInterval(refresh, 3000);
 "##;

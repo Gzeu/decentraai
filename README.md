@@ -377,11 +377,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 When the node runs as a fabric node (`decentraai node` with a compute
 manager), the chat proxy can also serve models advertised by *trusted remote
-workers*: pick a "Remote workers" model in the dashboard chat selector and
-the request is routed over P2P, with the response tagged
-`X-Decentra-Origin: remote` (+ `X-Decentra-Worker`/`X-Decentra-Node`) and a
-"served by `dca-xxxx` · remote" badge in the chat. Local models always win;
-remote routing never occupies the local inference queue.
+workers*. The chat model picker offers **Auto (best available)** (default:
+the largest model actually served anywhere in the fabric, local wins ties),
+**Local models**, and **Remote workers** (every advertised model labelled
+with its node, even when a local copy exists). A manual remote choice sends
+`worker_hint`; responses are tagged `X-Decentra-Origin: remote` (+
+`X-Decentra-Worker`/`X-Decentra-Node`) with a "served by `dca-xxxx` ·
+remote" badge. Remote routing never occupies the local inference queue.
 
 ### 6. Better answers: model quality and speed
 

@@ -91,6 +91,15 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
   and the model selector gains a "Remote workers" group from live
   `/v1/compute` data. Local models always win; remote routing never holds a
   local queue slot.
+- [x] P12: Model picker for the whole fabric — the chat selector is rebuilt
+  as `Auto (best available)` (default), `Local models` and `Remote workers`
+  (every advertised remote model, labelled with its node, even when a local
+  copy exists). Auto picks the largest model actually *served* anywhere in
+  the fabric (honest, deterministic: size desc, local wins ties, node id
+  asc), rewriting the local body when it lands locally; a manual remote
+  choice sends `worker_hint: <node_id>` and the proxy routes to exactly that
+  node (400 with a clear message if it is not trusted / not accepting remote
+  inference / does not serve the model).
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join

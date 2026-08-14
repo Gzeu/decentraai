@@ -1376,6 +1376,72 @@ fn resolve_chat_route(
     ChatRoute::Unknown
 }
 
+/// Best-model selection across the whole fabric (local + trusted remote
+/// workers accepting remote inference). Size is an honest, deterministic
+/// proxy for capability: the largest served model wins; ties prefer the
+/// local copy (no network round-trip), then the lexicographically smallest
+/// node id so the choice is stable across refreshes.
+#[derive(Debug, Clone, PartialEq)]
+enum BestModel {
+    Local(String),
+    Remote {
+        worker: decentraai_p2p::PeerId,
+        node_id: String,
+        model_hash: String,
+        file_name: String,
+    },
+}
+
+fn select_best_model(
+    workers: &[decentraai_distributed::ComputeAdvertisement],
+    local_peer: &decentraai_p2p::PeerId,
+) -> Option<BestModel> {
+    let mut best: Option<(u64, BestModel)> = None;
+    for w in workers {
+        let is_local = w.peer_id == *local_peer;
+        if !is_local && !w.accepts_remote_inference {
+            continue;
+        }
+        for m in &w.capability.served_models {
+            let candidate = if is_local {
+                BestModel::Local(m.file_name.clone())
+            } else {
+                BestModel::Remote {
+                    worker: w.peer_id,
+                    node_id: w.node_id.clone(),
+                    model_hash: m.model_hash.clone(),
+                    file_name: m.file_name.clone(),
+                }
+            };
+            let better = match &best {
+                None => true,
+                Some((best_size, best_choice)) => {
+                    if m.size_mb != *best_size {
+                        m.size_mb > *best_size
+                    } else {
+                        // Tie: a local copy beats a remote one, then remote
+                        // ties break deterministically by node id.
+                        matches!(
+                            (best_choice, &candidate),
+                            (BestModel::Remote { .. }, BestModel::Local { .. })
+                        ) || match (best_choice, &candidate) {
+                            (
+                                BestModel::Remote { node_id: a, .. },
+                                BestModel::Remote { node_id: b, .. },
+                            ) => a < b,
+                            _ => false,
+                        }
+                    }
+                }
+            };
+            if better {
+                best = Some((m.size_mb, candidate));
+            }
+        }
+    }
+    best.map(|(_, b)| b)
+}
+
 /// Local-serving origin headers (`X-Decentra-Origin: local`,
 /// `X-Decentra-Node: dca-xxxxxx`) attached to every locally-served inference
 /// response when the fabric is attached, so the dashboard can show *who*
@@ -1445,16 +1511,24 @@ async fn proxy_handler(
         }
     }
 
-    // Fabric-aware chat routing (M18+): when the requested model is advertised
-    // by a *trusted remote worker* (and not locally), route the inference over
-    // P2P instead of the local queue + proxy. Decided *before* the queue join
-    // so a remote request never holds a local backend slot (the worker has its
-    // own queue). The local path always wins for models served locally.
+    // Fabric-aware chat routing (M18+): three ways a chat request can be
+    // served — an explicit `worker_hint` (dashboard "Remote workers"
+    // selection forces that specific node), `model: "__auto__"` (the
+    // dashboard "Auto (best)" picker selects the best model anywhere in the
+    // fabric), or an explicit model name (local wins over remote, as before).
+    // Decided *before* the queue join so a remote request never holds a local
+    // backend slot (the worker has its own queue).
+    let mut outgoing = outgoing;
     if is_inference && uri.path() == "/v1/chat/completions" {
         if let (Some(compute), Some(_distributed)) = (&state.compute, &state.distributed) {
-            let model = serde_json::from_slice::<serde_json::Value>(&outgoing)
-                .ok()
+            let body_val: Option<serde_json::Value> = serde_json::from_slice(&outgoing).ok();
+            let model = body_val
+                .as_ref()
                 .and_then(|v| v["model"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let worker_hint = body_val
+                .as_ref()
+                .and_then(|v| v["worker_hint"].as_str().map(str::to_string))
                 .unwrap_or_default();
             if !model.is_empty() {
                 let local_peer = compute.local_peer();
@@ -1466,26 +1540,101 @@ async fn proxy_handler(
                         trusted.push(w);
                     }
                 }
-                match resolve_chat_route(&trusted, &local_peer, &model) {
-                    ChatRoute::Remote {
-                        worker,
-                        node_id,
-                        model_hash,
-                    } => {
-                        return route_remote_chat(
-                            &state,
-                            auth,
-                            uri.path().to_string(),
+                let mut remote_route: Option<(
+                    decentraai_p2p::PeerId,
+                    String,
+                    String,
+                    String,
+                )> = None;
+                let mut local_rewrite: Option<String> = None;
+
+                if !worker_hint.is_empty() {
+                    // Explicit remote selection: the node must exist, be
+                    // trusted, accept remote inference, and serve the model.
+                    let target = trusted.iter().find(|w| {
+                        w.peer_id != local_peer
+                            && w.accepts_remote_inference
+                            && w.node_id == worker_hint
+                    });
+                    match target.and_then(|w| {
+                        w.capability
+                            .served_models
+                            .iter()
+                            .find(|m| m.file_name == model)
+                            .map(|m| (w, m))
+                    }) {
+                        Some((w, m)) => {
+                            remote_route = Some((
+                                w.peer_id,
+                                w.node_id.clone(),
+                                m.model_hash.clone(),
+                                model.clone(),
+                            ));
+                        }
+                        None => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "{{\"error\":{{\"message\":\"worker {} does not serve model {} (or is not trusted / does not accept remote inference)\",\"type\":\"invalid_request_error\"}}}}",
+                                    worker_hint, model
+                                ),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else if model == "__auto__" || model == "auto" {
+                    match select_best_model(&trusted, &local_peer) {
+                        Some(BestModel::Remote {
                             worker,
                             node_id,
                             model_hash,
-                            model,
-                            &outgoing,
-                        )
-                        .await;
+                            file_name,
+                        }) => {
+                            remote_route =
+                                Some((worker, node_id, model_hash, file_name));
+                        }
+                        Some(BestModel::Local(file_name)) => {
+                            // Rewrite the outgoing body so the local backend
+                            // receives the real chosen model, not "auto".
+                            local_rewrite = Some(file_name);
+                        }
+                        None => { /* no model anywhere: local passthrough */ }
                     }
-                    ChatRoute::Local | ChatRoute::Unknown => {
-                        // Serve locally (headers added on the response below).
+                } else {
+                    match resolve_chat_route(&trusted, &local_peer, &model) {
+                        ChatRoute::Remote {
+                            worker,
+                            node_id,
+                            model_hash,
+                        } => {
+                            remote_route =
+                                Some((worker, node_id, model_hash, model.clone()));
+                        }
+                        ChatRoute::Local | ChatRoute::Unknown => {
+                            // Serve locally (headers added on the response).
+                        }
+                    }
+                }
+
+                if let Some((worker, node_id, model_hash, model_name)) = remote_route {
+                    return route_remote_chat(
+                        &state,
+                        auth,
+                        uri.path().to_string(),
+                        worker,
+                        node_id,
+                        model_hash,
+                        model_name,
+                        &outgoing,
+                    )
+                    .await;
+                }
+                if let Some(new_model) = local_rewrite {
+                    if let Ok(mut v) =
+                        serde_json::from_slice::<serde_json::Value>(&outgoing)
+                    {
+                        v["model"] = serde_json::Value::String(new_model);
+                        outgoing = serde_json::to_vec(&v).unwrap_or(outgoing);
                     }
                 }
             }
@@ -2686,7 +2835,7 @@ mod tests {
         assert!(body.contains("new AbortController()"), "Stop must abort via AbortController");
         assert!(body.contains("controller.signal"), "Stop aborts the fetch via its signal");
         assert!(body.contains("s.available_models"), "chat-model must read live available_models");
-        assert!(body.contains("chatModel.value || activeModel"), "send must fall back to the active model");
+        assert!(body.contains("return v || activeModel;"), "send must fall back to the active model");
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -2704,12 +2853,17 @@ mod tests {
             .await
             .unwrap();
         // The served-by indicator reads the proxy's origin headers, and the
-        // model selector gains a grouped remote-worker section from /v1/compute.
+        // model selector gains an Auto (best) picker + grouped remote-worker
+        // section from /v1/compute (including models that exist locally).
         for needle in [
             "id=\"chat-served\"",
             "x-decentra-origin",
             "x-decentra-worker",
             "x-decentra-node",
+            "__auto__",
+            "Auto (best available)",
+            "worker_hint",
+            "remote:",
             "Remote workers",
             "c.local_peer",
             "w.served_models",
@@ -3772,6 +3926,19 @@ mod tests {
         accepts_remote: bool,
         models: &[(&str, &str)],
     ) -> decentraai_distributed::ComputeAdvertisement {
+        let sized: Vec<(&str, &str, u64)> = models
+            .iter()
+            .map(|(f, h)| (*f, *h, 1024))
+            .collect();
+        test_adv_sized(peer, node_id, accepts_remote, &sized)
+    }
+
+    fn test_adv_sized(
+        peer: &decentraai_p2p::PeerId,
+        node_id: &str,
+        accepts_remote: bool,
+        models: &[(&str, &str, u64)],
+    ) -> decentraai_distributed::ComputeAdvertisement {
         decentraai_distributed::ComputeAdvertisement {
             peer_id: *peer,
             node_name: node_id.to_string(),
@@ -3782,13 +3949,15 @@ mod tests {
                 engine: "llama_server".to_string(),
                 served_models: models
                     .iter()
-                    .map(|(f, h)| decentraai_distributed::compute::ServedModel {
-                        model_hash: h.to_string(),
-                        file_name: f.to_string(),
-                        size_mb: 1024,
-                        est_ram_mb: 1024,
-                        est_vram_mb: 0,
-                        context_tokens: 4096,
+                    .map(|(f, h, size)| {
+                        decentraai_distributed::compute::ServedModel {
+                            model_hash: h.to_string(),
+                            file_name: f.to_string(),
+                            size_mb: *size,
+                            est_ram_mb: 1024,
+                            est_vram_mb: 0,
+                            context_tokens: 4096,
+                        }
                     })
                     .collect(),
                 can_provision: false,
@@ -3887,5 +4056,80 @@ mod tests {
             serde_json::from_str(r#"[{"role":"assistant","content":"done"}]"#).unwrap();
         // Already ends in an assistant turn: no extra tail appended.
         assert_eq!(remote_chat_prompt(&msgs), "assistant: done");
+    }
+
+    #[test]
+    fn best_model_remote_wins_when_bigger() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv_sized(&local, "dca-local", false, &[("small.gguf", "hS", 1024)]),
+            // Bigger remote model, explicitly accepting remote inference.
+            test_adv_sized(&remote, "dca-rem", true, &[("big.gguf", "hB", 4096)]),
+        ];
+        assert_eq!(
+            select_best_model(&workers, &local),
+            Some(BestModel::Remote {
+                worker: remote,
+                node_id: "dca-rem".to_string(),
+                model_hash: "hB".to_string(),
+                file_name: "big.gguf".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn best_model_tie_prefers_local() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("same.gguf", "hL")]),
+            test_adv(&remote, "dca-rem", true, &[("same.gguf", "hR")]),
+        ];
+        assert_eq!(
+            select_best_model(&workers, &local),
+            Some(BestModel::Local("same.gguf".to_string()))
+        );
+    }
+
+    #[test]
+    fn best_model_remote_only() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[]),
+            test_adv(&remote, "dca-rem", true, &[("only.gguf", "hO")]),
+        ];
+        assert_eq!(
+            select_best_model(&workers, &local),
+            Some(BestModel::Remote {
+                worker: remote,
+                node_id: "dca-rem".to_string(),
+                model_hash: "hO".to_string(),
+                file_name: "only.gguf".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn best_model_ignores_remote_worker_that_does_not_accept() {
+        let local = decentraai_p2p::PeerId::random();
+        let refuser = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("small.gguf", "hS")]),
+            // Bigger model but the worker refuses remote inference.
+            test_adv(&refuser, "dca-ref", false, &[("big.gguf", "hB")]),
+        ];
+        assert_eq!(
+            select_best_model(&workers, &local),
+            Some(BestModel::Local("small.gguf".to_string()))
+        );
+    }
+
+    #[test]
+    fn best_model_none_when_no_models() {
+        let local = decentraai_p2p::PeerId::random();
+        let workers = vec![test_adv(&local, "dca-local", false, &[])];
+        assert_eq!(select_best_model(&workers, &local), None);
     }
 }
