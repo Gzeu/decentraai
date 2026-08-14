@@ -241,6 +241,26 @@ defines each tier's `models` allowlist (empty = all models) and
 `rate_limit_per_minute`. Subscribers get 403 for out-of-tier models and
 429 past the rate limit; both are audited and visible on the dashboard.
 
+### 4b. Invites & join (P5)
+
+A private swarm adds a seat without manual token transfer. The operator
+issues an invite that bundles a reachable address with a **Tier-1 Guest
+token** (least privilege — a leaked invite is never more than a guest):
+
+```bash
+# On the coordinator:
+decentraai invite --addr /ip4/192.168.1.5/tcp/4001
+# prints:  /ip4/192.168.1.5/tcp/4001/p2p/<peer-id> dsk_<64hex>
+
+# On the fresh node (quote the whole invite):
+decentraai join "/ip4/192.168.1.5/tcp/4001/p2p/<peer-id> dsk_<64hex>"
+```
+
+`join` auto-provisions identity + config, stores the guest token as the
+node's credential (`runtime/invite.token`, 0600 — shown nowhere else) and
+verifies the coordinating peer is reachable over the verified P2P path.
+Revoke a seat at any time with `decentraai token revoke --name invite-<n>`.
+
 ### 5. Watch the node in your browser (dashboard)
 
 Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard refreshes
@@ -442,8 +462,10 @@ decentraai trust add --peer <PeerId> --name <n> # trust a peer (enables schedule
 decentraai distributed --model <name>           # low-level distributed node (worker mode)
 decentraai distributed                          # low-level distributed node (client mode)
 decentraai token create --name <n> --tier 1..3  # issue a subscription token
-decentraai token list                           # show issued tokens
-decentraai token revoke --name <n>              # revoke (effective next request)
+ decentraai token list                           # show issued tokens
+ decentraai token revoke --name <n>              # revoke (effective next request)
+ decentraai invite --addr <host:...>             # new-seat invite + guest token (P5)
+ decentraai join "<addr /p2p/<peer-id> dsk_...>" # join from an invite (P5)
 ```
 
 ## Architecture highlights

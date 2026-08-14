@@ -47,7 +47,11 @@
 - [x] P3: admin actions in the single embedded dashboard (`/admin` + `/api/admin/token/*` create/revoke tokens, usage per token)
 - [x] P6: dashboard views — Models, Settings, Diagnostics, Execution, Workers, Network (advanced) + normal-user view (Model, Inference, Chat, Queue, Recent, System), all from real runtime state, no mock data
 - [x] P4: contribution-based tier suggestions from catalog + reputation
-- [ ] P5: invites (`decentraai join <invite>`)
+- [x] P5: invites (`decentraai invite` prints a copy-pastable
+  `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join
+  "<invite>"` parses it, auto-provisions identity + config, stores the Tier-1
+  Guest token as the node's credential (`runtime/invite.token`, 0600) and
+  verifies the coordinating peer is reachable over the verified P2P path)
 
 ## 8. Operations and scale (in progress)
 - [x] Q1: generation defaults (sampling + system prompt merged into

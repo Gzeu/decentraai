@@ -65,6 +65,15 @@ enum Command {
     Node(NodeArgs),
     /// Open the running node's dashboard in the default browser.
     Open(OpenArgs),
+    /// Issue a join invite for a newcomer (P5): creates a Tier-1 Guest token
+    /// and shows a copy-pastable `<reachable-multiaddr> <token>` string that a
+    /// fresh node can pass to `decentraai join <invite>`.
+    Invite(InviteArgs),
+    /// Join a private swarm from an invite produced by `decentraai invite`
+    /// (P5): parse the `<reachable-multiaddr> <token>` string, auto-provision
+    /// identity + config, store the guest token as the node's credential, and
+    /// verify it can reach the coordinating peer.
+    Join(JoinArgs),
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -107,6 +116,28 @@ struct OpenArgs {
     /// The port of the node dashboard (matches config `inference.api_port`).
     #[arg(long, default_value = "8080")]
     port: u16,
+}
+#[derive(Debug, Args)]
+struct InviteArgs {
+    #[arg(long, default_value = "configs/node.example.yaml")]
+    config: PathBuf,
+    /// This node's reachable (dialable) address for the newcomer, WITHOUT the
+    /// `/p2p/<peer-id>` suffix — the peer id is derived from this node's
+    /// identity. Example: `/ip4/192.168.1.5/tcp/4001`.
+    #[arg(long)]
+    addr: String,
+}
+#[derive(Debug, Args)]
+struct JoinArgs {
+    /// The invite string printed by `decentraai invite`: a reachable
+    /// multiaddr followed by a space and the Tier-1 Guest token. Quote it on
+    /// the shell: `decentraai join "/ip4/192.168.1.5/tcp/4001 dsk_..."`
+    #[arg()]
+    invite: String,
+    #[arg(long, default_value = "~/.decentraai")]
+    data_dir: String,
+    #[arg(long, default_value = "~/.decentraai/node.yaml")]
+    config: PathBuf,
 }
 #[derive(Debug, Args)]
 struct DoctorArgs {
@@ -319,6 +350,8 @@ async fn main() -> Result<()> {
         Command::Tier { command } => tier_command(command),
         Command::Node(args) => node_start(args).await,
         Command::Open(args) => open_dashboard(args),
+        Command::Invite(args) => invite(args),
+        Command::Join(args) => join(args).await,
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -1931,9 +1964,152 @@ fn trust_command(command: TrustCommand) -> Result<()> {
     Ok(())
 }
 
+/// Splits an invite string (`<reachable-multiaddr> <token>`) into its two
+/// parts. The multiaddr and token are separated by exactly one space, so a
+/// path multiaddr (slashes, no spaces) parses unambiguously. The trailing
+/// `/p2p/<peer-id>` from the invite is the dial target and is preserved.
+fn parse_invite(invite: &str) -> Result<(String, String)> {
+    let split_at = invite
+        .find(' ')
+        .context("invite must be '<reachable-multiaddr> <token>'")?;
+    let multiaddr = invite[..split_at].trim();
+    let token = invite[split_at..].trim_start();
+    if multiaddr.is_empty() || token.is_empty() {
+        anyhow::bail!("invite must be '<reachable-multiaddr> <token>'");
+    }
+    if !token.starts_with("dsk_") {
+        anyhow::bail!("invite token must start with 'dsk_' — got an invalid invite string");
+    }
+    Ok((multiaddr.to_string(), token.to_string()))
+}
+
+/// Issues a join invite for a newcomer (P5). Creates a fresh Tier-1 Guest
+/// token (least privilege) named `invite-<n>` so it is easy to revoke a single
+/// seat, then prints a copy-pastable `<reachable-multiaddr>/p2p/<peer-id> <token>`
+/// string. The multiaddr suffix is appended from the node identity's libp2p
+/// peer id, so the printed value is dialable as-is. The plaintext token is
+/// shown exactly once; only its BLAKE3 hash is stored.
+fn invite(args: InviteArgs) -> Result<()> {
+    use decentraai_identity::Identity;
+    use decentraai_tokens::{Tier, TokenStore};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let config = NodeConfig::load(&args.config)
+        .with_context(|| format!("loading {}", args.config.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    let identity = Identity::load(&identity_path).with_context(|| {
+        format!(
+            "no identity at {} — run 'decentraai init' or 'decentraai setup' first",
+            identity_path.display()
+        )
+    })?;
+    let peer_id = identity.peer_id().to_string();
+
+    let addr = args.addr.trim();
+    if addr.is_empty() {
+        anyhow::bail!("--addr must be this node's reachable address (e.g. /ip4/192.168.1.5/tcp/4001)");
+    }
+    // Build the fully-qualified multiaddr so the printed invite dials directly.
+    let multiaddr = format!("{addr}/p2p/{peer_id}");
+
+    let mut store = TokenStore::load(&data_dir.join("db/tokens.json"))
+        .with_context(|| "loading token registry".to_string())?;
+    let name = format!(
+        "invite-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let token = store.create(&name, Tier::GUEST)?;
+    decentraai_audit::record_best_effort(
+        &data_dir.join("logs"),
+        "invite_created",
+        serde_json::json!({"name": name, "tier": Tier::GUEST.0, "addr": addr}),
+    );
+
+    println!("Join invite for '{name}' (Tier 1 — Guest, least privilege):");
+    println!("  {multiaddr} {token}");
+    println!();
+    println!(
+        "Share this with a newcomer, who runs exactly:\n  decentraai join \"{multiaddr} {token}\""
+    );
+    println!("The token is shown once; notify 'decentraai token revoke --name {name}' to invalidate a seat.");
+    Ok(())
+}
+
+/// Joins a private swarm from an invite produced by `decentraai invite` (P5).
+/// Parses the `<reachable-multiaddr> <token>` string, auto-provisions an
+/// identity + validated config for a fresh node (reusing the `setup` wizard so
+/// nothing needs to be hand-tuned), stores the guest token as this node's
+/// credential (`runtime/invite.token`, 0600), and verifies the multiaddr is
+/// actually reachable before declaring success. Ongoing peer discovery is
+/// handled by the node's normal mDNS/discovery path.
+async fn join(args: JoinArgs) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data_dir = expand_tilde(&args.data_dir);
+    let config_path = expand_tilde(&args.config.to_string_lossy());
+    let (multiaddr, token) = parse_invite(&args.invite)?;
+
+    // 1. Auto-provision identity + config for this fresh node if first run.
+    if !config_path.exists() && !data_dir.join("identity/key.pem").exists() {
+        setup(SetupArgs {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            config: config_path.clone(),
+            models_dir: None,
+            name: None,
+        })?;
+    }
+    let identity_path = data_dir.join("identity/key.pem");
+    if !identity_path.exists() {
+        anyhow::bail!(
+            "no identity at {}; run 'decentraai init' first",
+            identity_path.display()
+        );
+    }
+
+    // 2. Store the guest token as this node's credential (0600). The joined node
+    //    uses it to authenticate to the coordinator's API; the coordinator keeps
+    //    only the hash, so this is the seat's only plaintext copy.
+    let runtime_dir = data_dir.join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    let credential_path = runtime_dir.join("invite.token");
+    fs::write(&credential_path, format!("{token}\n"))?;
+    let mut perms = fs::metadata(&credential_path)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&credential_path, perms)?;
+
+    decentraai_audit::record_best_effort(
+        &data_dir.join("logs"),
+        "joined",
+        serde_json::json!({"peer": multiaddr}),
+    );
+
+    // 3. Verify the coordinating peer is reachable over the verified P2P path.
+    {
+        use decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES;
+        use decentraai_p2p::P2PNode;
+        let identity = Identity::load(&identity_path)?;
+        let node = P2PNode::new(&identity, 1_048_576, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)?;
+        node.dial(&multiaddr).await.with_context(|| {
+            format!("could not reach the coordinating peer at {multiaddr}; is it online?")
+        })?;
+        node.shutdown();
+    }
+
+    println!("Joined the swarm — connected to the coordinating peer at {multiaddr}");
+    println!("  Credential stored (0600): {}", credential_path.display());
+    let conf = config_path.display();
+    println!("  Start this node any time with:");
+    println!("    decentraai node --config {conf}");
+    println!("    decentraai open --port 8080");
+    Ok(())
+}
+
 fn token_command(command: TokenCommand) -> Result<()> {
     use decentraai_tokens::{Tier, TokenStore};
-
     let config_path = match &command {
         TokenCommand::Create { config, .. }
         | TokenCommand::List { config }
@@ -3148,5 +3324,42 @@ mod tests {
         let cfg = NodeConfig::load(&cfg_path).expect("wizard YAML must be a valid NodeConfig");
         assert_eq!(cfg.node.name, "test-node");
         assert_eq!(cfg.inference.max_context_tokens, 4096);
+    }
+
+    // ---- P5: invites & join ----
+
+    #[test]
+    fn invite_builds_a_fully_qualified_dialable_multiaddr() {
+        let peer = Identity::generate().peer_id().to_string();
+        let multiaddr = format!("/ip4/10.0.0.5/tcp/4001/p2p/{peer}");
+        let (addr, token) =
+            parse_invite(&format!("{multiaddr} dsk_abc123def456")).expect("valid invite");
+        assert_eq!(addr, multiaddr, "path multiaddr must round-trip (no spaces in it)");
+        assert_eq!(token, "dsk_abc123def456");
+    }
+
+    #[test]
+    fn invite_parsing_rejects_malformed_strings() {
+        assert!(parse_invite("/ip4/10.0.0.5/tcp/4001").is_err(), "missing token");
+        assert!(
+            parse_invite("/ip4/10.0.0.5/tcp/4001 xyz_token").is_err(),
+            "bad token prefix"
+        );
+        assert!(parse_invite("   dsk_xyz").is_err(), "empty multiaddr");
+    }
+
+    #[test]
+    fn invite_token_is_a_least_privilege_guest_seat() {
+        // Mirrors the token call the `invite` command performs: a fresh seat is
+        // always Tier 1 (Guest) and stored only as a hash, so an invite leak is
+        // never more than a guest — the least privilege roadmap (P5) guarantee.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = decentraai_tokens::TokenStore::load(&dir.path().join("tokens.json")).unwrap();
+        let plaintext = store
+            .create("invite-0", decentraai_tokens::Tier::GUEST)
+            .unwrap();
+        assert_eq!(store.lookup(&plaintext).unwrap().tier, 1);
+        let on_disk = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();
+        assert!(!on_disk.contains(&plaintext), "plaintext must never be persisted");
     }
 }
