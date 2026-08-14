@@ -363,7 +363,12 @@ release.
   revoke was already supported
 - [x] Replay protection via nonce/sequence number — P4: per-sender nonce +
   bounded TTL ReplayGuard on the worker; outbound monotonic nonces
-- [ ] Capability-based authorization: which models each worker can serve
+- [x] Capability-based authorization: which models each worker can serve — the
+  fabric planner only selects workers that serve (or can provision) the
+  requested model (`fabric::planner` filters `trusted && healthy &&
+  serves_model`, M13/M14/M18) and the worker independently refuses requests for
+  models it does not hold; per-tier client model allowlists gate who may request
+  each model (P1/H4)
 - [~] Rate limiting per token and per peer — per-token (per-tier) sliding-window
   already existed (`crates/runtime`); **per-peer** added on the P2P worker path
   (`distributed::rate_limit::PeerRateLimiter`, keyed by the authenticated peer,
