@@ -416,14 +416,33 @@ release.
   field, and enforced API gates (H4)
 
 #### Phase 4: Control Plane and Frontend
-- [ ] Onboarding: create node, generate identity, pairing QR, health check
-- [ ] Chat: conversations, streaming, stop generation, retry, model selection
-- [ ] Workers: approve/revoke, status, models, capacity, latency
-- [ ] Models: registry, hash, quantization, context size, availability
-- [ ] Network: peers, trust, latency, connection errors
-- [ ] Observability: logs, metrics, traces, alerts
-- [ ] Admin: tokens, roles, quotas, audit events
-- [ ] Settings: node config, inference defaults, limits, retention
+- [x] Onboarding: create node + generate identity + health check —
+  `decentraai setup` (data dirs, identity, validated config, READY) and
+  `decentraai doctor [--online]` (admission + live reachability);
+  pairing is token-based (`decentraai invite`/`join`, P5) — QR is intentionally
+  not used
+- [x] Chat: conversations, streaming, stop generation, retry, model selection —
+  SSE streaming, in-page history (localStorage), plus a live model selector,
+  a client-side Stop (AbortController) and Retry
+- [x] Workers: approve/revoke, status, models, capacity, latency — the Workers
+  view (real `/v1/compute`) shows status/load/queue/tok-s/latency plus reachable
+  and connection_errors, and Approve/Revoke buttons hit master-gated
+  `/api/admin/worker/{trust,revoke}`
+- [~] Models: registry, hash, quantization, context size, availability —
+  context/RAM/VRAM/availability shown; per-model hash and quantization are not
+  surfaced in the view
+- [x] Network: peers, trust, latency, connection errors — peers view (trusted/
+  banned/scores), links view (RTT/BW/locality), connected list, and worker
+  reachable/connection_errors
+- [~] Observability: logs, metrics, traces, alerts — audit/security-events view,
+  `/metrics` (Prometheus), latency percentiles/success-rate; no distributed
+  traces and no alert channel
+- [x] Admin: tokens, roles, quotas, audit events — token create includes a role
+  selector, token list shows role, `/api/admin/events` shows recent audit
+  events inline; quotas are not part of the (free) subscription model
+- [~] Settings: node config, inference defaults, limits, retention — the
+  Settings view shows node/resource config and limits read-only; it does not
+  edit live settings and there is no data retention knob
 
 ### Scoring Rubric (Target: 9/10)
 
