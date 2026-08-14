@@ -150,6 +150,10 @@ struct JoinArgs {
 struct DoctorArgs {
     #[arg(long, default_value = "configs/node.example.yaml")]
     config: PathBuf,
+    /// Run a live, non-destructive connectivity self-check: probe the
+    /// configured OpenAI/API port with a short TCP connect.
+    #[arg(long)]
+    online: bool,
 }
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
@@ -1239,7 +1243,71 @@ fn doctor(args: DoctorArgs) -> Result<()> {
         gpu_report,
         verdict
     );
+    if args.online {
+        run_online_check(&config);
+    }
     Ok(())
+}
+/// Maps the configured inference backend's bind address + API port to a
+/// `host:port` probe target. `port == 0` means the node was configured for
+/// an ephemeral API port, so there is no fixed port to probe and the check
+/// must report that instead of guessing.
+fn base_api_addr(bind_address: &str, api_port: u16) -> Option<String> {
+    if api_port == 0 {
+        return None;
+    }
+    let host = if bind_address.is_empty() {
+        "127.0.0.1"
+    } else {
+        bind_address
+    };
+    Some(format!("{}:{}", host, api_port))
+}
+/// Minimal, non-destructive reachability probe. Resolves the configured
+/// backend address and attempts a single short TCP connect to the API port.
+/// No process is started and no descriptor is held beyond the probe; a
+/// closed/unreachable port just prints a message and continues.
+fn run_online_check(config: &NodeConfig) {
+    println!("Online check:");
+    let reachable = match base_api_addr(&config.inference.bind_address, config.inference.api_port) {
+        Some(addr) => {
+            let start = std::time::Instant::now();
+            // 1.5s cap keeps the doctor command snappy and safe. The bind
+            // address is normally a loopback literal, so parse directly.
+            match addr.parse::<std::net::SocketAddr>() {
+                Ok(socket) => match std::net::TcpStream::connect_timeout(
+                    &socket,
+                    Duration::from_millis(1500),
+                ) {
+                    Ok(_) => {
+                        let latency_ms = start.elapsed().as_millis();
+                        println!("  Backend {} reachable (yes, {} ms)", addr, latency_ms);
+                        true
+                    }
+                    Err(e) => {
+                        let latency_ms = start.elapsed().as_millis();
+                        println!("  Backend {} reachable (no, {} ms): {}", addr, latency_ms, e);
+                        println!(
+                            "  Is the node serving? Run 'decentraai node' or 'decentraai serve start' first."
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    println!("  Backend {} address invalid ({}): {}", addr, e, addr);
+                    false
+                }
+            }
+        }
+        None => {
+            println!(
+                "  Backend reachable (skipped): inference.api_port is 0 (ephemeral), so there is no fixed API port to probe."
+            );
+            false
+        }
+    };
+    let status = if reachable { "ok" } else { "degraded" };
+    println!("  online: {}", status);
 }
 fn validate_config(file: PathBuf) -> Result<()> {
     let config =
@@ -3407,6 +3475,28 @@ mod tests {
                 command: RegistryCommand::List { .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_doctor_online_flag() {
+        let cli = Cli::try_parse_from(["decentraai", "doctor", "--online"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor(DoctorArgs { online: true, .. })));
+    }
+
+    #[test]
+    fn parses_doctor_without_online_flag() {
+        let cli = Cli::try_parse_from(["decentraai", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor(DoctorArgs { online: false, .. })));
+    }
+
+    #[test]
+    fn base_api_addr_maps_bind_and_port() {
+        assert_eq!(base_api_addr("127.0.0.1", 8080), Some("127.0.0.1:8080".into()));
+        assert_eq!(base_api_addr("::1", 8080), Some("::1:8080".into()));
+        // Empty bind falls back to loopback host.
+        assert_eq!(base_api_addr("", 8080), Some("127.0.0.1:8080".into()));
+        // Port 0 (ephemeral) has no fixed probe target.
+        assert_eq!(base_api_addr("127.0.0.1", 0), None);
     }
 
     #[test]
