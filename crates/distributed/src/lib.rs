@@ -81,6 +81,7 @@ pub mod config;
 pub mod fallback;
 pub mod p2p_handler;
 pub mod queue;
+pub mod rate_limit;
 pub mod replay;
 pub mod router;
 pub mod session;
@@ -499,6 +500,18 @@ impl DistributedInference {
             )),
         );
         let replay_for_closure = replay.clone();
+        // H1: per-peer sliding-window rate limit on the worker path, protecting
+        // the engine from an abusive/anomalous coordinator regardless of how
+        // many requests it sends. Window = 60s, burst = configured via a
+        // module constant (self._peer_limit below).
+        let peer_limit = 120usize;
+        let peer_limiter: Arc<std::sync::Mutex<crate::rate_limit::PeerRateLimiter>> =
+            Arc::new(std::sync::Mutex::new(crate::rate_limit::PeerRateLimiter::new(
+                std::time::Duration::from_secs(60),
+                peer_limit,
+                peer_limit * 2,
+            )));
+        let peer_limiter_for_closure = peer_limiter.clone();
         let logs_dir_for_infer = self.logs_dir.clone();
 
         // Register sync on_infer handler that enqueues the request and returns Accept
@@ -560,6 +573,36 @@ impl DistributedInference {
                         );
                         return serialize_message(&InferMessage::InferResponse(resp));
                     }
+                }
+                // H1: per-peer sliding-window limit. An abusive/anomalous peer
+                // that exceeds its burst is answered terminal (never executed),
+                // protecting the engine and queue from overload.
+                let within_burst = peer_limiter_for_closure
+                    .lock()
+                    .map(|mut l| l.allow(&peer, std::time::Instant::now()))
+                    .unwrap_or(true);
+                if !within_burst {
+                    let resp = InferResponse {
+                        request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
+                        worker_peer_id: local_peer,
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some("rate limited: peer exceeded the requests/minute budget".to_string()),
+                    };
+                    decentraai_audit::record_best_effort(
+                        &logs_dir_for_infer.clone().unwrap_or_default(),
+                        "peer_rate_limited",
+                        serde_json::json!({
+                            "request_id": req.request_id.to_string(),
+                            "peer": peer.to_string(),
+                            "limit_per_minute": peer_limit,
+                        }),
+                    );
+                    return serialize_message(&InferMessage::InferResponse(resp));
                 }
                 // Only accept requests for the configured model.
                 if req.model_hash != model_hash_clone {
