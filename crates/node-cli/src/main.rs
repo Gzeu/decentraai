@@ -16,6 +16,9 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
+    /// Log output format: 'text' (default) or 'json' (structured, H8).
+    #[arg(long, global = true, default_value = "text")]
+    log_format: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -328,10 +331,18 @@ enum TokenCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(cli.log_level))
-        .with_target(false)
-        .init();
+    if cli.log_format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(cli.log_level))
+            .with_target(false)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(cli.log_level))
+            .with_target(false)
+            .init();
+    }
     match cli.command {
         Command::Init(args) => init(args),
         Command::Setup(args) => setup(args),

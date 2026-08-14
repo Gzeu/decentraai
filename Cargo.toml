@@ -52,5 +52,5 @@ tempfile = "3.15"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "io-util", "fs", "sync", "signal", "process", "net"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }

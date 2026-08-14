@@ -464,6 +464,8 @@ decentraai distributed start --name coordinator --prompt "Tell me a haiku"
 ## CLI quick reference
 
 ```bash
+decentraai --log-format json node --config <path>  # structured JSON logs (H8); the worker's
+                                                   # logs tag each request with request_id/trace_id
 decentraai setup --data-dir ~/.decentraai        # one-command onboarding: detect HW → identity → model → validated config → READY
 decentraai init --data-dir ~/.decentraai        # bootstrap dirs + Ed25519 identity
 decentraai doctor --config <path>               # budgets, GPU, PeerId, admission verdict

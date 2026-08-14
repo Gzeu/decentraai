@@ -1196,6 +1196,18 @@ async fn stream_request_to_terminal(
     let local_peer = p2p.local_peer_id();
     let started = std::time::Instant::now();
 
+    // H8: correlate every downstream log line for this request. The span is
+    // entered for the whole function so stdout/std of the worker carry
+    // request_id/trace_id (and show up as structured fields with --log-format
+    // json), making requests traceable end-to-end.
+    let _span = tracing::info_span!(
+        "infer_request",
+        request_id = %request_id,
+        trace_id = %trace_id,
+        sender = %sender,
+    );
+    let _entered = _span.enter();
+
     // Worker-side reservation release (M15): every terminal path below must
     // free the RAM/VRAM booked at admission so capacity can be reused.
     let release_reservation =
