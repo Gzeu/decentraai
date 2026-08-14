@@ -70,6 +70,14 @@ pub struct ComputeAdvertisement {
     /// by a new coordinator without its operator opting in.
     #[serde(default)]
     pub accepts_remote_inference: bool,
+    /// Compact, stable human-readable node identifier (e.g. `dca-8f2a3c`),
+    /// derived from the node's peer id. Lets operators tell nodes apart at a
+    /// glance when every machine would otherwise show the same default name.
+    /// Backward-compatible: advertisements that predate the field deserialize
+    /// to the empty string, and the dashboard falls back to deriving a short
+    /// id client-side from the peer id.
+    #[serde(default)]
+    pub node_id: String,
 }
 
 #[cfg(test)]
@@ -120,11 +128,28 @@ mod tests {
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,
+            node_id: "dca-8f2a3c".into(),
         };
 
         let json = serde_json::to_string(&adv).unwrap();
         let back: ComputeAdvertisement = serde_json::from_str(&json).unwrap();
         assert_eq!(back, adv);
         assert_eq!(back.peer_id, peer);
+        assert_eq!(back.node_id, "dca-8f2a3c");
+    }
+
+    #[test]
+    fn legacy_advertisement_without_node_id_deserializes_safely() {
+        // A pre-node_id advertisement must keep deserializing: the field is
+        // optional and defaults to empty, so old workers never break a new
+        // coordinator (and vice versa).
+        let peer = crate::testutil::test_peer();
+        let legacy = format!(
+            r#"{{"peer_id":"{peer}","node_name":"old-worker","capability":{{"cpu_cores":4,"ram_mb":8192,"gpu":null,"engine":"llama_server","served_models":[],"can_provision":false}},"availability":{{"available_ram_mb":4096,"available_vram_mb":null,"load_percent":10,"queue_depth":0,"tokens_per_second":40,"current_latency_ms":80,"status":"Ready"}},"announced_at_ms":1700000000000,"accepts_remote_inference":false}}"#
+        );
+        let adv: ComputeAdvertisement = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(adv.node_id, "");
+        assert_eq!(adv.node_name, "old-worker");
+        assert!(!adv.accepts_remote_inference);
     }
 }

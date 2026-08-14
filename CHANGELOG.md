@@ -6,6 +6,25 @@ single version (`1.0.0`) shared by every crate.
 
 ## [Unreleased] — Multi-node fabric identity
 
+### Custom node names + compact node IDs (fabric identity)
+- **`decentraai setup --name <nume>`** sets a real per-node name (written to
+  `node.name`); the default is now `<hostname>-node` instead of the literal
+  `decentraai-node`, so machines auto-distinguish themselves on the fabric.
+- Every node advertises a **compact stable ID** — `dca-` + 6 chars derived
+  from its peer id (e.g. `dca-GriBWu`). It travels in every
+  `ComputeAdvertisement` (`node_id`, `#[serde(default)]` — old peers
+  deserialize to `""`), surfaces in `/v1/compute` worker rows and in the
+  `/status` node object (alongside the full `peer_id`), and the dashboard
+  shows it on canvas nodes, in the Fabric nodes identity cards and in the
+  Workers view cards. Workers that predate the field fall back to deriving
+  the same indicator client-side from the peer id — the fabric always has a
+  readable id per node, never a guessed one.
+- Unit coverage: backward-compat round-trip for legacy advertisements,
+  deterministic `short_node_id` (`dca-xxxxxx`, stable per key, well spread
+  across distinct peers), new dashboard needles for `node_id`/`nodeIdOf`.
+
+## [Unreleased] — Multi-node fabric identity
+
 ### Multi-node fabric experience (real Desktop ↔ Laptop identity)
 - **`allow_remote_inference` is now real, not dead config**: the setting is
   enforced as a worker-side inbound gate (remote `InferRequest`s to a

@@ -220,7 +220,20 @@ pub fn build_advertisement(
         },
         announced_at_ms,
         accepts_remote_inference: accepts_remote,
+        node_id: short_node_id(&local_peer),
     }
+}
+
+/// Compact, stable human-readable node identifier derived from the peer id
+/// (e.g. `dca-8f2a3c`). libp2p ed25519 peer ids serialize as base58 beginning
+/// with `12D3KooW`; the next six characters are taken as the indicator. The
+/// same derivation is mirrored client-side in the dashboard as a fallback for
+/// workers that predate the `node_id` advertisement field.
+pub fn short_node_id(peer: &PeerId) -> String {
+    let s = peer.to_string();
+    let body = s.strip_prefix("12D3KooW").unwrap_or(&s);
+    let head = &body[..body.len().min(6)];
+    format!("dca-{head}")
 }
 
 /// Coordinator-side compute manager.
@@ -1081,6 +1094,10 @@ pub fn gpu_from_snapshot(info: &GpuSnapshot) -> (Option<GpuSpec>, Option<u64>) {
 pub struct WorkerMetricRow {
     pub peer_id: String,
     pub node_name: String,
+    /// Compact stable identifier (`dca-…`) from the advertisement; empty when
+    /// the remote predates the field (the dashboard falls back to deriving it
+    /// from the peer id).
+    pub node_id: String,
     pub status: String,
     /// Whether the coordinator trusts this peer to run workloads (from the
     /// scheduler's live trust set, not derived from advertisements).
@@ -1231,6 +1248,7 @@ impl ComputeManager {
             rows.push(WorkerMetricRow {
                 peer_id: adv.peer_id.to_string(),
                 node_name: adv.node_name.clone(),
+                node_id: adv.node_id.clone(),
                 status: format!("{:?}", adv.availability.status),
                 trusted: self.is_trusted(&adv.peer_id).await,
                 reachable: !offline,
@@ -1330,6 +1348,23 @@ mod tests {
     fn peer() -> PeerId {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         PeerId::from(keypair.public())
+    }
+
+    #[test]
+    fn short_node_id_is_stable_and_compact() {
+        // Same key -> same indicator, every time (the identity a fabric
+        // participant is known by). Format: `dca-` + 6 chars.
+        let p = peer();
+        let id = short_node_id(&p);
+        assert!(id.starts_with("dca-"), "id must carry the dca- prefix: {id}");
+        assert_eq!(id.len(), 10, "dca-xxxxxx is exactly 10 chars: {id}");
+        assert_eq!(short_node_id(&p), id, "must be deterministic per peer");
+        // Distinct peers should almost never collide in the first 6 chars.
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..64 {
+            distinct.insert(short_node_id(&peer()));
+        }
+        assert!(distinct.len() >= 60, "6 hex chars must spread well: {}", distinct.len());
     }
 
     fn snapshot() -> SystemSnapshot {

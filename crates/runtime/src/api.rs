@@ -1518,28 +1518,35 @@ fn dashboard_js(state: &ApiState, share: &str) -> String {
 /// mock data.
 fn node_info(compute: &Option<Arc<decentraai_distributed::ComputeManager>>) -> serde_json::Value {
     let Some(compute) = compute else {
-        return serde_json::json!({ "name": "", "engine": "", "served_models": [], "attached": false });
+        return serde_json::json!({
+            "name": "", "node_id": "", "peer_id": "", "engine": "",
+            "served_models": [], "attached": false,
+        });
     };
     let NodeProfile {
         name,
+        node_id,
         engine,
         served_models,
     } = node_profile(compute);
     serde_json::json!({
         "name": name,
+        "node_id": node_id,
+        "peer_id": compute.local_peer().to_string(),
         "engine": engine,
         "served_models": served_models,
         "attached": true,
     })
 }
 
-/// Extracts the local node's real name, engine kind and served models (with
-/// model file, RAM/VRAM footprint and context window) from the last
-/// advertisement this node broadcast.
+/// Extracts the local node's real name, compact id, engine kind and served
+/// models (with model file, RAM/VRAM footprint and context window) from the
+/// last advertisement this node broadcast.
 fn node_profile(compute: &decentraai_distributed::ComputeManager) -> NodeProfile {
     let mut profile = NodeProfile::default();
     if let Some(adv) = compute.last_local_advertisement_sync() {
         profile.name = adv.node_name;
+        profile.node_id = adv.node_id;
         profile.engine = adv.capability.engine;
         profile.served_models = adv
             .capability
@@ -1562,6 +1569,7 @@ fn node_profile(compute: &decentraai_distributed::ComputeManager) -> NodeProfile
 #[derive(Default)]
 struct NodeProfile {
     name: String,
+    node_id: String,
     engine: String,
     served_models: Vec<serde_json::Value>,
 }
@@ -2290,6 +2298,8 @@ mod tests {
                 "function workerCard",
                 "function nodeChip",
                 "function trustChain",
+                "const nodeIdOf",
+                "node_id",
             ] {
                 assert!(body.contains(needle), "fabric JS must include {needle}");
             }

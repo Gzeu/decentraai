@@ -53,6 +53,11 @@ single universal `decentraai node`:
   DISCOVERED → UNTRUSTED → APPROVED → CONNECTED → WORKER READY, and a real
   discovery event feed (discovered / offline / reconnected) in the
   dashboard.
+- **Custom names + compact IDs**: `decentraai setup --name <nume>` names a
+  node (default `<hostname>-node`), and every node carries a stable
+  `dca-xxxxxx` indicator derived from its peer id — shown on the canvas,
+  the Fabric nodes cards and the Workers view, so operators can tell
+  machines apart at a glance even before they pick a name.
 
 Verified: worker selection, reservation create/release, P2P execution,
 streaming, worker health, and two-machine sequential + concurrent + reuse

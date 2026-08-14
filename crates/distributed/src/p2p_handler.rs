@@ -531,6 +531,7 @@ mod tests {
         let adv = decentraai_compute::ComputeAdvertisement {
             peer_id: create_test_peer_id(),
             node_name: "gpu-rig".into(),
+            node_id: "dca-gpurig".into(),
             capability: decentraai_compute::ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 32 * 1024,

@@ -694,6 +694,10 @@ const fmtUptime = s => { const h = Math.floor(s/3600), m = Math.floor((s%3600)/6
 const short = (s, n=14) => (s && s.length > n) ? s.slice(0, n)+'…' : (s || '—');
 const tstr = ts => ts ? new Date(ts*1000).toLocaleTimeString() : '—';
 const fmtMB = mb => mb ? (mb/1024).toFixed(1)+' GiB' : '—';
+// Compact stable node indicator (`dca-…`). The advertisement carries the
+// real node_id; workers that predate the field fall back to deriving it the
+// same way (`dca-` + 6 chars after the libp2p ed25519 base58 prefix).
+const nodeIdOf = p => (p && p.length) ? ('dca-' + (p.indexOf('12D3KooW') === 0 ? p.slice(8, 14) : p.slice(0, 6))) : '—';
 function toast(msg, bad=false){ const t=document.createElement('div'); t.className='toast'+(bad?' bad':''); t.textContent=msg; $('toast').appendChild(t); setTimeout(()=>t.remove(), 3600); }
 
 // ---- auth ------------------------------------------------------------------
@@ -957,6 +961,7 @@ function buildStageGeometry(f){
       load: (w.load_percent || 0) / 100, in_flight: w.in_flight || 0,
       trusted: !!w.trusted, active: activePeer === w.peer_id,
       label: (w.node_name || short(w.peer_id, 14)),
+      shortId: w.node_id || nodeIdOf(w.peer_id),
       addr: addrByPeer[w.peer_id] || '', connected: connected.has(w.peer_id),
       acceptsRemote: !!w.accepts_remote_inference, engine: w.engine || '',
       cpu: w.cpu_cores || 0, ramTotal: w.ram_mb || 0, ramFree: w.available_ram_mb || 0,
@@ -971,6 +976,7 @@ function buildStageGeometry(f){
     kind: 'local', x: cx, y: cy, status: 'Ready', col: '#22d3ee',
     load: 0, in_flight: 0, trusted: true, active: false,
     label: 'this node',
+    shortId: (d.s && d.s.node && d.s.node.node_id) || nodeIdOf(d.localPeer || (d.c && d.c.local_peer)),
     addr: d.localAddr || '', connected: true,
     acceptsRemote: true, engine: (d.s && d.s.node && d.s.node.engine) || '',
     cpu: (d.s && d.s.system && d.s.system.cpu_threads) || 0,
@@ -1046,6 +1052,8 @@ function drawStage(f){
       ctx.fillText('you · this node', n.x, n.y + 38);
       ctx.fillStyle = 'rgba(34,211,238,.9)'; ctx.font = '10px ui-monospace, Menlo, monospace';
       ctx.fillText(short(n.name, 18), n.x, n.y - 34);
+      ctx.fillStyle = 'rgba(34,211,238,.5)'; ctx.font = '9px ui-monospace, Menlo, monospace';
+      ctx.fillText(n.shortId || nodeIdOf(d.localPeer), n.x, n.y - 22);
       // local node identity: real LAN address, if known
       if (n.addr) {
         ctx.fillStyle = 'rgba(34,211,238,.55)'; ctx.font = '9.5px ui-monospace, Menlo, monospace';
@@ -1084,6 +1092,8 @@ function drawStage(f){
       ctx.fillStyle = n.status === 'Offline' ? '#5a6b80' : '#e8eef6';
       ctx.font = '600 11.5px -apple-system, Segoe UI, Roboto, sans-serif'; ctx.textAlign = 'center';
       ctx.fillText(n.label, n.x, n.y + 40);
+      ctx.fillStyle = 'rgba(143,160,179,.6)'; ctx.font = '8.5px ui-monospace, Menlo, monospace';
+      ctx.fillText(n.shortId || nodeIdOf(n.id), n.x, n.y + 51);
       ctx.fillStyle = sel ? '#22d3ee' : (n.trusted ? 'rgba(52,211,153,.85)' : 'rgba(251,191,36,.8)');
       ctx.font = '9.5px ui-monospace, Menlo, monospace';
       ctx.fillText((sel ? 'SELECTED · ' : '') + (n.status || '') + ' · ' + Math.round(n.load * 100) + '%', n.x, n.y - 30);
@@ -1313,6 +1323,7 @@ function renderFabricNodes(s, c, n){
   const localState = (s && s.queue && s.queue.serving) ? 'Busy' : 'Ready';
   chips.push(nodeChip({
     isLocal: true, name: (s && s.node && s.node.name) || 'this node', peer: localPeer,
+    id: (s && s.node && s.node.node_id) || nodeIdOf(localPeer),
     addr: stageData.localAddr, connected: true, status: localState, col: '#22d3ee',
     acceptsRemote: true, engine: (s && s.node && s.node.engine) || 'llama_server',
     cpu: sys.cpu_threads || 0, ramTotal: ramT, ramFree: ramF,
@@ -1324,6 +1335,7 @@ function renderFabricNodes(s, c, n){
     if (w.peer_id === localPeer) return;
     chips.push(nodeChip({
       isLocal: false, name: w.node_name || short(w.peer_id, 12), peer: w.peer_id,
+      id: w.node_id || nodeIdOf(w.peer_id),
       addr: stageData.addresses[w.peer_id] || '', connected: stageData.connected.has(w.peer_id),
       status: w.status || 'Offline', col: STATE_COLORS[w.status] || '#5a6b80',
       acceptsRemote: !!w.accepts_remote_inference, engine: w.engine || '',
@@ -1357,6 +1369,7 @@ function nodeChip(nd, isLocal, loadPct){
     '<div class="nc-head"><span class="dot" style="background:' + nd.col + '"></span>' + esc(nd.name) +
     '<span class="nc-tag ' + (isLocal ? 'local-tag' : 'remote-tag') + '">' + (isLocal ? 'local' : 'remote') + '</span></div>' +
     '<div class="nc-meta"><span><b>peer</b> ' + short(nd.peer, 12) + '</span>' +
+    '<span><b>id</b> ' + (nd.id || nodeIdOf(nd.peer)) + '</span>' +
     '<span><b>addr</b> ' + esc(nd.addr || '—') + '</span>' +
     '<span><b>engine</b> ' + esc(nd.engine || '—') + '</span>' +
     '<span><b>state</b> ' + esc(nd.status || '—') + (nd.acceptsRemote ? ' · accepts remote' : ' · local-only') + '</span></div>' +
@@ -1461,6 +1474,7 @@ function workerCard(w, localPeer){
     '</div>'+
     '<div class="wc-meta">'+
       '<span><b>peer</b> <code title="'+esc(w.peer_id)+'">'+short(w.peer_id, 14)+'</code></span>'+
+      '<span><b>id</b> '+(w.node_id || nodeIdOf(w.peer_id))+'</span>'+
       '<span><b>addr</b> '+esc((stageData.addresses[w.peer_id] || (isLocal ? stageData.localAddr : '')) || '—')+'</span>'+
       '<span><b>engine</b> '+esc(w.engine||'—')+'</span>'+
       '<span><b>last seen</b> '+(w.last_seen_secs != null ? fmtUptime(w.last_seen_secs)+' ago' : '—')+'</span>'+

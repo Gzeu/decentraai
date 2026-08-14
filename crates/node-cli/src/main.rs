@@ -393,6 +393,31 @@ async fn main() -> Result<()> {
 ///
 /// The wizard can be re-run safely: it never overwrites an identity and it
 /// regenerates the config with current detected hardware.
+///
+/// Default fabric identity name: `<hostname>-node` (distinct per machine by
+/// construction), falling back to a neutral name when no hostname is
+/// available in the environment. Operators override it with `setup --name`.
+fn default_node_name() -> String {
+    let host = std::env::var("HOSTNAME").ok();
+    if let Some(h) = host {
+        let clean: String = h
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let trimmed = clean.trim_matches('-').to_string();
+        if !trimmed.is_empty() {
+            return format!("{trimmed}-node");
+        }
+    }
+    "decentraai-node".to_string()
+}
+
 fn setup(args: SetupArgs) -> Result<()> {
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
@@ -455,7 +480,7 @@ fn setup(args: SetupArgs) -> Result<()> {
     //    hostname-derived node name, loopback API, auto GPU policy.
     let total_ram_gib = snapshot.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let max_context = if total_ram_gib >= 32.0 { 8192 } else { 4096 };
-    let node_name = args.name.unwrap_or_else(|| "decentraai-node".to_string());
+    let node_name = args.name.unwrap_or_else(default_node_name);
     // A model's port is irrelevant here; the API is fixed and loopback-only.
     let api_port = 8080u16;
     let gpu_policy = if matches!(&gpu, decentraai_system_probe::GpuProbeStatus::Nvidia(_)) {

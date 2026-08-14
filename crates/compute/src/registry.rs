@@ -201,6 +201,7 @@ mod tests {
         let adv = ComputeAdvertisement {
             peer_id: p,
             node_name: "rig".into(),
+            node_id: "dca-rig01".into(),
             capability: ComputeCapability {
                 cpu_cores: 4,
                 ram_mb: 8 * 1024,
