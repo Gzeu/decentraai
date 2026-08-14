@@ -297,8 +297,11 @@ release.
 ## 13. Complete End-to-End Flow (M10)
 
 ### Acceptance Criteria
-- [ ] Node starts with `decentraai init` and validated configuration
-- [ ] Worker is paired via QR or token and approved from dashboard
+- [x] Node starts with `decentraai init` / `decentraai setup` and validated
+  configuration (`config validate` + Q4 wizard + auto-provisioning `node`)
+- [~] Worker is paired via token and approved (`decentraai invite`/`join`
+  provides a least-privilege token seat, P5; `decentraai trust add` approves a
+  worker for the capability scheduler — physical QR pairing is not implemented)
 - [x] Worker publishes models, capacity and real-time status
 - [x] Client sends prompt (CLI `distributed --prompt`, `decentraai-p2p-invoke`)
 - [x] Router selects eligible worker
@@ -314,8 +317,13 @@ release.
   `inference_failed`) with request ID, worker ID, model hash, trace id, session
   and status — written best-effort from `DistributedInference` into
   `logs/audit.jsonl` when the node sets a logs dir
-- [ ] Offline worker detected and excluded from routing
-- [ ] E2E test can start two local nodes and reproduce full flow
+- [x] Offline worker detected and excluded from routing (M24 reaper:
+  stale-heartbeat flip-offline via `mark_offline`, reservation pruning, and
+  worker eviction with audit after a grace window)
+- [x] E2E test can start two local nodes and reproduce full flow
+  (`crates/distributed/tests/compute_e2e.rs`: real libp2p nodes on loopback —
+  advertisement propagation → selection → reservation → streamed inference →
+  release, plus fallback and fake-worker re-provisioning)
 
 ### Implementation Phases
 

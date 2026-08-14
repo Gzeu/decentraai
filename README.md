@@ -267,9 +267,9 @@ Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard refreshes
 every 3 seconds and shows:
 
 - the loaded model with file size, plus uptime and idle timer
-- inference metrics: completed requests, total tokens generated, last
-  request speed (tok/s), and the last 12 inference calls with prompt /
-  completion tokens and duration
+- inference metrics: completed requests, total tokens generated, latency
+  (p50/p95/p99) and success rate, last request speed (tok/s), and the last
+  12 inference calls with prompt / completion tokens and duration
 - live system pressure: free/total RAM, CPU threads, GPU name,
   temperature, free VRAM, utilization
 - tracked peers with verified/failed chunks, score, and ban status
