@@ -28,6 +28,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -505,12 +506,16 @@ fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
 const ADMIN_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>DecentraAI Admin</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;background:#0f141b;color:#e6edf3}.card{border:1px solid #2a3442;border-radius:10px;padding:14px}</style></head><body>
 <h1>DecentraAI Admin</h1>
-<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
-<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
+<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<div class="card"><h2>Audit events</h2><ul id="audit" style="list-style:none;padding-left:0"><li class="off">loading&hellip;</li></ul></div>
 <p id="api-url"></p></body><script>
 var f=document.getElementById('f'),status=document.getElementById('status'),tbl=document.querySelector('#tbl tbody'),tokenEl=document.getElementById('token'),newDiv=document.getElementById('new');
-f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value);status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'};
-async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+t.name+'</td><td>'+t.tier+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});}
+var esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]});};
+f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value),role=f.role.value;status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t,role:role})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'};
+async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+esc(t.name)+'</td><td>'+t.tier+'</td><td>'+esc(t.role)+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();}
+var auditEl=document.getElementById('audit');
+async function loadAudit(){var r=await fetch('/api/admin/events',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();var evs=d.events||[];auditEl.innerHTML=evs.length?'':('<li class="off">no security events yet</li>');evs.forEach(function(e){var li=document.createElement('li');var d2=new Date((e.timestamp||0)*1000).toLocaleString();li.innerHTML='<code>'+esc(e.event||'')+'</code> <span class="off">'+d2+'</span> <span class="small">'+esc(JSON.stringify(e.details||Object()))+'</span>';auditEl.appendChild(li);});}
 window.onload=load;
 function revoke(e){var n=e.target.dataset.n;fetch('/api/admin/token/revoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n})}).then(_=>load());}
 document.getElementById('api-url').textContent='API: http://127.0.0.1:{}/v1';
@@ -643,6 +648,103 @@ async fn admin_token_revoke_handler(
         .into_response()
 }
 
+/// Shared body-parsing + peer-id extraction for the worker trust / revoke
+/// admin endpoints. `peer_id` must be a valid base58 PeerId.
+fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return Err("invalid JSON".to_string()),
+    };
+    let peer = match req.get("peer_id").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Err("missing peer_id".to_string()),
+    };
+    decentraai_p2p::PeerId::from_str(peer).map_err(|_| "invalid peer_id".to_string())
+}
+
+/// P3/M10 — Approve a worker: adds it to the coordinator's trust set so it
+/// becomes eligible to run workloads. Master-gated like the other admin
+/// endpoints. Guards gracefully (a clear OpenAI-style error, not a panic)
+/// when no compute manager is attached.
+async fn admin_worker_trust_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let peer = match parse_worker_peer_id(&body) {
+        Ok(p) => p,
+        Err(msg) => return forbidden(&msg),
+    };
+    let Some(compute) = &state.compute else {
+        return forbidden("no compute manager attached; worker trust unavailable");
+    };
+    compute.add_trusted(peer).await;
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "worker_trusted",
+        serde_json::json!({"peer_id": peer.to_string()}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "peer_id": peer.to_string(), "trusted": true})
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// P3/M10 — Revoke a worker: removes it from the coordinator's trust set.
+/// Master-gated; guards gracefully when no compute manager is attached.
+async fn admin_worker_revoke_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let peer = match parse_worker_peer_id(&body) {
+        Ok(p) => p,
+        Err(msg) => return forbidden(&msg),
+    };
+    let Some(compute) = &state.compute else {
+        return forbidden("no compute manager attached; worker trust unavailable");
+    };
+    compute.remove_trusted(&peer).await;
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "worker_revoked",
+        serde_json::json!({"peer_id": peer.to_string()}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "peer_id": peer.to_string(), "trusted": false})
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// P3/M10 — Recent audit events for the Admin page, master-gated. Reuses the
+/// same best-effort reader as the dashboard's `/status` `recent_events`.
+async fn admin_audit_events_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let events = recent_audit_events(&state.info.repo_root);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"events": events}).to_string(),
+    )
+        .into_response()
+}
+
 /// OpenAPI 3.0 document (H6): the public, versioned contract for the
 /// `/v1/*` surface. Always served (no auth) so tooling can introspect it.
 async fn openapi_handler() -> Response {
@@ -667,6 +769,9 @@ async fn openapi_handler() -> Response {
             "/api/admin/token/create": { "post": { "operationId": "adminCreateToken", "summary": "Create a subscription token (master only)", "responses": { "200": { "description": "Token (shown once)" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/revoke": { "post": { "operationId": "adminRevokeToken", "summary": "Revoke a token (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/list": { "get": { "operationId": "adminListTokens", "summary": "List tokens (master only)", "responses": { "200": { "description": "Token list" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/worker/trust": { "post": { "operationId": "adminTrustWorker", "summary": "Approve a worker (master only)", "responses": { "200": { "description": "Trusted" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/worker/revoke": { "post": { "operationId": "adminRevokeWorker", "summary": "Revoke a worker (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/events": { "get": { "operationId": "adminAuditEvents", "summary": "Recent audit events (master only)", "responses": { "200": { "description": "Events" }, "401": { "description": "Unauthorized" } } } },
             "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
         }
     });
@@ -697,6 +802,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
         .route("/api/admin/token/revoke", post(admin_token_revoke_handler))
+        // P3/M10 - Worker trust + audit events (master-gated control plane)
+        .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
+        .route("/api/admin/worker/revoke", post(admin_worker_revoke_handler))
+        .route("/api/admin/events", get(admin_audit_events_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
@@ -1439,8 +1548,8 @@ ol{padding-left:20px} li{margin:6px 0}
 </div>
 <div class="card">
   <h2>Workers (compute registry)</h2>
-  <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th>Load</th><th>Queue</th><th>tok/s</th><th>Latency</th><th>RAM free</th><th>In-flight</th></tr></thead>
-  <tbody id="workers"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
+  <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th>Reach</th><th>Load</th><th>Queue</th><th>tok/s</th><th>Latency</th><th>RAM free</th><th>In-flight</th><th>Trusted</th><th>Action</th></tr></thead>
+  <tbody id="workers"><tr><td colspan="12" class="off">loading&hellip;</td></tr></tbody></table>
 </div>
 <div class="card">
   <h2>Network (measured links)</h2>
@@ -1526,6 +1635,10 @@ advBtn.addEventListener('click', () => {
 let token = '';
 try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+// Admin worker-control is available only when a master/admin token is
+// configured (the same token /v1/token returns). Buttons stay disabled/hidden
+// otherwise so the control plane is never offered without an admin boundary.
+const isAdmin = !!token;
 // Conversation history is real and kept across page reloads (client-side, in
 // localStorage) so a refresh does not wipe the ongoing session. It is never
 // invented: only messages the node actually exchanged are stored.
@@ -1662,6 +1775,47 @@ const fmtUptime = s => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? h + 'h ' + m + 'm' : (m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's');
 };
+// M10 worker control plane: Approve/Revoke a worker's trust on the
+// coordinator. Master-only (the endpoints 401/403 otherwise); each action
+// calls the admin endpoint and re-fetches the workers table live.
+const workerAct = async (action, peerId) => {
+  if (!peerId) return;
+  if (!isAdmin) return;
+  const endpoint = action === 'trust' ? '/api/admin/worker/trust' : '/api/admin/worker/revoke';
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ peer_id: peerId })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) alert((d.error && d.error.message) || 'worker ' + action + ' failed');
+  } catch (e) { alert('worker ' + action + ' failed: ' + e); }
+  try { await loadWorkers(); } catch (e) {}
+};
+window.trustWorker = e => workerAct('trust', e.target.dataset.p);
+window.revokeWorker = e => workerAct('revoke', e.target.dataset.p);
+// Renders the live workers tbody from the real /v1/compute payload. Called by
+// refresh() and after every Approve/Revoke so the table reflects the new trust.
+async function loadWorkers() {
+  const compute = await (await fetch('/v1/compute', { headers })).json();
+  renderWorkers(compute);
+}
+function renderWorkers(c) {
+  const wrows = (c.workers || []).map(w => {
+    const action = w.trusted
+      ? (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="revokeWorker(event)">Revoke</button>' : '<span class="off">trusted</span>')
+      : (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="trustWorker(event)">Approve</button>' : '<button disabled>Approve</button>');
+    return '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
+      (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' +
+      (w.reachable ? '<span class="ok">ok</span>' : '<span class="bad">offline</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' +
+      w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb || 0) / 1024) + ' GiB</td><td>' + w.in_flight + '</td><td>' +
+      (w.trusted ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + action + '</td></tr>';
+  }).join('');
+  document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="12" class="off">no workers yet (compute not attached)</td></tr>';
+  document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
+  document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
+}
 async function refresh() {
   try {
     const s = await (await fetch('/status')).json();
@@ -1741,15 +1895,8 @@ async function refresh() {
     ).join('');
     document.getElementById('peers').innerHTML = rows || '<tr><td colspan="5" class="off">no peers tracked yet</td></tr>';
   } catch (e) {}
-  let c = null, n = null;
-  try {
-    c = await (await fetch('/v1/compute', { headers })).json();
-    const wrows = (c.workers || []).map(w =>
-      '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
-      (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' + w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb||0)/1024) + ' GiB</td><td>' + w.in_flight + '</td></tr>'
-    ).join('');
-    document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="9" class="off">no workers yet (compute not attached)</td></tr>';
-  } catch (e) {}
+  let n = null;
+  try { await loadWorkers(); } catch (e) {}
   try {
     n = await (await fetch('/v1/network', { headers })).json();
     const nrows = (n.links || []).map(l =>
@@ -1801,10 +1948,6 @@ async function refresh() {
   diag.innerHTML = (s && s.engine_respawns > 0)
     ? '<span class="bad">' + s.engine_respawns + ' auto-restart(s)</span> (M24 recovery)'
     : '<span class="ok">0</span> auto-restarts (stable)';
-  if (c) {
-    document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
-    document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
-  }
   if (n) {
     document.getElementById('diag-p2p').innerHTML = (n.connected || []).length + ' connected, ' + (n.links || []).length + ' measured link(s)';
   }
@@ -2975,6 +3118,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_resp.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_worker_trust_and_revoke_endpoints_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let manager = test_manager(dir.path()).await;
+        // A live compute manager with one worker so trust/revoke have real state.
+        let worker = decentraai_p2p::PeerId::random();
+        let compute = Arc::new(decentraai_distributed::ComputeManager::new(
+            decentraai_p2p::PeerId::random(),
+            "coordinator".into(),
+            std::collections::HashSet::new(),
+        ));
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+
+        // Unauthenticated and client-token calls are rejected, master is allowed.
+        let no_auth = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401, "worker trust must be master-gated");
+
+        // Approve flips the worker to trusted in the live compute manager.
+        let trust = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(trust.status(), 200);
+        assert_eq!(trust.json::<serde_json::Value>().await.unwrap()["trusted"], true);
+        assert!(compute.is_trusted(&worker).await, "worker trusted after approve");
+
+        // In the /v1/compute worker report the trust flag reflects it too.
+        let report: serde_json::Value = client
+            .get(format!("{base}/v1/compute"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["attached"], true);
+        assert!(report["workers"].is_array());
+
+        // Invalid peer_id is a clean 403, not a panic.
+        let bad = client
+            .post(format!("{base}/api/admin/worker/revoke"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"peer_id":"not-a-peer"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 403);
+
+        // Revoke flips it back.
+        let revoke = client
+            .post(format!("{base}/api/admin/worker/revoke"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), 200);
+        assert!(!compute.is_trusted(&worker).await, "worker revoked after revoke");
+
+        // The actions were audited (security events are control-plane material).
+        let ev = client
+            .get(format!("{base}/api/admin/events"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ev.status(), 200);
+        let events: serde_json::Value = ev.json().await.unwrap();
+        let joined = serde_json::to_string(&events).unwrap();
+        assert!(joined.contains("worker_trusted"), "trust event audited");
+        assert!(joined.contains("worker_revoked"), "revoke event audited");
+
+        // Missing/malformed body is a clean 403.
+        let empty = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), 403);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_worker_endpoints_guard_without_compute_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        // No compute manager attached (plain serve), as in production without
+        // distributed compute. The endpoint must answer clearly, not panic.
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": decentraai_p2p::PeerId::random().to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert!(resp.text().await.unwrap().contains("no compute manager"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_create_sends_role_and_admin_page_shows_role_selector_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let store_path = dir.path().join("db/tokens.json");
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            Some(store_path),
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // A create with an explicit operator role round-trips through the store.
+        let create = client
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"op","tier":2,"role":"operator"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 200);
+        let list: serde_json::Value = client
+            .get(format!("http://{api}/api/admin/token/list"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let op = list["tokens"].as_array().unwrap().iter().find(|t| t["name"] == "op").unwrap();
+        assert_eq!(op["role"], "operator", "role must round-trip");
+
+        // The Admin page itself offers the role selector and the audit list.
+        let html = client
+            .get(format!("http://{api}/admin"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("operator"), "admin page must offer the operator role");
+        assert!(html.contains("Audit events"), "admin page must show audit events");
+        assert!(html.contains("/api/admin/events"), "audit list must fetch the gated events endpoint");
         manager.lock().await.shutdown().await.unwrap();
     }
     #[test]

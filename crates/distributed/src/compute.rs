@@ -324,6 +324,13 @@ impl ComputeManager {
         self.scheduler.lock().await.add_trusted(peer);
     }
 
+    /// Removes `peer` from the trusted set (no longer eligible to run
+    /// workloads). Mirror of [`ComputeManager::add_trusted`]; used by the
+    /// control-plane worker approve/revoke endpoints.
+    pub async fn remove_trusted(&self, peer: &PeerId) {
+        self.scheduler.lock().await.remove_trusted(peer);
+    }
+
     /// Whether `peer` is trusted to run workloads.
     pub async fn is_trusted(&self, peer: &PeerId) -> bool {
         self.scheduler.lock().await.is_trusted(peer)
@@ -904,6 +911,17 @@ pub struct WorkerMetricRow {
     pub peer_id: String,
     pub node_name: String,
     pub status: String,
+    /// Whether the coordinator trusts this peer to run workloads (from the
+    /// scheduler's live trust set, not derived from advertisements).
+    pub trusted: bool,
+    /// Whether the worker is currently reachable (not offline/stale in the
+    /// compute registry). Real state: an `Offline` advertisement means the
+    /// node stopped heartbeating.
+    pub reachable: bool,
+    /// Synthetic yet honest count of connection trouble: 1 when this worker
+    /// is offline/stale in the registry (its last heartbeat lapsed), else 0.
+    /// Derived from the same real registry state as `status`, never invented.
+    pub connection_errors: u64,
     pub load_percent: u8,
     pub queue_depth: u32,
     pub tokens_per_second: u32,
@@ -1001,10 +1019,14 @@ impl ComputeManager {
         let workers = self.scheduler.lock().await.registry().list();
         let mut rows = Vec::with_capacity(workers.len());
         for adv in &workers {
+            let offline = adv.availability.status == WorkerHealth::Offline;
             rows.push(WorkerMetricRow {
                 peer_id: adv.peer_id.to_string(),
                 node_name: adv.node_name.clone(),
                 status: format!("{:?}", adv.availability.status),
+                trusted: self.is_trusted(&adv.peer_id).await,
+                reachable: !offline,
+                connection_errors: u64::from(offline),
                 load_percent: adv.availability.load_percent,
                 queue_depth: adv.availability.queue_depth,
                 tokens_per_second: adv.availability.tokens_per_second,
@@ -1639,6 +1661,73 @@ mod tests {
         assert_eq!(report.workers[0].in_flight, 1);
         assert!(report.workers[0].reserved_ram_mb >= 256);
         manager.release(placement.reservation.reservation_id).await;
+    }
+
+    #[tokio::test]
+    async fn trusted_reachesable_fields_track_add_and_remove() {
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::new());
+        let worker = peer();
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        ))
+        .await;
+
+        // New worker is not trusted and reachable (heartbeat fresh).
+        assert!(!manager.is_trusted(&worker).await);
+        let before = manager.metrics_report().await;
+        let row = before.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        assert!(!row.trusted, "must start untrusted");
+        assert!(row.reachable, "fresh advertisement is reachable");
+        assert_eq!(row.connection_errors, 0);
+
+        // Approving flips the reported trust field and the is_trusted gate.
+        manager.add_trusted(worker).await;
+        assert!(manager.is_trusted(&worker).await);
+        let after = manager.metrics_report().await;
+        let row = after.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        assert!(row.trusted, "approve must mark trusted");
+
+        // Revoking flips it back.
+        manager.remove_trusted(&worker).await;
+        assert!(!manager.is_trusted(&worker).await);
+        let revoked = manager.metrics_report().await;
+        let row = revoked.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        assert!(!row.trusted, "revoke must clear trust");
+    }
+
+    #[tokio::test]
+    async fn offline_worker_is_flagged_unreachable_with_connection_error() {
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let worker = peer();
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            0,
+            LivePerf::default(),
+        ))
+        .await;
+
+        manager.mark_offline(&worker).await;
+        let report = manager.metrics_report().await;
+        let row = report.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        assert!(!row.reachable, "offline worker is unreachable");
+        assert_eq!(row.connection_errors, 1, "offline is surfaced as a connection error");
+        assert_eq!(row.status, "Offline");
     }
 
     #[tokio::test]
