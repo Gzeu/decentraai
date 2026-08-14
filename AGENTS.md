@@ -138,7 +138,7 @@ contribution**. Admin-only token issuance from a dashboard.
   limiting; audit `token_created`, `token_revoked`, `rate_limited`.
 - **P2 — Chat UI**: `/chat` page in the dashboard; model selector
   filtered by the caller's tier; token stored in localStorage;
-  non-streaming v1, SSE later.
+  streamed chat (SSE) is done.
 - **P3 — Admin dashboard**: `/admin` behind the master token; create /
   revoke tokens, set tiers, usage per token, peer catalogs; everything
   audited.
@@ -170,23 +170,36 @@ advertised as a remote endpoint.
 The crate also holds building blocks that are **parked as NEXT milestones
 (M21–M24), not claimed complete**: honest `ExpertRegistry`/`ExpertRouter`
 behind `expert_routing` (M21 — none advertise it; whole-model fallback is
-correct, never mocked), `EngineKind` + capability probe (M22 multi-engine), an
-`ExecutionPlanner` (M23), and the coordinator reaper `reap_unhealthy` (M24).
-Do NOT mark M21–M24 as done in documentation until their behaviors are
-production-verified. So far M24 has landed two production gaps (see below);
-request-level retry and a P2P reconnect loop remain un-wired.
+correct, never mocked), `EngineKind` + capability probe (M22 multi-engine), and
+an `ExecutionPlanner` (M23). Do NOT mark these as done until their behaviors are
+production-verified. M24 (resilience) has landed its remaining production gaps
+(see below) and is now considered wired: the coordinator reaper
+`reap_unhealthy`, reservation TTLs, stale/offline worker eviction with audit,
+graceful + startup recovery, mDNS recovery, false-ready prevention, engine
+crash auto-recovery, **bounded idempotency-safe request retry**, and an
+**explicit bounded P2P reconnect loop** all exist.
 
-**M24 (resilience) is partially landed**: the coordinator reaper, reservation
-TTLs, stale/offline worker eviction with audit, graceful + startup recovery,
-mDNS recovery all exist; **false-ready prevention** (`7b22dbf`, the compute
-broadcaster gates worker advertisement on live engine health) and **engine
-crash auto-recovery** (`a4aa762`, `ServeManager::ensure_healthy` respawns a
-crashed llama-server from a stored restart spec via a periodic supervisor) are
-shipped. Remaining M24: a bounded, non-idempotent-safe request retry in the
-route path and an explicit P2P reconnect loop (today reconnection is passive
-via mDNS re-discovery). The legacy `FallbackHandler` has bounded retry/backoff
-state but a stub fallback-worker selector and is not wired into the fabric
-route path.
+**M24 (resilience) is wired:**
+- Coordinator reaper, reservation TTLs, stale/offline eviction with audit,
+  graceful + startup recovery, mDNS recovery.
+- **False-ready prevention** (`7b22dbf`): the compute broadcaster gates worker
+  advertisement on live engine health.
+- **Engine crash auto-recovery** (`a4aa762`): `ServeManager::ensure_healthy`
+  respawns a crashed llama-server from a stored restart spec via a periodic
+  supervisor.
+- **Bounded, idempotency-safe request retry**: `route_request` retries
+  transport-level failures (P2P connection / timeout) on a fresh planner-chosen
+  worker up to `config.max_retries`, with exponential backoff via
+  `FallbackHandler`, releasing each attempt's reservation and re-planning per
+  attempt. `DistributedError::is_retryable()` encodes the policy: a definitive
+  worker rejection or a cancelled request is **never** re-sent — so
+  non-idempotent work (re-generation, double token/KV accounting) is never
+  duplicated. The streaming path intentionally stays single-attempt + legacy
+  fallback (retrying mid-stream would duplicate partial output to the client).
+- **Explicit bounded P2P reconnect loop**: on `ConnectionClosed` the swarm
+  re-dials a peer whose last address is known, with exponential backoff capped
+  at `RECONNECT_MAX_ATTEMPTS` (then it relies on mDNS re-discovery). Addresses
+  are captured at mDNS discovery and on dialer connect.
 
 **M20 (KV-aware inference fabric) is verified-DONE** (commit `caf9121`):
 coordinator-side KV/session accounting (`SessionAccount`), continuation
@@ -229,11 +242,20 @@ Diagnostics in the embedded HTML, all from real runtime state surfaced by
 `/status`, `/v1/compute`, `/v1/network`, `/v1/execution` and `/v1/peers` — no
 mock data, watching the page never touches the backend. Chat history is kept
 in-page for the session (server-side conversation persistence is not wired).
-The dashboard is split into a normal-user view (Model, Inference, Chat, Queue,
-Recent inference, System) and an opt-in "Show advanced" block (reputation,
-Workers, Network, Execution, Models, Settings, Diagnostics, audit events, share
-guide), so distributed-compute complexity is hidden unless the operator wants
-it.
+Chat streams by default: the proxy detects `stream:true` and forwards
+llama-server's SSE body chunk-by-chunk (a channel that drops early on client
+disconnect), and the page's JS reads the stream incrementally and surfaces
+latency + tokens from the trailing `usage` event; the `stream` checkbox offers
+a non-streaming fallback. The dashboard is split into a normal-user view
+(Model, Inference, Chat, Queue, Recent inference, System) and an opt-in "Show
+advanced" block (reputation, Workers, Network, Execution, Models, Settings,
+Diagnostics, audit events, share guide), so distributed-compute complexity is
+hidden unless the operator wants it.
+
+Admin (token create/list/revoke, `/admin`) is gated on the master API token
+via `ApiState::require_master` — subscriber tokens and unauthenticated callers
+are rejected (401/403), so the security event that the admin page previously
+omitted (it classified but discarded the auth result) is now enforced.
 
 Tier semantics: Tier 1 Guest (invited, small/public models, tight rate
 limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core

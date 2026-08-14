@@ -1197,6 +1197,7 @@ dependencies = [
  "decentraai-registry",
  "decentraai-system-probe",
  "decentraai-tokens",
+ "futures",
  "hex",
  "rand_core 0.6.4",
  "reqwest",

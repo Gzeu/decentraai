@@ -16,12 +16,13 @@
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use decentraai_config::{GenerationSection, TiersSection};
+use futures::StreamExt;
 use rand_core::RngCore;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -224,6 +225,21 @@ impl ApiState {
         }
     }
 
+    /// Admin endpoints (P3: token create/list/revoke) are gated on the
+    /// master token. When no API token is configured (open mode) there is
+    /// no boundary to enforce, so admin stays usable single-user; subscriber
+    /// tokens and unauthenticated callers are rejected. Returns a small
+    /// [`GateError`] so the handler boundary turns it into the response.
+    fn require_master(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
+                "'{name}' is a subscription token; admin asks for the master token"
+            ))),
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
     /// Per-tier model allowlist. The request body's `model` field is
     /// advisory (llama-server serves what it loaded), but we enforce it
     /// anyway: it is honest about what the tier may use, and it protects
@@ -405,11 +421,15 @@ fn admin_html(port: u16) -> String {
     ADMIN_HTML.replace("{}", &port.to_string())
 }
 async fn admin_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
     Html(admin_html(state.info.api_port)).into_response()
 }
 async fn admin_token_list_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
     let tokens = match &state.token_store_path {
         Some(p) => decentraai_tokens::TokenStore::load(p)
             .map(|s| s.list())
@@ -428,7 +448,9 @@ async fn admin_token_create_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return forbidden("invalid JSON"),
@@ -478,7 +500,9 @@ async fn admin_token_revoke_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _ = state.classify(&headers).map_err(|e| e.into_response());
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return forbidden("invalid JSON"),
@@ -740,6 +764,88 @@ async fn execution_handler(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
+/// True when the (already generation-defaulted) inference body asks for SSE
+/// streaming, so the proxy knows to forward chunks live instead of buffering.
+fn detect_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Best-effort completion-token count from an SSE body: llama-server's final
+/// `data:` event carries a `usage` object we pick up without buffering the
+/// whole stream. Streaming never blocks on metrics — zeros are fine.
+fn sse_completion_tokens(body: &str) -> u64 {
+    body.lines()
+        .filter(|l| l.trim_start().starts_with("data:"))
+        .filter_map(|l| {
+            let payload = l.trim_start().trim_start_matches("data:").trim();
+            serde_json::from_str::<serde_json::Value>(payload).ok()
+        })
+        .filter_map(|v| v["usage"]["completion_tokens"].as_u64())
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// Proxies a streaming inference response to the caller chunk-by-chunk while
+/// recording the same best-effort metrics the non-streaming path does. The
+/// channel lets a drop of the client cut upstream early; the spawned task
+/// still drains and accounts the completed stream.
+#[allow(clippy::needless_pass_by_value)]
+fn stream_inference(
+    state: ApiState,
+    auth: Auth,
+    path: String,
+    started: Instant,
+    upstream: reqwest::Response,
+    content_type: Option<axum::http::header::HeaderValue>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(64);
+    let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+    let drain_buffer = Arc::clone(&buffer);
+    let drain_path = path.clone();
+    tokio::spawn(async move {
+        let mut chunks = upstream.bytes_stream();
+        while let Some(item) = chunks.next().await {
+            match item {
+                Ok(bytes) => {
+                    drain_buffer.lock().unwrap().extend_from_slice(&bytes);
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        // Upstream finished cleanly: account the stream (best effort).
+        let body = drain_buffer.lock().unwrap().clone();
+        if !body.is_empty() {
+            state.record_inference(&drain_path, started.elapsed(), &body);
+            let text = String::from_utf8_lossy(&body);
+            let completion = sse_completion_tokens(&text);
+            if completion > 0 {
+                state.tokens_generated.fetch_add(completion, Ordering::SeqCst);
+                state.note_token_usage(&auth, completion);
+            }
+        }
+    });
+    let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        content_type.unwrap_or_else(|| {
+            axum::http::header::HeaderValue::from_static("text/event-stream")
+        }),
+    );
+    response
+}
+
 async fn proxy_handler(
     State(state): State<ApiState>,
     method: Method,
@@ -802,11 +908,22 @@ async fn proxy_handler(
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
+    let wants_stream = is_inference && detect_stream(&outgoing);
     match request.body(outgoing).send().await {
         Ok(upstream) => {
             let status = StatusCode::from_u16(upstream.status().as_u16())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+            if wants_stream && status.is_success() {
+                return stream_inference(
+                    state,
+                    auth,
+                    uri.path().to_string(),
+                    started,
+                    upstream,
+                    content_type,
+                );
+            }
             let bytes = upstream.bytes().await.unwrap_or_default();
             if is_inference && status.is_success() {
                 state.record_inference(uri.path(), started.elapsed(), &bytes);
@@ -1076,6 +1193,39 @@ const addMsg = (role, text) => {
   div.innerHTML = '<div>' + who + '</div><div>' + esc(text) + '</div>';
   chatbox.appendChild(div);
   chatbox.scrollTop = chatbox.scrollHeight;
+  return div;
+};
+// Streaming is the default; the checkbox lets a user fall back to a single
+// parsed HTTP response (useful with clients that do not read SSE).
+document.getElementById('chat-stream').checked = true;
+// Reads llama-server's SSE body and returns { text, tokens } once complete.
+const readSse = async (resp) => {
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buffer = '', text = '', tokens = null;
+  const msgNode = addMsg('node', '');
+  const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += dec.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
+        const delta = ev.choices && ev.choices[0] && ev.choices[0].delta && ev.choices[0].delta.content;
+        if (delta) { text += delta; bodyEl.textContent = text; }
+        if (ev.usage) tokens = ev.usage.completion_tokens;
+      }
+      chatbox.scrollTop = chatbox.scrollHeight;
+    }
+  } finally { reader.releaseLock(); }
+  return { text, tokens };
 };
 document.getElementById('chat-send').addEventListener('click', async () => {
   const input = document.getElementById('chat-input');
@@ -1084,21 +1234,31 @@ document.getElementById('chat-send').addEventListener('click', async () => {
   input.value = '';
   addMsg('user', prompt);
   hist.push({ role: 'user', content: prompt });
-  document.getElementById('chat-status').textContent = 'routing &amp; generating&hellip;';
+  const status = document.getElementById('chat-status');
+  const stream = document.getElementById('chat-stream').checked;
+  status.textContent = 'routing &amp; generating&hellip;';
   try {
-    const body = JSON.stringify({ model: '__MODEL__', messages: hist, stream: false });
+    const body = JSON.stringify({ model: '__MODEL__', messages: hist, stream });
     const t0 = performance.now();
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body });
-    const j = await r.json();
-    const answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
+    let answer = '', tokens = null;
+    if (stream && r.ok && r.body) {
+      const out = await readSse(r);
+      answer = out.text;
+      tokens = out.tokens;
+    } else {
+      const j = await r.json();
+      answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
+    }
     addMsg('node', answer || '(empty response)');
     hist.push({ role: 'assistant', content: answer || '' });
     const dt = Math.round(performance.now() - t0);
-    document.getElementById('chat-status').textContent = 'done in ' + dt + ' ms';
+    status.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
+      (tokens != null ? ' &middot; ' + tokens + ' tokens' : '');
     if (hist.length > 24) hist.splice(0, hist.length - 24);
   } catch (e) {
     addMsg('node', 'request failed: ' + e);
-    document.getElementById('chat-status').textContent = 'failed';
+    status.textContent = 'failed';
   }
 });
 document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chat-send').click(); } });
@@ -1996,8 +2156,16 @@ mod tests {
             None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        // Unauthenticated is rejected now that the admin surface is gated.
+        let denied = reqwest::Client::new()
+            .get(format!("http://{api}/admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 401);
         let resp = reqwest::Client::new()
             .get(format!("http://{api}/admin"))
+            .header("Authorization", "Bearer test_token")
             .send()
             .await
             .unwrap();
@@ -2081,5 +2249,139 @@ mod tests {
         ensure_api_token(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_create_rejects_wrong_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_store = dir.path().join("db/tokens.json");
+        let tiers = test_tiers(120);
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            Some(token_store.clone()),
+            Some(tiers.clone()),
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        // No credentials: unauthorized.
+        let no_auth = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"x","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401);
+
+        // Wrong password: unauthorized.
+        let wrong = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer not_the_master")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"x","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401);
+
+        // A subscriber token is not an admin: forbidden.
+        let mut store = decentraai_tokens::TokenStore::load(&token_store).unwrap();
+        let sub = store.create("alice", decentraai_tokens::Tier(2)).unwrap();
+        let subscriber = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", format!("Bearer {sub}"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"y","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(subscriber.status(), 403);
+
+        // Master token succeeds (control).
+        let master = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"ok_token","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_streams_sse_when_requested() {
+        // A backend that streams two SSE chunks (each with usage) like
+        // llama-server does, proving the proxy forwards event-stream content.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{addr}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.contains("text/event-stream"),
+            "streaming response should be SSE, got {ct:?}"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("data:"), "SSE body expected, got {body:?}");
+        assert!(body.contains("Hel"), "first delta forwarded");
+        assert!(body.contains("Lo") || body.contains("lo"), "second delta forwarded");
+        assert!(body.contains("[DONE]"), "sentinel forwarded");
+
+        // The token-use accounting picked up the streamed usage.
+        manager.lock().await.shutdown().await.unwrap();
     }
 }

@@ -481,7 +481,7 @@ no multi-worker contention) — the logic is unit/integration-proven.
 
 ## 19. NEXT — M23: Autonomous Execution Planner
 
-## 20. M24: Resilient Distributed Fabric — IN PROGRESS
+## 20. M24: Resilient Distributed Fabric — DONE
 
 - [x] worker health monitoring + stale detection (coordinator reaper, heartbeat
       staleness, worker eviction with audit)
@@ -494,8 +494,18 @@ no multi-worker contention) — the logic is unit/integration-proven.
 - [x] **engine crash recovery** — the universal node's runtime auto-restarts a
       crashed llama-server from a stored restart spec via a 5s supervisor
       loop (`ServeManager::ensure_healthy`)
-- [ ] request-level retry in the route path (FallbackHandler not yet wired)
-- [ ] P2P reconnect loop to known peers (passive mDNS re-dial today)
+- [x] **bounded, idempotency-safe request-level retry** in the fabric route
+      path — `route_request` retries transport-level failures (P2P/timeout) on
+      a fresh planner-chosen worker up to `config.max_retries` with exponential
+      backoff via `FallbackHandler`, releasing and re-planning per attempt;
+      `DistributedError::is_retryable()` never re-sends a definitive worker
+      rejection or a cancelled request (no duplicated non-idempotent work). The
+      streaming path stays single-attempt + legacy fallback to avoid
+      duplicating partial output to the client.
+- [x] **explicit bounded P2P reconnect loop** — on `ConnectionClosed` the swarm
+      re-dials a known-peers' last address with exponential backoff capped at
+      `RECONNECT_MAX_ATTEMPTS`, then relies on mDNS re-discovery; addresses are
+      captured at mDNS discovery and on dialer connect.
 
 ## 21. Ubuntu UX — Q4 setup wizard — DONE
 

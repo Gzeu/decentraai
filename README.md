@@ -57,14 +57,14 @@ requests — all on real hardware, no mocks.
 | M9 | Distributed inference: route requests to peer GPUs, paid in reputation | Done |
 | P1 | Subscriptions: hashed token registry, `decentraai token` CLI, per-tier model allowlists + rate limits | Done |
 | P6 | Zero-touch sharing: `swarm start` auto-downloads announced models (mDNS + consent modes) | Done |
-| P2 | Chat UI in the dashboard (single embedded dashboard: normal-user view + opt-in advanced block) | Done |
+| P2 | Chat UI in the dashboard (single embedded dashboard, SSE-streamed chat + non-streaming fallback, normal-user view + opt-in advanced block) | Done |
 | M18 | **Distributed execution fabric foundation** — universal node, mDNS/libp2p discovery, trusted admission, fabric planner, reservations, real remote inference, streaming, worker reuse, bidirectional Desktop ↔ Laptop (verified on real LAN) | **Done** |
 | M19 | Network-aware scheduler (latency, bandwidth, topology, transfer cost) — real RTT via InferPing/InferPong, fold reach cost into planner scoring | Done |
 | M20 | KV-aware inference fabric — coordinator-side KV/session accounting, continuation affinity, KV headroom/locality (llama-server live-KV occupancy not claimed) | Done |
 | M21 | Distributed MoE / expert fabric | Next |
 | M22 | Multi-engine runtime abstraction | Next |
 | M23 | Autonomous execution planner | Next |
-| M24 | Resilient distributed fabric (lifecycle, failure detection, recovery) | Next |
+| M24 | Resilient distributed fabric (lifecycle, failure detection, recovery, bounded idempotency-safe request retry, explicit bounded P2P reconnect loop) | **Done** |
 
 ## Using DecentraAI today
 
@@ -254,6 +254,9 @@ every 3 seconds and shows:
   temperature, free VRAM, utilization
 - tracked peers with verified/failed chunks, score, and ban status
   (`GET /v1/peers`, token-guarded)
+- a Chat box that streams model responses (SSE) token-by-token by
+  default, with a toggle for a non-streaming single reply; it shows
+  latency and token usage per request
 - the latest security events from the audit log (incl. token and
   rate-limit events)
 - a share guide with the exact `swarm start` + `pull` commands for this node

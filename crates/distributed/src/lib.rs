@@ -208,6 +208,18 @@ mod error {
         #[error("Worker {0} is not trusted")]
         UntrustedWorker(String),
     }
+
+    impl DistributedError {
+        /// Idempotency-safe retry policy: only transport/connection-level
+        /// failures are retried. A definite worker rejection or a cancelled
+        /// request must never be re-issued, because re-sending would
+        /// duplicate non-idempotent work (re-generation, double token/KV
+        /// accounting). A connection that never completed is safe to retry —
+        /// nothing was produced.
+        pub fn is_retryable(&self) -> bool {
+            matches!(self, DistributedError::P2PError(_) | DistributedError::RequestTimeout(_))
+        }
+    }
 }
 
 /// Main distributed inference coordinator
@@ -623,10 +635,15 @@ impl DistributedInference {
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
-                if let Some((plan, placement)) = compute
-                    .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref())
-                    .await
-                {
+                let base_backoff_ms = 200u64;
+                let mut last_error = None;
+                for attempt in 0u32..=self.config.max_retries {
+                    let Some((plan, placement)) = compute
+                        .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref())
+                        .await
+                    else {
+                        break;
+                    };
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -641,6 +658,7 @@ impl DistributedInference {
                         reservation_id = %placement.reservation.reservation_id,
                         plan_id = %plan.plan_id,
                         stages = %plan.stage_count(),
+                        attempt,
                         "fabric planner selected worker"
                     );
                     let result = self
@@ -688,12 +706,40 @@ impl DistributedInference {
                     if result.is_ok() {
                         return result;
                     }
+                    last_error = result.err();
+                    let err = last_error.as_ref().unwrap();
+                    // Idempotency-safe bounded retry: only transport-level
+                    // failures are retried, and only up to the configured
+                    // budget with backoff. A definitive worker rejection or a
+                    // cancellation is never re-sent (no duplicated work).
+                    if err.is_retryable() && attempt < self.config.max_retries {
+                        let can_retry_again = self
+                            .fallback_handler
+                            .record_failure(request.request_id, placement.worker)
+                            .await;
+                        tracing::warn!(
+                            request_id = %request.request_id,
+                            worker_peer_id = %placement.worker,
+                            error = %err,
+                            attempt,
+                            "retrying on a fresh worker after transport failure"
+                        );
+                        if can_retry_again {
+                            self.fallback_handler
+                                .wait_backoff(attempt, base_backoff_ms)
+                                .await;
+                            continue;
+                        }
+                    }
                     tracing::warn!(
                         worker_peer_id = %placement.worker,
-                        error = %result.as_ref().err().unwrap(),
+                        error = %err,
+                        attempt,
                         "fabric-planned worker failed; falling back to legacy router"
                     );
+                    break;
                 }
+                drop(last_error);
             }
         }
 
@@ -1351,5 +1397,16 @@ mod tests {
 
         assert!(!stats.local_worker_registered);
         assert_eq!(stats.worker_count, 0);
+    }
+
+    #[test]
+    fn error_retry_policy_is_idempotency_safe() {
+        // Connection-level failures are retryable.
+        assert!(DistributedError::P2PError(anyhow::anyhow!("conn refused")).is_retryable());
+        assert!(DistributedError::RequestTimeout(1000).is_retryable());
+        // A definitive rejection or cancellation must never be duplicated.
+        assert!(!DistributedError::WorkerRejected("w".into(), "cancelled".into()).is_retryable());
+        assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
+        assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
     }
 }
