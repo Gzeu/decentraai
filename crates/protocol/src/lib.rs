@@ -263,6 +263,76 @@ pub fn sign_infer_request_with_key(signing_key_bytes: &[u8; 32], req: &mut Infer
     req.signature = Some(signing_key.sign(&bytes).to_bytes().to_vec());
 }
 
+/// Serialized compute advertisement plus its sender's signature (P3).
+///
+/// The `advertisement` is the canonical serialized
+/// [`decentraai_compute::ComputeAdvertisement`]; `signature` is Ed25519 over
+/// those exact bytes with `sender_public_key`. The receiver verifies the
+/// signature and that the embedded advertisement's `peer_id` matches the
+/// signing public key, so a forged/spoofed advertisement is rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignedComputeAdvertisement {
+    pub protocol_version: u16,
+    /// Canonical bytes of the compute advertisement.
+    pub advertisement: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_public_key: Option<[u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none", with = "b64_opt")]
+    pub signature: Option<Vec<u8>>,
+}
+
+impl Default for SignedComputeAdvertisement {
+    fn default() -> Self {
+        Self {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            advertisement: Vec::new(),
+            sender_public_key: None,
+            signature: None,
+        }
+    }
+}
+
+/// Signs serialized advertisement bytes with the node identity (P3). Returns
+/// the wire-form `SignedComputeAdvertisement`.
+pub fn sign_compute_advertisement(
+    signing_key_bytes: &[u8; 32],
+    advertisement_bytes: &[u8],
+) -> SignedComputeAdvertisement {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
+    let signature = signing_key.sign(advertisement_bytes).to_bytes().to_vec();
+    SignedComputeAdvertisement {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        advertisement: advertisement_bytes.to_vec(),
+        sender_public_key: Some(signing_key.verifying_key().to_bytes()),
+        signature: Some(signature),
+    }
+}
+
+/// Verifies a signed advertisement. Requires a signature, a sender public key
+/// that maps to the embedded advertisement's `peer_id`, and an Ed25519
+/// signature valid over the advertisement bytes.
+pub fn verify_signed_compute_advertisement(
+    signed: &SignedComputeAdvertisement,
+    expected_peer: &PeerId,
+) -> Result<()> {
+    let (Some(sig), Some(pk_bytes)) = (signed.signature.as_deref(), signed.sender_public_key)
+    else {
+        anyhow::bail!("unsigned compute advertisement");
+    };
+    let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk_bytes)
+        .context("invalid sender public key")?;
+    let signer = PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey));
+    if &signer != expected_peer {
+        anyhow::bail!(
+            "advertisement signer {signer} does not match the claiming peer {expected_peer}"
+        );
+    }
+    let key = VerifyingKey::from_bytes(&pk_bytes).context("invalid ed25519 public key")?;
+    let sig = Signature::from_slice(sig).context("invalid signature")?;
+    decentraai_identity::verify_signature(&key, &signed.advertisement, &sig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +672,40 @@ mod tests {
             canonical_infer_request_bytes(&c),
             "canonical bytes must ignore the signature field"
         );
+    }
+
+    // ---- P3: signed compute advertisements ----
+
+    #[test]
+    fn signed_advertisement_roundtrip_verifies_for_the_claiming_peer() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        // Canonical advertisement bytes (arbitrary payload here).
+        let adv_bytes = serde_json::to_vec(&["cpu_cores", "gpu"]).unwrap();
+        let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        assert!(signed.signature.is_some());
+        assert!(verify_signed_compute_advertisement(&signed, &peer).is_ok());
+    }
+
+    #[test]
+    fn signed_advertisement_rejects_a_spoofed_claiming_peer() {
+        let identity = Identity::generate();
+        let other = Identity::generate();
+        let adv_bytes = serde_json::to_vec(&["gpu"]).unwrap();
+        let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        // Present the signed advertisement as claiming to be `other`: the signer
+        // key must map to the claiming peer, so this must fail (anti-spoof).
+        assert!(verify_signed_compute_advertisement(&signed, &peer_of(&other)).is_err());
+    }
+
+    #[test]
+    fn signed_advertisement_rejects_tampered_payload() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let adv_bytes = serde_json::to_vec(&["ram"]).unwrap();
+        let mut signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        // Tamper with the serialized payload after signing.
+        signed.advertisement = serde_json::to_vec(&["vram_999"]).unwrap();
+        assert!(verify_signed_compute_advertisement(&signed, &peer).is_err());
     }
 }

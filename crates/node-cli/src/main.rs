@@ -856,11 +856,15 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         local_peer_id,
         InferenceConfig::default(),
     ));
-    let compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
+    let mut compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
         local_peer_id,
         node_name.clone(),
         compute_trusted,
     ));
+    // P3: sign this node's advertisements so recipients authenticate them.
+    if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+        cm.set_signing_key(identity.signing_key_bytes());
+    }
     compute_manager
         .set_allow_provisioning(config.sharing.provision_models_on_demand)
         .await;
@@ -2612,11 +2616,15 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             }
         }
     }
-    let compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
+    let mut compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
         local_peer_id,
         args.name.clone(),
         compute_trusted,
     ));
+    // P3: sign this node's advertisements so recipients authenticate them.
+    if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+        cm.set_signing_key(identity.signing_key_bytes());
+    }
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model
     // instead of only to workers that already serve it (M14).
@@ -2871,7 +2879,6 @@ async fn spawn_compute_broadcaster(
     can_provision: bool,
     manager: Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>>,
 ) -> Result<()> {
-    use decentraai_protocol::serialize_message;
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
     tokio::spawn(async move {
@@ -2920,7 +2927,9 @@ async fn spawn_compute_broadcaster(
             let adv = compute_manager
                 .advertise_local(snapshot, gpu, served_models, can_provision)
                 .await;
-            if let Ok(bytes) = serialize_message(&adv) {
+            // P3: sign the advertisement when the node has a signing key set,
+            // so recipients authenticate it (anti-spoof).
+            if let Ok(bytes) = compute_manager.advertisement_wire_bytes(&adv) {
                 p2p_node.announce(bytes);
             }
         }

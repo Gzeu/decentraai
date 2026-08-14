@@ -252,6 +252,11 @@ pub struct ComputeManager {
     /// decisions + placements + outcomes surfaced by the dashboard EXECUTION
     /// view. `None` until `record_execution` is called.
     recent_executions: std::sync::Mutex<VecDeque<ExecutedPlan>>,
+    /// Optional Ed25519 signing key (P3). When set, `advertise_local` emits a
+    /// signed [`decentraai_protocol::SignedComputeAdvertisement`] so recipients
+    /// can authenticate that the advertisement genuinely came from the node
+    /// that claims it (anti-spoof). `None` broadcasts unsigned (legacy).
+    signing_key: Option<[u8; 32]>,
 }
 
 impl ComputeManager {
@@ -275,7 +280,14 @@ impl ComputeManager {
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
+            signing_key: None,
         }
+    }
+
+    /// Sets the node's Ed25519 signing key (P3) so `advertise_local` emits
+    /// signed advertisements that recipients can authenticate.
+    pub fn set_signing_key(&mut self, signing_key: [u8; 32]) {
+        self.signing_key = Some(signing_key);
     }
 
     pub fn local_peer(&self) -> PeerId {
@@ -790,6 +802,21 @@ impl ComputeManager {
         self.scheduler.lock().await.upsert(adv.clone());
         *self.last_local_ad.lock().unwrap() = Some(adv.clone());
         adv
+    }
+
+    /// The wire form of an advertisement to broadcast: a signed
+    /// [`decentraai_protocol::SignedComputeAdvertisement`] when a signing key is
+    /// set (P3), otherwise the raw advertisement (legacy). Recipients verify the
+    /// signed envelope and reject spoofed advertisements.
+    pub fn advertisement_wire_bytes(&self, adv: &ComputeAdvertisement) -> anyhow::Result<Vec<u8>> {
+        use decentraai_protocol::{sign_compute_advertisement, serialize_message};
+        let raw = serialize_message(adv)?;
+        if let Some(key) = &self.signing_key {
+            let signed = sign_compute_advertisement(key, &raw);
+            serialize_message(&signed)
+        } else {
+            Ok(raw)
+        }
     }
 
     /// The advertisement this node most recently built and broadcast (the
