@@ -252,6 +252,11 @@ pub struct ComputeManager {
     /// decisions + placements + outcomes surfaced by the dashboard EXECUTION
     /// view. `None` until `record_execution` is called.
     recent_executions: std::sync::Mutex<VecDeque<ExecutedPlan>>,
+    /// Bounded, newest-first full autonomous execution decisions (M23 Full
+    /// Autonomy): candidates, constraints, score, selected worker, KV affinity,
+    /// engine capability, expected mode, fallback and lifecycle trace — the
+    /// explainable decision, surfaced by the control plane.
+    recent_decisions: std::sync::Mutex<VecDeque<decentraai_fabric::ExecutionDecision>>,
     /// Optional Ed25519 signing key (P3). When set, `advertise_local` emits a
     /// signed [`decentraai_protocol::SignedComputeAdvertisement`] so recipients
     /// can authenticate that the advertisement genuinely came from the node
@@ -284,6 +289,7 @@ impl ComputeManager {
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
+            recent_decisions: std::sync::Mutex::new(VecDeque::new()),
             signing_key: None,
             breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
                 crate::breaker::BreakerConfig::default(),
@@ -586,6 +592,122 @@ impl ComputeManager {
             .collect()
     }
 
+    /// Snapshot of the newest-full autonomous execution decisions (M23 Full
+    /// Autonomy), newest-first, for the control plane.
+    pub fn decisions(&self) -> Vec<decentraai_fabric::ExecutionDecision> {
+        self.recent_decisions
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    /// Builds and records the full autonomous execution decision for a request
+    /// (DISCOVER → CLASSIFY → CANDIDATES → CONSTRAINTS → SCORE → SELECT),
+    /// reusing the same live fabric state the planner consumes. The decision is
+    /// explainable (candidates, constraints, score, selected worker, KV
+    /// affinity, engine capability, expected mode, fallback, trace) and stored
+    /// for the control plane. Returns `()`; never affects routing.
+    ///
+    /// The decision is recorded with the same *live* planner the real routing
+    /// path uses — the measured network graph (M19) and expert registry (M21) —
+    /// so its network cost and score reflect genuine runtime state, then held
+    /// in the bounded ring. The coordinator later calls [`Self::finalize_decision`]
+    /// to correlate it with the reservation/plan and the observed outcome and
+    /// to append the Reserved → Executing → Completed/Failed → Released trace.
+    pub async fn record_decision(
+        &self,
+        request_id: &str,
+        req: &WorkloadRequirements,
+        prompt_tokens: u32,
+        session_id: Option<&str>,
+        priority: u8,
+        streaming: bool,
+    ) {
+        use decentraai_fabric::decision;
+        const MAX_DECISIONS: usize = 64;
+        let facts = self.fabric_facts(&req.model_hash).await;
+        if facts.is_empty() {
+            return;
+        }
+        let (is_continuation, prefix_resident_on) = match session_id {
+            Some(sid) => match self.session_residency(sid) {
+                Some(w) => (true, Some(w.to_string())),
+                None => (false, None),
+            },
+            None => (false, None),
+        };
+        let rfacts = decentraai_fabric::RequestFacts {
+            model_hash: req.model_hash.clone(),
+            est_ram_mb: req.est_ram_mb,
+            est_vram_mb: req.est_vram_mb,
+            context: decentraai_fabric::ContextProfile {
+                prompt_tokens,
+                max_output_tokens: req.max_tokens,
+                is_continuation,
+                prefix_resident_on,
+            },
+            transfer_mib: 0,
+            local_peer: Some(self.local_peer.to_string()),
+            priority,
+        };
+        // Mirror the planner the real routing path builds, so the recorded
+        // decision shares the live network graph (M19) and objective weights.
+        let planner = decentraai_fabric::ExecutionPlanner {
+            network: self.network.lock().unwrap().clone(),
+            allow_multi_stage: true,
+            ..Default::default()
+        };
+        let decision = decision::evaluate(&planner, request_id, &rfacts, &facts, streaming, false);
+        let mut ring = self.recent_decisions.lock().unwrap();
+        ring.push_back(decision);
+        while ring.len() > MAX_DECISIONS {
+            ring.pop_front();
+        }
+    }
+
+    /// Correlates the stored autonomous [`ExecutionDecision`] for `request_id`
+    /// with the actual reservation, plan and observed outcome, and appends the
+    /// lifecycle events (Reserved → Executing → Completed/Failed → Released) so
+    /// the control plane renders a live trace rather than just the initial
+    /// intent. Safe, bounded observability only — never affects routing.
+    pub fn finalize_decision(
+        &self,
+        request_id: &str,
+        selected_worker: &str,
+        plan_id: &str,
+        reservation_id: &str,
+        ok: bool,
+    ) {
+        let mut ring = self.recent_decisions.lock().unwrap();
+        let Some(d) = ring.iter_mut().find(|d| d.request_id == request_id) else {
+            return;
+        };
+        d.selected_worker = Some(selected_worker.to_string());
+        if let Some(plan) = d.plan.as_mut() {
+            plan.plan_id = plan_id.to_string();
+        }
+        d.reservation_id = Some(reservation_id.to_string());
+        d.outcome = Some(if ok { "succeeded".into() } else { "failed".into() });
+        d.trace.push(decentraai_fabric::ExecutionEvent::Reserved {
+            worker: Some(selected_worker.to_string()),
+        });
+        d.trace.push(decentraai_fabric::ExecutionEvent::Executing {
+            worker: Some(selected_worker.to_string()),
+        });
+        if ok {
+            d.trace.push(decentraai_fabric::ExecutionEvent::Completed { ok: true });
+        } else {
+            d.trace
+                .push(decentraai_fabric::ExecutionEvent::Failed { cause: "execution_error".into(), retryable: false });
+        }
+        d.trace.push(decentraai_fabric::ExecutionEvent::Released {
+            worker: Some(selected_worker.to_string()),
+        });
+    }
+
     /// Snapshot of live workers, newest-advertisement first.
     pub async fn workers(&self) -> Vec<ComputeAdvertisement> {
         self.scheduler.lock().await.registry().list()
@@ -646,6 +768,28 @@ impl ComputeManager {
                 }
             })
             .collect()
+    }
+
+    /// Number of live, eligible workers for `model_hash` (trusted + healthy +
+    /// serves the model), from the current registry across the local scheduler
+    /// and the P2P advertisement view. Used as the *real* `eligible_after_primary`
+    /// input to `decentraai_fabric::adapt` so a retry/replan decision reflects
+    /// actual remaining capacity — never a fabricated count.
+    pub async fn eligible_worker_count(&self, model_hash: &str) -> usize {
+        let scheduler = self.scheduler.lock().await;
+        let now = std::time::Instant::now();
+        let breaker = self.breaker.lock().unwrap();
+        scheduler
+            .registry()
+            .list()
+            .into_iter()
+            .filter(|adv| breaker.allow(&adv.peer_id, now))
+            .filter(|adv| {
+                scheduler.is_trusted(&adv.peer_id)
+                    && adv.availability.healthy()
+                    && adv.capability.serves_or_provisions(model_hash)
+            })
+            .count()
     }
 
     /// Builds an `ExecutionPlan` for `req` using the fabric planner and books
@@ -1805,5 +1949,65 @@ mod tests {
             c.prefix_worker.as_deref(),
             Some(worker.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn record_decision_stores_an_explainable_autonomous_decision() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![ServedModel {
+                    context_tokens: 4096,
+                    est_vram_mb: 0,
+                    ..model()
+                }],
+                false,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+
+        let req = manager
+            .requirements_for("abc")
+            .await
+            .expect("the advertised model yields workload requirements");
+        manager
+            .record_decision("r1", &req, 100, None, 128, true)
+            .await;
+
+        let ds = manager.decisions();
+        assert_eq!(ds.len(), 1, "decision recorded");
+        let d = &ds[0];
+        assert_eq!(d.request_id, "r1");
+        // The eligible worker is selected and its constraints are satisfied.
+        assert_eq!(d.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        let cand = d
+            .candidates
+            .iter()
+            .find(|c| c.peer_id == worker.to_string())
+            .unwrap();
+        assert!(cand.constraints.is_satisfied());
+        assert!(cand.score.is_some(), "eligible candidate has a score");
+        assert!(
+            d.trace.iter().any(|e| matches!(
+                e,
+                decentraai_fabric::ExecutionEvent::Planned { .. }
+            )),
+            "trace includes the Planned event"
+        );
+        // Ring buffer bounds.
+        for i in 0..70 {
+            manager
+                .record_decision(&format!("r{i}"), &req, 10, None, 0, false)
+                .await;
+        }
+        assert!(manager.decisions().len() <= 64);
     }
 }

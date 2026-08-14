@@ -927,6 +927,19 @@ impl DistributedInference {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
                 let base_backoff_ms = 200u64;
+                // M23 Full Autonomy: record the explainable autonomous decision
+                // (candidates, constraints, score, KV affinity, engine cap,
+                // expected mode, fallback, trace) for the control plane.
+                compute
+                    .record_decision(
+                        &request.request_id.to_string(),
+                        &req,
+                        prompt_tokens,
+                        request.session_id.as_deref(),
+                        request.priority,
+                        request.stream,
+                    )
+                    .await;
                 let mut last_error = None;
                 for attempt in 0u32..=self.config.max_retries {
                     let Some((plan, placement)) = compute
@@ -976,6 +989,17 @@ impl DistributedInference {
                             "failed"
                         },
                     );
+                    // M23 Full Autonomy: correlate the recorded autonomous
+                    // decision with this reservation/plan/outcome and append
+                    // the Reserved → Executing → Completed/Failed → Released
+                    // lifecycle trace for the control plane.
+                    compute.finalize_decision(
+                        &request.request_id.to_string(),
+                        &placement.worker.to_string(),
+                        &plan.plan_id,
+                        &placement.reservation.reservation_id.to_string(),
+                        result.is_ok(),
+                    );
                     // M20: record the session's KV prefix residency from the
                     // real tokens the worker reported.
                     if let Some(session_id) = &request.session_id {
@@ -1015,39 +1039,64 @@ impl DistributedInference {
                         &placement.worker,
                         result.is_ok(),
                     );
-                    if result.is_ok() {
+                    let success = result.is_ok();
+                    if success {
                         return result;
                     }
                     last_error = result.err();
                     let err = last_error.as_ref().unwrap();
-                    // Idempotency-safe bounded retry: only transport-level
-                    // failures are retried, and only up to the configured
-                    // budget with backoff. A definitive worker rejection or a
-                    // cancellation is never re-sent (no duplicated work).
-                    if err.is_retryable() && attempt < self.config.max_retries {
-                        let can_retry_again = self
-                            .fallback_handler
-                            .record_failure(request.request_id, placement.worker)
-                            .await;
+                    // M23 Full Autonomy (OBSERVE → ADAPT): decide, from real
+                    // state, whether to retry/re-plan or abort. Safety-bound by
+                    // `decentraai_fabric::adapt` — never retry after emitting
+                    // tokens, never re-send a definitive rejection/cancellation.
+                    let is_continuation = request
+                        .session_id
+                        .as_deref()
+                        .map(|s| compute.session_residency(s).is_some())
+                        .unwrap_or(false);
+                    let budget_remaining = self.config.max_retries.saturating_sub(attempt);
+                    // Real remaining capacity from the live registry — than a
+                    // fabricated count holds. Any worker still trusted, healthy
+                    // and able to serve the model (minus the one we just tried)
+                    // is a genuine retry target.
+                    let eligible_after_primary = {
+                        let total = compute.eligible_worker_count(&request.model_hash).await;
+                        total.saturating_sub(1) // exclude the attempt just made
+                    };
+                    let adaptation = decentraai_fabric::adapt(
+                        success,
+                        err.is_retryable(),
+                        false, // non-streamed send is not a client cancellation
+                        0,     // transport failure before any output was delivered
+                        eligible_after_primary,
+                        budget_remaining,
+                        is_continuation,
+                    );
+                    let should_retry = matches!(
+                        adaptation,
+                        decentraai_fabric::Adaptation::Retry
+                            | decentraai_fabric::Adaptation::Replan
+                    );
+                    if should_retry && attempt < self.config.max_retries {
                         tracing::warn!(
                             request_id = %request.request_id,
                             worker_peer_id = %placement.worker,
                             error = %err,
                             attempt,
-                            "retrying on a fresh worker after transport failure"
+                            adaptation = ?adaptation,
+                            "autonomous adapt: replan / retry on a fresh worker"
                         );
-                        if can_retry_again {
-                            self.fallback_handler
-                                .wait_backoff(attempt, base_backoff_ms)
-                                .await;
-                            continue;
-                        }
+                        self.fallback_handler
+                            .wait_backoff(attempt, base_backoff_ms)
+                            .await;
+                        continue;
                     }
                     tracing::warn!(
                         worker_peer_id = %placement.worker,
                         error = %err,
                         attempt,
-                        "fabric-planned worker failed; falling back to legacy router"
+                        adaptation = ?adaptation,
+                        "no safe retry remains; aborting compute path"
                     );
                     break;
                 }
@@ -1083,6 +1132,19 @@ impl DistributedInference {
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
+                // M23 Full Autonomy: record the explainable autonomous decision
+                // (candidates, constraints, score, KV affinity, engine cap,
+                // expected mode, fallback, trace) for the control plane.
+                compute
+                    .record_decision(
+                        &request.request_id.to_string(),
+                        &req,
+                        prompt_tokens,
+                        request.session_id.as_deref(),
+                        request.priority,
+                        request.stream,
+                    )
+                    .await;
                 if let Some((plan, placement)) = compute
                     .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
                     .await
@@ -1130,6 +1192,17 @@ impl DistributedInference {
                         } else {
                             "failed"
                         },
+                    );
+                    // M23 Full Autonomy: correlate the recorded autonomous
+                    // decision with this reservation/plan/outcome and append
+                    // the Reserved → Executing → Completed/Failed → Released
+                    // lifecycle trace for the control plane.
+                    compute.finalize_decision(
+                        &request.request_id.to_string(),
+                        &placement.worker.to_string(),
+                        &plan.plan_id,
+                        &placement.reservation.reservation_id.to_string(),
+                        result.is_ok(),
                     );
                     // M20: record the session's KV prefix residency from the
                     // real tokens the worker reported.
