@@ -85,8 +85,12 @@ enum Auth {
     Open,
     /// The master admin token: unlimited.
     Master,
-    /// An issued subscription token with its tier.
-    Subscriber { name: String, tier: u8 },
+    /// An issued subscription token with its tier and role (H4).
+    Subscriber {
+        name: String,
+        tier: u8,
+        role: decentraai_tokens::Role,
+    },
 }
 
 impl Auth {
@@ -220,6 +224,7 @@ impl ApiState {
                             Some(record) => Ok(Auth::Subscriber {
                                 name: record.name.clone(),
                                 tier: record.tier,
+                                role: record.role,
                             }),
                             None => Err(GateError::Unauthorized),
                         }
@@ -245,12 +250,32 @@ impl ApiState {
         }
     }
 
+    /// Role separation (H4): the operational read views (status, workers,
+    /// network, execution, peers) are allowed for the master (admin), open
+    /// mode (single-user), or an `operator`-role subscription token. A plain
+    /// `client` token may only run inference within its tier.
+    fn require_operator_or_admin(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { role, name, .. }) => {
+                if role == decentraai_tokens::Role::Operator {
+                    Ok(())
+                } else {
+                    Err(GateError::Forbidden(format!(
+                        "'{name}' is a client token; operational views need an operator or admin token"
+                    )))
+                }
+            }
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
     /// Per-tier model allowlist. The request body's `model` field is
     /// advisory (llama-server serves what it loaded), but we enforce it
     /// anyway: it is honest about what the tier may use, and it protects
     /// multi-model routing when that lands.
     fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), GateError> {
-        let Auth::Subscriber { tier, name } = auth else {
+        let Auth::Subscriber { tier, name, .. } = auth else {
             return Ok(());
         };
         let Some(tiers) = &self.tiers else {
@@ -286,7 +311,7 @@ impl ApiState {
     /// Sliding-window rate limit per token. The master token and the
     /// open mode are unlimited; the window is pruned on every call.
     fn check_rate_limit(&self, auth: &Auth) -> Result<(), GateError> {
-        let Auth::Subscriber { name, tier } = auth else {
+        let Auth::Subscriber { name, tier, .. } = auth else {
             return Ok(());
         };
         let Some(policy) = self.tiers.as_ref().and_then(|t| t.policy(*tier)) else {
@@ -493,7 +518,7 @@ async fn admin_token_list_handler(State(state): State<ApiState>, headers: Header
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let body = serde_json::json!({"tokens": tokens.iter().map(|t| serde_json::json!({"name": t.name, "tier": t.tier, "created_at": t.created_at, "revoked": t.revoked})).collect::<Vec<_>>()});
+    let body = serde_json::json!({"tokens": tokens.iter().map(|t| serde_json::json!({"name": &t.name, "tier": t.tier, "role": t.role.name(), "created_at": t.created_at, "revoked": t.revoked})).collect::<Vec<_>>()});
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -524,19 +549,27 @@ async fn admin_token_create_handler(
         Some(t) if (1..=3).contains(&t) => t,
         _ => return forbidden("tier 1-3"),
     };
+    let role = match req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(|s| decentraai_tokens::Role::parse(s).ok())
+    {
+        Some(r) => r,
+        None => decentraai_tokens::Role::DEFAULT,
+    };
     let plaintext = match &state.token_store_path {
         Some(p) => {
             let mut s = match decentraai_tokens::TokenStore::load(p) {
                 Ok(s) => s,
                 Err(_) => return forbidden("load failed"),
             };
-            match s.create(&name, decentraai_tokens::Tier(tier), None) {
+            match s.create_with_role(&name, decentraai_tokens::Tier(tier), None, role) {
                 Ok(t) => {
                     let a = state.info.repo_root.join("logs/audit.jsonl");
                     let _ = decentraai_audit::record(
                         a.parent().unwrap_or(&state.info.repo_root),
                         "token_created",
-                        serde_json::json!({"name": &name, "tier": tier}),
+                        serde_json::json!({"name": &name, "tier": tier, "role": role.name()}),
                     );
                     Some(t)
                 }
@@ -545,7 +578,7 @@ async fn admin_token_create_handler(
         }
         None => return forbidden("no store"),
     };
-    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier});
+    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier, "role": role.name()});
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -764,7 +797,14 @@ async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
 /// WORKERS + OVERVIEW real state: the coordinator's live mesh (workers,
 /// health, load, capacity, models, reservations, local perf) and local node
 /// status. Empty structure when no compute manager is attached.
-async fn compute_handler(State(state): State<ApiState>) -> Response {
+async fn compute_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let mut body = serde_json::json!({
         "attached": false,
         "workers": [],
@@ -794,7 +834,14 @@ async fn compute_handler(State(state): State<ApiState>) -> Response {
 
 /// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
 /// locality), connected peers, and local peer id. Empty when no compute/P2P.
-async fn network_handler(State(state): State<ApiState>) -> Response {
+async fn network_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let mut body = serde_json::json!({
         "attached": false,
         "connected": [],
@@ -833,7 +880,14 @@ async fn network_handler(State(state): State<ApiState>) -> Response {
 
 /// EXECUTION real state: recent planner decisions with reasons, reservations
 /// and outcomes. Empty when no compute manager is attached.
-async fn execution_handler(State(state): State<ApiState>) -> Response {
+async fn execution_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let mut body = serde_json::json!({ "attached": false, "executions": [] });
     if let Some(compute) = &state.compute {
         body["executions"] = serde_json::json!(compute.executions());
@@ -1759,6 +1813,31 @@ mod tests {
         (api, manager)
     }
 
+    /// Like [`start_stateful_api`] but always wires the subscription-token store
+    /// (so a master + subscriber/operator tokens are both recognized), used by
+    /// the role-separation tests.
+    async fn start_stateful_api_with_store(
+        dir: &Path,
+        master: String,
+    ) -> (SocketAddr, Arc<Mutex<ServeManager>>) {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let store_path = dir.join("db/tokens.json");
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master),
+            manager.clone(),
+            test_info(dir, None),
+            Some(store_path),
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        (api, manager)
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn remote_backend_proxy_forwards_to_configured_url_when_manager_unloaded() {
@@ -1952,6 +2031,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.status(), 401);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn role_separation_gates_operational_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("db/tokens.json");
+        let (client_tok, operator_tok);
+        {
+            let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
+            client_tok = store
+                .create("client1", decentraai_tokens::Tier::GUEST, None)
+                .unwrap();
+            operator_tok = store
+                .create_with_role(
+                    "ops1",
+                    decentraai_tokens::Tier::GUEST,
+                    None,
+                    decentraai_tokens::Role::Operator,
+                )
+                .unwrap();
+        }
+        let (api, manager) =
+            start_stateful_api_with_store(dir.path(), "master".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // A client token is denied the advanced operational view (H4)...
+        let denied = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", format!("Bearer {client_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403, "client must not see operational views");
+        let denied_net = client
+            .get(format!("http://{api}/v1/network"))
+            .header("Authorization", format!("Bearer {client_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_net.status(), 403);
+
+        // ...while an operator token is allowed.
+        let allowed = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", format!("Bearer {operator_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200, "operator must see operational views");
+
+        // The master is still allowed too.
+        let master = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", "Bearer master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), 200);
         manager.lock().await.shutdown().await.unwrap();
     }
 

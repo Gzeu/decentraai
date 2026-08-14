@@ -229,8 +229,9 @@ Everything is free; the tier reflects contribution. The master token in
 allowlists and rate limits, applied at the next request (no restart):
 
 ```bash
-decentraai token create --name alice --tier 1   # guest: allowlisted models only, 10 req/min
-decentraai token create --name bob --tier 2     # contributor: all models, 60 req/min
+decentraai token create --name alice --tier 1        # guest: allowlisted models only, 10 req/min
+decentraai token create --name bob --tier 2           # contributor: all models, 60 req/min
+decentraai token create --name ops --tier 2 --role operator  # operator: read-only operational views (H4)
 decentraai token list
 decentraai token revoke --name alice
 ```

@@ -305,6 +305,9 @@ enum TokenCommand {
         /// 1 = guest, 2 = contributor, 3 = core.
         #[arg(long)]
         tier: u8,
+        /// client (inference only) or operator (read-only operational views).
+        #[arg(long, default_value = "client")]
+        role: String,
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
@@ -2237,18 +2240,20 @@ fn token_command(command: TokenCommand) -> Result<()> {
     let logs_dir = data_dir.join("logs");
 
     match command {
-        TokenCommand::Create { name, tier, .. } => {
+        TokenCommand::Create { name, tier, role, .. } => {
             let tier = Tier::parse(tier)?;
-            let plaintext = store.create(&name, tier, None)?;
+            let role = decentraai_tokens::Role::parse(&role)?;
+            let plaintext = store.create_with_role(&name, tier, None, role)?;
             decentraai_audit::record_best_effort(
                 &logs_dir,
                 "token_created",
-                serde_json::json!({"name": name, "tier": tier.0}),
+                serde_json::json!({"name": name, "tier": tier.0, "role": role.name()}),
             );
             println!(
-                "Subscription token for '{name}' (tier {} — {}):",
+                "Subscription token for '{name}' (tier {} — {}, role {}):",
                 tier.0,
-                tier.name()
+                tier.name(),
+                role.name()
             );
             println!("  {plaintext}");
             println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
@@ -2260,8 +2265,8 @@ fn token_command(command: TokenCommand) -> Result<()> {
             for record in records {
                 let status = if record.revoked { "revoked" } else { "active" };
                 println!(
-                    "  {} (tier {}, {}) — created {}",
-                    record.name, record.tier, status, record.created_at
+                    "  {} (tier {}, role {}, {}) — created {}",
+                    record.name, record.tier, record.role.name(), status, record.created_at
                 );
             }
             if store.list().is_empty() {

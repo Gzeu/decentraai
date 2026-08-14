@@ -26,6 +26,45 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Tier(pub u8);
 
+/// Role bound to a subscription token (H4 role separation).
+///
+/// - `Client` — may run inference within its tier limits; no operational view.
+/// - `Operator` — read-only operational views (status, workers, network,
+///   execution, peers) but NOT token management.
+///
+/// The master API token is the `Admin` role (everything, incl. token
+/// create/revoke); it is not stored in this registry — it lives only in
+/// `runtime/api.token`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Client,
+    Operator,
+}
+
+impl Role {
+    pub const DEFAULT: Self = Self::Client;
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "client" | "operator" => {}, // fallthrough below
+            _ => bail!("role must be 'client' or 'operator'"),
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "client" => Ok(Self::Client),
+            _ => Ok(Self::Operator),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 impl Tier {
     pub const GUEST: Self = Self(1);
     pub const CONTRIBUTOR: Self = Self(2);
@@ -58,6 +97,9 @@ pub struct TokenRecord {
     /// Backward-compatible: older registries without the field are `None`.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Role bound to this token (H4). Backward-compatible default: client.
+    #[serde(default)]
+    pub role: Role,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,8 +167,20 @@ impl TokenStore {
 
     /// Issues a new token. Returns the plaintext — show it once, then
     /// forget it; only the hash is kept. `expires_at` (unix seconds) makes the
-    /// token stop working after that instant; `None` means no expiry.
+    /// token stop working after that instant; `None` means no expiry. The
+    /// token is bound to [`Role::DEFAULT`] (client).
     pub fn create(&mut self, name: &str, tier: Tier, expires_at: Option<u64>) -> Result<String> {
+        self.create_with_role(name, tier, expires_at, Role::DEFAULT)
+    }
+
+    /// Like [`create`](Self::create) but binds an explicit [`Role`] (H4).
+    pub fn create_with_role(
+        &mut self,
+        name: &str,
+        tier: Tier,
+        expires_at: Option<u64>,
+        role: Role,
+    ) -> Result<String> {
         let name = name.trim();
         if name.is_empty() {
             bail!("token name must not be empty");
@@ -145,10 +199,27 @@ impl TokenStore {
                 created_at: now_secs(),
                 revoked: false,
                 expires_at,
+                role,
             },
         );
         self.save()?;
         Ok(plaintext)
+    }
+
+    /// Reassigns an active token's role (H4). Returns the previous role and
+    /// persists atomically. No-ops if already at `role`.
+    pub fn set_role(&mut self, name: &str, role: Role) -> Result<Role> {
+        let entry = self
+            .tokens
+            .values_mut()
+            .find(|r| r.name == name && !r.revoked)
+            .with_context(|| format!("no active token named '{name}'"))?;
+        let from = entry.role;
+        if from != role {
+            entry.role = role;
+            self.save()?;
+        }
+        Ok(from)
     }
 
     /// Revokes by name (the admin knows names, not hashes).
@@ -314,5 +385,26 @@ mod tests {
         assert!(store.lookup(&live).is_some());
         let never = store.create("frank", Tier::GUEST, None).unwrap();
         assert!(store.lookup(&never).is_some());
+    }
+
+    #[test]
+    fn tokens_carry_a_role_and_set_role_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        // Default role is client.
+        let t = store.create("grace", Tier::GUEST, None).unwrap();
+        assert_eq!(store.lookup(&t).unwrap().role, Role::DEFAULT);
+        assert_eq!(store.lookup(&t).unwrap().role, Role::Client);
+
+        // Promote to operator; the change persists across reloads.
+        store.set_role("grace", Role::Operator).unwrap();
+        let reloaded = open(dir.path());
+        assert_eq!(reloaded.lookup(&t).unwrap().role, Role::Operator);
+        assert!(reloaded.lookup(&t).unwrap().role != Role::Client);
+
+        // Role parsing accepts both spellings and rejects others.
+        assert_eq!(Role::parse("client").unwrap(), Role::Client);
+        assert_eq!(Role::parse("OPERATOR").unwrap(), Role::Operator);
+        assert!(Role::parse("root").is_err());
     }
 }

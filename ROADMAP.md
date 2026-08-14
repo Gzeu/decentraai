@@ -376,7 +376,12 @@ release.
   hashes; signing keys live only in the node's identity; audit never logs them)
 - [x] Audit for login, pairing, revoke, routing and inference — per-request
   `inference_completed`/`inference_failed` (M10) and `replay_rejected` (P4)
-- [ ] Role separation: admin, operator, client, worker
+- [x] Role separation: admin, operator, client — tokens carry a `role`
+  (client/operator; the master token is admin). Client tokens may only run
+  inference within tier limits; operator tokens get read-only operational views
+  (`/v1/compute`, `/v1/network`, `/v1/execution`) but not token management;
+  the master token has everything. CLI `token create --role`, admin API `role`
+  field, and enforced API gates (H4)
 
 #### Phase 4: Control Plane and Frontend
 - [ ] Onboarding: create node, generate identity, pairing QR, health check
