@@ -2367,6 +2367,72 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn open_webui_openai_surface_round_trips_through_proxy() {
+        // Open WebUI connects to DecentraAI as an OpenAI-compatible backend:
+        // ``/v1/models`` (a list with data[].id) and ``/v1/chat/completions``
+        // (choices[].message.content + usage), both streamed or not. This test
+        // proves the proxy preserves those standard shapes verbatim (no
+        // wrapping, no field loss), so Open WebUI can consume the node as its
+        // Chat engine while the DecentraAI dashboard stays the control plane.
+        let dir = tempfile::tempdir().unwrap();
+        let og = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async {
+                    "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\",\"object\":\"model\"}]}"
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    "{\"object\":\"chat.completion\",\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello from the node\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}"
+                }),
+            );
+        let manager = test_manager_with(dir.path(), og).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // /v1/models: OpenAI list shape Open WebUI's model picker parses.
+        let models = client
+            .get(format!("http://{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        let mj: serde_json::Value = models.json().await.unwrap();
+        assert_eq!(mj["object"], "list");
+        assert_eq!(mj["data"][0]["id"], "tinyllama");
+
+        // /v1/chat/completions: standard chat.completion shape Open WebUI
+        // renders, with the assistant message content preserved.
+        let chat = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"tinyllama\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200);
+        let cj: serde_json::Value = chat.json().await.unwrap();
+        assert_eq!(cj["object"], "chat.completion");
+        assert_eq!(cj["choices"][0]["message"]["content"], "Hello from the node");
+        assert_eq!(cj["usage"]["total_tokens"], 8);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn proxy_enforces_bearer_token() {
         let dir = tempfile::tempdir().unwrap();
         let (api, manager) = start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
