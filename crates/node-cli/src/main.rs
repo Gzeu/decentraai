@@ -320,6 +320,9 @@ enum TokenCommand {
     },
     /// Show every issued token (active and revoked).
     List {
+        /// Emit the records as a compact JSON array instead of the human table.
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
@@ -2364,7 +2367,7 @@ fn token_command(command: TokenCommand) -> Result<()> {
     use decentraai_tokens::{Tier, TokenStore};
     let config_path = match &command {
         TokenCommand::Create { config, .. }
-        | TokenCommand::List { config }
+        | TokenCommand::List { config, .. }
         | TokenCommand::Revoke { config, .. } => config,
     };
     let config = NodeConfig::load(config_path)
@@ -2395,20 +2398,24 @@ fn token_command(command: TokenCommand) -> Result<()> {
             println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
             println!("Active at the next API request; no restart needed.");
         }
-        TokenCommand::List { .. } => {
+        TokenCommand::List { json, .. } => {
             let records = store.list();
-            println!("Subscription tokens ({}):", records.len());
-            for record in records {
-                let status = if record.revoked { "revoked" } else { "active" };
-                println!(
-                    "  {} (tier {}, role {}, {}) — created {}",
-                    record.name, record.tier, record.role.name(), status, record.created_at
-                );
-            }
-            if store.list().is_empty() {
-                println!(
-                    "  none yet — create one with: decentraai token create --name <n> --tier 1..3"
-                );
+            if json {
+                println!("{}", serde_json::to_string(&records)?);
+            } else {
+                println!("Subscription tokens ({}):", records.len());
+                for record in records {
+                    let status = if record.revoked { "revoked" } else { "active" };
+                    println!(
+                        "  {} (tier {}, role {}, {}) — created {}",
+                        record.name, record.tier, record.role.name(), status, record.created_at
+                    );
+                }
+                if store.list().is_empty() {
+                    println!(
+                        "  none yet — create one with: decentraai token create --name <n> --tier 1..3"
+                    );
+                }
             }
         }
         TokenCommand::Revoke { name, .. } => {
@@ -3557,6 +3564,28 @@ mod tests {
             cli.command,
             Command::Serve {
                 command: ServeCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_token_list_json_flag() {
+        let cli = Cli::try_parse_from(["decentraai", "token", "list", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token {
+                command: TokenCommand::List { json: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_token_list_default_no_json() {
+        let cli = Cli::try_parse_from(["decentraai", "token", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token {
+                command: TokenCommand::List { json: false, .. }
             }
         ));
     }
