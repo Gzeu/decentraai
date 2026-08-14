@@ -21,7 +21,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use decentraai_config::{GenerationSection, TiersSection};
+use decentraai_config::{GenerationSection, ResourceSection, TiersSection};
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::Serialize;
@@ -118,6 +118,8 @@ pub struct DashboardInfo {
     pub model_size_bytes: u64,
     /// Sampling defaults merged into inference requests (Q1).
     pub generation: GenerationSection,
+    /// Resource limits/guards from the config (Settings view).
+    pub resources: ResourceSection,
 }
 
 /// Shared proxy state.
@@ -591,12 +593,12 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
     // Resolve the backend URL from the live manager (not the startup-frozen
     // one) so a M24 engine auto-restart — which re-allocates an ephemeral
     // port — is reflected here instead of a stale address.
-    let (loaded, idle_secs, backend) = {
+    let (loaded, idle_secs, backend, respawns) = {
         let manager = state.manager.lock().await;
         let backend = manager
             .base_url()
             .unwrap_or_else(|| state.backend_url.clone());
-        (manager.is_loaded(), manager.idle_for().as_secs(), backend)
+        (manager.is_loaded(), manager.idle_for().as_secs(), backend, manager.respawns)
     };
     let snapshot = decentraai_system_probe::SystemSnapshot::collect();
     let gpu = match decentraai_system_probe::probe_gpu() {
@@ -641,8 +643,17 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "gpu": gpu,
         },
         "backend": backend,
+        "engine_respawns": respawns,
         "api_port": state.info.api_port,
         "node": node_info(&state.compute),
+        "resources": {
+            "reserve_cpu_cores": state.info.resources.reserve_cpu_cores,
+            "reserve_ram_mb": state.info.resources.reserve_ram_mb,
+            "memory_max_percent": state.info.resources.memory_max_percent,
+            "gpu_enabled": format!("{:?}", state.info.resources.gpu_enabled),
+            "gpu_max_vram_percent": state.info.resources.gpu_max_vram_percent,
+            "reserve_vram_mb": state.info.resources.reserve_vram_mb,
+        },
         "recent_events": recent_audit_events(&state.info.repo_root),
     });
     (
@@ -1198,7 +1209,12 @@ advBtn.addEventListener('click', () => {
 let token = '';
 try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
-const hist = [];
+// Conversation history is real and kept across page reloads (client-side, in
+// localStorage) so a refresh does not wipe the ongoing session. It is never
+// invented: only messages the node actually exchanged are stored.
+const HIST_KEY = 'decentraai.chat.history';
+let hist = [];
+try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
 const chatbox = document.getElementById('chat-history');
 const addMsg = (role, text) => {
   const div = document.createElement('div');
@@ -1209,6 +1225,11 @@ const addMsg = (role, text) => {
   chatbox.scrollTop = chatbox.scrollHeight;
   return div;
 };
+const saveHist = () => {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-24))); } catch (e) {}
+};
+// Restore persisted conversation from a previous page load.
+hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : (m.role === 'system' ? 'node' : 'user'), m.content || '(empty)'));
 // Streaming is the default; the checkbox lets a user fall back to a single
 // parsed HTTP response (useful with clients that do not read SSE).
 document.getElementById('chat-stream').checked = true;
@@ -1266,10 +1287,11 @@ document.getElementById('chat-send').addEventListener('click', async () => {
     }
     addMsg('node', answer || '(empty response)');
     hist.push({ role: 'assistant', content: answer || '' });
+    if (hist.length > 24) hist.splice(0, hist.length - 24);
+    saveHist();
     const dt = Math.round(performance.now() - t0);
     status.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
       (tokens != null ? ' &middot; ' + tokens + ' tokens' : '');
-    if (hist.length > 24) hist.splice(0, hist.length - 24);
   } catch (e) {
     addMsg('node', 'request failed: ' + e);
     status.textContent = 'failed';
@@ -1378,20 +1400,29 @@ async function refresh() {
     document.getElementById('set-discovery').textContent = 'mDNS / LAN (auto)';
     document.getElementById('set-trust').textContent = trustList ? trustList : 'not loaded';
     document.getElementById('set-model').textContent = esc(s.model || '') + ' / ' + esc((s.node && s.node.engine) || '');
-    const sys = s.system || {};
-    document.getElementById('set-cpu').textContent = sys.cpu_threads ? sys.cpu_threads + ' threads' : '&mdash;';
-    document.getElementById('set-ram').textContent = (sys.ram_total_gib ? Math.round(sys.ram_total_gib) + ' GiB total' : '&mdash;');
-    document.getElementById('set-gpu').textContent = sys.gpu ? (sys.gpu.name || 'GPU') + ' @ ' + sys.gpu.utilization_percent + '%' : '<span class="off">none</span>';
-
-    const ok = (cond) => cond ? '<span class="ok">ok</span>' : '<span class="off">stale/unknown</span>';
     document.getElementById('diag-health').innerHTML = s.model_loaded ? '<span class="ok">model loaded, node up</span>' : '<span class="off">model not loaded</span>';
     document.getElementById('diag-engine').innerHTML = s.backend ? '<code>' + esc(s.backend) + '</code>' : '<span class="off">none</span>';
+  // ---- resource limits + startup state in Settings (from real config/spec) ----
+  if (s && s.resources) {
+    const r = s.resources;
+    document.getElementById('set-cpu').textContent =
+      (s.system && s.system.cpu_threads ? s.system.cpu_threads + ' threads' : '&mdash;') +
+      ' &middot; reserve ' + r.reserve_cpu_cores + ' core(s)';
+    document.getElementById('set-ram').textContent =
+      (s.system && s.system.ram_total_gib ? Math.round(s.system.ram_total_gib) + ' GiB total' : '&mdash;') +
+      ' &middot; reserve ' + (Math.round((r.reserve_ram_mb||0)/1024)) + ' GiB';
+    document.getElementById('set-gpu').textContent =
+      (r.gpu_enabled || 'auto') + (r.gpu_max_vram_percent ? ' (vram cap ' + r.gpu_max_vram_percent + '%)' : '') +
+      (r.reserve_vram_mb ? ' reserve ' + Math.round((r.reserve_vram_mb||0)/1024) + ' GiB' : '');
   }
+  const diag = document.getElementById('diag-restarts');
+  diag.innerHTML = (s && s.engine_respawns > 0)
+    ? '<span class="bad">' + s.engine_respawns + ' auto-restart(s)</span> (M24 recovery)'
+    : '<span class="ok">0</span> auto-restarts (stable)';
   if (c) {
     document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
     document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
   }
-  document.getElementById('diag-restarts').innerHTML = 'see audit / recovery events below';
   if (n) {
     document.getElementById('diag-p2p').innerHTML = (n.connected || []).length + ' connected, ' + (n.links || []).length + ' measured link(s)';
   }
@@ -1531,6 +1562,18 @@ mod tests {
                 top_k: Some(40),
                 repeat_penalty: 1.1,
                 system_prompt: "Test system line.".to_string(),
+            },
+            resources: ResourceSection {
+                cpu_max_percent: 65,
+                reserve_cpu_cores: 2,
+                memory_max_percent: 60,
+                reserve_ram_mb: 4096,
+                gpu_enabled: decentraai_config::GpuPolicy::Auto,
+                gpu_max_vram_percent: 75,
+                reserve_vram_mb: 1536,
+                stop_gpu_temperature_celsius: 83,
+                max_upload_mbps: 20,
+                max_download_mbps: 80,
             },
         }
     }

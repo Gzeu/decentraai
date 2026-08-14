@@ -980,6 +980,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             model_name: model_name.clone(),
             model_size_bytes,
             generation: config.inference.generation.clone(),
+            resources: config.resources.clone(),
         };
         let token_store_path = config
             .tiers
@@ -1591,6 +1592,7 @@ async fn serve_start(
         model_name,
         model_size_bytes,
         generation: config.inference.generation.clone(),
+        resources: config.resources.clone(),
     };
     let token_store_path = config
         .tiers

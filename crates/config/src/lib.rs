@@ -140,7 +140,7 @@ pub struct StorageSection {
     pub auto_seed_verified_models: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceSection {
     pub cpu_max_percent: u8,
