@@ -465,7 +465,8 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
  decentraai token list                           # show issued tokens
  decentraai token revoke --name <n>              # revoke (effective next request)
  decentraai invite --addr <host:...>             # new-seat invite + guest token (P5)
- decentraai join "<addr /p2p/<peer-id> dsk_...>" # join from an invite (P5)
+decentraai join "<addr /p2p/<peer-id> dsk_...>" # join from an invite (P5)
+decentraai serve start --backend http://H:P    # Q3: local auth/tiers/queue + remote model
 ```
 
 ## Architecture highlights

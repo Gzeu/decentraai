@@ -63,10 +63,15 @@ tests green).
 
 ## Remaining (genuinely open) work
 
-- **M10** implementation phase (contracts control-plane hardening): not itemized
-  as acceptance-criteria gaps but left as the checklist's hardening phase.
-- **P6/other**: none active — the roadmap's remaining milestone-scoped items are
-  now checked or honestly annotated.
+- **Q3 — remote backend** was the last product-scoped milestone; it is now
+  implemented (`serve start --backend http://host:port`, see ROADMAP Q3).
+- **M10** implementation phase (contracts control-plane hardening): the
+  acceptance-criteria gaps are closed; the remaining hardening items (circuit
+  breaker, replay protection, announcement signing, QR/pairing-with-expiry,
+  role separation, OpenAPI/versioned contracts, Docker Compose) are honest
+  follow-up work, not claimed.
+- **M21/M22/M23** remain parked/foundation-only (distributed MoE, multi-engine,
+  autonomous planner) — deliberately not claimed complete.
 - Productization/installer, dashboard UI, subscription model: already done and
   outside the "finish remaining milestones" scope chosen for this plan.
 

@@ -185,6 +185,13 @@ enum ServeCommand {
         /// Explicit llama-server binary path (overrides env and PATH search).
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Q3: a remote OpenAI-compatible backend URL (e.g.
+        /// http://192.168.1.50:8080) instead of a local llama-server. This
+        /// station keeps auth/tiers/queue/dashboard while the model runs on
+        /// the stronger machine. Overrides `--model`/`--binary` (no local
+        /// engine is spawned or needed).
+        #[arg(long)]
+        backend: Option<String>,
     },
 }
 #[derive(Debug, Args)]
@@ -340,8 +347,9 @@ async fn main() -> Result<()> {
                     model,
                     config,
                     binary,
+                    backend,
                 },
-        } => serve_start(config, model, binary).await,
+        } => serve_start(config, model, binary, backend).await,
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
         Command::Worker(args) => worker_command(args),
@@ -1562,9 +1570,8 @@ async fn serve_start(
     config_path: PathBuf,
     model: Option<String>,
     binary: Option<PathBuf>,
+    backend: Option<String>,
 ) -> Result<()> {
-    use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
-    use decentraai_runtime::queue::InferenceQueue;
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
@@ -1574,9 +1581,50 @@ async fn serve_start(
 
     let config = NodeConfig::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
-    ensure_admitted(&config)?;
 
     let data_dir = expand_tilde(&config.node.data_dir);
+    let idle_timeout =
+        Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+
+    // Q3 remote backend: the model runs on a remote OpenAI-compatible
+    // server; this node keeps auth/tiers/queue/dashboard local. No local
+    // llama-server is spawned or probed, and no local model/GPU is needed —
+    // inference admission and the engine process are the remote machine's job.
+    if let Some(remote) = backend {
+        if !remote.starts_with("http://") && !remote.starts_with("https://") {
+            anyhow::bail!(
+                "--backend must be an http(s) URL, e.g. http://192.168.1.50:8080 (got {remote})"
+            );
+        }
+        let backend_url = remote;
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(idle_timeout)));
+        // No round-trip health probe here (a dead remote would block boot and
+        // the proxy already surfaces 503 for an unreachable backend); the
+        // remote is used as configured.
+        let model_name = model
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("remote")
+            .to_string();
+        let _api_addr = serve_common(
+            &config,
+            backend_url,
+            manager.clone(),
+            model_name,
+            0,
+            data_dir.clone(),
+            config.inference.bind_address.clone(),
+            config.inference.api_port,
+            true,
+        )
+        .await?;
+        tokio::signal::ctrl_c().await?;
+        manager.lock().await.shutdown().await?;
+        return Ok(());
+    }
+
+    ensure_admitted(&config)?;
+
     let registry_path = data_dir.join("db/registry.json");
     if !registry_path.exists() {
         anyhow::bail!(
@@ -1614,8 +1662,6 @@ async fn serve_start(
 
     let server = LlamaServer::spawn(&binary, &runtime).await?;
     let backend_url = server.base_url();
-    let idle_timeout =
-        Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
     let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));
 
     // Idle watcher: unloads the model after the configured timeout.
@@ -1632,6 +1678,49 @@ async fn serve_start(
         }
     });
 
+    let api_addr = serve_common(
+        &config,
+        backend_url,
+        manager.clone(),
+        model_name,
+        model_size_bytes,
+        data_dir,
+        config.inference.bind_address.clone(),
+        config.inference.api_port,
+        false,
+    )
+    .await?;
+
+    println!(
+        "  Model: {}\n  Threads: {} (logical CPUs minus reserve)",
+        model_path.display(),
+        runtime.threads.unwrap_or(0),
+    );
+    tokio::signal::ctrl_c().await?;
+    manager.lock().await.shutdown().await?;
+    let _ = api_addr;
+    Ok(())
+}
+
+/// Shared tail for `serve start` (local engine and Q3 remote backend): builds
+/// the dashboard/API state, serves it, and returns the bound API socket addr.
+/// The caller is responsible for blocking until Ctrl+C and shutting down.
+#[allow(clippy::too_many_arguments)]
+async fn serve_common(
+    config: &NodeConfig,
+    backend_url: String,
+    manager: Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>,
+    model_name: String,
+    model_size_bytes: u64,
+    data_dir: std::path::PathBuf,
+    bind_address: String,
+    api_port: u16,
+    remote: bool,
+) -> Result<std::net::SocketAddr> {
+    use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
+    use decentraai_runtime::queue::InferenceQueue;
+    use std::time::Duration;
+
     let token = if config.inference.api_auth_required {
         Some(ensure_api_token(&data_dir.join("runtime/api.token"))?)
     } else {
@@ -1642,16 +1731,13 @@ async fn serve_start(
         reputation_path: Some(data_dir.join("db/reputation.json")),
         max_invalid_chunks: config.security.max_invalid_chunks_per_peer,
         ban_duration: Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60),
-        api_port: config.inference.api_port,
+        api_port,
         model_name,
         model_size_bytes,
         generation: config.inference.generation.clone(),
         resources: config.resources.clone(),
     };
-    let token_store_path = config
-        .tiers
-        .as_ref()
-        .map(|_| data_dir.join("db/tokens.json"));
+    let token_store_path = config.tiers.as_ref().map(|_| data_dir.join("db/tokens.json"));
     // Q2: one request at a time reaches the backend with the machine's
     // full resources; the waiting room and wait limit come from config.
     let queue = InferenceQueue::new(
@@ -1659,7 +1745,7 @@ async fn serve_start(
         Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
     );
     let state = ApiState::new(
-        backend_url,
+        backend_url.clone(),
         token.clone(),
         manager.clone(),
         info,
@@ -1669,18 +1755,13 @@ async fn serve_start(
         None,
         None,
     );
-    let api_addr = serve_api(
-        state,
-        &config.inference.bind_address,
-        config.inference.api_port,
-    )
-    .await?;
+    let api_addr = serve_api(state, &bind_address, api_port).await?;
 
     decentraai_audit::record_best_effort(
         &data_dir.join("logs"),
-        "inference_started",
+        if remote { "remote_backend_started" } else { "inference_started" },
         serde_json::json!({
-            "model": model_path.display().to_string(),
+            "backend": backend_url,
             "api": api_addr.to_string(),
         }),
     );
@@ -1697,21 +1778,22 @@ async fn serve_start(
     } else {
         "tiers: off (add a tiers: section to the config to enable subscriptions)"
     };
+    let mode_hint = if remote {
+        format!("remote backend (no local engine): {backend_url}")
+    } else {
+        format!("local llama-server: {backend_url}  idle unload: {} min", config.inference.idle_model_unload_minutes)
+    };
     println!(
-        "DecentraAI inference running\n  Model: {}\n  Threads: {} (logical CPUs minus reserve)\n  Queue: FIFO, {} waiting slots, {}s wait limit (dashboard shows it live)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Idle unload: {} min\n  Press Ctrl+C to stop",
-        model_path.display(),
-        runtime.threads.unwrap_or(0),
+        "DecentraAI inference running\n  Mode: {}\n  Queue: FIFO, {} waiting slots, {}s wait limit (dashboard shows it live)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Press Ctrl+C to stop",
+        mode_hint,
         config.inference.queue_max_requests,
         config.inference.request_timeout_seconds,
         api_addr,
         api_addr,
         auth_hint,
         tiers_hint,
-        config.inference.idle_model_unload_minutes
     );
-    tokio::signal::ctrl_c().await?;
-    manager.lock().await.shutdown().await?;
-    Ok(())
+    Ok(api_addr)
 }
 
 /// Pulls a model from a peer: fetch its catalog, pick the model,
@@ -3236,6 +3318,28 @@ mod tests {
                 command: ServeCommand::Start { .. }
             }
         ));
+    }
+
+    #[test]
+    fn parse_serves_remote_backend_flag() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "serve",
+            "start",
+            "--backend",
+            "http://192.168.1.50:8080",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve {
+                command:
+                    ServeCommand::Start {
+                        backend: Some(url),
+                        ..
+                    },
+            } => assert_eq!(url, "http://192.168.1.50:8080"),
+            other => panic!("expected remote-backend Start, got {other:?}"),
+        }
     }
 
     #[test]

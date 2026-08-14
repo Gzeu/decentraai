@@ -1759,6 +1759,40 @@ mod tests {
         (api, manager)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_backend_proxy_forwards_to_configured_url_when_manager_unloaded() {
+        // Q3: `serve start --backend http://host:port` keeps auth/tiers/queue
+        // local but runs the model on a remote OpenAI-compatible server. With
+        // no local engine, the proxy must fall back to `state.backend_url`
+        // (the remote) rather than fail: an unloaded manager's `base_url()` is
+        // None, so the proxy forwards to the configured backend.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(3600))));
+        assert!(!manager.lock().await.is_loaded(), "remote mode has no local engine");
+        assert!(manager.lock().await.base_url().is_none());
+
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        // A metadata GET must round-trip to the remote backend.
+        let resp = reqwest::get(format!("http://{api}/v1/models")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("\"list\""));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
     #[test]
     fn generation_defaults_fill_only_missing_fields() {
         let generation = GenerationSection {

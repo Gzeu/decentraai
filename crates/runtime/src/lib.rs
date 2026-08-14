@@ -360,6 +360,23 @@ impl ServeManager {
         }
     }
 
+    /// A manager with no local engine (Q3 remote backend). Used when the
+    /// model runs on a `serve start --backend http://host:port` and this
+    /// node only keeps auth/tiers/queue/dashboard local. `base_url()` returns
+    /// `None`, so the proxy falls back to `state.backend_url`; `is_loaded()`
+    /// is `false` and the idle watcher exits immediately (no local model to
+    /// unload).
+    pub fn unloaded(idle_timeout: Duration) -> Self {
+        Self {
+            server: None,
+            idle_timeout,
+            last_activity: Instant::now(),
+            binary: None,
+            restart_config: None,
+            respawns: 0,
+        }
+    }
+
     /// Supplies the binary + config needed to respawn the engine (M24 engine
     /// supervisor). Auto-restart stays disabled until this is set.
     pub fn set_restart_spec(&mut self, binary: PathBuf, config: RuntimeConfig) {

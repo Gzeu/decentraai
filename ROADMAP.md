@@ -60,9 +60,12 @@
 - [x] Q2: fair FIFO queue for inference requests — one request at a
   time reaches the backend with full resources, 503/504 on full/timeout,
   Queue card on the dashboard shows serving + waiting live
-- [ ] Q3: remote backend (`serve start --backend http://host:port`) —
-  a weaker station keeps auth/tiers/queue while a stronger machine runs
-  the model
+- [x] Q3: remote backend (`serve start --backend http://host:port`) —
+  a weaker station keeps auth/tiers/queue/dashboard while a stronger machine
+  runs the model. No local llama-server is spawned or probed; the proxy falls
+  back to `state.backend_url` (the remote) when the manager is unloaded, and
+  the local node surfaces 503 for an unreachable backend (`remote_backend_started`
+  audit event)
 - [x] Q4: onboarding wizard (`decentraai setup`) writing a validated
   config on first run
 
