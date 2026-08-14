@@ -269,6 +269,14 @@ impl std::fmt::Debug for LlamaServer {
     }
 }
 
+/// Serializes llama-server subprocess spawns process-wide. Under parallel test
+/// spawn an `execve` can transiently see a freshly-written script as "busy"
+/// (ETXTBSY, os error 26); holding this lock while spawning makes each spawn
+/// happen one at a time, which fully eliminates that race. Production impact is
+/// nil (the node spawns at most one engine at boot, and the lock is held only
+/// for the brief synchronous `Command::spawn`).
+static ENGINE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl LlamaServer {
     /// Spawns the child without waiting for readiness (exposed for tests).
     pub fn start(binary: &Path, config: &RuntimeConfig) -> Result<Self> {
@@ -278,15 +286,32 @@ impl LlamaServer {
         };
         let args = server_args(config, port);
         info!(binary = %binary.display(), port, "starting llama-server");
-        let child = Command::new(binary)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawning {}", binary.display()))?;
+        // Hold the process-wide spawn lock + retry briefly on ETXTBSY
+        // (os error 26): under parallel test spawn a concurrent exec can
+        // transiently see the executable/script as busy. Serializing the brief
+        // spawn (plus a small backoff) eliminates the flake deterministically.
+        let _guard = ENGINE_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = None;
+        for attempt in 0..5 {
+            let spawn = Command::new(binary)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match spawn {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 4 => {
+                    std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+                }
+                Err(e) => return Err(e).context(format!("spawning {}", binary.display())),
+            }
+        }
         Ok(Self {
-            child,
+            child: child.expect("engine spawn retries exhausted"),
             host: config.bind_host.clone(),
             port,
         })
