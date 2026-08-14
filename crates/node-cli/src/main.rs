@@ -883,6 +883,14 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
         cm.set_signing_key(identity.signing_key_bytes());
     }
+    // M22: if the config selects an alternative engine, advertise it honestly
+    // so coordinators' planners reason engine-aware instead of assuming
+    // llama-server. llama-server stays the default when unset.
+    if let Some(engine) = config.inference.engine.as_deref() {
+        if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+            cm.set_engine(engine);
+        }
+    }
     compute_manager
         .set_allow_provisioning(config.sharing.provision_models_on_demand)
         .await;
@@ -1600,6 +1608,7 @@ async fn serve_start(
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
+    use decentraai_inference_adapter::{BackendConfig, EngineKind, OpenAiCompatibleBackend};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -1615,13 +1624,61 @@ async fn serve_start(
     // server; this node keeps auth/tiers/queue/dashboard local. No local
     // llama-server is spawned or probed, and no local model/GPU is needed —
     // inference admission and the engine process are the remote machine's job.
-    if let Some(remote) = backend {
+    // The remote is selected by the `--backend` flag or, when absent, by
+    // `inference.backend_url` (M22).
+    let remote = backend.or_else(|| config.inference.backend_url.clone());
+    if let Some(remote) = remote {
         if !remote.starts_with("http://") && !remote.starts_with("https://") {
             anyhow::bail!(
                 "--backend must be an http(s) URL, e.g. http://192.168.1.50:8080 (got {remote})"
             );
         }
         let backend_url = remote;
+        // M22: engine-kind selection + honest capability probe. When the
+        // configured `inference.engine` selects a non-llama engine, build a
+        // real probe backend and inspect the live endpoint once at startup,
+        // logging the honest (possibly conservative) result. llama-server
+        // stays the default and this probe only runs for an opt-in
+        // alternative engine.
+        let engine = config
+            .inference
+            .engine
+            .as_deref()
+            .map(EngineKind::parse)
+            .unwrap_or(EngineKind::LlamaServer);
+        if engine != EngineKind::LlamaServer {
+            match OpenAiCompatibleBackend::new(BackendConfig {
+                base_url: backend_url.clone(),
+                model: "remote".to_string(),
+                api_key: None,
+                connect_timeout: Duration::from_secs(3),
+                request_timeout: Duration::from_secs(300),
+                max_prompt_bytes: 200_000,
+                max_output_tokens: 8192,
+                engine,
+            }) {
+                Ok(probe) => {
+                    let caps = probe.probe_capabilities().await;
+                    tracing::info!(
+                        engine = %engine.as_str(),
+                        base_url = %backend_url,
+                        streaming = caps.streaming,
+                        kv_report = caps.kv_report,
+                        prefill_decode_separation = caps.prefill_decode_separation,
+                        expert_routing = caps.expert_routing,
+                        tensor_parallel = caps.tensor_parallel,
+                        "M22 probed non-llama backend capabilities (best-effort, not production-verified)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        engine = %engine.as_str(),
+                        "M22 failed to build probe backend; continuing with configured URL"
+                    );
+                }
+            }
+        }
         let manager = Arc::new(Mutex::new(ServeManager::unloaded(idle_timeout)));
         // No round-trip health probe here (a dead remote would block boot and
         // the proxy already surfaces 503 for an unreachable backend); the
@@ -2662,6 +2719,13 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // P3: sign this node's advertisements so recipients authenticate them.
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
         cm.set_signing_key(identity.signing_key_bytes());
+    }
+    // M22: advertise the configured engine kind honestly rather than assuming
+    // llama-server (which remains the default when unset).
+    if let Some(engine) = config.inference.engine.as_deref() {
+        if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+            cm.set_engine(engine);
+        }
     }
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model

@@ -48,6 +48,16 @@ inference:
   queue_max_requests: 20
   idle_model_unload_minutes: 15
   api_port: 8080
+  # M22 (multi-engine, opt-in and best-effort — NOT production-verified).
+  # `engine` is the engine-kind string advertised for this node's workers;
+  # wire values: llama-server, vllm, sglang, ollama, openai-compatible.
+  # Unset (default) advertises and runs llama-server exactly as before.
+  # engine: "vllm"
+  # `backend_url` selects a remote OpenAI-compatible backend for `serve start`
+  # instead of a local llama-server (same as `--backend`). Must start with
+  # http:// or https://. Only meaningful together with a non-llama `engine`;
+  # llama-server (the default) is always spawned locally.
+  # backend_url: "http://192.168.1.50:8000"
   # Sampling defaults applied when a request omits them (Q1). Small
   # models answer far more coherently with sampling + a system line.
   generation:

@@ -309,6 +309,16 @@ impl ComputeManager {
         self.advertisement_interval_ms = ms;
     }
 
+    /// Sets the advertised engine-kind string (M22). Defaults to
+    /// [`ENGINE_LLAMA_SERVER`]; recording llama-server runs regardless. Call
+    /// this only when the config explicitly selects an alternative engine so
+    /// the node honestly advertises what it actually runs and coordinators'
+    /// planners can reason engine-aware. The value uses the engine fabric's
+    /// wire strings (`vllm`, `sglang`, `ollama`, `openai-compatible`).
+    pub fn set_engine(&mut self, engine: &str) {
+        self.engine = engine.to_string();
+    }
+
     /// Marks `peer` as trusted (eligible to run workloads).
     pub async fn add_trusted(&self, peer: PeerId) {
         self.scheduler.lock().await.add_trusted(peer);
@@ -1134,6 +1144,32 @@ mod tests {
         let spec = adv.capability.gpu.unwrap();
         assert_eq!(spec.name, "RTX 4090");
         assert_eq!(spec.vram_mb, 24564);
+    }
+
+    #[tokio::test]
+    async fn set_engine_advertises_and_parses_real_kind() {
+        let p = peer();
+        let mut manager = ComputeManager::new(p, "n".into(), HashSet::from([p]));
+        // Default is llama-server until an engine is explicitly selected.
+        manager
+            .advertise_local(snapshot(), gpu(), vec![model()], false)
+            .await;
+        assert_eq!(
+            manager.last_local_advertisement_sync().unwrap().capability.engine,
+            ENGINE_LLAMA_SERVER
+        );
+
+        // Selecting vLLM changes the advertised engine and the fabric facts
+        // parse it back to the honest kind (M22).
+        manager.set_engine("vllm");
+        manager
+            .advertise_local(snapshot(), gpu(), vec![model()], false)
+            .await;
+        let adv = manager.last_local_advertisement_sync().unwrap();
+        assert_eq!(adv.capability.engine, "vllm");
+        let facts = manager.fabric_facts("abc").await;
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].engine, decentraai_fabric::EngineKind::Vllm);
     }
 
     #[test]
