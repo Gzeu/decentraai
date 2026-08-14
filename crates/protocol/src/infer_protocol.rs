@@ -233,7 +233,7 @@ impl WorkerStatus {
 }
 
 /// Task placement result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskPlacement {
     pub selected_worker: PeerId,
     pub estimated_wait_ms: u32,
@@ -251,4 +251,28 @@ pub struct WorkerAnnouncement {
     pub queue_depth: u32,
     pub tokens_per_second: u32,
     pub current_latency_ms: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_placement_serde_round_trip() {
+        let original = TaskPlacement {
+            selected_worker: PeerId::random(),
+            estimated_wait_ms: 120,
+            estimated_time_ms: 5000,
+            confidence: 0.95,
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize should succeed");
+        let decoded: TaskPlacement =
+            serde_json::from_str(&json).expect("deserialize should succeed");
+
+        assert_eq!(decoded.selected_worker, original.selected_worker);
+        assert_eq!(decoded.estimated_wait_ms, original.estimated_wait_ms);
+        assert_eq!(decoded.estimated_time_ms, original.estimated_time_ms);
+        assert_eq!(decoded.confidence, original.confidence);
+    }
 }
