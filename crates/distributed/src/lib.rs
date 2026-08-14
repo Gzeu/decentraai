@@ -103,7 +103,8 @@ pub use worker::WorkerManager;
 
 /// Re-export protocol types for convenience
 pub use decentraai_protocol::{
-    InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
+    InferErrorCode, InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement,
+    WorkerStatus,
 };
 
 /// Builds a serving backend for a downloaded model file (M14 on-demand
@@ -186,6 +187,7 @@ pub struct ProvisioningConfig {
 
 /// Module for error types
 mod error {
+    use decentraai_protocol::InferErrorCode;
     use thiserror::Error;
 
     #[derive(Debug, Error)]
@@ -221,6 +223,28 @@ mod error {
         /// nothing was produced.
         pub fn is_retryable(&self) -> bool {
             matches!(self, DistributedError::P2PError(_) | DistributedError::RequestTimeout(_))
+        }
+
+        /// Stable machine-readable classification of this failure (M10
+        /// Phase-1). Lets `/metrics`, logs and clients categorize an error
+        /// without parsing the human-readable string. Maps directly to an
+        /// [`InferErrorCode`] for populating `InferFailed` frames.
+        pub fn code(&self) -> InferErrorCode {
+            match self {
+                DistributedError::NoWorkersAvailable(_) => InferErrorCode::NoWorkers,
+                DistributedError::AllWorkersFailed(_) => InferErrorCode::AllWorkersFailed,
+                DistributedError::RequestTimeout(_) => InferErrorCode::Timeout,
+                DistributedError::WorkerRejected(_, _) => InferErrorCode::Rejected,
+                DistributedError::P2PError(_) => InferErrorCode::Transport,
+                DistributedError::SerializationError(_) => InferErrorCode::Serialization,
+                DistributedError::UntrustedWorker(_) => InferErrorCode::Untrusted,
+            }
+        }
+    }
+
+    impl From<&DistributedError> for InferErrorCode {
+        fn from(e: &DistributedError) -> Self {
+            e.code()
         }
     }
 }
@@ -705,6 +729,7 @@ impl DistributedInference {
                                     describe_admit_reason(reason)
                                 ),
                                 retryable: true,
+                                code: Some(InferErrorCode::Capacity),
                             };
                             return serialize_message(&failed);
                         }
@@ -742,6 +767,7 @@ impl DistributedInference {
                             "worker queue is full (backpressure)".to_string()
                         },
                         retryable: !shutting_down,
+                        code: Some(InferErrorCode::Capacity),
                     };
                     return serialize_message(&failed);
                 }
@@ -799,6 +825,7 @@ impl DistributedInference {
                                 worker_peer_id: local_peer,
                                 error: "request timed out waiting in worker queue".to_string(),
                                 retryable: true,
+                                code: Some(InferErrorCode::Timeout),
                             }) {
                                 let _ = p2p_clone
                                     .request(swept.request.sender_peer_id, bytes)
@@ -828,6 +855,7 @@ impl DistributedInference {
                         worker_peer_id: local_peer,
                         error: "worker queue is full".to_string(),
                         retryable: true,
+                        code: Some(InferErrorCode::Capacity),
                     }) {
                         let _ = p2p_clone.request(req.sender_peer_id, bytes).await;
                     }
@@ -1331,6 +1359,7 @@ async fn stream_request_to_terminal(
                     worker_peer_id: local_peer,
                     error: format!("backend error: {e}"),
                     retryable: true,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -1373,6 +1402,7 @@ async fn stream_request_to_terminal(
                         worker_peer_id: local_peer,
                         error: format!("backend error: {e}"),
                         retryable: true,
+                        code: Some(InferErrorCode::Engine),
                     },
                 )
                 .await;
@@ -1388,6 +1418,7 @@ async fn stream_request_to_terminal(
                         worker_peer_id: local_peer,
                         error: "cancelled".to_string(),
                         retryable: false,
+                        code: Some(InferErrorCode::Cancelled),
                     },
                 )
                 .await;
@@ -1515,6 +1546,7 @@ async fn provision_on_demand(prov: &ProvisioningConfig, ctx: Provisioner, req: I
                     worker_peer_id: local_peer,
                     error: format!("model provisioning failed: {e}"),
                     retryable: false,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -1554,6 +1586,7 @@ async fn provision_on_demand(prov: &ProvisioningConfig, ctx: Provisioner, req: I
                     worker_peer_id: local_peer,
                     error: format!("provisioned engine failed to start: {e}"),
                     retryable: true,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -1590,6 +1623,7 @@ async fn serve_provisioned_request(
             worker_peer_id: local_peer,
             error: "worker queue is full".to_string(),
             retryable: true,
+            code: Some(InferErrorCode::Capacity),
         }) {
             let _ = p2p.request(req.sender_peer_id, bytes).await;
         }
@@ -1719,6 +1753,45 @@ mod tests {
         assert!(!DistributedError::WorkerRejected("w".into(), "cancelled".into()).is_retryable());
         assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
         assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
+    }
+
+    #[test]
+    fn distributed_error_maps_to_stable_error_code() {
+        use decentraai_protocol::InferErrorCode as Code;
+        // Required category coverage (stable, non-retryable rejection).
+        let rejected = DistributedError::WorkerRejected("w".into(), "busy".into());
+        assert_eq!(rejected.code(), Code::Rejected);
+        assert!(!rejected.is_retryable());
+        assert_eq!(Code::from(&rejected), Code::Rejected);
+
+        assert_eq!(
+            DistributedError::RequestTimeout(1000).code(),
+            Code::Timeout
+        );
+        assert_eq!(
+            DistributedError::P2PError(anyhow::anyhow!("conn refused")).code(),
+            Code::Transport
+        );
+        assert_eq!(
+            DistributedError::NoWorkersAvailable("m".into()).code(),
+            Code::NoWorkers
+        );
+        assert_eq!(
+            DistributedError::AllWorkersFailed("r".into()).code(),
+            Code::AllWorkersFailed
+        );
+        assert_eq!(
+            DistributedError::SerializationError("bad".into()).code(),
+            Code::Serialization
+        );
+        assert_eq!(
+            DistributedError::UntrustedWorker("w".into()).code(),
+            Code::Untrusted
+        );
+        // Token strings are stable for logging/metrics/clients.
+        assert_eq!(rejected.code().code(), "rejected");
+        assert_eq!(Code::Timeout.code(), "timeout");
+        assert_eq!(Code::Transport.code(), "transport");
     }
 
     #[tokio::test]

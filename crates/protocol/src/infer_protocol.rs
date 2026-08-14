@@ -159,6 +159,63 @@ pub struct InferProgress {
     pub percent_complete: f32,
 }
 
+/// Stable, machine-readable classification of an inference failure
+/// (M10 Phase-1 "error codes").
+///
+/// Carried on the wire as the `code` field of [`InferMessage::InferFailed`].
+/// Tokens returned by [`InferErrorCode::code`] are stable and lowercase so
+/// `/metrics`, logs and clients can categorize failures without parsing free
+/// text. Backward-compatible: an `InferFailed` frame without the `code` field
+/// deserializes to `None`; a new frame that carries it supersedes the string
+/// for programmatic consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferErrorCode {
+    /// No candidate worker was available for the requested model.
+    NoWorkers,
+    /// Every candidate worker failed for the request.
+    AllWorkersFailed,
+    /// The request exceeded its deadline.
+    Timeout,
+    /// The worker explicitly rejected the request (non-retryable).
+    Rejected,
+    /// The worker was not a trusted peer.
+    Untrusted,
+    /// A P2P / transport-level communication failure.
+    Transport,
+    /// A serialization/deserialization failure.
+    Serialization,
+    /// The worker lacked capacity / its queue was full / it was shutting down.
+    Capacity,
+    /// The inference engine (backend) failed.
+    Engine,
+    /// The request was cancelled by the requester.
+    Cancelled,
+    /// The failure did not map to a known category.
+    Unknown,
+}
+
+impl InferErrorCode {
+    /// Stable lowercase token used in logs, `/metrics` and by clients. These
+    /// strings are part of the public contract and must not change meaning
+    /// once released.
+    pub fn code(self) -> &'static str {
+        match self {
+            InferErrorCode::NoWorkers => "no_workers",
+            InferErrorCode::AllWorkersFailed => "all_workers_failed",
+            InferErrorCode::Timeout => "timeout",
+            InferErrorCode::Rejected => "rejected",
+            InferErrorCode::Untrusted => "untrusted",
+            InferErrorCode::Transport => "transport",
+            InferErrorCode::Serialization => "serialization",
+            InferErrorCode::Capacity => "capacity",
+            InferErrorCode::Engine => "engine",
+            InferErrorCode::Cancelled => "cancelled",
+            InferErrorCode::Unknown => "unknown",
+        }
+    }
+}
+
 /// P2P inference message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -186,6 +243,12 @@ pub enum InferMessage {
         worker_peer_id: PeerId,
         error: String,
         retryable: bool,
+        /// Stable machine-readable classification of the failure (M10
+        /// Phase-1). `None` on a legacy frame that predates this field; a new
+        /// frame that carries it supersedes the free-text `error` for
+        /// programmatic consumers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<InferErrorCode>,
     },
 
     /// Cancel request
@@ -256,6 +319,61 @@ pub struct WorkerAnnouncement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn infer_error_code_tokens_are_stable_lowercase() {
+        assert_eq!(InferErrorCode::NoWorkers.code(), "no_workers");
+        assert_eq!(InferErrorCode::AllWorkersFailed.code(), "all_workers_failed");
+        assert_eq!(InferErrorCode::Timeout.code(), "timeout");
+        assert_eq!(InferErrorCode::Rejected.code(), "rejected");
+        assert_eq!(InferErrorCode::Untrusted.code(), "untrusted");
+        assert_eq!(InferErrorCode::Transport.code(), "transport");
+        assert_eq!(InferErrorCode::Serialization.code(), "serialization");
+        assert_eq!(InferErrorCode::Capacity.code(), "capacity");
+        assert_eq!(InferErrorCode::Engine.code(), "engine");
+        assert_eq!(InferErrorCode::Cancelled.code(), "cancelled");
+        assert_eq!(InferErrorCode::Unknown.code(), "unknown");
+    }
+
+    #[test]
+    fn infer_failed_with_code_round_trips() {
+        let failed = InferMessage::InferFailed {
+            request_id: Uuid::new_v4(),
+            worker_peer_id: PeerId::random(),
+            error: "backend error: oom".to_string(),
+            retryable: true,
+            code: Some(InferErrorCode::Engine),
+        };
+        let json = serde_json::to_string(&failed).expect("serialize should succeed");
+        let decoded: InferMessage =
+            serde_json::from_str(&json).expect("deserialize should succeed");
+        let decoded = match decoded {
+            InferMessage::InferFailed { code, .. } => code,
+            other => panic!("expected InferFailed, got {other:?}"),
+        };
+        assert_eq!(decoded, Some(InferErrorCode::Engine));
+    }
+
+    #[test]
+    fn infer_failed_without_code_deserializes_to_none() {
+        // Legacy frame: no `code` field. Must deserialize to `None` so
+        // backward-compatible peers keep working unchanged.
+        let peer_json = serde_json::to_string(&PeerId::random()).expect("peer serializable");
+        let legacy = format!(
+            r#"{{"type":"infer_failed","payload":{{
+                "request_id":"00000000-0000-0000-0000-000000000000",
+                "worker_peer_id":{peer_json},
+                "error":"worker queue is full",
+                "retryable":true
+            }}}}"#
+        );
+        let decoded: InferMessage =
+            serde_json::from_str(&legacy).expect("legacy frame must parse");
+        match decoded {
+            InferMessage::InferFailed { code, .. } => assert_eq!(code, None),
+            other => panic!("expected InferFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn task_placement_serde_round_trip() {

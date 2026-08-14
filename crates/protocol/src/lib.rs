@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod infer_protocol;
 
 pub use infer_protocol::{
-    InferMessage, InferProgress, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement,
-    WorkerStatus,
+    InferErrorCode, InferMessage, InferProgress, InferRequest, InferResponse, TaskPlacement,
+    WorkerAnnouncement, WorkerStatus,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
