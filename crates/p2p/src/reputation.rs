@@ -114,7 +114,11 @@ impl ReputationStore {
     /// The ban expiry timestamp if the peer is banned right now.
     pub fn banned_until(&self, peer: &PeerId) -> Option<u64> {
         let until = self.scores.get(&peer.to_string())?.banned_until?;
-        if until > now_secs() { Some(until) } else { None }
+        if until > now_secs() {
+            Some(until)
+        } else {
+            None
+        }
     }
 
     pub fn is_banned(&self, peer: &PeerId) -> bool {
@@ -150,9 +154,7 @@ impl ReputationStore {
             .scores
             .iter()
             .map(|(peer_id, entry)| {
-                let banned = entry
-                    .banned_until
-                    .is_some_and(|until| until > now_secs());
+                let banned = entry.banned_until.is_some_and(|until| until > now_secs());
                 PeerSummary {
                     peer_id: peer_id.clone(),
                     verified: entry.verified_chunks,
@@ -254,7 +256,11 @@ mod tests {
         store.record_failure(&peer);
         assert!(store.is_banned(&peer));
         assert!(store.banned_until(&peer).is_some());
-        assert_eq!(store.failures(&peer), 0, "counter resets so the score can recover");
+        assert_eq!(
+            store.failures(&peer),
+            0,
+            "counter resets so the score can recover"
+        );
     }
 
     #[test]
@@ -263,7 +269,10 @@ mod tests {
         let mut store = open_store(dir.path(), 1, 0);
         let peer = PeerId::random();
         store.record_failure(&peer);
-        assert!(!store.is_banned(&peer), "a zero-length ban expires immediately");
+        assert!(
+            !store.is_banned(&peer),
+            "a zero-length ban expires immediately"
+        );
     }
 
     #[test]
@@ -337,7 +346,11 @@ mod tests {
         store.record_failure(&bad);
         let summaries = store.summaries();
         assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].peer_id, good.to_string(), "highest score first");
+        assert_eq!(
+            summaries[0].peer_id,
+            good.to_string(),
+            "highest score first"
+        );
         assert_eq!(summaries[0].score, 2.0);
         assert!(!summaries[0].banned);
         assert_eq!(summaries[1].peer_id, bad.to_string());

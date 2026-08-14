@@ -1,13 +1,18 @@
 [workspace]
 members = [
   "crates/audit",
+  "crates/compute",
   "crates/config",
   "crates/discovery",
+  "crates/distributed",
+  "crates/fabric",
   "crates/identity",
+  "crates/inference-adapter",
   "crates/manifest",
   "crates/monitoring",
   "crates/node-cli",
   "crates/p2p",
+  "crates/p2p-invoke",
   "crates/protocol",
   "crates/registry",
   "crates/runtime",
@@ -17,7 +22,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -47,5 +52,5 @@ tempfile = "3.15"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "io-util", "fs", "sync", "signal", "process", "net"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }

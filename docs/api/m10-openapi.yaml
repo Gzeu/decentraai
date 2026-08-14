@@ -1,0 +1,191 @@
+openapi: 3.0.3
+info:
+  title: DecentraAI M10 Node API
+  version: 0.1.0
+  description: Control-plane contract for the M10 production vertical slice.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Process health
+  /ready:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Node and backend readiness
+        '503':
+          description: Not ready
+  /v1/workers:
+    get:
+      summary: List visible workers
+      responses:
+        '200':
+          description: Workers
+    post:
+      summary: Approve a paired worker
+      responses:
+        '201':
+          description: Worker approved
+  /v1/workers/{peerId}/revoke:
+    post:
+      summary: Revoke a worker
+      parameters:
+        - $ref: '#/components/parameters/PeerId'
+      responses:
+        '204':
+          description: Worker revoked
+  /v1/models:
+    get:
+      summary: List available models
+      responses:
+        '200':
+          description: Models
+  /v1/inference:
+    post:
+      summary: Submit an inference request
+      description: Use Accept text/event-stream for streaming output.
+      parameters:
+        - in: header
+          name: Accept
+          schema:
+            type: string
+            enum: [application/json, text/event-stream]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceRequest'
+      responses:
+        '200':
+          description: Completed response or SSE stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: No eligible worker
+  /v1/inference/{requestId}/cancel:
+    post:
+      summary: Cancel an active request
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '204':
+          description: Cancellation accepted
+  /v1/metrics:
+    get:
+      summary: Dashboard metrics
+      responses:
+        '200':
+          description: Metrics snapshot
+  /v1/audit:
+    get:
+      summary: Query audit events
+      responses:
+        '200':
+          description: Audit events
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    RequestId:
+      in: path
+      name: requestId
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PeerId:
+      in: path
+      name: peerId
+      required: true
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Unauthorized:
+      description: Missing or invalid credentials
+    RateLimited:
+      description: Rate limit exceeded
+  schemas:
+    InferenceRequest:
+      type: object
+      required: [model_hash, prompt]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        model_hash:
+          type: string
+        prompt:
+          type: string
+          maxLength: 200000
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 8192
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+        timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 300000
+        stream:
+          type: boolean
+    InferenceResponse:
+      type: object
+      required: [request_id, status, output]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [completed, failed, cancelled, timeout]
+        output:
+          type: string
+        tokens_used:
+          type: integer
+        latency_ms:
+          type: integer
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+          format: uuid

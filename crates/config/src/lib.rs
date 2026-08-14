@@ -23,6 +23,10 @@ pub struct NodeConfig {
     pub inference: InferenceSection,
     pub privacy: PrivacySection,
     pub security: SecuritySection,
+    /// How inbound model announcements are handled (`swarm start`).
+    /// Absent = Auto (download announced models with verification).
+    #[serde(default)]
+    pub sharing: SharingSection,
     /// Subscription tiers (P1). Absent = admin-token-only, which keeps
     /// existing installs unchanged.
     #[serde(default)]
@@ -66,6 +70,10 @@ pub enum InferenceMode {
 #[serde(rename_all = "snake_case")]
 pub enum InferenceRuntime {
     LlamaServer,
+    Vllm,
+    Sglang,
+    Ollama,
+    RemoteOpenAI,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -73,6 +81,43 @@ pub enum InferenceRuntime {
 pub enum TrustMode {
     Private,
     Open,
+}
+
+/// How a `swarm start` node reacts to manifest announcements from peers.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareMode {
+    /// Download every announced model immediately. Every artifact is
+    /// still verified (per-chunk BLAKE3 + Merkle gate) before use.
+    Auto,
+    /// Ask on stdin before downloading each announced model.
+    Ask,
+    /// Ignore announcements entirely.
+    Off,
+}
+
+/// Automatic model sharing across the LAN swarm.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharingSection {
+    pub mode: ShareMode,
+    /// Upper bound on simultaneous auto downloads (disk/CPU guard).
+    pub max_concurrent_downloads: u32,
+    /// When true, a distributed worker that receives a workload for a model
+    /// it does not yet hold fetches that model on demand from the requester
+    /// through the verified-transfer pipeline (M14). The worker advertises
+    /// `can_provision` only when this is set.
+    pub provision_models_on_demand: bool,
+}
+
+impl Default for SharingSection {
+    fn default() -> Self {
+        Self {
+            mode: ShareMode::Auto,
+            max_concurrent_downloads: 2,
+            provision_models_on_demand: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +144,7 @@ pub struct StorageSection {
     pub auto_seed_verified_models: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceSection {
     pub cpu_max_percent: u8,
@@ -133,6 +178,18 @@ pub struct InferenceSection {
     /// Sampling defaults applied when a request omits them (Q1).
     #[serde(default)]
     pub generation: GenerationSection,
+    /// Optional engine-kind override (M22). Wire values match the engine
+    /// fabric's `EngineKind::as_str`: `llama-server`, `vllm`, `sglang`,
+    /// `ollama`, `openai-compatible`. When set for a worker, it is advertised
+    /// honestly so coordinators' planners reason engine-aware. `None`
+    /// (default) keeps the llama-server runtime and behavior unchanged.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Optional remote OpenAI-compatible backend URL (M22). When set with a
+    /// non-llama `engine`, `serve start` probes and serves this remote instead
+    /// of a local llama-server. Must start with `http://` or `https://`.
+    #[serde(default)]
+    pub backend_url: Option<String>,
 }
 
 /// Generation defaults injected into inference requests that do not
@@ -233,6 +290,11 @@ impl NodeConfig {
                 "network.max_connections must be greater than zero".into(),
             ));
         }
+        if self.sharing.max_concurrent_downloads == 0 {
+            return Err(ConfigError::Validation(
+                "sharing.max_concurrent_downloads must be greater than zero".into(),
+            ));
+        }
         if !(1..=64).contains(&self.storage.chunk_size_mb) {
             return Err(ConfigError::Validation(
                 "storage.chunk_size_mb must be between 1 and 64".into(),
@@ -278,6 +340,20 @@ impl NodeConfig {
                 "inference.api_port must be 0 (ephemeral) or at least 1024".into(),
             ));
         }
+        if let Some(engine) = &self.inference.engine {
+            if !is_known_engine(engine) {
+                return Err(ConfigError::Validation(format!(
+                    "inference.engine must be one of llama-server, vllm, sglang, ollama, openai-compatible (got {engine})"
+                )));
+            }
+        }
+        if let Some(url) = &self.inference.backend_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::Validation(format!(
+                    "inference.backend_url must start with http:// or https:// (got {url})"
+                )));
+            }
+        }
         let generation = &self.inference.generation;
         if !(0.0..=2.0).contains(&generation.temperature) {
             return Err(ConfigError::Validation(
@@ -309,6 +385,23 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
+
+/// Whether `s` is a recognized engine-kind wire string (M22). This is strict,
+/// mirroring the engine fabric's known kinds: an unknown engine is a config
+/// error at load time rather than silently degrading to `openai-compatible`,
+/// so a typo'd engine is caught early instead of mis-advertising a node's real
+/// runtime.
+pub fn is_known_engine(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "llama-server" | "llama_server" | "llamacpp" | "llama.cpp"
+            | "vllm"
+            | "sglang"
+            | "sglang_server"
+            | "ollama"
+            | "openai-compatible"
+    )
 }
 
 #[cfg(test)]
@@ -362,7 +455,11 @@ mod tests {
         let tiers = config.tiers.expect("example config defines tiers");
         assert_eq!(tiers.tier1.rate_limit_per_minute, 10);
         assert_eq!(tiers.policy(1).unwrap().models.len(), 1);
-        assert_eq!(tiers.policy(3).unwrap().models.len(), 0, "empty allowlist = all models");
+        assert_eq!(
+            tiers.policy(3).unwrap().models.len(),
+            0,
+            "empty allowlist = all models"
+        );
         assert!(tiers.policy(4).is_none());
     }
 
@@ -453,4 +550,203 @@ security:
         let err = NodeConfig::load(file.path()).unwrap_err();
         assert!(err.to_string().contains("api_port"));
     }
+
+    #[test]
+    fn example_sharing_section_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Auto);
+        assert_eq!(config.sharing.max_concurrent_downloads, 2);
+        assert!(config.sharing.provision_models_on_demand);
+    }
+
+    #[test]
+    fn missing_sharing_section_defaults_to_auto() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let stripped = raw
+            .replace(
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n  provision_models_on_demand: true\n",
+                "",
+            )
+            .replace(
+                "sharing:\n  mode: \"auto\"\n  max_concurrent_downloads: 2\n  provision_models_on_demand: true\n\n",
+                "",
+            );
+        std::fs::write(file.path(), stripped).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Auto);
+        assert!(config.sharing.provision_models_on_demand);
+    }
+
+    #[test]
+    fn provision_off_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace(
+            "provision_models_on_demand: true",
+            "provision_models_on_demand: false",
+        );
+        std::fs::write(file.path(), bad).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(!config.sharing.provision_models_on_demand);
+    }
+
+    #[test]
+    fn ask_mode_parses() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace("mode: \"auto\"", "mode: \"ask\"");
+        std::fs::write(file.path(), bad).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.sharing.mode, ShareMode::Ask);
+    }
+
+    #[test]
+    fn zero_max_concurrent_downloads_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let bad = raw.replace(
+            "max_concurrent_downloads: 2",
+            "max_concurrent_downloads: 0",
+        );
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_downloads"));
+    }
+
+    #[test]
+    fn new_runtime_variants_parse() {
+        let yaml = r#"
+node:
+  name: test
+  mode: balanced
+  data_dir: /tmp
+network:
+  private_swarm: true
+  lan_discovery: true
+  dht_enabled: true
+  relay_enabled: true
+  bootstrap_peers: []
+  max_connections: 50
+  max_message_bytes: 1048576
+storage:
+  chunk_size_mb: 16
+  hash_algorithm: blake3
+  max_cache_gb: 100
+  min_free_disk_gb: 20
+  verify_full_file_after_assembly: true
+  allow_unsigned_models: false
+  auto_seed_verified_models: true
+resources:
+  cpu_max_percent: 80
+  reserve_cpu_cores: 2
+  memory_max_percent: 80
+  reserve_ram_mb: 1024
+  gpu_enabled: auto
+  gpu_max_vram_percent: 75
+  reserve_vram_mb: 1024
+  stop_gpu_temperature_celsius: 83
+  max_upload_mbps: 20
+  max_download_mbps: 80
+inference:
+  enabled: auto
+  runtime: vllm
+  bind_address: 127.0.0.1
+  api_auth_required: true
+  allow_remote_inference: false
+  max_concurrent_requests: 4
+  max_context_tokens: 4096
+  max_generated_tokens: 2048
+  request_timeout_seconds: 120
+  queue_max_requests: 10
+  idle_model_unload_minutes: 10
+  api_port: 0
+privacy:
+  log_prompts: false
+  log_outputs: false
+  publish_exact_hardware: false
+  telemetry_opt_in: false
+security:
+  trust_mode: private
+  require_signed_announcements: true
+  require_request_signatures: true
+  ban_duration_minutes: 60
+  max_invalid_chunks_per_peer: 10
+"#;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.inference.runtime, InferenceRuntime::Vllm);
+    }
+
+    #[test]
+    fn engine_and_backend_url_round_trip() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        // Insert opt-in M22 fields inside the inference section, before the
+        // nested `generation:` block that terminates it.
+        let patched = raw.replace(
+            "  generation:",
+            "  engine: \"sglang\"\n  backend_url: \"http://192.168.1.50:8000\"\n  generation:",
+        );
+        std::fs::write(file.path(), patched).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(config.inference.engine.as_deref(), Some("sglang"));
+        assert_eq!(
+            config.inference.backend_url.as_deref(),
+            Some("http://192.168.1.50:8000")
+        );
+        assert_eq!(config.inference.runtime, InferenceRuntime::LlamaServer);
+    }
+
+    #[test]
+    fn backend_url_without_scheme_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let patched = raw.replace(
+            "  generation:",
+            "  backend_url: \"192.168.1.50:8000\"\n  generation:",
+        );
+        std::fs::write(file.path(), patched).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("backend_url"));
+    }
+
+    #[test]
+    fn unknown_engine_is_rejected_not_silently_remote() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let patched = raw.replace("  generation:", "  engine: baz-engine\n  generation:");
+        std::fs::write(file.path(), patched).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(err.to_string().contains("engine"));
+    }
+
+    #[test]
+    fn known_engine_wire_values_recognized() {
+        for known in ["llama-server", "vllm", "sglang", "ollama", "openai-compatible"] {
+            assert!(is_known_engine(known), "{known} should be known");
+        }
+        assert!(!is_known_engine("baz-engine"));
+    }
 }
+
+mod helpers;
+pub use helpers::ensure_mode_0600;

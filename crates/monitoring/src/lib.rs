@@ -1,16 +1,16 @@
 //! Structured logging and metrics collection
 
+mod dashboards;
 mod logs;
 mod metrics;
-mod dashboards;
 
-pub use logs::{LogEntry, LogLevel, LogCollector};
-pub use metrics::{Metric, MetricType, MetricsCollector};
 pub use dashboards::DashboardData;
+pub use logs::{LogCollector, LogEntry, LogLevel};
+pub use metrics::{Metric, MetricType, MetricsCollector};
 
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
 
 /// Main monitoring service
 pub struct MonitoringService {
@@ -53,14 +53,15 @@ impl MonitoringService {
     pub async fn export_json(&self) -> String {
         let logs = self.logs.read().await.get_recent(None, 1000);
         let metrics = self.metrics.read().await.get_all();
-        
+
         serde_json::json!({
             "start_time": self.start_time.to_rfc3339(),
             "current_time": Utc::now().to_rfc3339(),
             "logs": logs,
             "metrics": metrics,
             "dashboard": self.get_metrics().await
-        }).to_string()
+        })
+        .to_string()
     }
 }
 
@@ -77,22 +78,26 @@ mod tests {
     #[tokio::test]
     async fn test_monitoring_service() {
         let monitoring = MonitoringService::new();
-        
+
         // Record log
-        monitoring.log(LogEntry::info("test", "Test message".to_string())).await;
-        
+        monitoring
+            .log(LogEntry::info("test", "Test message".to_string()))
+            .await;
+
         // Record metric
-        monitoring.record_metric(
-            "cpu_usage".to_string(),
-            45.5,
-            vec![("host".to_string(), "worker-1".to_string())]
-        ).await;
-        
+        monitoring
+            .record_metric(
+                "cpu_usage_percent".to_string(),
+                45.5,
+                vec![("host".to_string(), "worker-1".to_string())],
+            )
+            .await;
+
         // Get data
         let logs = monitoring.get_logs(None, 10).await;
         assert_eq!(logs.len(), 1);
-        
+
         let metrics = monitoring.get_metrics().await;
-        assert!(metrics.system.cpu_usage > 0.0);
+        assert!(metrics.system.cpu_usage_percent > 0.0);
     }
 }

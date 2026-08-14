@@ -1,0 +1,41 @@
+# DecentraAI desktop node — systemd user unit.
+#
+# Runs the full node (LAN/P2P discovery + model serving + dashboard) as a
+# per-user background service. Being a *user* service it needs no root and no
+# password, auto-starts on login, and restarts on failure.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/decentraai-node.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now decentraai-node
+#
+# To survive reboot without logging in first, enable lingering for your user:
+#   sudo loginctl enable-linger $USER
+#
+# Data/config live under ~/.decentraai (see the node's --config below). The
+# dashboard is http://127.0.0.1:8080/ (config inference.api_port).
+
+[Unit]
+Description=DecentraAI desktop node (P2P discovery, model serving, dashboard)
+Documentation=https://github.com/Gzeu/decentraai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# $HOME/.decentraai/node.yaml is what `decentraai setup` writes. If it does
+# not exist the node auto-generates it (and its identity) on first start.
+ExecStart=%h/.cargo/bin/decentraai node --config %h/.decentraai/node.yaml
+Restart=always
+RestartSec=5
+# A fresh user service starts only after this many seconds have passed since
+# boot, so the network is up and mDNS peers are discoverable.
+ExecStartPre=/bin/sleep 5
+# Do not let THP/page-cache pressure or a hung model take the user session
+# down; the app must never block login.
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -3,14 +3,15 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use decentraai_identity::Identity;
 use decentraai_manifest::Manifest;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
+use libp2p::PeerId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod infer_protocol;
 
 pub use infer_protocol::{
-    InferRequest, InferResponse, InferProgress, InferMessage,
-    WorkerStatus, TaskPlacement, WorkerAnnouncement
+    InferErrorCode, InferMessage, InferProgress, InferRequest, InferResponse, TaskPlacement,
+    WorkerAnnouncement, WorkerStatus,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
@@ -134,7 +135,11 @@ pub fn deserialize_message<T: for<'de> Deserialize<'de>>(
     max_size: usize,
 ) -> Result<T> {
     if data.len() > max_size {
-        anyhow::bail!("message exceeds maximum size: {} > {}", data.len(), max_size);
+        anyhow::bail!(
+            "message exceeds maximum size: {} > {}",
+            data.len(),
+            max_size
+        );
     }
     serde_json::from_slice(data).context("failed to deserialize message")
 }
@@ -204,6 +209,130 @@ pub fn verify_manifest_signature(
     decentraai_identity::verify_signature(key, &bytes, sig)
 }
 
+/// Canonical bytes for signing an [`InferRequest`] (P1).
+///
+/// The `signature` field is stripped before serializing: the signature signs
+/// the request fields, not itself. Field order is deterministic (serde in
+/// declaration order) and there are no map fields, so canonical JSON matches
+/// on both sides. The `nonce` (P4) is included so a captured request cannot be
+/// re-minted with a fresh counter without the sender's key.
+pub fn canonical_infer_request_bytes(req: &InferRequest) -> Vec<u8> {
+    let mut stripped = req.clone();
+    stripped.signature = None;
+    serde_json::to_vec(&stripped).expect("infer request must be serializable")
+}
+
+/// Verifies a signed inference request against the authenticated connected
+/// peer (P1/P2). Fails if the request is unsigned, its embedded public key
+/// does not map to `connected_peer` (anti-spoof: `sender_peer_id` is not
+/// trusted), or the Ed25519 signature does not verify over the canonical bytes.
+pub fn verify_infer_request_signature(
+    connected_peer: &PeerId,
+    req: &InferRequest,
+) -> Result<()> {
+    let (Some(sig_bytes), Some(pk_bytes)) =
+        (req.signature.as_deref(), req.sender_public_key)
+    else {
+        anyhow::bail!("unsigned inference request");
+    };
+    let pubkey_kp = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk_bytes)
+        .context("invalid sender public key")?;
+    // Anti-spoof: the sender's public key must map to the authenticated
+    // connected peer. `sender_peer_id` in the payload is never trusted.
+    let expected =
+        PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey_kp));
+    if &expected != connected_peer {
+        anyhow::bail!(
+            "sender public key maps to {expected}, not the connected peer {connected_peer}"
+        );
+    }
+    let key = VerifyingKey::from_bytes(&pk_bytes).context("invalid ed25519 public key")?;
+    let sig = Signature::from_slice(sig_bytes).context("invalid signature")?;
+    decentraai_identity::verify_signature(&key, &canonical_infer_request_bytes(req), &sig)
+}
+
+/// Signs an [`InferRequest`] with an Ed25519 signing key (32 bytes) — the same
+/// material the node identity stores (P1). Sets `sender_public_key` and
+/// `signature` (over canonical bytes including the `nonce`). Used by the
+/// coordinator to sign outbound requests without sharing a full `Identity`.
+pub fn sign_infer_request_with_key(signing_key_bytes: &[u8; 32], req: &mut InferRequest) {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    req.sender_public_key = Some(verifying_key.to_bytes());
+    let bytes = canonical_infer_request_bytes(req);
+    req.signature = Some(signing_key.sign(&bytes).to_bytes().to_vec());
+}
+
+/// Serialized compute advertisement plus its sender's signature (P3).
+///
+/// The `advertisement` is the canonical serialized
+/// [`decentraai_compute::ComputeAdvertisement`]; `signature` is Ed25519 over
+/// those exact bytes with `sender_public_key`. The receiver verifies the
+/// signature and that the embedded advertisement's `peer_id` matches the
+/// signing public key, so a forged/spoofed advertisement is rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignedComputeAdvertisement {
+    pub protocol_version: u16,
+    /// Canonical bytes of the compute advertisement.
+    pub advertisement: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_public_key: Option<[u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none", with = "b64_opt")]
+    pub signature: Option<Vec<u8>>,
+}
+
+impl Default for SignedComputeAdvertisement {
+    fn default() -> Self {
+        Self {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            advertisement: Vec::new(),
+            sender_public_key: None,
+            signature: None,
+        }
+    }
+}
+
+/// Signs serialized advertisement bytes with the node identity (P3). Returns
+/// the wire-form `SignedComputeAdvertisement`.
+pub fn sign_compute_advertisement(
+    signing_key_bytes: &[u8; 32],
+    advertisement_bytes: &[u8],
+) -> SignedComputeAdvertisement {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
+    let signature = signing_key.sign(advertisement_bytes).to_bytes().to_vec();
+    SignedComputeAdvertisement {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        advertisement: advertisement_bytes.to_vec(),
+        sender_public_key: Some(signing_key.verifying_key().to_bytes()),
+        signature: Some(signature),
+    }
+}
+
+/// Verifies a signed advertisement. Requires a signature, a sender public key
+/// that maps to the embedded advertisement's `peer_id`, and an Ed25519
+/// signature valid over the advertisement bytes.
+pub fn verify_signed_compute_advertisement(
+    signed: &SignedComputeAdvertisement,
+    expected_peer: &PeerId,
+) -> Result<()> {
+    let (Some(sig), Some(pk_bytes)) = (signed.signature.as_deref(), signed.sender_public_key)
+    else {
+        anyhow::bail!("unsigned compute advertisement");
+    };
+    let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk_bytes)
+        .context("invalid sender public key")?;
+    let signer = PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey));
+    if &signer != expected_peer {
+        anyhow::bail!(
+            "advertisement signer {signer} does not match the claiming peer {expected_peer}"
+        );
+    }
+    let key = VerifyingKey::from_bytes(&pk_bytes).context("invalid ed25519 public key")?;
+    let sig = Signature::from_slice(sig).context("invalid signature")?;
+    decentraai_identity::verify_signature(&key, &signed.advertisement, &sig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,8 +385,7 @@ mod tests {
             manifest: create_test_manifest(),
         };
         let serialized = serialize_message(&response).unwrap();
-        let deserialized: ManifestResponse =
-            deserialize_message(&serialized, 1024 * 1024).unwrap();
+        let deserialized: ManifestResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
         assert_eq!(deserialized.manifest.file_name, "test.gguf");
     }
 
@@ -349,7 +477,12 @@ mod tests {
         let serialized = serialize_message(&request).unwrap();
         let result: Result<ManifestRequest> = deserialize_message(&serialized, 100);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum size")
+        );
     }
 
     #[test]
@@ -456,5 +589,123 @@ mod tests {
         let parsed: CatalogResponse = deserialize_message(&serialized, 1024 * 1024).unwrap();
         assert_eq!(parsed.manifests.len(), 1);
         assert_eq!(parsed.manifests[0].file_name, "test.gguf");
+    }
+
+    // ---- P1: inference request signing ----
+
+    fn peer_of(identity: &Identity) -> PeerId {
+        let bytes = identity.public_key().to_bytes();
+        let pk = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes).unwrap();
+        PeerId::from_public_key(&libp2p::identity::PublicKey::from(pk))
+    }
+
+    fn signed_req(identity: &Identity) -> InferRequest {
+        InferRequest::new("m".into(), "hi".into(), 16)
+            .with_sender(peer_of(identity))
+            .with_nonce(7)
+            .sign(identity)
+    }
+
+    #[test]
+    fn infer_request_signing_roundtrip_verifies_for_connected_peer() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let req = signed_req(&identity);
+        assert!(req.is_signed());
+        assert!(verify_infer_request_signature(&peer, &req).is_ok());
+    }
+
+    #[test]
+    fn infer_request_signature_rejects_sender_spoof() {
+        // Sign as A but present to a *different* connected peer B: must fail,
+        // proving sender_peer_id cannot be spoofed to another trusted identity.
+        let identity_a = Identity::generate();
+        let identity_b = Identity::generate();
+        let peer_b = peer_of(&identity_b);
+        let req = signed_req(&identity_a);
+        assert!(verify_infer_request_signature(&peer_b, &req).is_err());
+    }
+
+    #[test]
+    fn infer_request_signature_rejects_tampered_nonce() {
+        // The signature covers the nonce: re-minting a fresh counter without
+        // the key must fail verification.
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let mut req = signed_req(&identity);
+        req.nonce += 1; // attacker bumps the counter without re-signing
+        assert!(verify_infer_request_signature(&peer, &req).is_err());
+    }
+
+    #[test]
+    fn infer_request_signature_rejects_tampered_prompt() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let mut req = signed_req(&identity);
+        req.prompt = "tampered".to_string();
+        assert!(verify_infer_request_signature(&peer, &req).is_err());
+    }
+
+    #[test]
+    fn unsigned_infer_request_is_rejected() {
+        let req = InferRequest::new("m".into(), "hi".into(), 16);
+        assert!(!req.is_signed());
+        assert!(verify_infer_request_signature(&req.sender_peer_id, &req).is_err());
+    }
+
+    #[test]
+    fn canonical_infer_request_bytes_are_deterministic_and_ignore_signature() {
+        let identity = Identity::generate();
+        let a = signed_req(&identity);
+        let b = a.clone();
+        assert_eq!(
+            canonical_infer_request_bytes(&a),
+            canonical_infer_request_bytes(&b),
+            "canonical bytes must be deterministic"
+        );
+        // Signing twice with different signature bytes must not change the
+        // canonical bytes (the signature field is stripped).
+        let mut c = a.clone();
+        c.signature = Some(vec![1, 2, 3]);
+        assert_eq!(
+            canonical_infer_request_bytes(&a),
+            canonical_infer_request_bytes(&c),
+            "canonical bytes must ignore the signature field"
+        );
+    }
+
+    // ---- P3: signed compute advertisements ----
+
+    #[test]
+    fn signed_advertisement_roundtrip_verifies_for_the_claiming_peer() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        // Canonical advertisement bytes (arbitrary payload here).
+        let adv_bytes = serde_json::to_vec(&["cpu_cores", "gpu"]).unwrap();
+        let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        assert!(signed.signature.is_some());
+        assert!(verify_signed_compute_advertisement(&signed, &peer).is_ok());
+    }
+
+    #[test]
+    fn signed_advertisement_rejects_a_spoofed_claiming_peer() {
+        let identity = Identity::generate();
+        let other = Identity::generate();
+        let adv_bytes = serde_json::to_vec(&["gpu"]).unwrap();
+        let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        // Present the signed advertisement as claiming to be `other`: the signer
+        // key must map to the claiming peer, so this must fail (anti-spoof).
+        assert!(verify_signed_compute_advertisement(&signed, &peer_of(&other)).is_err());
+    }
+
+    #[test]
+    fn signed_advertisement_rejects_tampered_payload() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let adv_bytes = serde_json::to_vec(&["ram"]).unwrap();
+        let mut signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        // Tamper with the serialized payload after signing.
+        signed.advertisement = serde_json::to_vec(&["vram_999"]).unwrap();
+        assert!(verify_signed_compute_advertisement(&signed, &peer).is_err());
     }
 }

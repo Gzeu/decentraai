@@ -22,10 +22,10 @@ storage:
   auto_seed_verified_models: false
 
 resources:
-  cpu_max_percent: 65
-  reserve_cpu_cores: 2
+  cpu_max_percent: 50
   memory_max_percent: 60
-  reserve_ram_mb: 4096
+  reserve_cpu_cores: 1
+  reserve_ram_mb: 2048
   gpu_enabled: "auto"
   gpu_max_vram_percent: 75
   reserve_vram_mb: 1536
@@ -48,6 +48,16 @@ inference:
   queue_max_requests: 20
   idle_model_unload_minutes: 15
   api_port: 8080
+  # M22 (multi-engine, opt-in and best-effort — NOT production-verified).
+  # `engine` is the engine-kind string advertised for this node's workers;
+  # wire values: llama-server, vllm, sglang, ollama, openai-compatible.
+  # Unset (default) advertises and runs llama-server exactly as before.
+  # engine: "vllm"
+  # `backend_url` selects a remote OpenAI-compatible backend for `serve start`
+  # instead of a local llama-server (same as `--backend`). Must start with
+  # http:// or https://. Only meaningful together with a non-llama `engine`;
+  # llama-server (the default) is always spawned locally.
+  # backend_url: "http://192.168.1.50:8000"
   # Sampling defaults applied when a request omits them (Q1). Small
   # models answer far more coherently with sampling + a system line.
   generation:
@@ -69,6 +79,18 @@ security:
   require_request_signatures: true
   ban_duration_minutes: 60
   max_invalid_chunks_per_peer: 2
+
+# Automatic sharing (swarm start): what to do with model announcements
+# from peers on the LAN. `auto` downloads and verifies every announced
+# model (per-chunk BLAKE3 + Merkle gate, quarantine on corruption);
+# `ask` prompts before each download; `off` ignores announcements.
+# `provision_models_on_demand` lets a distributed worker fetch a model it
+# does not yet hold when a workload demands it (M14), reusing the verified
+# transfer pipeline. It is advertised to coordinators as `can_provision`.
+sharing:
+  mode: "auto"
+  max_concurrent_downloads: 2
+  provision_models_on_demand: true
 
 # Subscription tiers (P1): everything is free; your tier reflects your
 # contribution. `models` is an allowlist of model file names; an empty

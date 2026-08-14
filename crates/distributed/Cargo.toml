@@ -1,0 +1,40 @@
+[package]
+name = "decentraai-distributed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Internal dependencies
+decentraai-audit = { path = "../audit" }
+decentraai-compute = { path = "../compute" }
+decentraai-config = { path = "../config" }
+decentraai-discovery = { path = "../discovery" }
+decentraai-fabric = { path = "../fabric" }
+decentraai-identity = { path = "../identity" }
+decentraai-protocol = { path = "../protocol" }
+decentraai-p2p = { path = "../p2p" }
+decentraai-inference-adapter = { path = "../inference-adapter" }
+decentraai-system-probe = { path = "../system-probe" }
+decentraai-registry = { path = "../registry" }
+
+[dev-dependencies]
+tempfile.workspace = true
+httpmock = "0.7"
+blake3.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

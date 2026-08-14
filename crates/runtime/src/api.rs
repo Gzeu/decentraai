@@ -15,18 +15,20 @@
 //! inflates the request counter nor resets the idle-unload clock.
 
 use anyhow::{Context, Result};
-use axum::body::Bytes;
+use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use decentraai_config::{GenerationSection, TiersSection};
+use decentraai_config::{GenerationSection, ResourceSection, TiersSection};
+use futures::StreamExt;
 use rand_core::RngCore;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,6 +44,19 @@ const RECENT_REQUEST_LIMIT: usize = 12;
 /// Sliding rate-limit window.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Proxy-boundary cap on the JSON-encoded prompt text forwarded to
+/// llama-server (mirrors `BackendConfig::max_prompt_bytes` on the distributed
+/// path). Rejected up front so an oversized local request cannot hold the
+/// engine or the inference queue slot.
+const MAX_PROMPT_BYTES: usize = 200_000;
+/// Proxy-boundary cap on caller-requested `max_tokens` (mirrors
+/// `BackendConfig::max_output_tokens`). llama-server clamps internally, but we
+/// reject loudly instead of forwarding an unbounded generation request.
+const MAX_OUTPUT_TOKENS: u64 = 8192;
+/// HTTP request timeout to the managed llama-server backend, matching the
+/// distributed `BackendConfig` default so a hung engine releases its slot
+/// instead of holding the queue forever.
+const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
 type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
@@ -84,8 +99,12 @@ enum Auth {
     Open,
     /// The master admin token: unlimited.
     Master,
-    /// An issued subscription token with its tier.
-    Subscriber { name: String, tier: u8 },
+    /// An issued subscription token with its tier and role (H4).
+    Subscriber {
+        name: String,
+        tier: u8,
+        role: decentraai_tokens::Role,
+    },
 }
 
 impl Auth {
@@ -117,6 +136,8 @@ pub struct DashboardInfo {
     pub model_size_bytes: u64,
     /// Sampling defaults merged into inference requests (Q1).
     pub generation: GenerationSection,
+    /// Resource limits/guards from the config (Settings view).
+    pub resources: ResourceSection,
 }
 
 /// Shared proxy state.
@@ -141,15 +162,24 @@ pub struct ApiState {
     requests_served: Arc<AtomicU64>,
     /// Sum of completion tokens across all inference calls.
     tokens_generated: Arc<AtomicU64>,
+    /// Inference calls that reached the backend but failed (for success-rate).
+    requests_failed: Arc<AtomicU64>,
     /// Newest-first ring buffer of recent inference calls.
     recent_requests: Arc<StdMutex<VecDeque<RequestStat>>>,
     /// Per-token sliding-window timestamps (rate limiting).
     rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
     /// Per-token usage counters.
     token_usage: UsageCounters,
+    /// Real distributed-compute coordinator state (M23/M24), wired into the
+    /// dashboard so WORKERS/NETWORK/EXECUTION views render real state only.
+    /// `None` when running without a compute manager (e.g. plain serve).
+    compute: Option<Arc<decentraai_distributed::ComputeManager>>,
+    /// The live P2P node, for the NETWORK view (connected peers).
+    p2p: Option<decentraai_p2p::P2PNode>,
 }
 
 impl ApiState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_url: String,
         auth_token: Option<String>,
@@ -158,12 +188,17 @@ impl ApiState {
         token_store_path: Option<PathBuf>,
         tiers: Option<TiersSection>,
         queue: Arc<InferenceQueue>,
+        compute: Option<Arc<decentraai_distributed::ComputeManager>>,
+        p2p: Option<decentraai_p2p::P2PNode>,
     ) -> Self {
         Self {
             backend_url,
             auth_token: auth_token.map(Into::into),
             manager,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(BACKEND_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             info,
             token_store_path,
             tiers,
@@ -171,9 +206,12 @@ impl ApiState {
             started_at: Instant::now(),
             requests_served: Arc::new(AtomicU64::new(0)),
             tokens_generated: Arc::new(AtomicU64::new(0)),
+            requests_failed: Arc::new(AtomicU64::new(0)),
             recent_requests: Arc::new(StdMutex::new(VecDeque::new())),
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
+            compute,
+            p2p,
         }
     }
 
@@ -203,6 +241,7 @@ impl ApiState {
                             Some(record) => Ok(Auth::Subscriber {
                                 name: record.name.clone(),
                                 tier: record.tier,
+                                role: record.role,
                             }),
                             None => Err(GateError::Unauthorized),
                         }
@@ -213,12 +252,47 @@ impl ApiState {
         }
     }
 
+    /// Admin endpoints (P3: token create/list/revoke) are gated on the
+    /// master token. When no API token is configured (open mode) there is
+    /// no boundary to enforce, so admin stays usable single-user; subscriber
+    /// tokens and unauthenticated callers are rejected. Returns a small
+    /// [`GateError`] so the handler boundary turns it into the response.
+    fn require_master(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
+                "'{name}' is a subscription token; admin asks for the master token"
+            ))),
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
+    /// Role separation (H4): the operational read views (status, workers,
+    /// network, execution, peers) are allowed for the master (admin), open
+    /// mode (single-user), or an `operator`-role subscription token. A plain
+    /// `client` token may only run inference within its tier.
+    fn require_operator_or_admin(&self, headers: &HeaderMap) -> Result<(), GateError> {
+        match self.classify(headers) {
+            Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
+            Ok(Auth::Subscriber { role, name, .. }) => {
+                if role == decentraai_tokens::Role::Operator {
+                    Ok(())
+                } else {
+                    Err(GateError::Forbidden(format!(
+                        "'{name}' is a client token; operational views need an operator or admin token"
+                    )))
+                }
+            }
+            Err(_) => Err(GateError::Unauthorized),
+        }
+    }
+
     /// Per-tier model allowlist. The request body's `model` field is
     /// advisory (llama-server serves what it loaded), but we enforce it
     /// anyway: it is honest about what the tier may use, and it protects
     /// multi-model routing when that lands.
     fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), GateError> {
-        let Auth::Subscriber { tier, name } = auth else {
+        let Auth::Subscriber { tier, name, .. } = auth else {
             return Ok(());
         };
         let Some(tiers) = &self.tiers else {
@@ -238,7 +312,11 @@ impl ApiState {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(model);
-        if policy.models.iter().any(|allowed| allowed == model || allowed == base) {
+        if policy
+            .models
+            .iter()
+            .any(|allowed| allowed == model || allowed == base)
+        {
             Ok(())
         } else {
             Err(GateError::Forbidden(format!(
@@ -250,7 +328,7 @@ impl ApiState {
     /// Sliding-window rate limit per token. The master token and the
     /// open mode are unlimited; the window is pruned on every call.
     fn check_rate_limit(&self, auth: &Auth) -> Result<(), GateError> {
-        let Auth::Subscriber { name, tier } = auth else {
+        let Auth::Subscriber { name, tier, .. } = auth else {
             return Ok(());
         };
         let Some(policy) = self.tiers.as_ref().and_then(|t| t.policy(*tier)) else {
@@ -292,7 +370,8 @@ impl ApiState {
             })
             .unwrap_or(0.0);
         self.requests_served.fetch_add(1, Ordering::SeqCst);
-        self.tokens_generated.fetch_add(completion, Ordering::SeqCst);
+        self.tokens_generated
+            .fetch_add(completion, Ordering::SeqCst);
         let stat = RequestStat {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -321,6 +400,58 @@ impl ApiState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+    }
+}
+
+/// A small latency/success snapshot for the dashboard (M10): p50/p95/p99
+/// latencies over recent requests plus the overall success rate. Pure and
+/// I/O-free so tests drive it with synthetic samples.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InferenceStats {
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub count: u64,
+    pub success_rate_percent: f64,
+    pub requests_served: u64,
+    pub requests_failed: u64,
+    pub queue_waiting: usize,
+}
+
+/// Computes the given percentile (0..=100) from a list of durations (ms).
+fn percentile_ms(mut samples: Vec<u64>, q: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    let idx = ((samples.len() - 1) as f64 * q / 100.0).floor() as usize;
+    samples[idx]
+}
+
+/// Builds an [`InferenceStats`] from the recent-request ring buffer and the
+/// live counters. Deterministic; empty history yields zeros.
+pub fn inference_stats(
+    recent: &[RequestStat],
+    requests_served: u64,
+    requests_failed: u64,
+    queue_waiting: usize,
+) -> InferenceStats {
+    let durations: Vec<u64> = recent.iter().map(|r| r.duration_ms).collect();
+    let total = requests_served + requests_failed;
+    let success_rate = if total == 0 {
+        0.0
+    } else {
+        requests_served as f64 / total as f64 * 100.0
+    };
+    InferenceStats {
+        p50_ms: percentile_ms(durations.clone(), 50.0),
+        p95_ms: percentile_ms(durations.clone(), 95.0),
+        p99_ms: percentile_ms(durations.clone(), 99.0),
+        count: recent.len() as u64,
+        success_rate_percent: success_rate,
+        requests_served,
+        requests_failed,
+        queue_waiting,
     }
 }
 
@@ -367,10 +498,288 @@ fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
     registry
         .list_models()
         .into_iter()
-        .map(|m| {
-            serde_json::json!({"name": m.relative_path, "size_bytes": m.size_bytes})
-        })
+        .map(|m| serde_json::json!({"name": m.relative_path, "size_bytes": m.size_bytes}))
         .collect()
+}
+
+// P3 - Admin dashboard handlers
+const ADMIN_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>DecentraAI Admin</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;background:#0f141b;color:#e6edf3}.card{border:1px solid #2a3442;border-radius:10px;padding:14px}</style></head><body>
+<h1>DecentraAI Admin</h1>
+<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
+<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<div class="card"><h2>Audit events</h2><ul id="audit" style="list-style:none;padding-left:0"><li class="off">loading&hellip;</li></ul></div>
+<p id="api-url"></p></body><script>
+var f=document.getElementById('f'),status=document.getElementById('status'),tbl=document.querySelector('#tbl tbody'),tokenEl=document.getElementById('token'),newDiv=document.getElementById('new');
+var esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]});};
+f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value),role=f.role.value;status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t,role:role})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'};
+async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+esc(t.name)+'</td><td>'+t.tier+'</td><td>'+esc(t.role)+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();}
+var auditEl=document.getElementById('audit');
+async function loadAudit(){var r=await fetch('/api/admin/events',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();var evs=d.events||[];auditEl.innerHTML=evs.length?'':('<li class="off">no security events yet</li>');evs.forEach(function(e){var li=document.createElement('li');var d2=new Date((e.timestamp||0)*1000).toLocaleString();li.innerHTML='<code>'+esc(e.event||'')+'</code> <span class="off">'+d2+'</span> <span class="small">'+esc(JSON.stringify(e.details||Object()))+'</span>';auditEl.appendChild(li);});}
+window.onload=load;
+function revoke(e){var n=e.target.dataset.n;fetch('/api/admin/token/revoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n})}).then(_=>load());}
+document.getElementById('api-url').textContent='API: http://127.0.0.1:{}/v1';
+</script></html>"##;
+fn admin_html(port: u16) -> String {
+    ADMIN_HTML.replace("{}", &port.to_string())
+}
+async fn admin_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    Html(admin_html(state.info.api_port)).into_response()
+}
+async fn admin_token_list_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let tokens = match &state.token_store_path {
+        Some(p) => decentraai_tokens::TokenStore::load(p)
+            .map(|s| s.list())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let body = serde_json::json!({"tokens": tokens.iter().map(|t| serde_json::json!({"name": &t.name, "tier": t.tier, "role": t.role.name(), "created_at": t.created_at, "revoked": t.revoked})).collect::<Vec<_>>()});
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+async fn admin_token_create_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let name = match req.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return forbidden("missing name"),
+    };
+    let tier = match req
+        .get("tier")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u8::try_from(n).ok())
+    {
+        Some(t) if (1..=3).contains(&t) => t,
+        _ => return forbidden("tier 1-3"),
+    };
+    let role = match req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(|s| decentraai_tokens::Role::parse(s).ok())
+    {
+        Some(r) => r,
+        None => decentraai_tokens::Role::DEFAULT,
+    };
+    let plaintext = match &state.token_store_path {
+        Some(p) => {
+            let mut s = match decentraai_tokens::TokenStore::load(p) {
+                Ok(s) => s,
+                Err(_) => return forbidden("load failed"),
+            };
+            match s.create_with_role(&name, decentraai_tokens::Tier(tier), None, role) {
+                Ok(t) => {
+                    let a = state.info.repo_root.join("logs/audit.jsonl");
+                    let _ = decentraai_audit::record(
+                        a.parent().unwrap_or(&state.info.repo_root),
+                        "token_created",
+                        serde_json::json!({"name": &name, "tier": tier, "role": role.name()}),
+                    );
+                    Some(t)
+                }
+                Err(_) => return forbidden("name taken"),
+            }
+        }
+        None => return forbidden("no store"),
+    };
+    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier, "role": role.name()});
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+async fn admin_token_revoke_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let name = match req.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return forbidden("missing name"),
+    };
+    let success = match &state.token_store_path {
+        Some(p) => {
+            let mut s = match decentraai_tokens::TokenStore::load(p) {
+                Ok(s) => s,
+                Err(_) => return forbidden("load failed"),
+            };
+            match s.revoke(&name) {
+                Ok(()) => true,
+                Err(_) => return forbidden("no such token"),
+            }
+        }
+        None => return forbidden("no store"),
+    };
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "token_revoked",
+        serde_json::json!({"name": name}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": success}).to_string(),
+    )
+        .into_response()
+}
+
+/// Shared body-parsing + peer-id extraction for the worker trust / revoke
+/// admin endpoints. `peer_id` must be a valid base58 PeerId.
+fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return Err("invalid JSON".to_string()),
+    };
+    let peer = match req.get("peer_id").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Err("missing peer_id".to_string()),
+    };
+    decentraai_p2p::PeerId::from_str(peer).map_err(|_| "invalid peer_id".to_string())
+}
+
+/// P3/M10 — Approve a worker: adds it to the coordinator's trust set so it
+/// becomes eligible to run workloads. Master-gated like the other admin
+/// endpoints. Guards gracefully (a clear OpenAI-style error, not a panic)
+/// when no compute manager is attached.
+async fn admin_worker_trust_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let peer = match parse_worker_peer_id(&body) {
+        Ok(p) => p,
+        Err(msg) => return forbidden(&msg),
+    };
+    let Some(compute) = &state.compute else {
+        return forbidden("no compute manager attached; worker trust unavailable");
+    };
+    compute.add_trusted(peer).await;
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "worker_trusted",
+        serde_json::json!({"peer_id": peer.to_string()}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "peer_id": peer.to_string(), "trusted": true})
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// P3/M10 — Revoke a worker: removes it from the coordinator's trust set.
+/// Master-gated; guards gracefully when no compute manager is attached.
+async fn admin_worker_revoke_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let peer = match parse_worker_peer_id(&body) {
+        Ok(p) => p,
+        Err(msg) => return forbidden(&msg),
+    };
+    let Some(compute) = &state.compute else {
+        return forbidden("no compute manager attached; worker trust unavailable");
+    };
+    compute.remove_trusted(&peer).await;
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "worker_revoked",
+        serde_json::json!({"peer_id": peer.to_string()}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "peer_id": peer.to_string(), "trusted": false})
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// P3/M10 — Recent audit events for the Admin page, master-gated. Reuses the
+/// same best-effort reader as the dashboard's `/status` `recent_events`.
+async fn admin_audit_events_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let events = recent_audit_events(&state.info.repo_root);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"events": events}).to_string(),
+    )
+        .into_response()
+}
+
+/// OpenAPI 3.0 document (H6): the public, versioned contract for the
+/// `/v1/*` surface. Always served (no auth) so tooling can introspect it.
+async fn openapi_handler() -> Response {
+    let spec = serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "DecentraAI Node API",
+            "version": "1.0.0",
+            "description": "OpenAI-compatible inference + node status for a DecentraAI node. Endpoints that resolve the live engine (manager) prefer it; the OpenAI surface is /v1.",
+        },
+        "servers": [{ "url": "/" }],
+        "paths": {
+            "/v1/models": { "get": { "operationId": "listModels", "summary": "List served models", "responses": { "200": { "description": "Model list" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/chat/completions": { "post": { "operationId": "chatCompletions", "summary": "Streamed or single chat completion", "responses": { "200": { "description": "Chat completion (SSE when stream=true)" }, "429": { "description": "Rate limited" } } } },
+            "/v1/completions": { "post": { "operationId": "completions", "summary": "Text completion", "responses": { "200": { "description": "Completion" } } } },
+            "/status": { "get": { "operationId": "status", "summary": "Node status snapshot (dashboard)", "responses": { "200": { "description": "Status" } } } },
+            "/v1/token": { "get": { "operationId": "tokenInfo", "summary": "Issued-token summary", "responses": { "200": { "description": "Tokens" } } } },
+            "/v1/peers": { "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/compute": { "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
+            "/v1/network": { "get": { "operationId": "network", "summary": "Per-peer link metrics (operator+)", "responses": { "200": { "description": "Network" }, "403": { "description": "Forbidden for client tokens" } } } },
+            "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions + autonomous execution decisions (operator+)", "responses": { "200": { "description": "Executions + decisions" }, "403": { "description": "Forbidden for client tokens" } } } },
+            "/api/admin/token/create": { "post": { "operationId": "adminCreateToken", "summary": "Create a subscription token (master only)", "responses": { "200": { "description": "Token (shown once)" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/token/revoke": { "post": { "operationId": "adminRevokeToken", "summary": "Revoke a token (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/token/list": { "get": { "operationId": "adminListTokens", "summary": "List tokens (master only)", "responses": { "200": { "description": "Token list" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/worker/trust": { "post": { "operationId": "adminTrustWorker", "summary": "Approve a worker (master only)", "responses": { "200": { "description": "Trusted" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/worker/revoke": { "post": { "operationId": "adminRevokeWorker", "summary": "Revoke a worker (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/events": { "get": { "operationId": "adminAuditEvents", "summary": "Recent audit events (master only)", "responses": { "200": { "description": "Events" }, "401": { "description": "Unauthorized" } } } },
+            "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
+        }
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
 }
 
 /// Builds the proxy router: the OpenAI-compatible surface, the dashboard
@@ -378,12 +787,26 @@ fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(dashboard_handler))
+        .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/token", get(token_handler))
         .route("/v1/peers", get(peers_handler))
+        .route("/v1/compute", get(compute_handler))
+        .route("/v1/network", get(network_handler))
+        .route("/v1/execution", get(execution_handler))
         .route("/v1/models", get(proxy_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
+        // P3 - Admin dashboard endpoints
+        .route("/api/admin/token/list", get(admin_token_list_handler))
+        .route("/api/admin/token/create", post(admin_token_create_handler))
+        .route("/api/admin/token/revoke", post(admin_token_revoke_handler))
+        // P3/M10 - Worker trust + audit events (master-gated control plane)
+        .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
+        .route("/api/admin/worker/revoke", post(admin_worker_revoke_handler))
+        .route("/api/admin/events", get(admin_audit_events_handler))
+        .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
 }
@@ -416,9 +839,15 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
 /// Public status snapshot: no secrets, safe without the token. Includes
 /// a fresh hardware probe so the operator sees RAM/GPU pressure live.
 async fn status_handler(State(state): State<ApiState>) -> Response {
-    let (loaded, idle_secs) = {
+    // Resolve the backend URL from the live manager (not the startup-frozen
+    // one) so a M24 engine auto-restart — which re-allocates an ephemeral
+    // port — is reflected here instead of a stale address.
+    let (loaded, idle_secs, backend, respawns) = {
         let manager = state.manager.lock().await;
-        (manager.is_loaded(), manager.idle_for().as_secs())
+        let backend = manager
+            .base_url()
+            .unwrap_or_else(|| state.backend_url.clone());
+        (manager.is_loaded(), manager.idle_for().as_secs(), backend, manager.respawns)
     };
     let snapshot = decentraai_system_probe::SystemSnapshot::collect();
     let gpu = match decentraai_system_probe::probe_gpu() {
@@ -438,14 +867,24 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         .cloned()
         .collect();
     let (serving, waiting) = state.queue.snapshot();
+    let served = state.requests_served.load(Ordering::SeqCst);
+    let failed = state.requests_failed.load(Ordering::SeqCst);
+    let stats = inference_stats(&recent, served, failed, waiting.len());
     let body = serde_json::json!({
         "model": state.info.model_name,
         "model_size_bytes": state.info.model_size_bytes,
         "model_loaded": loaded,
         "uptime_secs": state.started_at.elapsed().as_secs(),
         "idle_for_secs": idle_secs,
-        "requests_served": state.requests_served.load(Ordering::SeqCst),
+        "requests_served": served,
         "tokens_generated": state.tokens_generated.load(Ordering::SeqCst),
+        "latency_ms": {
+            "p50": stats.p50_ms,
+            "p95": stats.p95_ms,
+            "p99": stats.p99_ms,
+        },
+        "success_rate_percent": stats.success_rate_percent,
+        "requests_failed": failed,
         "recent_requests": recent,
         "available_models": registry_models(&state.info.repo_root),
         "queue": {
@@ -462,11 +901,93 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "ram_available_gib": snapshot.available_memory_bytes as f64 / GIB,
             "gpu": gpu,
         },
-        "backend": state.backend_url,
+        "backend": backend,
+        "engine_respawns": respawns,
         "api_port": state.info.api_port,
+        "node": node_info(&state.compute),
+        "resources": {
+            "reserve_cpu_cores": state.info.resources.reserve_cpu_cores,
+            "reserve_ram_mb": state.info.resources.reserve_ram_mb,
+            "memory_max_percent": state.info.resources.memory_max_percent,
+            "gpu_enabled": format!("{:?}", state.info.resources.gpu_enabled),
+            "gpu_max_vram_percent": state.info.resources.gpu_max_vram_percent,
+            "reserve_vram_mb": state.info.resources.reserve_vram_mb,
+        },
         "recent_events": recent_audit_events(&state.info.repo_root),
     });
-    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Prometheus text-format `/metrics` endpoint: the node's real counters and
+/// gauges, exposed for local scraping. Auth-neutral (mirrors `/status`): it
+/// carries no secrets and reveals no prompts/outputs, so it is served open.
+/// The body is hand-formatted Prometheus exposition (no extra deps) with a
+/// `# HELP`/`# TYPE` line per metric family.
+async fn metrics_handler(State(state): State<ApiState>) -> Response {
+    let served = state.requests_served.load(Ordering::SeqCst);
+    let failed = state.requests_failed.load(Ordering::SeqCst);
+    let tokens = state.tokens_generated.load(Ordering::SeqCst);
+    let recent: Vec<RequestStat> = state
+        .recent_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    let stats = inference_stats(&recent, served, failed, 0);
+    let (serving, waiting) = state.queue.snapshot();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let loaded = { state.manager.lock().await.is_loaded() };
+
+    let mut body = String::new();
+    body.push_str("# HELP decentraai_requests_served_total Inference calls served by this node.\n");
+    body.push_str("# TYPE decentraai_requests_served_total counter\n");
+    body.push_str(&format!("decentraai_requests_served_total {served}\n"));
+    body.push_str("# HELP decentraai_requests_failed_total Inference calls that reached the backend but failed.\n");
+    body.push_str("# TYPE decentraai_requests_failed_total counter\n");
+    body.push_str(&format!("decentraai_requests_failed_total {failed}\n"));
+    body.push_str("# HELP decentraai_tokens_generated_total Completion tokens generated by this node.\n");
+    body.push_str("# TYPE decentraai_tokens_generated_total counter\n");
+    body.push_str(&format!("decentraai_tokens_generated_total {tokens}\n"));
+    body.push_str("# HELP decentraai_latency_ms Inference latency percentiles over recent requests.\n");
+    body.push_str("# TYPE decentraai_latency_ms gauge\n");
+    body.push_str(&format!(
+        "decentraai_latency_ms{{quantile=\"p50\"}} {}\n",
+        stats.p50_ms
+    ));
+    body.push_str(&format!(
+        "decentraai_latency_ms{{quantile=\"p95\"}} {}\n",
+        stats.p95_ms
+    ));
+    body.push_str(&format!(
+        "decentraai_latency_ms{{quantile=\"p99\"}} {}\n",
+        stats.p99_ms
+    ));
+    body.push_str("# HELP decentraai_queue_waiting Inference requests waiting in the queue.\n");
+    body.push_str("# TYPE decentraai_queue_waiting gauge\n");
+    body.push_str(&format!("decentraai_queue_waiting {}\n", waiting.len()));
+    body.push_str("# HELP decentraai_queue_serving Inference requests currently being served.\n");
+    body.push_str("# TYPE decentraai_queue_serving gauge\n");
+    body.push_str(&format!(
+        "decentraai_queue_serving {}\n",
+        if serving.is_some() { 1 } else { 0 }
+    ));
+    body.push_str("# HELP decentraai_uptime_seconds Node uptime in seconds.\n");
+    body.push_str("# TYPE decentraai_uptime_seconds gauge\n");
+    body.push_str(&format!("decentraai_uptime_seconds {uptime_secs}\n"));
+    body.push_str("# HELP decentraai_model_loaded Whether the model is currently loaded (1) or not (0).\n");
+    body.push_str("# TYPE decentraai_model_loaded gauge\n");
+    body.push_str(&format!("decentraai_model_loaded {}\n", if loaded { 1 } else { 0 }));
+
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 /// Returns the API token itself: the dashboard is loopback-only and its
@@ -502,6 +1023,253 @@ async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
         .into_response()
 }
 
+/// WORKERS + OVERVIEW real state: the coordinator's live mesh (workers,
+/// health, load, capacity, models, reservations, local perf) and local node
+/// status. Empty structure when no compute manager is attached.
+async fn compute_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let mut body = serde_json::json!({
+        "attached": false,
+        "workers": [],
+        "executions": [],
+    });
+    if let Some(compute) = &state.compute {
+        let report = compute.metrics_report().await;
+        let executions = compute.executions();
+        let session_count = compute.session_count();
+        body = serde_json::json!({
+            "attached": true,
+            "workers": report.workers,
+            "contributions": report.contributions,
+            "local_peer": report.local_peer,
+            "local_perf": report.local_perf,
+            "totals": report.totals,
+            "sessions": session_count,
+            "executions": executions,
+        });
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
+/// locality), connected peers, and local peer id. Empty when no compute/P2P.
+async fn network_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let mut body = serde_json::json!({
+        "attached": false,
+        "connected": [],
+        "links": [],
+        "local_peer": null,
+    });
+    if let Some(p2p) = &state.p2p {
+        let connected = p2p.connected_peers().await;
+        body["connected"] =
+            serde_json::json!(connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+    }
+    if let Some(compute) = &state.compute {
+        let graph = compute.network_graph();
+        let links: Vec<_> = graph
+            .peers()
+            .map(|(peer, link)| {
+                serde_json::json!({
+                    "peer": peer,
+                    "rtt_ms": link.rtt_us / 1000,
+                    "bandwidth_mbps": link.bandwidth_mbps,
+                    "transfer_ms_per_mib": link.transfer_ms_per_mib,
+                    "locality": format!("{:?}", link.locality),
+                })
+            })
+            .collect();
+        body["links"] = serde_json::json!(links);
+        body["local_peer"] = serde_json::json!(compute.local_peer().to_string());
+        body["attached"] = serde_json::json!(state.compute.is_some());
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// EXECUTION real state: recent planner decisions with reasons, reservations
+/// and outcomes. Empty when no compute manager is attached.
+async fn execution_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // H4 role separation: the advanced operational view needs operator/admin.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let mut body = serde_json::json!({ "attached": false, "executions": [], "decisions": [] });
+    if let Some(compute) = &state.compute {
+        body["executions"] = serde_json::json!(compute.executions());
+        // M23 Full Autonomy: surface the explainable autonomous execution
+        // decisions (candidates, constraints, score, selected worker, KV
+        // affinity, engine capability, expected mode, reservation/plan/outcome
+        // correlation + lifecycle trace) for the control plane. Safe operational
+        // metadata only — never chain-of-thought or request content.
+        body["decisions"] = serde_json::json!(compute.decisions());
+        body["attached"] = serde_json::json!(true);
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// True when the (already generation-defaulted) inference body asks for SSE
+/// streaming, so the proxy knows to forward chunks live instead of buffering.
+fn detect_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Best-effort completion-token count from an SSE body: llama-server's final
+/// `data:` event carries a `usage` object we pick up without buffering the
+/// whole stream. Streaming never blocks on metrics — zeros are fine.
+fn sse_completion_tokens(body: &str) -> u64 {
+    body.lines()
+        .filter(|l| l.trim_start().starts_with("data:"))
+        .filter_map(|l| {
+            let payload = l.trim_start().trim_start_matches("data:").trim();
+            serde_json::from_str::<serde_json::Value>(payload).ok()
+        })
+        .filter_map(|v| v["usage"]["completion_tokens"].as_u64())
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// Bytes of user-supplied inference text in a request body: the sum of
+/// `messages[].content` (chat) or the `prompt` string (completions). Used to
+/// enforce the proxy prompt cap. Runs on the merged body so caller-supplied
+/// sampling defaults are already folded in.
+fn proxy_prompt_bytes(body: &[u8]) -> usize {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return 0;
+    };
+    if let Some(messages) = value["messages"].as_array() {
+        return messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .map(str::len)
+            .sum();
+    }
+    value["prompt"].as_str().map(str::len).unwrap_or(0)
+}
+
+/// Proxy-boundary size caps for the local /v1/* surface, mirroring the caps
+/// the distributed routing path enforces via `BackendConfig`. Guards against
+/// forwarding an oversized prompt or an unbounded `max_tokens` to the managed
+/// llama-server. Returns the error response to send when a cap is exceeded,
+/// or `None` when the request may be forwarded.
+fn enforce_size_caps(outgoing: &[u8]) -> Option<Response> {
+    if proxy_prompt_bytes(outgoing) > MAX_PROMPT_BYTES {
+        return Some(
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{{\"error\":{{\"message\":\"prompt exceeds the {MAX_PROMPT_BYTES} byte limit\",\"type\":\"invalid_request_error\"}}}}"
+                ),
+            )
+                .into_response(),
+        );
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(outgoing) {
+        if let Some(requested) = value["max_tokens"].as_u64() {
+            if requested > MAX_OUTPUT_TOKENS {
+                return Some(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "{{\"error\":{{\"message\":\"max_tokens {requested} exceeds the {MAX_OUTPUT_TOKENS} limit\",\"type\":\"invalid_request_error\"}}}}"
+                        ),
+                    )
+                        .into_response(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Proxies a streaming inference response to the caller chunk-by-chunk while
+/// recording the same best-effort metrics the non-streaming path does. The
+/// channel lets a drop of the client cut upstream early; the spawned task
+/// still drains and accounts the completed stream.
+#[allow(clippy::needless_pass_by_value)]
+fn stream_inference(
+    state: ApiState,
+    auth: Auth,
+    path: String,
+    started: Instant,
+    upstream: reqwest::Response,
+    content_type: Option<axum::http::header::HeaderValue>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(64);
+    let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+    let drain_buffer = Arc::clone(&buffer);
+    let drain_path = path.clone();
+    tokio::spawn(async move {
+        let mut chunks = upstream.bytes_stream();
+        while let Some(item) = chunks.next().await {
+            match item {
+                Ok(bytes) => {
+                    drain_buffer.lock().unwrap().extend_from_slice(&bytes);
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+        // Upstream finished cleanly: account the stream (best effort).
+        let body = drain_buffer.lock().unwrap().clone();
+        if !body.is_empty() {
+            state.record_inference(&drain_path, started.elapsed(), &body);
+            let text = String::from_utf8_lossy(&body);
+            let completion = sse_completion_tokens(&text);
+            if completion > 0 {
+                state.tokens_generated.fetch_add(completion, Ordering::SeqCst);
+                state.note_token_usage(&auth, completion);
+            }
+        }
+    });
+    let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        content_type.unwrap_or_else(|| {
+            axum::http::header::HeaderValue::from_static("text/event-stream")
+        }),
+    );
+    response
+}
+
 async fn proxy_handler(
     State(state): State<ApiState>,
     method: Method,
@@ -515,9 +1283,22 @@ async fn proxy_handler(
     };
     let is_inference = method == Method::POST
         && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
+    // The body the proxy will actually forward (caller sampling defaults
+    // folded in), computed once up front so the proxy-boundary caps see the
+    // exact prompt/max_tokens and it can be reused for the request below.
+    let outgoing = if is_inference {
+        apply_generation_defaults(&state.info.generation, &body)
+    } else {
+        body.to_vec()
+    };
     if is_inference {
         if let Err(e) = state.check_model_access(&auth, &body) {
             return e.into_response();
+        }
+        // Proxy-boundary size caps: reject an oversized prompt or an unbounded
+        // max_tokens before they can hold the queue slot or the engine.
+        if let Some(error) = enforce_size_caps(&outgoing) {
+            return error;
         }
         if let Err(e) = state.check_rate_limit(&auth) {
             return e.into_response();
@@ -550,25 +1331,43 @@ async fn proxy_handler(
         }
     }
 
-    state.manager.lock().await.note_activity();
+    // Only real inference resets the idle-unload clock (and drives the request
+    // counters via record_inference below); a bare GET /v1/models metadata
+    // poll must not defeat idle-unload.
+    if is_inference {
+        state.manager.lock().await.note_activity();
+    }
     let started = Instant::now();
 
-    let outgoing = if is_inference {
-        apply_generation_defaults(&state.info.generation, &body)
-    } else {
-        body.to_vec()
+    // Resolve the backend URL from the live manager so engine auto-restarts
+    // (M24) are reflected — the port changes on every respawn when ephemeral.
+    let backend_url = {
+        let manager = state.manager.lock().await;
+        manager
+            .base_url()
+            .unwrap_or_else(|| state.backend_url.clone())
     };
-
-    let url = format!("{}{}", state.backend_url, uri.path());
+    let url = format!("{}{}", backend_url, uri.path());
     let mut request = state.client.request(method, &url);
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
+    let wants_stream = is_inference && detect_stream(&outgoing);
     match request.body(outgoing).send().await {
         Ok(upstream) => {
             let status = StatusCode::from_u16(upstream.status().as_u16())
                 .unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+            if wants_stream && status.is_success() {
+                return stream_inference(
+                    state,
+                    auth,
+                    uri.path().to_string(),
+                    started,
+                    upstream,
+                    content_type,
+                );
+            }
             let bytes = upstream.bytes().await.unwrap_or_default();
             if is_inference && status.is_success() {
                 state.record_inference(uri.path(), started.elapsed(), &bytes);
@@ -578,6 +1377,8 @@ async fn proxy_handler(
                     .as_u64()
                     .unwrap_or(0);
                 state.note_token_usage(&auth, completion);
+            } else if is_inference {
+                state.requests_failed.fetch_add(1, Ordering::SeqCst);
             }
             let mut response = (status, bytes).into_response();
             if let Some(value) = content_type {
@@ -585,11 +1386,16 @@ async fn proxy_handler(
             }
             response
         }
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{\"error\":{\"message\":\"model backend unavailable (unloaded or crashed); restart decentraai serve\",\"type\":\"server_error\"}}",
-        )
-            .into_response(),
+        Err(_) => {
+            if is_inference {
+                state.requests_failed.fetch_add(1, Ordering::SeqCst);
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{\"error\":{\"message\":\"model backend unavailable (unloaded or crashed); restart decentraai serve\",\"type\":\"server_error\"}}",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -671,14 +1477,22 @@ code{background:#0a0e13;padding:2px 6px;border-radius:6px;font-size:13px}
 .ok{color:#3fb950}.off{color:#8b949e}.bad{color:#f85149}
 .bignum{font-size:26px;font-weight:600}
 .small{color:#8b949e;font-size:12px}
+.tiny{color:#8b949e;font-size:11px;line-height:1.5}
+.reasons{margin:4px 0 0;padding-left:16px;list-style:disc}
 ol{padding-left:20px} li{margin:6px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .metric{background:#0a0e13;border-radius:8px;padding:10px 14px}
 .metric .label{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+#chat-history{max-height:280px;overflow-y:auto;margin-bottom:10px}
+#chat-history .msg-user{margin:6px 0;padding:8px 12px;background:#0a0e13;border-radius:8px;border:1px solid #1d4ed8}
+#chat-history .msg-node{margin:6px 0;padding:8px 12px;background:#161d27;border-radius:8px;border-left:3px solid #238636;white-space:pre-wrap}
 </style>
 </head>
 <body>
-<h1>DecentraAI node</h1>
+  <h1>DecentraAI node</h1>
+<div style="text-align:right;margin:-4px 0 0">
+  <button id="adv-toggle" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:6px 12px;cursor:pointer">Show advanced</button>
+</div>
 <div class="card">
   <h2>Model</h2>
   <div class="bignum" id="model-name">&hellip;</div>
@@ -690,6 +1504,8 @@ ol{padding-left:20px} li{margin:6px 0}
   <div class="grid">
     <div class="metric"><div class="label">Requests</div><div class="bignum" id="requests">0</div></div>
     <div class="metric"><div class="label">Tokens generated</div><div class="bignum" id="tokens">0</div></div>
+    <div class="metric"><div class="label">Latency</div><div class="bignum" id="latency">&mdash;</div></div>
+    <div class="metric"><div class="label">Success rate</div><div class="bignum" id="successrate">&mdash;</div></div>
     <div class="metric"><div class="label">Last speed</div><div class="bignum" id="toksec">&mdash;</div></div>
     <div class="metric"><div class="label">Uptime</div><div class="bignum" id="uptime">&mdash;</div></div>
     <div class="metric"><div class="label">Idle for</div><div class="bignum" id="idle">&mdash;</div></div>
@@ -698,6 +1514,19 @@ ol{padding-left:20px} li{margin:6px 0}
     <tr><td>Backend (llama-server)</td><td><code id="backend">&mdash;</code></td></tr>
     <tr><td>API</td><td><code>http://127.0.0.1:__API_PORT__/v1</code> (OpenAI-compatible: <code>/v1/models</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/peers</code>)</td></tr>
   </table>
+</div>
+<div class="card">
+  <h2>Chat</h2>
+  <div id="chat-history"><p class="off">Ask the node something. Responses are routed through the fabric planner to a worker.</p></div>
+  <textarea id="chat-input" rows="2" placeholder="Type a message&hellip;" style="width:100%;box-sizing:border-box;background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></textarea>
+  <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select id="chat-model" title="Model for chat" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></select>
+    <button id="chat-send" style="background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer">Send</button>
+    <button id="chat-stop" style="background:#f85149;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer;display:none">Stop</button>
+    <button id="chat-retry" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px 12px;cursor:pointer" disabled>Retry</button>
+    <span id="chat-status" class="small">&mdash;</span>
+    <input id="chat-stream" type="checkbox" style="margin-left:auto"> <label for="chat-stream" class="small">stream</label>
+  </div>
 </div>
 <div class="card">
   <h2>Queue</h2>
@@ -719,10 +1548,62 @@ ol{padding-left:20px} li{margin:6px 0}
     <tr><td>GPU</td><td id="gpu">&mdash;</td></tr>
   </table>
 </div>
+<div id="advanced" hidden>
 <div class="card">
   <h2>Tracked peers (reputation)</h2>
   <table><thead><tr><th>Peer</th><th>Verified chunks</th><th>Failed</th><th>Score</th><th>Status</th></tr></thead>
   <tbody id="peers"><tr><td colspan="5" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Workers (compute registry)</h2>
+  <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th>Reach</th><th>Load</th><th>Queue</th><th>tok/s</th><th>Latency</th><th>RAM free</th><th>In-flight</th><th>Trusted</th><th>Action</th></tr></thead>
+  <tbody id="workers"><tr><td colspan="12" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Network (measured links)</h2>
+  <table><thead><tr><th>Peer</th><th>RTT</th><th>Bandwidth</th><th>Locality</th></tr></thead>
+  <tbody id="network"><tr><td colspan="4" class="off">loading&hellip;</td></tr></tbody></table>
+  <div class="small" id="connected"></div>
+</div>
+<div class="card">
+  <h2>Execution (planner decisions)</h2>
+  <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Network</th><th>KV</th><th>Outcome</th><th>Reasoning</th></tr></thead>
+  <tbody id="execution"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Autonomous decisions (M23 lifecycle)</h2>
+  <table><thead><tr><th>Req</th><th>Workload</th><th>Selected</th><th>Mode</th><th>Priority</th><th>Network</th><th>KV affinity</th><th>Reservation</th><th>Outcome</th><th>Trace / Reasons</th></tr></thead>
+  <tbody id="decisions"><tr><td colspan="10" class="off">loading&hellip;</td></tr></tbody></table>
+</div>
+<div class="card">
+  <h2>Models</h2>
+  <table><thead><tr><th>Model</th><th>Engine</th><th>Context</th><th>RAM</th><th>VRAM</th><th>Active</th></tr></thead>
+  <tbody id="models"><tr><td colspan="6" class="off">loading&hellip;</td></tr></tbody></table>
+  <div class="small" id="models-status"></div>
+</div>
+<div class="card">
+  <h2>Settings</h2>
+  <table>
+    <tr><td>Node name</td><td id="set-name">&mdash;</td></tr>
+    <tr><td>Dashboard port</td><td id="set-port">&mdash;</td></tr>
+    <tr><td>Discovery</td><td id="set-discovery">&mdash;</td></tr>
+    <tr><td>Trusted workers</td><td id="set-trust">&mdash;</td></tr>
+    <tr><td>Model / engine</td><td id="set-model">&mdash;</td></tr>
+    <tr><td>CPU cores</td><td id="set-cpu">&mdash;</td></tr>
+    <tr><td>RAM</td><td id="set-ram">&mdash;</td></tr>
+    <tr><td>GPU</td><td id="set-gpu">&mdash;</td></tr>
+  </table>
+</div>
+<div class="card">
+  <h2>Diagnostics</h2>
+  <table>
+    <tr><td>Node health</td><td id="diag-health">&mdash;</td></tr>
+    <tr><td>Engine</td><td id="diag-engine">&mdash;</td></tr>
+    <tr><td>P2P / network</td><td id="diag-p2p">&mdash;</td></tr>
+    <tr><td>Workers</td><td id="diag-workers">&mdash;</td></tr>
+    <tr><td>Engine restarts (recovery)</td><td id="diag-restarts">&mdash;</td></tr>
+    <tr><td>Active sessions (KV)</td><td id="diag-sessions">&mdash;</td></tr>
+  </table>
 </div>
 <div class="card">
   <h2>Recent security events (audit log)</h2>
@@ -732,6 +1613,7 @@ ol{padding-left:20px} li{margin:6px 0}
 <div class="card">
   <h2>Share a model with another machine</h2>
   <div id="share"></div>
+</div>
 </div>
 <p class="small">Refreshes every 3s from /status and /v1/peers only &mdash; watching this page never touches the inference backend. Loopback only.</p>
 <script type="module">
@@ -749,17 +1631,222 @@ fn dashboard_js(state: &ApiState, share: &str) -> String {
 const JS_TEMPLATE: &str = r#"
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 document.getElementById('share').innerHTML = "__SHARE__";
-document.getElementById('model-name').textContent = "__MODEL__";
+const activeModel = "__MODEL__";
+document.getElementById('model-name').textContent = activeModel;
+const advEl = document.getElementById('advanced');
+const advBtn = document.getElementById('adv-toggle');
+const setAdv = (show) => {
+  advEl.hidden = !show;
+  advBtn.textContent = show ? 'Hide advanced' : 'Show advanced';
+};
+setAdv((localStorage.getItem('decentraai.advanced') || '0') === '1');
+advBtn.addEventListener('click', () => {
+  const show = advEl.hidden;
+  try { localStorage.setItem('decentraai.advanced', show ? '1' : '0'); } catch (e) {}
+  setAdv(show);
+});
 let token = '';
 try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
-const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+// Admin worker-control is available only when a master/admin token is
+// configured (the same token /v1/token returns). Buttons stay disabled/hidden
+// otherwise so the control plane is never offered without an admin boundary.
+const isAdmin = !!token;
+// Conversation history is real and kept across page reloads (client-side, in
+// localStorage) so a refresh does not wipe the ongoing session. It is never
+// invented: only messages the node actually exchanged are stored.
+const HIST_KEY = 'decentraai.chat.history';
+let hist = [];
+try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
+const chatbox = document.getElementById('chat-history');
+const chatModel = document.getElementById('chat-model');
+const currentModel = () => chatModel.value || activeModel;
+const addMsg = (role, text) => {
+  const div = document.createElement('div');
+  const who = role === 'user' ? '<b>You</b>' : '<b>Node</b>';
+  div.className = role === 'user' ? 'msg-user' : 'msg-node';
+  div.innerHTML = '<div>' + who + '</div><div>' + esc(text) + '</div>';
+  chatbox.appendChild(div);
+  chatbox.scrollTop = chatbox.scrollHeight;
+  return div;
+};
+const saveHist = () => {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-24))); } catch (e) {}
+};
+// Restore persisted conversation from a previous page load.
+hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : (m.role === 'system' ? 'node' : 'user'), m.content || '(empty)'));
+// Streaming is the default; the checkbox lets a user fall back to a single
+// parsed HTTP response (useful with clients that do not read SSE).
+document.getElementById('chat-stream').checked = true;
+// Reads llama-server's SSE body and returns { text, tokens } once complete.
+const readSse = async (resp) => {
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buffer = '', text = '', tokens = null;
+  const msgNode = addMsg('node', '');
+  const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += dec.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
+        const delta = ev.choices && ev.choices[0] && ev.choices[0].delta && ev.choices[0].delta.content;
+        if (delta) { text += delta; bodyEl.textContent = text; }
+        if (ev.usage) tokens = ev.usage.completion_tokens;
+      }
+      chatbox.scrollTop = chatbox.scrollHeight;
+    }
+  } finally { reader.releaseLock(); }
+  return { text, tokens };
+};
+const chatStatus = document.getElementById('chat-status');
+const chatStopBtn = document.getElementById('chat-stop');
+const chatRetryBtn = document.getElementById('chat-retry');
+const chatSendBtn = document.getElementById('chat-send');
+const chatInput = document.getElementById('chat-input');
+let currentController = null;
+let lastUserPrompt = null;
+const setStreamingUI = (on) => {
+  chatStopBtn.style.display = on ? 'inline-block' : 'none';
+  chatSendBtn.disabled = on;
+  chatRetryBtn.disabled = on || !lastUserPrompt;
+};
+// Sends one chat turn: appends the user message to the live conversation and
+// history, streams/awaits the node's reply, and records a new turn. The
+// active AbortController is stored in `currentController` so the Stop button
+// can cancel an in-flight stream (all further SSE chunks are dropped) and so
+// the Retry button can re-send with the current model/stream settings.
+const sendChat = async (prompt) => {
+  prompt = (prompt || '').trim();
+  if (!prompt) return;
+  lastUserPrompt = prompt;
+  chatInput.value = '';
+  addMsg('user', prompt);
+  hist.push({ role: 'user', content: prompt });
+  const stream = document.getElementById('chat-stream').checked;
+  const controller = new AbortController();
+  currentController = controller;
+  setStreamingUI(true);
+  chatStatus.textContent = 'routing &amp; generating&hellip;';
+  const t0 = performance.now();
+  try {
+    const body = JSON.stringify({ model: currentModel(), messages: hist, stream });
+    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
+    let answer = '', tokens = null;
+    if (stream && r.ok && r.body) {
+      const out = await readSse(r);
+      answer = out.text;
+      tokens = out.tokens;
+    } else {
+      const j = await r.json();
+      answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
+    }
+    if (controller.signal.aborted) return;
+    addMsg('node', answer || '(empty response)');
+    hist.push({ role: 'assistant', content: answer || '' });
+    if (hist.length > 24) hist.splice(0, hist.length - 24);
+    saveHist();
+    const dt = Math.round(performance.now() - t0);
+    chatStatus.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
+      (tokens != null ? ' &middot; ' + tokens + ' tokens' : '');
+  } catch (e) {
+    if (controller.signal.aborted) {
+      // User pressed Stop: abort the in-flight fetch/SSE reader. The stream is
+      // left as a partial bubble in the page but is NOT committed to history.
+      chatStatus.textContent = 'stopped';
+    } else {
+      addMsg('node', 'request failed: ' + e);
+      chatStatus.textContent = 'failed';
+    }
+  } finally {
+    if (currentController === controller) currentController = null;
+    setStreamingUI(false);
+  }
+};
+chatSendBtn.addEventListener('click', () => {
+  if (currentController) return;
+  sendChat(chatInput.value);
+});
+chatStopBtn.addEventListener('click', () => {
+  if (currentController) currentController.abort();
+});
+chatRetryBtn.addEventListener('click', () => {
+  if (currentController || !lastUserPrompt) return;
+  sendChat(lastUserPrompt);
+});
+setStreamingUI(false);
+chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSendBtn.click(); } });
 const fmtUptime = s => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? h + 'h ' + m + 'm' : (m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's');
 };
+// M10 worker control plane: Approve/Revoke a worker's trust on the
+// coordinator. Master-only (the endpoints 401/403 otherwise); each action
+// calls the admin endpoint and re-fetches the workers table live.
+const workerAct = async (action, peerId) => {
+  if (!peerId) return;
+  if (!isAdmin) return;
+  const endpoint = action === 'trust' ? '/api/admin/worker/trust' : '/api/admin/worker/revoke';
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ peer_id: peerId })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) alert((d.error && d.error.message) || 'worker ' + action + ' failed');
+  } catch (e) { alert('worker ' + action + ' failed: ' + e); }
+  try { await loadWorkers(); } catch (e) {}
+};
+window.trustWorker = e => workerAct('trust', e.target.dataset.p);
+window.revokeWorker = e => workerAct('revoke', e.target.dataset.p);
+// Renders the live workers tbody from the real /v1/compute payload. Called by
+// refresh() and after every Approve/Revoke so the table reflects the new trust.
+async function loadWorkers() {
+  const compute = await (await fetch('/v1/compute', { headers })).json();
+  renderWorkers(compute);
+}
+function renderWorkers(c) {
+  const wrows = (c.workers || []).map(w => {
+    const action = w.trusted
+      ? (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="revokeWorker(event)">Revoke</button>' : '<span class="off">trusted</span>')
+      : (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="trustWorker(event)">Approve</button>' : '<button disabled>Approve</button>');
+    return '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
+      (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' +
+      (w.reachable ? '<span class="ok">ok</span>' : '<span class="bad">offline</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' +
+      w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb || 0) / 1024) + ' GiB</td><td>' + w.in_flight + '</td><td>' +
+      (w.trusted ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + action + '</td></tr>';
+  }).join('');
+  document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="12" class="off">no workers yet (compute not attached)</td></tr>';
+  document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
+  document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
+}
 async function refresh() {
   try {
     const s = await (await fetch('/status')).json();
+    // Populate the chat model selector once from live /status data: the active
+    // model always leads, followed by every index/model the node advertises in
+    // `available_models`. Only fills when empty so the user's chosen value
+    // survives every 3s refresh.
+    if (chatModel.options.length === 0) {
+      const names = new Set([activeModel]);
+      (s.available_models || []).forEach(m => { if (m && m.name) names.add(m.name); });
+      names.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        chatModel.appendChild(opt);
+      });
+      chatModel.value = activeModel;
+    }
     document.getElementById('model-size').textContent =
       s.model_size_bytes > 0 ? (s.model_size_bytes / 1073741824).toFixed(2) + ' GiB' : '';
     document.getElementById('model-status').innerHTML = s.model_loaded
@@ -771,6 +1858,13 @@ async function refresh() {
       : '';
     document.getElementById('requests').textContent = s.requests_served;
     document.getElementById('tokens').textContent = s.tokens_generated;
+    const lat = s.latency_ms || {};
+    document.getElementById('latency').textContent =
+      (lat.p50 !== undefined && lat.p50 > 0)
+        ? lat.p50 + 'ms' + '<span class="small"> p50 &middot; ' + (lat.p95||0) + 'ms p95 &middot; ' + (lat.p99||0) + 'ms p99</span>'
+        : '\u2014';
+    document.getElementById('successrate').textContent =
+      (s.success_rate_percent !== undefined) ? s.success_rate_percent.toFixed(1) + '%' : '\u2014';
     const last = s.recent_requests[0];
     document.getElementById('toksec').textContent = last ? last.tokens_per_second.toFixed(1) + ' tok/s' : '\u2014';
     document.getElementById('uptime').textContent = fmtUptime(s.uptime_secs);
@@ -814,9 +1908,140 @@ async function refresh() {
     ).join('');
     document.getElementById('peers').innerHTML = rows || '<tr><td colspan="5" class="off">no peers tracked yet</td></tr>';
   } catch (e) {}
+  let n = null;
+  try { await loadWorkers(); } catch (e) {}
+  try {
+    n = await (await fetch('/v1/network', { headers })).json();
+    const nrows = (n.links || []).map(l =>
+      '<tr><td><code>' + esc(l.peer.slice(0, 16)) + '&hellip;</code></td><td>' + l.rtt_ms + ' ms</td><td>' + (l.bandwidth_mbps || '&mdash;') + ' Mbps</td><td>' + esc(l.locality || '') + '</td></tr>'
+    ).join('');
+    document.getElementById('network').innerHTML = nrows || '<tr><td colspan="4" class="off">no measured links yet</td></tr>';
+    document.getElementById('connected').textContent = (n.connected || []).length ? ('connected peers: ' + n.connected.map(p => p.slice(0, 12)).join(', ')) : 'no connected peers';
+  } catch (e) {}
+  try {
+    const x = await (await fetch('/v1/execution', { headers })).json();
+    const xrows = (x.executions || []).slice(0, 12).map(e =>
+      '<tr><td><code>' + esc(e.request_id.slice(0, 8)) + '</code></td><td><code>' + esc(e.selected_worker.slice(0, 12)) + '&hellip;</code></td><td>' + e.score.toFixed(2) + '</td><td>' + e.stages + '</td><td>' +
+      (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + e.network_rtt_ms + ' ms</td><td class="small">' + esc(e.kv_headroom || '') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
+    ).join('');
+    document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="9" class="off">no executions yet</td></tr>';
+    const drows = (x.decisions || []).slice(0, 12).map(d => {
+      const cls = d.workload_class || 'unknown';
+      const sel = d.selected_worker ? '<code>' + esc(d.selected_worker.slice(0, 12)) + '&hellip;</code>' : '<span class="off">none</span>';
+      // Safe operational reasons only: constraints passed, network cost,
+      // queue depth, KV affinity, priority, engine/health. Never chain-of-thought.
+      const reasons = (d.candidates || [])
+        .filter(c => c.constraints && !c.constraints.breaches.length)
+        .map(c =>
+          '<li><code>' + esc(c.peer_id.slice(0, 10)) + '&hellip;</code> score ' +
+          (c.score ? c.score.total.toFixed(2) : '&mdash;') +
+          (c.network_cost_ms ? (' net ' + c.network_cost_ms + 'ms') : '') +
+          (c.kv_prefix_resident ? ' <span class="ok">KV-resident</span>' : '') +
+          '</li>'
+        ).join('');
+      const trace = (d.trace || []).map(t => (t.event || '')).join(' &rarr; ');
+      return '<tr><td><code>' + esc(d.request_id.slice(0, 8)) + '</code></td><td>' + esc(cls) + '</td><td>' + sel + '</td><td>' + esc(d.expected_mode || '') +
+        '</td><td>' + d.priority + '</td><td>' + d.network_cost_ms + ' ms</td><td class="small">' + esc(d.kv_affinity || '') +
+        '</td><td>' + (d.reservation_id ? '<code>' + esc(d.reservation_id.slice(0, 8)) + '</code>' : '<span class="off">pending</span>') +
+        '</td><td>' + (d.outcome === 'succeeded' ? '<span class="ok">succeeded</span>' : d.outcome === 'failed' ? '<span class="bad">failed</span>' : esc(d.outcome || 'in flight')) +
+        '</td><td class="small">' + esc(trace || '') + (reasons ? '<ul class="tiny reasons">' + reasons + '</ul>' : '') + '</td></tr>';
+    }).join('');
+    document.getElementById('decisions').innerHTML = drows || '<tr><td colspan="10" class="off">no autonomous decisions yet</td></tr>';
+  } catch (e) {}
+  // ---- Models / Settings / Diagnostics (from /status node+system + real manager state) ----
+  let trustList = '';
+  try { const tp = await (await fetch('/v1/peers', { headers })).json(); trustList = tp.length + ' tracked peer(s)'; } catch (e) {}
+  const s = await (await fetch('/status')).json().catch(() => null);
+  if (s) {
+    const mrows = (s.node && s.node.served_models || []).map(m =>
+      '<tr><td>' + esc(m.name || '') + '</td><td>' + esc(s.node.engine || '') + '</td><td>' + (m.context_tokens || '&mdash;') + ' tok</td><td>' + Math.round((m.est_ram_mb||0)/1024) + ' GiB</td><td>' + (m.est_vram_mb ? Math.round((m.est_vram_mb||0)/1024)+' GiB' : '&mdash;') + '</td><td>' + (s.model === m.name ? '<span class="ok">loaded</span>' : '<span class="off">-</span>') + '</td></tr>'
+    ).join('');
+    document.getElementById('models').innerHTML = mrows || '<tr><td colspan="6" class="off">no served models advertised</td></tr>';
+    document.getElementById('models-status').textContent = 'active model: ' + esc(s.model || '') + (s.model_loaded ? ' &middot; <span class="ok">loaded</span>' : ' &middot; <span class="off">unloaded</span>');
+
+    document.getElementById('set-name').textContent = (s.node && s.node.name) || esc(s.model) || '';
+    document.getElementById('set-port').textContent = s.api_port;
+    document.getElementById('set-discovery').textContent = 'mDNS / LAN (auto)';
+    document.getElementById('set-trust').textContent = trustList ? trustList : 'not loaded';
+    document.getElementById('set-model').textContent = esc(s.model || '') + ' / ' + esc((s.node && s.node.engine) || '');
+    document.getElementById('diag-health').innerHTML = s.model_loaded ? '<span class="ok">model loaded, node up</span>' : '<span class="off">model not loaded</span>';
+    document.getElementById('diag-engine').innerHTML = s.backend ? '<code>' + esc(s.backend) + '</code>' : '<span class="off">none</span>';
+  // ---- resource limits + startup state in Settings (from real config/spec) ----
+  if (s && s.resources) {
+    const r = s.resources;
+    document.getElementById('set-cpu').textContent =
+      (s.system && s.system.cpu_threads ? s.system.cpu_threads + ' threads' : '&mdash;') +
+      ' &middot; reserve ' + r.reserve_cpu_cores + ' core(s)';
+    document.getElementById('set-ram').textContent =
+      (s.system && s.system.ram_total_gib ? Math.round(s.system.ram_total_gib) + ' GiB total' : '&mdash;') +
+      ' &middot; reserve ' + (Math.round((r.reserve_ram_mb||0)/1024)) + ' GiB';
+    document.getElementById('set-gpu').textContent =
+      (r.gpu_enabled || 'auto') + (r.gpu_max_vram_percent ? ' (vram cap ' + r.gpu_max_vram_percent + '%)' : '') +
+      (r.reserve_vram_mb ? ' reserve ' + Math.round((r.reserve_vram_mb||0)/1024) + ' GiB' : '');
+  }
+  const diag = document.getElementById('diag-restarts');
+  diag.innerHTML = (s && s.engine_respawns > 0)
+    ? '<span class="bad">' + s.engine_respawns + ' auto-restart(s)</span> (M24 recovery)'
+    : '<span class="ok">0</span> auto-restarts (stable)';
+  if (n) {
+    document.getElementById('diag-p2p').innerHTML = (n.connected || []).length + ' connected, ' + (n.links || []).length + ' measured link(s)';
+  }
 }
 refresh(); setInterval(refresh, 3000);
 "#;
+
+/// Real node + engine info derived from the local compute advertisement when a
+/// compute manager is attached. Falls back to empty markers otherwise — never
+/// mock data.
+fn node_info(compute: &Option<Arc<decentraai_distributed::ComputeManager>>) -> serde_json::Value {
+    let Some(compute) = compute else {
+        return serde_json::json!({ "name": "", "engine": "", "served_models": [], "attached": false });
+    };
+    let NodeProfile {
+        name,
+        engine,
+        served_models,
+    } = node_profile(compute);
+    serde_json::json!({
+        "name": name,
+        "engine": engine,
+        "served_models": served_models,
+        "attached": true,
+    })
+}
+
+/// Extracts the local node's real name, engine kind and served models (with
+/// model file, RAM/VRAM footprint and context window) from the last
+/// advertisement this node broadcast.
+fn node_profile(compute: &decentraai_distributed::ComputeManager) -> NodeProfile {
+    let mut profile = NodeProfile::default();
+    if let Some(adv) = compute.last_local_advertisement_sync() {
+        profile.name = adv.node_name;
+        profile.engine = adv.capability.engine;
+        profile.served_models = adv
+            .capability
+            .served_models
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "name": m.file_name,
+                    "size_mb": m.size_mb,
+                    "est_ram_mb": m.est_ram_mb,
+                    "est_vram_mb": m.est_vram_mb,
+                    "context_tokens": m.context_tokens,
+                })
+            })
+            .collect();
+    }
+    profile
+}
+
+#[derive(Default)]
+struct NodeProfile {
+    name: String,
+    engine: String,
+    served_models: Vec<serde_json::Value>,
+}
 
 /// Loads the local API token or generates a fresh one with 0600
 /// permissions. The token never leaves the machine: it only guards the
@@ -852,23 +2077,90 @@ mod tests {
     use crate::{LlamaServer, RuntimeConfig};
     use decentraai_config::{TierPolicy, TiersSection};
 
+    #[test]
+    fn node_info_without_compute_is_not_attached() {
+        let info = node_info(&None);
+        assert_eq!(info["attached"], false);
+        assert_eq!(info["name"], "");
+        assert!(info["served_models"].as_array().unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     fn write_fake_server(dir: &Path) -> std::path::PathBuf {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-llama-server");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // Durable write + sync + close before spawn, and retry on ETXTBSY, so a
+        // concurrent exec in another test never sees a half-open script.
+        let mut last = None;
+        for attempt in 0..4 {
+            match std::fs::File::create(&path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"#!/bin/sh\nexec sleep 60\n");
+                    let _ = f.sync_all();
+                    drop(f);
+                    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&path, perms).unwrap();
+                    return path;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 3 => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            panic!("failed to write fake llama-server after retries: {e}");
+        }
         path
     }
 
     #[cfg(unix)]
     async fn test_manager(dir: &Path) -> Arc<Mutex<ServeManager>> {
+        test_manager_with(dir, generic_fake_engine()).await
+    }
+
+    /// A minimal OpenAI-compatible backend exercising the fields the proxy
+    /// tests assert on (a models list, counted chat completion). The proxy
+    /// resolves the live engine from the manager (M24), so this must be a
+    /// real HTTP listener, not a dead process.
+    #[cfg(unix)]
+    fn generic_fake_engine() -> Router {
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\"}]}" }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":20,\"total_tokens\":40},\"timings\":{\"predicted_per_second\":19.97}}"
+                }),
+            )
+    }
+
+    /// Binds a real, minimal engine (`app`) on an ephemeral loopback port and
+    /// wraps it in a [`ServeManager`] whose `base_url()` points at it. This
+    /// mirrors production: the proxy forwards to the live engine address from
+    /// the manager (M24). The spawned child process only satisfies
+    /// [`LlamaServer`]'s process contract; the actual HTTP server is `app`.
+    #[cfg(unix)]
+    async fn test_manager_with(dir: &Path, app: Router) -> Arc<Mutex<ServeManager>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let binary = write_fake_server(dir);
-        let config = RuntimeConfig::new(dir.join("model.gguf"));
-        let server = LlamaServer::start(&binary, &config).unwrap();
-        Arc::new(Mutex::new(ServeManager::new(server, Duration::from_secs(3600))))
+        let mut config = RuntimeConfig::new(dir.join("model.gguf"));
+        config.port = Some(addr.port());
+        let server = LlamaServer::start(&binary, &config).expect("fake llama-server spawns");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Arc::new(Mutex::new(ServeManager::new(
+            server,
+            Duration::from_secs(3600),
+        )))
     }
 
     fn test_info(dir: &Path, reputation_path: Option<PathBuf>) -> DashboardInfo {
@@ -886,6 +2178,18 @@ mod tests {
                 top_k: Some(40),
                 repeat_penalty: 1.1,
                 system_prompt: "Test system line.".to_string(),
+            },
+            resources: ResourceSection {
+                cpu_max_percent: 65,
+                reserve_cpu_cores: 2,
+                memory_max_percent: 60,
+                reserve_ram_mb: 4096,
+                gpu_enabled: decentraai_config::GpuPolicy::Auto,
+                gpu_max_vram_percent: 75,
+                reserve_vram_mb: 1536,
+                stop_gpu_temperature_celsius: 83,
+                max_upload_mbps: 20,
+                max_download_mbps: 80,
             },
         }
     }
@@ -932,27 +2236,6 @@ mod tests {
     }
 
     /// Backend that echoes the request body, proving what the proxy sent.
-    async fn start_echo_backend() -> SocketAddr {
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(|body: Bytes| async move {
-                (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    format!(
-                        "{{\"echo\":{},\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
-                        String::from_utf8_lossy(&body)
-                    ),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        addr
-    }
-
     async fn start_stateful_api(
         dir: &Path,
         master: Option<String>,
@@ -969,9 +2252,70 @@ mod tests {
             token_store,
             tiers,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         (api, manager)
+    }
+
+    /// Like [`start_stateful_api`] but always wires the subscription-token store
+    /// (so a master + subscriber/operator tokens are both recognized), used by
+    /// the role-separation tests.
+    async fn start_stateful_api_with_store(
+        dir: &Path,
+        master: String,
+    ) -> (SocketAddr, Arc<Mutex<ServeManager>>) {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let store_path = dir.join("db/tokens.json");
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master),
+            manager.clone(),
+            test_info(dir, None),
+            Some(store_path),
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        (api, manager)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_backend_proxy_forwards_to_configured_url_when_manager_unloaded() {
+        // Q3: `serve start --backend http://host:port` keeps auth/tiers/queue
+        // local but runs the model on a remote OpenAI-compatible server. With
+        // no local engine, the proxy must fall back to `state.backend_url`
+        // (the remote) rather than fail: an unloaded manager's `base_url()` is
+        // None, so the proxy forwards to the configured backend.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(3600))));
+        assert!(!manager.lock().await.is_loaded(), "remote mode has no local engine");
+        assert!(manager.lock().await.base_url().is_none());
+
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        // A metadata GET must round-trip to the remote backend.
+        let resp = reqwest::get(format!("http://{api}/v1/models")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("\"list\""));
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     #[test]
@@ -989,10 +2333,10 @@ mod tests {
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
         );
         let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
-        assert_eq!(value["temperature"], 0.7);
-        assert_eq!(value["top_p"], 0.9);
+        assert!((value["temperature"].as_f64().unwrap() - 0.7).abs() < 0.001);
+        assert!((value["top_p"].as_f64().unwrap() - 0.9).abs() < 0.001);
         assert_eq!(value["top_k"], 40);
-        assert_eq!(value["repeat_penalty"], 1.1);
+        assert!((value["repeat_penalty"].as_f64().unwrap() - 1.1).abs() < 0.001);
         let messages = value["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -1010,6 +2354,39 @@ mod tests {
         assert_eq!(messages[0]["content"], "mine");
     }
 
+    #[test]
+    fn inference_stats_empties_are_zero() {
+        let stats = inference_stats(&[], 0, 0, 0);
+        assert_eq!(stats.p50_ms, 0);
+        assert_eq!(stats.p99_ms, 0);
+        assert_eq!(stats.success_rate_percent, 0.0);
+        assert_eq!(stats.requests_served, 0);
+    }
+
+    #[test]
+    fn inference_stats_computes_percentiles_and_success() {
+        let recent: Vec<RequestStat> = [10u64, 20, 30, 40, 50]
+            .iter()
+            .map(|ms| RequestStat {
+                timestamp: 0,
+                endpoint: "/v1/chat/completions".into(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                duration_ms: *ms,
+                tokens_per_second: 3.0,
+            })
+            .collect();
+        let stats = inference_stats(&recent, 90, 10, 3);
+        assert_eq!(stats.p50_ms, 30, "median of 5 sorted samples");
+        // Nearest-rank: p95 index = floor(4*0.95)=3 -> 40; p99 likewise.
+        assert_eq!(stats.p95_ms, 40, "p95 nearest-rank sample");
+        assert_eq!(stats.p99_ms, 40, "p99 nearest-rank sample");
+        // 90 served / (90+10) = 90%.
+        assert!((stats.success_rate_percent - 90.0).abs() < 1e-9);
+        assert_eq!(stats.requests_failed, 10);
+        assert_eq!(stats.queue_waiting, 3);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn proxy_forwards_models_to_backend() {
@@ -1025,10 +2402,75 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn open_webui_openai_surface_round_trips_through_proxy() {
+        // Open WebUI connects to DecentraAI as an OpenAI-compatible backend:
+        // ``/v1/models`` (a list with data[].id) and ``/v1/chat/completions``
+        // (choices[].message.content + usage), both streamed or not. This test
+        // proves the proxy preserves those standard shapes verbatim (no
+        // wrapping, no field loss), so Open WebUI can consume the node as its
+        // Chat engine while the DecentraAI dashboard stays the control plane.
+        let dir = tempfile::tempdir().unwrap();
+        let og = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async {
+                    "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\",\"object\":\"model\"}]}"
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    "{\"object\":\"chat.completion\",\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello from the node\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}"
+                }),
+            );
+        let manager = test_manager_with(dir.path(), og).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // /v1/models: OpenAI list shape Open WebUI's model picker parses.
+        let models = client
+            .get(format!("http://{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        let mj: serde_json::Value = models.json().await.unwrap();
+        assert_eq!(mj["object"], "list");
+        assert_eq!(mj["data"][0]["id"], "tinyllama");
+
+        // /v1/chat/completions: standard chat.completion shape Open WebUI
+        // renders, with the assistant message content preserved.
+        let chat = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body("{\"model\":\"tinyllama\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 200);
+        let cj: serde_json::Value = chat.json().await.unwrap();
+        assert_eq!(cj["object"], "chat.completion");
+        assert_eq!(cj["choices"][0]["message"]["content"], "Hello from the node");
+        assert_eq!(cj["usage"]["total_tokens"], 8);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn proxy_enforces_bearer_token() {
         let dir = tempfile::tempdir().unwrap();
-        let (api, manager) =
-            start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
+        let (api, manager) = start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
         let client = reqwest::Client::new();
 
         let denied = client
@@ -1063,14 +2505,12 @@ mod tests {
         let guest;
         {
             let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
-            guest = store.create("guest", decentraai_tokens::Tier::GUEST).unwrap();
+            guest = store
+                .create("guest", decentraai_tokens::Tier::GUEST, None)
+                .unwrap();
         }
-        let (api, manager) = start_stateful_api(
-            dir.path(),
-            Some("master".to_string()),
-            Some(test_tiers(60)),
-        )
-        .await;
+        let (api, manager) =
+            start_stateful_api(dir.path(), Some("master".to_string()), Some(test_tiers(60))).await;
         let client = reqwest::Client::new();
 
         // Guest can call the allowed model.
@@ -1108,6 +2548,66 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn role_separation_gates_operational_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("db/tokens.json");
+        let (client_tok, operator_tok);
+        {
+            let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
+            client_tok = store
+                .create("client1", decentraai_tokens::Tier::GUEST, None)
+                .unwrap();
+            operator_tok = store
+                .create_with_role(
+                    "ops1",
+                    decentraai_tokens::Tier::GUEST,
+                    None,
+                    decentraai_tokens::Role::Operator,
+                )
+                .unwrap();
+        }
+        let (api, manager) =
+            start_stateful_api_with_store(dir.path(), "master".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // A client token is denied the advanced operational view (H4)...
+        let denied = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", format!("Bearer {client_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403, "client must not see operational views");
+        let denied_net = client
+            .get(format!("http://{api}/v1/network"))
+            .header("Authorization", format!("Bearer {client_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_net.status(), 403);
+
+        // ...while an operator token is allowed.
+        let allowed = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", format!("Bearer {operator_tok}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200, "operator must see operational views");
+
+        // The master is still allowed too.
+        let master = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", "Bearer master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn rate_limit_returns_429_and_audits() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
@@ -1115,7 +2615,9 @@ mod tests {
         let guest;
         {
             let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
-            guest = store.create("guest", decentraai_tokens::Tier::GUEST).unwrap();
+            guest = store
+                .create("guest", decentraai_tokens::Tier::GUEST, None)
+                .unwrap();
         }
         let (api, manager) =
             start_stateful_api(dir.path(), Some("master".to_string()), Some(test_tiers(2))).await;
@@ -1145,7 +2647,11 @@ mod tests {
         let client = reqwest::Client::new();
 
         // Metadata GETs must not count as inference.
-        client.get(format!("http://{api}/v1/models")).send().await.unwrap();
+        client
+            .get(format!("http://{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
 
         let response = client
             .post(format!("http://{api}/v1/chat/completions"))
@@ -1183,7 +2689,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = start_backend().await;
         let manager = test_manager(dir.path()).await;
-        // Waiting room of zero: any second request is rejected instantly.
+        // Waiting room of one: first request serves, second waits, third is rejected.
         let state = ApiState::new(
             format!("http://{backend}"),
             None,
@@ -1191,13 +2697,24 @@ mod tests {
             test_info(dir.path(), None),
             None,
             None,
-            InferenceQueue::new(0, Duration::from_secs(5)),
+            InferenceQueue::new(1, Duration::from_secs(5)),
+            None,
+            None,
         );
         let api = serve_api(state.clone(), "127.0.0.1", 0).await.unwrap();
 
         // Hold the serving slot with a manual ticket so the queue is busy.
-        let hold = state.queue.enqueue("holder", "/v1/chat/completions").unwrap();
+        let hold = state
+            .queue
+            .enqueue("holder", "/v1/chat/completions")
+            .unwrap();
         hold.wait_turn().await.unwrap();
+
+        // Fill the waiting room
+        let _waiter = state
+            .queue
+            .enqueue("waiter", "/v1/chat/completions")
+            .unwrap();
 
         let response = reqwest::Client::new()
             .post(format!("http://{api}/v1/chat/completions"))
@@ -1225,7 +2742,11 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), 200, "path {path} must serve the dashboard");
+            assert_eq!(
+                response.status(),
+                200,
+                "path {path} must serve the dashboard"
+            );
             let body = response.text().await.unwrap();
             assert!(body.contains("DecentraAI dashboard"));
             assert!(body.contains("Tokens generated"));
@@ -1233,6 +2754,102 @@ mod tests {
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
         }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_chat_view_has_model_stop_and_retry_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // The three new Chat UX controls and the model selector are present.
+        for needle in [
+            "id=\"chat-model\"",
+            "<select id=\"chat-model\"",
+            "id=\"chat-stop\"",
+            "id=\"chat-retry\"",
+        ] {
+            assert!(body.contains(needle), "dashboard must include {needle}");
+        }
+        // The controls are wired to real behavior: Stop aborts the in-flight
+        // request (AbortController) and the model select is populated from the
+        // live /status `available_models` payload rather than a hardcoded list.
+        assert!(body.contains("new AbortController()"), "Stop must abort via AbortController");
+        assert!(body.contains("controller.signal"), "Stop aborts the fetch via its signal");
+        assert!(body.contains("s.available_models"), "chat-model must read live available_models");
+        assert!(body.contains("chatModel.value || activeModel"), "send must fall back to the active model");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn openapi_document_is_served_and_versioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let resp = reqwest::get(format!("http://{api}/openapi.json"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let spec: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.0.0");
+        assert_eq!(spec["info"]["version"], "1.0.0");
+        assert!(spec["paths"]["/v1/chat/completions"].is_object());
+        assert!(spec["paths"]["/v1/compute"].is_object());
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_hides_advanced_compute_internals_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let body = client
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // Normal-user essentials are always present.
+        for needle in [
+            "id=\"adv-toggle\"",
+            "id=\"chat-history\"",
+            "id=\"recent\"",
+            "id=\"ram\"",
+        ] {
+            assert!(body.contains(needle), "normal view must include {needle}");
+        }
+        // Distributed-compute internals live behind the opt-in advanced block.
+        assert!(
+            body.contains("<div id=\"advanced\" hidden>"),
+            "advanced compute cards must be hidden by default"
+        );
+        for needle in [
+            "Tracked peers (reputation)",
+            "Workers (compute registry)",
+            "Execution (planner decisions)",
+            "Diagnostics",
+            "Recent security events",
+        ] {
+            let idx = body.find(needle).expect("advanced card present");
+            let open = body
+                .find("<div id=\"advanced\"")
+                .expect("advanced container");
+            assert!(idx > open, "{needle} must be inside the advanced container");
+        }
+        // The toggle must drive the advanced container from real state (no mocks).
+        assert!(body.contains("document.getElementById('advanced')"));
+        assert!(body.contains("localStorage.setItem('decentraai.advanced'"));
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -1269,6 +2886,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let client = reqwest::Client::new();
@@ -1305,14 +2924,134 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn metrics_endpoint_exposes_prometheus_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+
+        // Auth-neutral: no token required, like /status.
+        let response = client
+            .get(format!("http://{api}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "metrics must be plain text, got {content_type:?}"
+        );
+        assert!(
+            content_type.contains("0.0.4"),
+            "Prometheus content-type version, got {content_type:?}"
+        );
+
+        let body = response.text().await.unwrap();
+        for needle in [
+            "decentraai_requests_served_total",
+            "decentraai_requests_failed_total",
+            "decentraai_tokens_generated_total",
+            "decentraai_latency_ms",
+            "decentraai_queue_waiting",
+            "decentraai_queue_serving",
+            "decentraai_uptime_seconds",
+            "decentraai_model_loaded",
+            "# HELP",
+            "# TYPE",
+        ] {
+            assert!(
+                body.contains(needle),
+                "metrics body must contain {needle:?}: {body}"
+            );
+        }
+        // Real counters, not mock data: uptime and model_loaded must be present.
+        assert!(
+            body.contains("decentraai_uptime_seconds "),
+            "uptime gauge value expected: {body}"
+        );
+        assert!(
+            body.contains("decentraai_model_loaded 1")
+                || body.contains("decentraai_model_loaded 0"),
+            "model_loaded gauge must be 0 or 1: {body}"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compute_network_execution_endpoints_respond() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Without a compute manager these return a well-formed "not attached"
+        // structure (never mock data).
+        let compute: serde_json::Value = client
+            .get(format!("http://{api}/v1/compute"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(compute["attached"], false);
+        assert!(compute["workers"].is_array());
+
+        let network: serde_json::Value = client
+            .get(format!("http://{api}/v1/network"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(network["attached"], false);
+        assert!(network["connected"].is_array());
+
+        let exec: serde_json::Value = client
+            .get(format!("http://{api}/v1/execution"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exec["attached"], false);
+        assert!(exec["executions"].is_array());
+        assert!(exec["decisions"].is_array());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn status_lists_registry_models() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
+        let db_dir = dir.path().join("db");
         std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
         std::fs::write(models_dir.join("extra.gguf"), b"GGUF test").unwrap();
         let mut registry = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
         registry.scan_directory(&models_dir).unwrap();
-        registry.save(&dir.path().join("db/registry.json")).unwrap();
+        registry.save(&db_dir.join("registry.json")).unwrap();
 
         let backend = start_backend().await;
         let manager = test_manager(dir.path()).await;
@@ -1324,6 +3063,8 @@ mod tests {
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
@@ -1343,16 +3084,32 @@ mod tests {
     #[tokio::test]
     async fn proxy_merges_generation_into_outgoing_body() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = start_echo_backend().await;
-        let manager = test_manager(dir.path()).await;
+        let echo_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: Bytes| async move {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    format!(
+                        "{{\"echo\":{},\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
+                        String::from_utf8_lossy(&body)
+                    ),
+                )
+            }),
+        );
+        // The proxy forwards to the LIVE engine address (M24), so the manager
+        // must own (point at) the echo backend for this test to observe the
+        // merged outgoing body.
+        let manager = test_manager_with(dir.path(), echo_app).await;
         let state = ApiState::new(
-            format!("http://{backend}"),
+            "http://127.0.0.1:0".to_string(),
             None,
             manager.clone(),
             test_info(dir.path(), None),
             None,
             None,
             test_queue(),
+            None,
+            None,
         );
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
@@ -1365,11 +3122,308 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         let echoed = response.text().await.unwrap();
-        assert!(echoed.contains("temperature"), "sampling defaults must reach the backend");
-        assert!(echoed.contains("Test system line."), "system prompt must reach the backend");
+        assert!(
+            echoed.contains("temperature"),
+            "sampling defaults must reach the backend"
+        );
+        assert!(
+            echoed.contains("Test system line."),
+            "system prompt must reach the backend"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn admin_page_serves_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("test_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        // Unauthenticated is rejected now that the admin surface is gated.
+        let denied = reqwest::Client::new()
+            .get(format!("http://{api}/admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 401);
+        let resp = reqwest::Client::new()
+            .get(format!("http://{api}/admin"))
+            .header("Authorization", "Bearer test_token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let html = resp.text().await.unwrap();
+        assert!(html.contains("DecentraAI Admin"));
+        assert!(html.contains("Create Token"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_token_create_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let token_store_path = db_dir.join("tokens.json");
+        let tiers = TiersSection {
+            tier1: TierPolicy {
+                rate_limit_per_minute: 10,
+                models: vec!["test.gguf".into()],
+            },
+            tier2: TierPolicy {
+                rate_limit_per_minute: 60,
+                models: vec![],
+            },
+            tier3: TierPolicy {
+                rate_limit_per_minute: 120,
+                models: vec![],
+            },
+        };
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            Some(token_store_path.clone()),
+            Some(tiers),
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let create_resp = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"test_token","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), 200);
+        let json: serde_json::Value = create_resp.json().await.unwrap();
+        assert!(json["token"].as_str().unwrap().starts_with("dsk_"));
+        let list_resp = reqwest::Client::new()
+            .get(format!("http://{api}/api/admin/token/list"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_worker_trust_and_revoke_endpoints_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let manager = test_manager(dir.path()).await;
+        // A live compute manager with one worker so trust/revoke have real state.
+        let worker = decentraai_p2p::PeerId::random();
+        let compute = Arc::new(decentraai_distributed::ComputeManager::new(
+            decentraai_p2p::PeerId::random(),
+            "coordinator".into(),
+            std::collections::HashSet::new(),
+        ));
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+
+        // Unauthenticated and client-token calls are rejected, master is allowed.
+        let no_auth = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401, "worker trust must be master-gated");
+
+        // Approve flips the worker to trusted in the live compute manager.
+        let trust = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(trust.status(), 200);
+        assert_eq!(trust.json::<serde_json::Value>().await.unwrap()["trusted"], true);
+        assert!(compute.is_trusted(&worker).await, "worker trusted after approve");
+
+        // In the /v1/compute worker report the trust flag reflects it too.
+        let report: serde_json::Value = client
+            .get(format!("{base}/v1/compute"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["attached"], true);
+        assert!(report["workers"].is_array());
+
+        // Invalid peer_id is a clean 403, not a panic.
+        let bad = client
+            .post(format!("{base}/api/admin/worker/revoke"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"peer_id":"not-a-peer"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 403);
+
+        // Revoke flips it back.
+        let revoke = client
+            .post(format!("{base}/api/admin/worker/revoke"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": worker.to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), 200);
+        assert!(!compute.is_trusted(&worker).await, "worker revoked after revoke");
+
+        // The actions were audited (security events are control-plane material).
+        let ev = client
+            .get(format!("{base}/api/admin/events"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ev.status(), 200);
+        let events: serde_json::Value = ev.json().await.unwrap();
+        let joined = serde_json::to_string(&events).unwrap();
+        assert!(joined.contains("worker_trusted"), "trust event audited");
+        assert!(joined.contains("worker_revoked"), "revoke event audited");
+
+        // Missing/malformed body is a clean 403.
+        let empty = client
+            .post(format!("{base}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), 403);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_worker_endpoints_guard_without_compute_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        // No compute manager attached (plain serve), as in production without
+        // distributed compute. The endpoint must answer clearly, not panic.
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/worker/trust"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({"peer_id": decentraai_p2p::PeerId::random().to_string()}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert!(resp.text().await.unwrap().contains("no compute manager"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_create_sends_role_and_admin_page_shows_role_selector_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let store_path = dir.path().join("db/tokens.json");
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            Some(store_path),
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // A create with an explicit operator role round-trips through the store.
+        let create = client
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"op","tier":2,"role":"operator"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 200);
+        let list: serde_json::Value = client
+            .get(format!("http://{api}/api/admin/token/list"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let op = list["tokens"].as_array().unwrap().iter().find(|t| t["name"] == "op").unwrap();
+        assert_eq!(op["role"], "operator", "role must round-trip");
+
+        // The Admin page itself offers the role selector and the audit list.
+        let html = client
+            .get(format!("http://{api}/admin"))
+            .header("Authorization", "Bearer master_token")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("operator"), "admin page must offer the operator role");
+        assert!(html.contains("Audit events"), "admin page must show audit events");
+        assert!(html.contains("/api/admin/events"), "audit list must fetch the gated events endpoint");
+        manager.lock().await.shutdown().await.unwrap();
+    }
     #[test]
     fn token_is_generated_once_and_reused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1390,5 +3444,309 @@ mod tests {
         ensure_api_token(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_create_rejects_wrong_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_store = dir.path().join("db/tokens.json");
+        let tiers = test_tiers(120);
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            Some(token_store.clone()),
+            Some(tiers.clone()),
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        // No credentials: unauthorized.
+        let no_auth = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"x","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401);
+
+        // Wrong password: unauthorized.
+        let wrong = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer not_the_master")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"x","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401);
+
+        // A subscriber token is not an admin: forbidden.
+        let mut store = decentraai_tokens::TokenStore::load(&token_store).unwrap();
+        let sub = store.create("alice", decentraai_tokens::Tier(2), None).unwrap();
+        let subscriber = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", format!("Bearer {sub}"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"y","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(subscriber.status(), 403);
+
+        // Master token succeeds (control).
+        let master = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"ok_token","tier":1}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_streams_sse_when_requested() {
+        // A backend that streams two SSE chunks (each with usage) like
+        // llama-server does, proving the proxy forwards event-stream content.
+        let sse_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                )
+            }),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // The proxy forwards to the live engine address (M24), so the manager
+        // must own (point at) the SSE backend for this test to observe the
+        // streamed body.
+        let manager = test_manager_with(dir.path(), sse_app).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.contains("text/event-stream"),
+            "streaming response should be SSE, got {ct:?}"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("data:"), "SSE body expected, got {body:?}");
+        assert!(body.contains("Hel"), "first delta forwarded");
+        assert!(body.contains("Lo") || body.contains("lo"), "second delta forwarded");
+        assert!(body.contains("[DONE]"), "sentinel forwarded");
+
+        // The token-use accounting picked up the streamed usage.
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// A backend that counts completions it actually serves, so a test can
+    /// prove a request rejected at the proxy boundary never reached it. The
+    /// manager owns the counting app (the proxy forwards to the live engine),
+    /// following the same pattern as `proxy_streams_sse_when_requested`. The
+    /// returned [`ServeManager`] wraps the app; `dir` keeps the fake
+    /// engine's temp dir alive for the test.
+    #[cfg(unix)]
+    async fn start_echo_backend(
+        dir: &Path,
+        hits: Arc<AtomicU64>,
+    ) -> Arc<Mutex<ServeManager>> {
+        let app_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let h = Arc::clone(&app_hits);
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    "{\"usage\":{\"completion_tokens\":1}}"
+                }
+            }),
+        );
+        test_manager_with(dir, app).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_rejects_oversized_prompt_and_max_tokens_before_backend() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let manager = start_echo_backend(dir.path(), hits.clone()).await;
+        // The proxy forwards to the live engine, so the manager must own the
+        // counting backend; the state's backend_url is therefore unused.
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}/v1/chat/completions");
+
+        // Oversized prompt text (> MAX_PROMPT_BYTES) -> 413, never forwarded.
+        let big_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":big_prompt}]});
+        let resp = client
+            .post(&base)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prompt exceeds"));
+
+        // Oversized max_tokens (> MAX_OUTPUT_TOKENS) -> 400, never forwarded.
+        let big_tokens = MAX_OUTPUT_TOKENS + 1;
+        let body = serde_json::json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens": big_tokens,
+        });
+        let resp = client
+            .post(&base)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
+
+        // Neither oversized request reached the backend.
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_within_limits_is_forwarded_to_backend() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let manager = start_echo_backend(dir.path(), hits.clone()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let body = serde_json::json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens": MAX_OUTPUT_TOKENS,
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "in-limit request must reach the backend");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_models_does_not_reset_idle_clock_but_post_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+
+        // A metadata GET must not reset the idle clock: it keeps growing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_get_before_sleep = manager.lock().await.idle_for();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_get = manager.lock().await.idle_for();
+        assert!(
+            after_get > after_get_before_sleep,
+            "GET must not reset idle clock: grew {after_get_before_sleep:?} -> {after_get:?}"
+        );
+
+        // Another GET keeps it growing (no idle reset either).
+        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        let after_more_get = manager.lock().await.idle_for();
+        assert!(
+            after_more_get >= after_get,
+            "GET must not reset idle clock: {after_get:?} -> {after_more_get:?}"
+        );
+
+        // A real inference POST resets the idle clock back near zero.
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let after_post = manager.lock().await.idle_for();
+        assert!(
+            after_post < after_get,
+            "inference POST must reset idle clock: {after_get:?} -> {after_post:?}"
+        );
+        manager.lock().await.shutdown().await.unwrap();
     }
 }

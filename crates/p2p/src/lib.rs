@@ -25,7 +25,14 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Max re-dial attempts for a peer that disconnected, before giving up and
+/// relying on mDNS re-discovery (a peer that left the network permanently
+/// must not be re-dialed forever). Each attempt backs off exponentially.
+pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+/// Base backoff (ms) doubled on each reconnect attempt.
+pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
 
 /// Request/response protocol carrying serialized decentraai-protocol messages.
 pub const MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/decentraai/message/1");
@@ -40,6 +47,44 @@ pub const DEFAULT_MAX_CHUNK_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
 /// Serves inbound requests from peers.
 pub trait RequestHandler: Send + Sync + 'static {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Chains multiple request handlers together
+///
+/// Tries each handler in order until one succeeds.
+pub struct ChainedHandler {
+    handlers: Vec<Arc<dyn RequestHandler>>,
+}
+
+impl ChainedHandler {
+    pub fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
+        }
+    }
+
+    pub fn add_handler(mut self, handler: Arc<dyn RequestHandler>) -> Self {
+        self.handlers.push(handler);
+        self
+    }
+}
+
+impl Default for ChainedHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestHandler for ChainedHandler {
+    fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        for handler in &self.handlers {
+            match handler.handle(request) {
+                Ok(response) => return Ok(response),
+                Err(_) => continue, // Try next handler
+            }
+        }
+        anyhow::bail!("No handler could process the request")
+    }
 }
 
 /// Serves a static manifest plus chunk reads from a local file.
@@ -79,7 +124,9 @@ impl RequestHandler for StaticFileServer {
             }
             use std::io::{Read, Seek, SeekFrom};
             let mut file = std::fs::File::open(&self.file).context("opening served file")?;
-            file.seek(SeekFrom::Start(u64::from(req.chunk_index) * self.chunk_size))?;
+            file.seek(SeekFrom::Start(
+                u64::from(req.chunk_index) * self.chunk_size,
+            ))?;
             let mut buf = vec![0u8; self.chunk_size as usize];
             let mut filled = 0usize;
             while filled < buf.len() {
@@ -141,9 +188,8 @@ impl RegistryServer {
 impl RequestHandler for RegistryServer {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::{
-            CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest,
-            ChunkResponse, ManifestRequest, deserialize_message, manifest_response_bytes,
-            serialize_message,
+            CURRENT_PROTOCOL_VERSION, CatalogRequest, CatalogResponse, ChunkRequest, ChunkResponse,
+            ManifestRequest, deserialize_message, manifest_response_bytes, serialize_message,
         };
 
         if let Ok(req) = deserialize_message::<CatalogRequest>(request, request.len()) {
@@ -180,8 +226,8 @@ impl RequestHandler for RegistryServer {
                 .get_model(&manifest.file_name)
                 .with_context(|| format!("registry entry missing for {}", manifest.file_name))?;
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&record.canonical_path)
-                .context("opening registered model")?;
+            let mut file =
+                std::fs::File::open(&record.canonical_path).context("opening registered model")?;
             file.seek(SeekFrom::Start(
                 u64::from(req.chunk_index) * manifest.chunk_size as u64,
             ))?;
@@ -227,16 +273,93 @@ enum Command {
     Broadcast {
         payload: Vec<u8>,
     },
+    /// Reply with the ids of currently connected peers.
+    Connected {
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     Shutdown,
 }
 
+/// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
+/// Called with the transport-authenticated connected peer and the request;
+/// `peer` is the real Noise-authenticated PeerId, NOT `req.sender_peer_id`
+/// (which is attacker-controllable payload, see P2).
+type InferHandler =
+    Arc<dyn Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+
+/// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
+type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
+
+/// Handler for inbound manifest announcements, called with the announcing
+/// peer and the announced manifest. MUST be non-blocking: the swarm event
+/// loop invokes it inline, so downloads belong in a spawned task.
+type ManifestAnnouncementHandler = Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
+
+/// Shared, swappable handler slot read by the swarm task.
+type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
+
 /// Handle to the background swarm task.
+#[derive(Clone)]
 pub struct P2PNode {
     commands: mpsc::UnboundedSender<Command>,
     peer_id: PeerId,
+    /// Optional callback invoked for inbound InferRequest messages. Stored
+    /// here so callers can register a handler after the node is created.
+    on_infer: SharedHandler<InferHandler>,
+    /// Optional callback invoked for inbound InferCancel messages. The
+    /// worker registers this to mark in-flight requests as cancelled in the
+    /// queue manager, which the streaming loop observes to abort promptly.
+    on_cancel: SharedHandler<CancelHandler>,
+    /// Optional callback invoked for inbound manifest announcements.
+    on_manifest: SharedHandler<ManifestAnnouncementHandler>,
 }
 
 impl P2PNode {
+    /// Sets a callback for worker announcements
+    pub fn set_on_worker_announcement<F>(&mut self, _callback: F)
+    where
+        F: Fn(decentraai_protocol::WorkerAnnouncement) + Send + Sync + 'static,
+    {
+        // Worker announcements are handled elsewhere; not implemented yet.
+        let _ = _callback;
+    }
+
+    /// Sets a callback for inference requests. The callback should return an
+    /// immediate response (e.g., an InferAccepted message), and may spawn
+    /// background tasks to stream progress back to the requester using
+    /// P2PNode::request().
+    pub fn set_on_infer_request<F>(&mut self, callback: F)
+    where
+        F: Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_infer.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
+    /// Sets a callback for inbound cancellation requests. Called with the
+    /// request id whenever an InferCancel message arrives from a peer.
+    pub fn set_on_cancel_request<F>(&mut self, callback: F)
+    where
+        F: Fn(uuid::Uuid) + Send + Sync + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_cancel.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
+    /// Sets a callback for inbound manifest announcements (peer, manifest).
+    /// The callback is invoked inline by the swarm task and MUST NOT block;
+    /// spawn a background task to download the announced model.
+    pub fn set_on_manifest_announcement<F>(&mut self, callback: F)
+    where
+        F: Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_manifest.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
     /// Creates a node and spawns its swarm task. Must be called from within
     /// a Tokio runtime: the mDNS behaviour registers with the reactor.
     pub fn new(
@@ -274,14 +397,30 @@ impl P2PNode {
             .build();
 
         let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
+        // A second sender used only by the reconnect tasks spawned on peer
+        // disconnects, so redial attempts don't block the event loop.
+        let reconnect_sender = commands.clone();
+        // Shared on_infer callback storage for runtime registration
+        let on_infer: SharedHandler<InferHandler> = Arc::new(tokio::sync::Mutex::new(None));
+        let on_infer_clone = on_infer.clone();
+        let on_cancel: SharedHandler<CancelHandler> = Arc::new(tokio::sync::Mutex::new(None));
+        let on_cancel_clone = on_cancel.clone();
+        let on_manifest: SharedHandler<ManifestAnnouncementHandler> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let on_manifest_clone = on_manifest.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
                 oneshot::Sender<Result<Vec<u8>>>,
             > = HashMap::new();
-            let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> =
-                VecDeque::new();
+            let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> = VecDeque::new();
             let mut connected: Vec<PeerId> = Vec::new();
+            // Per-peer reconnect attempts since the last successful connection,
+            // so a peer that went away doesn't get dialed forever.
+            let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
+            // Last known address per peer, kept so a disconnect can be
+            // re-dialed without waiting for another mDNS announcement.
+            let mut known_addresses: HashMap<PeerId, Multiaddr> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -305,9 +444,25 @@ impl P2PNode {
                                 pending.insert(id, reply);
                             }
                             Command::Broadcast { payload } => {
-                                for peer in &connected {
-                                    swarm.behaviour_mut().messages.send_request(peer, payload.clone());
+                                // Send to connected peers plus every peer whose
+                                // address we know (e.g. from mDNS) even if the
+                                // connection is not established yet —
+                                // request_response auto-dials in that case.
+                                let mut peers = connected.clone();
+                                for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
+                                    if !peers.contains(peer) {
+                                        peers.push(*peer);
+                                    }
                                 }
+                                for peer in peers {
+                                    swarm
+                                        .behaviour_mut()
+                                        .messages
+                                        .send_request(&peer, payload.clone());
+                                }
+                            }
+                            Command::Connected { reply } => {
+                                let _ = reply.send(connected.clone());
                             }
                             Command::Shutdown => break,
                         }
@@ -325,17 +480,70 @@ impl P2PNode {
                                 if !connected.contains(&peer_id) {
                                     connected.push(peer_id);
                                 }
+                                // A successful connection resets the redial
+                                // budget so a future drop can attempt again.
+                                reconnect_attempts.remove(&peer_id);
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            SwarmEvent::ConnectionClosed {
+                                peer_id, endpoint, ..
+                            } => {
                                 info!(%peer_id, "peer disconnected");
                                 connected.retain(|p| p != &peer_id);
+                                // Remember the remote address from the closing
+                                // link when it was us doing the dialing.
+                                if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
+                                    endpoint
+                                {
+                                    known_addresses.insert(peer_id, address.clone());
+                                }
+                                let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
+                                let addr_known = known_addresses.get(&peer_id).cloned();
+                                // Bounded explicit re-dial: drop the budget when
+                                // we've retried too often or have no address, and
+                                // let mDNS re-discovery take over.
+                                let Some(addr) = addr_known.clone() else {
+                                    reconnect_attempts.remove(&peer_id);
+                                    continue;
+                                };
+                                if *attempt >= RECONNECT_MAX_ATTEMPTS {
+                                    reconnect_attempts.remove(&peer_id);
+                                    debug!(%peer_id, "reconnect budget exhausted; waiting for mDNS");
+                                    continue;
+                                }
+                                let nth = *attempt;
+                                *attempt += 1;
+                                let backoff = Duration::from_millis(
+                                    RECONNECT_BASE_BACKOFF_MS << nth.min(10),
+                                );
+                                let sender = reconnect_sender.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(backoff).await;
+                                    let (reply, _) = oneshot::channel();
+                                    let _ = sender.send(Command::Dial { addr, reply });
+                                });
+                                debug!(
+                                    %peer_id,
+                                    attempt = nth + 1,
+                                    max = RECONNECT_MAX_ATTEMPTS,
+                                    backoff_ms = backoff.as_millis(),
+                                    "scheduled reconnect dial"
+                                );
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
                                 mdns::Event::Discovered(list),
                             )) => {
                                 for (peer, addr) in list {
                                     info!(%peer, %addr, "mDNS discovered peer");
-                                    swarm.add_peer_address(peer, addr);
+                                    swarm.add_peer_address(peer, addr.clone());
+                                    known_addresses.insert(peer, addr.clone());
+                                    // mDNS discovery is passive: it only adds
+                                    // addresses to the peerstore. Dial so the
+                                    // connection is actually established and
+                                    // request/response streaming can reach
+                                    // this peer.
+                                    if let Err(e) = swarm.dial(addr) {
+                                        debug!(%peer, error = %e, "mDNS auto-dial deferred");
+                                    }
                                 }
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
@@ -344,13 +552,70 @@ impl P2PNode {
                                 request_response::Message::Request {
                                     request, channel, ..
                                 } => {
-                                    if decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
+                                    if let Ok(announcement) = decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
                                         &request,
                                         request.len(),
-                                    )
-                                    .is_ok()
+                                    ) {
+                                        info!(
+                                            %peer,
+                                            model = %announcement.manifest.file_name,
+                                            "received manifest announcement"
+                                        );
+                                        // Announcements are fire-and-forget but a handler may
+                                        // want to act (e.g. auto-download). The callback must
+                                        // not block the event loop; it spawns its own task.
+                                        let guard = on_manifest_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            cb(peer, announcement.manifest);
+                                        }
+                                        continue;
+                                    }
+                                    // Check for InferRequest
+                                    if let Ok(infer_req) = decentraai_protocol::deserialize_message::<decentraai_protocol::InferRequest>(
+                                        &request,
+                                        request.len(),
+                                    ) {
+                                        info!(%peer, bytes = request.len(), "received inference request");
+                                        // If a runtime on_infer callback has been registered, call it
+                                        let guard = on_infer_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            match cb(peer, infer_req) {
+                                                Ok(bytes) => {
+                                                    if swarm
+                                                        .behaviour_mut()
+                                                        .messages
+                                                        .send_response(channel, bytes)
+                                                        .is_err()
+                                                    {
+                                                        warn!(%peer, "failed to send response");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(%peer, error = %e, "on_infer handler failed");
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        // else fallthrough to normal handler
+                                    }
+                                    // Check for InferCancel (single request id in the message, no
+                                    // request/response payload semantics)
+                                    if let Ok(decentraai_protocol::InferMessage::InferCancel {
+                                        request_id,
+                                        ..
+                                    }) = decentraai_protocol::deserialize_message::<
+                                        decentraai_protocol::InferMessage,
+                                    >(&request, request.len())
                                     {
-                                        info!(%peer, bytes = request.len(), "received manifest announcement");
+                                        info!(%peer, %request_id, "received inference cancel");
+                                        let guard = on_cancel_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            cb(request_id);
+                                        }
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, Vec::new());
                                         continue;
                                     }
                                     let response = match &handler {
@@ -411,7 +676,13 @@ impl P2PNode {
             }
         });
 
-        Ok(Self { commands, peer_id })
+        Ok(Self {
+            commands,
+            peer_id,
+            on_infer,
+            on_cancel,
+            on_manifest,
+        })
     }
 
     pub fn local_peer_id(&self) -> PeerId {
@@ -464,6 +735,16 @@ impl P2PNode {
     pub fn shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
     }
+
+    /// Returns the PeerIds of currently connected peers. Best-effort: an
+    /// empty/truncated result is returned if the swarm task is busy or gone.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        if self.commands.send(Command::Connected { reply }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -490,7 +771,11 @@ impl request_response::Codec for FrameCodec {
         read_frame(io, self.max_frame_bytes).await
     }
 
-    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {

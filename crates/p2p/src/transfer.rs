@@ -75,7 +75,11 @@ pub async fn download(
         done[index] = true;
         save_bitmap(&bitmap_path, &done)?;
         reputation.record_success(&peer);
-        info!(chunk = index, total = chunk_count, "chunk verified and stored");
+        info!(
+            chunk = index,
+            total = chunk_count,
+            "chunk verified and stored"
+        );
     }
 
     let final_path = finalize_download(&staging_path, &bitmap_path, data_dir, &manifest)?;
@@ -297,10 +301,17 @@ async fn fetch_manifest(node: &P2PNode, peer: PeerId, manifest_id: &str) -> Resu
     let raw = node.request(peer, payload).await?;
     let response: ManifestResponse = deserialize_message(&raw, DEFAULT_MAX_MESSAGE_BYTES)?;
     if response.protocol_version != CURRENT_PROTOCOL_VERSION {
-        bail!("peer answered with protocol version {}", response.protocol_version);
+        bail!(
+            "peer answered with protocol version {}",
+            response.protocol_version
+        );
     }
     if response.manifest.model_id != manifest_id {
-        bail!("peer served manifest {} for requested {}", response.manifest.model_id, manifest_id);
+        bail!(
+            "peer served manifest {} for requested {}",
+            response.manifest.model_id,
+            manifest_id
+        );
     }
     Ok(response.manifest)
 }
@@ -335,13 +346,19 @@ async fn fetch_chunk(
     };
     let payload = serialize_message(&request)?;
     let raw = node.request(peer, payload).await?;
-    let response: ChunkResponse =
-        deserialize_message(&raw, DEFAULT_MAX_CHUNK_MESSAGE_BYTES)?;
+    let response: ChunkResponse = deserialize_message(&raw, DEFAULT_MAX_CHUNK_MESSAGE_BYTES)?;
     if response.protocol_version != CURRENT_PROTOCOL_VERSION {
-        bail!("peer answered with protocol version {}", response.protocol_version);
+        bail!(
+            "peer answered with protocol version {}",
+            response.protocol_version
+        );
     }
     if response.chunk_index as usize != index {
-        bail!("peer answered chunk {} for requested {}", response.chunk_index, index);
+        bail!(
+            "peer answered chunk {} for requested {}",
+            response.chunk_index,
+            index
+        );
     }
     Ok(response.chunk_data)
 }
@@ -362,10 +379,7 @@ fn verify_chunk(manifest: &Manifest, index: usize, data: &[u8]) -> Result<()> {
 }
 
 /// Preallocates the staging file and loads the resume bitmap.
-fn prepare_staging(
-    data_dir: &Path,
-    manifest: &Manifest,
-) -> Result<(PathBuf, PathBuf, Vec<bool>)> {
+fn prepare_staging(data_dir: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBuf, Vec<bool>)> {
     let staging_dir = data_dir.join("staging");
     std::fs::create_dir_all(&staging_dir)?;
     let staging_path = staging_dir.join(format!("{}.part", manifest.model_id));
@@ -383,9 +397,7 @@ fn prepare_staging(
 }
 
 fn write_chunk(staging_path: &Path, chunk_size: u64, index: usize, data: &[u8]) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(staging_path)?;
+    let mut file = std::fs::OpenOptions::new().write(true).open(staging_path)?;
     file.seek(SeekFrom::Start(index as u64 * chunk_size))?;
     file.write_all(data)?;
     file.sync_data()?;
@@ -412,11 +424,19 @@ fn finalize_download(
     }
     let file_hash = full.finalize().to_hex().to_string();
     if file_hash != manifest.model_id {
-        bail!("assembled file hash mismatch: expected {}, got {}", manifest.model_id, file_hash);
+        bail!(
+            "assembled file hash mismatch: expected {}, got {}",
+            manifest.model_id,
+            file_hash
+        );
     }
     let root = merkle_root(&manifest.chunk_hashes);
     if root != manifest.merkle_root {
-        bail!("merkle root mismatch: expected {}, got {}", manifest.merkle_root, root);
+        bail!(
+            "merkle root mismatch: expected {}, got {}",
+            manifest.merkle_root,
+            root
+        );
     }
 
     let models_dir = data_dir.join("models");
@@ -430,9 +450,7 @@ fn finalize_download(
 
 fn load_bitmap(path: &Path, chunk_count: usize) -> Result<Vec<bool>> {
     match std::fs::read(path) {
-        Ok(bytes) if bytes.len() == chunk_count => {
-            Ok(bytes.iter().map(|b| *b == 1u8).collect())
-        }
+        Ok(bytes) if bytes.len() == chunk_count => Ok(bytes.iter().map(|b| *b == 1u8).collect()),
         _ => Ok(vec![false; chunk_count]),
     }
 }

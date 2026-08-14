@@ -1,0 +1,61 @@
+node:
+  name: "decentraai-coord"
+  mode: "balanced"
+  data_dir: "~/.decentraai_coord"
+
+network:
+  private_swarm: true
+  lan_discovery: true
+  dht_enabled: false
+  relay_enabled: false
+  bootstrap_peers: []
+  max_connections: 64
+  max_message_bytes: 1048576
+
+storage:
+  chunk_size_mb: 4
+  hash_algorithm: "blake3"
+  max_cache_gb: 100
+  min_free_disk_gb: 1
+  verify_full_file_after_assembly: true
+  allow_unsigned_models: true
+  auto_seed_verified_models: false
+
+resources:
+  cpu_max_percent: 80
+  memory_max_percent: 90
+  reserve_cpu_cores: 0
+  reserve_ram_mb: 256
+  gpu_enabled: "auto"
+  gpu_max_vram_percent: 90
+  reserve_vram_mb: 256
+  stop_gpu_temperature_celsius: 83
+  max_upload_mbps: 20
+  max_download_mbps: 80
+
+inference:
+  enabled: "auto"
+  runtime: "llama_server"
+  bind_address: "127.0.0.1"
+  api_auth_required: false
+  allow_remote_inference: true
+  max_concurrent_requests: 1
+  max_context_tokens: 4096
+  max_generated_tokens: 1024
+  request_timeout_seconds: 180
+  queue_max_requests: 20
+  idle_model_unload_minutes: 15
+  api_port: 8083
+
+privacy:
+  log_prompts: false
+  log_outputs: false
+  publish_exact_hardware: false
+  telemetry_opt_in: false
+
+security:
+  trust_mode: "private"
+  require_signed_announcements: false
+  require_request_signatures: false
+  ban_duration_minutes: 60
+  max_invalid_chunks_per_peer: 2
