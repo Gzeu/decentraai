@@ -2002,6 +2002,22 @@ mod tests {
             )),
             "trace includes the Planned event"
         );
+        // Finalize correlates the decision with the reservation/plan/outcome
+        // and appends the lifecycle trace (Reserved → Executing → Released).
+        manager.finalize_decision("r1", &worker.to_string(), "plan-1", "res-1", true);
+        let ds = manager.decisions();
+        let d = &ds[0];
+        assert_eq!(d.reservation_id.as_deref(), Some("res-1"));
+        assert_eq!(d.outcome.as_deref(), Some("succeeded"));
+        assert_eq!(d.plan.as_ref().map(|p| p.plan_id.as_str()), Some("plan-1"));
+        assert!(d
+            .trace
+            .iter()
+            .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Reserved { .. })));
+        assert!(d
+            .trace
+            .iter()
+            .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Completed { ok: true })));
         // Ring buffer bounds.
         for i in 0..70 {
             manager
