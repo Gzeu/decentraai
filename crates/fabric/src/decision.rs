@@ -160,6 +160,12 @@ pub struct ExecutionDecision {
     pub engine_capability: EngineCapabilities,
     pub reasoning: String,
     pub ts: u64,
+    /// Reservation held for this request, filled in once the coordinator
+    /// actually reserves a worker (correlates the decision with the outcome).
+    pub reservation_id: Option<String>,
+    /// Terminal outcome: "in_flight" until the coordinator records the result,
+    /// then "succeeded" or "failed" (safe operational metadata, no content).
+    pub outcome: Option<String>,
     /// Every lifecycle event observed for this request (control-plane trace).
     pub trace: Vec<ExecutionEvent>,
 }
@@ -248,7 +254,14 @@ fn evaluate_candidates(req: &RequestFacts, workers: &[WorkerFacts]) -> Vec<Candi
 /// DISCOVER → CLASSIFY → CANDIDATES → CONSTRAINTS → SCORE → SELECT pipeline and
 /// records the trace events. Fan-out/staged modes are only selected when a real
 /// engine advertises the capability (the planner already gates this).
+///
+/// The provided [`ExecutionPlanner`] carries the live fabric context used by the
+/// real routing path — the measured network graph (M19), expert registry (M21)
+/// and objective weights — so the decision's per-candidate scores and network
+/// cost reflect genuine runtime state, not a cold default planner. Callers that
+/// have no live fabric pass `&ExecutionPlanner::default()`.
 pub fn evaluate(
+    planner: &ExecutionPlanner,
     request_id: &str,
     req: &RequestFacts,
     workers: &[WorkerFacts],
@@ -265,8 +278,9 @@ pub fn evaluate(
     ];
     let cls = classify(&req.context, req.priority, streaming);
     let mut candidates = evaluate_candidates(req, workers);
-    // Score the eligible candidates via the planner's ranked breakdown.
-    let plan_result: PlanResult = ExecutionPlanner::default().plan(req, workers);
+    // Score the eligible candidates via the planner's ranked breakdown (using
+    // the caller's live network graph and objective weights).
+    let plan_result: PlanResult = planner.plan(req, workers);
     for cand in candidates.iter_mut() {
         if let Some(cs) = plan_result
             .rationale
@@ -278,12 +292,14 @@ pub fn evaluate(
         }
         cand.kv_prefix_resident = req.context.prefix_resident_on.as_deref()
             == Some(cand.peer_id.as_str());
+        // Real network reach cost (M19) from the caller's measured graph.
+        cand.network_cost_ms = planner.network.reach_cost_ms(&cand.peer_id, req.transfer_mib);
     }
 
     let selected = plan_result.rationale.chosen_worker.clone();
     // Fan-out is only ever selected when a real engine advertises it.
     let fanout = allow_fanout
-        && matches!(crate::advisory::fan_out_candidacy(req, workers, &ExecutionPlanner::default().config, true), crate::advisory::FanOutAdvisory::CandidateFanOut { .. });
+        && matches!(crate::advisory::fan_out_candidacy(req, workers, &planner.config, true), crate::advisory::FanOutAdvisory::CandidateFanOut { .. });
     let (plan, expected_mode) = if fanout {
         // Only build a fan-out from workers a real engine advertises as
         // staging-capable (never fabricate multi-worker execution).
@@ -350,6 +366,8 @@ pub fn evaluate(
         engine_capability,
         reasoning: plan_result.reasoning.clone(),
         ts: now_secs(),
+        reservation_id: None,
+        outcome: None,
         trace,
     }
 }
@@ -515,6 +533,7 @@ mod tests {
         let good = worker("g", 150, 20, 10);
         let ws = vec![bad, good];
         let d = evaluate(
+            &ExecutionPlanner::default(),
             "r1",
             &req(
                 ContextProfile {
@@ -541,6 +560,7 @@ mod tests {
     fn decision_is_serializable_and_round_trips() {
         let g = worker("g", 150, 20, 10);
         let d = evaluate(
+            &ExecutionPlanner::default(),
             "r1",
             &req(
                 ContextProfile {
@@ -559,5 +579,44 @@ mod tests {
         let back: ExecutionDecision = serde_json::from_str(&j).unwrap();
         assert_eq!(back.request_id, "r1");
         assert_eq!(back.selected_worker, d.selected_worker);
+    }
+
+    #[test]
+    fn evaluate_uses_the_callers_measured_network_graph() {
+        // A coordinator feeds the decision its live network graph (M19), so the
+        // recorded network cost must reflect real measured RTT rather than 0.
+        let mut planner = ExecutionPlanner::default();
+        use crate::network::{LinkMetrics, Locality};
+        planner
+            .network
+            .set("far", LinkMetrics::prior(Locality::Remote, Some(80_000)));
+        planner
+            .network
+            .set("near", LinkMetrics::prior(Locality::Lan, Some(1_000)));
+        // One eligible candidate, transfer cost of 2 MiB.
+        let mut rf = req(ContextProfile {
+            prompt_tokens: 10,
+            max_output_tokens: 10,
+            is_continuation: false,
+            prefix_resident_on: None,
+        }, 0);
+        rf.transfer_mib = 2;
+        let ws = vec![worker("far", 150, 40, 10)];
+        let d = evaluate(&planner, "r1", &rf, &ws, false, false);
+        assert!(
+            d.network_cost_ms > 0,
+            "decision must carry real network cost from the live graph"
+        );
+        let far = d.candidates.iter().find(|c| c.peer_id == "far").unwrap();
+        assert!(
+            far.network_cost_ms > 0,
+            "candidate carries measured reach cost"
+        );
+        // The remote worker's per-candidate reach cost (RTT + 2 MiB transfer)
+        // must reflect the measured Remote prior, i.e. be non-trivial.
+        assert!(
+            far.network_cost_ms >= 70,
+            "reach cost includes the measured RTT term"
+        );
     }
 }
