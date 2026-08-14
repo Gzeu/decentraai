@@ -43,6 +43,19 @@ const RECENT_REQUEST_LIMIT: usize = 12;
 /// Sliding rate-limit window.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Proxy-boundary cap on the JSON-encoded prompt text forwarded to
+/// llama-server (mirrors `BackendConfig::max_prompt_bytes` on the distributed
+/// path). Rejected up front so an oversized local request cannot hold the
+/// engine or the inference queue slot.
+const MAX_PROMPT_BYTES: usize = 200_000;
+/// Proxy-boundary cap on caller-requested `max_tokens` (mirrors
+/// `BackendConfig::max_output_tokens`). llama-server clamps internally, but we
+/// reject loudly instead of forwarding an unbounded generation request.
+const MAX_OUTPUT_TOKENS: u64 = 8192;
+/// HTTP request timeout to the managed llama-server backend, matching the
+/// distributed `BackendConfig` default so a hung engine releases its slot
+/// instead of holding the queue forever.
+const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
 type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
@@ -181,7 +194,10 @@ impl ApiState {
             backend_url,
             auth_token: auth_token.map(Into::into),
             manager,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(BACKEND_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             info,
             token_store_path,
             tiers,
@@ -959,6 +975,59 @@ fn sse_completion_tokens(body: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Bytes of user-supplied inference text in a request body: the sum of
+/// `messages[].content` (chat) or the `prompt` string (completions). Used to
+/// enforce the proxy prompt cap. Runs on the merged body so caller-supplied
+/// sampling defaults are already folded in.
+fn proxy_prompt_bytes(body: &[u8]) -> usize {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return 0;
+    };
+    if let Some(messages) = value["messages"].as_array() {
+        return messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .map(str::len)
+            .sum();
+    }
+    value["prompt"].as_str().map(str::len).unwrap_or(0)
+}
+
+/// Proxy-boundary size caps for the local /v1/* surface, mirroring the caps
+/// the distributed routing path enforces via `BackendConfig`. Guards against
+/// forwarding an oversized prompt or an unbounded `max_tokens` to the managed
+/// llama-server. Returns the error response to send when a cap is exceeded,
+/// or `None` when the request may be forwarded.
+fn enforce_size_caps(outgoing: &[u8]) -> Option<Response> {
+    if proxy_prompt_bytes(outgoing) > MAX_PROMPT_BYTES {
+        return Some(
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{{\"error\":{{\"message\":\"prompt exceeds the {MAX_PROMPT_BYTES} byte limit\",\"type\":\"invalid_request_error\"}}}}"
+                ),
+            )
+                .into_response(),
+        );
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(outgoing) {
+        if let Some(requested) = value["max_tokens"].as_u64() {
+            if requested > MAX_OUTPUT_TOKENS {
+                return Some(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "{{\"error\":{{\"message\":\"max_tokens {requested} exceeds the {MAX_OUTPUT_TOKENS} limit\",\"type\":\"invalid_request_error\"}}}}"
+                        ),
+                    )
+                        .into_response(),
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Proxies a streaming inference response to the caller chunk-by-chunk while
 /// recording the same best-effort metrics the non-streaming path does. The
 /// channel lets a drop of the client cut upstream early; the spawned task
@@ -1030,9 +1099,22 @@ async fn proxy_handler(
     };
     let is_inference = method == Method::POST
         && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
+    // The body the proxy will actually forward (caller sampling defaults
+    // folded in), computed once up front so the proxy-boundary caps see the
+    // exact prompt/max_tokens and it can be reused for the request below.
+    let outgoing = if is_inference {
+        apply_generation_defaults(&state.info.generation, &body)
+    } else {
+        body.to_vec()
+    };
     if is_inference {
         if let Err(e) = state.check_model_access(&auth, &body) {
             return e.into_response();
+        }
+        // Proxy-boundary size caps: reject an oversized prompt or an unbounded
+        // max_tokens before they can hold the queue slot or the engine.
+        if let Some(error) = enforce_size_caps(&outgoing) {
+            return error;
         }
         if let Err(e) = state.check_rate_limit(&auth) {
             return e.into_response();
@@ -1065,14 +1147,13 @@ async fn proxy_handler(
         }
     }
 
-    state.manager.lock().await.note_activity();
+    // Only real inference resets the idle-unload clock (and drives the request
+    // counters via record_inference below); a bare GET /v1/models metadata
+    // poll must not defeat idle-unload.
+    if is_inference {
+        state.manager.lock().await.note_activity();
+    }
     let started = Instant::now();
-
-    let outgoing = if is_inference {
-        apply_generation_defaults(&state.info.generation, &body)
-    } else {
-        body.to_vec()
-    };
 
     // Resolve the backend URL from the live manager so engine auto-restarts
     // (M24) are reflected — the port changes on every respawn when ephemeral.
@@ -2804,6 +2885,178 @@ mod tests {
         assert!(body.contains("[DONE]"), "sentinel forwarded");
 
         // The token-use accounting picked up the streamed usage.
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// A backend that counts completions it actually serves, so a test can
+    /// prove a request rejected at the proxy boundary never reached it. The
+    /// manager owns the counting app (the proxy forwards to the live engine),
+    /// following the same pattern as `proxy_streams_sse_when_requested`. The
+    /// returned [`ServeManager`] wraps the app; `dir` keeps the fake
+    /// engine's temp dir alive for the test.
+    #[cfg(unix)]
+    async fn start_echo_backend(
+        dir: &Path,
+        hits: Arc<AtomicU64>,
+    ) -> Arc<Mutex<ServeManager>> {
+        let app_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let h = Arc::clone(&app_hits);
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    "{\"usage\":{\"completion_tokens\":1}}"
+                }
+            }),
+        );
+        test_manager_with(dir, app).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_rejects_oversized_prompt_and_max_tokens_before_backend() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let manager = start_echo_backend(dir.path(), hits.clone()).await;
+        // The proxy forwards to the live engine, so the manager must own the
+        // counting backend; the state's backend_url is therefore unused.
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}/v1/chat/completions");
+
+        // Oversized prompt text (> MAX_PROMPT_BYTES) -> 413, never forwarded.
+        let big_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":big_prompt}]});
+        let resp = client
+            .post(&base)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prompt exceeds"));
+
+        // Oversized max_tokens (> MAX_OUTPUT_TOKENS) -> 400, never forwarded.
+        let big_tokens = MAX_OUTPUT_TOKENS + 1;
+        let body = serde_json::json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens": big_tokens,
+        });
+        let resp = client
+            .post(&base)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
+
+        // Neither oversized request reached the backend.
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_within_limits_is_forwarded_to_backend() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let manager = start_echo_backend(dir.path(), hits.clone()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let body = serde_json::json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens": MAX_OUTPUT_TOKENS,
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "in-limit request must reach the backend");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_models_does_not_reset_idle_clock_but_post_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+
+        // A metadata GET must not reset the idle clock: it keeps growing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_get_before_sleep = manager.lock().await.idle_for();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after_get = manager.lock().await.idle_for();
+        assert!(
+            after_get > after_get_before_sleep,
+            "GET must not reset idle clock: grew {after_get_before_sleep:?} -> {after_get:?}"
+        );
+
+        // Another GET keeps it growing (no idle reset either).
+        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        let after_more_get = manager.lock().await.idle_for();
+        assert!(
+            after_more_get >= after_get,
+            "GET must not reset idle clock: {after_get:?} -> {after_more_get:?}"
+        );
+
+        // A real inference POST resets the idle clock back near zero.
+        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let after_post = manager.lock().await.idle_for();
+        assert!(
+            after_post < after_get,
+            "inference POST must reset idle clock: {after_get:?} -> {after_post:?}"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
 }
