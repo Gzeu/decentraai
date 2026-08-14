@@ -758,12 +758,34 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_server(dir: &Path) -> PathBuf {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-llama-server");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // Write + sync + close BEFORE spawning, so a concurrent exec in another
+        // test never sees a freshly-open-for-write script (the ETXTBSY flake
+        // under parallel tests). Retry a few times on ETXTBSY just in case.
+        let mut last = None;
+        for attempt in 0..4 {
+            match std::fs::File::create(&path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"#!/bin/sh\nexec sleep 60\n");
+                    let _ = f.sync_all();
+                    drop(f);
+                    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&path, perms).unwrap();
+                    return path;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 3 => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            panic!("failed to write fake llama-server after retries: {e}");
+        }
         path
     }
 
