@@ -627,11 +627,46 @@ async fn admin_token_revoke_handler(
         .into_response()
 }
 
+/// OpenAPI 3.0 document (H6): the public, versioned contract for the
+/// `/v1/*` surface. Always served (no auth) so tooling can introspect it.
+async fn openapi_handler() -> Response {
+    let spec = serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "DecentraAI Node API",
+            "version": "1.0.0",
+            "description": "OpenAI-compatible inference + node status for a DecentraAI node. Endpoints that resolve the live engine (manager) prefer it; the OpenAI surface is /v1.",
+        },
+        "servers": [{ "url": "/" }],
+        "paths": {
+            "/v1/models": { "get": { "operationId": "listModels", "summary": "List served models", "responses": { "200": { "description": "Model list" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/chat/completions": { "post": { "operationId": "chatCompletions", "summary": "Streamed or single chat completion", "responses": { "200": { "description": "Chat completion (SSE when stream=true)" }, "429": { "description": "Rate limited" } } } },
+            "/v1/completions": { "post": { "operationId": "completions", "summary": "Text completion", "responses": { "200": { "description": "Completion" } } } },
+            "/status": { "get": { "operationId": "status", "summary": "Node status snapshot (dashboard)", "responses": { "200": { "description": "Status" } } } },
+            "/v1/token": { "get": { "operationId": "tokenInfo", "summary": "Issued-token summary", "responses": { "200": { "description": "Tokens" } } } },
+            "/v1/peers": { "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/compute": { "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
+            "/v1/network": { "get": { "operationId": "network", "summary": "Per-peer link metrics (operator+)", "responses": { "200": { "description": "Network" }, "403": { "description": "Forbidden for client tokens" } } } },
+            "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions (operator+)", "responses": { "200": { "description": "Executions" }, "403": { "description": "Forbidden for client tokens" } } } },
+            "/api/admin/token/create": { "post": { "operationId": "adminCreateToken", "summary": "Create a subscription token (master only)", "responses": { "200": { "description": "Token (shown once)" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/token/revoke": { "post": { "operationId": "adminRevokeToken", "summary": "Revoke a token (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
+            "/api/admin/token/list": { "get": { "operationId": "adminListTokens", "summary": "List tokens (master only)", "responses": { "200": { "description": "Token list" }, "401": { "description": "Unauthorized" } } } },
+            "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
+        }
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
 /// Builds the proxy router: the OpenAI-compatible surface, the dashboard
 /// (also the fallback), and the small JSON views that feed it.
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(dashboard_handler))
+        .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/v1/token", get(token_handler))
         .route("/v1/peers", get(peers_handler))
@@ -2242,6 +2277,23 @@ mod tests {
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
         }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn openapi_document_is_served_and_versioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let resp = reqwest::get(format!("http://{api}/openapi.json"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let spec: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.0.0");
+        assert_eq!(spec["info"]["version"], "1.0.0");
+        assert!(spec["paths"]["/v1/chat/completions"].is_object());
+        assert!(spec["paths"]["/v1/compute"].is_object());
         manager.lock().await.shutdown().await.unwrap();
     }
 

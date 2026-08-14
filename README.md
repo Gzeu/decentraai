@@ -222,6 +222,11 @@ with `--threads` (physical-core budget), `--flash-attn on`, and `--jinja`
 (the model's own chat template). The model unloads automatically after
 `idle_model_unload_minutes` without requests.
 
+An OpenAPI 3.0 document describing the `/v1` surface (models, chat and text
+completions, status, peers, and the operator/admin compute views) is served at
+[`/openapi.json`](http://127.0.0.1:8080/openapi.json) so tooling can
+introspect the contract (H6).
+
 ### 4. Subscriptions: issue tokens with tiers (P1)
 
 Everything is free; the tier reflects contribution. The master token in
