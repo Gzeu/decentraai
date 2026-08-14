@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::{pin::Pin, time::Duration};
 use thiserror::Error;
 
@@ -83,7 +84,14 @@ impl EngineCapabilities {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Resolves the live backend base URL at request time. Used when the engine
+/// endpoint can change after a respawn (M24 engine supervisor may bind a new
+/// ephemeral port), so the adapter follows the authoritative engine source of
+/// truth instead of a frozen startup URL. Returning `None` falls back to
+/// [`BackendConfig::base_url`].
+pub type LiveBackendUrl = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct BackendConfig {
     pub base_url: String,
     pub model: String,
@@ -94,6 +102,10 @@ pub struct BackendConfig {
     pub max_output_tokens: u32,
     /// Which engine this backend drives (M22). Defaults to a plain remote.
     pub engine: EngineKind,
+    /// Optional live URL resolver (single source of truth for the engine
+    /// endpoint). When set, every request resolves the base URL through it so
+    /// an engine respawn on a new port is followed automatically.
+    pub backend_url_resolver: Option<LiveBackendUrl>,
 }
 
 impl Default for BackendConfig {
@@ -107,6 +119,7 @@ impl Default for BackendConfig {
             max_prompt_bytes: 200_000,
             max_output_tokens: 8192,
             engine: EngineKind::RemoteOpenAI,
+            backend_url_resolver: None,
         }
     }
 }
@@ -233,7 +246,13 @@ impl OpenAiCompatibleBackend {
     }
 
     fn endpoint(&self, path: &str) -> String {
-        format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
+        let base = self
+            .config
+            .backend_url_resolver
+            .as_ref()
+            .and_then(|r| r())
+            .unwrap_or_else(|| self.config.base_url.clone());
+        format!("{}/{}", base.trim_end_matches('/'), path)
     }
     fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.config.api_key {
@@ -449,5 +468,41 @@ mod tests {
             b.validate(&r),
             Err(BackendError::OutputLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn live_url_resolver_follows_a_moving_engine_endpoint() {
+        // Simulates an engine respawn changing port: the resolver (the single
+        // source of truth) returns the new live URL, and endpoint() must follow
+        // it instead of the frozen static base_url.
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let live = Arc::new(Mutex::new(Some("http://127.0.0.1:10021".to_string())));
+        let live2 = live.clone();
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            base_url: "http://127.0.0.1:9999".to_string(), // frozen startup URL
+            backend_url_resolver: Some(Arc::new(move || live2.lock().ok().and_then(|g| g.clone()))),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Follows the resolver's current value.
+        assert_eq!(b.endpoint("v1/chat/completions"), "http://127.0.0.1:10021/v1/chat/completions");
+        // Engine respawned on a new port: the resolver moves, endpoint follows.
+        *live.lock().unwrap() = Some("http://127.0.0.1:10022".to_string());
+        assert_eq!(b.endpoint("v1/models"), "http://127.0.0.1:10022/v1/models");
+        // Resolver gone => falls back to the static base_url.
+        *live.lock().unwrap() = None;
+        assert_eq!(b.endpoint("health"), "http://127.0.0.1:9999/health");
+    }
+
+    #[test]
+    fn no_resolver_uses_static_base_url() {
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            base_url: "http://127.0.0.1:4321".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(b.endpoint("v1/models"), "http://127.0.0.1:4321/v1/models");
     }
 }

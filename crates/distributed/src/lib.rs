@@ -60,21 +60,31 @@ const MIN_FREE_VRAM_MB: u64 = 512;
 /// Human-readable message for an admission rejection (M15).
 fn describe_admit_reason(reason: AdmitReason) -> String {
     match reason {
-        AdmitReason::InsufficientRam { available, required } => {
+        AdmitReason::InsufficientRam {
+            available,
+            required,
+        } => {
             format!("{available} MiB free RAM below the required {required} MiB")
         }
-        AdmitReason::InsufficientVram { available, required } => {
+        AdmitReason::InsufficientVram {
+            available,
+            required,
+        } => {
             format!("{available} MiB free VRAM below the required {required} MiB")
         }
     }
 }
 
+pub mod breaker;
 pub mod compute;
 pub mod config;
 pub mod fallback;
 pub mod p2p_handler;
 pub mod queue;
+pub mod rate_limit;
+pub mod replay;
 pub mod router;
+pub mod session;
 pub mod tracker;
 pub mod worker;
 
@@ -93,7 +103,8 @@ pub use worker::WorkerManager;
 
 /// Re-export protocol types for convenience
 pub use decentraai_protocol::{
-    InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement, WorkerStatus,
+    InferErrorCode, InferMessage, InferRequest, InferResponse, TaskPlacement, WorkerAnnouncement,
+    WorkerStatus,
 };
 
 /// Builds a serving backend for a downloaded model file (M14 on-demand
@@ -176,6 +187,7 @@ pub struct ProvisioningConfig {
 
 /// Module for error types
 mod error {
+    use decentraai_protocol::InferErrorCode;
     use thiserror::Error;
 
     #[derive(Debug, Error)]
@@ -201,6 +213,40 @@ mod error {
         #[error("Worker {0} is not trusted")]
         UntrustedWorker(String),
     }
+
+    impl DistributedError {
+        /// Idempotency-safe retry policy: only transport/connection-level
+        /// failures are retried. A definite worker rejection or a cancelled
+        /// request must never be re-issued, because re-sending would
+        /// duplicate non-idempotent work (re-generation, double token/KV
+        /// accounting). A connection that never completed is safe to retry —
+        /// nothing was produced.
+        pub fn is_retryable(&self) -> bool {
+            matches!(self, DistributedError::P2PError(_) | DistributedError::RequestTimeout(_))
+        }
+
+        /// Stable machine-readable classification of this failure (M10
+        /// Phase-1). Lets `/metrics`, logs and clients categorize an error
+        /// without parsing the human-readable string. Maps directly to an
+        /// [`InferErrorCode`] for populating `InferFailed` frames.
+        pub fn code(&self) -> InferErrorCode {
+            match self {
+                DistributedError::NoWorkersAvailable(_) => InferErrorCode::NoWorkers,
+                DistributedError::AllWorkersFailed(_) => InferErrorCode::AllWorkersFailed,
+                DistributedError::RequestTimeout(_) => InferErrorCode::Timeout,
+                DistributedError::WorkerRejected(_, _) => InferErrorCode::Rejected,
+                DistributedError::P2PError(_) => InferErrorCode::Transport,
+                DistributedError::SerializationError(_) => InferErrorCode::Serialization,
+                DistributedError::UntrustedWorker(_) => InferErrorCode::Untrusted,
+            }
+        }
+    }
+
+    impl From<&DistributedError> for InferErrorCode {
+        fn from(e: &DistributedError) -> Self {
+            e.code()
+        }
+    }
 }
 
 /// Main distributed inference coordinator
@@ -215,6 +261,18 @@ pub struct DistributedInference {
     queue_manager: Arc<RequestQueueManager>,
     compute_manager: Option<Arc<crate::compute::ComputeManager>>,
     config: InferenceConfig,
+    /// Security-log directory. When set, each routed request records a
+    /// per-request audit event (`routed`/`inference_completed`) capturing the
+    /// request id, worker, model hash and outcome (M10). None disables audit.
+    logs_dir: Option<PathBuf>,
+    /// Coordinator signing key bytes (P1). When set, outbound ``InferRequest``s
+    /// are signed so workers can authenticate them and reject spoofs / unsigned
+    /// traffic. `None` sends unsigned (legacy) frames.
+    signing_key: Option<[u8; 32]>,
+    /// Monotonic per-worker-outbound nonce source (P4). Each signed request
+    /// gets a unique nonce so the worker's replay guard never sees a duplicate
+    /// for this coordinator.
+    outbound_nonce: std::sync::atomic::AtomicU64,
 }
 
 impl DistributedInference {
@@ -249,7 +307,55 @@ impl DistributedInference {
             queue_manager,
             compute_manager: None,
             config,
+            logs_dir: None,
+            signing_key: None,
+            outbound_nonce: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Sets the coordinator's signing key bytes (P1). With it set, every
+    /// outbound routed request is Ed25519-signed so workers can authenticate
+    /// it and reject spoofed/unsigned traffic.
+    pub fn set_signing_identity(&mut self, signing_key: [u8; 32]) {
+        self.signing_key = Some(signing_key);
+    }
+
+    /// Sets the security-log directory so routing records per-request audit
+    /// events (M10). Pass `None` to keep routing silent.
+    pub fn set_logs_dir(&mut self, logs_dir: Option<PathBuf>) {
+        self.logs_dir = logs_dir;
+    }
+
+    /// Best-effort per-request audit event (M10): request id, session, worker,
+    /// model hash and outcome. Never breaks the routing flow on a write error.
+    fn audit_routed(&self, request: &InferRequest, worker: &libp2p::PeerId, ok: bool) {
+        if let Some(logs_dir) = &self.logs_dir {
+            decentraai_audit::record_best_effort(
+                logs_dir,
+                if ok { "inference_completed" } else { "inference_failed" },
+                serde_json::json!({
+                    "request_id": request.request_id.to_string(),
+                    "session_id": request.session_id.clone().unwrap_or_default(),
+                    "trace_id": request.trace_id,
+                    "worker_id": worker.to_string(),
+                    "model_hash": request.model_hash,
+                    "status": if ok { "completed" } else { "failed" },
+                }),
+            );
+        }
+    }
+
+    /// Ed25519-signs an outbound infer request with this node's signing key (P1).
+    /// No-op when no signing key is set (legacy unsigned traffic).
+    fn sign_request(&self, request: &mut InferRequest) {
+        if let Some(key) = &self.signing_key {
+            // P4: give each outbound request a unique nonce so the receiving
+            // worker's replay guard never confuses it with a replayed frame.
+            request.nonce = self
+                .outbound_nonce
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            decentraai_protocol::sign_infer_request_with_key(key, request);
+        }
     }
 
     /// Attaches a [`crate::compute::ComputeManager`] so routing can select
@@ -345,16 +451,21 @@ impl DistributedInference {
         model_hash: String,
         provisioning: Option<ProvisioningConfig>,
     ) -> anyhow::Result<()> {
-        use decentraai_protocol::{
-            InferMessage, InferResponse, serialize_message,
-        };
+        use decentraai_protocol::{InferMessage, InferResponse, serialize_message};
 
         let local_peer = self.p2p_node.local_peer_id();
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<(
-                decentraai_protocol::InferRequest,
-                Option<decentraai_compute::ResourceReservation>,
-            )>();
+        // Bounded inbound pipeline (data-plane hardening): the worker loop
+        // serves one queued request at a time, so an abusive sender could
+        // otherwise flood the unbounded channel and enqueue without bound.
+        // Capacity is derived from `max_queue_depth` so the number of
+        // requests in the pipeline (buffered + being served) never exceeds
+        // the configured depth. The producer uses `try_send` and rejects the
+        // request when the pipe is already full (see the on_infer handler).
+        let inbound_cap = self.config.max_queue_depth.max(1) as usize;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            decentraai_protocol::InferRequest,
+            Option<decentraai_compute::ResourceReservation>,
+        )>(inbound_cap);
         let tx_clone = tx.clone();
         let p2p_clone = self.p2p_node.clone();
         let queue_mgr = self.queue_manager.clone();
@@ -364,8 +475,7 @@ impl DistributedInference {
         let compute_for_closure = self.compute_manager.clone();
         // M16: real compute metrics. The worker's streaming task records
         // measured tokens/sec and latency; the queue path keeps depth current.
-        let compute_metrics =
-            self.compute_manager.as_ref().map(|c| c.runtime_metrics());
+        let compute_metrics = self.compute_manager.as_ref().map(|c| c.runtime_metrics());
 
         // Worker-side reservation enforcement (M15): the worker keeps its own
         // ledger of in-flight workloads booked against the capacity it
@@ -373,12 +483,11 @@ impl DistributedInference {
         // exceed the remaining headroom — even if a buggy or malicious
         // coordinator sent more work than it booked. The TTL is a safety net;
         // reservations are released explicitly on the terminal event.
-        let local_reservations: Arc<std::sync::Mutex<ReservationLedger>> = Arc::new(
-            std::sync::Mutex::new(ReservationLedger::new(
+        let local_reservations: Arc<std::sync::Mutex<ReservationLedger>> =
+            Arc::new(std::sync::Mutex::new(ReservationLedger::new(
                 std::time::Duration::from_secs(300),
                 8,
-            )),
-        );
+            )));
         let reservations_closure = local_reservations.clone();
         let reservations_for_task = local_reservations.clone();
 
@@ -389,7 +498,11 @@ impl DistributedInference {
         let provisioned_clone = provisioned.clone();
         let provisioning_clone = provisioning.clone();
         let provision_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            provisioning.as_ref().map(|p| p.max_concurrent_downloads).unwrap_or(0).max(1),
+            provisioning
+                .as_ref()
+                .map(|p| p.max_concurrent_downloads)
+                .unwrap_or(0)
+                .max(1),
         ));
         let semaphore_clone = provision_semaphore.clone();
 
@@ -409,60 +522,176 @@ impl DistributedInference {
         let queue_for_closure = queue_mgr.clone();
         let wm_for_closure = worker_manager.clone();
         let metrics_for_infer = compute_metrics.clone();
+        // P4: replay guard for inbound requests, keyed by the authenticated
+        // sender peer. TTL wraps the request timeout so a captured frame can't
+        // be replayed after the window; capacity bounds memory per peer.
+        let replay: Arc<std::sync::Mutex<crate::replay::ReplayGuard>> = Arc::new(
+            std::sync::Mutex::new(crate::replay::ReplayGuard::new(
+                std::time::Duration::from_secs(300),
+                4096,
+            )),
+        );
+        let replay_for_closure = replay.clone();
+        // H1: per-peer sliding-window rate limit on the worker path, protecting
+        // the engine from an abusive/anomalous coordinator regardless of how
+        // many requests it sends. Window = 60s, burst = configured via a
+        // module constant (self._peer_limit below).
+        let peer_limit = 120usize;
+        let peer_limiter: Arc<std::sync::Mutex<crate::rate_limit::PeerRateLimiter>> =
+            Arc::new(std::sync::Mutex::new(crate::rate_limit::PeerRateLimiter::new(
+                std::time::Duration::from_secs(60),
+                peer_limit,
+                peer_limit * 2,
+            )));
+        let peer_limiter_for_closure = peer_limiter.clone();
+        let logs_dir_for_infer = self.logs_dir.clone();
 
         // Register sync on_infer handler that enqueues the request and returns Accept
-        self.p2p_node.set_on_infer_request(move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
-            // Only accept requests for the configured model.
-            if req.model_hash != model_hash_clone {
-                // On-demand provisioning (M14): a workload for a model we do
-                // not hold yet is answered with InferAccepted immediately
-                // (the requester keeps waiting on the tracker) while a
-                // background task downloads, verifies, and serves the model.
-                if let Some(prov) = &provisioning_clone {
-                    let accepted = serialize_message(&InferMessage::InferAccepted {
+        self.p2p_node.set_on_infer_request(
+            move |peer: libp2p::PeerId, req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
+                // P1/P2: verify the request is signed by the authenticated
+                // connected peer before accepting work. `peer` is the real
+                // Noise-authenticated PeerId; `req.sender_peer_id` is payload
+                // and never trusted. A failed signature or an unsigned frame
+                // when signing is required is answered terminal (never
+                // executed, never retried).
+                if !decentraai_protocol::verify_infer_request_signature(&peer, &req).is_ok() {
+                    let resp = InferResponse {
                         request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
                         worker_peer_id: local_peer,
-                        estimated_wait_ms: 10,
-                    })?;
-                    let prov = prov.clone();
-                    let ctx = Provisioner {
-                        p2p: p2p_for_closure.clone(),
-                        queue_mgr: queue_for_closure.clone(),
-                        worker_manager: wm_for_closure.clone(),
-                        provisioned: provisioned_clone.clone(),
-                        semaphore: semaphore_clone.clone(),
-                        reservations: reservations_closure.clone(),
-                        metrics: metrics_for_infer.clone(),
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some("unauthenticated inference request: bad or missing signature".to_string()),
                     };
-                    tokio::spawn(async move {
-                        provision_on_demand(&prov, ctx, req).await;
-                    });
-                    return Ok(accepted);
+                    return serialize_message(&InferMessage::InferResponse(resp));
+                }
+                // P4: replay protection — only *signed* requests (which we just
+                // verified) consult the guard. Replaying an already-seen nonce
+                // from the same authenticated sender is rejected before
+                // admission/queue/backend, so output is never duplicated.
+                if let Ok(mut replay_guard) = replay_for_closure.lock() {
+                    if replay_guard.check_and_mark(
+                        &peer,
+                        req.nonce,
+                        std::time::Instant::now(),
+                    ) == crate::replay::ReplayCheck::Rejected
+                    {
+                        let resp = InferResponse {
+                            request_id: req.request_id,
+                            trace_id: req.trace_id.clone(),
+                            worker_peer_id: local_peer,
+                            completed_at: chrono::Utc::now().to_rfc3339(),
+                            output: "".to_string(),
+                            tokens_used: 0,
+                            processing_time_ms: 0,
+                            success: false,
+                            error: Some(format!(
+                                "replay detected: nonce {} already processed for this peer",
+                                req.nonce
+                            )),
+                        };
+                        if let Some(logs_dir) = &logs_dir_for_infer {
+                            decentraai_audit::record_best_effort(
+                                logs_dir,
+                                "replay_rejected",
+                                serde_json::json!({
+                                    "request_id": req.request_id.to_string(),
+                                    "peer": peer.to_string(),
+                                    "nonce": req.nonce,
+                                }),
+                            );
+                        }
+                        return serialize_message(&InferMessage::InferResponse(resp));
+                    }
+                }
+                // H1: per-peer sliding-window limit. An abusive/anomalous peer
+                // that exceeds its burst is answered terminal (never executed),
+                // protecting the engine and queue from overload.
+                let within_burst = peer_limiter_for_closure
+                    .lock()
+                    .map(|mut l| l.allow(&peer, std::time::Instant::now()))
+                    .unwrap_or(true);
+                if !within_burst {
+                    let resp = InferResponse {
+                        request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
+                        worker_peer_id: local_peer,
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some("rate limited: peer exceeded the requests/minute budget".to_string()),
+                    };
+                    if let Some(logs_dir) = &logs_dir_for_infer {
+                        decentraai_audit::record_best_effort(
+                            logs_dir,
+                            "peer_rate_limited",
+                            serde_json::json!({
+                                "request_id": req.request_id.to_string(),
+                                "peer": peer.to_string(),
+                                "limit_per_minute": peer_limit,
+                            }),
+                        );
+                    }
+                    return serialize_message(&InferMessage::InferResponse(resp));
+                }
+                // Only accept requests for the configured model.
+                if req.model_hash != model_hash_clone {
+                    // On-demand provisioning (M14): a workload for a model we do
+                    // not hold yet is answered with InferAccepted immediately
+                    // (the requester keeps waiting on the tracker) while a
+                    // background task downloads, verifies, and serves the model.
+                    if let Some(prov) = &provisioning_clone {
+                        let accepted = serialize_message(&InferMessage::InferAccepted {
+                            request_id: req.request_id,
+                            worker_peer_id: local_peer,
+                            estimated_wait_ms: 10,
+                        })?;
+                        let prov = prov.clone();
+                        let ctx = Provisioner {
+                            p2p: p2p_for_closure.clone(),
+                            queue_mgr: queue_for_closure.clone(),
+                            worker_manager: wm_for_closure.clone(),
+                            provisioned: provisioned_clone.clone(),
+                            semaphore: semaphore_clone.clone(),
+                            reservations: reservations_closure.clone(),
+                            metrics: metrics_for_infer.clone(),
+                        };
+                        tokio::spawn(async move {
+                            provision_on_demand(&prov, ctx, req).await;
+                        });
+                        return Ok(accepted);
+                    }
+
+                    let resp = InferResponse {
+                        request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
+                        worker_peer_id: local_peer,
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some("Model not available on this worker".to_string()),
+                    };
+                    return serialize_message(&InferMessage::InferResponse(resp));
                 }
 
-                let resp = InferResponse {
-                    request_id: req.request_id,
-                    trace_id: req.trace_id.clone(),
-                    worker_peer_id: local_peer,
-                    completed_at: chrono::Utc::now().to_rfc3339(),
-                    output: "".to_string(),
-                    tokens_used: 0,
-                    processing_time_ms: 0,
-                    success: false,
-                    error: Some("Model not available on this worker".to_string()),
-                };
-                return serialize_message(&InferMessage::InferResponse(resp));
-            }
-
-            // Worker-side admission gate (M15): book a local reservation for
-            // this workload and refuse to serve it when the request's model
-            // footprint would exceed the free capacity this node advertised.
-            // Skip the gate when no advertisement has been broadcast yet or no
-            // compute manager is attached (nothing was committed to the mesh).
-            let reservation = {
-                let mut ledger = reservations_closure.lock().unwrap_or_else(|e| e.into_inner());
-                let (avail_ram, avail_vram, est_ram, est_vram) =
-                    match compute_for_closure
+                // Worker-side admission gate (M15): book a local reservation for
+                // this workload and refuse to serve it when the request's model
+                // footprint would exceed the free capacity this node advertised.
+                // Skip the gate when no advertisement has been broadcast yet or no
+                // compute manager is attached (nothing was committed to the mesh).
+                let reservation = {
+                    let mut ledger = reservations_closure
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let (avail_ram, avail_vram, est_ram, est_vram) = match compute_for_closure
                         .as_ref()
                         .and_then(|c| c.last_local_advertisement_sync())
                     {
@@ -483,56 +712,131 @@ impl DistributedInference {
                         }
                         None => (0, None, 0, 0),
                     };
-                if avail_ram > 0 {
-                    let capacity = Admission {
-                        available_ram_mb: avail_ram,
-                        available_vram_mb: avail_vram,
-                        min_free_ram_mb: MIN_FREE_RAM_MB,
-                        min_free_vram_mb: MIN_FREE_VRAM_MB,
-                    };
-                    if let Err(reason) = ledger.admit(&local_peer, capacity, est_ram, est_vram) {
-                        let failed = InferMessage::InferFailed {
-                            request_id: req.request_id,
-                            worker_peer_id: local_peer,
-                            error: format!(
-                                "worker has insufficient free capacity: {}",
-                                describe_admit_reason(reason)
-                            ),
-                            retryable: true,
+                    if avail_ram > 0 {
+                        let capacity = Admission {
+                            available_ram_mb: avail_ram,
+                            available_vram_mb: avail_vram,
+                            min_free_ram_mb: MIN_FREE_RAM_MB,
+                            min_free_vram_mb: MIN_FREE_VRAM_MB,
                         };
-                        return serialize_message(&failed);
+                        if let Err(reason) = ledger.admit(&local_peer, capacity, est_ram, est_vram)
+                        {
+                            let failed = InferMessage::InferFailed {
+                                request_id: req.request_id,
+                                worker_peer_id: local_peer,
+                                error: format!(
+                                    "worker has insufficient free capacity: {}",
+                                    describe_admit_reason(reason)
+                                ),
+                                retryable: true,
+                                code: Some(InferErrorCode::Capacity),
+                            };
+                            return serialize_message(&failed);
+                        }
+                        ledger.reserve(local_peer, est_ram, est_vram)
+                    } else {
+                        None
                     }
-                    ledger.reserve(local_peer, est_ram, est_vram)
-                } else {
-                    None
-                }
-            };
+                };
 
-            // Send to processing channel (background task will enqueue). If the
-            // channel is gone the worker is shutting down; tell the requester.
-            if tx_clone.send((req.clone(), reservation)).is_err() {
-                let failed = InferMessage::InferFailed {
+                // Send to processing channel (background task will enqueue).
+                // The channel is bounded (see `inbound_cap` above), so an
+                // abusive sender cannot push unlimited queued work: when the
+                // pipe is already full we reject the request here (a single
+                // terminal `InferFailed`) and release the capacity booked at
+                // admission rather than letting it linger until the TTL. A
+                // channel that is closed means the worker is shutting down.
+                if let Err(send_err) = tx_clone.try_send((req.clone(), reservation)) {
+                    let shutting_down = matches!(
+                        send_err,
+                        tokio::sync::mpsc::error::TrySendError::Closed(_)
+                    );
+                    let (_, reservation) = send_err.into_inner();
+                    if let Some(res) = &reservation {
+                        reservations_closure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .release(res.reservation_id);
+                    }
+                    let failed = InferMessage::InferFailed {
+                        request_id: req.request_id,
+                        worker_peer_id: local_peer,
+                        error: if shutting_down {
+                            "worker is shutting down".to_string()
+                        } else {
+                            "worker queue is full (backpressure)".to_string()
+                        },
+                        retryable: !shutting_down,
+                        code: Some(InferErrorCode::Capacity),
+                    };
+                    return serialize_message(&failed);
+                }
+
+                // Respond with InferAccepted echoing the ORIGINAL request id so the
+                // requester can correlate subsequent progress frames.
+                let msg = InferMessage::InferAccepted {
                     request_id: req.request_id,
                     worker_peer_id: local_peer,
-                    error: "worker is shutting down".to_string(),
-                    retryable: false,
+                    estimated_wait_ms: 10,
                 };
-                return serialize_message(&failed);
-            }
-
-            // Respond with InferAccepted echoing the ORIGINAL request id so the
-            // requester can correlate subsequent progress frames.
-            let msg = InferMessage::InferAccepted {
-                request_id: req.request_id,
-                worker_peer_id: local_peer,
-                estimated_wait_ms: 10,
-            };
-            serialize_message(&msg)
-        });
+                serialize_message(&msg)
+            },
+        );
 
         // Spawn background task to process queued requests and stream
         tokio::spawn(async move {
-            while let Some((req, reservation)) = rx.recv().await {
+            // Worker-side bookings keyed by request id, mirroring the queue so
+            // a request swept by the timeout sweep can release the capacity
+            // booked at admission (M15). The reservation accompanies the request
+            // through the inbound channel but is not stored in the queue, so we
+            // keep it here until the request is either served or swept.
+            let mut pending_bookings: HashMap<
+                uuid::Uuid,
+                Option<decentraai_compute::ResourceReservation>,
+            > = HashMap::new();
+            // Periodic worker-side timeout sweep. A request may sit in the
+            // worker's own queue (e.g. while an earlier request streams out) and
+            // must be timed out by the worker itself, not only by the requester
+            // (M10 audit: the queue timeout helpers were defined but never wired
+            // into the serving path). Every swept request is answered with a
+            // single terminal `InferFailed` and its reservation is released.
+            let mut sweep =
+                tokio::time::interval(std::time::Duration::from_millis(250));
+
+            loop {
+                let inbound = tokio::select! {
+                    item = rx.recv() => item,
+                    _ = sweep.tick() => {
+                        for swept in queue_mgr.cleanup_timed_out().await {
+                            if let Some(res) = pending_bookings
+                                .remove(&swept.request_id)
+                                .flatten()
+                            {
+                                reservations_for_task
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .release(res.reservation_id);
+                            }
+                            if let Some(m) = &compute_metrics {
+                                m.record_failure();
+                            }
+                            if let Ok(bytes) = serialize_message(&InferMessage::InferFailed {
+                                request_id: swept.request_id,
+                                worker_peer_id: local_peer,
+                                error: "request timed out waiting in worker queue".to_string(),
+                                retryable: true,
+                                code: Some(InferErrorCode::Timeout),
+                            }) {
+                                let _ = p2p_clone
+                                    .request(swept.request.sender_peer_id, bytes)
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some((req, reservation)) = inbound else { break };
+
                 // Queue the request; a full queue is answered immediately so the
                 // requester is never left hanging. The local reservation booked
                 // at admission is released — the workload never ran.
@@ -551,11 +855,16 @@ impl DistributedInference {
                         worker_peer_id: local_peer,
                         error: "worker queue is full".to_string(),
                         retryable: true,
+                        code: Some(InferErrorCode::Capacity),
                     }) {
                         let _ = p2p_clone.request(req.sender_peer_id, bytes).await;
                     }
                     continue;
                 }
+
+                // Hold the booking until the request is served or swept; it is
+                // now owned by the queue (indexed by request id).
+                pending_bookings.insert(req.request_id, reservation);
 
                 if let Some(m) = &compute_metrics {
                     m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
@@ -563,6 +872,8 @@ impl DistributedInference {
 
                 // Dequeue and process the request to a single terminal event.
                 if let Some(queued) = queue_mgr.dequeue_request(&local_peer).await {
+                    // The reservation lives on with the streaming task.
+                    let reservation = pending_bookings.remove(&queued.request_id).flatten();
                     if let Some(m) = &compute_metrics {
                         m.set_queue_depth(queue_mgr.queue_depth(&local_peer).await as u32);
                     }
@@ -603,8 +914,10 @@ impl DistributedInference {
     /// The inference response from a worker, or an error if all workers fail
     pub async fn route_request(
         &self,
-        request: InferRequest,
+        mut request: InferRequest,
     ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
         // Capability-aware compute path: pick a worker that serves the model
         // and has RAM/VRAM headroom, and hold a reservation for the duration.
         // If the selected worker fails (offline, rejection, timeout), fall
@@ -613,7 +926,28 @@ impl DistributedInference {
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
-                if let Some((plan, placement)) = compute.plan_and_reserve(&req, prompt_tokens).await {
+                let base_backoff_ms = 200u64;
+                // M23 Full Autonomy: record the explainable autonomous decision
+                // (candidates, constraints, score, KV affinity, engine cap,
+                // expected mode, fallback, trace) for the control plane.
+                compute
+                    .record_decision(
+                        &request.request_id.to_string(),
+                        &req,
+                        prompt_tokens,
+                        request.session_id.as_deref(),
+                        request.priority,
+                        request.stream,
+                    )
+                    .await;
+                let mut last_error = None;
+                for attempt in 0u32..=self.config.max_retries {
+                    let Some((plan, placement)) = compute
+                        .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
+                        .await
+                    else {
+                        break;
+                    };
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -622,11 +956,13 @@ impl DistributedInference {
                     };
                     tracing::info!(
                         request_id = %request.request_id,
+                        session_id = request.session_id.as_deref().unwrap_or(""),
                         model_hash = %request.model_hash,
                         worker_peer_id = %placement.worker,
                         reservation_id = %placement.reservation.reservation_id,
                         plan_id = %plan.plan_id,
                         stages = %plan.stage_count(),
+                        attempt,
                         "fabric planner selected worker"
                     );
                     let result = self
@@ -635,19 +971,136 @@ impl DistributedInference {
                         .await;
                     // Release the booking whether or not the request succeeded.
                     compute.release(placement.reservation.reservation_id).await;
+                    // M23: record the executed planner decision for the
+                    // dashboard EXECUTION view (real state).
+                    let cont = request
+                        .session_id
+                        .as_deref()
+                        .and_then(|s| compute.session_residency(s));
+                    compute.record_execution(
+                        &request.request_id.to_string(),
+                        &plan,
+                        &placement,
+                        cont.is_some(),
+                        cont.map(|p| p.to_string()),
+                        if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                    );
+                    // M23 Full Autonomy: correlate the recorded autonomous
+                    // decision with this reservation/plan/outcome and append
+                    // the Reserved → Executing → Completed/Failed → Released
+                    // lifecycle trace for the control plane.
+                    compute.finalize_decision(
+                        &request.request_id.to_string(),
+                        &placement.worker.to_string(),
+                        &plan.plan_id,
+                        &placement.reservation.reservation_id.to_string(),
+                        result.is_ok(),
+                    );
+                    // M20: record the session's KV prefix residency from the
+                    // real tokens the worker reported.
+                    if let Some(session_id) = &request.session_id {
+                        if let Ok(resp) = &result {
+                            compute
+                                .record_session_usage(
+                                    session_id,
+                                    &placement.worker,
+                                    &request.model_hash,
+                                    resp.tokens_used,
+                                )
+                                .await;
+                        }
+                    }
                     // M17: account the routed outcome for contribution.
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // P5: feed the per-worker circuit breaker — a success
+                    // resets the run; only a retryable failure counts toward
+                    // tripping (rejections/cancellations are not the worker's
+                    // fault and never trip it).
                     if result.is_ok() {
+                        compute.record_breaker_success(&placement.worker);
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.is_retryable())
+                        .unwrap_or(false)
+                    {
+                        compute.record_breaker_failure(&placement.worker);
+                    }
+                    // M10: per-request audit event tying request, worker and
+                    // model hash to the observed outcome.
+                    self.audit_routed(
+                        &request,
+                        &placement.worker,
+                        result.is_ok(),
+                    );
+                    let success = result.is_ok();
+                    if success {
                         return result;
+                    }
+                    last_error = result.err();
+                    let err = last_error.as_ref().unwrap();
+                    // M23 Full Autonomy (OBSERVE → ADAPT): decide, from real
+                    // state, whether to retry/re-plan or abort. Safety-bound by
+                    // `decentraai_fabric::adapt` — never retry after emitting
+                    // tokens, never re-send a definitive rejection/cancellation.
+                    let is_continuation = request
+                        .session_id
+                        .as_deref()
+                        .map(|s| compute.session_residency(s).is_some())
+                        .unwrap_or(false);
+                    let budget_remaining = self.config.max_retries.saturating_sub(attempt);
+                    // Real remaining capacity from the live registry — than a
+                    // fabricated count holds. Any worker still trusted, healthy
+                    // and able to serve the model (minus the one we just tried)
+                    // is a genuine retry target.
+                    let eligible_after_primary = {
+                        let total = compute.eligible_worker_count(&request.model_hash).await;
+                        total.saturating_sub(1) // exclude the attempt just made
+                    };
+                    let adaptation = decentraai_fabric::adapt(
+                        success,
+                        err.is_retryable(),
+                        false, // non-streamed send is not a client cancellation
+                        0,     // transport failure before any output was delivered
+                        eligible_after_primary,
+                        budget_remaining,
+                        is_continuation,
+                    );
+                    let should_retry = matches!(
+                        adaptation,
+                        decentraai_fabric::Adaptation::Retry
+                            | decentraai_fabric::Adaptation::Replan
+                    );
+                    if should_retry && attempt < self.config.max_retries {
+                        tracing::warn!(
+                            request_id = %request.request_id,
+                            worker_peer_id = %placement.worker,
+                            error = %err,
+                            attempt,
+                            adaptation = ?adaptation,
+                            "autonomous adapt: replan / retry on a fresh worker"
+                        );
+                        self.fallback_handler
+                            .wait_backoff(attempt, base_backoff_ms)
+                            .await;
+                        continue;
                     }
                     tracing::warn!(
                         worker_peer_id = %placement.worker,
-                        error = %result.as_ref().err().unwrap(),
-                        "fabric-planned worker failed; falling back to legacy router"
+                        error = %err,
+                        attempt,
+                        adaptation = ?adaptation,
+                        "no safe retry remains; aborting compute path"
                     );
+                    break;
                 }
+                drop(last_error);
             }
         }
 
@@ -656,7 +1109,10 @@ impl DistributedInference {
         let workers = self.worker_manager.get_workers().await;
 
         // Select the best worker for this request
-        let placement = self.request_router.select_worker(&request, &workers).await?;
+        let placement = self
+            .request_router
+            .select_worker(&request, &workers)
+            .await?;
 
         // Send the request and handle the response
         self.request_router
@@ -668,13 +1124,31 @@ impl DistributedInference {
     /// `InferProgress` chunk into `progress` as it arrives.
     pub async fn route_request_streamed(
         &self,
-        request: InferRequest,
+        mut request: InferRequest,
         progress: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
-                if let Some((plan, placement)) = compute.plan_and_reserve(&req, prompt_tokens).await {
+                // M23 Full Autonomy: record the explainable autonomous decision
+                // (candidates, constraints, score, KV affinity, engine cap,
+                // expected mode, fallback, trace) for the control plane.
+                compute
+                    .record_decision(
+                        &request.request_id.to_string(),
+                        &req,
+                        prompt_tokens,
+                        request.session_id.as_deref(),
+                        request.priority,
+                        request.stream,
+                    )
+                    .await;
+                if let Some((plan, placement)) = compute
+                    .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
+                    .await
+                {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -683,6 +1157,7 @@ impl DistributedInference {
                     };
                     tracing::info!(
                         request_id = %request.request_id,
+                        session_id = request.session_id.as_deref().unwrap_or(""),
                         model_hash = %request.model_hash,
                         worker_peer_id = %placement.worker,
                         reservation_id = %placement.reservation.reservation_id,
@@ -700,9 +1175,65 @@ impl DistributedInference {
                         )
                         .await;
                     compute.release(placement.reservation.reservation_id).await;
+                    // M23: record the executed planner decision for the
+                    // dashboard EXECUTION view (real state).
+                    let cont = request
+                        .session_id
+                        .as_deref()
+                        .and_then(|s| compute.session_residency(s));
+                    compute.record_execution(
+                        &request.request_id.to_string(),
+                        &plan,
+                        &placement,
+                        cont.is_some(),
+                        cont.map(|p| p.to_string()),
+                        if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                    );
+                    // M23 Full Autonomy: correlate the recorded autonomous
+                    // decision with this reservation/plan/outcome and append
+                    // the Reserved → Executing → Completed/Failed → Released
+                    // lifecycle trace for the control plane.
+                    compute.finalize_decision(
+                        &request.request_id.to_string(),
+                        &placement.worker.to_string(),
+                        &plan.plan_id,
+                        &placement.reservation.reservation_id.to_string(),
+                        result.is_ok(),
+                    );
+                    // M20: record the session's KV prefix residency from the
+                    // real tokens the worker reported.
+                    if let Some(session_id) = &request.session_id {
+                        if let Ok(resp) = &result {
+                            compute
+                                .record_session_usage(
+                                    session_id,
+                                    &placement.worker,
+                                    &request.model_hash,
+                                    resp.tokens_used,
+                                )
+                                .await;
+                        }
+                    }
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // P5: feed the per-worker circuit breaker (streaming path).
+                    if result.is_ok() {
+                        compute.record_breaker_success(&placement.worker);
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.is_retryable())
+                        .unwrap_or(false)
+                    {
+                        compute.record_breaker_failure(&placement.worker);
+                    }
+                    // M10: per-request audit event (streaming path).
+                    self.audit_routed(&request, &placement.worker, result.is_ok());
                     if result.is_ok() {
                         return result;
                     }
@@ -716,7 +1247,10 @@ impl DistributedInference {
         }
 
         let workers = self.worker_manager.get_workers().await;
-        let placement = self.request_router.select_worker(&request, &workers).await?;
+        let placement = self
+            .request_router
+            .select_worker(&request, &workers)
+            .await?;
         self.request_router
             .send_request_streamed(&self.p2p_node, request, placement, progress)
             .await
@@ -847,17 +1381,30 @@ async fn stream_request_to_terminal(
     let local_peer = p2p.local_peer_id();
     let started = std::time::Instant::now();
 
+    // H8: correlate every downstream log line for this request. The span is
+    // entered for the whole function so stdout/std of the worker carry
+    // request_id/trace_id (and show up as structured fields with --log-format
+    // json), making requests traceable end-to-end.
+    let _span = tracing::info_span!(
+        "infer_request",
+        request_id = %request_id,
+        trace_id = %trace_id,
+        sender = %sender,
+    );
+    let _entered = _span.enter();
+
     // Worker-side reservation release (M15): every terminal path below must
     // free the RAM/VRAM booked at admission so capacity can be reused.
-    let release_reservation = |reservations: &Arc<std::sync::Mutex<ReservationLedger>>,
-                               reservation: &Option<decentraai_compute::ResourceReservation>| {
-        if let Some(res) = reservation {
-            reservations
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .release(res.reservation_id);
-        }
-    };
+    let release_reservation =
+        |reservations: &Arc<std::sync::Mutex<ReservationLedger>>,
+         reservation: &Option<decentraai_compute::ResourceReservation>| {
+            if let Some(res) = reservation {
+                reservations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .release(res.reservation_id);
+            }
+        };
 
     // Mark the worker busy for the duration of the request.
     let _ = worker_manager.update_local_capacity(0.0, 0, 0, 0);
@@ -885,6 +1432,7 @@ async fn stream_request_to_terminal(
                     worker_peer_id: local_peer,
                     error: format!("backend error: {e}"),
                     retryable: true,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -927,6 +1475,7 @@ async fn stream_request_to_terminal(
                         worker_peer_id: local_peer,
                         error: format!("backend error: {e}"),
                         retryable: true,
+                        code: Some(InferErrorCode::Engine),
                     },
                 )
                 .await;
@@ -942,6 +1491,7 @@ async fn stream_request_to_terminal(
                         worker_peer_id: local_peer,
                         error: "cancelled".to_string(),
                         retryable: false,
+                        code: Some(InferErrorCode::Cancelled),
                     },
                 )
                 .await;
@@ -995,11 +1545,7 @@ async fn stream_request_to_terminal(
 /// inference engine, and only then streams the request to a terminal
 /// event. Any failure is reported as a terminal `InferFailed`; this
 /// function never panics or takes down the node.
-async fn provision_on_demand(
-    prov: &ProvisioningConfig,
-    ctx: Provisioner,
-    req: InferRequest,
-) {
+async fn provision_on_demand(prov: &ProvisioningConfig, ctx: Provisioner, req: InferRequest) {
     use decentraai_protocol::{InferMessage, InferProgress};
 
     let p2p = &ctx.p2p;
@@ -1073,6 +1619,7 @@ async fn provision_on_demand(
                     worker_peer_id: local_peer,
                     error: format!("model provisioning failed: {e}"),
                     retryable: false,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -1112,6 +1659,7 @@ async fn provision_on_demand(
                     worker_peer_id: local_peer,
                     error: format!("provisioned engine failed to start: {e}"),
                     retryable: true,
+                    code: Some(InferErrorCode::Engine),
                 },
             )
             .await;
@@ -1148,6 +1696,7 @@ async fn serve_provisioned_request(
             worker_peer_id: local_peer,
             error: "worker queue is full".to_string(),
             retryable: true,
+            code: Some(InferErrorCode::Capacity),
         }) {
             let _ = p2p.request(req.sender_peer_id, bytes).await;
         }
@@ -1181,7 +1730,12 @@ async fn send_infer(p2p: &decentraai_p2p::P2PNode, sender: libp2p::PeerId, msg: 
 /// One unit of a streamed backend response, enriched with the cancellation
 /// signal so the caller can distinguish stream end from an abort.
 enum NextItem {
-    Chunk(Result<decentraai_inference_adapter::StreamChunk, decentraai_inference_adapter::BackendError>),
+    Chunk(
+        Result<
+            decentraai_inference_adapter::StreamChunk,
+            decentraai_inference_adapter::BackendError,
+        >,
+    ),
     End,
     Cancelled,
 }
@@ -1195,8 +1749,12 @@ async fn next_stream_item<S>(
     request_id: uuid::Uuid,
 ) -> Option<NextItem>
 where
-    S: futures::Stream<Item = Result<decentraai_inference_adapter::StreamChunk, decentraai_inference_adapter::BackendError>>
-        + Unpin
+    S: futures::Stream<
+            Item = Result<
+                decentraai_inference_adapter::StreamChunk,
+                decentraai_inference_adapter::BackendError,
+            >,
+        > + Unpin
         + Send,
 {
     use futures::StreamExt;
@@ -1257,5 +1815,96 @@ mod tests {
 
         assert!(!stats.local_worker_registered);
         assert_eq!(stats.worker_count, 0);
+    }
+
+    #[test]
+    fn error_retry_policy_is_idempotency_safe() {
+        // Connection-level failures are retryable.
+        assert!(DistributedError::P2PError(anyhow::anyhow!("conn refused")).is_retryable());
+        assert!(DistributedError::RequestTimeout(1000).is_retryable());
+        // A definitive rejection or cancellation must never be duplicated.
+        assert!(!DistributedError::WorkerRejected("w".into(), "cancelled".into()).is_retryable());
+        assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
+        assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
+    }
+
+    #[test]
+    fn distributed_error_maps_to_stable_error_code() {
+        use decentraai_protocol::InferErrorCode as Code;
+        // Required category coverage (stable, non-retryable rejection).
+        let rejected = DistributedError::WorkerRejected("w".into(), "busy".into());
+        assert_eq!(rejected.code(), Code::Rejected);
+        assert!(!rejected.is_retryable());
+        assert_eq!(Code::from(&rejected), Code::Rejected);
+
+        assert_eq!(
+            DistributedError::RequestTimeout(1000).code(),
+            Code::Timeout
+        );
+        assert_eq!(
+            DistributedError::P2PError(anyhow::anyhow!("conn refused")).code(),
+            Code::Transport
+        );
+        assert_eq!(
+            DistributedError::NoWorkersAvailable("m".into()).code(),
+            Code::NoWorkers
+        );
+        assert_eq!(
+            DistributedError::AllWorkersFailed("r".into()).code(),
+            Code::AllWorkersFailed
+        );
+        assert_eq!(
+            DistributedError::SerializationError("bad".into()).code(),
+            Code::Serialization
+        );
+        assert_eq!(
+            DistributedError::UntrustedWorker("w".into()).code(),
+            Code::Untrusted
+        );
+        // Token strings are stable for logging/metrics/clients.
+        assert_eq!(rejected.code().code(), "rejected");
+        assert_eq!(Code::Timeout.code(), "timeout");
+        assert_eq!(Code::Transport.code(), "transport");
+    }
+
+    #[tokio::test]
+    async fn per_request_audit_records_outcome_when_logs_dir_set() {
+        use crate::{DistributedInference, InferenceConfig};
+        use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let identity = decentraai_identity::Identity::generate();
+        let node = P2PNode::new(
+            &identity,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap();
+        let mut distributed =
+            DistributedInference::new(node, InferenceConfig::default(), None, None).unwrap();
+        distributed.set_logs_dir(Some(logs_dir.clone()));
+
+        let worker = libp2p::PeerId::random();
+        let mut req = InferRequest::new("modelhash".into(), "hi".into(), 32);
+        req.request_id = uuid::Uuid::new_v4();
+        req.trace_id = "tr_audit_test".into();
+        req.session_id = Some("sess1".into());
+
+        // Routing a completed request writes an inference_completed audit event
+        // carrying request/worker/model-hash/status correlation fields (M10).
+        distributed.audit_routed(&req, &worker, true);
+        let line = std::fs::read_to_string(logs_dir.join("audit.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(event["event"], "inference_completed");
+        assert_eq!(event["details"]["request_id"], req.request_id.to_string());
+        assert_eq!(event["details"]["trace_id"], "tr_audit_test");
+        assert_eq!(event["details"]["worker_id"], worker.to_string());
+        assert_eq!(event["details"]["model_hash"], "modelhash");
+        assert_eq!(event["details"]["status"], "completed");
     }
 }

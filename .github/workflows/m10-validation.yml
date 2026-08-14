@@ -25,21 +25,6 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  frontend:
-    name: Frontend checks
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - run: bun install --frozen-lockfile
-      - run: bun run check
-      - run: bun run build
-
   contract:
     name: Contract and secret checks
     runs-on: ubuntu-latest

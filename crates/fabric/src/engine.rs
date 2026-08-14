@@ -200,4 +200,65 @@ mod tests {
         assert!(!EngineKind::Ollama.advertised_capabilities().supports_staging());
         assert!(!EngineKind::LlamaServer.advertised_capabilities().supports_staging());
     }
+
+    // Against engine.rs documentation: these capabilities are *parked* (M21 /
+    // M22 prefill) and NOT wired into any running engine. The two gates that
+    // would enable distributed MoE / prefill-decode splits must stay OFF for
+    // every engine DecentraAI actually runs today — llama-server is the only
+    // engine the runtime spawns. This test pins that honest state so a future
+    // change cannot silently "enable" a mechanism no engine can actually
+    // serve, which would route requests into a broken split path.
+    #[test]
+    fn every_engine_decentraai_runs_is_gated_conservative_on_split_features() {
+        let kinds = [
+            EngineKind::LlamaServer,
+            EngineKind::Ollama,
+            EngineKind::RemoteOpenAI,
+        ];
+        for kind in kinds {
+            let capa = kind.advertised_capabilities();
+            assert!(
+                !capa.expert_routing,
+                "{kind:?} must not advertise expert routing (parked M21)"
+            );
+        }
+        // llama-server (the production engine) must not advertise prefill/decode
+        // separation either — that split is parked behind the capability gate.
+        assert!(
+            !EngineKind::LlamaServer
+                .advertised_capabilities()
+                .prefill_decode_separation,
+            "llama-server must stay on the single-phase path (parked split)"
+        );
+    }
+
+    // Complementary pin: probing/capability narrowing can only ever *lower* the
+    // advertised set toward the conservative baseline; it must never flip
+    // `expert_routing` on. So every engine kind DecentraAI knows about, honest
+    // or experimental, plus the unprobed conservative baseline, keeps
+    // `expert_routing` = false. This is the guarantee the degenerate-split
+    // guard in expert.rs relies on: no advertisement that powers it can come
+    // from a capability that this module claims to be on.
+    #[test]
+    fn no_engine_kind_or_conservative_baseline_ever_advertises_expert_routing() {
+        let kinds = [
+            EngineKind::LlamaServer,
+            EngineKind::Vllm,
+            EngineKind::Sglang,
+            EngineKind::Ollama,
+            EngineKind::RemoteOpenAI,
+        ];
+        for kind in kinds {
+            let capa = kind.advertised_capabilities();
+            assert!(
+                !capa.expert_routing,
+                "{kind:?} must never advertise expert routing"
+            );
+        }
+        let conservative = EngineCapabilities::conservative();
+        assert!(
+            !conservative.expert_routing,
+            "the unprobed conservative baseline must not advertise expert routing"
+        );
+    }
 }

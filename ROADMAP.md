@@ -43,10 +43,15 @@
 - [x] P1: token registry (`db/tokens.json`, hashed) + `decentraai token`
   CLI + tiered auth in the proxy (per-tier model allowlist, sliding-window
   rate limit, usage counters, audits)
-- [ ] P2: chat UI in the dashboard (model selector filtered by tier)
-- [ ] P3: admin dashboard (create/revoke tokens, usage per token)
+- [x] P2: chat UI in the single embedded dashboard (non-streaming `/v1/chat/completions`, real worker routing); tier-filtered model selector folded into the single-dashboard approach — chat uses the node's active model and shows what it is
+- [x] P3: admin actions in the single embedded dashboard (`/admin` + `/api/admin/token/*` create/revoke tokens, usage per token)
+- [x] P6: dashboard views — Models, Settings, Diagnostics, Execution, Workers, Network (advanced) + normal-user view (Model, Inference, Chat, Queue, Recent, System), all from real runtime state, no mock data
 - [x] P4: contribution-based tier suggestions from catalog + reputation
-- [ ] P5: invites (`decentraai join <invite>`)
+- [x] P5: invites (`decentraai invite` prints a copy-pastable
+  `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join
+  "<invite>"` parses it, auto-provisions identity + config, stores the Tier-1
+  Guest token as the node's credential (`runtime/invite.token`, 0600) and
+  verifies the coordinating peer is reachable over the verified P2P path)
 
 ## 8. Operations and scale (in progress)
 - [x] Q1: generation defaults (sampling + system prompt merged into
@@ -55,9 +60,12 @@
 - [x] Q2: fair FIFO queue for inference requests — one request at a
   time reaches the backend with full resources, 503/504 on full/timeout,
   Queue card on the dashboard shows serving + waiting live
-- [ ] Q3: remote backend (`serve start --backend http://host:port`) —
-  a weaker station keeps auth/tiers/queue while a stronger machine runs
-  the model
+- [x] Q3: remote backend (`serve start --backend http://host:port`) —
+  a weaker station keeps auth/tiers/queue/dashboard while a stronger machine
+  runs the model. No local llama-server is spawned or probed; the proxy falls
+  back to `state.backend_url` (the remote) when the manager is unloaded, and
+  the local node surfaces 503 for an unreachable backend (`remote_backend_started`
+  audit event)
 - [x] Q4: onboarding wizard (`decentraai setup`) writing a validated
   config on first run
 
@@ -70,7 +78,17 @@
 - [x] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
 - [x] M9-7: Inference request handler for workers (real llama-server adapter)
 - [x] M9-8: Real-time capacity updates from runtime
-- [ ] M9-9: Reputation-based compensation for workers
+- [x] M9-9: Reputation-based compensation for workers — pure reward policy
+  (`decentraai-compute::compensation::reward_tokens`, `RewardPolicy`): a
+  deterministic, synthetic **contribution-credits** ledger (not a payment
+  platform) = `verified_requests × rate`, scaled by contribution quality and a
+  reputation term (clean-service ratio `verified/(verified+failed)`). Zero
+  verified work or a complete-failure record earns 0. Wired into the
+  coordinator's `ContributionRow.reward_tokens`, surfaced on `/v1/compute` and
+  the `decentraai tier suggest` table. A worker whose verified-transfer
+  reputation is bad is already banned and never routed work, so its earnings
+  are zero regardless — the reputation axis rewards how *cleanly* served work
+  completed.
 
 ## 10. Zero-Touch Swarm Sharing (DONE)
 
@@ -282,8 +300,11 @@ release.
 ## 13. Complete End-to-End Flow (M10)
 
 ### Acceptance Criteria
-- [ ] Node starts with `decentraai init` and validated configuration
-- [ ] Worker is paired via QR or token and approved from dashboard
+- [x] Node starts with `decentraai init` / `decentraai setup` and validated
+  configuration (`config validate` + Q4 wizard + auto-provisioning `node`)
+- [~] Worker is paired via token and approved (`decentraai invite`/`join`
+  provides a least-privilege token seat, P5; `decentraai trust add` approves a
+  worker for the capability scheduler — physical QR pairing is not implemented)
 - [x] Worker publishes models, capacity and real-time status
 - [x] Client sends prompt (CLI `distributed --prompt`, `decentraai-p2p-invoke`)
 - [x] Router selects eligible worker
@@ -291,52 +312,137 @@ release.
 - [x] Worker calls real llama-server (not mock handler)
 - [x] Streaming response to client, with cancellation via `InferCancel`
 - [x] Timeout, retry and fallback work correctly
-- [ ] Queue depth, latency, P50/P95/P99 and success rate in dashboard
-- [ ] Each request produces audit event with request ID, worker ID, model hash, status
-- [ ] Offline worker detected and excluded from routing
-- [ ] E2E test can start two local nodes and reproduce full flow
+- [x] Queue depth, latency, P50/P95/P99 and success rate in the dashboard —
+  `/status` now exposes `latency_ms.{p50,p95,p99}`, `success_rate_percent` and
+  `requests_failed` (from a ring buffer of real request durations + a live
+  success/failure counter), rendered in the normal-user Inference card
+- [x] Each routed request produces an audit event (`inference_completed` /
+  `inference_failed`) with request ID, worker ID, model hash, trace id, session
+  and status — written best-effort from `DistributedInference` into
+  `logs/audit.jsonl` when the node sets a logs dir
+- [x] Offline worker detected and excluded from routing (M24 reaper:
+  stale-heartbeat flip-offline via `mark_offline`, reservation pruning, and
+  worker eviction with audit after a grace window)
+- [x] E2E test can start two local nodes and reproduce full flow
+  (`crates/distributed/tests/compute_e2e.rs`: real libp2p nodes on loopback —
+  advertisement propagation → selection → reservation → streamed inference →
+  release, plus fallback and fake-worker re-provisioning)
 
 ### Implementation Phases
 
 #### Phase 1: Common Contracts
-- [ ] Stabilize NodeConfig, WorkerAnnouncement, InferRequest, InferResponse
-- [ ] Stabilize WorkerStatus, TaskPlacement
-- [ ] Define error codes and retry semantics
-- [ ] Request lifecycle: received → queued → assigned → running → completed/failed/timeout
-- [ ] Add mandatory request_id, trace_id, created_at, deadline_at, model_hash, sender_peer_id, assigned_worker_id
+- [x] Stabilize NodeConfig, WorkerAnnouncement, InferRequest, InferResponse — all
+  four are stable serde contracts: NodeConfig is `deny_unknown_fields` with
+  strict validation (config:16, validate ~282); WorkerAnnouncement/InferRequest/
+  InferResponse are fully defined serde structs (infer_protocol.rs)
+- [x] Stabilize WorkerStatus, TaskPlacement — WorkerStatus is wire-serializable;
+  TaskPlacement is now serializable too (derive + round-trip test)
+- [~] Define error codes and retry semantics — `DistributedError::is_retryable()`
+  + bounded backoff is defined/tested (only transport retries; rejections/cancels
+  never resend). Machine-readable numeric error *codes* are not present (only
+  string + boolean `retryable`)
+- [~] Request lifecycle received→queued→assigned→running→completed/failed/timeout —
+  the pipeline is fully wired (accepted→queued→dequeue→stream→terminal); there is
+  no distinct observable "assigned" transition and queued-timeout cleanup is
+  requester-side only (`cleanup_timed_out` is defined but not swept on the worker)
+- [~] Mandatory request_id, trace_id, created_at, deadline_at, model_hash,
+  sender_peer_id, assigned_worker_id — 6 of 7 are mandatory fields on
+  InferRequest; `assigned_worker_id` is absent (routing uses
+  `TaskPlacement.selected_worker` instead), and `new()` seeds sender with a
+  placeholder
 
 #### Phase 2: Real Data Plane
-- [ ] Fix queue manager: shared state, not clone
-- [ ] Install effective inference handler in ChainedHandler
-- [ ] Adapter for llama-server/OpenAI-compatible API
-- [ ] Streaming incremental tokens
-- [ ] Backpressure and bounded queues
-- [ ] Retry only for transient errors
-- [ ] Circuit breaker for unstable workers
-- [ ] Idempotency for resent requests
-- [ ] Server-side limits for timeout, tokens, prompt size
+- [x] Fix queue manager: shared state, not clone — `RequestQueueManager` is
+  `Arc<Mutex<HashMap<PeerId, Arc<Mutex<WorkerRequestQueue>>>>>`, shared, not
+  cloned-by-value (queue.rs:185)
+- [x] Install effective inference handler — served via `P2PNode.on_infer`
+  (`register_worker_backend`) rather than inside `ChainedHandler`; the chain
+  dispatches announcements/compute, inference bypasses it (lib.rs:518-730)
+- [x] Adapter for llama-server/OpenAI-compatible API — `OpenAiCompatibleBackend`
+  (complete/stream against /v1/chat/completions, /v1/models, /health)
+- [x] Streaming incremental tokens — `stream()` with `"stream":true` + SSE
+  parse into `StreamChunk`; worker relays as `InferProgress`
+- [~] Backpressure and bounded queues — per-worker queue depth is capped and
+  queue-full is answered terminal, but the ingress channel is unbounded
+  (`mpsc::unbounded_channel`) with no producer suspension
+- [x] Retry only for transient errors — `is_retryable()` returns true only for
+  P2PError/RequestTimeout; bounded backoff; tested (lib.rs:222,915)
+- [x] Circuit breaker for unstable workers (P5: per-worker breaker trips after
+  consecutive retryable failures; open workers are omitted from the planner feed
+  and re-admitted after a cooldown)
+- [x] Idempotency for resent requests — `ReplayGuard` (per-auth-peer nonce + TTL)
+  rejects a resent request terminal before admission/queue/backend (replay.rs)
+- [x] Server-side limits for timeout, tokens, prompt size — enforced in
+  `inference-adapter::validate()` on both paths; the local /v1 proxy now also
+  caps prompt bytes + max_tokens and applies a 300s HTTP timeout (runtime proxy
+  hardening), and idle-clock/counters only fire on real inference POSTs
 
 #### Phase 3: Trust and Security
-- [ ] Verify WorkerAnnouncement signature
-- [ ] Compare announcement.peer_id with transport peer ID
-- [ ] Pairing with expiration and revocation
-- [ ] Replay protection via nonce/sequence number
-- [ ] Capability-based authorization: which models each worker can serve
-- [ ] Rate limiting per token and per peer
-- [ ] Limit prompt size and output size
-- [ ] Secret management without tokens in config or logs
-- [ ] Audit for login, pairing, revoke, routing and inference
-- [ ] Role separation: admin, operator, client, worker
+- [~] Verify WorkerAnnouncement / compute advertisement signature — P3 signs
+  compute advertisements, verified on receipt (the legacy unsigned path remains
+  as a fallback). (WorkerAnnouncement legacy frame itself is not signed.)
+- [x] Compare announcement.peer_id with transport peer ID — the on_infer path
+  (P2) verifies against the authenticated connected peer; signed advertisements
+  are keyed to the signer's public key mapping to the claimed peer (P3)
+- [x] Pairing with expiration and revocation — `decentraai invite --ttl <min>`
+  issues a Guest token that stops working after the TTL (tokens registry now
+  stores an optional `expires_at`, `lookup`/`is_active` reject expired tokens);
+  revoke was already supported
+- [x] Replay protection via nonce/sequence number — P4: per-sender nonce +
+  bounded TTL ReplayGuard on the worker; outbound monotonic nonces
+- [x] Capability-based authorization: which models each worker can serve — the
+  fabric planner only selects workers that serve (or can provision) the
+  requested model (`fabric::planner` filters `trusted && healthy &&
+  serves_model`, M13/M14/M18) and the worker independently refuses requests for
+  models it does not hold; per-tier client model allowlists gate who may request
+  each model (P1/H4)
+- [~] Rate limiting per token and per peer — per-token (per-tier) sliding-window
+  already existed (`crates/runtime`); **per-peer** added on the P2P worker path
+  (`distributed::rate_limit::PeerRateLimiter`, keyed by the authenticated peer,
+  `peer_rate_limited` audit)
+- [x] Limit prompt size and output size — enforced in `inference-adapter`
+  `validate()` (`max_prompt_bytes`/`max_output_tokens`) on both `generate` and
+  `stream`, surfaced as a clear terminal `InferFailed` (`PromptTooLarge` /
+  `OutputLimitExceeded`) by the worker
+- [x] Secret management without tokens in config or logs (token registry stores
+  hashes; signing keys live only in the node's identity; audit never logs them)
+- [x] Audit for login, pairing, revoke, routing and inference — per-request
+  `inference_completed`/`inference_failed` (M10) and `replay_rejected` (P4)
+- [x] Role separation: admin, operator, client — tokens carry a `role`
+  (client/operator; the master token is admin). Client tokens may only run
+  inference within tier limits; operator tokens get read-only operational views
+  (`/v1/compute`, `/v1/network`, `/v1/execution`) but not token management;
+  the master token has everything. CLI `token create --role`, admin API `role`
+  field, and enforced API gates (H4)
 
 #### Phase 4: Control Plane and Frontend
-- [ ] Onboarding: create node, generate identity, pairing QR, health check
-- [ ] Chat: conversations, streaming, stop generation, retry, model selection
-- [ ] Workers: approve/revoke, status, models, capacity, latency
-- [ ] Models: registry, hash, quantization, context size, availability
-- [ ] Network: peers, trust, latency, connection errors
-- [ ] Observability: logs, metrics, traces, alerts
-- [ ] Admin: tokens, roles, quotas, audit events
-- [ ] Settings: node config, inference defaults, limits, retention
+- [x] Onboarding: create node + generate identity + health check —
+  `decentraai setup` (data dirs, identity, validated config, READY) and
+  `decentraai doctor [--online]` (admission + live reachability);
+  pairing is token-based (`decentraai invite`/`join`, P5) — QR is intentionally
+  not used
+- [x] Chat: conversations, streaming, stop generation, retry, model selection —
+  SSE streaming, in-page history (localStorage), plus a live model selector,
+  a client-side Stop (AbortController) and Retry
+- [x] Workers: approve/revoke, status, models, capacity, latency — the Workers
+  view (real `/v1/compute`) shows status/load/queue/tok-s/latency plus reachable
+  and connection_errors, and Approve/Revoke buttons hit master-gated
+  `/api/admin/worker/{trust,revoke}`
+- [~] Models: registry, hash, quantization, context size, availability —
+  context/RAM/VRAM/availability shown; per-model hash and quantization are not
+  surfaced in the view
+- [x] Network: peers, trust, latency, connection errors — peers view (trusted/
+  banned/scores), links view (RTT/BW/locality), connected list, and worker
+  reachable/connection_errors
+- [~] Observability: logs, metrics, traces, alerts — audit/security-events view,
+  `/metrics` (Prometheus), latency percentiles/success-rate; no distributed
+  traces and no alert channel
+- [x] Admin: tokens, roles, quotas, audit events — token create includes a role
+  selector, token list shows role, `/api/admin/events` shows recent audit
+  events inline; quotas are not part of the (free) subscription model
+- [~] Settings: node config, inference defaults, limits, retention — the
+  Settings view shows node/resource config and limits read-only; it does not
+  edit live settings and there is no data retention knob
 
 ### Scoring Rubric (Target: 9/10)
 
@@ -369,7 +475,7 @@ release.
 
 ---
 
-## 14. Execution Fabric (M18–M23) — DONE
+## 14. Execution Fabric — M18 Foundation — DONE
 
 A new pure crate, `decentraai-fabric`, holds DecentraAI's orchestration
 intelligence — the engine-neutral execution-fabric core that turns a request +
@@ -378,45 +484,193 @@ coordinator path. It is deliberately engine-agnostic (DecentraAI is not a
 marketplace, cloud, or wrapper around one model server) and never fabricates
 behavior the runtime cannot provide.
 
-- [x] **M22 — Multi-engine runtime**: `EngineKind` (llama-server / vLLM /
-  SGLang / Ollama / openai-compatible) + capability ABI on the backend
-  (`decentraai-inference-adapter`), a best-effort `probe_capabilities()`, and
-  the engine string flows into `capability.engine` so the planner reasons
-  engine-aware. All adaptation goes through the same OpenAI-compatible surface.
-- [x] **M18 — Distributed execution engine**: `ExecutionPlan` (Single /
-  Sequential / FanOut) + `ExecutionStage` with fallback order and per-stage
-  reservation budgets; `ComputeScheduler::reserve_worker` lets the planner own
-  *who* while the scheduler enforces capacity; `plan_and_reserve` drives the
-  real `route_request`/`route_request_streamed`.
-- [x] **M19 — Network-aware scheduler**: real `InferPing`/`InferPong` RTT
-  measurement (previously dead protocol surface), a coordinator `NetworkGraph`
-  (link RTT / bandwidth / locality + transfer-cost estimator), and a 5s probe
-  that feeds measured RTT into planning.
-- [x] **M20 — KV-aware inference fabric**: `KVCacheState` / `ContextProfile` /
-  `KvPlanner` steering continuation locality, KV-headroom and prefill/decode
-  split; the coordinator derives prompt tokens from the real prompt and passes
-  them to the planner.
-- [x] **M21 — Distributed MoE / expert fabric**: `ExpertRegistry` /
-  `ExpertRouter` that honestly returns whole-model decisions unless an engine
-  advertises `expert_routing` (none do via OpenAI API today) — the abstraction
-  is live, never mocked.
-- [x] **M23 — Autonomous execution planner**: `ExecutionPlanner` decides local
-  vs remote, single vs staged, worker ordering, fallback path and reservations
-  from model + capabilities + network + KV + reliability; the user never
-  configures topology.
+**M18 — Distributed Execution Fabric Foundation — DONE**
 
-Tests: 25 fabric unit tests (engine, plan, network, KV, expert, planner) +
-planner integration + `reserve_worker` capacity tests. All green, clippy clean.
+Verified on real hardware/LAN (two physical Ubuntu machines, Desktop ↔
+Laptop, both running the single universal `decentraai node`):
 
-## 15. Resilient Fabric (M24) — DONE
+- [x] Multi-node universal runtime (every node is coordinator + worker)
+- [x] P2P discovery / connectivity (mDNS + libp2p on the LAN)
+- [x] Trusted worker admission (`decentraai trust add` → scheduler selects only
+  trusted, eligible workers)
+- [x] Planner-based worker selection (`plan_and_reserve` → `reserve_worker`)
+- [x] Reservation lifecycle (created per request, released after completion)
+- [x] Real remote inference (coordinator → P2P `InferRequest` → remote worker →
+  worker's local llama-server on loopback → streamed `InferProgress` →
+  terminal `InferResponse`)
+- [x] Streaming responses and cooperative cancellation
+- [x] Concurrent requests (separate request IDs, non-colliding reservations,
+  worker capacity respected)
+- [x] Worker reuse (same healthy worker selected again across requests)
+- [x] Bidirectional Desktop ↔ Laptop execution
+- [x] Persistent worker engine lifecycle: the worker's local llama-server stays
+  bound to loopback and is **not** idle-unloaded, so the worker never
+  advertises ready while its engine is dead (`5758e05`).
+- [x] One `decentraai node` process — no separate `decentraai distributed`
+  required for the product flow.
 
-- [x] Worker-fabric maintenance: `ComputeRegistry::reap_offline` +
-  `ComputeScheduler::reap_offline` expire stale reservations, flip
-  no-heartbeat peers offline, and evict long-gone workers; a 10s coordinator
-  reaper (`decentraai distributed`) records a `worker_evicted` audit per
-  removal. Rejoin is automatic via fresh advertisements on the next heartbeat.
+The fabric crate supplies the building blocks (`ExecutionPlan`,
+`ComputeScheduler::reserve_worker`, an `ExecutionPlanner`, a `NetworkGraph`, a
+`KvPlanner`, an `ExpertRegistry`/`ExpertRouter` capability gate). **The
+single-worker reservation/streaming path is production-verified, and the
+execution planner now weighs real network cost (M19) when it selects a worker.**
+Model/layer splitting, KV reuse, MoE distribution and multi-worker execution
+planning are still the milestones below.
 
-## 16. Ubuntu UX — Q4 setup wizard — DONE
+## 15. M19: Network-Aware Scheduler — DONE
+
+The execution planner no longer ranks workers in isolation: it reads a live
+inter-node link graph and folds reach cost into its score. The coordinator
+measures real round-trip latency by pinging every known *remote* worker over
+the P2P request/response channel (`InferPing`/`InferPong`) every 5s, and writes
+the measured RTT into the graph the planner reads. The local node is never
+pinged (libp2p refuses self-dial).
+
+- [x] latency — real RTT measured via `InferPing`/`InferPong` over the P2P
+  request/response channel; `spawn_network_probe` times each round trip and
+  feeds `ComputeManager::record_rtt` into the coordinator's `NetworkGraph`.
+- [x] bandwidth — per-peer `bandwidth_mbps` in `LinkMetrics`, with soft priors
+  per locality and a measured field; feeds the transfer-cost estimator.
+- [x] topology / connection quality — `Locality` (Local / SameHost / Lan /
+  Remote) with prior RTT + bandwidth, folded into link scoring.
+- [x] transfer cost — deterministic `transfer_ms_per_mib` estimator and
+  `reach_cost_ms` (RTT + transfer time) consulted by the planner.
+- [x] worker load / capacity — `load_percent`, `queue_depth`, RAM/VRAM headroom
+  are first-class scoring terms in the planner.
+- [x] dynamic worker scoring — `ExecutionPlanner::score` combines throughput,
+  latency, load, queue, headroom, network reach cost and KV headroom; ranks
+  deterministically (score desc, PeerId asc) with deterministic fallbacks.
+- [x] preserves trust → planner → reservation → P2P → worker path (M18);
+  the loopback-backend guarantee is untouched (no llama-server LAN exposure);
+  no mocks on the production path.
+
+Related commit: `c5d2b44` (plus the probe wiring in `node-cli`).
+
+## 16. M20: KV-Aware Inference Fabric — DONE
+
+KV-aware placement builds on the M19 network-aware scheduler. The coordinator
+now makes honest, KV-aware placement decisions from real advertised `n_ctx` and
+tracked request/session state — no invented engine telemetry. Committed at
+`caf9121`.
+
+Scope:
+- [x] KV locality / continuation affinity — coordinator-side session→worker
+      residency (`SessionAccount`); a continuation with a known session is
+      steered to the worker holding the KV prefix, with deterministic fallback
+      when residency is unknown/stale. Wired into `RequestFacts`
+      (`is_continuation`, `prefix_resident_on`).
+- [x] context / KV state — `ServedModel.context_tokens` advertises a worker's
+      real `n_ctx`; `fabric_facts` now reports each worker's `KVCacheState`
+      (was hardcoded `Unknown`) from real capacity + accounted usage.
+- [x] KV headroom — `KvPlanner` + `KVCacheState` headroom consumed in the
+      planner; honest coordinator-side accounting (`record_session_usage`)
+      derived from real `tokens_used` and advertised `n_ctx` — no invented
+      telemetry.
+- [x] long-context placement — per-worker KV occupancy feeds the planner's
+      long-context handling; actual cross-worker steering depends on
+      multi-worker contention and a worker advertising a real `n_ctx`.
+- [~] prefill / decode considerations — gated behind
+      `EngineCapabilities::prefill_decode_separation`, which no real engine
+      advertises; llama-server stays conservative. **Not claimed as
+      implemented** — the capability gate exists, the split does not run.
+
+**Notes (not claimed):** live llama-server KV *occupancy* telemetry is not
+exposed/consumed; the coordinator-side accounting described above is the
+honest model. Cross-worker non-empty KV-headroom steering has not been observed
+on the live link (the current worker advertises unknown capacity and there is
+no multi-worker contention) — the logic is unit/integration-proven.
+
+## 17. NOT DONE — M21: Distributed MoE / Expert Fabric (foundation only)
+
+`decentraai-fabric::expert` provides the honest abstraction: an
+`ExpertRegistry` (which workers hold which experts), the pure `ExpertRouter`
+(whole-model fallback vs expert split), and the `expert_routing` capability
+gate. Every expert-aware decision is gated behind an engine advertising
+`EngineCapabilities::expert_routing`. **No engine DecentraAI runs advertises
+it** — so the router returns exactly the whole-model result (the single
+correct answer for a monolithic model) and an `ExpertSplit` is never produced
+in production. A pinned test (`every_engine_decentraai_runs_is_gated...`)
+guards this so the split path can never be routed into without an engine that
+actually supports it. **Not marked done**: distributed MoE is not
+production-verified on real hardware; this is preparedness only.
+
+## 18. NOT DONE — M22: Multi-Engine Runtime Abstraction (foundation only)
+
+`decentraai-fabric::engine` defines `EngineKind` (llama-server / vLLM / SGLang /
+Ollama / generic OpenAI-compatible) and the `EngineCapabilities` contract
+(streaming, KV reporting, prefill/decode separation, expert routing, tensor
+parallel). DecentraAI never embeds an engine; it drives an external process's
+OpenAI-compatible HTTP API. Capabilities are conservative by default and
+narrowed by a live probe. **Only llama-server is actually spawned today**, and
+`prefill_decode_separation` stays `false` for it (that split is a parked idea,
+not a running feature). **Not production-verified** for any second engine;
+this is the abstraction layer only.
+
+## 19. PARTIAL — M23: Autonomous Execution Planner (foundation + live decision core)
+
+`decentraai-fabric::planner::ExecutionPlanner` folds real state into worker
+scoring: throughput, latency, load, queue depth, RAM/VRAM headroom, network
+reach cost (M19) and KV headroom (M20), ranked deterministically. It is deeply
+integrated (the live node routes through `plan_and_reserve`).
+
+**M23 Increment B/C** turns the planner's single-worker selection into an
+explicit, observable decision in the real execution path, without replacing the
+M18/M19/M20/M24 planner it extends (a cooperative base with the live decision
+core, decision correlation, event-driven adapt and control-plane surfacing):
+
+- `decentraai-fabric::decision` (`WorkloadClass`/`classify`, `ConstraintKind`/
+  `ConstraintResult`, `CandidateOutcome`, `ExecutionDecision`, `ExecutionEvent`,
+  `adapt`) is now **wired into the live coordinator**, not just an exported API.
+- The coordinator records an explainable decision per routed request via
+  `ComputeManager::record_decision` (DISCOVER → CLASSIFY → CANDIDATES →
+  CONSTRAINTS → SCORE → SELECT), built with the **same live planner** the routing
+  path uses — so scores and per-candidate network cost reflect the real measured
+  network graph (M19) and KV state (M20), never a cold-default planner.
+- Each decision is **correlated** with `reservation_id`, `plan_id` and the
+  observed `outcome` via `ComputeManager::finalize_decision`, and carries a
+  lifecycle trace (Reserved → Executing → Completed/Failed → Released). Safe
+  operational metadata only — no chain-of-thought, no request content.
+- `adapt()` (OBSERVE → ADAPT/RECOVER/REPLAN) now feeds the real retry path in
+  `route_request` with the **actual** remaining eligible-worker count from the
+  live registry (never a fabricated count), preserving the M24 idempotency-safe
+  retry semantics.
+- The control plane (`/v1/execution`) exposes the bounded, concurrency-safe
+  decision ring (`ComputeManager::decisions`, newest-first, cap 64), rendered by
+  the dashboard "Autonomous decisions" view (workload, selected worker, mode,
+  priority, network cost, KV affinity, reservation, outcome, trace, safe reasons).
+
+Fully autonomous goals — self-healing, multi-objective re-planning mid-request,
+proactive rebalancing — are **not** claimed; the planner remains a capable
+single-worker selector, not an autonomous orchestrator. This is `decentraai-fabric::decision`
+integrated into the live execution lifecycle, not M23 Full Autonomy.
+
+## 20. M24: Resilient Distributed Fabric — DONE
+
+- [x] worker health monitoring + stale detection (coordinator reaper, heartbeat
+      staleness, worker eviction with audit)
+- [x] reservation timeout / expiry and release on completion/failure
+- [x] graceful shutdown, mDNS discovery/recovery, startup recovery (systemd
+      restart + identity/config auto-provision)
+- [x] **false-ready prevention** — node admission: the compute broadcaster now
+      gates worker advertisement on live engine health (TCP probe), so a node
+      with a crashed engine never advertises a ready worker (7b22dbf)
+- [x] **engine crash recovery** — the universal node's runtime auto-restarts a
+      crashed llama-server from a stored restart spec via a 5s supervisor
+      loop (`ServeManager::ensure_healthy`)
+- [x] **bounded, idempotency-safe request-level retry** in the fabric route
+      path — `route_request` retries transport-level failures (P2P/timeout) on
+      a fresh planner-chosen worker up to `config.max_retries` with exponential
+      backoff via `FallbackHandler`, releasing and re-planning per attempt;
+      `DistributedError::is_retryable()` never re-sends a definitive worker
+      rejection or a cancelled request (no duplicated non-idempotent work). The
+      streaming path stays single-attempt + legacy fallback to avoid
+      duplicating partial output to the client.
+- [x] **explicit bounded P2P reconnect loop** — on `ConnectionClosed` the swarm
+      re-dials a known-peers' last address with exponential backoff capped at
+      `RECONNECT_MAX_ATTEMPTS`, then relies on mDNS re-discovery; addresses are
+      captured at mDNS discovery and on dialer connect.
+
+## 21. Ubuntu UX — Q4 setup wizard — DONE
 
 - [x] `decentraai setup` — one-command fresh-node onboarding: auto-detects
   hardware (CPU/RAM/GPU via the real system probe), generates or reuses an
@@ -426,7 +680,7 @@ planner integration + `reserve_worker` capacity tests. All green, clippy clean.
   real libp2p distributed node off the generated config. Idempotent across
   reruns (same PeerId), model-discovery works, no-model degrades gracefully.
 
-## 17. Installable Application (Productization) — DONE
+## 22. Installable Application (Productization) — DONE
 
 Turn DecentraAI into an installable app; the normal user flow is
 **Download → Install → Open → Ready**, hiding distributed-compute complexity.

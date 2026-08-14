@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use decentraai_distributed::{
-    ComputeManager, DistributedInference, DistributedP2PHandler, InferenceConfig, ProvisioningConfig,
-    ProvisioningFactory, RequestTracker, WorkerManager,
+    ComputeManager, DistributedInference, DistributedP2PHandler, InferenceConfig,
+    ProvisioningConfig, ProvisioningFactory, RequestTracker, WorkerManager,
 };
 use decentraai_identity::Identity;
 use decentraai_p2p::{
@@ -24,8 +24,8 @@ use decentraai_p2p::{
 use decentraai_protocol::{InferRequest, serialize_message};
 use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{GpuProbeStatus, GpuSnapshot, SystemSnapshot};
-use libp2p::identity::Keypair;
 use libp2p::PeerId;
+use libp2p::identity::Keypair;
 
 const MODEL_HASH: &str = "e2e-model-hash";
 
@@ -63,6 +63,7 @@ fn served_model() -> decentraai_compute::ServedModel {
         size_mb: 512,
         est_ram_mb: 1024,
         est_vram_mb: 3072,
+        context_tokens: 0,
     }
 }
 
@@ -76,7 +77,8 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         "data: [DONE]\n\n"
     );
     mock.mock_async(|when, then| {
-        when.method(httpmock::Method::POST).path("/v1/chat/completions");
+        when.method(httpmock::Method::POST)
+            .path("/v1/chat/completions");
         then.status(200)
             .header("content-type", "text/event-stream")
             .body(stream_body);
@@ -91,12 +93,8 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         "worker".to_string(),
         HashSet::new(),
     ));
-    let worker_manager = Arc::new(WorkerManager::new(
-        worker_peer,
-        InferenceConfig::default(),
-    ));
-    let mut worker_handler =
-        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
+    let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
     let worker_node = P2PNode::new(
         &worker_identity,
@@ -135,10 +133,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         "coordinator".to_string(),
         HashSet::new(),
     ));
-    let coord_worker_manager = Arc::new(WorkerManager::new(
-        coord_peer,
-        InferenceConfig::default(),
-    ));
+    let coord_worker_manager = Arc::new(WorkerManager::new(coord_peer, InferenceConfig::default()));
     let tracker = Arc::new(RequestTracker::new());
     let mut coord_handler =
         DistributedP2PHandler::with_worker_manager(coord_worker_manager.clone());
@@ -165,6 +160,8 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The worker advertises a real probe-derived advertisement over the wire.
     // Re-announce until the dialed connection settles and the coordinator's
@@ -174,9 +171,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         let adv = worker_compute
             .advertise_local(snapshot(), gpu(), vec![served_model()], false)
             .await;
-        worker
-            .p2p_node()
-            .announce(serialize_message(&adv).unwrap());
+        worker.p2p_node().announce(serialize_message(&adv).unwrap());
         if !coord_compute.workers().await.is_empty() {
             break;
         }
@@ -190,10 +185,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     // The coordinator's compute registry picks it up (M12 propagation).
     let workers = coord_compute.workers().await;
     assert_eq!(workers[0].node_name, "worker");
-    assert_eq!(
-        workers[0].capability.gpu.as_ref().unwrap().name,
-        "RTX 4090"
-    );
+    assert_eq!(workers[0].capability.gpu.as_ref().unwrap().name, "RTX 4090");
     assert!(workers[0].capability.has_model(MODEL_HASH));
     assert_eq!(workers[0].availability.available_ram_mb, 12 * 1024);
 
@@ -215,7 +207,9 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     assert_eq!(coord_compute.in_flight(&worker_peer).await, 1);
     assert_eq!(coord_compute.reserved_ram(&worker_peer).await, 1024);
     // Leave a clean ledger: the routed request below books its own booking.
-    coord_compute.release(placement.reservation.reservation_id).await;
+    coord_compute
+        .release(placement.reservation.reservation_id)
+        .await;
     assert_eq!(coord_compute.in_flight(&worker_peer).await, 0);
 
     // Route a real request through the compute path: worker has no legacy
@@ -234,16 +228,26 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     .expect("routed request must complete")
     .expect("route must succeed");
 
-    assert!(response.success, "inference must succeed: {:?}", response.error);
+    assert!(
+        response.success,
+        "inference must succeed: {:?}",
+        response.error
+    );
     assert_eq!(response.worker_peer_id, worker_peer);
     assert_eq!(response.output, "hello world");
-    assert_eq!(response.tokens_used, 3, "two content chunks plus the terminal chunk");
+    assert_eq!(
+        response.tokens_used, 3,
+        "two content chunks plus the terminal chunk"
+    );
 
     let mut streamed = String::new();
     while let Ok(chunk) = progress_rx.try_recv() {
         streamed.push_str(&chunk);
     }
-    assert_eq!(streamed, "hello world", "streamed chunks must match the output");
+    assert_eq!(
+        streamed, "hello world",
+        "streamed chunks must match the output"
+    );
 
     // The reservation must be released after the request completes (M13).
     assert_eq!(
@@ -272,7 +276,8 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         "data: [DONE]\n\n"
     );
     mock.mock_async(|when, then| {
-        when.method(httpmock::Method::POST).path("/v1/chat/completions");
+        when.method(httpmock::Method::POST)
+            .path("/v1/chat/completions");
         then.status(200)
             .header("content-type", "text/event-stream")
             .body(stream_body);
@@ -283,12 +288,8 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
     // ---- the old way (WorkerAnnouncement, no compute advertisement).
     let w2_identity = Identity::generate();
     let w2_peer = libp2p_peer_id(&w2_identity);
-    let w2_worker_manager = Arc::new(WorkerManager::new(
-        w2_peer,
-        InferenceConfig::default(),
-    ));
-    let w2_handler =
-        DistributedP2PHandler::with_worker_manager(w2_worker_manager.clone());
+    let w2_worker_manager = Arc::new(WorkerManager::new(w2_peer, InferenceConfig::default()));
+    let w2_handler = DistributedP2PHandler::with_worker_manager(w2_worker_manager.clone());
     let w2_node = P2PNode::new(
         &w2_identity,
         DEFAULT_MAX_MESSAGE_BYTES,
@@ -323,10 +324,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         "coordinator".to_string(),
         HashSet::new(),
     ));
-    let coord_worker_manager = Arc::new(WorkerManager::new(
-        coord_peer,
-        InferenceConfig::default(),
-    ));
+    let coord_worker_manager = Arc::new(WorkerManager::new(coord_peer, InferenceConfig::default()));
     let tracker = Arc::new(RequestTracker::new());
     let mut coord_handler =
         DistributedP2PHandler::with_worker_manager(coord_worker_manager.clone());
@@ -353,6 +351,8 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The coordinator also trusts a "ghost" worker that is never connected:
     // the capability-aware scheduler will pick it, and the send must fail.
@@ -412,13 +412,21 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
     .expect("fallback must complete")
     .expect("fallback must succeed");
 
-    assert!(response.success, "fallback must succeed: {:?}", response.error);
+    assert!(
+        response.success,
+        "fallback must succeed: {:?}",
+        response.error
+    );
     assert_eq!(
         response.worker_peer_id, w2_peer,
         "the legacy worker must serve after the compute worker fails"
     );
     assert_eq!(response.output, "fallback");
-    assert_eq!(coord_compute.in_flight(&ghost_peer).await, 0, "ghost reservation released");
+    assert_eq!(
+        coord_compute.in_flight(&ghost_peer).await,
+        0,
+        "ghost reservation released"
+    );
 }
 /// M14 on-demand provisioning: a worker that does not hold the requested
 /// model fetches it from the requester through the verified transfer
@@ -438,7 +446,9 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     let mut coord_registry = ModelRegistry::new(coord_models.clone()).unwrap();
     coord_registry.scan_directory(&coord_models).unwrap();
     std::fs::create_dir_all(coord_dir.path().join("db")).unwrap();
-    coord_registry.save(&coord_dir.path().join("db/registry.json")).unwrap();
+    coord_registry
+        .save(&coord_dir.path().join("db/registry.json"))
+        .unwrap();
     let provisioned_hash = blake3::hash(&model_bytes).to_hex().to_string();
 
     // Mock engine for the provisioned model.
@@ -449,7 +459,8 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         "data: [DONE]\n\n"
     );
     mock.mock_async(|when, then| {
-        when.method(httpmock::Method::POST).path("/v1/chat/completions");
+        when.method(httpmock::Method::POST)
+            .path("/v1/chat/completions");
         then.status(200)
             .header("content-type", "text/event-stream")
             .body(stream_body);
@@ -464,12 +475,8 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         "worker".to_string(),
         HashSet::new(),
     ));
-    let worker_manager = Arc::new(WorkerManager::new(
-        worker_peer,
-        InferenceConfig::default(),
-    ));
-    let mut worker_handler =
-        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
+    let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
     let worker_node = P2PNode::new(
         &worker_identity,
@@ -535,10 +542,7 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         HashSet::new(),
     ));
     coord_compute.set_allow_provisioning(true).await;
-    let coord_worker_manager = Arc::new(WorkerManager::new(
-        coord_peer,
-        InferenceConfig::default(),
-    ));
+    let coord_worker_manager = Arc::new(WorkerManager::new(coord_peer, InferenceConfig::default()));
     let tracker = Arc::new(RequestTracker::new());
     let mut coord_handler =
         DistributedP2PHandler::with_worker_manager(coord_worker_manager.clone());
@@ -568,6 +572,8 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The worker advertises `can_provision = true` over the wire until the
     // coordinator's registry sees it.
@@ -576,9 +582,7 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         let adv = worker_compute
             .advertise_local(snapshot(), gpu(), vec![served_model()], true)
             .await;
-        worker
-            .p2p_node()
-            .announce(serialize_message(&adv).unwrap());
+        worker.p2p_node().announce(serialize_message(&adv).unwrap());
         if !coord_compute.workers().await.is_empty() {
             break;
         }
@@ -600,7 +604,9 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         .await
         .expect("trusted provisioning worker must be selected");
     assert_eq!(placement.worker, worker_peer);
-    coord_compute.release(placement.reservation.reservation_id).await;
+    coord_compute
+        .release(placement.reservation.reservation_id)
+        .await;
 
     // Route a request for the not-yet-local model; the worker must fetch,
     // verify, and serve it.
@@ -618,28 +624,47 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     .expect("provisioned request must complete")
     .expect("provisioning route must succeed");
 
-    assert!(response.success, "provisioned inference must succeed: {:?}", response.error);
+    assert!(
+        response.success,
+        "provisioned inference must succeed: {:?}",
+        response.error
+    );
     assert_eq!(response.worker_peer_id, worker_peer);
     assert_eq!(response.output, "provisioned");
-    assert_eq!(response.tokens_used, 2, "one content chunk plus the terminal chunk");
+    assert_eq!(
+        response.tokens_used, 2,
+        "one content chunk plus the terminal chunk"
+    );
 
     let mut streamed = String::new();
     while let Ok(chunk) = progress_rx.try_recv() {
         streamed.push_str(&chunk);
     }
-    assert_eq!(streamed, "provisioned", "streamed chunks must match the output");
+    assert_eq!(
+        streamed, "provisioned",
+        "streamed chunks must match the output"
+    );
 
     // The model was downloaded through the verified pipeline, then indexed
     // into the worker's registry.
     let downloaded = worker_dir.path().join("models/provisioned.gguf");
-    assert!(downloaded.is_file(), "provisioned model must land in the worker's models dir");
+    assert!(
+        downloaded.is_file(),
+        "provisioned model must land in the worker's models dir"
+    );
     assert_eq!(
-        blake3::hash(&std::fs::read(&downloaded).unwrap()).to_hex().to_string(),
+        blake3::hash(&std::fs::read(&downloaded).unwrap())
+            .to_hex()
+            .to_string(),
         provisioned_hash,
         "the provisioned file must verify byte-for-byte"
     );
     let registry = ModelRegistry::load(&worker_registry_path).unwrap();
-    assert_eq!(registry.models.len(), 1, "provisioned model must be indexed");
+    assert_eq!(
+        registry.models.len(),
+        1,
+        "provisioned model must be indexed"
+    );
 
     // The reservation is released after the request completes.
     assert_eq!(coord_compute.in_flight(&worker_peer).await, 0);
@@ -663,6 +688,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         size_mb: 8192,
         est_ram_mb: 8192,
         est_vram_mb: 0,
+        context_tokens: 0,
     };
     let tiny_snapshot = SystemSnapshot {
         logical_cpus: 8,
@@ -681,7 +707,8 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     );
     let big_mock = mock
         .mock_async(|when, then| {
-            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(stream_body);
@@ -696,12 +723,8 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         "worker".to_string(),
         HashSet::new(),
     ));
-    let worker_manager = Arc::new(WorkerManager::new(
-        worker_peer,
-        InferenceConfig::default(),
-    ));
-    let mut worker_handler =
-        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
+    let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
     let worker_node = P2PNode::new(
         &worker_identity,
@@ -742,7 +765,6 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
 
     // ---- Client that routes the request regardless of headroom.
     let client_identity = Identity::generate();
-    let client_peer = libp2p_peer_id(&client_identity);
     let client_node = P2PNode::new(
         &client_identity,
         DEFAULT_MAX_MESSAGE_BYTES,
@@ -759,30 +781,46 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     async fn send(
         client_node: &P2PNode,
         worker_peer: PeerId,
-        client_peer: PeerId,
+        client_identity: &Identity,
+        nonce: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        let client_peer = libp2p_peer_id(client_identity);
         let mut request = InferRequest::new(MODEL_HASH.to_string(), "hello".into(), 64);
         request = request.with_sender(client_peer);
         request.timeout_ms = 10_000;
+        request.nonce = nonce; // P4: distinct nonce per send (replays rejected)
+        // P1: sign so the worker authenticates the request before admitting it.
+        decentraai_protocol::sign_infer_request_with_key(
+            &client_identity.signing_key_bytes(),
+            &mut request,
+        );
         let payload = serialize_message(&request)?;
         client_node.request(worker_peer, payload).await
     }
 
     // The worker must reject the oversized workload at the door. Retry only
-    // for the newly dialed connection to settle (per AGENTS.md).
+    // for the newly dialed connection to settle (per AGENTS.md). Each retry
+    // uses a fresh nonce so the replay guard never flags the connection settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let rejected = loop {
-        match send(&client_node, worker_peer, client_peer).await {
-            Ok(bytes) => break bytes,
-            Err(_) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let rejected = {
+        let mut n = 0u64;
+        loop {
+            let attempt = send(&client_node, worker_peer, &client_identity, n).await;
+            n += 1;
+            match attempt {
+                Ok(bytes) => break bytes,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("timed out awaiting a connection to the worker: {e}"),
             }
-            Err(e) => panic!("timed out awaiting a connection to the worker: {e}"),
         }
     };
     let reply: InferMessage = deserialize_message(&rejected, rejected.len()).unwrap();
     match reply {
-        InferMessage::InferFailed { retryable, error, .. } => {
+        InferMessage::InferFailed {
+            retryable, error, ..
+        } => {
             assert!(retryable, "capacity rejection must be retryable");
             assert!(
                 error.contains("insufficient free capacity"),
@@ -791,14 +829,20 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         }
         other => panic!("expected InferFailed, got {other:?}"),
     }
-    assert_eq!(big_mock.hits(), 0, "the rejected request must never reach the backend");
+    assert_eq!(
+        big_mock.hits(),
+        0,
+        "the rejected request must never reach the backend"
+    );
 
     // ...and admit the same workload once the advertised free capacity
     // actually fits it (positive control proving the gate is the cause).
     worker_compute
         .advertise_local(snapshot(), gpu(), vec![big_model], false)
         .await;
-    let admitted = send(&client_node, worker_peer, client_peer).await.unwrap();
+    let admitted = send(&client_node, worker_peer, &client_identity, 5000)
+        .await
+        .unwrap();
     let reply: InferMessage = deserialize_message(&admitted, admitted.len()).unwrap();
     assert!(
         matches!(reply, InferMessage::InferAccepted { .. }),

@@ -27,6 +27,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+/// Max re-dial attempts for a peer that disconnected, before giving up and
+/// relying on mDNS re-discovery (a peer that left the network permanently
+/// must not be re-dialed forever). Each attempt backs off exponentially.
+pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+/// Base backoff (ms) doubled on each reconnect attempt.
+pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
+
 /// Request/response protocol carrying serialized decentraai-protocol messages.
 pub const MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/decentraai/message/1");
 
@@ -266,11 +273,19 @@ enum Command {
     Broadcast {
         payload: Vec<u8>,
     },
+    /// Reply with the ids of currently connected peers.
+    Connected {
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
     Shutdown,
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
-type InferHandler = Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+/// Called with the transport-authenticated connected peer and the request;
+/// `peer` is the real Noise-authenticated PeerId, NOT `req.sender_peer_id`
+/// (which is attacker-controllable payload, see P2).
+type InferHandler =
+    Arc<dyn Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 /// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
 type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
@@ -278,8 +293,7 @@ type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
 /// Handler for inbound manifest announcements, called with the announcing
 /// peer and the announced manifest. MUST be non-blocking: the swarm event
 /// loop invokes it inline, so downloads belong in a spawned task.
-type ManifestAnnouncementHandler =
-    Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
+type ManifestAnnouncementHandler = Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
 
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
@@ -316,7 +330,10 @@ impl P2PNode {
     /// P2PNode::request().
     pub fn set_on_infer_request<F>(&mut self, callback: F)
     where
-        F: Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
+        F: Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
+            + Send
+            + Sync
+            + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_infer.lock());
         *guard = Some(std::sync::Arc::new(callback));
@@ -380,6 +397,9 @@ impl P2PNode {
             .build();
 
         let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
+        // A second sender used only by the reconnect tasks spawned on peer
+        // disconnects, so redial attempts don't block the event loop.
+        let reconnect_sender = commands.clone();
         // Shared on_infer callback storage for runtime registration
         let on_infer: SharedHandler<InferHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_infer_clone = on_infer.clone();
@@ -395,6 +415,12 @@ impl P2PNode {
             > = HashMap::new();
             let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> = VecDeque::new();
             let mut connected: Vec<PeerId> = Vec::new();
+            // Per-peer reconnect attempts since the last successful connection,
+            // so a peer that went away doesn't get dialed forever.
+            let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
+            // Last known address per peer, kept so a disconnect can be
+            // re-dialed without waiting for another mDNS announcement.
+            let mut known_addresses: HashMap<PeerId, Multiaddr> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -435,6 +461,9 @@ impl P2PNode {
                                         .send_request(&peer, payload.clone());
                                 }
                             }
+                            Command::Connected { reply } => {
+                                let _ = reply.send(connected.clone());
+                            }
                             Command::Shutdown => break,
                         }
                     }
@@ -451,10 +480,54 @@ impl P2PNode {
                                 if !connected.contains(&peer_id) {
                                     connected.push(peer_id);
                                 }
+                                // A successful connection resets the redial
+                                // budget so a future drop can attempt again.
+                                reconnect_attempts.remove(&peer_id);
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            SwarmEvent::ConnectionClosed {
+                                peer_id, endpoint, ..
+                            } => {
                                 info!(%peer_id, "peer disconnected");
                                 connected.retain(|p| p != &peer_id);
+                                // Remember the remote address from the closing
+                                // link when it was us doing the dialing.
+                                if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
+                                    endpoint
+                                {
+                                    known_addresses.insert(peer_id, address.clone());
+                                }
+                                let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
+                                let addr_known = known_addresses.get(&peer_id).cloned();
+                                // Bounded explicit re-dial: drop the budget when
+                                // we've retried too often or have no address, and
+                                // let mDNS re-discovery take over.
+                                let Some(addr) = addr_known.clone() else {
+                                    reconnect_attempts.remove(&peer_id);
+                                    continue;
+                                };
+                                if *attempt >= RECONNECT_MAX_ATTEMPTS {
+                                    reconnect_attempts.remove(&peer_id);
+                                    debug!(%peer_id, "reconnect budget exhausted; waiting for mDNS");
+                                    continue;
+                                }
+                                let nth = *attempt;
+                                *attempt += 1;
+                                let backoff = Duration::from_millis(
+                                    RECONNECT_BASE_BACKOFF_MS << nth.min(10),
+                                );
+                                let sender = reconnect_sender.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(backoff).await;
+                                    let (reply, _) = oneshot::channel();
+                                    let _ = sender.send(Command::Dial { addr, reply });
+                                });
+                                debug!(
+                                    %peer_id,
+                                    attempt = nth + 1,
+                                    max = RECONNECT_MAX_ATTEMPTS,
+                                    backoff_ms = backoff.as_millis(),
+                                    "scheduled reconnect dial"
+                                );
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
                                 mdns::Event::Discovered(list),
@@ -462,6 +535,7 @@ impl P2PNode {
                                 for (peer, addr) in list {
                                     info!(%peer, %addr, "mDNS discovered peer");
                                     swarm.add_peer_address(peer, addr.clone());
+                                    known_addresses.insert(peer, addr.clone());
                                     // mDNS discovery is passive: it only adds
                                     // addresses to the peerstore. Dial so the
                                     // connection is actually established and
@@ -505,7 +579,7 @@ impl P2PNode {
                                         // If a runtime on_infer callback has been registered, call it
                                         let guard = on_infer_clone.lock().await;
                                         if let Some(cb) = &*guard {
-                                            match cb(infer_req) {
+                                            match cb(peer, infer_req) {
                                                 Ok(bytes) => {
                                                     if swarm
                                                         .behaviour_mut()
@@ -660,6 +734,16 @@ impl P2PNode {
 
     pub fn shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
+    }
+
+    /// Returns the PeerIds of currently connected peers. Best-effort: an
+    /// empty/truncated result is returned if the swarm task is busy or gone.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        if self.commands.send(Command::Connected { reply }).is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 }
 

@@ -116,6 +116,11 @@ impl ComputeScheduler {
         self.trusted.insert(peer);
     }
 
+    /// Removes `peer` from the trusted set (ineligible to run workloads).
+    pub fn remove_trusted(&mut self, peer: &PeerId) {
+        self.trusted.remove(peer);
+    }
+
     /// Selects the best eligible worker for `req` and books a reservation
     /// on it. Returns `None` when no worker can run the workload right now.
     ///

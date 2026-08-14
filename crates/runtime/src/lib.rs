@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Environment variable that overrides the llama-server binary location.
 pub const LLAMA_SERVER_ENV: &str = "DECENTRAAI_LLAMA_SERVER";
@@ -35,7 +35,10 @@ const BINARY_NAMES: [&str; 2] = ["llama-server", "llama-server.exe"];
 /// cmake -B build && cmake --build build` land here; distro packages put
 /// the binary in /usr/lib/ollama. We probe these so `distributed --model`
 /// works out of the box instead of silently falling back to a mock.
-const HOME_BINARY_PATHS: [&str; 2] = ["llama.cpp/build/bin/llama-server", "llama.cpp/build/bin/Release/llama-server"];
+const HOME_BINARY_PATHS: [&str; 2] = [
+    "llama.cpp/build/bin/llama-server",
+    "llama.cpp/build/bin/Release/llama-server",
+];
 const ABSOLUTE_BINARY_PATHS: [&str; 1] = ["/usr/lib/ollama/llama-server"];
 
 /// How long a single health probe may take before it is abandoned.
@@ -266,6 +269,14 @@ impl std::fmt::Debug for LlamaServer {
     }
 }
 
+/// Serializes llama-server subprocess spawns process-wide. Under parallel test
+/// spawn an `execve` can transiently see a freshly-written script as "busy"
+/// (ETXTBSY, os error 26); holding this lock while spawning makes each spawn
+/// happen one at a time, which fully eliminates that race. Production impact is
+/// nil (the node spawns at most one engine at boot, and the lock is held only
+/// for the brief synchronous `Command::spawn`).
+static ENGINE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl LlamaServer {
     /// Spawns the child without waiting for readiness (exposed for tests).
     pub fn start(binary: &Path, config: &RuntimeConfig) -> Result<Self> {
@@ -275,15 +286,32 @@ impl LlamaServer {
         };
         let args = server_args(config, port);
         info!(binary = %binary.display(), port, "starting llama-server");
-        let child = Command::new(binary)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawning {}", binary.display()))?;
+        // Hold the process-wide spawn lock + retry briefly on ETXTBSY
+        // (os error 26): under parallel test spawn a concurrent exec can
+        // transiently see the executable/script as busy. Serializing the brief
+        // spawn (plus a small backoff) eliminates the flake deterministically.
+        let _guard = ENGINE_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = None;
+        for attempt in 0..5 {
+            let spawn = Command::new(binary)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match spawn {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 4 => {
+                    std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+                }
+                Err(e) => return Err(e).context(format!("spawning {}", binary.display())),
+            }
+        }
         Ok(Self {
-            child,
+            child: child.expect("engine spawn retries exhausted"),
             host: config.bind_host.clone(),
             port,
         })
@@ -337,6 +365,12 @@ pub struct ServeManager {
     server: Option<LlamaServer>,
     idle_timeout: Duration,
     last_activity: Instant,
+    /// Restart spec used by the M24 engine supervisor to respawn a crashed
+    /// llama-server. `None` disables auto-restart.
+    binary: Option<PathBuf>,
+    restart_config: Option<RuntimeConfig>,
+    /// Number of automatic restarts performed (observability).
+    pub respawns: u32,
 }
 
 impl ServeManager {
@@ -345,7 +379,34 @@ impl ServeManager {
             server: Some(server),
             idle_timeout,
             last_activity: Instant::now(),
+            binary: None,
+            restart_config: None,
+            respawns: 0,
         }
+    }
+
+    /// A manager with no local engine (Q3 remote backend). Used when the
+    /// model runs on a `serve start --backend http://host:port` and this
+    /// node only keeps auth/tiers/queue/dashboard local. `base_url()` returns
+    /// `None`, so the proxy falls back to `state.backend_url`; `is_loaded()`
+    /// is `false` and the idle watcher exits immediately (no local model to
+    /// unload).
+    pub fn unloaded(idle_timeout: Duration) -> Self {
+        Self {
+            server: None,
+            idle_timeout,
+            last_activity: Instant::now(),
+            binary: None,
+            restart_config: None,
+            respawns: 0,
+        }
+    }
+
+    /// Supplies the binary + config needed to respawn the engine (M24 engine
+    /// supervisor). Auto-restart stays disabled until this is set.
+    pub fn set_restart_spec(&mut self, binary: PathBuf, config: RuntimeConfig) {
+        self.binary = Some(binary);
+        self.restart_config = Some(config);
     }
 
     /// Marks the model as actively serving; resets the idle clock.
@@ -389,6 +450,55 @@ impl ServeManager {
             server.stop().await?;
         }
         Ok(())
+    }
+
+    /// M24 engine supervisor: probes the running engine's health endpoint and,
+    /// if the engine has crashed or gone unreachable, respawns it from the
+    /// stored restart spec. Returns `true` when the engine is healthy after the
+    /// call (possibly after a restart), `false` when it could not be made
+    /// healthy (e.g. no restart spec, or the binary failed to start).
+    pub async fn ensure_healthy(&mut self) -> Result<bool> {
+        // If we have a live handle, confirm it answers health.
+        if let Some(server) = &self.server {
+            let probe_host = server.host.clone();
+            let probe_port = server.port();
+            let ok = tokio::task::spawn_blocking(move || probe_health(&probe_host, probe_port))
+                .await
+                .unwrap_or(Err(anyhow::anyhow!("health probe task failed")));
+            if ok.is_ok() {
+                return Ok(true);
+            }
+            warn!(
+                probe_port,
+                "engine health probe failed; restarting llama-server (M24)"
+            );
+            // Engine is dead. Drop it (stop kills the child) and respawn.
+            let dead = self.server.take().unwrap();
+            let _ = dead.stop().await;
+        } else if self.restart_config.is_none() {
+            // No engine and no restart spec: nothing to supervise.
+            return Ok(false);
+        }
+
+        let (Some(binary), Some(config)) = (&self.binary, &self.restart_config) else {
+            return Ok(false);
+        };
+        self.respawns += 1; // count the restart attempt
+        match LlamaServer::spawn(binary, config).await {
+            Ok(server) => {
+                info!(
+                    port = server.port(),
+                    respawn = self.respawns,
+                    "restarted llama-server (M24 auto-recovery)"
+                );
+                self.server = Some(server);
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to restart llama-server");
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -470,7 +580,10 @@ mod tests {
     #[test]
     fn runtime_config_port_defaults_to_auto_allocate() {
         let config = RuntimeConfig::new(PathBuf::from("/m.gguf"));
-        assert_eq!(config.port, None, "default: auto-allocate an ephemeral port");
+        assert_eq!(
+            config.port, None,
+            "default: auto-allocate an ephemeral port"
+        );
         let mut fixed = RuntimeConfig::new(PathBuf::from("/m.gguf"));
         fixed.port = Some(8081);
         assert_eq!(fixed.port, Some(8081));
@@ -503,8 +616,7 @@ mod tests {
         let mut perms = std::fs::metadata(&target).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&target, perms).unwrap();
-        let found =
-            probe_common_locations(Some(dir.path().as_os_str().to_os_string())).unwrap();
+        let found = probe_common_locations(Some(dir.path().as_os_str().to_os_string())).unwrap();
         assert_eq!(found, target);
     }
 
@@ -515,8 +627,7 @@ mod tests {
         // with that package), so the found path must not live under the temp
         // dir used as $HOME.
         let dir = tempfile::tempdir().unwrap();
-        let result =
-            probe_common_locations(Some(dir.path().as_os_str().to_os_string()));
+        let result = probe_common_locations(Some(dir.path().as_os_str().to_os_string()));
         if let Some(found) = result {
             assert!(
                 !found.starts_with(dir.path()),
@@ -672,12 +783,34 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_server(dir: &Path) -> PathBuf {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-llama-server");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // Write + sync + close BEFORE spawning, so a concurrent exec in another
+        // test never sees a freshly-open-for-write script (the ETXTBSY flake
+        // under parallel tests). Retry a few times on ETXTBSY just in case.
+        let mut last = None;
+        for attempt in 0..4 {
+            match std::fs::File::create(&path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"#!/bin/sh\nexec sleep 60\n");
+                    let _ = f.sync_all();
+                    drop(f);
+                    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&path, perms).unwrap();
+                    return path;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 3 => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            panic!("failed to write fake llama-server after retries: {e}");
+        }
         path
     }
 
@@ -735,5 +868,39 @@ mod tests {
         assert!(manager.is_loaded());
         manager.shutdown().await.unwrap();
         assert!(!manager.is_loaded());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_healthy_attempts_restart_for_dead_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = write_fake_server(dir.path());
+        let mut config = RuntimeConfig::new(dir.path().join("model.gguf"));
+        config.ready_timeout = Duration::from_millis(300);
+
+        // A started-but-never-serving fake engine: it holds a port number but
+        // does not bind it, so the health probe fails as if the engine crashed.
+        let server = LlamaServer::start(&binary, &config).unwrap();
+        let port = server.port();
+
+        let mut manager = ServeManager::new(server, Duration::from_secs(60));
+        // No restart spec -> supervisor cannot recover a dead engine.
+        assert!(!manager.ensure_healthy().await.unwrap());
+
+        // Simulate a crash: drop the live handle. Without a restart spec this
+        // reports unhealthy.
+        manager.server = None;
+        assert!(!manager.ensure_healthy().await.unwrap());
+
+        // With a restart spec, recovery is attempted. The fake never serves
+        // HTTP 200, so spawn's ready-wait fails and ensure_healthy reports the
+        // engine is still not healthy (and does not panic). This exercises the
+        // full probe->stop->respawn path against a real child.
+        manager.set_restart_spec(binary, config);
+        manager.server = None;
+        let healthy = manager.ensure_healthy().await.unwrap();
+        assert!(!healthy, "fake server never becomes ready");
+        assert_eq!(manager.respawns, 1, "one restart was attempted");
+        let _ = port;
     }
 }

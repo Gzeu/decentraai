@@ -94,13 +94,42 @@ impl Default for DistributedP2PHandler {
 
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
-        use decentraai_protocol::{InferMessage, deserialize_message, serialize_message};
+        use decentraai_protocol::{
+            InferMessage, SignedComputeAdvertisement, deserialize_message, serialize_message,
+            verify_signed_compute_advertisement,
+        };
 
-        // Try to deserialize as a compute advertisement
-        if let Ok(adv) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
-            request,
-            request.len(),
-        ) {
+        // P3: a signed compute advertisement is verified before being trusted.
+        // The signer's public key must map to the advertisement's own peer_id
+        // (an attacker cannot forge a signature for a peer they don't control).
+        if let Ok(signed) = deserialize_message::<SignedComputeAdvertisement>(request, request.len())
+        {
+            if let Ok(inner) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
+                &signed.advertisement,
+                signed.advertisement.len(),
+            ) {
+                let claiming_peer = inner.peer_id;
+                match verify_signed_compute_advertisement(&signed, &claiming_peer) {
+                    Ok(()) => {
+                        if let Some(manager) = &self.compute_manager {
+                            let manager = manager.clone();
+                            tokio::spawn(async move {
+                                manager.process_advertisement(inner).await;
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%claiming_peer, error = %e, "rejected signed advertisement");
+                    }
+                }
+            }
+            return Ok(Vec::new()); // No response for advertisements
+        }
+
+        // Try to deserialize as a compute advertisement (legacy unsigned)
+        if let Ok(adv) =
+            deserialize_message::<decentraai_compute::ComputeAdvertisement>(request, request.len())
+        {
             if let Some(manager) = &self.compute_manager {
                 let manager = manager.clone();
                 tokio::spawn(async move {
@@ -517,6 +546,7 @@ mod tests {
                     size_mb: 2048,
                     est_ram_mb: 256,
                     est_vram_mb: 3072,
+                    context_tokens: 0,
                 }],
                 can_provision: false,
             },
@@ -540,7 +570,11 @@ mod tests {
         // The advertisement is processed on a spawned task; yield so it runs.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let workers = manager.workers().await;
-        assert_eq!(workers.len(), 1, "advertisement lands in the compute registry");
+        assert_eq!(
+            workers.len(),
+            1,
+            "advertisement lands in the compute registry"
+        );
         assert_eq!(workers[0].node_name, "gpu-rig");
     }
 }

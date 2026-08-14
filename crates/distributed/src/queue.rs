@@ -452,6 +452,69 @@ mod tests {
     }
 
     #[test]
+    fn test_cleanup_timed_out_removes_expired() {
+        let manager = RequestQueueManager::new(10, Duration::from_secs(60));
+        let peer_id = create_test_peer_id();
+        let mut req = create_test_request();
+        req.timeout_ms = 100; // short deadline so it expires quickly
+
+        let queued = futures::executor::block_on(manager.queue_request(req.clone(), peer_id));
+        assert!(queued, "request should be queued");
+        assert_eq!(
+            futures::executor::block_on(manager.total_queued()),
+            1,
+            "request should be pending before the deadline"
+        );
+
+        // Let the deadline pass, then sweep.
+        std::thread::sleep(Duration::from_millis(150));
+        let swept = futures::executor::block_on(manager.cleanup_timed_out());
+
+        assert_eq!(
+            swept.len(),
+            1,
+            "the past-deadline request must be swept by cleanup_timed_out"
+        );
+        assert_eq!(swept[0].request_id, req.request_id);
+        assert!(swept[0].is_timed_out(), "the swept entry still reports expired");
+        assert_eq!(
+            futures::executor::block_on(manager.total_queued()),
+            0,
+            "queue must be empty after the sweep"
+        );
+    }
+
+    #[test]
+    fn manager_rejects_beyond_configured_depth() {
+        let manager = RequestQueueManager::new(2, Duration::from_secs(60));
+        let peer_id = create_test_peer_id();
+        let req = create_test_request();
+        let req_id = req.request_id;
+
+        // Two requests fit within the configured depth...
+        assert!(futures::executor::block_on(manager.queue_request(req.clone(), peer_id)));
+        assert!(futures::executor::block_on(manager.queue_request(req.clone(), peer_id)));
+
+        // ...the third must be rejected (a peer cannot push unlimited work).
+        let third = futures::executor::block_on(manager.queue_request(req.clone(), peer_id));
+        assert!(!third, "work beyond max_queue_depth must be rejected");
+        assert_eq!(
+            futures::executor::block_on(manager.queue_depth(&peer_id)),
+            2,
+            "depth must stay capped at max_queue_depth"
+        );
+
+        // Sweeping none (no deadline elapsed) leaves both intact; the dequeued
+        // requests still bear the original id, proving FIFO/ordering intact.
+        let swept = futures::executor::block_on(manager.cleanup_timed_out());
+        assert!(swept.is_empty());
+
+        let first = futures::executor::block_on(manager.dequeue_request(&peer_id));
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().request_id, req_id);
+    }
+
+    #[test]
     fn test_cancel_queued_and_inflight() {
         let manager = RequestQueueManager::new(10, Duration::from_secs(60));
         let peer_id = create_test_peer_id();
