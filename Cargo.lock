@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-audit"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-compute"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libp2p",
  "serde",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-discovery"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-distributed"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-fabric"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-identity"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-inference-adapter"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-manifest"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "hex",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-monitoring"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-p2p"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-p2p-invoke"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-registry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-runtime"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-system-probe"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "decentraai-config",
  "sysinfo",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "decentraai-tokens"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",

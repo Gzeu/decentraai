@@ -5,6 +5,10 @@ Nodes discover each other on the LAN, exchange cryptographically verified model 
 and serve inference through a local OpenAI-compatible endpoint with a live web dashboard.
 Free, contribution-tiered subscriptions gate models and request rates per token.
 
+> **v1.0.0** — initial production release. See [`CHANGELOG.md`](CHANGELOG.md) for
+> the milestone/session history and [`ROADMAP.md`](ROADMAP.md) for the honest
+> current-state checklist.
+
 DecentraAI is a **distributed execution fabric**, not a marketplace, cloud
 marketplace, token/economic product, or centralized server product.
 
