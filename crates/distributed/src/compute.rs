@@ -664,6 +664,7 @@ impl ComputeManager {
         req: &WorkloadRequirements,
         prompt_tokens: u32,
         session_id: Option<&str>,
+        priority: u8,
     ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
         let facts = self.fabric_facts(&req.model_hash).await;
         if facts.is_empty() {
@@ -719,6 +720,7 @@ impl ComputeManager {
             },
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
+            priority,
         };
 
         let result = planner.plan(&rfacts, &facts);
@@ -1261,7 +1263,7 @@ mod tests {
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         let (plan, placement) = manager
-            .plan_and_reserve(&req, 200, None)
+            .plan_and_reserve(&req, 200, None, 0)
             .await
             .expect("fabric planner finds the worker");
         assert_eq!(
@@ -1300,7 +1302,7 @@ mod tests {
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         assert!(
-            manager.plan_and_reserve(&req, 10, None).await.is_none(),
+            manager.plan_and_reserve(&req, 10, None, 0).await.is_none(),
             "coordinator must not route a remote request to itself"
         );
     }
@@ -1326,7 +1328,7 @@ mod tests {
 
         // Before tripping, the worker is routable.
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        assert!(manager.plan_and_reserve(&req, 10, None).await.is_some());
+        assert!(manager.plan_and_reserve(&req, 10, None, 0).await.is_some());
         assert_eq!(manager.fabric_facts("abc").await.len(), 1);
 
         // Trip the breaker: repeated retryable failures open it.
@@ -1338,7 +1340,7 @@ mod tests {
         assert!(!manager.breaker_allows(&worker));
         assert_eq!(manager.fabric_facts("abc").await.len(), 0);
         assert!(
-            manager.plan_and_reserve(&req, 10, None).await.is_none(),
+            manager.plan_and_reserve(&req, 10, None, 0).await.is_none(),
             "must not reserve/open a trip request on an open worker"
         );
 
@@ -1390,7 +1392,7 @@ mod tests {
         // Cold request with a session id -> arbitrary (a or b).
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         let cold = manager
-            .plan_and_reserve(&req, 100, Some("s1"))
+            .plan_and_reserve(&req, 100, Some("s1"), 0)
             .await
             .expect("workers eligible");
         let (plan_cold, placement_cold) = cold;
@@ -1404,7 +1406,7 @@ mod tests {
         // Continuation with the same session must be steered back to that
         // same worker (cache locality), deterministically.
         let cont = manager
-            .plan_and_reserve(&req, 50, Some("s1"))
+            .plan_and_reserve(&req, 50, Some("s1"), 0)
             .await
             .expect("continuation routable");
         assert_eq!(
@@ -1491,7 +1493,7 @@ mod tests {
         // Unknown session -> not a continuation; must still route to the
         // (only) eligible worker deterministically.
         let (plan, placement) = manager
-            .plan_and_reserve(&req, 100, Some("never-seen"))
+            .plan_and_reserve(&req, 100, Some("never-seen"), 0)
             .await
             .expect("routes");
         assert_eq!(placement.worker, worker);
@@ -1755,7 +1757,7 @@ mod tests {
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         let (plan, placement) = manager
-            .plan_and_reserve(&req, 100, None)
+            .plan_and_reserve(&req, 100, None, 0)
             .await
             .expect("plan");
         let plan = plan.clone();
@@ -1785,7 +1787,7 @@ mod tests {
         assert!(manager.executions().len() <= 128);
         // Continue the session so continuation reasons render in the record.
         let cont = manager
-            .plan_and_reserve(&req, 50, Some("s1"))
+            .plan_and_reserve(&req, 50, Some("s1"), 0)
             .await
             .expect("cont");
         manager.record_execution(

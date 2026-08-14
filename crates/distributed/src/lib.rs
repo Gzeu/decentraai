@@ -930,7 +930,7 @@ impl DistributedInference {
                 let mut last_error = None;
                 for attempt in 0u32..=self.config.max_retries {
                     let Some((plan, placement)) = compute
-                        .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref())
+                        .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
                         .await
                     else {
                         break;
@@ -1084,7 +1084,7 @@ impl DistributedInference {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
                 if let Some((plan, placement)) = compute
-                    .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref())
+                    .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
                     .await
                 {
                     let task_placement = TaskPlacement {
