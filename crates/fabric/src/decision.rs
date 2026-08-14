@@ -179,8 +179,17 @@ pub enum ExecutionEvent {
     Planned { selected_worker: Option<String> },
     Reserved { worker: Option<String> },
     Executing { worker: Option<String> },
+    /// The orchestrator is observing live runtime state for a running stage.
+    Observing { stage: String, worker: Option<String> },
     Adapting { reason: String },
+    /// Re-planning because the fabric changed / the primary worker is no longer
+    /// the best safe choice (before this request produced output).
+    Replanning { from: Option<String>, to: Option<String> },
+    /// Recovering after a retryable worker failure onto an alternative.
+    Recovering { worker: Option<String>, attempt: u32 },
     Replanned { retry_on: Option<String> },
+    /// The request exceeded its deadline while still in a safe (no-output) stage.
+    DeadlineElapsed { deadline_ms: u32 },
     Completed { ok: bool },
     Released { worker: Option<String> },
     Failed { cause: String, retryable: bool },
@@ -429,6 +438,143 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+// ---------------------------------------------------------------------------
+// Autonomous runtime orchestration (M23 Increment D)
+// ---------------------------------------------------------------------------
+
+/// The lifecycle phase a request is in — the control-plane timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "uppercase")]
+pub enum ExecutionPhase {
+    Discovered,
+    Classified,
+    Planned,
+    Reserved,
+    Executing,
+    Observing,
+    Adapting,
+    Replanning,
+    Recovering,
+    Completed,
+    Released,
+    Failed,
+}
+
+/// A real-time observation of a stage's runtime state (all safe operational
+/// facts; no request content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Observation {
+    /// Which phase the observation is about (which transition to compute).
+    pub phase: ExecutionPhase,
+    /// The worker currently running the stage (if any).
+    pub worker: Option<String>,
+    /// Number of attempts already made for this request.
+    pub attempt: u32,
+    /// Remaining re-plan / retry budget (0 = no more attempts).
+    pub replan_budget: u32,
+    /// Tokens already delivered to the client (must stay 0 before a retry).
+    pub tokens_emitted: u64,
+    /// Whether the last attempt failed in a retryable (transport) way.
+    pub retryable: bool,
+    /// Whether the failure was a client cancellation (never retried).
+    pub cancelled: bool,
+    /// Whether this is a session continuation (preserve KV affinity).
+    pub is_continuation: bool,
+    /// How many *other* eligible workers remain as an alternative.
+    pub eligible_alternatives: usize,
+    /// Worker the session prefix is resident on (continuation steering).
+    pub prefix_on: Option<String>,
+    /// Whether the request's wall-clock deadline has elapsed.
+    pub deadline_elapsed: bool,
+    /// Whether the current worker is now over its load/queue congestion cap.
+    pub worker_congested: bool,
+}
+
+/// The orchestrator's safe next action for a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestrationAction {
+    /// Keep executing on the current worker.
+    Continue,
+    /// Retry the same worker (only when nothing was emitted and it is safe).
+    RetrySameWorker,
+    /// Re-plan onto an alternative (or the best continued candidate).
+    Replan { to: Option<String> },
+    /// Recover from a retryable worker failure onto an alternative.
+    Recover { on: Option<String> },
+    /// No safe action; stop.
+    Abort,
+}
+
+impl OrchestrationAction {
+    /// Whether the orchestrator intends to keep trying (not abort).
+    pub fn keeps_trying(&self) -> bool {
+        !matches!(self, OrchestrationAction::Abort)
+    }
+}
+
+/// Pure controller that decides the next safe orchestration action from a
+/// single runtime observation (M23 Increment D). It generalizes the retry-only
+/// `adapt` step into a continuous observe→adapt loop over the lifecycle:
+///
+/// - If the phase is a success → Continue.
+/// - If the deadline elapsed while nothing was emitted → Abort (safe).
+/// - If tokens were emitted or it was cancelled or the failure is definite
+///   (non-retryable) → Abort (never duplicate / never re-send).
+/// - Otherwise, if an alternative or the same worker is safely available within
+///   the remaining budget, Replan / Recover / RetrySameWorker (honoring session
+///   affinity and avoiding a congested primary).
+///
+/// No mid-stream migration, no KV migration, no tensor/layer/expert parallelism:
+/// this only decides *which worker* and *whether to keep trying*, reusing the
+/// planner for the actual re-plan.
+pub fn orchestrate(o: &Observation) -> OrchestrationAction {
+    // Success at any stage: keep the result.
+    if o.tokens_emitted > 0 && o.phase == ExecutionPhase::Observing {
+        return OrchestrationAction::Continue;
+    }
+    if o.phase == ExecutionPhase::Completed {
+        return OrchestrationAction::Continue;
+    }
+    // Hard safety: never duplicate work or re-send a definitive rejection.
+    if o.cancelled || o.tokens_emitted > 0 || (!o.retryable && o.phase == ExecutionPhase::Adapting)
+    {
+        return OrchestrationAction::Abort;
+    }
+    // Deadline with nothing safely producible: stop.
+    if o.deadline_elapsed {
+        return OrchestrationAction::Abort;
+    }
+    // No budget and no alternatives left: stop.
+    if o.replan_budget == 0 || (o.eligible_alternatives == 0 && !o.retryable) {
+        return OrchestrationAction::Abort;
+    }
+    // Prefer to stay on the same worker when it is not congested and not the
+    // one that just failed in a way that suggests the worker itself.
+    if o.phase == ExecutionPhase::Recovering && o.eligible_alternatives > 0 {
+        return OrchestrationAction::Recover {
+            on: if o.is_continuation { o.prefix_on.clone() } else { None },
+        };
+    }
+    if o.phase == ExecutionPhase::Replanning {
+        return OrchestrationAction::Replan {
+            to: if o.is_continuation { o.prefix_on.clone() } else { None },
+        };
+    }
+    if !o.worker_congested && o.retryable && o.worker.is_some() {
+        return OrchestrationAction::RetrySameWorker;
+    }
+    if o.eligible_alternatives > 0 {
+        return OrchestrationAction::Replan { to: None };
+    }
+    OrchestrationAction::Abort
+}
+
+/// Appends an event to a decision's trace (the observable, event-driven record).
+pub fn observe(decision: &mut ExecutionDecision, event: ExecutionEvent) {
+    decision.trace.push(event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +764,118 @@ mod tests {
             far.network_cost_ms >= 70,
             "reach cost includes the measured RTT term"
         );
+    }
+
+    // ---- M23 Increment D: autonomous runtime orchestration ----
+
+    fn obs(phase: ExecutionPhase) -> Observation {
+        Observation {
+            phase,
+            worker: None,
+            attempt: 0,
+            replan_budget: 3,
+            tokens_emitted: 0,
+            retryable: true,
+            cancelled: false,
+            is_continuation: false,
+            eligible_alternatives: 2,
+            prefix_on: None,
+            deadline_elapsed: false,
+            worker_congested: false,
+        }
+    }
+
+    #[test]
+    fn orchestrate_never_retries_after_output_or_cancellation_or_definitive_failure() {
+        // tokens emitted → abort (never duplicate output)
+        let mut o = obs(ExecutionPhase::Adapting);
+        o.tokens_emitted = 5;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Abort);
+        // cancelled → abort
+        let mut o = obs(ExecutionPhase::Adapting);
+        o.cancelled = true;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Abort);
+        // definite non-retryable failure → abort
+        let mut o = obs(ExecutionPhase::Adapting);
+        o.retryable = false;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Abort);
+    }
+
+    #[test]
+    fn orchestrate_replans_and_recovers_when_a_safe_alternative_exists() {
+        // retryable transport failure, alternative remains → Replan
+        assert_eq!(
+            orchestrate(&obs(ExecutionPhase::Adapting)),
+            OrchestrationAction::Replan { to: None }
+        );
+        // recovering with an alternative (and session affinity) → Recover
+        let mut r = obs(ExecutionPhase::Recovering);
+        r.is_continuation = false;
+        assert!(matches!(orchestrate(&r), OrchestrationAction::Recover { .. }));
+        // replanning a continuation steers to the prefix-resident worker
+        let mut p = obs(ExecutionPhase::Replanning);
+        p.is_continuation = true;
+        p.prefix_on = Some("kv1".into());
+        assert_eq!(orchestrate(&p), OrchestrationAction::Replan { to: Some("kv1".into()) });
+    }
+
+    #[test]
+    fn orchestrate_respects_budget_deadline_and_congestion() {
+        // no budget → abort
+        let mut o = obs(ExecutionPhase::Adapting);
+        o.replan_budget = 0;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Abort);
+        // deadline elapsed → abort
+        let mut o = obs(ExecutionPhase::Executing);
+        o.deadline_elapsed = true;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Abort);
+        // congested worker → Replan (not retry-same-worker)
+        let mut o = obs(ExecutionPhase::Observing);
+        o.worker = Some("w1".into());
+        o.worker_congested = true;
+        assert_eq!(orchestrate(&o), OrchestrationAction::Replan { to: None });
+        // un-congested same worker + retryable → RetrySameWorker
+        let mut o = obs(ExecutionPhase::Observing);
+        o.worker = Some("w1".into());
+        o.worker_congested = false;
+        assert_eq!(orchestrate(&o), OrchestrationAction::RetrySameWorker);
+    }
+
+    #[test]
+    fn observe_appends_events_to_the_decision_trace() {
+        let g = worker("g", 150, 20, 10);
+        let mut d = evaluate(
+            "r1",
+            &req(
+                ContextProfile {
+                    prompt_tokens: 10,
+                    max_output_tokens: 10,
+                    is_continuation: false,
+                    prefix_resident_on: None,
+                },
+                0,
+            ),
+            &[g],
+            false,
+            false,
+        );
+        let before = d.trace.len();
+        observe(&mut d, ExecutionEvent::Observing {
+            stage: "s1".into(),
+            worker: Some("g".into()),
+        });
+        observe(&mut d, ExecutionEvent::Recovering {
+            worker: Some("g".into()),
+            attempt: 1,
+        });
+        assert_eq!(d.trace.len(), before + 2);
+        assert!(d
+            .trace
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Observing { .. })));
+        assert!(d
+            .trace
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Recovering { attempt: 1, .. })));
     }
 }
