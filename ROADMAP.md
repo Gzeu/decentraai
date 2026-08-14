@@ -80,9 +80,17 @@
   own `dca-xxxxxx` indicator (derived from the identity at `setup` time, no
   manual naming); every node advertises that stable id (`node_id` in the
   advertisement, `/v1/compute` and `/status`; dashboard shows it on canvas
-  nodes, Fabric nodes cards and Workers cards, with a client-side fallback
-  for pre-`node_id` peers). `setup --name` stays as an optional semantic
-  label.
+nodes, Fabric nodes cards and Workers cards, with a client-side fallback
+   for pre-`node_id` peers). `setup --name` stays as an optional semantic
+   label.
+- [x] P11: Fabric chat routing — the dashboard `/v1/chat/completions` proxy
+  routes a chat request to a *trusted remote worker* that advertises the
+  requested model (P2P `InferRequest`, SSE + non-streaming), and tags every
+  inference response with `X-Decentra-Origin`/`X-Decentra-Worker`/
+  `X-Decentra-Node`. The chat shows a "served by `dca-xxxx` · remote" badge
+  and the model selector gains a "Remote workers" group from live
+  `/v1/compute` data. Local models always win; remote routing never holds a
+  local queue slot.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join

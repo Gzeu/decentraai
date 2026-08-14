@@ -27,6 +27,7 @@ use crate::config::InferenceConfig;
 /// - Broadcasting local worker status updates
 /// - Detecting and removing stale workers
 /// - Providing worker information to the scheduler
+#[derive(Clone)]
 pub struct WorkerManager {
     /// The peer ID of the local node
     local_peer_id: PeerId,

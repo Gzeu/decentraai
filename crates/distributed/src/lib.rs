@@ -89,8 +89,8 @@ pub mod tracker;
 pub mod worker;
 
 pub use compute::{
-    ComputeManager, ComputeMetricsReport, ContributionProfile, ContributionRow, LivePerf,
-    RuntimeMetrics, WorkerMetricRow, build_advertisement, short_node_id,
+    ComputeAdvertisement, ComputeManager, ComputeMetricsReport, ContributionProfile,
+    ContributionRow, LivePerf, RuntimeMetrics, WorkerMetricRow, build_advertisement, short_node_id,
 };
 pub use config::InferenceConfig;
 pub use error::DistributedError;
@@ -273,6 +273,25 @@ pub struct DistributedInference {
     /// gets a unique nonce so the worker's replay guard never sees a duplicate
     /// for this coordinator.
     outbound_nonce: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for DistributedInference {
+    fn clone(&self) -> Self {
+        Self {
+            p2p_node: self.p2p_node.clone(),
+            worker_manager: self.worker_manager.clone(),
+            request_router: self.request_router.clone(),
+            fallback_handler: self.fallback_handler.clone(),
+            queue_manager: self.queue_manager.clone(),
+            compute_manager: self.compute_manager.clone(),
+            config: self.config.clone(),
+            logs_dir: self.logs_dir.clone(),
+            signing_key: self.signing_key,
+            outbound_nonce: std::sync::atomic::AtomicU64::new(
+                self.outbound_nonce.load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
 }
 
 impl DistributedInference {

@@ -22,6 +22,7 @@ use crate::{DistributedError, RequestRouter};
 /// The FallbackHandler keeps track of retry attempts and provides
 /// fallback workers sorted by the same scoring algorithm used for
 /// primary selection.
+#[derive(Clone)]
 pub struct FallbackHandler {
     /// Maximum number of retry attempts
     max_retries: u32,

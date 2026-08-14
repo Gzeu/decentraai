@@ -21,6 +21,7 @@ use crate::DistributedError;
 ///
 /// The RequestRouter uses a scheduler to select the best worker for each request
 /// and handles sending requests via the P2P network.
+#[derive(Clone)]
 pub struct RequestRouter {
     /// The peer ID of the local node
     local_peer_id: PeerId,

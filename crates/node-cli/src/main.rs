@@ -1211,7 +1211,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             usize::from(config.inference.queue_max_requests),
             Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
         );
-        let state = ApiState::new(
+        let mut state = ApiState::new(
             backend_url.clone(),
             token.clone(),
             manager.clone(),
@@ -1222,6 +1222,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(compute_manager.clone()),
             Some(distributed.p2p_node().clone()),
         );
+        // M18+: let the dashboard proxy route chat inference to trusted remote
+        // workers that advertise the requested model (fabric chat routing).
+        state.attach_distributed(distributed.clone().into());
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
             Err(e) => warn!(error = %e, "dashboard failed to bind"),

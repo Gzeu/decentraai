@@ -1144,6 +1144,10 @@ pub struct WorkerMetricRow {
 pub struct MetricServedModel {
     pub file_name: String,
     pub size_mb: u64,
+    /// Content hash of the GGUF artifact. Lets the coordinator map a
+    /// dashboard-visible file name onto the exact artifact a worker serves,
+    /// so chat routing can build a real `InferRequest` for a remote model.
+    pub model_hash: String,
     /// Real KV-cache context window this worker allocates for the model
     /// (`--ctx-size`); 0 = unknown.
     pub context_tokens: u32,
@@ -1273,6 +1277,7 @@ impl ComputeManager {
                     .map(|m| MetricServedModel {
                         file_name: m.file_name.clone(),
                         size_mb: m.size_mb,
+                        model_hash: m.model_hash.clone(),
                         context_tokens: m.context_tokens,
                     })
                     .collect(),

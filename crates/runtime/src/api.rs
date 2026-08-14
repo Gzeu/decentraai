@@ -177,6 +177,11 @@ pub struct ApiState {
     compute: Option<Arc<decentraai_distributed::ComputeManager>>,
     /// The live P2P node, for the NETWORK view (connected peers).
     p2p: Option<decentraai_p2p::P2PNode>,
+    /// Fabric inference coordinator (M18+). When attached, the proxy can
+    /// route `/v1/chat/completions` to a *trusted remote worker* that
+    /// advertises the requested model, instead of only serving locally.
+    /// `None` = plain local-only proxy (unchanged behaviour).
+    distributed: Option<Arc<decentraai_distributed::DistributedInference>>,
 }
 
 impl ApiState {
@@ -213,7 +218,15 @@ impl ApiState {
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
             compute,
             p2p,
+            distributed: None,
         }
+    }
+
+    /// Attaches the fabric inference coordinator so the proxy can route chat
+    /// inference to trusted remote workers (M18+). Call once at startup on
+    /// the node daemon path, where a `DistributedInference` already exists.
+    pub fn attach_distributed(&mut self, distributed: Arc<decentraai_distributed::DistributedInference>) {
+        self.distributed = Some(distributed);
     }
 
     fn presented_token(headers: &HeaderMap) -> Option<&str> {
@@ -1312,6 +1325,91 @@ fn stream_inference(
     response
 }
 
+/// Where a requested chat model can be served from. Pure decision, separated
+/// from I/O so tests can drive it with synthetic advertisements.
+#[derive(Debug, Clone, PartialEq)]
+enum ChatRoute {
+    /// The local llama-server advertises the model — serve locally (default).
+    Local,
+    /// A trusted remote worker advertises the model and accepts remote
+    /// inference — route through the fabric (M18+).
+    Remote {
+        worker: decentraai_p2p::PeerId,
+        node_id: String,
+        model_hash: String,
+    },
+    /// No worker advertises the model — caller falls back to local handling.
+    Unknown,
+}
+
+/// Pure fabric routing decision for chat inference.
+///
+/// `workers` must already be filtered to trusted peers (plus the local
+/// advertisement, which is always allowed). `local_peer` is our own peer id.
+/// The local advertisement wins over remote ones, so a model served locally
+/// is never routed across the network; the first trusted remote worker
+/// accepting remote inference that advertises the model is the remote target.
+fn resolve_chat_route(
+    workers: &[decentraai_distributed::ComputeAdvertisement],
+    local_peer: &decentraai_p2p::PeerId,
+    model: &str,
+) -> ChatRoute {
+    for w in workers {
+        if w.peer_id == *local_peer
+            && w.capability.served_models.iter().any(|m| m.file_name == model)
+        {
+            return ChatRoute::Local;
+        }
+    }
+    for w in workers {
+        if w.peer_id == *local_peer || !w.accepts_remote_inference {
+            continue;
+        }
+        if let Some(m) = w.capability.served_models.iter().find(|m| m.file_name == model) {
+            return ChatRoute::Remote {
+                worker: w.peer_id,
+                node_id: w.node_id.clone(),
+                model_hash: m.model_hash.clone(),
+            };
+        }
+    }
+    ChatRoute::Unknown
+}
+
+/// Local-serving origin headers (`X-Decentra-Origin: local`,
+/// `X-Decentra-Node: dca-xxxxxx`) attached to every locally-served inference
+/// response when the fabric is attached, so the dashboard can show *who*
+/// served a chat answer. `None` on plain (non-fabric) serve = no header, so
+/// non-fabric deployments keep byte-identical behaviour.
+fn local_origin_headers(
+    state: &ApiState,
+) -> Option<(header::HeaderValue, header::HeaderValue)> {
+    let compute = state.compute.as_ref()?;
+    let node_id = decentraai_distributed::short_node_id(&compute.local_peer());
+    Some((
+        header::HeaderValue::from_static("local"),
+        header::HeaderValue::from_str(&node_id).ok()?,
+    ))
+}
+
+/// Inserts the remote-serving origin headers on a fabric-routed response.
+fn tag_remote_response(
+    response: &mut Response,
+    worker: &decentraai_p2p::PeerId,
+    node_id: &str,
+) {
+    let o = header::HeaderValue::from_static("remote");
+    let Ok(w) = header::HeaderValue::from_str(&worker.to_string()) else {
+        return;
+    };
+    let Ok(n) = header::HeaderValue::from_str(node_id) else {
+        return;
+    };
+    response.headers_mut().insert("x-decentra-origin", o);
+    response.headers_mut().insert("x-decentra-worker", w);
+    response.headers_mut().insert("x-decentra-node", n);
+}
+
 async fn proxy_handler(
     State(state): State<ApiState>,
     method: Method,
@@ -1344,6 +1442,53 @@ async fn proxy_handler(
         }
         if let Err(e) = state.check_rate_limit(&auth) {
             return e.into_response();
+        }
+    }
+
+    // Fabric-aware chat routing (M18+): when the requested model is advertised
+    // by a *trusted remote worker* (and not locally), route the inference over
+    // P2P instead of the local queue + proxy. Decided *before* the queue join
+    // so a remote request never holds a local backend slot (the worker has its
+    // own queue). The local path always wins for models served locally.
+    if is_inference && uri.path() == "/v1/chat/completions" {
+        if let (Some(compute), Some(_distributed)) = (&state.compute, &state.distributed) {
+            let model = serde_json::from_slice::<serde_json::Value>(&outgoing)
+                .ok()
+                .and_then(|v| v["model"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if !model.is_empty() {
+                let local_peer = compute.local_peer();
+                let mut trusted: Vec<decentraai_distributed::ComputeAdvertisement> = Vec::new();
+                for w in compute.workers().await {
+                    // The local advertisement always counts; remote peers only
+                    // when trusted (cryptographic reputation, never network).
+                    if w.peer_id == local_peer || compute.is_trusted(&w.peer_id).await {
+                        trusted.push(w);
+                    }
+                }
+                match resolve_chat_route(&trusted, &local_peer, &model) {
+                    ChatRoute::Remote {
+                        worker,
+                        node_id,
+                        model_hash,
+                    } => {
+                        return route_remote_chat(
+                            &state,
+                            auth,
+                            uri.path().to_string(),
+                            worker,
+                            node_id,
+                            model_hash,
+                            model,
+                            &outgoing,
+                        )
+                        .await;
+                    }
+                    ChatRoute::Local | ChatRoute::Unknown => {
+                        // Serve locally (headers added on the response below).
+                    }
+                }
+            }
         }
     }
 
@@ -1401,7 +1546,8 @@ async fn proxy_handler(
                 .unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
             if wants_stream && status.is_success() {
-                return stream_inference(
+                let local_headers = local_origin_headers(&state);
+                let mut response = stream_inference(
                     state,
                     auth,
                     uri.path().to_string(),
@@ -1409,6 +1555,11 @@ async fn proxy_handler(
                     upstream,
                     content_type,
                 );
+                if let Some((origin, node)) = local_headers {
+                    response.headers_mut().insert("x-decentra-origin", origin);
+                    response.headers_mut().insert("x-decentra-node", node);
+                }
+                return response;
             }
             let bytes = upstream.bytes().await.unwrap_or_default();
             if is_inference && status.is_success() {
@@ -1426,6 +1577,10 @@ async fn proxy_handler(
             if let Some(value) = content_type {
                 response.headers_mut().insert(header::CONTENT_TYPE, value);
             }
+            if let Some((origin, node)) = local_origin_headers(&state) {
+                response.headers_mut().insert("x-decentra-origin", origin);
+                response.headers_mut().insert("x-decentra-node", node);
+            }
             response
         }
         Err(_) => {
@@ -1435,6 +1590,202 @@ async fn proxy_handler(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{\"error\":{\"message\":\"model backend unavailable (unloaded or crashed); restart decentraai serve\",\"type\":\"server_error\"}}",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Builds a plain-text prompt from an OpenAI chat `messages` array for the
+/// fabric path: the P2P `InferRequest` transports a single prompt string (the
+/// remote worker serves it through its own llama-server), not an OpenAI chat
+/// body. Multi-turn history is joined as `role: content` blocks, and the
+/// prompt ends with an `assistant:` turn so the engine completes the reply.
+fn remote_chat_prompt(messages: &[serde_json::Value]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("user");
+        let content = m["content"].as_str().unwrap_or("");
+        if !content.is_empty() {
+            parts.push(format!("{role}: {content}"));
+        }
+    }
+    if !parts.last().is_some_and(|p| p.starts_with("assistant:")) {
+        parts.push("assistant:".to_string());
+    }
+    parts.join("\n\n")
+}
+
+/// Routes a chat inference request over the fabric to a trusted remote worker
+/// (M18+). Emits an OpenAI-compatible response — SSE when the caller asked for
+/// streaming, JSON otherwise — tagged with `X-Decentra-Origin: remote` plus
+/// the serving worker and node id. Metrics stay honest: the streaming path
+/// records the real token count / duration when the fabric response arrives.
+#[allow(clippy::too_many_arguments)]
+async fn route_remote_chat(
+    state: &ApiState,
+    auth: Auth,
+    path: String,
+    worker: decentraai_p2p::PeerId,
+    node_id: String,
+    model_hash: String,
+    model: String,
+    outgoing: &[u8],
+) -> Response {
+    let distributed = match &state.distributed {
+        Some(d) => d.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{\"error\":{\"message\":\"fabric unavailable\",\"type\":\"server_error\"}}",
+            )
+                .into_response();
+        }
+    };
+    let body: serde_json::Value = match serde_json::from_slice(outgoing) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "{\"error\":{\"message\":\"invalid JSON body\",\"type\":\"invalid_request_error\"}}",
+            )
+                .into_response();
+        }
+    };
+    let prompt = remote_chat_prompt(
+        body["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+    );
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(1024).min(4096) as u32;
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let request = decentraai_distributed::InferRequest::new(
+        model_hash,
+        prompt,
+        max_tokens,
+    )
+    .with_sender(distributed.p2p_node().local_peer_id())
+    .with_streaming(stream);
+    let started = Instant::now();
+
+    if stream {
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let dist = distributed.clone();
+        let resp_task =
+            tokio::spawn(async move { dist.route_request_streamed(request, progress_tx).await });
+        // SSE body: consume progress chunks, then a final usage/error event.
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        let state2 = state.clone();
+        let path2 = path.clone();
+        let started2 = started;
+        let worker2 = worker;
+        let node2 = node_id;
+        tokio::spawn(async move {
+            while let Some(chunk) = progress_rx.recv().await {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let payload = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+                    serde_json::to_string(&chunk)
+                        .unwrap_or_else(|_| "\"\"".to_string())
+                );
+                if body_tx.send(Ok(Bytes::from(payload))).await.is_err() {
+                    break;
+                }
+            }
+            let final_event = match resp_task.await {
+                Ok(Ok(resp)) => {
+                    let usage = format!(
+                        "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                        resp.tokens_used
+                    );
+                    state2.record_inference(&path2, started2.elapsed(), usage.as_bytes());
+                    format!(
+                        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}\n\n",
+                        resp.tokens_used
+                    )
+                }
+                Ok(Err(_)) => {
+                    state2.requests_failed.fetch_add(1, Ordering::SeqCst);
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n"
+                        .to_string()
+                }
+                Err(_) => String::new(),
+            };
+            let _ = body_tx.send(Ok(Bytes::from(final_event))).await;
+            let _ = body_tx
+                .send(Ok(Bytes::from("data: [DONE]\n\n".to_string())))
+                .await;
+        });
+        let body = Body::from_stream(futures::stream::unfold(body_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        let mut response = (StatusCode::OK, body).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        tag_remote_response(&mut response, &worker2, &node2);
+        return response;
+    }
+
+    // Non-streaming fabric route.
+    match distributed.route_request(request).await {
+        Ok(resp) => {
+            let usage_json = format!(
+                "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                resp.tokens_used
+            );
+            state.record_inference(&path, started.elapsed(), usage_json.as_bytes());
+            state.note_token_usage(&auth, resp.tokens_used.into());
+            let created = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let payload = serde_json::json!({
+                "id": format!("chatcmpl-{}", resp.request_id),
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": resp.output },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": resp.tokens_used,
+                    "total_tokens": resp.tokens_used
+                }
+            });
+            let mut response = (StatusCode::OK, payload.to_string()).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            tag_remote_response(&mut response, &worker, &node_id);
+            response
+        }
+        Err(e) => {
+            state.requests_failed.fetch_add(1, Ordering::SeqCst);
+            let (code, msg) = match e.code() {
+                decentraai_distributed::InferErrorCode::Untrusted => {
+                    (StatusCode::FORBIDDEN, "worker is not trusted")
+                }
+                decentraai_distributed::InferErrorCode::Timeout
+                | decentraai_distributed::InferErrorCode::Capacity
+                | decentraai_distributed::InferErrorCode::Transport => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "remote worker unavailable")
+                }
+                _ => (StatusCode::BAD_GATEWAY, "remote inference failed"),
+            };
+            (
+                code,
+                format!(
+                    "{{\"error\":{{\"message\":\"{}\",\"type\":\"fabric_error\"}}}}",
+                    msg
+                ),
             )
                 .into_response()
         }
@@ -2336,6 +2687,35 @@ mod tests {
         assert!(body.contains("controller.signal"), "Stop aborts the fetch via its signal");
         assert!(body.contains("s.available_models"), "chat-model must read live available_models");
         assert!(body.contains("chatModel.value || activeModel"), "send must fall back to the active model");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_chat_has_fabric_origin_indicator_and_remote_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // The served-by indicator reads the proxy's origin headers, and the
+        // model selector gains a grouped remote-worker section from /v1/compute.
+        for needle in [
+            "id=\"chat-served\"",
+            "x-decentra-origin",
+            "x-decentra-worker",
+            "x-decentra-node",
+            "Remote workers",
+            "c.local_peer",
+            "w.served_models",
+        ] {
+            assert!(body.contains(needle), "dashboard must include {needle}");
+        }
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -3382,5 +3762,130 @@ mod tests {
             "inference POST must reset idle clock: {after_get:?} -> {after_post:?}"
         );
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // ---- fabric chat routing: pure decision (M18+) -------------------------
+
+    fn test_adv(
+        peer: &decentraai_p2p::PeerId,
+        node_id: &str,
+        accepts_remote: bool,
+        models: &[(&str, &str)],
+    ) -> decentraai_distributed::ComputeAdvertisement {
+        decentraai_distributed::ComputeAdvertisement {
+            peer_id: *peer,
+            node_name: node_id.to_string(),
+            capability: decentraai_distributed::compute::ComputeCapability {
+                cpu_cores: 4,
+                ram_mb: 16384,
+                gpu: None,
+                engine: "llama_server".to_string(),
+                served_models: models
+                    .iter()
+                    .map(|(f, h)| decentraai_distributed::compute::ServedModel {
+                        model_hash: h.to_string(),
+                        file_name: f.to_string(),
+                        size_mb: 1024,
+                        est_ram_mb: 1024,
+                        est_vram_mb: 0,
+                        context_tokens: 4096,
+                    })
+                    .collect(),
+                can_provision: false,
+            },
+            availability: decentraai_distributed::compute::ComputeAvailability {
+                available_ram_mb: 8192,
+                available_vram_mb: None,
+                load_percent: 0,
+                queue_depth: 0,
+                tokens_per_second: 10,
+                current_latency_ms: 1,
+                status: decentraai_distributed::compute::WorkerHealth::Ready,
+            },
+            announced_at_ms: 0,
+            accepts_remote_inference: accepts_remote,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn chat_route_local_wins_over_remote() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("tiny.gguf", "h1")]),
+            test_adv(&remote, "dca-rem", true, &[("tiny.gguf", "h1")]),
+        ];
+        assert_eq!(
+            resolve_chat_route(&workers, &local, "tiny.gguf"),
+            ChatRoute::Local
+        );
+    }
+
+    #[test]
+    fn chat_route_remote_model() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("local.gguf", "hL")]),
+            test_adv(&remote, "dca-rem", true, &[("remote.gguf", "hR")]),
+        ];
+        assert_eq!(
+            resolve_chat_route(&workers, &local, "remote.gguf"),
+            ChatRoute::Remote {
+                worker: remote,
+                node_id: "dca-rem".to_string(),
+                model_hash: "hR".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn chat_route_skips_worker_that_does_not_accept_remote() {
+        let local = decentraai_p2p::PeerId::random();
+        let refuser = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("local.gguf", "hL")]),
+            // The only worker with the model refuses remote inference.
+            test_adv(&refuser, "dca-ref", false, &[("remote.gguf", "hR")]),
+        ];
+        assert_eq!(
+            resolve_chat_route(&workers, &local, "remote.gguf"),
+            ChatRoute::Unknown
+        );
+    }
+
+    #[test]
+    fn chat_route_unknown_model() {
+        let local = decentraai_p2p::PeerId::random();
+        let remote = decentraai_p2p::PeerId::random();
+        let workers = vec![
+            test_adv(&local, "dca-local", false, &[("local.gguf", "hL")]),
+            test_adv(&remote, "dca-rem", true, &[("remote.gguf", "hR")]),
+        ];
+        assert_eq!(
+            resolve_chat_route(&workers, &local, "missing.gguf"),
+            ChatRoute::Unknown
+        );
+    }
+
+    #[test]
+    fn remote_chat_prompt_builds_turns_and_ends_with_assistant() {
+        let msgs: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remote_chat_prompt(&msgs),
+            "user: hi\n\nassistant: hello"
+        );
+    }
+
+    #[test]
+    fn remote_chat_prompt_no_duplicate_assistant_tail() {
+        let msgs: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"role":"assistant","content":"done"}]"#).unwrap();
+        // Already ends in an assistant turn: no extra tail appended.
+        assert_eq!(remote_chat_prompt(&msgs), "assistant: done");
     }
 }

@@ -126,6 +126,9 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .badge.bad{background:rgba(248,113,113,.12);color:var(--bad)}
 .badge.accent{background:var(--accent-soft);color:var(--accent)}
 .badge.faint{background:rgba(255,255,255,.05);color:var(--muted)}
+.badge.remote{background:rgba(139,92,246,.16);color:#c4b5fd}
+.badge.local{background:rgba(52,211,153,.10);color:var(--ok)}
+#chat-served{margin-left:auto;min-height:20px}
 .bar{height:5px;background:var(--bg-2);border-radius:99px;overflow:hidden;margin-top:5px}
 .bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .5s ease}
 .bar.warn>i{background:linear-gradient(90deg,#fbbf24,#f59e0b)}
@@ -436,6 +439,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <select id="chat-model" title="Model for chat" style="min-width:180px"></select>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"><input id="chat-stream" type="checkbox" checked> stream</label>
             <span class="chat-status" id="chat-status">ready</span>
+            <span id="chat-served"></span>
           </div>
         </div>
       </div>
@@ -831,6 +835,21 @@ const sendChat = async (prompt) => {
   try {
     const body = JSON.stringify({ model: currentModel(), messages: hist, stream });
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
+    const servedEl = $('chat-served');
+    if (servedEl) {
+      const origin = r.headers.get('x-decentra-origin') || '';
+      const worker = r.headers.get('x-decentra-worker') || '';
+      const node = r.headers.get('x-decentra-node') || '';
+      if (origin === 'remote') {
+        servedEl.textContent = 'served by ' + (node || worker || 'remote worker') + ' · remote';
+        servedEl.className = 'badge remote';
+      } else if (origin === 'local') {
+        servedEl.textContent = 'served locally' + (node ? ' · ' + node : '');
+        servedEl.className = 'badge local';
+      } else {
+        servedEl.textContent = '';
+      }
+    }
     let answer = '', tokens = null;
     if (stream && r.ok && r.body) { const out = await readSse(r); answer = out.text; tokens = out.tokens; }
     else {
@@ -1755,6 +1774,7 @@ async function refresh(){
       names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; chatModel.appendChild(opt); });
       chatModel.value = activeModel;
     }
+    populateChatModels(c);
     renderModels(s);
     renderDiag(s, null, null);
     renderSettings(s);
@@ -1770,5 +1790,31 @@ async function refresh(){
   if (s) renderRecovery(s, c, x);
 }
 setStageVisible(true);
+// Add models advertised by *remote* workers to the chat selector, once, as a
+// grouped "Remote workers" section. Local models win: a file name already
+// served locally is never duplicated. Uses only real /v1/compute data.
+const populateChatModels = (c) => {
+  if (!c || !c.workers || chatModel.querySelector('optgroup[label="Remote workers"]')) return;
+  const names = new Set([].map.call(chatModel.options, o => o.value));
+  const remote = [];
+  (c.workers || []).forEach(w => {
+    if (w && w.peer_id === c.local_peer) return;
+    (w.served_models || []).forEach(m => {
+      if (m && m.file_name && !names.has(m.file_name)) {
+        remote.push({ file: m.file_name, node: w.node_id || w.node_name || w.peer_id });
+      }
+    });
+  });
+  if (!remote.length) return;
+  const og = document.createElement('optgroup');
+  og.label = 'Remote workers';
+  remote.forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = r.file;
+    opt.textContent = r.file + '  (remote · ' + r.node + ')';
+    og.appendChild(opt);
+  });
+  chatModel.appendChild(og);
+};
 refresh(); setInterval(refresh, 3000);
 "##;
