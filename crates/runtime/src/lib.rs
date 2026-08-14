@@ -10,6 +10,7 @@
 //! rejections are written to the audit log (M6).
 
 pub mod api;
+pub mod dashboard;
 pub mod queue;
 
 use anyhow::{Context, Result, bail};

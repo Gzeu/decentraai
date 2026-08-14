@@ -4,6 +4,46 @@ All notable changes to DecentraAI. Adheres loosely to
 [Keep a Changelog](https://keepachangelog.com/). The workspace ships as a
 single version (`1.0.0`) shared by every crate.
 
+## [Unreleased] — Command Deck UI
+
+### Command Deck (embedded control plane, rewritten)
+- The embedded dashboard is rewritten as a full **Command Deck** in a new
+  `crates/runtime/src/dashboard.rs` module (single-binary constraint kept:
+  pure HTML+CSS+JS served by the node, no external assets or build step).
+- 13 views on a sidebar rail: Overview, Chat, Topology (live fabric),
+  Autonomous decisions (M23), Execution, Workers, Network, Models,
+  Observability, Recovery, Diag, Security, Settings — all fed by real
+  runtime state (`/status`, `/v1/peers`, `/v1/compute`, `/v1/network`,
+  `/v1/execution`) with no mock data.
+- **Topology** renders the live fabric as SVG: local node at the center,
+  advertised workers around it, edges colored by measured RTT (M19),
+  worker rings shaded by health/load, trusted badges.
+- **Autonomous decisions** renders the M23 decision ring: workload class,
+  candidate score breakdowns (tps/latency/load/queue/headroom/net/kv),
+  constraint breaches, KV affinity, expected mode, reasoning and the
+  safe-reasons trace.
+- **Observability** adds latency/tok-per-s sparklines; **Recovery** surfaces
+  engine respawns, KV sessions and resilience events; **Security** keeps the
+  token create/list/revoke actions plus the audit event stream.
+- **Settings** now renders real generation defaults (temperature/top_p/
+  top_k/repeat_penalty/system prompt) and the subscription tier policies —
+  `/status` gains `generation` and `tiers` fields (tiers null when
+  unconfigured), covered by two new tests.
+- Command palette (Ctrl+K) jumps to any view; quick chat keeps SSE streaming
+  with abort/retry; advanced views stay behind the opt-in advanced block
+  (the dashboard never polls proxied inference endpoints, so watching the
+  page still cannot inflate counters or reset the idle clock).
+- The old inline `DASHBOARD_HTML` / `JS_TEMPLATE` constants in `api.rs` are
+  removed; the module is wired as `crate::dashboard`.
+
+### Fixes
+- `decentraai-fabric`: `ExecutionPhase` used an invalid serde rule
+  (`rename_all = "uppercase"` → `"UPPERCASE"`), which broke the workspace
+  build; fixed.
+- `decentraai-fabric`: `observe_appends_events_to_the_decision_trace` test
+  called `evaluate` with five arguments after the planner parameter was
+  added; now passes `&ExecutionPlanner::default()`.
+
 ## [Unreleased] — M23 Increment B (decision core into the live fabric)
 
 ### M23 Full Autonomy, Increment B (live decision + lifecycle observability)

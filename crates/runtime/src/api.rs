@@ -35,6 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::ServeManager;
+use crate::dashboard::{DASHBOARD_HTML, JS_TEMPLATE};
 use crate::queue::InferenceQueue;
 
 /// Maximum audit events shown on the dashboard.
@@ -913,6 +914,27 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "gpu_max_vram_percent": state.info.resources.gpu_max_vram_percent,
             "reserve_vram_mb": state.info.resources.reserve_vram_mb,
         },
+        "generation": {
+            "temperature": state.info.generation.temperature,
+            "top_p": state.info.generation.top_p,
+            "top_k": state.info.generation.top_k,
+            "repeat_penalty": state.info.generation.repeat_penalty,
+            "system_prompt": state.info.generation.system_prompt,
+        },
+        "tiers": state.tiers.as_ref().map(|tiers| serde_json::json!({
+            "tier1": {
+                "models": tiers.tier1.models,
+                "rate_limit_per_minute": tiers.tier1.rate_limit_per_minute,
+            },
+            "tier2": {
+                "models": tiers.tier2.models,
+                "rate_limit_per_minute": tiers.tier2.rate_limit_per_minute,
+            },
+            "tier3": {
+                "models": tiers.tier3.models,
+                "rate_limit_per_minute": tiers.tier3.rate_limit_per_minute,
+            },
+        })),
         "recent_events": recent_audit_events(&state.info.repo_root),
     });
     (
@@ -1463,164 +1485,6 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const DASHBOARD_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>DecentraAI dashboard</title>
-<style>
-body{font:15px/1.5 system-ui,sans-serif;background:#0f141b;color:#e6edf3;max-width:960px;margin:24px auto;padding:0 16px}
-h1{font-size:20px} h2{font-size:14px;color:#9da7b3;margin:0 0 10px;text-transform:uppercase;letter-spacing:.08em}
-.card{background:#161d27;border:1px solid #2a3442;border-radius:10px;padding:14px 18px;margin-bottom:14px}
-table{border-collapse:collapse;width:100%} td,th{padding:4px 8px;text-align:left;border-bottom:1px solid #232c38}
-code{background:#0a0e13;padding:2px 6px;border-radius:6px;font-size:13px}
-.ok{color:#3fb950}.off{color:#8b949e}.bad{color:#f85149}
-.bignum{font-size:26px;font-weight:600}
-.small{color:#8b949e;font-size:12px}
-.tiny{color:#8b949e;font-size:11px;line-height:1.5}
-.reasons{margin:4px 0 0;padding-left:16px;list-style:disc}
-ol{padding-left:20px} li{margin:6px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.metric{background:#0a0e13;border-radius:8px;padding:10px 14px}
-.metric .label{color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
-#chat-history{max-height:280px;overflow-y:auto;margin-bottom:10px}
-#chat-history .msg-user{margin:6px 0;padding:8px 12px;background:#0a0e13;border-radius:8px;border:1px solid #1d4ed8}
-#chat-history .msg-node{margin:6px 0;padding:8px 12px;background:#161d27;border-radius:8px;border-left:3px solid #238636;white-space:pre-wrap}
-</style>
-</head>
-<body>
-  <h1>DecentraAI node</h1>
-<div style="text-align:right;margin:-4px 0 0">
-  <button id="adv-toggle" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:6px 12px;cursor:pointer">Show advanced</button>
-</div>
-<div class="card">
-  <h2>Model</h2>
-  <div class="bignum" id="model-name">&hellip;</div>
-  <div class="small"><span id="model-size"></span> &middot; <span id="model-status">loading&hellip;</span></div>
-  <div class="small" id="also-models"></div>
-</div>
-<div class="card">
-  <h2>Inference</h2>
-  <div class="grid">
-    <div class="metric"><div class="label">Requests</div><div class="bignum" id="requests">0</div></div>
-    <div class="metric"><div class="label">Tokens generated</div><div class="bignum" id="tokens">0</div></div>
-    <div class="metric"><div class="label">Latency</div><div class="bignum" id="latency">&mdash;</div></div>
-    <div class="metric"><div class="label">Success rate</div><div class="bignum" id="successrate">&mdash;</div></div>
-    <div class="metric"><div class="label">Last speed</div><div class="bignum" id="toksec">&mdash;</div></div>
-    <div class="metric"><div class="label">Uptime</div><div class="bignum" id="uptime">&mdash;</div></div>
-    <div class="metric"><div class="label">Idle for</div><div class="bignum" id="idle">&mdash;</div></div>
-  </div>
-  <table style="margin-top:10px">
-    <tr><td>Backend (llama-server)</td><td><code id="backend">&mdash;</code></td></tr>
-    <tr><td>API</td><td><code>http://127.0.0.1:__API_PORT__/v1</code> (OpenAI-compatible: <code>/v1/models</code>, <code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/peers</code>)</td></tr>
-  </table>
-</div>
-<div class="card">
-  <h2>Chat</h2>
-  <div id="chat-history"><p class="off">Ask the node something. Responses are routed through the fabric planner to a worker.</p></div>
-  <textarea id="chat-input" rows="2" placeholder="Type a message&hellip;" style="width:100%;box-sizing:border-box;background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></textarea>
-  <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-    <select id="chat-model" title="Model for chat" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></select>
-    <button id="chat-send" style="background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer">Send</button>
-    <button id="chat-stop" style="background:#f85149;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer;display:none">Stop</button>
-    <button id="chat-retry" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px 12px;cursor:pointer" disabled>Retry</button>
-    <span id="chat-status" class="small">&mdash;</span>
-    <input id="chat-stream" type="checkbox" style="margin-left:auto"> <label for="chat-stream" class="small">stream</label>
-  </div>
-</div>
-<div class="card">
-  <h2>Queue</h2>
-  <table>
-    <tr><td>Serving now</td><td id="queue-serving"><span class="off">idle</span></td></tr>
-    <tr><td>Waiting</td><td id="queue-waiting"><span class="off">nobody</span></td></tr>
-  </table>
-</div>
-<div class="card">
-  <h2>Recent inference calls</h2>
-  <table><thead><tr><th>Time</th><th>Endpoint</th><th>Prompt tok</th><th>Gen tok</th><th>ms</th><th>tok/s</th></tr></thead>
-  <tbody id="recent"><tr><td colspan="6" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>System</h2>
-  <table>
-    <tr><td>RAM free</td><td id="ram">&mdash;</td></tr>
-    <tr><td>CPU</td><td id="cpu">&mdash;</td></tr>
-    <tr><td>GPU</td><td id="gpu">&mdash;</td></tr>
-  </table>
-</div>
-<div id="advanced" hidden>
-<div class="card">
-  <h2>Tracked peers (reputation)</h2>
-  <table><thead><tr><th>Peer</th><th>Verified chunks</th><th>Failed</th><th>Score</th><th>Status</th></tr></thead>
-  <tbody id="peers"><tr><td colspan="5" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>Workers (compute registry)</h2>
-  <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th>Reach</th><th>Load</th><th>Queue</th><th>tok/s</th><th>Latency</th><th>RAM free</th><th>In-flight</th><th>Trusted</th><th>Action</th></tr></thead>
-  <tbody id="workers"><tr><td colspan="12" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>Network (measured links)</h2>
-  <table><thead><tr><th>Peer</th><th>RTT</th><th>Bandwidth</th><th>Locality</th></tr></thead>
-  <tbody id="network"><tr><td colspan="4" class="off">loading&hellip;</td></tr></tbody></table>
-  <div class="small" id="connected"></div>
-</div>
-<div class="card">
-  <h2>Execution (planner decisions)</h2>
-  <table><thead><tr><th>Req</th><th>Worker</th><th>Score</th><th>Stages</th><th>Continuation</th><th>Network</th><th>KV</th><th>Outcome</th><th>Reasoning</th></tr></thead>
-  <tbody id="execution"><tr><td colspan="9" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>Autonomous decisions (M23 lifecycle)</h2>
-  <table><thead><tr><th>Req</th><th>Workload</th><th>Selected</th><th>Mode</th><th>Priority</th><th>Network</th><th>KV affinity</th><th>Reservation</th><th>Outcome</th><th>Trace / Reasons</th></tr></thead>
-  <tbody id="decisions"><tr><td colspan="10" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>Models</h2>
-  <table><thead><tr><th>Model</th><th>Engine</th><th>Context</th><th>RAM</th><th>VRAM</th><th>Active</th></tr></thead>
-  <tbody id="models"><tr><td colspan="6" class="off">loading&hellip;</td></tr></tbody></table>
-  <div class="small" id="models-status"></div>
-</div>
-<div class="card">
-  <h2>Settings</h2>
-  <table>
-    <tr><td>Node name</td><td id="set-name">&mdash;</td></tr>
-    <tr><td>Dashboard port</td><td id="set-port">&mdash;</td></tr>
-    <tr><td>Discovery</td><td id="set-discovery">&mdash;</td></tr>
-    <tr><td>Trusted workers</td><td id="set-trust">&mdash;</td></tr>
-    <tr><td>Model / engine</td><td id="set-model">&mdash;</td></tr>
-    <tr><td>CPU cores</td><td id="set-cpu">&mdash;</td></tr>
-    <tr><td>RAM</td><td id="set-ram">&mdash;</td></tr>
-    <tr><td>GPU</td><td id="set-gpu">&mdash;</td></tr>
-  </table>
-</div>
-<div class="card">
-  <h2>Diagnostics</h2>
-  <table>
-    <tr><td>Node health</td><td id="diag-health">&mdash;</td></tr>
-    <tr><td>Engine</td><td id="diag-engine">&mdash;</td></tr>
-    <tr><td>P2P / network</td><td id="diag-p2p">&mdash;</td></tr>
-    <tr><td>Workers</td><td id="diag-workers">&mdash;</td></tr>
-    <tr><td>Engine restarts (recovery)</td><td id="diag-restarts">&mdash;</td></tr>
-    <tr><td>Active sessions (KV)</td><td id="diag-sessions">&mdash;</td></tr>
-  </table>
-</div>
-<div class="card">
-  <h2>Recent security events (audit log)</h2>
-  <table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead>
-  <tbody id="events"><tr><td colspan="3" class="off">loading&hellip;</td></tr></tbody></table>
-</div>
-<div class="card">
-  <h2>Share a model with another machine</h2>
-  <div id="share"></div>
-</div>
-</div>
-<p class="small">Refreshes every 3s from /status and /v1/peers only &mdash; watching this page never touches the inference backend. Loopback only.</p>
-<script type="module">
-/*__JS__*/
-</script>
-</body>
-</html>"#;
 
 fn dashboard_js(state: &ApiState, share: &str) -> String {
     JS_TEMPLATE
@@ -1628,367 +1492,6 @@ fn dashboard_js(state: &ApiState, share: &str) -> String {
         .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
 }
 
-const JS_TEMPLATE: &str = r#"
-const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-document.getElementById('share').innerHTML = "__SHARE__";
-const activeModel = "__MODEL__";
-document.getElementById('model-name').textContent = activeModel;
-const advEl = document.getElementById('advanced');
-const advBtn = document.getElementById('adv-toggle');
-const setAdv = (show) => {
-  advEl.hidden = !show;
-  advBtn.textContent = show ? 'Hide advanced' : 'Show advanced';
-};
-setAdv((localStorage.getItem('decentraai.advanced') || '0') === '1');
-advBtn.addEventListener('click', () => {
-  const show = advEl.hidden;
-  try { localStorage.setItem('decentraai.advanced', show ? '1' : '0'); } catch (e) {}
-  setAdv(show);
-});
-let token = '';
-try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
-const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
-// Admin worker-control is available only when a master/admin token is
-// configured (the same token /v1/token returns). Buttons stay disabled/hidden
-// otherwise so the control plane is never offered without an admin boundary.
-const isAdmin = !!token;
-// Conversation history is real and kept across page reloads (client-side, in
-// localStorage) so a refresh does not wipe the ongoing session. It is never
-// invented: only messages the node actually exchanged are stored.
-const HIST_KEY = 'decentraai.chat.history';
-let hist = [];
-try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
-const chatbox = document.getElementById('chat-history');
-const chatModel = document.getElementById('chat-model');
-const currentModel = () => chatModel.value || activeModel;
-const addMsg = (role, text) => {
-  const div = document.createElement('div');
-  const who = role === 'user' ? '<b>You</b>' : '<b>Node</b>';
-  div.className = role === 'user' ? 'msg-user' : 'msg-node';
-  div.innerHTML = '<div>' + who + '</div><div>' + esc(text) + '</div>';
-  chatbox.appendChild(div);
-  chatbox.scrollTop = chatbox.scrollHeight;
-  return div;
-};
-const saveHist = () => {
-  try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-24))); } catch (e) {}
-};
-// Restore persisted conversation from a previous page load.
-hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : (m.role === 'system' ? 'node' : 'user'), m.content || '(empty)'));
-// Streaming is the default; the checkbox lets a user fall back to a single
-// parsed HTTP response (useful with clients that do not read SSE).
-document.getElementById('chat-stream').checked = true;
-// Reads llama-server's SSE body and returns { text, tokens } once complete.
-const readSse = async (resp) => {
-  const reader = resp.body.getReader();
-  const dec = new TextDecoder();
-  let buffer = '', text = '', tokens = null;
-  const msgNode = addMsg('node', '');
-  const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += dec.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
-        const delta = ev.choices && ev.choices[0] && ev.choices[0].delta && ev.choices[0].delta.content;
-        if (delta) { text += delta; bodyEl.textContent = text; }
-        if (ev.usage) tokens = ev.usage.completion_tokens;
-      }
-      chatbox.scrollTop = chatbox.scrollHeight;
-    }
-  } finally { reader.releaseLock(); }
-  return { text, tokens };
-};
-const chatStatus = document.getElementById('chat-status');
-const chatStopBtn = document.getElementById('chat-stop');
-const chatRetryBtn = document.getElementById('chat-retry');
-const chatSendBtn = document.getElementById('chat-send');
-const chatInput = document.getElementById('chat-input');
-let currentController = null;
-let lastUserPrompt = null;
-const setStreamingUI = (on) => {
-  chatStopBtn.style.display = on ? 'inline-block' : 'none';
-  chatSendBtn.disabled = on;
-  chatRetryBtn.disabled = on || !lastUserPrompt;
-};
-// Sends one chat turn: appends the user message to the live conversation and
-// history, streams/awaits the node's reply, and records a new turn. The
-// active AbortController is stored in `currentController` so the Stop button
-// can cancel an in-flight stream (all further SSE chunks are dropped) and so
-// the Retry button can re-send with the current model/stream settings.
-const sendChat = async (prompt) => {
-  prompt = (prompt || '').trim();
-  if (!prompt) return;
-  lastUserPrompt = prompt;
-  chatInput.value = '';
-  addMsg('user', prompt);
-  hist.push({ role: 'user', content: prompt });
-  const stream = document.getElementById('chat-stream').checked;
-  const controller = new AbortController();
-  currentController = controller;
-  setStreamingUI(true);
-  chatStatus.textContent = 'routing &amp; generating&hellip;';
-  const t0 = performance.now();
-  try {
-    const body = JSON.stringify({ model: currentModel(), messages: hist, stream });
-    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
-    let answer = '', tokens = null;
-    if (stream && r.ok && r.body) {
-      const out = await readSse(r);
-      answer = out.text;
-      tokens = out.tokens;
-    } else {
-      const j = await r.json();
-      answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
-    }
-    if (controller.signal.aborted) return;
-    addMsg('node', answer || '(empty response)');
-    hist.push({ role: 'assistant', content: answer || '' });
-    if (hist.length > 24) hist.splice(0, hist.length - 24);
-    saveHist();
-    const dt = Math.round(performance.now() - t0);
-    chatStatus.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
-      (tokens != null ? ' &middot; ' + tokens + ' tokens' : '');
-  } catch (e) {
-    if (controller.signal.aborted) {
-      // User pressed Stop: abort the in-flight fetch/SSE reader. The stream is
-      // left as a partial bubble in the page but is NOT committed to history.
-      chatStatus.textContent = 'stopped';
-    } else {
-      addMsg('node', 'request failed: ' + e);
-      chatStatus.textContent = 'failed';
-    }
-  } finally {
-    if (currentController === controller) currentController = null;
-    setStreamingUI(false);
-  }
-};
-chatSendBtn.addEventListener('click', () => {
-  if (currentController) return;
-  sendChat(chatInput.value);
-});
-chatStopBtn.addEventListener('click', () => {
-  if (currentController) currentController.abort();
-});
-chatRetryBtn.addEventListener('click', () => {
-  if (currentController || !lastUserPrompt) return;
-  sendChat(lastUserPrompt);
-});
-setStreamingUI(false);
-chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSendBtn.click(); } });
-const fmtUptime = s => {
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return h > 0 ? h + 'h ' + m + 'm' : (m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's');
-};
-// M10 worker control plane: Approve/Revoke a worker's trust on the
-// coordinator. Master-only (the endpoints 401/403 otherwise); each action
-// calls the admin endpoint and re-fetches the workers table live.
-const workerAct = async (action, peerId) => {
-  if (!peerId) return;
-  if (!isAdmin) return;
-  const endpoint = action === 'trust' ? '/api/admin/worker/trust' : '/api/admin/worker/revoke';
-  try {
-    const r = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-      body: JSON.stringify({ peer_id: peerId })
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) alert((d.error && d.error.message) || 'worker ' + action + ' failed');
-  } catch (e) { alert('worker ' + action + ' failed: ' + e); }
-  try { await loadWorkers(); } catch (e) {}
-};
-window.trustWorker = e => workerAct('trust', e.target.dataset.p);
-window.revokeWorker = e => workerAct('revoke', e.target.dataset.p);
-// Renders the live workers tbody from the real /v1/compute payload. Called by
-// refresh() and after every Approve/Revoke so the table reflects the new trust.
-async function loadWorkers() {
-  const compute = await (await fetch('/v1/compute', { headers })).json();
-  renderWorkers(compute);
-}
-function renderWorkers(c) {
-  const wrows = (c.workers || []).map(w => {
-    const action = w.trusted
-      ? (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="revokeWorker(event)">Revoke</button>' : '<span class="off">trusted</span>')
-      : (isAdmin ? '<button data-p="' + w.peer_id + '" onclick="trustWorker(event)">Approve</button>' : '<button disabled>Approve</button>');
-    return '<tr><td><code>' + esc(w.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + esc(w.node_name || '') + '</td><td>' +
-      (w.status === 'Ready' ? '<span class="ok">ready</span>' : '<span class="off">' + esc(w.status || '') + '</span>') + '</td><td>' +
-      (w.reachable ? '<span class="ok">ok</span>' : '<span class="bad">offline</span>') + '</td><td>' + w.load_percent + '%</td><td>' + w.queue_depth + '</td><td>' +
-      w.tokens_per_second + '</td><td>' + w.current_latency_ms + 'ms</td><td>' + Math.round((w.available_ram_mb || 0) / 1024) + ' GiB</td><td>' + w.in_flight + '</td><td>' +
-      (w.trusted ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + action + '</td></tr>';
-  }).join('');
-  document.getElementById('workers').innerHTML = wrows || '<tr><td colspan="12" class="off">no workers yet (compute not attached)</td></tr>';
-  document.getElementById('diag-workers').textContent = (c.workers || []).length + ' worker(s)';
-  document.getElementById('diag-sessions').textContent = c.sessions + ' KV session(s)';
-}
-async function refresh() {
-  try {
-    const s = await (await fetch('/status')).json();
-    // Populate the chat model selector once from live /status data: the active
-    // model always leads, followed by every index/model the node advertises in
-    // `available_models`. Only fills when empty so the user's chosen value
-    // survives every 3s refresh.
-    if (chatModel.options.length === 0) {
-      const names = new Set([activeModel]);
-      (s.available_models || []).forEach(m => { if (m && m.name) names.add(m.name); });
-      names.forEach(name => {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        chatModel.appendChild(opt);
-      });
-      chatModel.value = activeModel;
-    }
-    document.getElementById('model-size').textContent =
-      s.model_size_bytes > 0 ? (s.model_size_bytes / 1073741824).toFixed(2) + ' GiB' : '';
-    document.getElementById('model-status').innerHTML = s.model_loaded
-      ? '<span class="ok">&#9679; loaded</span>'
-      : '<span class="off">&#9675; unloaded (idle timeout)</span>';
-    const others = (s.available_models || []).filter(m => m.name !== s.model);
-    document.getElementById('also-models').textContent = others.length
-      ? 'also indexed: ' + others.map(m => esc(m.name) + ' (' + (m.size_bytes / 1073741824).toFixed(2) + ' GiB)').join(', ')
-      : '';
-    document.getElementById('requests').textContent = s.requests_served;
-    document.getElementById('tokens').textContent = s.tokens_generated;
-    const lat = s.latency_ms || {};
-    document.getElementById('latency').textContent =
-      (lat.p50 !== undefined && lat.p50 > 0)
-        ? lat.p50 + 'ms' + '<span class="small"> p50 &middot; ' + (lat.p95||0) + 'ms p95 &middot; ' + (lat.p99||0) + 'ms p99</span>'
-        : '\u2014';
-    document.getElementById('successrate').textContent =
-      (s.success_rate_percent !== undefined) ? s.success_rate_percent.toFixed(1) + '%' : '\u2014';
-    const last = s.recent_requests[0];
-    document.getElementById('toksec').textContent = last ? last.tokens_per_second.toFixed(1) + ' tok/s' : '\u2014';
-    document.getElementById('uptime').textContent = fmtUptime(s.uptime_secs);
-    document.getElementById('idle').textContent = Math.floor(s.idle_for_secs / 60) + ' min';
-    document.getElementById('backend').textContent = s.backend;
-    const q = s.queue || {};
-    document.getElementById('queue-serving').innerHTML = q.serving
-      ? '<span class="ok">&#9679;</span> <code>' + esc(q.serving.who) + '</code> &mdash; ' +
-        esc(q.serving.endpoint.replace('/v1/', '')) + ' (' + q.serving.elapsed_secs + 's)'
-      : '<span class="off">idle</span>';
-    document.getElementById('queue-waiting').innerHTML = (q.waiting || []).length
-      ? (q.waiting || []).map((w, i) =>
-          '#' + (i + 1) + ' <code>' + esc(w.who) + '</code> (' + w.waited_secs + 's)'
-        ).join(' &middot; ')
-      : '<span class="off">nobody</span>';
-    const rr = s.recent_requests.map(r => {
-      const d = new Date(r.timestamp * 1000).toLocaleTimeString();
-      return '<tr><td>' + d + '</td><td><code>' + esc(r.endpoint.replace('/v1/', '')) + '</code></td><td>' +
-        r.prompt_tokens + '</td><td>' + r.completion_tokens + '</td><td>' + r.duration_ms + '</td><td>' +
-        r.tokens_per_second.toFixed(1) + '</td></tr>';
-    }).join('');
-    document.getElementById('recent').innerHTML = rr || '<tr><td colspan="6" class="off">no inference calls yet</td></tr>';
-    document.getElementById('ram').textContent =
-      s.system.ram_available_gib.toFixed(1) + ' / ' + s.system.ram_total_gib.toFixed(1) + ' GiB';
-    document.getElementById('cpu').textContent = s.system.cpu_threads + ' threads';
-    document.getElementById('gpu').innerHTML = s.system.gpu
-      ? esc(s.system.gpu.name) + ' &mdash; ' + s.system.gpu.temperature_c + '&deg;C, ' +
-        s.system.gpu.free_vram_mib + ' MiB VRAM free, ' + s.system.gpu.utilization_percent + '% util'
-      : '<span class="off">none detected</span>';
-    const rows = s.recent_events.map(e => {
-      const d = new Date(e.timestamp * 1000).toLocaleTimeString();
-      return '<tr><td>' + d + '</td><td><code>' + esc(e.event) + '</code></td><td class="small">' + esc(JSON.stringify(e.details)) + '</td></tr>';
-    }).join('');
-    document.getElementById('events').innerHTML = rows || '<tr><td colspan="3" class="off">no security events yet</td></tr>';
-  } catch (e) {}
-  try {
-    const p = await (await fetch('/v1/peers', { headers })).json();
-    const rows = p.map(peer =>
-      '<tr><td><code>' + esc(peer.peer_id.slice(0, 16)) + '&hellip;</code></td><td>' + peer.verified + '</td><td>' + peer.failed + '</td><td>' + peer.score.toFixed(1) + '</td><td>' +
-      (peer.banned ? '<span class="bad">banned</span>' : '<span class="ok">ok</span>') + '</td></tr>'
-    ).join('');
-    document.getElementById('peers').innerHTML = rows || '<tr><td colspan="5" class="off">no peers tracked yet</td></tr>';
-  } catch (e) {}
-  let n = null;
-  try { await loadWorkers(); } catch (e) {}
-  try {
-    n = await (await fetch('/v1/network', { headers })).json();
-    const nrows = (n.links || []).map(l =>
-      '<tr><td><code>' + esc(l.peer.slice(0, 16)) + '&hellip;</code></td><td>' + l.rtt_ms + ' ms</td><td>' + (l.bandwidth_mbps || '&mdash;') + ' Mbps</td><td>' + esc(l.locality || '') + '</td></tr>'
-    ).join('');
-    document.getElementById('network').innerHTML = nrows || '<tr><td colspan="4" class="off">no measured links yet</td></tr>';
-    document.getElementById('connected').textContent = (n.connected || []).length ? ('connected peers: ' + n.connected.map(p => p.slice(0, 12)).join(', ')) : 'no connected peers';
-  } catch (e) {}
-  try {
-    const x = await (await fetch('/v1/execution', { headers })).json();
-    const xrows = (x.executions || []).slice(0, 12).map(e =>
-      '<tr><td><code>' + esc(e.request_id.slice(0, 8)) + '</code></td><td><code>' + esc(e.selected_worker.slice(0, 12)) + '&hellip;</code></td><td>' + e.score.toFixed(2) + '</td><td>' + e.stages + '</td><td>' +
-      (e.is_continuation ? '<span class="ok">yes</span>' : '<span class="off">no</span>') + '</td><td>' + e.network_rtt_ms + ' ms</td><td class="small">' + esc(e.kv_headroom || '') + '</td><td>' + esc(e.outcome) + '</td><td class="small">' + esc(e.reasoning || '') + '</td></tr>'
-    ).join('');
-    document.getElementById('execution').innerHTML = xrows || '<tr><td colspan="9" class="off">no executions yet</td></tr>';
-    const drows = (x.decisions || []).slice(0, 12).map(d => {
-      const cls = d.workload_class || 'unknown';
-      const sel = d.selected_worker ? '<code>' + esc(d.selected_worker.slice(0, 12)) + '&hellip;</code>' : '<span class="off">none</span>';
-      // Safe operational reasons only: constraints passed, network cost,
-      // queue depth, KV affinity, priority, engine/health. Never chain-of-thought.
-      const reasons = (d.candidates || [])
-        .filter(c => c.constraints && !c.constraints.breaches.length)
-        .map(c =>
-          '<li><code>' + esc(c.peer_id.slice(0, 10)) + '&hellip;</code> score ' +
-          (c.score ? c.score.total.toFixed(2) : '&mdash;') +
-          (c.network_cost_ms ? (' net ' + c.network_cost_ms + 'ms') : '') +
-          (c.kv_prefix_resident ? ' <span class="ok">KV-resident</span>' : '') +
-          '</li>'
-        ).join('');
-      const trace = (d.trace || []).map(t => (t.event || '')).join(' &rarr; ');
-      return '<tr><td><code>' + esc(d.request_id.slice(0, 8)) + '</code></td><td>' + esc(cls) + '</td><td>' + sel + '</td><td>' + esc(d.expected_mode || '') +
-        '</td><td>' + d.priority + '</td><td>' + d.network_cost_ms + ' ms</td><td class="small">' + esc(d.kv_affinity || '') +
-        '</td><td>' + (d.reservation_id ? '<code>' + esc(d.reservation_id.slice(0, 8)) + '</code>' : '<span class="off">pending</span>') +
-        '</td><td>' + (d.outcome === 'succeeded' ? '<span class="ok">succeeded</span>' : d.outcome === 'failed' ? '<span class="bad">failed</span>' : esc(d.outcome || 'in flight')) +
-        '</td><td class="small">' + esc(trace || '') + (reasons ? '<ul class="tiny reasons">' + reasons + '</ul>' : '') + '</td></tr>';
-    }).join('');
-    document.getElementById('decisions').innerHTML = drows || '<tr><td colspan="10" class="off">no autonomous decisions yet</td></tr>';
-  } catch (e) {}
-  // ---- Models / Settings / Diagnostics (from /status node+system + real manager state) ----
-  let trustList = '';
-  try { const tp = await (await fetch('/v1/peers', { headers })).json(); trustList = tp.length + ' tracked peer(s)'; } catch (e) {}
-  const s = await (await fetch('/status')).json().catch(() => null);
-  if (s) {
-    const mrows = (s.node && s.node.served_models || []).map(m =>
-      '<tr><td>' + esc(m.name || '') + '</td><td>' + esc(s.node.engine || '') + '</td><td>' + (m.context_tokens || '&mdash;') + ' tok</td><td>' + Math.round((m.est_ram_mb||0)/1024) + ' GiB</td><td>' + (m.est_vram_mb ? Math.round((m.est_vram_mb||0)/1024)+' GiB' : '&mdash;') + '</td><td>' + (s.model === m.name ? '<span class="ok">loaded</span>' : '<span class="off">-</span>') + '</td></tr>'
-    ).join('');
-    document.getElementById('models').innerHTML = mrows || '<tr><td colspan="6" class="off">no served models advertised</td></tr>';
-    document.getElementById('models-status').textContent = 'active model: ' + esc(s.model || '') + (s.model_loaded ? ' &middot; <span class="ok">loaded</span>' : ' &middot; <span class="off">unloaded</span>');
-
-    document.getElementById('set-name').textContent = (s.node && s.node.name) || esc(s.model) || '';
-    document.getElementById('set-port').textContent = s.api_port;
-    document.getElementById('set-discovery').textContent = 'mDNS / LAN (auto)';
-    document.getElementById('set-trust').textContent = trustList ? trustList : 'not loaded';
-    document.getElementById('set-model').textContent = esc(s.model || '') + ' / ' + esc((s.node && s.node.engine) || '');
-    document.getElementById('diag-health').innerHTML = s.model_loaded ? '<span class="ok">model loaded, node up</span>' : '<span class="off">model not loaded</span>';
-    document.getElementById('diag-engine').innerHTML = s.backend ? '<code>' + esc(s.backend) + '</code>' : '<span class="off">none</span>';
-  // ---- resource limits + startup state in Settings (from real config/spec) ----
-  if (s && s.resources) {
-    const r = s.resources;
-    document.getElementById('set-cpu').textContent =
-      (s.system && s.system.cpu_threads ? s.system.cpu_threads + ' threads' : '&mdash;') +
-      ' &middot; reserve ' + r.reserve_cpu_cores + ' core(s)';
-    document.getElementById('set-ram').textContent =
-      (s.system && s.system.ram_total_gib ? Math.round(s.system.ram_total_gib) + ' GiB total' : '&mdash;') +
-      ' &middot; reserve ' + (Math.round((r.reserve_ram_mb||0)/1024)) + ' GiB';
-    document.getElementById('set-gpu').textContent =
-      (r.gpu_enabled || 'auto') + (r.gpu_max_vram_percent ? ' (vram cap ' + r.gpu_max_vram_percent + '%)' : '') +
-      (r.reserve_vram_mb ? ' reserve ' + Math.round((r.reserve_vram_mb||0)/1024) + ' GiB' : '');
-  }
-  const diag = document.getElementById('diag-restarts');
-  diag.innerHTML = (s && s.engine_respawns > 0)
-    ? '<span class="bad">' + s.engine_respawns + ' auto-restart(s)</span> (M24 recovery)'
-    : '<span class="ok">0</span> auto-restarts (stable)';
-  if (n) {
-    document.getElementById('diag-p2p').innerHTML = (n.connected || []).length + ' connected, ' + (n.links || []).length + ' measured link(s)';
-  }
-}
-refresh(); setInterval(refresh, 3000);
-"#;
 
 /// Real node + engine info derived from the local compute advertisement when a
 /// compute manager is attached. Falls back to empty markers otherwise — never
@@ -2918,6 +2421,86 @@ mod tests {
             .unwrap();
         assert_eq!(peers.as_array().unwrap().len(), 1);
         assert_eq!(peers[0]["banned"], true);
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// The Settings view renders real config: `/status` must expose the
+    /// generation defaults (sampling) and the subscription tier policies
+    /// without leaking secrets. When no tiers are configured the field is null.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_exposes_generation_defaults_and_tier_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            Some(test_tiers(60)),
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let status: serde_json::Value = client
+            .get(format!("http://{api}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let temperature = status["generation"]["temperature"].as_f64().unwrap();
+        assert!(
+            (temperature - 0.7).abs() < 1e-6,
+            "generation temperature must round-trip, got {temperature}"
+        );
+        assert_eq!(status["generation"]["top_k"], 40);
+        assert_eq!(status["generation"]["system_prompt"], "Test system line.");
+        assert_eq!(status["tiers"]["tier1"]["rate_limit_per_minute"], 60);
+        assert_eq!(status["tiers"]["tier1"]["models"][0], "tinyllama.gguf");
+        assert_eq!(status["tiers"]["tier2"]["rate_limit_per_minute"], 60);
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_tiers_is_null_when_unconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let status: serde_json::Value = client
+            .get(format!("http://{api}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(status["tiers"].is_null(), "tiers must be null when unconfigured");
 
         manager.lock().await.shutdown().await.unwrap();
     }

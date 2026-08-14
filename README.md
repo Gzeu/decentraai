@@ -285,43 +285,48 @@ Revoke a seat at any time with `decentraai token revoke --name invite-<n>`.
 
 ### 5. Watch the node in your browser (dashboard)
 
-Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard refreshes
-every 3 seconds and shows:
+Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard is the
+node's **Command Deck** — a single embedded control plane with a sidebar
+rail of 13 views and a command palette (Ctrl+K), refreshed every 3 seconds:
 
-- the loaded model with file size, plus uptime and idle timer
-- inference metrics: completed requests, total tokens generated, latency
-  (p50/p95/p99) and success rate, last request speed (tok/s), and the last
-  12 inference calls with prompt / completion tokens and duration
-- live system pressure: free/total RAM, CPU threads, GPU name,
-  temperature, free VRAM, utilization
-- tracked peers with verified/failed chunks, score, and ban status
-  (`GET /v1/peers`, token-guarded)
-- a Chat box that streams model responses (SSE) token-by-token by
-  default, with a toggle for a non-streaming single reply; it shows
-  latency and token usage per request, and keeps the real conversation
-  history across page reloads (client-side `localStorage`)
-- the latest security events from the audit log (incl. token and
-  rate-limit events)
-- a share guide with the exact `swarm start` + `pull` commands for this node
-
-An opt-in **"Show advanced"** block adds the real distributed views, all
-sourced from live runtime state (`/v1/compute`, `/v1/network`, `/v1/execution`,
-`/status`) with no mock data:
-- **Workers** — each worker's status, load, queue, tok/s, latency, free RAM,
-  in-flight requests
-- **Network** — measured per-peer links (RTT, bandwidth, locality) + connected
-  peers
+- **Overview** — the loaded model with file size, uptime and idle timer,
+  inference metrics (completed requests, total tokens generated, latency
+  p50/p95/p99 and success rate, last request speed in tok/s, and the last
+  12 inference calls), live system pressure (free/total RAM, CPU threads,
+  GPU name, temperature, free VRAM, utilization), and the queue card
+- **Chat** — streams model responses (SSE) token-by-token by default, with
+  a non-streaming toggle, abort and retry; it shows latency and token
+  usage per request and keeps the conversation across page reloads
+  (client-side `localStorage`)
+- **Topology** — the live fabric as an SVG graph: the local node at the
+  center, every advertised worker around it, edges colored by measured RTT
+  (M19), worker rings shaded by health/load, trusted badges
+- **Autonomous decisions** — the M23 decision ring: workload class,
+  candidate score breakdowns (tps/latency/load/queue/headroom/net/kv),
+  constraint breaches, KV affinity, expected mode, reasoning and the
+  safe-reasons trace
 - **Execution** — recent planner decisions: selected worker, score, stages,
   continuation, network RTT, KV/session headroom, outcome and reasoning
-- **Models** — served models with engine, context, RAM/VRAM footprint, active/loaded
-- **Settings** — node name, discovery, tracked/trusted peers, model + engine,
-  and the real resource limits/guards from config (CPU/RAM reserve, GPU policy)
-- **Diagnostics** — node health, P2P/network, workers, engine endpoint, engine
-  auto-restart (recovery) count, active KV sessions, and recent audit events
+- **Workers** — each worker's status, load, queue, tok/s, latency, free RAM,
+  in-flight requests; **Network** — measured per-peer links (RTT, bandwidth,
+  locality) + connected peers; **Models** — served models with engine,
+  context, RAM/VRAM footprint, active/loaded
+- **Observability** — latency/tok-per-second sparklines and gauges;
+  **Recovery** — engine auto-restart (respawn) count, active KV sessions and
+  resilience events; **Diag** — node health, P2P/network, workers, engine
+  endpoint, audit events
+- **Security** — token create/list/revoke plus the audit event stream
+  (incl. token and rate-limit events); **Settings** — node name, discovery,
+  tracked/trusted peers, model + engine, the real resource limits/guards
+  from config (CPU/RAM reserve, GPU policy), the generation defaults
+  (sampling + system prompt) and the subscription tier policies
+- a share guide with the exact `swarm start` + `pull` commands for this node
 
-The dashboard reads only `GET /status` and `GET /v1/peers` — watching the
-page never touches the inference backend, so it neither inflates the
-request counter nor resets the idle-unload clock.
+The page polls only the read-only status/control endpoints (`/status`,
+`/v1/peers`, `/v1/compute`, `/v1/network`, `/v1/execution`) — it never
+touches a proxied inference endpoint on its own, so watching the page
+neither inflates the request counter nor resets the idle-unload clock.
+The Chat POST happens only when you actually send a message.
 
 ```bash
 TOKEN=$(cat ~/.decentraai/runtime/api.token)

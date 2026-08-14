@@ -444,7 +444,7 @@ fn now_secs() -> u64 {
 
 /// The lifecycle phase a request is in — the control-plane timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "uppercase")]
+#[serde(rename_all = "UPPERCASE")]
 pub enum ExecutionPhase {
     Discovered,
     Classified,
@@ -845,6 +845,7 @@ mod tests {
     fn observe_appends_events_to_the_decision_trace() {
         let g = worker("g", 150, 20, 10);
         let mut d = evaluate(
+            &ExecutionPlanner::default(),
             "r1",
             &req(
                 ContextProfile {

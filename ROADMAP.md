@@ -46,6 +46,12 @@
 - [x] P2: chat UI in the single embedded dashboard (non-streaming `/v1/chat/completions`, real worker routing); tier-filtered model selector folded into the single-dashboard approach — chat uses the node's active model and shows what it is
 - [x] P3: admin actions in the single embedded dashboard (`/admin` + `/api/admin/token/*` create/revoke tokens, usage per token)
 - [x] P6: dashboard views — Models, Settings, Diagnostics, Execution, Workers, Network (advanced) + normal-user view (Model, Inference, Chat, Queue, Recent, System), all from real runtime state, no mock data
+- [x] P7: Command Deck UI — the embedded dashboard rewritten as a 13-view
+  control plane (Overview, Chat, Topology, Autonomous decisions, Execution,
+  Workers, Network, Models, Observability, Recovery, Diag, Security,
+  Settings) with a sidebar rail, command palette (Ctrl+K), live fabric
+  topology SVG, M23 decision traces, and Settings rendering the real
+  generation defaults + tier policies from `/status`
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join
