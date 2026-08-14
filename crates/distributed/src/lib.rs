@@ -562,15 +562,17 @@ impl DistributedInference {
                                 req.nonce
                             )),
                         };
-                        decentraai_audit::record_best_effort(
-                            &logs_dir_for_infer.clone().unwrap_or_default(),
-                            "replay_rejected",
-                            serde_json::json!({
-                                "request_id": req.request_id.to_string(),
-                                "peer": peer.to_string(),
-                                "nonce": req.nonce,
-                            }),
-                        );
+                        if let Some(logs_dir) = &logs_dir_for_infer {
+                            decentraai_audit::record_best_effort(
+                                logs_dir,
+                                "replay_rejected",
+                                serde_json::json!({
+                                    "request_id": req.request_id.to_string(),
+                                    "peer": peer.to_string(),
+                                    "nonce": req.nonce,
+                                }),
+                            );
+                        }
                         return serialize_message(&InferMessage::InferResponse(resp));
                     }
                 }
@@ -593,15 +595,17 @@ impl DistributedInference {
                         success: false,
                         error: Some("rate limited: peer exceeded the requests/minute budget".to_string()),
                     };
-                    decentraai_audit::record_best_effort(
-                        &logs_dir_for_infer.clone().unwrap_or_default(),
-                        "peer_rate_limited",
-                        serde_json::json!({
-                            "request_id": req.request_id.to_string(),
-                            "peer": peer.to_string(),
-                            "limit_per_minute": peer_limit,
-                        }),
-                    );
+                    if let Some(logs_dir) = &logs_dir_for_infer {
+                        decentraai_audit::record_best_effort(
+                            logs_dir,
+                            "peer_rate_limited",
+                            serde_json::json!({
+                                "request_id": req.request_id.to_string(),
+                                "peer": peer.to_string(),
+                                "limit_per_minute": peer_limit,
+                            }),
+                        );
+                    }
                     return serialize_message(&InferMessage::InferResponse(resp));
                 }
                 // Only accept requests for the configured model.

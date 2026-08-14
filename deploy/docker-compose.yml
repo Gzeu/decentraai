@@ -1,0 +1,31 @@
+# DecentraAI universal node — reproducible local deployment.
+#
+# Runs a single `decentraai node` in a container: LAN/P2P discovery + model
+# serving + dashboard. Every instance is both coordinator and worker, so one
+# service is the full app. The host's ~/.decentraai (identity, config, models)
+# is mounted read-write so state persists and is reusable on the host.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#   open http://127.0.0.1:8080/
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: decentraai-node
+    ports:
+      # Dashboard / OpenAI-compatible API on loopback only.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Host state (identity/key.pem, node.yaml, models/) persisted and shared.
+      - ${DECENTRAAI_HOME:-$HOME/.decentraai}:/root/.decentraai
+    environment:
+      DECENTRAAI_LOG: ${DECENTRAAI_LOG:-info}
+    restart: unless-stopped
+    healthcheck:
+      # The real /status endpoint, not a made-up /ready.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/status"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
