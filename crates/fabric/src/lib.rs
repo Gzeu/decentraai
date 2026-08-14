@@ -29,6 +29,7 @@
 //! no KV report → context-length-only routing), so the fabric never fabricates
 //! behavior the runtime cannot actually provide.
 
+pub mod advisory;
 pub mod engine;
 pub mod expert;
 pub mod kv;
@@ -36,6 +37,7 @@ pub mod network;
 pub mod plan;
 pub mod planner;
 
+pub use advisory::{FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision};
 pub use engine::{EngineCapabilities, EngineKind};
 pub use expert::{ExpertDecision, ExpertLayout, ExpertRegistry, ExpertRouter, ExpertShard};
 pub use kv::{ContextProfile, KVCacheState, KvPlanner, KvRoutingHint};
@@ -44,4 +46,7 @@ pub use network::{
     transfer_ms_per_mib,
 };
 pub use plan::{ExecutionPlan, ExecutionStage, PlanCost, PlanKind};
-pub use planner::{ExecutionPlanner, PlanResult, RequestFacts, WorkerFacts};
+pub use planner::{
+    CandidateScore, ExecutionPlanner, PlanResult, PlannerConfig, PlannerRationale, RequestFacts,
+    WorkerFacts,
+};

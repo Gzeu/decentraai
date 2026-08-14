@@ -675,6 +675,7 @@ impl ComputeManager {
             network: self.network.lock().unwrap().clone(),
             experts,
             allow_multi_stage: true,
+            ..Default::default()
         };
 
         // M20: continuation affinity. If this session already ran on a worker

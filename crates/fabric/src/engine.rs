@@ -231,4 +231,34 @@ mod tests {
             "llama-server must stay on the single-phase path (parked split)"
         );
     }
+
+    // Complementary pin: probing/capability narrowing can only ever *lower* the
+    // advertised set toward the conservative baseline; it must never flip
+    // `expert_routing` on. So every engine kind DecentraAI knows about, honest
+    // or experimental, plus the unprobed conservative baseline, keeps
+    // `expert_routing` = false. This is the guarantee the degenerate-split
+    // guard in expert.rs relies on: no advertisement that powers it can come
+    // from a capability that this module claims to be on.
+    #[test]
+    fn no_engine_kind_or_conservative_baseline_ever_advertises_expert_routing() {
+        let kinds = [
+            EngineKind::LlamaServer,
+            EngineKind::Vllm,
+            EngineKind::Sglang,
+            EngineKind::Ollama,
+            EngineKind::RemoteOpenAI,
+        ];
+        for kind in kinds {
+            let capa = kind.advertised_capabilities();
+            assert!(
+                !capa.expert_routing,
+                "{kind:?} must never advertise expert routing"
+            );
+        }
+        let conservative = EngineCapabilities::conservative();
+        assert!(
+            !conservative.expert_routing,
+            "the unprobed conservative baseline must not advertise expert routing"
+        );
+    }
 }

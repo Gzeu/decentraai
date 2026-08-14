@@ -20,6 +20,7 @@ use crate::expert::{ExpertRegistry, ExpertRouter};
 use crate::kv::{ContextProfile, KVCacheState, KvPlanner};
 use crate::network::{LinkMetrics, NetworkGraph};
 use crate::plan::{ExecutionPlan, ExecutionStage, PlanKind};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A candidate worker the planner can place stages on.
@@ -58,6 +59,67 @@ pub struct RequestFacts {
     pub local_peer: Option<String>,
 }
 
+/// Configurable objective weights for the planner's [`ExecutionPlanner::score`].
+///
+/// The `Default` weights reproduce the previous hard-coded constants, so this
+/// exposes tuning ("prioritize throughput") without changing current behavior.
+/// Weights are not required to sum to 1; they only rank candidates within one
+/// request, so any non-negative combination is a legal objective.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PlannerConfig {
+    pub w_tps: f64,
+    pub w_latency: f64,
+    pub w_load: f64,
+    pub w_queue: f64,
+    pub w_headroom: f64,
+    pub w_net: f64,
+    pub w_kv: f64,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            w_tps: 0.25,
+            w_latency: 0.15,
+            w_load: 0.15,
+            w_queue: 0.10,
+            w_headroom: 0.15,
+            w_net: 0.10,
+            w_kv: 0.10,
+        }
+    }
+}
+
+/// The per-candidate component scores that made up a planner score. Kept pure
+/// and serde-serializable so a coordinator can persist / display *why* the
+/// chosen worker won without re-running the score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateScore {
+    pub peer_id: String,
+    pub total: f32,
+    pub tps: f32,
+    pub latency: f32,
+    pub load: f32,
+    pub queue: f32,
+    pub headroom: f32,
+    pub net: f32,
+    pub kv: f32,
+}
+
+/// Observability of a planning decision: the chosen worker's component scores
+/// and the margin over the runner-up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannerRationale {
+    /// The worker selected, if any were eligible.
+    pub chosen_worker: Option<String>,
+    /// Component scores of the chosen worker.
+    pub chosen: Option<CandidateScore>,
+    /// `chosen.total - runner_up.total`; `None` when fewer than 2 candidates.
+    pub runner_up_delta: Option<f32>,
+    /// All eligible candidates ranked (score desc, PeerId asc).
+    pub ranked: Vec<CandidateScore>,
+}
+
 /// The planner's materialized decision plus the plan it chose.
 #[derive(Debug, Clone)]
 pub struct PlanResult {
@@ -65,6 +127,8 @@ pub struct PlanResult {
     /// Why this plan over alternatives (for audit/observability).
     pub reasoning: String,
     pub estimated_ms: u32,
+    /// Per-candidate score breakdown behind the decision.
+    pub rationale: PlannerRationale,
 }
 
 impl ExecutionPlan {
@@ -88,6 +152,8 @@ pub struct ExecutionPlanner {
     pub network: NetworkGraph,
     pub experts: ExpertRegistry,
     pub allow_multi_stage: bool,
+    /// Objective weights driving [`ExecutionPlanner::score`].
+    pub config: PlannerConfig,
 }
 
 impl Default for ExecutionPlanner {
@@ -96,6 +162,7 @@ impl Default for ExecutionPlanner {
             network: NetworkGraph::new(),
             experts: ExpertRegistry::new(),
             allow_multi_stage: true,
+            config: PlannerConfig::default(),
         }
     }
 }
@@ -135,20 +202,27 @@ impl ExecutionPlanner {
         );
 
         // Score eligible workers: perf + load + network reach cost.
-        let mut ranked: Vec<(f32, &WorkerFacts)> = eligible
+        let mut ranked: Vec<(CandidateScore, &WorkerFacts)> = eligible
             .iter()
             .map(|f| {
-                let score = self.score(f, req, kv_hint.prefer_kv_headroom);
-                (score, *f)
+                let cs = self.candidate_score(f, req, kv_hint.prefer_kv_headroom, &self.config);
+                (cs, *f)
             })
             .collect();
         ranked.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
+            b.0.total
+                .partial_cmp(&a.0.total)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.peer_id.cmp(&b.1.peer_id)) // PeerId asc tie-break
+                .then_with(|| a.0.peer_id.cmp(&b.0.peer_id)) // PeerId asc tie-break
         });
 
         let Some((_, best)) = ranked.first() else {
+            let rationale = PlannerRationale {
+                chosen_worker: None,
+                chosen: None,
+                runner_up_delta: None,
+                ranked: Vec::new(),
+            };
             return PlanResult {
                 plan: ExecutionPlan {
                     plan_id: uuid::Uuid::new_v4().to_string(),
@@ -165,6 +239,7 @@ impl ExecutionPlanner {
                 },
                 reasoning: "no eligible worker serves this model".to_string(),
                 estimated_ms: 0,
+                rationale,
             };
         };
 
@@ -177,10 +252,21 @@ impl ExecutionPlanner {
             fallback_orders,
         };
         let est = ExecutionPlan::cost_estimate(&[&stage.0], &by_id);
+        let rationale = PlannerRationale {
+            chosen_worker: Some(best.peer_id.clone()),
+            chosen: Some(ranked[0].0.clone()),
+            runner_up_delta: if ranked.len() >= 2 {
+                Some(ranked[0].0.total - ranked[1].0.total)
+            } else {
+                None
+            },
+            ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
+        };
         PlanResult {
             reasoning: stage.1,
             estimated_ms: est,
             plan,
+            rationale,
         }
     }
 
@@ -212,14 +298,16 @@ impl ExecutionPlanner {
         (stage, reasons)
     }
 
-    /// Scores a worker for the request. Perf/load dominate; network and KV
-    /// headroom steer ties and long-context / continuation cases.
-    fn score(
+    /// Computes a worker's score and its per-component breakdown with the
+    /// given objective weights. Pure and deterministic — the single place the
+    /// score formula lives (used by both the ranker and the rationale).
+    fn candidate_score(
         &self,
         f: &WorkerFacts,
         req: &RequestFacts,
         prefer_kv_headroom: bool,
-    ) -> f32 {
+        cfg: &PlannerConfig,
+    ) -> CandidateScore {
         let tps_score = (f.tokens_per_second as f32 / 200.0).clamp(0.0, 1.0);
         let latency_score = 1.0 - (f.latency_ms as f32 / 1000.0).clamp(0.0, 1.0);
         let load_score = 1.0 - (f.load_percent as f32 / 100.0);
@@ -242,13 +330,25 @@ impl ExecutionPlanner {
             0.0
         };
 
-        0.25 * tps_score
-            + 0.15 * latency_score
-            + 0.15 * load_score
-            + 0.10 * queue_score
-            + 0.15 * headroom
-            + 0.10 * net_score
-            + 0.10 * kv_score
+        let total = (cfg.w_tps * tps_score as f64
+            + cfg.w_latency * latency_score as f64
+            + cfg.w_load * load_score as f64
+            + cfg.w_queue * queue_score as f64
+            + cfg.w_headroom * headroom as f64
+            + cfg.w_net * net_score as f64
+            + cfg.w_kv * kv_score as f64) as f32;
+
+        CandidateScore {
+            peer_id: f.peer_id.clone(),
+            total,
+            tps: tps_score,
+            latency: latency_score,
+            load: load_score,
+            queue: queue_score,
+            headroom,
+            net: net_score,
+            kv: kv_score,
+        }
     }
 
     fn network_score(&self, link: &LinkMetrics) -> f32 {
@@ -258,10 +358,10 @@ impl ExecutionPlanner {
     }
 
     /// Builds deterministic fallback worker orders (ranked, minus already used).
-    fn fallback_orders(&self, ranked: &[(f32, &WorkerFacts)]) -> Vec<Vec<String>> {
+    fn fallback_orders(&self, ranked: &[(CandidateScore, &WorkerFacts)]) -> Vec<Vec<String>> {
         let mut orders = Vec::new();
         if ranked.len() > 1 {
-            let mut rest: Vec<String> = ranked.iter().map(|(_, f)| f.peer_id.clone()).collect();
+            let mut rest: Vec<String> = ranked.iter().map(|(cs, _)| cs.peer_id.clone()).collect();
             for _ in 0..(ranked.len().saturating_sub(1)) {
                 orders.push(rest.clone());
                 if !rest.is_empty() {
@@ -393,5 +493,108 @@ mod tests {
         ];
         let p = planner.plan(&req(), &ws);
         assert_eq!(p.plan.workers(), vec!["fast"]);
+    }
+
+    #[test]
+    fn default_config_weights_reproduce_previous_score() {
+        // The Default weights must equal the historical hard-coded constants;
+        // regression-guards the refactor that moved them into PlannerConfig.
+        let cfg = PlannerConfig::default();
+        assert_eq!(cfg.w_tps, 0.25);
+        assert_eq!(cfg.w_latency, 0.15);
+        assert_eq!(cfg.w_load, 0.15);
+        assert_eq!(cfg.w_queue, 0.10);
+        assert_eq!(cfg.w_headroom, 0.15);
+        assert_eq!(cfg.w_net, 0.10);
+        assert_eq!(cfg.w_kv, 0.10);
+    }
+
+    #[test]
+    fn default_objective_reproduces_original_ranking() {
+        // With default weights the planner must select the same worker it did
+        // before the configurable-weights refactor.
+        let ws = vec![
+            worker_facts("slow", 40, 400, 90),
+            worker_facts("fast", 180, 50, 10),
+        ];
+        let p = ExecutionPlanner::default().plan(&req(), &ws);
+        assert_eq!(p.plan.workers(), vec!["fast"]);
+    }
+
+    #[test]
+    fn weight_inversion_reverses_ranking() {
+        // Heavily weight headroom: a lower-throughput worker with far more RAM
+        // must win over the faster, memory-poor worker.
+        let config = PlannerConfig {
+            w_headroom: 1.0,
+            ..PlannerConfig::default()
+        };
+        let slow_roomy = {
+            let mut w = worker_facts("roomy", 40, 400, 90);
+            w.available_ram_mb = 64 * 1024;
+            w
+        };
+        let fast_tight = {
+            let mut w = worker_facts("tight", 180, 50, 10);
+            w.available_ram_mb = 256;
+            w
+        };
+        let p = ExecutionPlanner {
+            config,
+            ..ExecutionPlanner::default()
+        }
+        .plan(&req(), &[fast_tight, slow_roomy]);
+        assert_eq!(p.plan.workers(), vec!["roomy"]);
+    }
+
+    #[test]
+    fn rationale_records_chosen_and_runner_up_delta() {
+        let ws = vec![
+            worker_facts("a", 180, 50, 10),
+            worker_facts("b", 150, 60, 20),
+        ];
+        let p = ExecutionPlanner::default().plan(&req(), &ws);
+        assert_eq!(p.rationale.chosen_worker.as_deref(), Some("a"));
+        let chosen = p.rationale.chosen.as_ref().expect("chosen scores present");
+        // With default weights, total must equal the weighted component sum.
+        let tps: f32 = (180.0_f32 / 200.0_f32).clamp(0.0_f32, 1.0_f32);
+        let latency: f32 = 1.0_f32 - (50.0_f32 / 1000.0_f32).clamp(0.0_f32, 1.0_f32);
+        let load: f32 = 1.0_f32 - (10.0_f32 / 100.0_f32);
+        let queue: f32 = 1.0_f32;
+        let headroom: f32 = (4096.0_f32 / 512.0_f32).min(1.0_f32);
+        let net = p.rationale.chosen.as_ref().unwrap().net; // network default
+        let kv = 0.0;
+        let expect = 0.25 * tps + 0.15 * latency + 0.15 * load + 0.10 * queue + 0.15 * headroom + 0.10 * net + 0.10 * kv;
+        assert!((chosen.total - expect).abs() < 1e-4);
+        assert!(p.rationale.runner_up_delta.unwrap() >= 0.0);
+        assert_eq!(p.rationale.ranked.len(), 2);
+        // ranked[0] is the chosen worker.
+        assert_eq!(p.rationale.ranked[0].peer_id, "a");
+    }
+
+    #[test]
+    fn rationale_empty_when_no_eligible_worker() {
+        let mut w = worker_facts("slow", 40, 400, 90);
+        w.serves_model = false;
+        let p = ExecutionPlanner::default().plan(&req(), &[w]);
+        assert!(p.rationale.chosen_worker.is_none());
+        assert!(p.rationale.chosen.is_none());
+        assert!(p.rationale.ranked.is_empty());
+    }
+
+    #[test]
+    fn planner_config_round_trips_serde() {
+        let c = PlannerConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: PlannerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+        // Rationale is serde-serializable too.
+        let p = ExecutionPlanner::default().plan(
+            &req(),
+            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+        );
+        let rj = serde_json::to_string(&p.rationale).unwrap();
+        let rback: PlannerRationale = serde_json::from_str(&rj).unwrap();
+        assert_eq!(rback, p.rationale);
     }
 }
