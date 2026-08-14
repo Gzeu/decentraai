@@ -354,8 +354,8 @@ universal node, bidirectional execution"). Below is the lower-level
 `decentraai distributed` command that underlies worker registration, request
 routing, queueing and streaming. The product flow does **not** require running
 `decentraai distributed` separately — it is provided for low-level use and
-validation. Reputation-based compensation for workers (M9-9) is not yet
-implemented.
+validation. Reputation-based compensation for workers (M9-9) is implemented
+as a synthetic contribution-credits ledger; see `decentraai tier suggest`.
 
 **Start a low-level distributed node** (acts as both worker and client):
 

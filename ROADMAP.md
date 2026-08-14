@@ -75,7 +75,17 @@
 - [x] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
 - [x] M9-7: Inference request handler for workers (real llama-server adapter)
 - [x] M9-8: Real-time capacity updates from runtime
-- [ ] M9-9: Reputation-based compensation for workers
+- [x] M9-9: Reputation-based compensation for workers — pure reward policy
+  (`decentraai-compute::compensation::reward_tokens`, `RewardPolicy`): a
+  deterministic, synthetic **contribution-credits** ledger (not a payment
+  platform) = `verified_requests × rate`, scaled by contribution quality and a
+  reputation term (clean-service ratio `verified/(verified+failed)`). Zero
+  verified work or a complete-failure record earns 0. Wired into the
+  coordinator's `ContributionRow.reward_tokens`, surfaced on `/v1/compute` and
+  the `decentraai tier suggest` table. A worker whose verified-transfer
+  reputation is bad is already banned and never routed work, so its earnings
+  are zero regardless — the reputation axis rewards how *cleanly* served work
+  completed.
 
 ## 10. Zero-Touch Swarm Sharing (DONE)
 

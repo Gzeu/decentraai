@@ -854,6 +854,9 @@ pub struct ContributionRow {
     pub failed_requests: u64,
     pub score: f64,
     pub suggested_tier: u8,
+    /// Reputation-dampened contribution credits (M9-9): zero for idle or
+    /// complete-failure workers, scaled by quality and clean-service ratio.
+    pub reward_tokens: u64,
 }
 
 /// Coordinator-side view of the whole mesh for observability (M16).
@@ -972,7 +975,7 @@ impl ComputeManager {
         &self,
         workers: Vec<ComputeAdvertisement>,
     ) -> Vec<ContributionRow> {
-        use decentraai_compute::{contribution_score, suggest_tier};
+        use decentraai_compute::{contribution_score, reward_tokens, suggest_tier, RewardPolicy};
         let ledger = self.contribution.lock().unwrap();
         let mut rows = Vec::with_capacity(workers.len());
         for adv in workers {
@@ -989,6 +992,7 @@ impl ComputeManager {
                 failed_requests: profile.failed_requests,
                 score: contribution_score(&profile),
                 suggested_tier: suggest_tier(&profile),
+                reward_tokens: reward_tokens(&profile, &RewardPolicy::default()),
             });
         }
         rows

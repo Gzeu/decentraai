@@ -2220,17 +2220,15 @@ fn print_tier_suggestions(rows: &[decentraai_distributed::ContributionRow]) -> R
         return Ok(());
     }
     println!(
-        "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8}  {:>16}",
-        "tier", "node", "cpu", "ram_mb", "vram_mb", "score", "verified (hours, failed)"
+        "{:<6} {:<24} {:>8} {:>8} {:>12}  {:>16}",
+        "tier", "node", "reward", "score", "circ", "verified (hours, failed)"
     );
     for r in rows {
         println!(
-            "{:<6} {:<24} {:>8} {:>12} {:>12} {:>8.2}  {} ({}h, {} failed)",
+            "{:<6} {:<24} {:>8} {:>8.2}  {} ({}h, {} failed)",
             r.suggested_tier,
             r.node_name,
-            r.cpu_cores,
-            r.ram_mb,
-            r.vram_mb,
+            r.reward_tokens,
             r.score,
             r.verified_requests,
             r.online_seconds / 3600,
@@ -2238,7 +2236,8 @@ fn print_tier_suggestions(rows: &[decentraai_distributed::ContributionRow]) -> R
         );
     }
     println!(
-        "Suggested tiers: 1=guest 2=contributor 3=core. Reflects measured compute served.\n\
+        "Suggested tiers: 1=guest 2=contributor 3=core. Reward = M9-9 contribution\n\
+         credits (hardware x availability x verified work, damped by failures).\n\
          Review with `decentraai tier apply` (dry-run), then `--yes` to write them."
     );
     Ok(())
