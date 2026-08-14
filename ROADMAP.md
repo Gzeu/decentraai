@@ -495,11 +495,42 @@ honest model. Cross-worker non-empty KV-headroom steering has not been observed
 on the live link (the current worker advertises unknown capacity and there is
 no multi-worker contention) — the logic is unit/integration-proven.
 
-## 17. NEXT — M21: Distributed MoE / Expert Fabric
+## 17. NOT DONE — M21: Distributed MoE / Expert Fabric (foundation only)
 
-## 18. NEXT — M22: Multi-Engine Runtime Abstraction
+`decentraai-fabric::expert` provides the honest abstraction: an
+`ExpertRegistry` (which workers hold which experts), the pure `ExpertRouter`
+(whole-model fallback vs expert split), and the `expert_routing` capability
+gate. Every expert-aware decision is gated behind an engine advertising
+`EngineCapabilities::expert_routing`. **No engine DecentraAI runs advertises
+it** — so the router returns exactly the whole-model result (the single
+correct answer for a monolithic model) and an `ExpertSplit` is never produced
+in production. A pinned test (`every_engine_decentraai_runs_is_gated...`)
+guards this so the split path can never be routed into without an engine that
+actually supports it. **Not marked done**: distributed MoE is not
+production-verified on real hardware; this is preparedness only.
 
-## 19. NEXT — M23: Autonomous Execution Planner
+## 18. NOT DONE — M22: Multi-Engine Runtime Abstraction (foundation only)
+
+`decentraai-fabric::engine` defines `EngineKind` (llama-server / vLLM / SGLang /
+Ollama / generic OpenAI-compatible) and the `EngineCapabilities` contract
+(streaming, KV reporting, prefill/decode separation, expert routing, tensor
+parallel). DecentraAI never embeds an engine; it drives an external process's
+OpenAI-compatible HTTP API. Capabilities are conservative by default and
+narrowed by a live probe. **Only llama-server is actually spawned today**, and
+`prefill_decode_separation` stays `false` for it (that split is a parked idea,
+not a running feature). **Not production-verified** for any second engine;
+this is the abstraction layer only.
+
+## 19. NOT DONE — M23: Autonomous Execution Planner (foundation only)
+
+`decentraai-fabric::planner::ExecutionPlanner` folds real state into worker
+scoring: throughput, latency, load, queue depth, RAM/VRAM headroom, network
+reach cost (M19) and KV headroom (M20), ranked deterministically. It is deeply
+integrated (the live node routes through `plan_and_reserve`), but that is the
+*scheduler picking the best single worker*. Fully autonomous goals — self-
+healing, multi-objective re-planning mid-request, proactive rebalancing — are
+**not** claimed; the planner today is a capable single-worker selector, not an
+autonomous orchestrator.
 
 ## 20. M24: Resilient Distributed Fabric — DONE
 
