@@ -1040,17 +1040,31 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
 
         // Advertise real compute + hardware so the capability scheduler can
-        // select this node and coordinators see it as a ready worker.
+        // select this node and coordinators see it as a ready worker. GPU is
+        // first-class: when a GPU is probed and the config policy allows, the
+        // model advertises a real VRAM footprint (so GPU vs CPU workers are
+        // distinguished and VRAM headroom is enforced), otherwise CPU-only.
+        let snapshot = SystemSnapshot::collect();
+        let gpu = decentraai_system_probe::probe_gpu();
+        let gpu_offload = match &gpu {
+            decentraai_system_probe::GpuProbeStatus::Nvidia(_) => {
+                config.resources.gpu_enabled != decentraai_config::GpuPolicy::Off
+            }
+            _ => false,
+        };
+        let max_ctx = config.inference.max_context_tokens;
         let served_models = vec![decentraai_compute::ServedModel {
             model_hash: model_hash.clone(),
             file_name: model_name.clone(),
             size_mb: (model_size_bytes / (1024 * 1024)).max(1),
             est_ram_mb: model_size_bytes / (1024 * 1024) / 4 + 1024,
-            est_vram_mb: 0,
-            context_tokens: config.inference.max_context_tokens,
+            est_vram_mb: decentraai_compute::ServedModel::estimate_vram_mb(
+                model_size_bytes,
+                gpu_offload,
+                max_ctx,
+            ),
+            context_tokens: max_ctx,
         }];
-        let snapshot = SystemSnapshot::collect();
-        let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
             .advertise_local(snapshot, gpu, served_models, can_provision)
             .await;
