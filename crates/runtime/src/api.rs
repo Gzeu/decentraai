@@ -144,6 +144,8 @@ pub struct ApiState {
     requests_served: Arc<AtomicU64>,
     /// Sum of completion tokens across all inference calls.
     tokens_generated: Arc<AtomicU64>,
+    /// Inference calls that reached the backend but failed (for success-rate).
+    requests_failed: Arc<AtomicU64>,
     /// Newest-first ring buffer of recent inference calls.
     recent_requests: Arc<StdMutex<VecDeque<RequestStat>>>,
     /// Per-token sliding-window timestamps (rate limiting).
@@ -183,6 +185,7 @@ impl ApiState {
             started_at: Instant::now(),
             requests_served: Arc::new(AtomicU64::new(0)),
             tokens_generated: Arc::new(AtomicU64::new(0)),
+            requests_failed: Arc::new(AtomicU64::new(0)),
             recent_requests: Arc::new(StdMutex::new(VecDeque::new())),
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
@@ -355,6 +358,58 @@ impl ApiState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+    }
+}
+
+/// A small latency/success snapshot for the dashboard (M10): p50/p95/p99
+/// latencies over recent requests plus the overall success rate. Pure and
+/// I/O-free so tests drive it with synthetic samples.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InferenceStats {
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub count: u64,
+    pub success_rate_percent: f64,
+    pub requests_served: u64,
+    pub requests_failed: u64,
+    pub queue_waiting: usize,
+}
+
+/// Computes the given percentile (0..=100) from a list of durations (ms).
+fn percentile_ms(mut samples: Vec<u64>, q: f64) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    let idx = ((samples.len() - 1) as f64 * q / 100.0).floor() as usize;
+    samples[idx]
+}
+
+/// Builds an [`InferenceStats`] from the recent-request ring buffer and the
+/// live counters. Deterministic; empty history yields zeros.
+pub fn inference_stats(
+    recent: &[RequestStat],
+    requests_served: u64,
+    requests_failed: u64,
+    queue_waiting: usize,
+) -> InferenceStats {
+    let durations: Vec<u64> = recent.iter().map(|r| r.duration_ms).collect();
+    let total = requests_served + requests_failed;
+    let success_rate = if total == 0 {
+        0.0
+    } else {
+        requests_served as f64 / total as f64 * 100.0
+    };
+    InferenceStats {
+        p50_ms: percentile_ms(durations.clone(), 50.0),
+        p95_ms: percentile_ms(durations.clone(), 95.0),
+        p99_ms: percentile_ms(durations.clone(), 99.0),
+        count: recent.len() as u64,
+        success_rate_percent: success_rate,
+        requests_served,
+        requests_failed,
+        queue_waiting,
     }
 }
 
@@ -618,14 +673,24 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         .cloned()
         .collect();
     let (serving, waiting) = state.queue.snapshot();
+    let served = state.requests_served.load(Ordering::SeqCst);
+    let failed = state.requests_failed.load(Ordering::SeqCst);
+    let stats = inference_stats(&recent, served, failed, waiting.len());
     let body = serde_json::json!({
         "model": state.info.model_name,
         "model_size_bytes": state.info.model_size_bytes,
         "model_loaded": loaded,
         "uptime_secs": state.started_at.elapsed().as_secs(),
         "idle_for_secs": idle_secs,
-        "requests_served": state.requests_served.load(Ordering::SeqCst),
+        "requests_served": served,
         "tokens_generated": state.tokens_generated.load(Ordering::SeqCst),
+        "latency_ms": {
+            "p50": stats.p50_ms,
+            "p95": stats.p95_ms,
+            "p99": stats.p99_ms,
+        },
+        "success_rate_percent": stats.success_rate_percent,
+        "requests_failed": failed,
         "recent_requests": recent,
         "available_models": registry_models(&state.info.repo_root),
         "queue": {
@@ -958,6 +1023,8 @@ async fn proxy_handler(
                     .as_u64()
                     .unwrap_or(0);
                 state.note_token_usage(&auth, completion);
+            } else if is_inference {
+                state.requests_failed.fetch_add(1, Ordering::SeqCst);
             }
             let mut response = (status, bytes).into_response();
             if let Some(value) = content_type {
@@ -965,11 +1032,16 @@ async fn proxy_handler(
             }
             response
         }
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{\"error\":{\"message\":\"model backend unavailable (unloaded or crashed); restart decentraai serve\",\"type\":\"server_error\"}}",
-        )
-            .into_response(),
+        Err(_) => {
+            if is_inference {
+                state.requests_failed.fetch_add(1, Ordering::SeqCst);
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{\"error\":{\"message\":\"model backend unavailable (unloaded or crashed); restart decentraai serve\",\"type\":\"server_error\"}}",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1076,6 +1148,8 @@ ol{padding-left:20px} li{margin:6px 0}
   <div class="grid">
     <div class="metric"><div class="label">Requests</div><div class="bignum" id="requests">0</div></div>
     <div class="metric"><div class="label">Tokens generated</div><div class="bignum" id="tokens">0</div></div>
+    <div class="metric"><div class="label">Latency</div><div class="bignum" id="latency">&mdash;</div></div>
+    <div class="metric"><div class="label">Success rate</div><div class="bignum" id="successrate">&mdash;</div></div>
     <div class="metric"><div class="label">Last speed</div><div class="bignum" id="toksec">&mdash;</div></div>
     <div class="metric"><div class="label">Uptime</div><div class="bignum" id="uptime">&mdash;</div></div>
     <div class="metric"><div class="label">Idle for</div><div class="bignum" id="idle">&mdash;</div></div>
@@ -1316,6 +1390,13 @@ async function refresh() {
       : '';
     document.getElementById('requests').textContent = s.requests_served;
     document.getElementById('tokens').textContent = s.tokens_generated;
+    const lat = s.latency_ms || {};
+    document.getElementById('latency').textContent =
+      (lat.p50 !== undefined && lat.p50 > 0)
+        ? lat.p50 + 'ms' + '<span class="small"> p50 &middot; ' + (lat.p95||0) + 'ms p95 &middot; ' + (lat.p99||0) + 'ms p99</span>'
+        : '\u2014';
+    document.getElementById('successrate').textContent =
+      (s.success_rate_percent !== undefined) ? s.success_rate_percent.toFixed(1) + '%' : '\u2014';
     const last = s.recent_requests[0];
     document.getElementById('toksec').textContent = last ? last.tokens_per_second.toFixed(1) + ' tok/s' : '\u2014';
     document.getElementById('uptime').textContent = fmtUptime(s.uptime_secs);
@@ -1712,6 +1793,39 @@ mod tests {
         let messages = value["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2, "no second system message");
         assert_eq!(messages[0]["content"], "mine");
+    }
+
+    #[test]
+    fn inference_stats_empties_are_zero() {
+        let stats = inference_stats(&[], 0, 0, 0);
+        assert_eq!(stats.p50_ms, 0);
+        assert_eq!(stats.p99_ms, 0);
+        assert_eq!(stats.success_rate_percent, 0.0);
+        assert_eq!(stats.requests_served, 0);
+    }
+
+    #[test]
+    fn inference_stats_computes_percentiles_and_success() {
+        let recent: Vec<RequestStat> = [10u64, 20, 30, 40, 50]
+            .iter()
+            .map(|ms| RequestStat {
+                timestamp: 0,
+                endpoint: "/v1/chat/completions".into(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                duration_ms: *ms,
+                tokens_per_second: 3.0,
+            })
+            .collect();
+        let stats = inference_stats(&recent, 90, 10, 3);
+        assert_eq!(stats.p50_ms, 30, "median of 5 sorted samples");
+        // Nearest-rank: p95 index = floor(4*0.95)=3 -> 40; p99 likewise.
+        assert_eq!(stats.p95_ms, 40, "p95 nearest-rank sample");
+        assert_eq!(stats.p99_ms, 40, "p99 nearest-rank sample");
+        // 90 served / (90+10) = 90%.
+        assert!((stats.success_rate_percent - 90.0).abs() < 1e-9);
+        assert_eq!(stats.requests_failed, 10);
+        assert_eq!(stats.queue_waiting, 3);
     }
 
     #[cfg(unix)]

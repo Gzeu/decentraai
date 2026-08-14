@@ -21,6 +21,7 @@ uuid.workspace = true
 chrono.workspace = true
 
 # Internal dependencies
+decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }

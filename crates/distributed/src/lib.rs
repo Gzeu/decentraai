@@ -234,6 +234,10 @@ pub struct DistributedInference {
     queue_manager: Arc<RequestQueueManager>,
     compute_manager: Option<Arc<crate::compute::ComputeManager>>,
     config: InferenceConfig,
+    /// Security-log directory. When set, each routed request records a
+    /// per-request audit event (`routed`/`inference_completed`) capturing the
+    /// request id, worker, model hash and outcome (M10). None disables audit.
+    logs_dir: Option<PathBuf>,
 }
 
 impl DistributedInference {
@@ -268,7 +272,33 @@ impl DistributedInference {
             queue_manager,
             compute_manager: None,
             config,
+            logs_dir: None,
         })
+    }
+
+    /// Sets the security-log directory so routing records per-request audit
+    /// events (M10). Pass `None` to keep routing silent.
+    pub fn set_logs_dir(&mut self, logs_dir: Option<PathBuf>) {
+        self.logs_dir = logs_dir;
+    }
+
+    /// Best-effort per-request audit event (M10): request id, session, worker,
+    /// model hash and outcome. Never breaks the routing flow on a write error.
+    fn audit_routed(&self, request: &InferRequest, worker: &libp2p::PeerId, ok: bool) {
+        if let Some(logs_dir) = &self.logs_dir {
+            decentraai_audit::record_best_effort(
+                logs_dir,
+                if ok { "inference_completed" } else { "inference_failed" },
+                serde_json::json!({
+                    "request_id": request.request_id.to_string(),
+                    "session_id": request.session_id.clone().unwrap_or_default(),
+                    "trace_id": request.trace_id,
+                    "worker_id": worker.to_string(),
+                    "model_hash": request.model_hash,
+                    "status": if ok { "completed" } else { "failed" },
+                }),
+            );
+        }
     }
 
     /// Attaches a [`crate::compute::ComputeManager`] so routing can select
@@ -703,6 +733,13 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // M10: per-request audit event tying request, worker and
+                    // model hash to the observed outcome.
+                    self.audit_routed(
+                        &request,
+                        &placement.worker,
+                        result.is_ok(),
+                    );
                     if result.is_ok() {
                         return result;
                     }
@@ -834,6 +871,8 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // M10: per-request audit event (streaming path).
+                    self.audit_routed(&request, &placement.worker, result.is_ok());
                     if result.is_ok() {
                         return result;
                     }
@@ -1408,5 +1447,46 @@ mod tests {
         assert!(!DistributedError::WorkerRejected("w".into(), "cancelled".into()).is_retryable());
         assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
         assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn per_request_audit_records_outcome_when_logs_dir_set() {
+        use crate::{DistributedInference, InferenceConfig};
+        use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let identity = decentraai_identity::Identity::generate();
+        let node = P2PNode::new(
+            &identity,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap();
+        let mut distributed =
+            DistributedInference::new(node, InferenceConfig::default(), None, None).unwrap();
+        distributed.set_logs_dir(Some(logs_dir.clone()));
+
+        let worker = libp2p::PeerId::random();
+        let mut req = InferRequest::new("modelhash".into(), "hi".into(), 32);
+        req.request_id = uuid::Uuid::new_v4();
+        req.trace_id = "tr_audit_test".into();
+        req.session_id = Some("sess1".into());
+
+        // Routing a completed request writes an inference_completed audit event
+        // carrying request/worker/model-hash/status correlation fields (M10).
+        distributed.audit_routed(&req, &worker, true);
+        let line = std::fs::read_to_string(logs_dir.join("audit.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(event["event"], "inference_completed");
+        assert_eq!(event["details"]["request_id"], req.request_id.to_string());
+        assert_eq!(event["details"]["trace_id"], "tr_audit_test");
+        assert_eq!(event["details"]["worker_id"], worker.to_string());
+        assert_eq!(event["details"]["model_hash"], "modelhash");
+        assert_eq!(event["details"]["status"], "completed");
     }
 }

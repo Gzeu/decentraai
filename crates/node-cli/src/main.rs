@@ -888,6 +888,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         Some(tracker.clone()),
     )?;
     distributed.set_compute_manager(compute_manager.clone());
+    // M10: per-request routing audit events (request/worker/model hash/status).
+    distributed.set_logs_dir(Some(data_dir.join("logs")));
 
     // The dashboard owns the llama-server lifecycle; the worker advertises in
     // sync with its LIVE health (see spawn_compute_broadcaster). Create the
@@ -2576,6 +2578,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         Some(tracker.clone()),
     )?;
     distributed.set_compute_manager(compute_manager.clone());
+    // M10: per-request routing audit events (request/worker/model hash/status).
+    distributed.set_logs_dir(Some(data_dir.join("logs")));
     // If we have a model specified, register as a worker
     if will_be_worker {
         let model_hash = model_hash.expect("model_hash must be set for worker");

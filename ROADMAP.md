@@ -306,8 +306,14 @@ release.
 - [x] Worker calls real llama-server (not mock handler)
 - [x] Streaming response to client, with cancellation via `InferCancel`
 - [x] Timeout, retry and fallback work correctly
-- [ ] Queue depth, latency, P50/P95/P99 and success rate in dashboard
-- [ ] Each request produces audit event with request ID, worker ID, model hash, status
+- [x] Queue depth, latency, P50/P95/P99 and success rate in the dashboard —
+  `/status` now exposes `latency_ms.{p50,p95,p99}`, `success_rate_percent` and
+  `requests_failed` (from a ring buffer of real request durations + a live
+  success/failure counter), rendered in the normal-user Inference card
+- [x] Each routed request produces an audit event (`inference_completed` /
+  `inference_failed`) with request ID, worker ID, model hash, trace id, session
+  and status — written best-effort from `DistributedInference` into
+  `logs/audit.jsonl` when the node sets a logs dir
 - [ ] Offline worker detected and excluded from routing
 - [ ] E2E test can start two local nodes and reproduce full flow
 
