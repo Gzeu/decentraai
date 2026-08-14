@@ -277,7 +277,24 @@ enum Command {
     Connected {
         reply: oneshot::Sender<Vec<PeerId>>,
     },
+    /// Reply with the full peer snapshot: connected ids, last-known
+    /// addresses per peer (from mDNS discovery / dialer connect), and the
+    /// node's own listen addresses. This is the identity view the control
+    /// plane needs to render the fabric (LAN address per node).
+    Peers {
+        reply: oneshot::Sender<PeersSnapshot>,
+    },
     Shutdown,
+}
+
+/// Read-only snapshot of the swarm's peer identity state, surfaced by
+/// [`P2PNode::peers_snapshot`]. All fields are live swarm state: connected
+/// peers, the last address we know per peer, and our own listeners.
+#[derive(Debug, Clone, Default)]
+pub struct PeersSnapshot {
+    pub connected: Vec<PeerId>,
+    pub addresses: HashMap<PeerId, Multiaddr>,
+    pub local_addresses: Vec<Multiaddr>,
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
@@ -421,6 +438,8 @@ impl P2PNode {
             // Last known address per peer, kept so a disconnect can be
             // re-dialed without waiting for another mDNS announcement.
             let mut known_addresses: HashMap<PeerId, Multiaddr> = HashMap::new();
+            // Our own listen addresses (the node's LAN identity).
+            let mut local_addresses: Vec<Multiaddr> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -464,6 +483,13 @@ impl P2PNode {
                             Command::Connected { reply } => {
                                 let _ = reply.send(connected.clone());
                             }
+                            Command::Peers { reply } => {
+                                let _ = reply.send(PeersSnapshot {
+                                    connected: connected.clone(),
+                                    addresses: known_addresses.clone(),
+                                    local_addresses: local_addresses.clone(),
+                                });
+                            }
                             Command::Shutdown => break,
                         }
                     }
@@ -471,6 +497,9 @@ impl P2PNode {
                         match event {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 info!(%address, "listening");
+                                if !local_addresses.contains(&address) {
+                                    local_addresses.push(address.clone());
+                                }
                                 if let Some(reply) = pending_listens.pop_front() {
                                     let _ = reply.send(Ok(address));
                                 }
@@ -742,6 +771,18 @@ impl P2PNode {
         let (reply, rx) = oneshot::channel();
         if self.commands.send(Command::Connected { reply }).is_err() {
             return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Returns the full peer identity snapshot: connected ids, last-known
+    /// addresses per peer (from mDNS discovery / dialer connect), and this
+    /// node's own listen addresses. Best-effort: the default snapshot is
+    /// returned if the swarm task is busy or gone.
+    pub async fn peers_snapshot(&self) -> PeersSnapshot {
+        let (reply, rx) = oneshot::channel();
+        if self.commands.send(Command::Peers { reply }).is_err() {
+            return PeersSnapshot::default();
         }
         rx.await.unwrap_or_default()
     }

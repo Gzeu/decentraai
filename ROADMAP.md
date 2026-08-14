@@ -62,6 +62,20 @@
   executing, no chain-of-thought), and M24 recovery becomes part of the
   story (affected worker changes state, replan pulse). Metrics/tables stay
   but are secondary; same single-binary embedded dashboard, same 13 views.
+- [x] P9: Multi-node fabric identity — `inference.allow_remote_inference`
+  enforced end-to-end (worker-side inbound gate + advertised
+  `accepts_remote_inference` + coordinator `NotAcceptingRemote` matcher;
+  local peer always eligible); real LAN addresses per connected peer plus
+  own listen addresses surfaced via a new p2p `Peers` snapshot
+  (`/v1/network.addresses` + `local_addresses`); `/v1/compute` workers
+  carry real static identity/resources (CPU, RAM, GPU, engine, served
+  models with KV context, last seen, remote opt-in); the dashboard shows
+  the fabric from the node's own perspective — Fabric nodes identity cards
+  with a live trust chain (DISCOVERED→UNTRUSTED→APPROVED→CONNECTED→WORKER
+  READY), a real discovery event feed (discovered/offline/reconnected), a
+  named WORKER pipeline stage (`local`/`remote`), and an identity-first
+  Workers view (per-node cards, master-gated Approve/Revoke). All data
+  read-only from `/status`, `/v1/compute`, `/v1/network` — nothing faked.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join

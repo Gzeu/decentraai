@@ -61,6 +61,15 @@ pub struct ComputeAdvertisement {
     pub availability: ComputeAvailability,
     /// Unix epoch milliseconds when this advertisement was produced.
     pub announced_at_ms: u64,
+    /// Whether the node accepts inference work routed from *remote* peers
+    /// (coordinator-side policy). The local node always accepts its own
+    /// work; this flag is the honest opt-in for remote resource sharing
+    /// (config `inference.allow_remote_inference`). Backward-compatible:
+    /// advertisements that predate the field deserialize to `false` — a
+    /// conservative default — so an old worker is never scheduled remotely
+    /// by a new coordinator without its operator opting in.
+    #[serde(default)]
+    pub accepts_remote_inference: bool,
 }
 
 #[cfg(test)]
@@ -110,6 +119,7 @@ mod tests {
                 status: WorkerHealth::Ready,
             },
             announced_at_ms: 1_700_000_000_000,
+            accepts_remote_inference: true,
         };
 
         let json = serde_json::to_string(&adv).unwrap();

@@ -450,6 +450,7 @@ impl DistributedInference {
         backend: decentraai_inference_adapter::OpenAiCompatibleBackend,
         model_hash: String,
         provisioning: Option<ProvisioningConfig>,
+        allow_remote: bool,
     ) -> anyhow::Result<()> {
         use decentraai_protocol::{InferMessage, InferResponse, serialize_message};
 
@@ -566,6 +567,31 @@ impl DistributedInference {
                         processing_time_ms: 0,
                         success: false,
                         error: Some("unauthenticated inference request: bad or missing signature".to_string()),
+                    };
+                    return serialize_message(&InferMessage::InferResponse(resp));
+                }
+                // Remote-sharing opt-in gate (config
+                // `inference.allow_remote_inference`): the node only accepts
+                // inference routed from *remote* peers when the operator has
+                // explicitly enabled it. Local requests (`peer` == ourselves,
+                // i.e. the node serving its own CLI ask) are never gated. The
+                // rejection is terminal and non-retryable so a coordinator that
+                // raced with a config change never re-sends a request the
+                // worker will keep refusing.
+                if !allow_remote && peer != local_peer {
+                    let resp = InferResponse {
+                        request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
+                        worker_peer_id: local_peer,
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some(
+                            "worker is not accepting remote inference (inference.allow_remote_inference is false)"
+                                .to_string(),
+                        ),
                     };
                     return serialize_message(&InferMessage::InferResponse(resp));
                 }

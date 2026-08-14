@@ -52,5 +52,6 @@ pub(crate) fn test_advertisement(
             status: health,
         },
         announced_at_ms: 1_700_000_000_000,
+        accepts_remote_inference: true,
     }
 }

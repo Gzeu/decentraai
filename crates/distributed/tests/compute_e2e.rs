@@ -93,6 +93,9 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         "worker".to_string(),
         HashSet::new(),
     ));
+    // The E2E worker opts in to remote inference so the coordinator can
+    // actually route to it (the real node does this from its config).
+    worker_compute.set_accepts_remote_inference(true);
     let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
     let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
@@ -122,7 +125,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     )
     .unwrap();
     worker
-        .register_worker_backend(backend, MODEL_HASH.to_string(), None)
+        .register_worker_backend(backend, MODEL_HASH.to_string(), None, true)
         .unwrap();
 
     // ---- Coordinator node: aggregates advertisements and routes requests.
@@ -313,7 +316,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         },
     )
     .unwrap();
-    w2.register_worker_backend(w2_backend, MODEL_HASH.to_string(), None)
+    w2.register_worker_backend(w2_backend, MODEL_HASH.to_string(), None, true)
         .unwrap();
 
     // ---- Coordinator.
@@ -365,6 +368,7 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
         gpu(),
         vec![served_model()],
         false,
+        true,
         1_700_000_000_000,
         decentraai_distributed::LivePerf::default(),
     );
@@ -475,6 +479,9 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         "worker".to_string(),
         HashSet::new(),
     ));
+    // The E2E worker opts in to remote inference so the coordinator can
+    // actually route to it (the real node does this from its config).
+    worker_compute.set_accepts_remote_inference(true);
     let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
     let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
@@ -530,7 +537,7 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         backend_factory: factory,
     };
     worker
-        .register_worker_backend(bound_backend, MODEL_HASH.to_string(), Some(provisioning))
+        .register_worker_backend(bound_backend, MODEL_HASH.to_string(), Some(provisioning), true)
         .unwrap();
 
     // ---- Coordinator: chained handler (distributed + registry server).
@@ -723,6 +730,9 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         "worker".to_string(),
         HashSet::new(),
     ));
+    // The E2E worker opts in to remote inference so the coordinator can
+    // actually route to it (the real node does this from its config).
+    worker_compute.set_accepts_remote_inference(true);
     let worker_manager = Arc::new(WorkerManager::new(worker_peer, InferenceConfig::default()));
     let mut worker_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     worker_handler.set_compute_manager(worker_compute.clone());
@@ -750,7 +760,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     })
     .unwrap();
     worker
-        .register_worker_backend(backend, MODEL_HASH.to_string(), None)
+        .register_worker_backend(backend, MODEL_HASH.to_string(), None, true)
         .unwrap();
 
     // The worker advertises only 2 GiB free RAM — the big model cannot fit.

@@ -178,6 +178,63 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .ds-step.fail .k{color:var(--bad)}
 .ds-arrow{align-self:center;color:var(--faint);padding:0 3px;font-size:12px;opacity:.55}
 .ds-empty{font-size:12.5px;color:var(--faint);padding:4px 2px}
+/* living fabric: per-node identity/resource view (real registry + network) */
+.pipe-name{display:block;font-family:var(--mono);font-size:8.5px;color:var(--accent);letter-spacing:0;text-transform:none;margin-top:1px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fabric-nodes{margin-top:14px}
+.fabric-nodes-wrap{display:flex;gap:10px;flex-wrap:wrap}
+.node-chip{flex:1 1 210px;max-width:340px;background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;position:relative;overflow:hidden;box-shadow:var(--shadow)}
+.node-chip.local{border-color:rgba(34,211,238,.45)}
+.node-chip .nc-head{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:var(--text);margin-bottom:6px}
+.node-chip .nc-head .dot{width:8px;height:8px;border-radius:50%;flex:none}
+.node-chip .nc-tag{font-family:var(--mono);font-size:9px;letter-spacing:.1em;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted);text-transform:uppercase}
+.node-chip .nc-tag.local-tag{color:var(--accent);border-color:rgba(34,211,238,.4)}
+.node-chip .nc-tag.remote-tag{color:var(--ok);border-color:rgba(52,211,153,.35)}
+.node-chip .nc-meta{display:flex;gap:4px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:10px;color:var(--faint);margin-bottom:7px}
+.node-chip .nc-meta b{color:var(--muted);font-weight:600}
+.node-chip .nc-bars{display:flex;flex-direction:column;gap:4px}
+.node-chip .nc-bar{display:flex;align-items:center;gap:7px;font-size:9.5px;color:var(--faint);font-family:var(--mono)}
+.node-chip .nc-bar .track{flex:1;height:4px;background:rgba(130,150,180,.12);border-radius:2px;overflow:hidden}
+.node-chip .nc-bar .track i{display:block;height:100%;border-radius:2px;background:var(--accent)}
+.node-chip .nc-bar .track i.warn{background:var(--warn)}
+.node-chip .nc-bar .track i.bad{background:var(--bad)}
+.node-chip .nc-model{display:inline-block;font-family:var(--mono);font-size:9px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px;margin:2px 3px 0 0;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-chip .nc-trust{display:flex;align-items:center;gap:0;margin-top:8px;flex-wrap:wrap}
+.node-chip .nc-trust .tc-step{display:flex;align-items:center;gap:4px;font-size:8.5px;font-family:var(--mono);letter-spacing:.04em;color:var(--faint);text-transform:uppercase;padding:2px 5px;border-radius:6px;border:1px solid var(--line);background:rgba(8,12,19,.6);white-space:nowrap}
+.node-chip .nc-trust .tc-step.done{color:var(--ok);border-color:rgba(52,211,153,.3)}
+.node-chip .nc-trust .tc-step.cur{color:#0a0f16;background:var(--ok);border-color:var(--ok);font-weight:700}
+.node-chip .nc-trust .tc-step.cur.warn{background:var(--warn);border-color:var(--warn)}
+.node-chip .nc-trust .tc-arr{color:var(--faint);font-size:9px;opacity:.5;padding:0 1px}
+.discovery-feed{margin-top:10px;font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;flex-direction:column;gap:3px}
+.disc-ev{display:flex;align-items:center;gap:7px;animation:discIn .35s ease}
+@keyframes discIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.disc-ev .de-dot{width:6px;height:6px;border-radius:50%;flex:none}
+.disc-ev .de-time{color:var(--faint);opacity:.7}
+.disc-ev .de-msg b{color:var(--text);font-weight:600}
+.disc-ev .de-msg .up{color:var(--ok)}
+.disc-ev .de-msg .down{color:var(--bad)}
+/* worker cards (Workers view) */
+.worker-cards{display:flex;flex-direction:column;gap:10px}
+.worker-card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;box-shadow:var(--shadow)}
+.worker-card.local{border-color:rgba(34,211,238,.45)}
+.worker-card .wc-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.worker-card .wc-name{font-size:13.5px;font-weight:700;color:var(--text)}
+.worker-card .wc-id{font-family:var(--mono);font-size:10px;color:var(--faint)}
+.worker-card .wc-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:4px 14px;font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-bottom:9px}
+.worker-card .wc-meta b{color:var(--muted);font-weight:600}
+.worker-card .wc-res{display:flex;flex-direction:column;gap:5px;margin-bottom:9px}
+.worker-card .wc-res .nc-bar{display:flex;align-items:center;gap:7px;font-size:10px;color:var(--faint);font-family:var(--mono)}
+.worker-card .wc-res .track{flex:1;height:5px;background:rgba(130,150,180,.12);border-radius:2px;overflow:hidden}
+.worker-card .wc-res .track i{display:block;height:100%;border-radius:2px;background:var(--accent)}
+.worker-card .wc-res .track i.warn{background:var(--warn)}
+.worker-card .wc-res .track i.bad{background:var(--bad)}
+.worker-card .wc-models{display:flex;gap:3px;flex-wrap:wrap;margin-bottom:9px}
+.worker-card .wc-trust{margin-top:8px}
+.worker-card .wc-actions{margin-top:10px;display:flex;gap:8px;align-items:center}
+.worker-card .wc-actions button{font-size:10.5px;padding:4px 11px;border-radius:7px;border:1px solid var(--line);background:rgba(13,18,28,.7);color:var(--accent);cursor:pointer;transition:border-color .2s,color .2s}
+.worker-card .wc-actions button:hover{border-color:var(--accent)}
+.worker-card .wc-actions button.danger{color:var(--bad)}
+.worker-card .wc-actions button.danger:hover{border-color:var(--bad)}
+.worker-card .wc-actions .badge{margin-left:auto}
 /* secondary metrics */
 .secondary{margin-top:14px}
 .secondary .card{padding:13px 15px}
@@ -298,7 +355,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <div class="pipe" data-stage="planner"><span class="pi">✦</span><span>PLANNER</span></div><span class="pipe-arrow">→</span>
             <div class="pipe" data-stage="reservation"><span class="pi">⊞</span><span>RESERVATION</span></div><span class="pipe-arrow">→</span>
             <div class="pipe" data-stage="fabric"><span class="pi">◈</span><span>FABRIC</span></div><span class="pipe-arrow">→</span>
-            <div class="pipe" data-stage="worker"><span class="pi">▤</span><span>WORKER</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="worker"><span class="pi">▤</span><span>WORKER<span class="pipe-name" id="pipe-worker-name"></span></span></div><span class="pipe-arrow">→</span>
             <div class="pipe" data-stage="engine"><span class="pi">▦</span><span>ENGINE</span></div><span class="pipe-arrow">→</span>
             <div class="pipe" data-stage="stream"><span class="pi">⇄</span><span>STREAM</span></div><span class="pipe-arrow">→</span>
             <div class="pipe" data-stage="result"><span class="pi">✓</span><span>RESULT</span></div>
@@ -311,6 +368,13 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <div class="decision-strip">
         <div class="ds-head">Autonomous decision <span class="count" id="ds-count"></span></div>
         <div id="decision-strip" class="ds-empty">no autonomous decision yet — the planner is idle. Send a routed request to watch it plan.</div>
+      </div>
+
+      <!-- discovered nodes: identity + resources per node, from /v1/compute + /v1/network -->
+      <div class="card fabric-nodes">
+        <div class="ds-head">Fabric nodes <span class="count" id="fabric-nodes-count"></span></div>
+        <div id="fabric-nodes" class="fabric-nodes-wrap"><span class="badge faint">discovering peers…</span></div>
+        <div class="discovery-feed" id="discovery-feed"></div>
       </div>
 
       <!-- secondary: metrics, queue, recent, share -->
@@ -433,8 +497,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <section class="view" id="view-workers">
         <div class="card">
           <h2>Workers (compute registry) <span class="count" id="workers-count"></span></h2>
-          <table><thead><tr><th>Worker</th><th>Node</th><th>Status</th><th class="num">Load</th><th class="num">Queue</th><th class="num">tok/s</th><th class="num">Latency</th><th class="num">RAM free</th><th class="num">In-flight</th><th>Trust</th><th>Action</th></tr></thead>
-          <tbody id="workers"><tr><td colspan="11" class="empty">no workers yet (compute not attached)</td></tr></tbody></table>
+          <div id="workers" class="worker-cards"><div class="empty">no workers yet (compute not attached)</div></div>
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Contributions <span class="count">M17 · real served work</span></h2>
@@ -825,7 +888,7 @@ function spark(id, values, color){
 // LIVING FABRIC ENGINE — Canvas 2D stage, real data only
 // =============================================================================
 const STATE_COLORS = { Ready:'#34d399', Busy:'#22d3ee', Degraded:'#fbbf24', Unhealthy:'#f87171', Offline:'#5a6b80' };
-const stageData = { s:null, c:null, n:null, x:null, mode:'idle', lastTokens:0, lastStreamTs:0 };
+const stageData = { s:null, c:null, n:null, x:null, mode:'idle', lastTokens:0, lastStreamTs:0, addresses:{}, connected:new Set(), localPeer:'local', localAddr:'' };
 
 function initStage(canvasId){
   const cv = document.getElementById(canvasId);
@@ -873,6 +936,8 @@ function buildStageGeometry(f){
   const rtt = {}; links.forEach(l => rtt[l.peer] = l.rtt_ms);
   const dec = (d.x && d.x.decisions && d.x.decisions[0]) || null;
   const activePeer = (dec && dec.selected_worker) || null;
+  const connected = d.connected || new Set();
+  const addrByPeer = d.addresses || {};
 
   f.W = f.W || f.cv.clientWidth || 900; f.H = f.H || f.cv.clientHeight || 520;
   const W = f.W, H = f.H;
@@ -884,6 +949,7 @@ function buildStageGeometry(f){
   const nW = Math.max(workers.length, 1);
   workers.forEach((w, i) => {
     const ang = -Math.PI/2 + (i / nW) * Math.PI * 2;
+    const maxCtx = (w.served_models || []).reduce((m, mo) => Math.max(m, mo.context_tokens || 0), 0);
     f.nodes.push({
       id: w.peer_id, name: w.node_name || short(w.peer_id, 10),
       kind: 'worker', x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang),
@@ -891,13 +957,31 @@ function buildStageGeometry(f){
       load: (w.load_percent || 0) / 100, in_flight: w.in_flight || 0,
       trusted: !!w.trusted, active: activePeer === w.peer_id,
       label: (w.node_name || short(w.peer_id, 14)),
+      addr: addrByPeer[w.peer_id] || '', connected: connected.has(w.peer_id),
+      acceptsRemote: !!w.accepts_remote_inference, engine: w.engine || '',
+      cpu: w.cpu_cores || 0, ramTotal: w.ram_mb || 0, ramFree: w.available_ram_mb || 0,
+      gpu: w.gpu_name || null, vram: w.gpu_vram_mb || null, vramFree: w.available_vram_mb || null,
+      ctx: maxCtx, queue: w.queue_depth || 0, tps: w.tokens_per_second || 0,
+      lat: w.current_latency_ms || 0, lastSeen: w.last_seen_secs || 0,
+      models: w.served_models || [],
     });
   });
   f.nodes.unshift({
-    id: 'local', name: (d.c && d.c.local_peer) || (d.n && d.n.local_peer) || 'local',
+    id: 'local', name: (d.s && d.s.node && d.s.node.name) || (d.c && d.c.local_peer) || 'this node',
     kind: 'local', x: cx, y: cy, status: 'Ready', col: '#22d3ee',
     load: 0, in_flight: 0, trusted: true, active: false,
     label: 'this node',
+    addr: d.localAddr || '', connected: true,
+    acceptsRemote: true, engine: (d.s && d.s.node && d.s.node.engine) || '',
+    cpu: (d.s && d.s.system && d.s.system.cpu_threads) || 0,
+    ramTotal: (d.s && d.s.system && d.s.system.ram_total_gib) ? (d.s.system.ram_total_gib * 1024) : 0,
+    ramFree: (d.s && d.s.system && d.s.system.ram_available_gib) ? (d.s.system.ram_available_gib * 1024) : 0,
+    gpu: (d.s && d.s.system && d.s.system.gpu && d.s.system.gpu.name) || null,
+    vram: (d.s && d.s.system && d.s.system.gpu) ? (d.s.system.gpu.total_vram_mib || null) : null,
+    vramFree: (d.s && d.s.system && d.s.system.gpu) ? (d.s.system.gpu.free_vram_mib || null) : null,
+    ctx: (d.s && d.s.node && d.s.node.served_models || []).reduce((m, mo) => Math.max(m, mo.context_tokens || 0), 0),
+    queue: (d.s && d.s.queue && d.s.queue.waiting || []).length,
+    models: (d.s && d.s.node && d.s.node.served_models) || [],
   });
   // links: local -> worker, real RTT
   f.links = f.nodes.filter(n => n.kind === 'worker').map(n => {
@@ -962,6 +1046,11 @@ function drawStage(f){
       ctx.fillText('you · this node', n.x, n.y + 38);
       ctx.fillStyle = 'rgba(34,211,238,.9)'; ctx.font = '10px ui-monospace, Menlo, monospace';
       ctx.fillText(short(n.name, 18), n.x, n.y - 34);
+      // local node identity: real LAN address, if known
+      if (n.addr) {
+        ctx.fillStyle = 'rgba(34,211,238,.55)'; ctx.font = '9.5px ui-monospace, Menlo, monospace';
+        ctx.fillText('local · ' + short(n.addr, 22), n.x, n.y + 52);
+      }
     } else {
       const col = recovering && n.active ? '#fbbf24' : n.col;
       const sel = n.active;
@@ -977,6 +1066,14 @@ function drawStage(f){
         ctx.beginPath(); ctx.arc(n.x, n.y, 24, -Math.PI/2, -Math.PI/2 + circ * Math.min(n.load, 1));
         ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.stroke();
       }
+      // resource ring: RAM free/total as a thin arc (real advertised values)
+      if (n.ramTotal > 0) {
+        const ratio = Math.max(0, Math.min(1, n.ramFree / n.ramTotal));
+        const circ = 2 * Math.PI * 20;
+        ctx.beginPath(); ctx.arc(n.x, n.y, 20, -Math.PI/2, -Math.PI/2 + circ * ratio);
+        ctx.strokeStyle = ratio < .15 ? 'rgba(248,113,113,.85)' : 'rgba(52,211,153,.7)';
+        ctx.lineWidth = 2; ctx.stroke();
+      }
       // core
       ctx.beginPath(); ctx.arc(n.x, n.y, 11, 0, Math.PI * 2);
       ctx.fillStyle = col;
@@ -990,6 +1087,16 @@ function drawStage(f){
       ctx.fillStyle = sel ? '#22d3ee' : (n.trusted ? 'rgba(52,211,153,.85)' : 'rgba(251,191,36,.8)');
       ctx.font = '9.5px ui-monospace, Menlo, monospace';
       ctx.fillText((sel ? 'SELECTED · ' : '') + (n.status || '') + ' · ' + Math.round(n.load * 100) + '%', n.x, n.y - 30);
+      // connection + trust + remote-sharing identity (real state)
+      ctx.fillStyle = n.connected ? 'rgba(52,211,153,.9)' : 'rgba(90,107,128,.8)';
+      ctx.fillText(n.connected ? '● connected' : '○ not connected', n.x, n.y - 18);
+      ctx.fillStyle = 'rgba(143,160,179,.7)';
+      ctx.fillText((n.acceptsRemote ? 'REMOTE-OK' : 'local-only') + (n.engine ? ' · ' + short(n.engine, 12) : ''), n.x, n.y + 54);
+      // real LAN address when the p2p node knows one
+      if (n.addr) {
+        ctx.fillStyle = 'rgba(143,160,179,.45)'; ctx.font = '8.5px ui-monospace, Menlo, monospace';
+        ctx.fillText(short(n.addr, 24), n.x, n.y + 64);
+      }
     }
   });
 
@@ -1073,6 +1180,16 @@ function renderPipeline(s, c, n, x){
   setPipe('stream', streaming ? 'on' : '');
   setPipe('result', done ? 'done' : (failed ? 'fail' : (streaming ? 'on' : '')));
 
+  // worker pipe identity: which real node is executing (local vs remote)
+  const pwn = $('pipe-worker-name');
+  if (dec && dec.selected_worker) {
+    const w = (c && c.workers || []).find(x => x.peer_id === dec.selected_worker);
+    const remote = dec.selected_worker !== stageData.localPeer;
+    pwn.textContent = (w && w.node_name ? w.node_name : short(dec.selected_worker, 12)) + (remote ? ' · remote' : ' · local');
+  } else {
+    pwn.textContent = '';
+  }
+
   // planner chip: visible identity + state
   const pd = $('planner-dot'), ps = $('planner-state');
   if (recovering) { pd.className = 'pd fail'; ps.textContent = 'recovering · replanning'; }
@@ -1139,9 +1256,17 @@ function renderDecisionStrip(x){
 function renderFabric(s, c, n, x){
   stageData.s = s; stageData.c = c; stageData.n = n; stageData.x = x;
   stageData.mode = deriveMode(s, c, x);
+  // identity enrichment for every renderer: real addresses + connectivity
+  stageData.localPeer = (c && c.local_peer) || (n && n.local_peer) || 'local';
+  stageData.localAddr = (n && n.local_addresses && n.local_addresses[0]) || '';
+  stageData.addresses = {};
+  (n && n.addresses || []).forEach(a => { if (a && a.peer) stageData.addresses[a.peer] = a.addr; });
+  stageData.connected = new Set((n && n.connected) || []);
   [stageOverview, stageTopo].forEach(f => { if (f) buildStageGeometry(f); });
   renderPipeline(s, c, n, x);
   renderDecisionStrip(x);
+  renderFabricNodes(s, c, n);
+  updateDiscovery(c, n);
   // pulses: real events get a ring on the canvas
   const recent = (s && s.recent_requests || [])[0];
   const now = Date.now() / 1000;
@@ -1165,30 +1290,201 @@ function renderFabric(s, c, n, x){
   else { $('fabric-last').textContent = '—'; $('fabric-last-sub').textContent = ''; }
 }
 
+// ---- fabric nodes strip: identity + resources per real node -----------------
+function barSeg(label, pct, ok){
+  const cls = pct > 80 ? 'bad' : pct > 60 ? 'warn' : '';
+  return '<div class="nc-bar"><span style="flex:none;width:44px">'+label+'</span><span class="track"><i class="'+(ok ? '' : cls)+'" style="width:'+Math.max(2, Math.min(100, pct))+'%"></i></span><span style="flex:none;width:34px;text-align:right">'+pct+'%</span></div>';
+}
+function trustChain(steps, curIdx){
+  return steps.map((st, i) => {
+    const cls = i < curIdx ? 'done' : (i === curIdx ? 'cur' + (st.warn ? ' warn' : '') : '');
+    return '<span class="tc-step ' + cls + '">' + st.k + '</span>' + (i < steps.length - 1 ? '<span class="tc-arr">→</span>' : '');
+  }).join('');
+}
+function renderFabricNodes(s, c, n){
+  const workers = (c && c.workers) || [];
+  const chips = [];
+  const localPeer = stageData.localPeer;
+  // local node first — the perspective anchor
+  const sys = (s && s.system) || {};
+  const ramT = sys.ram_total_gib ? sys.ram_total_gib * 1024 : 0;
+  const ramF = sys.ram_available_gib ? sys.ram_available_gib * 1024 : 0;
+  const localModels = (s && s.node && s.node.served_models) || [];
+  const localState = (s && s.queue && s.queue.serving) ? 'Busy' : 'Ready';
+  chips.push(nodeChip({
+    isLocal: true, name: (s && s.node && s.node.name) || 'this node', peer: localPeer,
+    addr: stageData.localAddr, connected: true, status: localState, col: '#22d3ee',
+    acceptsRemote: true, engine: (s && s.node && s.node.engine) || 'llama_server',
+    cpu: sys.cpu_threads || 0, ramTotal: ramT, ramFree: ramF,
+    gpu: (sys.gpu && sys.gpu.name) || null, vram: (sys.gpu && sys.gpu.total_vram_mib) || null,
+    vramFree: (sys.gpu && sys.gpu.free_vram_mib) || null, models: localModels, trusted: true,
+  }, true, null));
+  // remote workers (skip a worker row equal to the local peer — never duplicate)
+  workers.forEach(w => {
+    if (w.peer_id === localPeer) return;
+    chips.push(nodeChip({
+      isLocal: false, name: w.node_name || short(w.peer_id, 12), peer: w.peer_id,
+      addr: stageData.addresses[w.peer_id] || '', connected: stageData.connected.has(w.peer_id),
+      status: w.status || 'Offline', col: STATE_COLORS[w.status] || '#5a6b80',
+      acceptsRemote: !!w.accepts_remote_inference, engine: w.engine || '',
+      cpu: w.cpu_cores || 0, ramTotal: w.ram_mb || 0, ramFree: w.available_ram_mb || 0,
+      gpu: w.gpu_name || null, vram: w.gpu_vram_mb || null, vramFree: w.available_vram_mb || null,
+      models: w.served_models || [], trusted: !!w.trusted,
+    }, false, w.load_percent || 0));
+  });
+  $('fabric-nodes').innerHTML = chips.join('') || '<span class="badge faint">no peers discovered yet</span>';
+  $('fabric-nodes-count').textContent = chips.length + ' node(s)';
+}
+function nodeChip(nd, isLocal, loadPct){
+  const ramPct = nd.ramTotal > 0 ? Math.round(((nd.ramTotal - nd.ramFree) / nd.ramTotal) * 100) : 0;
+  const vramPct = (nd.vram && nd.vram > 0) ? Math.round((((nd.vram - (nd.vramFree || nd.vram)) / nd.vram)) * 100) : 0;
+  const cpuLbl = nd.cpu ? nd.cpu + ' core(s)' : '—';
+  const ramLbl = nd.ramTotal > 0 ? fmtMB(nd.ramFree) + ' / ' + fmtMB(nd.ramTotal) : '—';
+  const gpuLbl = nd.gpu ? (nd.gpu + (nd.vram ? ' · ' + fmtMB(nd.vram) : '')) : 'CPU-only';
+  const steps = [
+    { k: 'DISCOVERED', warn: false },
+    { k: 'UNTRUSTED', warn: true },
+    { k: 'APPROVED', warn: false },
+    { k: 'CONNECTED', warn: false },
+    { k: 'WORKER READY', warn: false },
+  ];
+  const curIdx = nd.isLocal ? steps.length - 1 : (nd.trusted ? (nd.connected ? steps.length - 1 : 3) : 1);
+  const models = (nd.models || []).slice(0, 3).map(m =>
+    '<span class="nc-model" title="' + esc(m.file_name || '') + (m.context_tokens ? ' · ctx ' + m.context_tokens : '') + '">' + esc(m.file_name || 'model') + (m.context_tokens ? ' · ' + m.context_tokens + ' ctx' : '') + '</span>'
+  ).join('');
+  const loadBar = loadPct == null ? '' : barSeg('load', loadPct, true);
+  return '<div class="node-chip ' + (isLocal ? 'local' : '') + '">' +
+    '<div class="nc-head"><span class="dot" style="background:' + nd.col + '"></span>' + esc(nd.name) +
+    '<span class="nc-tag ' + (isLocal ? 'local-tag' : 'remote-tag') + '">' + (isLocal ? 'local' : 'remote') + '</span></div>' +
+    '<div class="nc-meta"><span><b>peer</b> ' + short(nd.peer, 12) + '</span>' +
+    '<span><b>addr</b> ' + esc(nd.addr || '—') + '</span>' +
+    '<span><b>engine</b> ' + esc(nd.engine || '—') + '</span>' +
+    '<span><b>state</b> ' + esc(nd.status || '—') + (nd.acceptsRemote ? ' · accepts remote' : ' · local-only') + '</span></div>' +
+    '<div class="nc-bars">' +
+      loadBar +
+      barSeg('ram', ramPct, true) +
+      barSeg('vram', vramPct, false) +
+    '</div>' +
+    '<div><span class="mono" style="font-size:9px;color:var(--faint)">cpu ' + cpuLbl + ' · ' + ramLbl + ' · gpu ' + esc(gpuLbl) + '</span></div>' +
+    (models ? '<div class="nc-models" style="margin-top:6px">' + models + '</div>' : '') +
+    '<div class="nc-trust">' + trustChain(steps, curIdx) + '</div>' +
+  '</div>';
+}
+
+// ---- discovery feed: real appearance/offline/reconnect events ---------------
+const discoveryState = { seen: new Set(), status: {} };
+let discoveryFeed = [];
+function renderDiscoveryFeed(){
+  const el = $('discovery-feed');
+  if (!discoveryFeed.length) { el.innerHTML = ''; return; }
+  el.innerHTML = discoveryFeed.map(ev => {
+    const t = new Date(ev.ts).toLocaleTimeString();
+    let dot, msg;
+    if (ev.kind === 'appear') {
+      dot = 'background:var(--ok)';
+      msg = '<b class="up">discovered</b> ' + esc(ev.name) + ' <code>' + short(ev.peer, 10) + '</code> · ' + esc(ev.status || '') + (ev.acceptsRemote ? ' · accepts remote work' : ' · local-only');
+    } else if (ev.kind === 'reconnect') {
+      dot = 'background:var(--accent)';
+      msg = '<b>reconnected</b> ' + esc(ev.name) + ' <code>' + short(ev.peer, 10) + '</code> · worker is ready again';
+    } else {
+      dot = 'background:var(--bad)';
+      msg = '<b class="down">offline</b> ' + short(ev.peer, 10) + ' — no heartbeat';
+    }
+    return '<div class="disc-ev"><span class="de-dot" style="' + dot + '"></span><span class="de-time">' + t + '</span><span class="de-msg">' + msg + '</span></div>';
+  }).join('');
+}
+function updateDiscovery(c, n){
+  const workers = (c && c.workers) || [];
+  const nowKeys = new Set(workers.map(w => w.peer_id));
+  const statusNow = {}; workers.forEach(w => statusNow[w.peer_id] = w.status);
+  const events = [];
+  workers.forEach(w => {
+    if (!discoveryState.seen.has(w.peer_id)) {
+      events.push({ kind: 'appear', ts: Date.now(), peer: w.peer_id, name: w.node_name || w.peer_id, status: w.status, acceptsRemote: !!w.accepts_remote_inference });
+    } else if (discoveryState.status[w.peer_id] === 'Offline' && (w.status === 'Ready' || w.status === 'Busy')) {
+      events.push({ kind: 'reconnect', ts: Date.now(), peer: w.peer_id, name: w.node_name || w.peer_id });
+    }
+  });
+  discoveryState.seen.forEach(id => {
+    if (!nowKeys.has(id)) events.push({ kind: 'gone', ts: Date.now(), peer: id });
+  });
+  events.slice(0, 3).forEach(ev => {
+    discoveryFeed.unshift(ev);
+    // real events pulse the stage canvas at that node
+    if (ev.kind === 'appear') {
+      const nd = stageOverview && stageOverview.nodes.find(x => x.id === ev.peer);
+      if (nd) addPulse(stageOverview, nd, '#34d399');
+    } else if (ev.kind === 'reconnect') {
+      const nd = stageOverview && stageOverview.nodes.find(x => x.id === ev.peer);
+      if (nd) addPulse(stageOverview, nd, '#22d3ee');
+    }
+  });
+  discoveryFeed = discoveryFeed.slice(0, 7);
+  discoveryState.seen = nowKeys;
+  discoveryState.status = statusNow;
+  renderDiscoveryFeed();
+}
+
 function addPulse(f, node, col){
   if (!f || !node || node.x === undefined) return;
   f.pulses.push({ x: node.x, y: node.y, t: 0, col });
 }
 
 // ---- renderers -------------------------------------------------------------
+function workerCard(w, localPeer){
+  const isLocal = w.peer_id === localPeer;
+  const connected = stageData.connected.has(w.peer_id);
+  const status = w.status || '';
+  const col = STATE_COLORS[status] || '#5a6b80';
+  const badge = status === 'Ready' ? '<span class="badge ok">ready</span>' : status === 'Busy' ? '<span class="badge accent">busy</span>' : status === 'Offline' ? '<span class="badge bad">offline</span>' : status ? '<span class="badge warn">'+esc(status)+'</span>' : '<span class="badge faint">—</span>';
+  const action = isLocal ? '' : (w.trusted
+    ? (isAdmin ? '<button data-p="'+w.peer_id+'" onclick="revokeWorker(event)" class="danger">Revoke</button>' : '<span class="badge ok">trusted</span>')
+    : (isAdmin ? '<button data-p="'+w.peer_id+'" onclick="trustWorker(event)">Approve</button>' : '<button disabled>Approve</button>'));
+  const ramPct = w.ram_mb > 0 ? Math.round(((w.ram_mb - (w.available_ram_mb || 0)) / w.ram_mb) * 100) : 0;
+  const vramPct = (w.gpu_vram_mb && w.gpu_vram_mb > 0) ? Math.round((((w.gpu_vram_mb - (w.available_vram_mb || w.gpu_vram_mb)) / w.gpu_vram_mb)) * 100) : 0;
+  const models = (w.served_models || []).slice(0, 4).map(m =>
+    '<span class="nc-model" title="'+esc(m.file_name||'')+(m.context_tokens?' · ctx '+m.context_tokens:'')+'">'+esc(m.file_name||'model')+(m.context_tokens?' · '+m.context_tokens+' ctx':'')+'</span>'
+  ).join('');
+  const steps = [
+    { k: 'DISCOVERED' }, { k: 'UNTRUSTED', warn: true }, { k: 'APPROVED' },
+    { k: 'CONNECTED' }, { k: 'WORKER READY' },
+  ];
+  const curIdx = isLocal ? steps.length - 1 : (w.trusted ? (connected ? steps.length - 1 : 3) : 1);
+  return '<div class="worker-card '+(isLocal?'local':'')+'" id="node-card-'+esc(w.peer_id)+'">'+
+    '<div class="wc-head">'+
+      '<span class="dot" style="background:'+col+';width:9px;height:9px;border-radius:50%"></span>'+
+      '<span class="wc-name">'+esc(w.node_name || short(w.peer_id, 14))+'</span>'+
+      (isLocal ? '<span class="nc-tag local-tag">local</span>' : '<span class="nc-tag remote-tag">remote</span>')+
+      badge+
+      (w.accepts_remote_inference ? '<span class="nc-tag" title="this node accepts inference routed from remote peers">remote-ok</span>' : '<span class="nc-tag" title="this node serves local requests only">local-only</span>')+
+      (connected ? '<span class="badge ok">p2p connected</span>' : '<span class="badge faint">not connected</span>')+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>peer</b> <code title="'+esc(w.peer_id)+'">'+short(w.peer_id, 14)+'</code></span>'+
+      '<span><b>addr</b> '+esc((stageData.addresses[w.peer_id] || (isLocal ? stageData.localAddr : '')) || '—')+'</span>'+
+      '<span><b>engine</b> '+esc(w.engine||'—')+'</span>'+
+      '<span><b>last seen</b> '+(w.last_seen_secs != null ? fmtUptime(w.last_seen_secs)+' ago' : '—')+'</span>'+
+      '<span><b>queue</b> '+w.queue_depth+'</span><span><b>in-flight</b> '+w.in_flight+'</span>'+
+      '<span><b>tok/s</b> '+w.tokens_per_second+'</span><span><b>latency</b> '+w.current_latency_ms+'ms</span>'+
+    '</div>'+
+    '<div class="wc-res">'+
+      '<div class="nc-bar"><span style="flex:none;width:52px">cpu</span><span class="track"><i class="'+(w.load_percent>80?'bad':w.load_percent>60?'warn':'')+'" style="width:'+Math.min(w.load_percent||0,100)+'%"></i></span><span style="flex:none;width:96px;text-align:right">'+w.load_percent+'% · '+(w.cpu_cores||'—')+' cores</span></div>'+
+      '<div class="nc-bar"><span style="flex:none;width:52px">ram</span><span class="track"><i class="'+(ramPct>80?'bad':ramPct>60?'warn':'')+'" style="width:'+Math.max(2,Math.min(100,ramPct))+'%"></i></span><span style="flex:none;width:96px;text-align:right">'+fmtMB(w.available_ram_mb)+' / '+fmtMB(w.ram_mb)+'</span></div>'+
+      '<div class="nc-bar"><span style="flex:none;width:52px">vram</span><span class="track"><i class="'+(vramPct>80?'bad':vramPct>60?'warn':'')+'" style="width:'+Math.max(2,Math.min(100,vramPct))+'%"></i></span><span style="flex:none;width:96px;text-align:right">'+(w.gpu_name ? esc(w.gpu_name)+' · '+fmtMB(w.gpu_vram_mb) : 'CPU-only')+'</span></div>'+
+    '</div>'+
+    (models ? '<div class="wc-models">'+models+'</div>' : '')+
+    '<div class="wc-trust">'+trustChain(steps, curIdx)+'</div>'+
+    (action ? '<div class="wc-actions">'+action+'</div>' : '')+
+  '</div>';
+}
 function renderWorkers(c){
-  const rows = (c && c.workers || []).map(w => {
-    const action = w.trusted
-      ? (isAdmin ? '<button data-p="'+w.peer_id+'" onclick="revokeWorker(event)" class="danger">Revoke</button>' : '<span class="badge ok">trusted</span>')
-      : (isAdmin ? '<button data-p="'+w.peer_id+'" onclick="trustWorker(event)">Approve</button>' : '<button disabled>Approve</button>');
-    const status = w.status || '';
-    const badge = status === 'Ready' ? '<span class="badge ok">ready</span>' : status === 'Offline' ? '<span class="badge bad">offline</span>' : status ? '<span class="badge warn">'+esc(status)+'</span>' : '<span class="badge faint">—</span>';
-    return '<tr><td><code>'+short(w.peer_id)+'</code></td><td>'+esc(w.node_name || '')+'</td><td>'+badge+'</td>'+
-      '<td class="num"><span>'+w.load_percent+'%</span><div class="bar '+(w.load_percent>80?'bad':w.load_percent>60?'warn':'')+'"><i style="width:'+Math.min(w.load_percent||0,100)+'%"></i></div></td>'+
-      '<td class="num">'+w.queue_depth+'</td><td class="num">'+w.tokens_per_second+'</td><td class="num">'+w.current_latency_ms+'ms</td>'+
-      '<td class="num">'+fmtMB(w.available_ram_mb)+'</td><td class="num">'+w.in_flight+'</td>'+
-      '<td>'+(w.trusted ? '<span class="badge ok">yes</span>' : '<span class="badge faint">no</span>')+'</td><td>'+action+'</td></tr>';
-  }).join('');
-  $('workers').innerHTML = rows || '<tr><td colspan="11" class="empty">no workers yet (compute not attached)</td></tr>';
-  $('workers-count').textContent = (c && c.workers || []).length + ' advertised';
-  $('diag-workers').innerHTML = ((c && c.workers || []).length) + ' worker(s)';
+  const workers = (c && c.workers) || [];
+  const localPeer = (c && c.local_peer) || 'local';
+  $('workers').innerHTML = workers.map(w => workerCard(w, localPeer)).join('') || '<div class="empty">no workers yet (compute not attached)</div>';
+  $('workers-count').textContent = workers.length + ' advertised';
+  $('diag-workers').innerHTML = workers.length + ' worker(s)';
   $('diag-sessions').innerHTML = (c && c.sessions) + ' KV session(s)';
-  $('set-trust').textContent = ((c && c.workers || []).filter(w => w.trusted).length) + ' trusted of ' + (c && c.workers || []).length;
+  $('set-trust').textContent = workers.filter(w => w.trusted).length + ' trusted of ' + workers.length;
   // contributions
   const crel = (c && c.contributions || []).map(r =>
     '<tr><td>'+esc(r.node_name || short(r.peer_id))+'</td><td class="num">'+r.cpu_cores+'</td><td class="num">'+fmtMB(r.ram_mb)+'</td><td class="num">'+fmtUptime(r.online_seconds)+'</td>'+
@@ -1198,13 +1494,26 @@ function renderWorkers(c){
   $('contributions').innerHTML = crel || '<tr><td colspan="9" class="empty">no contribution ledger yet</td></tr>';
 }
 function renderNetwork(n){
+  // identity enrichment is self-contained here too (renderNetwork may run
+  // before renderFabric on the first refresh cycle)
+  stageData.addresses = stageData.addresses || {};
+  stageData.connected = stageData.connected || new Set();
+  (n && n.addresses || []).forEach(a => { if (a && a.peer) stageData.addresses[a.peer] = a.addr; });
+  ((n && n.connected) || []).forEach(p => stageData.connected.add(p));
+  if (n && n.local_peer) stageData.localPeer = n.local_peer;
+  if (n && n.local_addresses && n.local_addresses[0]) stageData.localAddr = n.local_addresses[0];
   const links = (n && n.links || []).map(l =>
     '<tr><td><code>'+short(l.peer)+'</code></td><td class="num">'+l.rtt_ms+' ms</td><td class="num">'+(l.bandwidth_mbps || '—')+'</td><td class="num">'+(l.transfer_ms_per_mib || '—')+'</td><td><span class="badge '+(l.locality==='Lan'?'ok':l.locality==='Remote'?'warn':'accent')+'">'+esc(l.locality||'')+'</span></td></tr>'
   ).join('');
   $('network').innerHTML = links || '<tr><td colspan="5" class="empty">no measured links yet</td></tr>';
   const conn = (n && n.connected || []);
-  $('connected').innerHTML = conn.length ? conn.map(p => '<code style="display:inline-block;margin:2px">'+esc(p)+'</code>').join(' ') : 'no connected peers';
-  $('diag-p2p').innerHTML = conn.length + ' connected, ' + (n && n.links || []).length + ' measured link(s)';
+  $('connected').innerHTML = conn.length
+    ? conn.map(p => {
+        const addr = stageData.addresses[p] || '';
+        return '<div style="display:inline-block;margin:2px 6px 2px 0"><code>'+esc(p)+'</code>'+(addr ? '<span class="mono" style="display:block;font-size:9px;color:var(--faint)">'+esc(addr)+'</span>' : '')+'</div>';
+      }).join(' ')
+    : 'no connected peers';
+  $('diag-p2p').innerHTML = conn.length + ' connected, ' + (n && n.links || []).length + ' measured link(s)' + ((n && n.addresses || []).length ? ' · ' + (n.addresses || []).length + ' address(es) known' : '');
   $('rec-connected').textContent = conn.length;
   $('rec-links').textContent = (n && n.links || []).length;
 }

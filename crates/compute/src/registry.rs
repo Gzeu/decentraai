@@ -51,6 +51,15 @@ impl ComputeRegistry {
         self.workers.get(peer)
     }
 
+    /// Seconds elapsed since this peer's last heartbeat, or `None` when the
+    /// peer is unknown to the registry. Surfaced by the metrics API so the
+    /// dashboard can show how fresh a worker's advertisement is.
+    pub fn last_seen_secs(&self, peer: &PeerId, now: Instant) -> Option<u64> {
+        self.last_seen
+            .get(peer)
+            .map(|seen| now.duration_since(*seen).as_secs())
+    }
+
     /// All known advertisements, newest-updated first (stable order).
     pub fn list(&self) -> Vec<ComputeAdvertisement> {
         let mut all: Vec<_> = self.workers.values().cloned().collect();
@@ -217,6 +226,7 @@ mod tests {
                 status: WorkerHealth::Ready,
             },
             announced_at_ms: 1_700_000_000_000,
+            accepts_remote_inference: true,
         };
         let json = serde_json::to_string(&adv).unwrap();
         let back: ComputeAdvertisement = serde_json::from_str(&json).unwrap();

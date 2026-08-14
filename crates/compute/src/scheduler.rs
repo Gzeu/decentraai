@@ -37,6 +37,9 @@ pub struct ComputeScheduler {
     /// Coordinator-side trust set (pairing/trust store), not derived from
     /// advertisements.
     trusted: HashSet<PeerId>,
+    /// The coordinator's own peer id, used to exempt local work from the
+    /// `accepts_remote_inference` gate (local requests are not remote).
+    local_peer: Option<PeerId>,
 }
 
 impl ComputeScheduler {
@@ -51,7 +54,14 @@ impl ComputeScheduler {
             ledger,
             matcher,
             trusted,
+            local_peer: None,
         }
+    }
+
+    /// Records the coordinator's own peer id so the scheduler never treats
+    /// local work as remote (see [`CapabilityMatcher::matches`]).
+    pub fn set_local_peer(&mut self, peer: PeerId) {
+        self.local_peer = Some(peer);
     }
 
     pub fn registry(&self) -> &ComputeRegistry {
@@ -137,7 +147,7 @@ impl ComputeScheduler {
             .filter(|adv| self.trusted.contains(&adv.peer_id))
             .filter(|adv| {
                 matches!(
-                    self.matcher.matches(adv, req, &self.ledger, true),
+                    self.matcher.matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
                     MatchOutcome::Eligible
                 )
             })
@@ -186,7 +196,7 @@ impl ComputeScheduler {
             return None;
         }
         if !matches!(
-            self.matcher.matches(adv, req, &self.ledger, true),
+            self.matcher.matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
             MatchOutcome::Eligible
         ) {
             return None;

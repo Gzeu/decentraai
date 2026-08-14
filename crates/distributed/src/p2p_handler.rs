@@ -560,6 +560,7 @@ mod tests {
                 status: decentraai_compute::WorkerHealth::Ready,
             },
             announced_at_ms: 1_700_000_000_000,
+            accepts_remote_inference: true,
         };
 
         let payload = serialize_message(&adv).unwrap();

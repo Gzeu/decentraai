@@ -180,6 +180,7 @@ pub fn build_advertisement(
     gpu: GpuProbeStatus,
     served_models: Vec<ServedModel>,
     can_provision: bool,
+    accepts_remote: bool,
     announced_at_ms: u64,
     perf: LivePerf,
 ) -> ComputeAdvertisement {
@@ -218,6 +219,7 @@ pub fn build_advertisement(
             status: WorkerHealth::Ready,
         },
         announced_at_ms,
+        accepts_remote_inference: accepts_remote,
     }
 }
 
@@ -266,6 +268,12 @@ pub struct ComputeManager {
     /// planner feed so a consistently failing worker is not re-selected (and
     /// no reservation is booked on it) until its cooldown elapses.
     breaker: std::sync::Mutex<crate::breaker::CircuitBreaker>,
+    /// Whether this node accepts inference routed from remote peers
+    /// (config `inference.allow_remote_inference`). Advertised honestly so
+    /// coordinators never schedule a remote worker that would reject the
+    /// request; the local node always accepts its own work regardless.
+    /// Atomic so the shared `Arc<ComputeManager>` can flip it at runtime.
+    accepts_remote_inference: std::sync::atomic::AtomicBool,
 }
 
 impl ComputeManager {
@@ -275,8 +283,11 @@ impl ComputeManager {
             ComputeRegistry::new(std::time::Duration::from_millis(DEFAULT_STALE_AFTER_MS));
         let ledger =
             decentraai_compute::ReservationLedger::new(std::time::Duration::from_secs(60), 4);
-        let scheduler =
+        let mut scheduler =
             ComputeScheduler::new(registry, ledger, CapabilityMatcher::default(), trusted);
+        // The coordinator's own peer id exempts local work from the remote
+        // opt-in gate: a node always serves its own requests.
+        scheduler.set_local_peer(local_peer);
         Self {
             local_peer,
             node_name,
@@ -294,6 +305,7 @@ impl ComputeManager {
             breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
                 crate::breaker::BreakerConfig::default(),
             )),
+            accepts_remote_inference: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -301,6 +313,15 @@ impl ComputeManager {
     /// signed advertisements that recipients can authenticate.
     pub fn set_signing_key(&mut self, signing_key: [u8; 32]) {
         self.signing_key = Some(signing_key);
+    }
+
+    /// Sets whether this node accepts inference routed from remote peers
+    /// (config `inference.allow_remote_inference`). The value is advertised
+    /// in every heartbeat so coordinators only schedule remote workers that
+    /// will actually serve the request. Local work is always accepted.
+    pub fn set_accepts_remote_inference(&self, accepts: bool) {
+        self.accepts_remote_inference
+            .store(accepts, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn local_peer(&self) -> PeerId {
@@ -998,6 +1019,8 @@ impl ComputeManager {
             gpu,
             served_models,
             can_provision,
+            self.accepts_remote_inference
+                .load(std::sync::atomic::Ordering::Relaxed),
             now,
             self.metrics.snapshot(),
         );
@@ -1051,7 +1074,9 @@ pub fn gpu_from_snapshot(info: &GpuSnapshot) -> (Option<GpuSpec>, Option<u64>) {
 
 /// One worker row for the compute metrics report (M16). Built entirely from
 /// the real [`ComputeManager`] state: the last advertisement's live
-/// availability plus the scheduler's reservation bookkeeping.
+/// availability plus the scheduler's reservation bookkeeping. The static
+/// identity + resource fields (CPU/RAM/GPU/engine/models) come from the
+/// advertised capability — never invented.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkerMetricRow {
     pub peer_id: String,
@@ -1076,6 +1101,35 @@ pub struct WorkerMetricRow {
     pub available_vram_mb: Option<u64>,
     pub in_flight: usize,
     pub reserved_ram_mb: u64,
+    // ---- Static identity + resources from the advertised capability ----
+    /// Logical CPU cores this node advertises.
+    pub cpu_cores: u16,
+    /// Total host RAM in MiB.
+    pub ram_mb: u64,
+    /// GPU name (None = CPU-only node).
+    pub gpu_name: Option<String>,
+    /// Total VRAM in MiB (None = CPU-only node).
+    pub gpu_vram_mb: Option<u64>,
+    /// Inference engine, e.g. "llama_server".
+    pub engine: String,
+    /// Models this node serves, with their real KV context window.
+    pub served_models: Vec<MetricServedModel>,
+    /// Seconds since this worker's last heartbeat (registry staleness).
+    pub last_seen_secs: u64,
+    /// Whether the node accepts inference routed from remote peers (its
+    /// advertised `accepts_remote_inference` — the honest remote-sharing
+    /// opt-in). Local work is always accepted regardless.
+    pub accepts_remote_inference: bool,
+}
+
+/// Compact serde view of one served model (per-node, M16/M20).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MetricServedModel {
+    pub file_name: String,
+    pub size_mb: u64,
+    /// Real KV-cache context window this worker allocates for the model
+    /// (`--ctx-size`); 0 = unknown.
+    pub context_tokens: u32,
 }
 
 /// One worker's contribution row for the metrics report (M17): the raw
@@ -1163,9 +1217,17 @@ impl ComputeManager {
     /// dashboard (M16).
     pub async fn metrics_report(&self) -> ComputeMetricsReport {
         let workers = self.scheduler.lock().await.registry().list();
+        let now = std::time::Instant::now();
         let mut rows = Vec::with_capacity(workers.len());
         for adv in &workers {
             let offline = adv.availability.status == WorkerHealth::Offline;
+            let last_seen_secs = self
+                .scheduler
+                .lock()
+                .await
+                .registry()
+                .last_seen_secs(&adv.peer_id, now)
+                .unwrap_or(0);
             rows.push(WorkerMetricRow {
                 peer_id: adv.peer_id.to_string(),
                 node_name: adv.node_name.clone(),
@@ -1181,6 +1243,23 @@ impl ComputeManager {
                 available_vram_mb: adv.availability.available_vram_mb,
                 in_flight: self.in_flight(&adv.peer_id).await,
                 reserved_ram_mb: self.reserved_ram(&adv.peer_id).await,
+                cpu_cores: adv.capability.cpu_cores,
+                ram_mb: adv.capability.ram_mb,
+                gpu_name: adv.capability.gpu.as_ref().map(|g| g.name.clone()),
+                gpu_vram_mb: adv.capability.gpu.as_ref().map(|g| g.vram_mb),
+                engine: adv.capability.engine.clone(),
+                served_models: adv
+                    .capability
+                    .served_models
+                    .iter()
+                    .map(|m| MetricServedModel {
+                        file_name: m.file_name.clone(),
+                        size_mb: m.size_mb,
+                        context_tokens: m.context_tokens,
+                    })
+                    .collect(),
+                last_seen_secs,
+                accepts_remote_inference: adv.accepts_remote_inference,
             });
         }
         let contributions = self.contribution_report_locked(workers).await;
@@ -1297,6 +1376,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             1_700_000_000_000,
             LivePerf::default(),
         );
@@ -1351,6 +1431,7 @@ mod tests {
             GpuProbeStatus::Unavailable("nvidia-smi not found".into()),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1370,6 +1451,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1399,6 +1481,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1439,6 +1522,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1465,6 +1549,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1516,6 +1601,7 @@ mod tests {
             gpu(),
             vec![ctx_model.clone()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1527,6 +1613,7 @@ mod tests {
             gpu(),
             vec![ctx_model.clone()],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1577,6 +1664,7 @@ mod tests {
             gpu(),
             vec![ctx_model],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1628,6 +1716,7 @@ mod tests {
                 gpu(),
                 vec![ctx_model],
                 false,
+                true,
                 0,
                 LivePerf::default(),
             ))
@@ -1656,6 +1745,7 @@ mod tests {
             gpu(),
             vec![],
             true,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1679,6 +1769,7 @@ mod tests {
             gpu(),
             vec![],
             false,
+            true,
             0,
             LivePerf::default(),
         );
@@ -1698,6 +1789,7 @@ mod tests {
             snapshot(),
             gpu(),
             vec![],
+            true,
             true,
             0,
             LivePerf::default(),
@@ -1771,6 +1863,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             perf,
         );
@@ -1791,6 +1884,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf {
                 queue_depth: 2,
@@ -1822,6 +1916,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         ))
@@ -1863,6 +1958,7 @@ mod tests {
             gpu(),
             vec![model()],
             false,
+            true,
             0,
             LivePerf::default(),
         ))
@@ -1893,6 +1989,7 @@ mod tests {
                     ..model()
                 }],
                 false,
+                true,
                 0,
                 LivePerf::default(),
             ))
@@ -1969,6 +2066,7 @@ mod tests {
                     ..model()
                 }],
                 false,
+                true,
                 0,
                 LivePerf::default(),
             ))

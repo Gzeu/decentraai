@@ -3,6 +3,7 @@
 use crate::availability::ComputeAdvertisement;
 use crate::requirements::WorkloadRequirements;
 use crate::reservation::ReservationLedger;
+use libp2p::PeerId;
 
 /// Why a worker was rejected, so operators and logs can distinguish a
 /// missing model from an overloaded GPU.
@@ -10,10 +11,14 @@ use crate::reservation::ReservationLedger;
 pub enum MatchReason {
     /// Coordinator has no trust record for this peer.
     NotTrusted,
-    /// Worker is not in a `Ready` health state.
-    NotHealthy,
     /// The worker does not serve the required model hash.
     ModelNotServed,
+    /// The worker is not in a `Ready` health state.
+    NotHealthy,
+    /// The worker does not accept inference routed from remote peers
+    /// (`accepts_remote_inference == false` in its advertisement). The local
+    /// node itself is exempt: its own work is local, not remote.
+    NotAcceptingRemote,
     /// Not enough free RAM after subtracting reservations.
     InsufficientRam { available: u64, required: u64 },
     /// Not enough free VRAM after subtracting reservations.
@@ -59,24 +64,34 @@ impl Default for CapabilityMatcher {
 
 impl CapabilityMatcher {
     /// Pure decision. `trusted` is coordinator-side state (pairing/trust
-    /// store), never derived from the advertisement itself.
+    /// store), never derived from the advertisement itself. `local_peer` is
+    /// the coordinator's own peer id: the local node always accepts its own
+    /// work, so it is exempt from the `accepts_remote_inference` gate (that
+    /// flag governs *remote* resource sharing only).
     pub fn matches(
         &self,
         adv: &ComputeAdvertisement,
         req: &WorkloadRequirements,
         ledger: &ReservationLedger,
         trusted: bool,
+        local_peer: Option<&PeerId>,
     ) -> MatchOutcome {
         if !trusted {
             return MatchOutcome::Rejected(MatchReason::NotTrusted);
-        }
-        if !adv.availability.healthy() {
-            return MatchOutcome::Rejected(MatchReason::NotHealthy);
         }
         if !adv.capability.has_model(&req.model_hash)
             && !(self.allow_provisioning && adv.capability.can_provision)
         {
             return MatchOutcome::Rejected(MatchReason::ModelNotServed);
+        }
+        // A remote worker that has not opted in to remote sharing is not an
+        // eligible scheduling candidate (its own engine would reject the
+        // request). The local node is exempt: local work is not remote.
+        if !adv.accepts_remote_inference && Some(&adv.peer_id) != local_peer {
+            return MatchOutcome::Rejected(MatchReason::NotAcceptingRemote);
+        }
+        if !adv.availability.healthy() {
+            return MatchOutcome::Rejected(MatchReason::NotHealthy);
         }
 
         let booked_ram = ledger.reserved_ram(&adv.peer_id);
@@ -132,7 +147,26 @@ mod tests {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
-        assert_eq!(matcher.matches(&adv, &req(), &ledger, true), MatchOutcome::Eligible);
+        assert_eq!(matcher.matches(&adv, &req(), &ledger, true, None), MatchOutcome::Eligible);
+    }
+
+    #[test]
+    fn remote_worker_without_remote_opt_in_rejected() {
+        let matcher = CapabilityMatcher::default();
+        let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
+        let mut adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        adv.accepts_remote_inference = false;
+        // A remote worker that has not opted in is never a scheduling candidate.
+        assert_eq!(
+            matcher.matches(&adv, &req(), &ledger, true, None),
+            MatchOutcome::Rejected(MatchReason::NotAcceptingRemote)
+        );
+        // The local node itself is exempt: local work is not remote sharing.
+        let local = adv.peer_id;
+        assert_eq!(
+            matcher.matches(&adv, &req(), &ledger, true, Some(&local)),
+            MatchOutcome::Eligible
+        );
     }
 
     #[test]
@@ -141,7 +175,7 @@ mod tests {
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, false),
+            matcher.matches(&adv, &req(), &ledger, false, None),
             MatchOutcome::Rejected(MatchReason::NotTrusted)
         );
     }
@@ -152,7 +186,7 @@ mod tests {
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Unhealthy);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::NotHealthy)
         );
     }
@@ -164,7 +198,7 @@ mod tests {
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
         let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
         assert_eq!(
-            matcher.matches(&adv, &other, &ledger, true),
+            matcher.matches(&adv, &other, &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::ModelNotServed)
         );
     }
@@ -187,7 +221,7 @@ mod tests {
         adv.capability.can_provision = true;
         let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
         assert_eq!(
-            matcher.matches(&adv, &other, &ledger, true),
+            matcher.matches(&adv, &other, &ledger, true, None),
             MatchOutcome::Eligible
         );
     }
@@ -207,7 +241,7 @@ mod tests {
         adv.capability.can_provision = true;
         let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
         assert_eq!(
-            matcher.matches(&adv, &other, &ledger, true),
+            matcher.matches(&adv, &other, &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::ModelNotServed)
         );
     }
@@ -217,7 +251,7 @@ mod tests {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 512, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
-        match matcher.matches(&adv, &req(), &ledger, true) {
+        match matcher.matches(&adv, &req(), &ledger, true, None) {
             MatchOutcome::Rejected(MatchReason::InsufficientRam { available, required }) => {
                 assert!(available < required);
             }
@@ -231,7 +265,7 @@ mod tests {
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(512), 32, 0, WorkerHealth::Ready);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::InsufficientVram {
                 available: 512,
                 required: 3072 + 512
@@ -245,13 +279,13 @@ mod tests {
         let mut ledger = ReservationLedger::new(Duration::from_secs(60), 4);
         let p = test_peer();
         let adv = test_advertisement(p, 8 * 1024, Some(8 * 1024), 0, 0, WorkerHealth::Ready);
-        assert_eq!(matcher.matches(&adv, &req(), &ledger, true), MatchOutcome::Eligible);
+        assert_eq!(matcher.matches(&adv, &req(), &ledger, true, None), MatchOutcome::Eligible);
 
         // Book two workloads; the third must hit the RAM/VRAM ceiling.
         ledger.reserve(p, 3072, 4096);
         ledger.reserve(p, 3072, 4096);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::InsufficientVram {
                 available: 0,
                 required: 3072 + 512
@@ -265,7 +299,7 @@ mod tests {
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 99, 0, WorkerHealth::Ready);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::Overloaded)
         );
     }
@@ -276,7 +310,7 @@ mod tests {
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
         let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 0, 8, WorkerHealth::Ready);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::Overloaded)
         );
     }
@@ -289,7 +323,7 @@ mod tests {
         let adv = test_advertisement(p, 12 * 1024, Some(18 * 1024), 0, 0, WorkerHealth::Ready);
         ledger.reserve(p, 256, 3072);
         assert_eq!(
-            matcher.matches(&adv, &req(), &ledger, true),
+            matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::AtReservationCap)
         );
     }

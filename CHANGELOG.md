@@ -4,6 +4,43 @@ All notable changes to DecentraAI. Adheres loosely to
 [Keep a Changelog](https://keepachangelog.com/). The workspace ships as a
 single version (`1.0.0`) shared by every crate.
 
+## [Unreleased] — Multi-node fabric identity
+
+### Multi-node fabric experience (real Desktop ↔ Laptop identity)
+- **`allow_remote_inference` is now real, not dead config**: the setting is
+  enforced as a worker-side inbound gate (remote `InferRequest`s to a
+  node that did not opt in are rejected with a terminal, non-retryable
+  error), advertised in every `ComputeAdvertisement`
+  (`accepts_remote_inference`, `#[serde(default)]` → old peers deserialize
+  to `false`, the conservative choice) and enforced coordinator-side by the
+  `CapabilityMatcher` (a worker that did not opt in is `NotAcceptingRemote`
+  and never selected for remote work; the local peer is always eligible).
+- **Per-node identity reaches the API**: `/v1/network` now returns the
+  real LAN addresses of every connected peer (`addresses`) plus the node's
+  own listen addresses (`local_addresses`) from a new p2p `Peers` snapshot;
+  `/v1/compute` worker rows carry real static identity + resources
+  (CPU cores, total RAM, GPU name/VRAM, engine, served models with KV
+  context, `last_seen_secs`, `accepts_remote_inference`) sourced from the
+  advertised capability — never invented.
+- **The dashboard shows the distributed fabric from the node's own
+  perspective**: a "Fabric nodes" strip renders the local node plus every
+  discovered worker as identity cards (name, peer, LAN address, engine,
+  load/RAM/VRAM bars, served-model chips) with a live trust chain
+  DISCOVERED → UNTRUSTED → APPROVED → CONNECTED → WORKER READY.
+- **Discovery events are real**: a client-side diff of the worker registry
+  surfaces discovered / offline / reconnected events (with a canvas pulse
+  on the affected node) — no fake animations, only real transitions.
+- **Workers view is identity-first**: the registry table became per-node
+  cards with the same identity/resources/trust-chain rendering plus the
+  real trust action buttons (master-gated Approve/Revoke).
+- The fabric stage and pipeline now label nodes honestly: `● connected` /
+  `○ not connected`, `REMOTE-OK` / `local-only` (from the advertised opt-in),
+  real LAN addresses under each node, a RAM-free resource ring, and the
+  WORKER pipeline stage names the executing node (`local` / `remote`).
+- All identity data is read-only from `/status`, `/v1/compute`,
+  `/v1/network`; the page still never mutates state except on explicit
+  intent.
+
 ## [Unreleased] — Living Fabric UI
 
 ### Living Fabric (Overview redesign, "DecentraAI = a living distributed AI fabric")

@@ -967,6 +967,12 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             cm.set_engine(engine);
         }
     }
+    // Remote-sharing opt-in: the advertisement carries whether this node
+    // accepts inference routed from remote peers, so coordinators only ever
+    // schedule remote workers that will actually serve the request.
+    if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+        cm.set_accepts_remote_inference(config.inference.allow_remote_inference);
+    }
     compute_manager
         .set_allow_provisioning(config.sharing.provision_models_on_demand)
         .await;
@@ -1087,7 +1093,12 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             None
         };
         if let Some(backend) = worker_backend {
-            distributed.register_worker_backend(backend, model_hash.clone(), provisioning)?;
+            distributed.register_worker_backend(
+                backend,
+                model_hash.clone(),
+                provisioning,
+                config.inference.allow_remote_inference,
+            )?;
         }
 
         // Advertise real compute + hardware so the capability scheduler can
@@ -2899,12 +2910,18 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
         cm.set_signing_key(identity.signing_key_bytes());
     }
-    // M22: advertise the configured engine kind honestly rather than assuming
+// M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
     if let Some(engine) = config.inference.engine.as_deref() {
         if let Some(cm) = Arc::get_mut(&mut compute_manager) {
             cm.set_engine(engine);
         }
+    }
+    // Remote-sharing opt-in: the advertisement carries whether this node
+    // accepts inference routed from remote peers, so coordinators only ever
+    // schedule remote workers that will actually serve the request.
+    if let Some(cm) = Arc::get_mut(&mut compute_manager) {
+        cm.set_accepts_remote_inference(config.inference.allow_remote_inference);
     }
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model
@@ -2995,6 +3012,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 backend.clone(),
                 model_hash.clone(),
                 provisioning,
+                config.inference.allow_remote_inference,
             )?;
         }
 

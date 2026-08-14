@@ -1084,7 +1084,8 @@ async fn compute_handler(
 }
 
 /// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
-/// locality), connected peers, and local peer id. Empty when no compute/P2P.
+/// locality), connected peers, per-peer last-known LAN addresses, and the
+/// local peer + its own addresses. Empty when no compute/P2P.
 async fn network_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1097,12 +1098,31 @@ async fn network_handler(
         "attached": false,
         "connected": [],
         "links": [],
+        "addresses": [],
         "local_peer": null,
+        "local_addresses": [],
     });
     if let Some(p2p) = &state.p2p {
-        let connected = p2p.connected_peers().await;
+        let snapshot = p2p.peers_snapshot().await;
         body["connected"] =
-            serde_json::json!(connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+            serde_json::json!(snapshot.connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        body["addresses"] = serde_json::json!(
+            snapshot
+                .addresses
+                .iter()
+                .map(|(peer, addr)| serde_json::json!({
+                    "peer": peer.to_string(),
+                    "addr": addr.to_string(),
+                }))
+                .collect::<Vec<_>>()
+        );
+        body["local_addresses"] = serde_json::json!(
+            snapshot
+                .local_addresses
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if let Some(compute) = &state.compute {
         let graph = compute.network_graph();
@@ -2256,6 +2276,23 @@ mod tests {
             assert!(body.contains("Queue"));
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
+            // Multi-node fabric identity: per-node resource view + discovery
+            // feed + worker pipe identity are part of the normal user view.
+            assert!(body.contains("Fabric nodes"), "fabric nodes strip must be in the normal view");
+            assert!(body.contains("id=\"fabric-nodes\""), "fabric nodes container id present");
+            assert!(body.contains("id=\"discovery-feed\""), "discovery feed container id present");
+            assert!(body.contains("id=\"pipe-worker-name\""), "worker pipe identity element present");
+            // The JS that powers the identity view must exist (DOM without
+            // renderers would stay empty — the dashboard never fakes state).
+            for needle in [
+                "function renderFabricNodes",
+                "function updateDiscovery",
+                "function workerCard",
+                "function nodeChip",
+                "function trustChain",
+            ] {
+                assert!(body.contains(needle), "fabric JS must include {needle}");
+            }
         }
         manager.lock().await.shutdown().await.unwrap();
     }
@@ -2607,6 +2644,10 @@ mod tests {
             .unwrap();
         assert_eq!(network["attached"], false);
         assert!(network["connected"].is_array());
+        // Identity view: addresses + local addresses are always present
+        // (empty without a live p2p node), so the fabric UI never guesses.
+        assert!(network["addresses"].is_array());
+        assert!(network["local_addresses"].is_array());
 
         let exec: serde_json::Value = client
             .get(format!("http://{api}/v1/execution"))

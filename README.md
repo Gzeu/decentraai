@@ -41,6 +41,18 @@ single universal `decentraai node`:
 - **Persistent workers**: the worker's local llama-server stays bound to
   loopback and is **not idle-unloaded**, so a node never advertises ready while
   its engine is dead (`5758e05`).
+- **Explicit remote-sharing opt-in**: `inference.allow_remote_inference` is
+  now enforced end-to-end — a worker that does not opt in rejects remote
+  `InferRequest`s at its own gate and is never selected by a coordinator
+  (`NotAcceptingRemote`); the local peer is always eligible. Advertisements
+  carry the flag (`accepts_remote_inference`, default `false` for old peers).
+- **Per-node identity everywhere**: every node sees the fabric from its own
+  perspective — real LAN addresses (new p2p `Peers` snapshot →
+  `/v1/network.addresses` + `local_addresses`), per-worker CPU/RAM/GPU/
+  engine/model resources, a live trust chain
+  DISCOVERED → UNTRUSTED → APPROVED → CONNECTED → WORKER READY, and a real
+  discovery event feed (discovered / offline / reconnected) in the
+  dashboard.
 
 Verified: worker selection, reservation create/release, P2P execution,
 streaming, worker health, and two-machine sequential + concurrent + reuse
@@ -291,20 +303,26 @@ seconds: *"what is DecentraAI doing right now?"*
 
 **The Overview is the fabric itself.** A live canvas stage renders the
 local node at the center and every advertised worker (Laptop/Desktop/GPU
-nodes) as living entities — status color, load ring, trust badge —
+nodes) as living entities — status color, load ring, trust badge, real
+LAN address, connection state and `REMOTE-OK` / `local-only` label —
 connected by measured P2P links (M19 RTT). A pipeline strip
 (USER → REQUEST → PLANNER → RESERVATION → FABRIC → WORKER → ENGINE →
 STREAM → RESULT) lights up from real queue, recent-request and decision
 data: when a request is served the planner activates, the selected worker
-lights up, the reservation appears and tokens visibly stream; when idle
-the stage is calm and atmospheric. The M23 planner has a visible identity
-and an autonomous-decision strip shows safe operational facts only
-(CLASSIFYING → N CANDIDATES → NETWORK COST → KV AFFINITY → ENGINE →
-SELECTED WORKER → EXECUTING, no chain-of-thought). M24 recovery is part
-of the story: on a real failure the affected worker changes state and the
-replan becomes visible. **Nothing is faked** — every light, particle and
-state comes from `/status`, `/v1/peers`, `/v1/compute`, `/v1/network` and
-`/v1/execution`.
+lights up (named `local` / `remote` in the WORKER stage), the reservation
+appears and tokens visibly stream; when idle the stage is calm and
+atmospheric. The M23 planner has a visible identity and an
+autonomous-decision strip shows safe operational facts only (CLASSIFYING →
+N CANDIDATES → NETWORK COST → KV AFFINITY → ENGINE → SELECTED WORKER →
+EXECUTING, no chain-of-thought). M24 recovery is part of the story: on a
+real failure the affected worker changes state and the replan becomes
+visible. A **Fabric nodes** strip below renders every node (local +
+discovered workers) as an identity card — CPU/RAM/VRAM, engine, served
+models, LAN address, live trust chain
+DISCOVERED → UNTRUSTED → APPROVED → CONNECTED → WORKER READY — and a
+discovery feed surfaces real discovered / offline / reconnected events.
+**Nothing is faked** — every light, particle and state comes from
+`/status`, `/v1/peers`, `/v1/compute`, `/v1/network` and `/v1/execution`.
 
 Metrics, tables and the other 12 views (Chat, Topology, Decisions,
 Execution, Workers, Network, Models, Observability, Recovery, Diag,
