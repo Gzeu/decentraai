@@ -249,12 +249,15 @@ token** (least privilege — a leaked invite is never more than a guest):
 
 ```bash
 # On the coordinator:
-decentraai invite --addr /ip4/192.168.1.5/tcp/4001
+decentraai invite --addr /ip4/192.168.1.5/tcp/4001 --ttl 1440   # optional TTL in minutes
 # prints:  /ip4/192.168.1.5/tcp/4001/p2p/<peer-id> dsk_<64hex>
 
 # On the fresh node (quote the whole invite):
 decentraai join "/ip4/192.168.1.5/tcp/4001/p2p/<peer-id> dsk_<64hex>"
 ```
+
+`--ttl` makes the guest seat expire after the given minutes (default 0 = no
+expiry); an expired token is inactive at the next request (H3).
 
 `join` auto-provisions identity + config, stores the guest token as the
 node's credential (`runtime/invite.token`, 0600 — shown nowhere else) and

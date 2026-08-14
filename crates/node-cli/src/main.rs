@@ -126,6 +126,10 @@ struct InviteArgs {
     /// identity. Example: `/ip4/192.168.1.5/tcp/4001`.
     #[arg(long)]
     addr: String,
+    /// Invite lifetime in minutes. Past this the guest token stops working
+    /// (H3). Default 0 = no expiry.
+    #[arg(long, default_value = "0")]
+    ttl: u64,
 }
 #[derive(Debug, Args)]
 struct JoinArgs {
@@ -2113,15 +2117,33 @@ fn invite(args: InviteArgs) -> Result<()> {
             .unwrap_or_default()
             .as_secs()
     );
-    let token = store.create(&name, Tier::GUEST)?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = if args.ttl > 0 {
+        Some(now_secs + args.ttl * 60)
+    } else {
+        None
+    };
+    let token = store.create(&name, Tier::GUEST, expires_at)?;
     decentraai_audit::record_best_effort(
         &data_dir.join("logs"),
         "invite_created",
-        serde_json::json!({"name": name, "tier": Tier::GUEST.0, "addr": addr}),
+        serde_json::json!({
+            "name": name,
+            "tier": Tier::GUEST.0,
+            "addr": addr,
+            "expires_at": expires_at,
+            "ttl_minutes": args.ttl,
+        }),
     );
 
     println!("Join invite for '{name}' (Tier 1 — Guest, least privilege):");
     println!("  {multiaddr} {token}");
+    if let Some(exp) = expires_at {
+        println!("  Expires: {} ({} min left)", exp, args.ttl);
+    }
     println!();
     println!(
         "Share this with a newcomer, who runs exactly:\n  decentraai join \"{multiaddr} {token}\""
@@ -2217,7 +2239,7 @@ fn token_command(command: TokenCommand) -> Result<()> {
     match command {
         TokenCommand::Create { name, tier, .. } => {
             let tier = Tier::parse(tier)?;
-            let plaintext = store.create(&name, tier)?;
+            let plaintext = store.create(&name, tier, None)?;
             decentraai_audit::record_best_effort(
                 &logs_dir,
                 "token_created",
@@ -3478,7 +3500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = decentraai_tokens::TokenStore::load(&dir.path().join("tokens.json")).unwrap();
         let plaintext = store
-            .create("invite-0", decentraai_tokens::Tier::GUEST)
+            .create("invite-0", decentraai_tokens::Tier::GUEST, None)
             .unwrap();
         assert_eq!(store.lookup(&plaintext).unwrap().tier, 1);
         let on_disk = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();

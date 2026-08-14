@@ -357,7 +357,10 @@ release.
 - [x] Compare announcement.peer_id with transport peer ID — the on_infer path
   (P2) verifies against the authenticated connected peer; signed advertisements
   are keyed to the signer's public key mapping to the claimed peer (P3)
-- [ ] Pairing with expiration and revocation (invite/trust grant seats; no TTL)
+- [x] Pairing with expiration and revocation — `decentraai invite --ttl <min>`
+  issues a Guest token that stops working after the TTL (tokens registry now
+  stores an optional `expires_at`, `lookup`/`is_active` reject expired tokens);
+  revoke was already supported
 - [x] Replay protection via nonce/sequence number — P4: per-sender nonce +
   bounded TTL ReplayGuard on the worker; outbound monotonic nonces
 - [ ] Capability-based authorization: which models each worker can serve
@@ -365,7 +368,10 @@ release.
   already existed (`crates/runtime`); **per-peer** added on the P2P worker path
   (`distributed::rate_limit::PeerRateLimiter`, keyed by the authenticated peer,
   `peer_rate_limited` audit)
-- [ ] Limit prompt size and output size
+- [x] Limit prompt size and output size — enforced in `inference-adapter`
+  `validate()` (`max_prompt_bytes`/`max_output_tokens`) on both `generate` and
+  `stream`, surfaced as a clear terminal `InferFailed` (`PromptTooLarge` /
+  `OutputLimitExceeded`) by the worker
 - [x] Secret management without tokens in config or logs (token registry stores
   hashes; signing keys live only in the node's identity; audit never logs them)
 - [x] Audit for login, pairing, revoke, routing and inference — per-request

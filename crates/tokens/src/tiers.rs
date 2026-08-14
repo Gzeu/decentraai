@@ -75,6 +75,7 @@ mod tests {
             tier,
             created_at: 1,
             revoked: false,
+            expires_at: None,
         }
     }
 

@@ -54,6 +54,10 @@ pub struct TokenRecord {
     pub tier: u8,
     pub created_at: u64,
     pub revoked: bool,
+    /// Unix seconds at which the token stops working, or `None` for no expiry.
+    /// Backward-compatible: older registries without the field are `None`.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,8 +124,9 @@ impl TokenStore {
     }
 
     /// Issues a new token. Returns the plaintext — show it once, then
-    /// forget it; only the hash is kept.
-    pub fn create(&mut self, name: &str, tier: Tier) -> Result<String> {
+    /// forget it; only the hash is kept. `expires_at` (unix seconds) makes the
+    /// token stop working after that instant; `None` means no expiry.
+    pub fn create(&mut self, name: &str, tier: Tier, expires_at: Option<u64>) -> Result<String> {
         let name = name.trim();
         if name.is_empty() {
             bail!("token name must not be empty");
@@ -139,6 +144,7 @@ impl TokenStore {
                 tier: tier.0,
                 created_at: now_secs(),
                 revoked: false,
+                expires_at,
             },
         );
         self.save()?;
@@ -172,11 +178,22 @@ impl TokenStore {
         Ok(from)
     }
 
-    /// Resolves a plaintext token to its record, if active.
+    /// Resolves a plaintext token to its record, if active (not revoked and not
+    /// expired). A token whose `expires_at` is in the past is inactive.
     pub fn lookup(&self, plaintext: &str) -> Option<&TokenRecord> {
         self.tokens
             .get(&hash_token(plaintext))
-            .filter(|r| !r.revoked)
+            .filter(|r| !r.revoked && Self::not_expired(r))
+    }
+
+    /// Whether a record is live at the current time: not revoked and, if it has
+    /// an expiry, that expiry is still in the future.
+    pub fn is_active(&self, record: &TokenRecord) -> bool {
+        !record.revoked && Self::not_expired(record)
+    }
+
+    fn not_expired(record: &TokenRecord) -> bool {
+        record.expires_at.is_none_or(|ts| ts > now_secs())
     }
 
     /// All records (active and revoked), newest first, for `token list`.
@@ -199,7 +216,7 @@ mod tests {
     fn create_shows_plaintext_once_and_stores_only_the_hash() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
-        let plaintext = store.create("alice", Tier::GUEST).unwrap();
+        let plaintext = store.create("alice", Tier::GUEST, None).unwrap();
         assert!(plaintext.starts_with("dsk_"));
         assert_eq!(plaintext.len(), 4 + 64);
 
@@ -219,29 +236,29 @@ mod tests {
     fn duplicate_active_names_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
-        store.create("alice", Tier::GUEST).unwrap();
-        assert!(store.create("alice", Tier::CORE).is_err());
+        store.create("alice", Tier::GUEST, None).unwrap();
+        assert!(store.create("alice", Tier::CORE, None).is_err());
     }
 
     #[test]
     fn revoke_hides_the_token_but_keeps_the_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
-        let plaintext = store.create("bob", Tier::CONTRIBUTOR).unwrap();
+        let plaintext = store.create("bob", Tier::CONTRIBUTOR, None).unwrap();
         store.revoke("bob").unwrap();
         assert!(store.lookup(&plaintext).is_none());
         let listed = store.list();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].revoked);
         // A revoked name can be reused.
-        store.create("bob", Tier::CORE).unwrap();
+        store.create("bob", Tier::CORE, None).unwrap();
     }
 
     #[test]
     fn set_tier_reassigns_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
-        let plaintext = store.create("dana", Tier::GUEST).unwrap();
+        let plaintext = store.create("dana", Tier::GUEST, None).unwrap();
         store.set_tier("dana", Tier::CORE).unwrap();
 
         let reloaded = open(dir.path());
@@ -255,7 +272,7 @@ mod tests {
         let plaintext;
         {
             let mut store = open(dir.path());
-            plaintext = store.create("carol", Tier::CORE).unwrap();
+            plaintext = store.create("carol", Tier::CORE, None).unwrap();
         }
         let reloaded = open(dir.path());
         let record = reloaded.lookup(&plaintext).unwrap();
@@ -275,5 +292,27 @@ mod tests {
         assert!(Tier::parse(0).is_err());
         assert!(Tier::parse(4).is_err());
         assert_eq!(Tier::parse(2).unwrap().name(), "contributor");
+    }
+
+    #[test]
+    fn expired_token_is_inactive_but_revoked_stays_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path());
+        // An expiry in the far past makes the token unusable immediately.
+        let expired = store
+            .create("dave", Tier::GUEST, Some(1))
+            .unwrap();
+        assert!(
+            store.lookup(&expired).is_none(),
+            "a token whose expiry has passed must not resolve"
+        );
+        let rec = store.tokens.get(&hash_token(&expired)).unwrap();
+        assert!(!store.is_active(rec), "expired token must not be active");
+
+        // A future or absent expiry stays active.
+        let live = store.create("erin", Tier::GUEST, Some(now_secs() + 3600)).unwrap();
+        assert!(store.lookup(&live).is_some());
+        let never = store.create("frank", Tier::GUEST, None).unwrap();
+        assert!(store.lookup(&never).is_some());
     }
 }

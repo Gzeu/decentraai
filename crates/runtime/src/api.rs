@@ -530,7 +530,7 @@ async fn admin_token_create_handler(
                 Ok(s) => s,
                 Err(_) => return forbidden("load failed"),
             };
-            match s.create(&name, decentraai_tokens::Tier(tier)) {
+            match s.create(&name, decentraai_tokens::Tier(tier), None) {
                 Ok(t) => {
                     let a = state.info.repo_root.join("logs/audit.jsonl");
                     let _ = decentraai_audit::record(
@@ -1915,7 +1915,7 @@ mod tests {
         {
             let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
             guest = store
-                .create("guest", decentraai_tokens::Tier::GUEST)
+                .create("guest", decentraai_tokens::Tier::GUEST, None)
                 .unwrap();
         }
         let (api, manager) =
@@ -1965,7 +1965,7 @@ mod tests {
         {
             let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
             guest = store
-                .create("guest", decentraai_tokens::Tier::GUEST)
+                .create("guest", decentraai_tokens::Tier::GUEST, None)
                 .unwrap();
         }
         let (api, manager) =
@@ -2527,7 +2527,7 @@ mod tests {
 
         // A subscriber token is not an admin: forbidden.
         let mut store = decentraai_tokens::TokenStore::load(&token_store).unwrap();
-        let sub = store.create("alice", decentraai_tokens::Tier(2)).unwrap();
+        let sub = store.create("alice", decentraai_tokens::Tier(2), None).unwrap();
         let subscriber = reqwest::Client::new()
             .post(format!("http://{api}/api/admin/token/create"))
             .header("Authorization", format!("Bearer {sub}"))
