@@ -1,48 +1,38 @@
-//! The Command Deck — the node's single control-plane UI.
+//! The DecentraAI Command Deck — a living visual control plane for a
+//! distributed AI fabric.
 //!
-//! One embedded HTML/JS surface served by the node from `crates/runtime` (no
-//! separate frontend build, single-binary constraint). Every number rendered
-//! here is **real runtime state**: the page reads `/status`, `/v1/peers`,
-//! `/v1/compute`, `/v1/network` and `/v1/execution` (operator/admin views) and
-//! the master-gated admin JSON endpoints. It never calls the proxied inference
-//! endpoints on its own, so watching the page neither inflates the request
-//! counter nor resets the idle-unload clock.
+//! Design principle: DecentraAI is a **living distributed AI fabric**, not an
+//! admin panel. The primary surface (Overview) answers "what is the system
+//! doing right now?" visually: a live canvas stage renders the fabric as
+//! entities — the local node, every advertised worker, the planner — with real
+//! P2P links and visible execution flow. Statistics, tables and metrics stay
+//! available but are **secondary**.
 //!
-//! Open WebUI remains the primary Chat; the deck keeps a compact quick-chat
-//! (streamed `/v1/chat/completions`) so the control plane can also talk to the
-//! node directly. The dashboard is the technical control plane; it is not
-//! replaced by Open WebUI.
+//! Everything drawn is derived from **real runtime state** (`/status`,
+//! `/v1/peers`, `/v1/compute`, `/v1/network`, `/v1/execution`). Nothing is
+//! faked: when idle the stage is calm and atmospheric; when a real request is
+//! being planned, reserved and executed, the planner activates, the selected
+//! worker lights up, reservations appear and tokens visibly stream. When the
+//! M24 recovery machinery reacts to a failure, the affected worker changes
+//! state and the replan becomes part of the story.
 //!
-//! # Views (all from real state, never mocks)
+//! Views (unchanged from the previous Command Deck, functionality preserved):
+//! - **Overview** — the living fabric (primary) + M23 decision strip +
+//!   secondary metrics (Model, Inference, Queue, Recent, Share).
+//! - **Chat** — quick chat (Open WebUI is the primary Chat).
+//! - **Topology** — the same fabric engine on a larger stage.
+//! - **Decisions / Execution / Workers / Network / Models / Observability /
+//!   Recovery / Diag / Security / Settings** — real data, operator-grade.
 //!
-//! - **Overview** — model, inference metrics (requests/tokens/latency/success
-//!   rate/tok/s/uptime/idle), quick chat, fair queue, recent calls, system.
-//! - **Fabric** — live topology: the local node at the center, every advertised
-//!   worker on a ring, edges colored by the **measured** M19 RTT, node rings
-//!   colored by real worker health, load arcs from the compute registry.
-//! - **Decisions** — the M23 autonomous execution decisions: workload class,
-//!   priority, every candidate with its constraint breaches + score breakdown,
-//!   the selected worker, expected mode, network cost, KV affinity, reservation,
-//!   outcome and the full lifecycle trace.
-//! - **Execution** — the correlated `ExecutedPlan` rows (plan/reservation/
-//!   worker/RTT/KV-headroom/outcome/reasoning) from `/v1/execution`.
-//! - **Workers** — the compute registry with load/queue/tok-s/latency/RAM/VRAM,
-//!   in-flight and reserved capacity, trust state and master-gated
-//!   Approve/Revoke.
-//! - **Network** — measured per-peer links (RTT, bandwidth, transfer cost,
-//!   locality), connected peers and the reputation store (`/v1/peers`).
-//! - **Models** — served models (engine, context, RAM/VRAM, active) + the local
-//!   registry index.
-//! - **Observability** — latency/tok-s sparklines from real recent requests,
-//!   p50/p95/p99, success rate, lifetime totals, Prometheus endpoint note.
-//! - **Recovery** — M24 resilience signals: engine auto-restarts, KV sessions,
-//!   offline/stale workers, connection state.
-//! - **Diagnostics** — health checks (node, engine, P2P, workers, sessions)
-//!   + recent audit events.
-//! - **Security** — full audit events + token admin (create/list/revoke,
-//!   tier + role) + worker trust actions.
-//! - **Settings** — node config, resources, generation defaults and tier
-//!   policies surfaced from `/status`.
+//! Single-binary constraint: pure embedded HTML/CSS/JS, no external assets,
+//! no CDN. The strongest visualization technology compatible with that
+//! constraint is the **Canvas 2D** API (with requestAnimationFrame), which is
+//! what the fabric stage uses.
+//!
+//! Invariant: the page only ever polls read-only control endpoints; a chat
+//! POST or an admin action happens exclusively on explicit user intent, so
+//! watching the page never touches the inference backend, never inflates the
+//! request counter and never resets the idle-unload clock.
 
 /// The Command Deck HTML shell. All dynamic data is fetched by the module JS;
 /// the shell itself contains no node data (invariant: watching the page never
@@ -56,19 +46,19 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 <title>DecentraAI dashboard</title>
 <style>
 :root{
-  --bg:#070a10; --bg-2:#0b0f17; --panel:#10161f; --panel-2:#0d131c;
-  --line:#1c2634; --line-2:#273244;
-  --text:#e6edf3; --muted:#8fa0b3; --faint:#5c6c80;
-  --accent:#22d3ee; --accent-2:#6366f1; --accent-soft:rgba(34,211,238,.12);
+  --bg:#05070d; --bg-2:#0a0e16; --panel:#0d121c; --panel-2:#0a0f18;
+  --line:#182234; --line-2:#223048;
+  --text:#e8eef6; --muted:#8fa0b3; --faint:#5a6b80;
+  --accent:#22d3ee; --accent-2:#6366f1; --accent-soft:rgba(34,211,238,.1);
   --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
   --radius:14px; --radius-sm:9px;
-  --shadow:0 10px 30px rgba(0,0,0,.35);
+  --shadow:0 14px 44px rgba(0,0,0,.45);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{background:radial-gradient(1200px 800px at 80% -10%,#101b2e 0%,var(--bg) 45%);color:var(--text);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+body{background:radial-gradient(1100px 700px at 78% -12%, rgba(34,211,238,.07) 0%, transparent 55%), radial-gradient(900px 620px at -8% 108%, rgba(99,102,241,.06) 0%, transparent 50%), var(--bg);color:var(--text);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
 code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:6px;padding:1px 6px}
 .mono{font-family:var(--mono)}
@@ -84,21 +74,21 @@ input,select,textarea{font:inherit;color:var(--text);background:var(--bg-2);bord
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .layout{display:grid;grid-template-columns:224px 1fr;min-height:100vh}
 /* ---------- sidebar ---------- */
-.rail{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:rgba(11,15,23,.85);border-right:1px solid var(--line);padding:18px 12px;gap:4px;backdrop-filter:blur(10px)}
+.rail{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:rgba(8,12,20,.82);border-right:1px solid var(--line);padding:18px 12px;gap:4px;backdrop-filter:blur(12px)}
 .brand{display:flex;align-items:center;gap:10px;padding:4px 8px 16px}
-.brand-mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:grid;place-items:center;font-weight:800;color:#04121a;font-size:15px}
+.brand-mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:grid;place-items:center;font-weight:800;color:#04121a;font-size:15px;box-shadow:0 0 18px rgba(34,211,238,.35)}
 .brand-name{font-weight:700;letter-spacing:.02em}
 .brand-sub{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.14em}
 .rail-label{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.12em;padding:14px 10px 4px}
-.nav-item{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:1px solid transparent;color:var(--muted);padding:8px 10px;border-radius:10px;font-size:13px}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:transparent;border:1px solid transparent;color:var(--muted);padding:8px 10px;border-radius:10px;font-size:13px;transition:background .15s,color .15s}
 .nav-item:hover{background:rgba(255,255,255,.04);color:var(--text)}
 .nav-item.active{background:var(--accent-soft);border-color:rgba(34,211,238,.28);color:var(--accent);font-weight:600}
 .nav-item .ic{width:16px;text-align:center;font-size:13px;opacity:.85}
 .rail-foot{margin-top:auto;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
 .rail-live{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:2px 8px}
 /* ---------- main ---------- */
-.main{padding:22px 26px 60px;max-width:1320px;width:100%}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
+.main{padding:22px 26px 60px;max-width:1360px;width:100%}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px}
 .topbar h1{font-size:19px;font-weight:700;letter-spacing:-.01em}
 .topbar .crumb{color:var(--faint);font-size:12px}
 .top-right{display:flex;align-items:center;gap:10px}
@@ -108,6 +98,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .dot.warn{background:var(--warn);box-shadow:0 0 8px var(--warn)}
 .dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
 .dot.off{background:var(--faint)}
+.dot.accent{background:var(--accent);box-shadow:0 0 8px var(--accent)}
 .pulse{animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .view{display:none;animation:fade .25s ease}
@@ -143,6 +134,53 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .score-bars .sb{font-size:10px;color:var(--faint)}
 .score-bars .sb b{font-family:var(--mono);color:var(--text);font-weight:600}
 .score-bars .bar{height:3px;margin-top:2px}
+/* ---------- living fabric stage ---------- */
+.now-strip{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;font-size:12.5px}
+.now-label{font-size:10px;font-weight:700;letter-spacing:.18em;color:var(--accent);border:1px solid rgba(34,211,238,.3);border-radius:999px;padding:2px 10px;background:var(--accent-soft)}
+#now-state{font-family:var(--mono);font-size:12.5px;color:var(--text)}
+.planner-chip{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-family:var(--mono);color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:rgba(13,18,28,.7)}
+.planner-chip b{color:var(--accent);font-weight:600}
+.planner-chip .pd{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.planner-chip .pd.on{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.planner-chip .pd.busy{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+.planner-chip .pd.fail{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.stage-card{position:relative;background:radial-gradient(820px 460px at 32% -6%, rgba(34,211,238,.07), transparent 62%), linear-gradient(180deg,#0b101a,#060a11);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
+.fabric-stage{display:block;width:100%;height:520px}
+.stage-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 14px;border-top:1px solid var(--line);background:rgba(6,10,17,.72);flex-wrap:wrap}
+.stage-foot .sf{font-size:11px;color:var(--faint);font-family:var(--mono)}
+.stage-foot .sf b{color:var(--muted);font-weight:600}
+/* pipeline: USER -> REQUEST -> PLANNER -> RESERVATION -> FABRIC -> WORKER -> ENGINE -> STREAM -> RESULT */
+.pipeline{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
+.pipe{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.1em;color:var(--faint);padding:4px 8px;border-radius:8px;border:1px solid transparent;transition:color .45s,border-color .45s,background .45s}
+.pipe .pi{font-size:11px;opacity:.85}
+.pipe.on{color:var(--accent);border-color:rgba(34,211,238,.32);background:var(--accent-soft)}
+.pipe.on .pi{opacity:1;text-shadow:0 0 8px rgba(34,211,238,.75)}
+.pipe.done{color:var(--ok)}
+.pipe.done .pi{color:var(--ok);text-shadow:0 0 8px rgba(52,211,153,.6)}
+.pipe.fail{color:var(--bad);border-color:rgba(248,113,113,.4)}
+.pipe.fail .pi{color:var(--bad)}
+.pipe-arrow{color:var(--faint);font-size:11px;opacity:.4}
+/* M23 decision strip — safe operational facts only, no chain-of-thought */
+.decision-strip{margin-top:14px;background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px;box-shadow:var(--shadow)}
+.ds-head{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.ds-head .count{color:var(--accent);font-family:var(--mono)}
+.ds-row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.ds-step{display:flex;flex-direction:column;gap:2px;padding:7px 12px;border:1px solid var(--line);border-left:0;background:rgba(8,12,19,.6);min-width:108px}
+.ds-step:first-child{border-left:1px solid var(--line);border-radius:10px 0 0 10px}
+.ds-step:last-child{border-radius:0 10px 10px 0}
+.ds-step .k{font-size:9.5px;letter-spacing:.13em;color:var(--faint);text-transform:uppercase}
+.ds-step .v{font-family:var(--mono);font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.ds-step.on{border-color:rgba(34,211,238,.35);background:var(--accent-soft)}
+.ds-step.on .k{color:var(--accent)}
+.ds-step.done{border-color:rgba(52,211,153,.3)}
+.ds-step.done .k{color:var(--ok)}
+.ds-step.fail{border-color:rgba(248,113,113,.4);background:rgba(248,113,113,.06)}
+.ds-step.fail .k{color:var(--bad)}
+.ds-arrow{align-self:center;color:var(--faint);padding:0 3px;font-size:12px;opacity:.55}
+.ds-empty{font-size:12.5px;color:var(--faint);padding:4px 2px}
+/* secondary metrics */
+.secondary{margin-top:14px}
+.secondary .card{padding:13px 15px}
 /* chat */
 .chat-box{display:flex;flex-direction:column;height:300px}
 #chat-history{flex:1;overflow-y:auto;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
@@ -155,7 +193,7 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .chat-status{font-size:11.5px;color:var(--muted);font-family:var(--mono)}
 /* topology */
 .topo-wrap{background:var(--bg-2);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.topo-wrap svg{display:block;width:100%;height:auto}
+.topo-wrap canvas{display:block;width:100%;height:560px}
 .topo-legend{display:flex;gap:16px;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted)}
 .topo-legend span{display:inline-flex;align-items:center;gap:6px}
 /* timeline */
@@ -196,7 +234,7 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px solid var(--line-2);border-radius:5px;padding:1px 6px;color:var(--muted)}
 .empty{color:var(--faint);font-size:12.5px;padding:10px 4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:900px){.two-col{grid-template-columns:1fr}.layout{grid-template-columns:64px 1fr}.rail{padding:14px 8px}.brand-name,.brand-sub,.rail-label,.nav-item span:not(.ic),.rail-live span:last-child{display:none}.rail-live{justify-content:center}}
+@media(max-width:900px){.two-col{grid-template-columns:1fr}.layout{grid-template-columns:64px 1fr}.rail{padding:14px 8px}.brand-name,.brand-sub,.rail-label,.nav-item span:not(.ic),.rail-live span:last-child{display:none}.rail-live{justify-content:center}.fabric-stage{height:360px}.ds-row{flex-direction:column}.ds-step{border-left:1px solid var(--line);border-radius:0}.ds-step:first-child{border-radius:10px 10px 0 0}.ds-step:last-child{border-radius:0 0 10px 10px}}
 </style>
 </head>
 <body>
@@ -242,9 +280,41 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       </div>
     </div>
 
-    <!-- ================= OVERVIEW (normal user) ================= -->
+    <!-- ================= OVERVIEW (the living fabric — primary) ================= -->
     <section class="view active" id="view-overview">
-      <div class="grid cols-3">
+      <div class="now-strip">
+        <span class="now-label">NOW</span>
+        <span id="now-state">connecting to the fabric…</span>
+        <span class="planner-chip" id="planner-chip"><span class="pd" id="planner-dot"></span>planner · <b id="planner-state">idle</b></span>
+      </div>
+
+      <!-- primary: the living fabric stage -->
+      <div class="stage-card">
+        <canvas id="fabric-stage" class="fabric-stage"></canvas>
+        <div class="stage-foot">
+          <div class="pipeline" id="pipeline">
+            <div class="pipe" data-stage="user"><span class="pi">◉</span><span>USER</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="request"><span class="pi">✉</span><span>REQUEST</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="planner"><span class="pi">✦</span><span>PLANNER</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="reservation"><span class="pi">⊞</span><span>RESERVATION</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="fabric"><span class="pi">◈</span><span>FABRIC</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="worker"><span class="pi">▤</span><span>WORKER</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="engine"><span class="pi">▦</span><span>ENGINE</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="stream"><span class="pi">⇄</span><span>STREAM</span></div><span class="pipe-arrow">→</span>
+            <div class="pipe" data-stage="result"><span class="pi">✓</span><span>RESULT</span></div>
+          </div>
+          <div class="sf" id="stage-facts">fabric: — · peers: — · rtt: —</div>
+        </div>
+      </div>
+
+      <!-- M23 autonomous decision strip — safe operational facts only -->
+      <div class="decision-strip">
+        <div class="ds-head">Autonomous decision <span class="count" id="ds-count"></span></div>
+        <div id="decision-strip" class="ds-empty">no autonomous decision yet — the planner is idle. Send a routed request to watch it plan.</div>
+      </div>
+
+      <!-- secondary: metrics, queue, recent, share -->
+      <div class="grid cols-3 secondary">
         <div class="card">
           <h2>Model</h2>
           <div class="metric accent" style="margin-bottom:8px"><div class="label">Active model</div><div class="value" id="model-name" style="font-size:17px">&hellip;</div></div>
@@ -314,13 +384,13 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
         <div class="card">
           <h2>Live fabric · topology <span class="count" id="topo-count"></span></h2>
           <div class="topo-wrap">
-            <svg id="topology" viewBox="0 0 900 520" preserveAspectRatio="xMidYMid meet"></svg>
+            <canvas id="fabric-topo" class="fabric-topo"></canvas>
             <div class="topo-legend">
               <span><span class="dot ok"></span>ready</span>
               <span><span class="dot warn"></span>degraded/busy</span>
               <span><span class="dot bad"></span>unhealthy/offline</span>
               <span><span class="dot accent" style="background:var(--accent)"></span>local node</span>
-              <span style="margin-left:auto">edge = measured RTT (M19) · ring = health</span>
+              <span style="margin-left:auto">edge = measured RTT (M19) · ring = health · flow = live execution</span>
             </div>
           </div>
         </div>
@@ -547,6 +617,12 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 /// views; the only mutation of runtime state happens when the user explicitly
 /// sends a chat message or performs an admin action. `__SHARE__` and
 /// `__MODEL__` are filled at serve time by `api.rs`.
+///
+/// The living-fabric canvas engine draws real state: the local node at the
+/// center, every advertised worker as a living entity, measured P2P links as
+/// beziers and execution flow as particles. It never fabricates activity —
+/// particles only flow along links that are genuinely busy, and the pipeline /
+/// decision strip light up only from real queue, execution and decision data.
 pub const JS_TEMPLATE: &str = r##"
 // ---- helpers ---------------------------------------------------------------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -572,6 +648,7 @@ function show(view){
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
   document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   $('page-title').textContent = TITLES[view] || view;
+  setStageVisible(view === 'overview' || view === 'fabric');
 }
 document.querySelectorAll('.nav-item').forEach(b => b.addEventListener('click', () => show(b.dataset.view)));
 document.addEventListener('keydown', e => {
@@ -744,63 +821,353 @@ function spark(id, values, color){
     + '<polyline points="'+line+'" fill="none" stroke="'+color+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
 }
 
-// ---- topology --------------------------------------------------------------
-function renderTopology(c, n){
-  const svg = $('topology'); if (!svg) return;
-  const W = 900, H = 520, cx = W/2, cy = H/2, R = 200;
+// =============================================================================
+// LIVING FABRIC ENGINE — Canvas 2D stage, real data only
+// =============================================================================
+const STATE_COLORS = { Ready:'#34d399', Busy:'#22d3ee', Degraded:'#fbbf24', Unhealthy:'#f87171', Offline:'#5a6b80' };
+const stageData = { s:null, c:null, n:null, x:null, mode:'idle', lastTokens:0, lastStreamTs:0 };
+
+function initStage(canvasId){
+  const cv = document.getElementById(canvasId);
+  if (!cv || cv.__fabric) return cv && cv.__fabric;
+  const ctx = cv.getContext('2d');
+  const f = {
+    cv, ctx, W: 0, H: 0, dpr: Math.min(window.devicePixelRatio || 1, 2),
+    visible: false, raf: null, t: 0,
+    nodes: [], links: [], parts: [], pulses: [],
+  };
+  const resize = () => {
+    f.W = cv.clientWidth || 900; f.H = cv.clientHeight || 520;
+    cv.width = Math.round(f.W * f.dpr); cv.height = Math.round(f.H * f.dpr);
+    ctx.setTransform(f.dpr, 0, 0, f.dpr, 0, 0);
+  };
+  resize();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(cv);
+  cv.__fabric = f;
+  return f;
+}
+
+const stageOverview = initStage('fabric-stage');
+const stageTopo = initStage('fabric-topo');
+
+function setStageVisible(on){
+  [stageOverview, stageTopo].forEach(f => {
+    if (!f) return;
+    f.visible = on;
+    if (on && !f.raf) f.raf = requestAnimationFrame(() => stageLoop(f));
+  });
+}
+
+function stageLoop(f){
+  if (!f.visible) { f.raf = null; return; }
+  f.t += 0.016;
+  drawStage(f);
+  f.raf = requestAnimationFrame(() => stageLoop(f));
+}
+
+// Rebuild node/link geometry from real state on every refresh.
+function buildStageGeometry(f){
+  const d = stageData;
+  const workers = (d.c && d.c.workers) || [];
+  const links = (d.n && d.n.links) || [];
+  const rtt = {}; links.forEach(l => rtt[l.peer] = l.rtt_ms);
+  const dec = (d.x && d.x.decisions && d.x.decisions[0]) || null;
+  const activePeer = (dec && dec.selected_worker) || null;
+
+  f.W = f.W || f.cv.clientWidth || 900; f.H = f.H || f.cv.clientHeight || 520;
+  const W = f.W, H = f.H;
+  const cx = W * 0.5, cy = H * 0.56;
+  const R = Math.min(W, H) * 0.30;
+
+  // nodes: local + workers on an orbit
+  f.nodes = [];
+  const nW = Math.max(workers.length, 1);
+  workers.forEach((w, i) => {
+    const ang = -Math.PI/2 + (i / nW) * Math.PI * 2;
+    f.nodes.push({
+      id: w.peer_id, name: w.node_name || short(w.peer_id, 10),
+      kind: 'worker', x: cx + R * Math.cos(ang), y: cy + R * Math.sin(ang),
+      status: w.status || 'Offline', col: STATE_COLORS[w.status] || '#5a6b80',
+      load: (w.load_percent || 0) / 100, in_flight: w.in_flight || 0,
+      trusted: !!w.trusted, active: activePeer === w.peer_id,
+      label: (w.node_name || short(w.peer_id, 14)),
+    });
+  });
+  f.nodes.unshift({
+    id: 'local', name: (d.c && d.c.local_peer) || (d.n && d.n.local_peer) || 'local',
+    kind: 'local', x: cx, y: cy, status: 'Ready', col: '#22d3ee',
+    load: 0, in_flight: 0, trusted: true, active: false,
+    label: 'this node',
+  });
+  // links: local -> worker, real RTT
+  f.links = f.nodes.filter(n => n.kind === 'worker').map(n => {
+    const r = rtt[n.id];
+    return { a: f.nodes[0], b: n, rtt_ms: r, active: n.active || n.in_flight > 0 };
+  });
+}
+
+function drawStage(f){
+  const { ctx } = f;
+  const W = f.W, H = f.H;
+  ctx.clearRect(0, 0, W, H);
+  if (W < 40 || H < 40) return;
+
+  const d = stageData;
+  const dec = (d.x && d.x.decisions && d.x.decisions[0]) || null;
+  const recovering = d.mode === 'recovering';
+
+  // ---- ambient dot grid (atmospheric, very subtle) ----
+  ctx.fillStyle = 'rgba(130,150,180,.05)';
+  for (let x = 26; x < W; x += 52) {
+    for (let y = 26; y < H; y += 52) {
+      ctx.beginPath(); ctx.arc(x, y, 0.9, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ---- links (beziers, color = measured RTT, glow when live) ----
+  f.links.forEach(lk => {
+    const { a, b } = lk;
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 - 26;
+    const rtt = lk.rtt_ms;
+    let col = 'rgba(140,160,185,.22)';
+    if (rtt !== undefined) col = rtt < 5 ? 'rgba(52,211,153,.5)' : rtt < 25 ? 'rgba(34,211,238,.45)' : rtt < 100 ? 'rgba(251,191,36,.5)' : 'rgba(248,113,113,.55)';
+    if (lk.active) col = 'rgba(34,211,238,.85)';
+    ctx.strokeStyle = col;
+    ctx.lineWidth = lk.active ? 2.2 : 1.1;
+    ctx.setLineDash(lk.active ? [] : [3, 6]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(mx, my, b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    // RTT label on measured links
+    if (rtt !== undefined) {
+      ctx.fillStyle = 'rgba(143,160,179,.7)';
+      ctx.font = '10px ui-monospace, Menlo, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(rtt + 'ms', mx, my - 6);
+    }
+  });
+
+  // ---- nodes ----
+  f.nodes.forEach(n => {
+    const pulse = 0.5 + 0.5 * Math.sin(f.t * (n.active ? 4.5 : 1.1) + (n.x % 7));
+    const alpha = 0.75 + 0.25 * pulse;
+    if (n.kind === 'local') {
+      // soft halo + core
+      ctx.beginPath(); ctx.arc(n.x, n.y, 46, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(34,211,238,.07)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(n.x, n.y, 30, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(34,211,238,.4)'; ctx.lineWidth = 1; ctx.setLineDash([3, 5]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(n.x, n.y, 16, 0, Math.PI * 2);
+      ctx.fillStyle = '#22d3ee'; ctx.shadowColor = 'rgba(34,211,238,.6)'; ctx.shadowBlur = 18; ctx.fill(); ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(143,160,179,.85)'; ctx.font = '600 11px -apple-system, Segoe UI, Roboto, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('you · this node', n.x, n.y + 38);
+      ctx.fillStyle = 'rgba(34,211,238,.9)'; ctx.font = '10px ui-monospace, Menlo, monospace';
+      ctx.fillText(short(n.name, 18), n.x, n.y - 34);
+    } else {
+      const col = recovering && n.active ? '#fbbf24' : n.col;
+      const sel = n.active;
+      // halo
+      ctx.beginPath(); ctx.arc(n.x, n.y, 30, 0, Math.PI * 2);
+      ctx.fillStyle = sel ? 'rgba(34,211,238,.10)' : 'rgba(0,0,0,.30)'; ctx.fill();
+      // outer ring + load arc
+      ctx.beginPath(); ctx.arc(n.x, n.y, 24, 0, Math.PI * 2);
+      ctx.strokeStyle = col; ctx.globalAlpha = sel ? 1 : .35; ctx.lineWidth = sel ? 2.5 : 1.6; ctx.stroke();
+      ctx.globalAlpha = 1;
+      if (n.load > 0.02) {
+        const circ = 2 * Math.PI * 24;
+        ctx.beginPath(); ctx.arc(n.x, n.y, 24, -Math.PI/2, -Math.PI/2 + circ * Math.min(n.load, 1));
+        ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.stroke();
+      }
+      // core
+      ctx.beginPath(); ctx.arc(n.x, n.y, 11, 0, Math.PI * 2);
+      ctx.fillStyle = col;
+      ctx.globalAlpha = alpha * (n.status === 'Offline' ? .3 : .92);
+      ctx.shadowColor = col; ctx.shadowBlur = sel ? 20 : 10; ctx.fill(); ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+      // labels
+      ctx.fillStyle = n.status === 'Offline' ? '#5a6b80' : '#e8eef6';
+      ctx.font = '600 11.5px -apple-system, Segoe UI, Roboto, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(n.label, n.x, n.y + 40);
+      ctx.fillStyle = sel ? '#22d3ee' : (n.trusted ? 'rgba(52,211,153,.85)' : 'rgba(251,191,36,.8)');
+      ctx.font = '9.5px ui-monospace, Menlo, monospace';
+      ctx.fillText((sel ? 'SELECTED · ' : '') + (n.status || '') + ' · ' + Math.round(n.load * 100) + '%', n.x, n.y - 30);
+    }
+  });
+
+  // ---- particles: only along genuinely live links ----
+  const flowRate = d.mode === 'active' ? 0.9 : d.mode === 'recovering' ? 0.25 : 0.06;
+  if (Math.random() < flowRate && f.links.length) {
+    const live = f.links.filter(l => l.active);
+    const pool = (d.mode === 'idle' ? f.links : (live.length ? live : f.links));
+    const lk = pool[Math.floor(Math.random() * pool.length)];
+    if (lk) {
+      const fromWorker = Math.random() < 0.5;
+      f.parts.push({
+        x: fromWorker ? lk.b.x : lk.a.x, y: fromWorker ? lk.b.y : lk.a.y,
+        tx: fromWorker ? lk.a.x : lk.b.x, ty: fromWorker ? lk.a.y : lk.b.y,
+        t: 0, sp: 0.006 + Math.random() * 0.004,
+        col: d.mode === 'recovering' ? '#fbbf24' : '#22d3ee',
+      });
+    }
+  }
+  f.parts = f.parts.filter(p => p.t < 1);
+  f.parts.forEach(p => {
+    p.t += p.sp;
+    const x = p.x + (p.tx - p.x) * p.t, y = p.y + (p.ty - p.y) * p.t;
+    const a = 1 - p.t;
+    ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2);
+    ctx.fillStyle = p.col; ctx.globalAlpha = a * .85;
+    ctx.shadowColor = p.col; ctx.shadowBlur = 8; ctx.fill(); ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  });
+
+  // ---- pulses (decision/complete/recovery rings) ----
+  f.pulses = f.pulses.filter(p => p.t < 1);
+  f.pulses.forEach(p => {
+    p.t += 0.012;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 12 + p.t * 44, 0, Math.PI * 2);
+    ctx.strokeStyle = p.col; ctx.globalAlpha = (1 - p.t) * .5; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.globalAlpha = 1;
+  });
+}
+
+// ---- fabric state derivation (real data only) ------------------------------
+function recoveryEvents(s){
+  return (s && s.recent_events || []).filter(e => /restart|recover|evict|offline|reconnect|respawn|replan/i.test(e.event || ''));
+}
+function deriveMode(s, c, x){
+  const dec = (x && x.decisions && x.decisions[0]) || null;
+  const serving = (s && s.queue && s.queue.serving);
+  const recent = (s && s.recent_requests || [])[0];
+  const now = Date.now() / 1000;
+  const streaming = recent && (now - recent.timestamp) < 12;
+  if (recoveryEvents(s).length > 0) return 'recovering';
+  if (serving || streaming || (dec && dec.outcome === 'in_flight')) return 'active';
+  return 'idle';
+}
+
+// ---- pipeline + decision strip + now-state (HTML, derived from real data) --
+function setPipe(stage, cls){
+  document.querySelectorAll('.pipe[data-stage="' + stage + '"]').forEach(el => {
+    el.classList.remove('on', 'done', 'fail');
+    if (cls) el.classList.add(cls);
+  });
+}
+function renderPipeline(s, c, n, x){
+  const dec = (x && x.decisions && x.decisions[0]) || null;
+  const serving = (s && s.queue && s.queue.serving);
+  const recent = (s && s.recent_requests || [])[0];
+  const now = Date.now() / 1000;
+  const streaming = recent && (now - recent.timestamp) < 12;
+  const mode = stageData.mode;
+  const recovering = mode === 'recovering';
+  const done = dec && (dec.outcome === 'succeeded' || dec.outcome === 'completed');
+  const failed = dec && (dec.outcome === 'failed');
+
+  setPipe('user', (serving || streaming) ? 'on' : (done ? 'done' : ''));
+  setPipe('request', (serving || streaming) ? 'on' : (done ? 'done' : ''));
+  setPipe('planner', dec ? (done ? 'done' : (failed ? 'fail' : (recovering ? 'fail' : 'on'))) : '');
+  setPipe('reservation', dec && dec.reservation_id ? (done ? 'done' : 'on') : (recovering ? 'fail' : ''));
+  setPipe('fabric', ((c && c.workers || []).length || (n && n.links || []).length) ? 'on' : '');
+  setPipe('worker', dec && dec.selected_worker ? (done ? 'done' : (failed ? 'fail' : 'on')) : '');
+  setPipe('engine', s && s.model_loaded ? 'on' : '');
+  setPipe('stream', streaming ? 'on' : '');
+  setPipe('result', done ? 'done' : (failed ? 'fail' : (streaming ? 'on' : '')));
+
+  // planner chip: visible identity + state
+  const pd = $('planner-dot'), ps = $('planner-state');
+  if (recovering) { pd.className = 'pd fail'; ps.textContent = 'recovering · replanning'; }
+  else if (dec) {
+    if (done) { pd.className = 'pd on'; ps.textContent = 'idle (last: ' + (dec.selected_worker ? short(dec.selected_worker, 10) : 'no worker') + ')'; }
+    else if (failed) { pd.className = 'pd fail'; ps.textContent = 'failed · reacting'; }
+    else { pd.className = 'pd busy'; ps.textContent = (dec.workload_class || '').replace(/_/g, ' ') + ' · routing'; }
+  } else { pd.className = 'pd'; ps.textContent = 'idle'; }
+
+  // now-state: the one-line answer to "what is DecentraAI doing right now?"
+  const ns = $('now-state');
+  if (recovering) {
+    const ev = recoveryEvents(s)[0];
+    ns.textContent = 'recovering — ' + (ev ? ev.event.replace(/_/g, ' ') : 'replanning after a failure') + ' · the fabric is rerouting';
+  } else if (serving) {
+    ns.textContent = 'executing request from ' + esc(serving.who) + ' on ' + esc((dec && dec.selected_worker ? short(dec.selected_worker, 12) : 'this node')) + ' · ' + serving.endpoint.replace('/v1/', '');
+  } else if (streaming) {
+    ns.textContent = 'streaming a reply · ' + recent.tokens_per_second.toFixed(1) + ' tok/s · ' + recent.completion_tokens + ' tokens generated';
+  } else if (dec && dec.outcome === 'in_flight') {
+    ns.textContent = 'planning ' + (dec.workload_class || 'request').replace(/_/g, ' ') + ' · ' + (dec.candidates || []).length + ' candidates';
+  } else if (done) {
+    ns.textContent = 'fabric calm · last request completed on ' + short(dec.selected_worker || 'this node', 12);
+  } else {
+    ns.textContent = 'fabric calm · ' + ((c && c.workers || []).length) + ' worker(s) · ' + ((n && n.connected || []).length) + ' peer(s) connected';
+  }
+
+  // stage facts line
+  const rtts = (n && n.links || []).map(l => l.rtt_ms).filter(v => v !== undefined);
+  const rttStr = rtts.length ? (Math.min(...rtts) + '–' + Math.max(...rtts) + ' ms') : 'not measured';
+  $('stage-facts').innerHTML = 'fabric: <b>' + ((c && c.workers || []).length) + '</b> workers · peers: <b>' + ((n && n.connected || []).length) + '</b> · rtt: <b>' + rttStr + '</b>' + (s ? ' · tokens: <b>' + s.tokens_generated + '</b>' : '');
+}
+
+function renderDecisionStrip(x){
+  const dec = (x && x.decisions && x.decisions[0]) || null;
+  const el = $('decision-strip');
+  $('ds-count').textContent = (x && x.decisions || []).length + ' tracked';
+  if (!dec) {
+    el.className = 'ds-empty';
+    el.innerHTML = 'no autonomous decision yet — the planner is idle. Send a routed request to watch it plan.';
+    return;
+  }
+  const cands = (dec.candidates || []);
+  const kv = dec.kv_affinity || (cands.some(c => c.kv_prefix_resident) ? 'prefix resident' : 'cold');
+  const eng = dec.engine_capability || (cands[0] && cands[0].engine) || 'llama_server';
+  const done = dec.outcome === 'succeeded' || dec.outcome === 'completed';
+  const failed = dec.outcome === 'failed';
+  const live = done || failed ? 'done' : 'on';
+  const steps = [
+    { k: 'Classifying', v: (dec.workload_class || '—').replace(/_/g, ' '), cls: live },
+    { k: 'Candidates', v: cands.length + ' eligible', cls: live },
+    { k: 'Network cost', v: dec.network_cost_ms != null ? dec.network_cost_ms + ' ms' : '—', cls: live },
+    { k: 'KV affinity', v: kv, cls: live },
+    { k: 'Engine', v: eng, cls: live },
+    { k: 'Selected worker', v: dec.selected_worker ? short(dec.selected_worker, 12) : 'none', cls: failed ? 'fail' : live },
+    { k: 'Execution', v: failed ? 'failed · rerouting' : (done ? 'completed' : (dec.expected_mode || 'in flight')), cls: failed ? 'fail' : live },
+  ];
+  el.className = '';
+  el.innerHTML = '<div class="ds-row">' + steps.map((st, i) =>
+    '<div class="ds-step ' + st.cls + '"><span class="k">' + st.k + '</span><span class="v">' + esc(st.v) + '</span></div>' +
+    (i < steps.length - 1 ? '<span class="ds-arrow">→</span>' : '')
+  ).join('') + '</div>';
+}
+
+function renderFabric(s, c, n, x){
+  stageData.s = s; stageData.c = c; stageData.n = n; stageData.x = x;
+  stageData.mode = deriveMode(s, c, x);
+  [stageOverview, stageTopo].forEach(f => { if (f) buildStageGeometry(f); });
+  renderPipeline(s, c, n, x);
+  renderDecisionStrip(x);
+  // pulses: real events get a ring on the canvas
+  const recent = (s && s.recent_requests || [])[0];
+  const now = Date.now() / 1000;
+  if (recent && (now - recent.timestamp) < 6) addPulse(stageOverview, stageOverview.nodes[0] || { x: 0, y: 0 }, '#34d399');
+  if (stageData.mode === 'recovering') {
+    const dec = (x && x.decisions && x.decisions[0]) || null;
+    const w = dec && dec.selected_worker ? stageOverview.nodes.find(n => n.id === dec.selected_worker) : null;
+    addPulse(stageOverview, w || stageOverview.nodes[0] || { x: 0, y: 0 }, '#fbbf24');
+  }
+  // topology metrics (shared with the advanced fabric view)
   const workers = (c && c.workers) || [];
   const links = (n && n.links) || [];
-  const rtt = {}; links.forEach(l => rtt[l.peer] = l.rtt_ms);
-  const local = (c && c.local_peer) || (n && n.local_peer) || 'local';
-  $('local-peer').textContent = short(local, 24);
+  $('local-peer').textContent = short((c && c.local_peer) || (n && n.local_peer) || 'local', 24);
   $('fabric-workers').textContent = workers.length;
   $('fabric-connected').textContent = ((n && n.connected) || []).length;
   $('fabric-links').textContent = links.length;
   $('fabric-sessions').textContent = (c && c.sessions) || 0;
   $('topo-count').textContent = workers.length + ' workers · ' + links.length + ' links';
+  const last = (x && x.decisions || [])[0];
+  if (last) { $('fabric-last').textContent = short(last.selected_worker || 'no worker', 22); $('fabric-last-sub').textContent = (last.workload_class || '') + ' · ' + (last.expected_mode || '') + ' · ' + (last.network_cost_ms || 0) + 'ms'; }
+  else { $('fabric-last').textContent = '—'; $('fabric-last-sub').textContent = ''; }
+}
 
-  const colors = { Ready:'#34d399', Busy:'#22d3ee', Degraded:'#fbbf24', Unhealthy:'#f87171', Offline:'#5c6c80' };
-  const stateOf = w => (w && w.status) || 'Offline';
-  const edgeColor = rtt_ms => rtt_ms === undefined ? 'rgba(140,160,180,.25)' : rtt_ms < 5 ? 'rgba(52,211,153,.7)' : rtt_ms < 25 ? 'rgba(34,211,238,.65)' : rtt_ms < 100 ? 'rgba(251,191,36,.7)' : 'rgba(248,113,113,.75)';
-
-  let s = '<defs><filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
-  // ring guides
-  for (let rr = R; rr >= 120; rr -= 40) s += '<circle cx="'+cx+'" cy="'+cy+'" r="'+rr+'" fill="none" stroke="rgba(255,255,255,.04)"/>';
-  // edges (measured RTT)
-  workers.forEach((w, i) => {
-    const ang = -Math.PI/2 + (i / Math.max(workers.length,1)) * Math.PI * 2;
-    const x = cx + R*Math.cos(ang), y = cy + R*Math.sin(ang);
-    const rtt_ms = rtt[w.peer_id];
-    s += '<line x1="'+cx+'" y1="'+cy+'" x2="'+x+'" y2="'+y+'" stroke="'+edgeColor(rtt_ms)+'" stroke-width="'+(rtt_ms ? 2.2 : 1)+'" stroke-dasharray="'+(rtt_ms ? '' : '3 5')+'"/>';
-    if (rtt_ms !== undefined) s += '<text x="'+((cx+x)/2)+'" y="'+((cy+y)/2-6)+'" fill="'+edgeColor(rtt_ms)+'" font-size="11" text-anchor="middle" font-family="var(--mono)">'+rtt_ms+'ms</text>';
-  });
-  // workers
-  workers.forEach((w, i) => {
-    const ang = -Math.PI/2 + (i / Math.max(workers.length,1)) * Math.PI * 2;
-    const x = cx + R*Math.cos(ang), y = cy + R*Math.sin(ang);
-    const col = colors[stateOf(w)] || '#5c6c80';
-    const load = (w.load_percent || 0) / 100;
-    s += '<circle cx="'+x+'" cy="'+y+'" r="26" fill="rgba(0,0,0,.35)"/>';
-    s += '<circle cx="'+x+'" cy="'+y+'" r="22" fill="none" stroke="'+col+'" stroke-width="2.5" opacity=".35"/>';
-    s += '<circle cx="'+x+'" cy="'+y+'" r="14" fill="'+col+'" opacity="'+(stateOf(w)==='Offline' ? .25 : .9)+'" filter="url(#glow)"/>';
-    // load arc
-    if (load > 0.02) {
-      const circ = 2*Math.PI*22;
-      s += '<circle cx="'+x+'" cy="'+y+'" r="22" fill="none" stroke="'+col+'" stroke-width="3" stroke-dasharray="'+(circ*load)+' '+(circ)+'" transform="rotate(-90 '+x+' '+y+')"/>';
-    }
-    if (w.in_flight > 0) s += '<circle cx="'+x+'" cy="'+y+'" r="26" fill="none" stroke="'+col+'" stroke-width="1.5" stroke-dasharray="4 6" class="pulse"/>';
-    const label = (w.node_name || short(w.peer_id, 10));
-    s += '<text x="'+x+'" y="'+y+34+'" fill="'+(stateOf(w)==='Offline' ? '#5c6c80' : '#e6edf3')+'" font-size="11.5" text-anchor="middle" font-weight="600">'+esc(label)+'</text>';
-    s += '<text x="'+x+'" y="'+y+48+'" fill="'+(w.trusted ? '#34d399' : '#fbbf24')+'" font-size="9.5" text-anchor="middle" font-family="var(--mono)">'+(w.trusted ? 'TRUSTED' : 'UNTRUSTED')+'</text>';
-    s += '<text x="'+x+'" y="'+y-28+'" fill="#8fa0b3" font-size="10" text-anchor="middle" font-family="var(--mono)">'+(stateOf(w))+' · '+(w.load_percent||0)+'%</text>';
-  });
-  // local node
-  s += '<circle cx="'+cx+'" cy="'+cy+'" r="44" fill="rgba(34,211,238,.08)"/>';
-  s += '<circle cx="'+cx+'" cy="'+cy+'" r="30" fill="none" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3 5" class="pulse"/>';
-  s += '<circle cx="'+cx+'" cy="'+cy+'" r="18" fill="#22d3ee" filter="url(#glow)"/>';
-  s += '<text x="'+cx+'" y="'+cy+26+'" fill="#8fa0b3" font-size="11" text-anchor="middle">you · this node</text>';
-  s += '<text x="'+cx+'" y="'+cy-30+'" fill="#22d3ee" font-size="10.5" text-anchor="middle" font-family="var(--mono)">'+short(local, 16)+'</text>';
-  svg.innerHTML = s;
+function addPulse(f, node, col){
+  if (!f || !node || node.x === undefined) return;
+  f.pulses.push({ x: node.x, y: node.y, t: 0, col });
 }
 
 // ---- renderers -------------------------------------------------------------
@@ -856,9 +1223,6 @@ function renderExecutions(x){
   ).join('');
   $('execution').innerHTML = rows || '<tr><td colspan="9" class="empty">no executions yet</td></tr>';
   $('exec-count').textContent = (x && x.executions || []).length;
-  const last = (x && x.decisions || [])[0];
-  if (last) { $('fabric-last').textContent = short(last.selected_worker || 'no worker', 22); $('fabric-last-sub').textContent = (last.workload_class || '') + ' · ' + (last.expected_mode || '') + ' · ' + (last.network_cost_ms || 0) + 'ms'; }
-  else { $('fabric-last').textContent = '—'; $('fabric-last-sub').textContent = ''; }
 }
 function outcomeBadge(o){
   if (o === 'succeeded') return '<span class="badge ok">succeeded</span>';
@@ -1078,9 +1442,10 @@ async function refresh(){
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderObservability(s, c); renderRecovery(s, c, null); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
-  if (c || n) renderTopology(c, n);
+  renderFabric(s, c, n, x);
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);
 }
+setStageVisible(true);
 refresh(); setInterval(refresh, 3000);
 "##;

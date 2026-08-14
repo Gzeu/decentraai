@@ -286,21 +286,38 @@ Revoke a seat at any time with `decentraai token revoke --name invite-<n>`.
 ### 5. Watch the node in your browser (dashboard)
 
 Open `http://127.0.0.1:8080/` while `serve` runs. The dashboard is the
-node's **Command Deck** — a single embedded control plane with a sidebar
-rail of 13 views and a command palette (Ctrl+K), refreshed every 3 seconds:
+node's **Command Deck** — a living control plane that answers visually in
+seconds: *"what is DecentraAI doing right now?"*
 
-- **Overview** — the loaded model with file size, uptime and idle timer,
-  inference metrics (completed requests, total tokens generated, latency
-  p50/p95/p99 and success rate, last request speed in tok/s, and the last
-  12 inference calls), live system pressure (free/total RAM, CPU threads,
-  GPU name, temperature, free VRAM, utilization), and the queue card
+**The Overview is the fabric itself.** A live canvas stage renders the
+local node at the center and every advertised worker (Laptop/Desktop/GPU
+nodes) as living entities — status color, load ring, trust badge —
+connected by measured P2P links (M19 RTT). A pipeline strip
+(USER → REQUEST → PLANNER → RESERVATION → FABRIC → WORKER → ENGINE →
+STREAM → RESULT) lights up from real queue, recent-request and decision
+data: when a request is served the planner activates, the selected worker
+lights up, the reservation appears and tokens visibly stream; when idle
+the stage is calm and atmospheric. The M23 planner has a visible identity
+and an autonomous-decision strip shows safe operational facts only
+(CLASSIFYING → N CANDIDATES → NETWORK COST → KV AFFINITY → ENGINE →
+SELECTED WORKER → EXECUTING, no chain-of-thought). M24 recovery is part
+of the story: on a real failure the affected worker changes state and the
+replan becomes visible. **Nothing is faked** — every light, particle and
+state comes from `/status`, `/v1/peers`, `/v1/compute`, `/v1/network` and
+`/v1/execution`.
+
+Metrics, tables and the other 12 views (Chat, Topology, Decisions,
+Execution, Workers, Network, Models, Observability, Recovery, Diag,
+Security, Settings) remain available below the stage and via the sidebar
+rail with a command palette (Ctrl+K):
+
+- **Overview** — living fabric stage (primary) + decision strip +
+  secondary Model/Inference/Queue cards, recent inference calls and the
+  share guide
 - **Chat** — streams model responses (SSE) token-by-token by default, with
-  a non-streaming toggle, abort and retry; it shows latency and token
-  usage per request and keeps the conversation across page reloads
-  (client-side `localStorage`)
-- **Topology** — the live fabric as an SVG graph: the local node at the
-  center, every advertised worker around it, edges colored by measured RTT
-  (M19), worker rings shaded by health/load, trusted badges
+  a non-streaming toggle, abort and retry; keeps the conversation across
+  page reloads (client-side `localStorage`)
+- **Topology** — the same fabric engine on a larger stage
 - **Autonomous decisions** — the M23 decision ring: workload class,
   candidate score breakdowns (tps/latency/load/queue/headroom/net/kv),
   constraint breaches, KV affinity, expected mode, reasoning and the
@@ -320,7 +337,6 @@ rail of 13 views and a command palette (Ctrl+K), refreshed every 3 seconds:
   tracked/trusted peers, model + engine, the real resource limits/guards
   from config (CPU/RAM reserve, GPU policy), the generation defaults
   (sampling + system prompt) and the subscription tier policies
-- a share guide with the exact `swarm start` + `pull` commands for this node
 
 The page polls only the read-only status/control endpoints (`/status`,
 `/v1/peers`, `/v1/compute`, `/v1/network`, `/v1/execution`) — it never

@@ -52,6 +52,16 @@
   Settings) with a sidebar rail, command palette (Ctrl+K), live fabric
   topology SVG, M23 decision traces, and Settings rendering the real
   generation defaults + tier policies from `/status`
+- [x] P8: Living Fabric UI — the Overview becomes the visual identity of
+  DecentraAI: a Canvas 2D fabric stage renders the local node and every
+  advertised worker as living entities with real P2P links (M19 RTT),
+  execution visibly travels through a USER→REQUEST→PLANNER→RESERVATION→
+  FABRIC→WORKER→ENGINE→STREAM→RESULT pipeline (real queue/decision data
+  only), the M23 planner has a visible identity with a safe-facts decision
+  strip (classifying/candidates/network cost/KV affinity/engine/selected/
+  executing, no chain-of-thought), and M24 recovery becomes part of the
+  story (affected worker changes state, replan pulse). Metrics/tables stay
+  but are secondary; same single-binary embedded dashboard, same 13 views.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join

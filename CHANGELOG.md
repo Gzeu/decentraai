@@ -4,6 +4,39 @@ All notable changes to DecentraAI. Adheres loosely to
 [Keep a Changelog](https://keepachangelog.com/). The workspace ships as a
 single version (`1.0.0`) shared by every crate.
 
+## [Unreleased] — Living Fabric UI
+
+### Living Fabric (Overview redesign, "DecentraAI = a living distributed AI fabric")
+- The Overview is no longer primarily a grid of statistics: the primary
+  element is a live **Canvas 2D fabric stage** (single-binary constraint
+  kept — no external assets, no CDN, `requestAnimationFrame` engine).
+- The stage renders the fabric as living entities: the local node at the
+  center, every advertised worker (Laptop/Desktop/GPU) as an entity with
+  real status color, load arc, trust and live labels, connected by
+  measured P2P links (M19 RTT) drawn as beziers.
+- **Execution visibly travels**: particles flow only along genuinely live
+  links; the pipeline strip (USER → REQUEST → PLANNER → RESERVATION →
+  FABRIC → WORKER → ENGINE → STREAM → RESULT) lights up from real queue /
+  recent-request / decision data. Idle is calm and atmospheric; a real
+  request activates the planner, lights the selected worker, shows the
+  reservation, streams tokens and returns to calm on completion.
+- **The M23 planner has a visible identity**: a planner chip shows
+  idle/classifying/routing/recovering state, and a decision strip renders
+  safe operational facts only — CLASSIFYING → N CANDIDATES → NETWORK COST →
+  KV AFFINITY → ENGINE CAPABILITY → SELECTED WORKER → EXECUTING — with no
+  chain-of-thought exposed.
+- **Recovery is part of the story**: when real M24 recovery events exist
+  (restart/recover/evict/replan), the mode flips to `recovering`, the
+  affected worker changes color, the planner chip reacts and a recovery
+  pulse ring appears on the stage.
+- Topology view uses the same canvas engine on a larger stage (SVG diagram
+  replaced). All other views (Chat, Decisions, Execution, Workers, Network,
+  Models, Observability, Recovery, Diag, Security, Settings) are untouched
+  functionally and remain fed by real runtime state.
+- Invariant preserved: the page still only polls read-only control
+  endpoints; a chat POST or admin action happens exclusively on explicit
+  user intent.
+
 ## [Unreleased] — Command Deck UI
 
 ### Command Deck (embedded control plane, rewritten)
