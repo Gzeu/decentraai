@@ -4,6 +4,33 @@ All notable changes to DecentraAI. Adheres loosely to
 [Keep a Changelog](https://keepachangelog.com/). The workspace ships as a
 single version (`1.0.0`) shared by every crate.
 
+## [Unreleased] — M23 Increment B (decision core into the live fabric)
+
+### M23 Full Autonomy, Increment B (live decision + lifecycle observability)
+- `decentraai-fabric::decision` is now wired into the actual coordinator path,
+  not just an exported module: `ComputeManager::record_decision` builds an
+  explainable `ExecutionDecision` (workload class, candidates, hard constraints,
+  per-candidate score + network cost, selected worker, KV affinity, engine
+  capability, expected mode) per routed request, using the **same live
+  planner/network/KV state** as `plan_and_reserve`.
+- `ComputeManager::finalize_decision` correlates each decision with its real
+  `reservation_id`, `plan_id` and observed `outcome`, and appends the
+  Reserved → Executing → Completed/Failed → Released lifecycle trace.
+- `decentraai_fabric::decision::adapt` (OBSERVE → ADAPT) now drives the real
+  retry/replan decision in `route_request` with the live remaining
+  eligible-worker count (`ComputeManager::eligible_worker_count`), preserving
+  M24 idempotency-safe retry semantics (never after output, never on definitive
+  rejection/cancellation).
+- Control plane: `/v1/execution` now also returns the bounded (cap 64)
+  `decisions` ring; dashboard adds an "Autonomous decisions (M23 lifecycle)"
+  view rendering workload, selected worker, priority, network cost, KV affinity,
+  reservation, outcome and the safe-reasons trace.
+- Honest scope: this is the decision core *integrated into the live execution
+  lifecycle*. Self-healing, mid-request multi-objective re-planning and
+  proactive rebalancing (true M23 Full Autonomy) remain not-claimed.
+- Full honest status (what is operational vs foundation): see
+  [`docs/autonomous-execution.md`](docs/autonomous-execution.md).
+
 ## [1.0.0] - Initial production release
 
 DecentraAI is a decentralized P2P network for sharing GGUF models and serving
@@ -49,11 +76,14 @@ security + control-plane hardening, and stable parallel test gates.
   audit) views — all from real runtime state.
 
 ### Foundations kept honest
-- M21 (distributed MoE) / M22 (multi-engine) / M23 (autonomous planner) remain
-  **foundation-only**: engineered with safe, gated increments (expert-split
-  guard, engine-kind selection + capability probe, planner configurable
-  weights + decision modules) but not claimed production-verified — no engine
+- M21 (distributed MoE) / M22 (multi-engine) remain **foundation-only**:
+  engineered with safe, gated increments (expert-split guard, engine-kind
+  selection + capability probe) but not claimed production-verified — no engine
   advertises the gating capabilities yet.
+- M23 (autonomous planner) is **partial**: the decision core is now integrated
+  into the live execution lifecycle (Increment B), but true full autonomy
+  (self-healing, mid-request multi-objective re-planning, proactive
+  rebalancing) is **not** claimed.
 
 ### How to run
 ```bash

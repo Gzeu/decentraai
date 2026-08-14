@@ -57,6 +57,9 @@ pub struct RequestFacts {
     pub transfer_mib: u64,
     /// Whether local execution exists (i.e. this node can self-run).
     pub local_peer: Option<String>,
+    /// Request priority 0..=255 (higher = more urgent). Drives priority-aware
+    /// scoring: urgent work favors the lowest-latency, least-queued worker.
+    pub priority: u8,
 }
 
 /// Configurable objective weights for the planner's [`ExecutionPlanner::score`].
@@ -312,6 +315,12 @@ impl ExecutionPlanner {
         let latency_score = 1.0 - (f.latency_ms as f32 / 1000.0).clamp(0.0, 1.0);
         let load_score = 1.0 - (f.load_percent as f32 / 100.0);
         let queue_score = (1.0 - f.queue_depth as f32 / 10.0).clamp(0.0, 1.0);
+        // Priority-aware: urgent requests (priority > 0) amplify the value of a
+        // fast, unqueued worker, biasing selection toward the best available
+        // compute. At priority 0 the factor is exactly 1.0, so default behavior
+        // is unchanged.
+        let priority_on = (f32::from(req.priority) / 255.0).clamp(0.0, 1.0);
+        let priority_boost = 1.0 + 0.5 * priority_on;
         let headroom = if req.est_ram_mb > 0 {
             (f.available_ram_mb as f64 / req.est_ram_mb as f64).min(1.0) as f32
         } else {
@@ -331,9 +340,9 @@ impl ExecutionPlanner {
         };
 
         let total = (cfg.w_tps * tps_score as f64
-            + cfg.w_latency * latency_score as f64
+            + cfg.w_latency * (latency_score * priority_boost) as f64
             + cfg.w_load * load_score as f64
-            + cfg.w_queue * queue_score as f64
+            + cfg.w_queue * (queue_score * priority_boost) as f64
             + cfg.w_headroom * headroom as f64
             + cfg.w_net * net_score as f64
             + cfg.w_kv * kv_score as f64) as f32;
@@ -408,6 +417,7 @@ mod tests {
             },
             transfer_mib: 0,
             local_peer: None,
+            priority: 0,
         }
     }
 
@@ -420,6 +430,28 @@ mod tests {
         let p = ExecutionPlanner::default().plan(&req(), &ws);
         assert_eq!(p.plan.workers(), vec!["fast"]);
         assert_eq!(p.plan.stage_count(), 1);
+    }
+
+    #[test]
+    fn priority_boosts_the_latency_sensitive_score() {
+        // A pure, deterministic check of the priority-aware objective: for the
+        // SAME worker, a high-priority request must value its low-latency /
+        // low-queue position strictly more than an impartial one does, so an
+        // urgent request is steered toward the fastest available compute.
+        let fast = worker_facts("fast", 180, 50, 10);
+        let planner = ExecutionPlanner::default();
+        let cfg = PlannerConfig::default();
+        let mut low = req();
+        low.priority = 0;
+        let mut high = req();
+        high.priority = 255;
+
+        let lo = planner.candidate_score(&fast, &low, false, &cfg);
+        let hi = planner.candidate_score(&fast, &high, false, &cfg);
+        // At priority 0 the boost factor is exactly 1.0; at 255 it is 1.5, so
+        // the latency*queue contribution (and thus the total) strictly grows.
+        assert!(hi.total > lo.total, "high-priority must value the fast worker more");
+        assert!((lo.latency - hi.latency).abs() < f32::EPSILON, "latency term unchanged");
     }
 
     #[test]

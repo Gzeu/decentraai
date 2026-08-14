@@ -757,6 +757,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let mut maybe_server: Option<LlamaServer> = None;
     let mut provision_factory: Option<decentraai_distributed::ProvisioningFactory> = None;
     let mut worker_backend: Option<OpenAiCompatibleBackend> = None;
+    // Single authoritative source of truth for the live engine base URL. The
+    // engine supervisor (M24) writes the current port here after every start /
+    // respawn; the worker backend resolves its base URL synchronously from this
+    // cache each request, so routed inference can never hit a stale engine port
+    // after a respawn (no frozen backend URL, no false worker).
+    let live_engine_url: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // M24 engine supervisor restart spec: captured so the ServeManager can
     // respawn llama-server if it crashes while the node stays up.
     let mut restart_binary: Option<std::path::PathBuf> = None;
@@ -794,6 +801,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             match LlamaServer::start(&binary, &runtime) {
                 Ok(server) => {
                     backend_url = server.base_url();
+                    *live_engine_url.lock().unwrap() = Some(backend_url.clone());
+                    let resolver_state = live_engine_url.clone();
                     let backend = OpenAiCompatibleBackend::new(BackendConfig {
                         base_url: backend_url.clone(),
                         model: model_name.clone(),
@@ -803,6 +812,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         max_prompt_bytes: 200_000,
                         max_output_tokens: 8192,
                         engine: EngineKind::LlamaServer,
+                        // Follow the authoritative engine URL at request time so
+                        // a respawn on a new port is never served on a stale one.
+                        backend_url_resolver: Some(Arc::new(move || {
+                            resolver_state.lock().ok().and_then(|g| g.clone())
+                        })),
                     })
                     .ok();
                     worker_backend = backend;
@@ -834,6 +848,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                                 max_prompt_bytes: 200_000,
                                 max_output_tokens: 8192,
                                 engine: EngineKind::LlamaServer,
+                                // Provisioned engines are spawned fresh per
+                                // model and die with the node; no respawn
+                                // port drift, so a static base URL is correct.
+                                backend_url_resolver: None,
                             };
                             let backend = OpenAiCompatibleBackend::new(backend_cfg)
                                 .map_err(|e| anyhow::anyhow!("provisioned backend: {e}"))?;
@@ -845,6 +863,57 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 Err(e) => {
                     warn!(error = %e, "failed to start llama-server; continuing as coordinator-only")
                 }
+            }
+        }
+    }
+
+    // Multi-engine worker (Objective 7): when a remote OpenAI-compatible
+    // backend (e.g. a vLLM/Ollama endpoint) is configured instead of a local
+    // llama-server, register it as a FIRST-CLASS distributed worker — the same
+    // register_worker_backend path a local engine uses — so P2P InferRequests
+    // route to it just like any other worker. Opt-in (only when
+    // inference.backend_url is set and no local engine was built). The model
+    // identity is derived deterministically from the configured engine/model.
+    if worker_backend.is_none() {
+        if let Some(remote) = config.inference.backend_url.clone() {
+            let engine = config
+                .inference
+                .engine
+                .as_deref()
+                .map(EngineKind::parse)
+                .unwrap_or(EngineKind::LlamaServer);
+            if let Ok(backend) = OpenAiCompatibleBackend::new(BackendConfig {
+                base_url: remote.clone(),
+                model: model_name.clone(),
+                api_key: None,
+                connect_timeout: Duration::from_secs(3),
+                request_timeout: Duration::from_secs(300),
+                max_prompt_bytes: 200_000,
+                max_output_tokens: 8192,
+                engine,
+                // Remote URL is a fixed config value; no respawn, static is correct.
+                backend_url_resolver: None,
+            }) {
+                // Deterministic model id/hash for a remote worker (no local GGUF).
+                if model_hash.is_empty() {
+                    model_hash =
+                        blake3::hash(format!("{engine:?}:{model_name}").as_bytes())
+                            .to_hex()
+                            .to_string();
+                }
+                if model_size_bytes == 0 {
+                    model_size_bytes = 1024;
+                }
+                backend_url = remote.clone();
+                *live_engine_url.lock().unwrap() = Some(remote.clone());
+                worker_backend = Some(backend);
+                info!(
+                    engine = %engine.as_str(),
+                    base_url = %remote,
+                    model = %model_name,
+                    hash = %model_hash,
+                    "registered remote OpenAI-compatible engine as a distributed worker"
+                );
             }
         }
     }
@@ -967,6 +1036,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             if let (Some(binary), Some(runtime)) = (restart_binary, restart_runtime) {
                 manager.lock().await.set_restart_spec(binary, runtime);
                 let supervisor = manager.clone();
+                let live_for_supervisor = live_engine_url.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_secs(5));
                     loop {
@@ -977,7 +1047,16 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             // or shut down); stop supervising.
                             break;
                         }
-                        let _ = guard.ensure_healthy().await;
+                        let ok = guard.ensure_healthy().await.unwrap_or(false);
+                        // Publish the authoritative engine URL after every pass
+                        // (start or respawn), so the worker backend and the
+                        // advertisement gate share the SAME live port — never a
+                        // stale or frozen one.
+                        if ok {
+                            if let Some(url) = guard.base_url() {
+                                *live_for_supervisor.lock().unwrap() = Some(url);
+                            }
+                        }
                     }
                 });
             }
@@ -1012,17 +1091,31 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
 
         // Advertise real compute + hardware so the capability scheduler can
-        // select this node and coordinators see it as a ready worker.
+        // select this node and coordinators see it as a ready worker. GPU is
+        // first-class: when a GPU is probed and the config policy allows, the
+        // model advertises a real VRAM footprint (so GPU vs CPU workers are
+        // distinguished and VRAM headroom is enforced), otherwise CPU-only.
+        let snapshot = SystemSnapshot::collect();
+        let gpu = decentraai_system_probe::probe_gpu();
+        let gpu_offload = match &gpu {
+            decentraai_system_probe::GpuProbeStatus::Nvidia(_) => {
+                config.resources.gpu_enabled != decentraai_config::GpuPolicy::Off
+            }
+            _ => false,
+        };
+        let max_ctx = config.inference.max_context_tokens;
         let served_models = vec![decentraai_compute::ServedModel {
             model_hash: model_hash.clone(),
             file_name: model_name.clone(),
             size_mb: (model_size_bytes / (1024 * 1024)).max(1),
             est_ram_mb: model_size_bytes / (1024 * 1024) / 4 + 1024,
-            est_vram_mb: 0,
-            context_tokens: config.inference.max_context_tokens,
+            est_vram_mb: decentraai_compute::ServedModel::estimate_vram_mb(
+                model_size_bytes,
+                gpu_offload,
+                max_ctx,
+            ),
+            context_tokens: max_ctx,
         }];
-        let snapshot = SystemSnapshot::collect();
-        let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
             .advertise_local(snapshot, gpu, served_models, can_provision)
             .await;
@@ -1039,6 +1132,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             distributed.p2p_node().clone(),
             can_provision,
             instance_manager.clone(),
+            Some(live_engine_url.clone()),
         )
         .await?;
     }
@@ -1727,6 +1821,8 @@ async fn serve_start(
                 max_prompt_bytes: 200_000,
                 max_output_tokens: 8192,
                 engine,
+                // Remote backend is a fixed external URL (Q3); static is correct.
+                backend_url_resolver: None,
             }) {
                 Ok(probe) => {
                     let caps = probe.probe_capabilities().await;
@@ -2700,6 +2796,10 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             max_prompt_bytes: 200_000,
             max_output_tokens: 8192,
             engine: EngineKind::LlamaServer,
+            // Static URL for the low-level distributed worker backend (no
+            // respawn supervisor on this path in current use); can be swapped
+            // for a live resolver if it is ever supervised.
+            backend_url_resolver: None,
         };
 
         let backend = OpenAiCompatibleBackend::new(backend_config)
@@ -2733,6 +2833,10 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                     max_prompt_bytes: 200_000,
                     max_output_tokens: 8192,
                     engine: EngineKind::LlamaServer,
+                    // Provisioned engines are freshly spawned per model and
+                    // live for the session; static URL is correct (see note at
+                    // the node start provisioning factory).
+                    backend_url_resolver: None,
                 };
                 let backend = OpenAiCompatibleBackend::new(backend_cfg)
                     .map_err(|e| anyhow::anyhow!("failed to create provisioned backend: {e}"))?;
@@ -2919,6 +3023,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             distributed.p2p_node().clone(),
             can_provision,
             None,
+            None,
         )
         .await?;
 
@@ -3055,6 +3160,7 @@ async fn spawn_compute_broadcaster(
     p2p_node: decentraai_p2p::P2PNode,
     can_provision: bool,
     manager: Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>>,
+    live_engine_url: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<()> {
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
@@ -3064,23 +3170,26 @@ async fn spawn_compute_broadcaster(
         ));
         loop {
             interval.tick().await;
-            // M24: gate the advertisement on live engine health. A dead
-            // engine means this node is not a usable worker this beat.
-            // Resolve the engine's host:port from the *live* ServeManager
-            // every beat — the M24 supervisor may respawn llama-server on a
-            // NEW port, so a frozen startup URL would keep the worker
-            // advertising a dead port (and, worse, wrongly suppress the
-            // advertisement after a respawn). A dead engine (no live server)
-            // suppresses advertisement this beat without blocking the loop.
-            let health_sockaddr = match &manager {
-                Some(m) => m
+            // M24: gate the advertisement on live engine health. A dead engine
+            // means this node is not a usable worker this beat. The engine
+            // address comes from the SINGLE authoritative source (the supervisor-
+            // published live URL cache, falling back to the ServeManager's live
+            // base_url), so a respawn on a new port is always probed and a frozen
+            // startup URL can never suppress or wrongly enable advertisement.
+            let health_sockaddr = match (&live_engine_url, &manager) {
+                (Some(cache), _) => cache
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .and_then(|u| parse_http_addr(&u).map(|(h, p)| format!("{h}:{p}"))),
+                (None, Some(m)) => m
                     .lock()
                     .await
                     .base_url()
                     .as_deref()
                     .and_then(parse_http_addr)
                     .map(|(h, p)| format!("{h}:{p}")),
-                None => None,
+                (None, None) => None,
             };
             if let Some(addr) = &health_sockaddr {
                 let alive = tokio::net::TcpStream::connect(addr).await.is_ok();

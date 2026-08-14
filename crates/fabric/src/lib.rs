@@ -30,6 +30,7 @@
 //! behavior the runtime cannot actually provide.
 
 pub mod advisory;
+pub mod decision;
 pub mod engine;
 pub mod expert;
 pub mod kv;
@@ -38,6 +39,10 @@ pub mod plan;
 pub mod planner;
 
 pub use advisory::{FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision};
+pub use decision::{
+    Adaptation, CandidateOutcome, ConstraintKind, ConstraintResult, ExecutionDecision,
+    ExecutionEvent, WorkloadClass, adapt, classify, evaluate,
+};
 pub use engine::{EngineCapabilities, EngineKind};
 pub use expert::{ExpertDecision, ExpertLayout, ExpertRegistry, ExpertRouter, ExpertShard};
 pub use kv::{ContextProfile, KVCacheState, KvPlanner, KvRoutingHint};
