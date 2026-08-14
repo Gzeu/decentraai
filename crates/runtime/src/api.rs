@@ -1402,8 +1402,11 @@ ol{padding-left:20px} li{margin:6px 0}
   <h2>Chat</h2>
   <div id="chat-history"><p class="off">Ask the node something. Responses are routed through the fabric planner to a worker.</p></div>
   <textarea id="chat-input" rows="2" placeholder="Type a message&hellip;" style="width:100%;box-sizing:border-box;background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></textarea>
-  <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+  <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select id="chat-model" title="Model for chat" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px"></select>
     <button id="chat-send" style="background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer">Send</button>
+    <button id="chat-stop" style="background:#f85149;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer;display:none">Stop</button>
+    <button id="chat-retry" style="background:#0a0e13;color:#e6edf3;border:1px solid #2a3442;border-radius:8px;padding:8px 12px;cursor:pointer" disabled>Retry</button>
     <span id="chat-status" class="small">&mdash;</span>
     <input id="chat-stream" type="checkbox" style="margin-left:auto"> <label for="chat-stream" class="small">stream</label>
   </div>
@@ -1506,7 +1509,8 @@ fn dashboard_js(state: &ApiState, share: &str) -> String {
 const JS_TEMPLATE: &str = r#"
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 document.getElementById('share').innerHTML = "__SHARE__";
-document.getElementById('model-name').textContent = "__MODEL__";
+const activeModel = "__MODEL__";
+document.getElementById('model-name').textContent = activeModel;
 const advEl = document.getElementById('advanced');
 const advBtn = document.getElementById('adv-toggle');
 const setAdv = (show) => {
@@ -1529,6 +1533,8 @@ const HIST_KEY = 'decentraai.chat.history';
 let hist = [];
 try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
 const chatbox = document.getElementById('chat-history');
+const chatModel = document.getElementById('chat-model');
+const currentModel = () => chatModel.value || activeModel;
 const addMsg = (role, text) => {
   const div = document.createElement('div');
   const who = role === 'user' ? '<b>You</b>' : '<b>Node</b>';
@@ -1575,20 +1581,39 @@ const readSse = async (resp) => {
   } finally { reader.releaseLock(); }
   return { text, tokens };
 };
-document.getElementById('chat-send').addEventListener('click', async () => {
-  const input = document.getElementById('chat-input');
-  const prompt = input.value.trim();
+const chatStatus = document.getElementById('chat-status');
+const chatStopBtn = document.getElementById('chat-stop');
+const chatRetryBtn = document.getElementById('chat-retry');
+const chatSendBtn = document.getElementById('chat-send');
+const chatInput = document.getElementById('chat-input');
+let currentController = null;
+let lastUserPrompt = null;
+const setStreamingUI = (on) => {
+  chatStopBtn.style.display = on ? 'inline-block' : 'none';
+  chatSendBtn.disabled = on;
+  chatRetryBtn.disabled = on || !lastUserPrompt;
+};
+// Sends one chat turn: appends the user message to the live conversation and
+// history, streams/awaits the node's reply, and records a new turn. The
+// active AbortController is stored in `currentController` so the Stop button
+// can cancel an in-flight stream (all further SSE chunks are dropped) and so
+// the Retry button can re-send with the current model/stream settings.
+const sendChat = async (prompt) => {
+  prompt = (prompt || '').trim();
   if (!prompt) return;
-  input.value = '';
+  lastUserPrompt = prompt;
+  chatInput.value = '';
   addMsg('user', prompt);
   hist.push({ role: 'user', content: prompt });
-  const status = document.getElementById('chat-status');
   const stream = document.getElementById('chat-stream').checked;
-  status.textContent = 'routing &amp; generating&hellip;';
+  const controller = new AbortController();
+  currentController = controller;
+  setStreamingUI(true);
+  chatStatus.textContent = 'routing &amp; generating&hellip;';
+  const t0 = performance.now();
   try {
-    const body = JSON.stringify({ model: '__MODEL__', messages: hist, stream });
-    const t0 = performance.now();
-    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body });
+    const body = JSON.stringify({ model: currentModel(), messages: hist, stream });
+    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
     let answer = '', tokens = null;
     if (stream && r.ok && r.body) {
       const out = await readSse(r);
@@ -1598,19 +1623,41 @@ document.getElementById('chat-send').addEventListener('click', async () => {
       const j = await r.json();
       answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
     }
+    if (controller.signal.aborted) return;
     addMsg('node', answer || '(empty response)');
     hist.push({ role: 'assistant', content: answer || '' });
     if (hist.length > 24) hist.splice(0, hist.length - 24);
     saveHist();
     const dt = Math.round(performance.now() - t0);
-    status.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
+    chatStatus.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' +
       (tokens != null ? ' &middot; ' + tokens + ' tokens' : '');
   } catch (e) {
-    addMsg('node', 'request failed: ' + e);
-    status.textContent = 'failed';
+    if (controller.signal.aborted) {
+      // User pressed Stop: abort the in-flight fetch/SSE reader. The stream is
+      // left as a partial bubble in the page but is NOT committed to history.
+      chatStatus.textContent = 'stopped';
+    } else {
+      addMsg('node', 'request failed: ' + e);
+      chatStatus.textContent = 'failed';
+    }
+  } finally {
+    if (currentController === controller) currentController = null;
+    setStreamingUI(false);
   }
+};
+chatSendBtn.addEventListener('click', () => {
+  if (currentController) return;
+  sendChat(chatInput.value);
 });
-document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chat-send').click(); } });
+chatStopBtn.addEventListener('click', () => {
+  if (currentController) currentController.abort();
+});
+chatRetryBtn.addEventListener('click', () => {
+  if (currentController || !lastUserPrompt) return;
+  sendChat(lastUserPrompt);
+});
+setStreamingUI(false);
+chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSendBtn.click(); } });
 const fmtUptime = s => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h > 0 ? h + 'h ' + m + 'm' : (m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's');
@@ -1618,6 +1665,21 @@ const fmtUptime = s => {
 async function refresh() {
   try {
     const s = await (await fetch('/status')).json();
+    // Populate the chat model selector once from live /status data: the active
+    // model always leads, followed by every index/model the node advertises in
+    // `available_models`. Only fills when empty so the user's chosen value
+    // survives every 3s refresh.
+    if (chatModel.options.length === 0) {
+      const names = new Set([activeModel]);
+      (s.available_models || []).forEach(m => { if (m && m.name) names.add(m.name); });
+      names.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        chatModel.appendChild(opt);
+      });
+      chatModel.value = activeModel;
+    }
     document.getElementById('model-size').textContent =
       s.model_size_bytes > 0 ? (s.model_size_bytes / 1073741824).toFixed(2) + ' GiB' : '';
     document.getElementById('model-status').innerHTML = s.model_loaded
@@ -2448,6 +2510,38 @@ mod tests {
             assert!(body.contains("Recent inference calls"));
             assert!(body.contains("Share a model"));
         }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_chat_view_has_model_stop_and_retry_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // The three new Chat UX controls and the model selector are present.
+        for needle in [
+            "id=\"chat-model\"",
+            "<select id=\"chat-model\"",
+            "id=\"chat-stop\"",
+            "id=\"chat-retry\"",
+        ] {
+            assert!(body.contains(needle), "dashboard must include {needle}");
+        }
+        // The controls are wired to real behavior: Stop aborts the in-flight
+        // request (AbortController) and the model select is populated from the
+        // live /status `available_models` payload rather than a hardcoded list.
+        assert!(body.contains("new AbortController()"), "Stop must abort via AbortController");
+        assert!(body.contains("controller.signal"), "Stop aborts the fetch via its signal");
+        assert!(body.contains("s.available_models"), "chat-model must read live available_models");
+        assert!(body.contains("chatModel.value || activeModel"), "send must fall back to the active model");
         manager.lock().await.shutdown().await.unwrap();
     }
 
