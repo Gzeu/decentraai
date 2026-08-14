@@ -1,8 +1,11 @@
 //! Worker P2P inference protocol
 
+use decentraai_identity::Identity;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use super::{b64_opt, canonical_infer_request_bytes};
 
 /// Inference request sent to worker (M10)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +43,20 @@ pub struct InferRequest {
     /// without the field deserialize to `None`.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Monotonic per-destination counter set by the sender for replay
+    /// protection (P4). Never reused for the same (sender, worker) edge.
+    #[serde(default)]
+    pub nonce: u64,
+    /// Ed25519 public key (32 bytes) of the sender, when signed. Used by the
+    /// worker to (a) verify the request signature and (b) confirm it matches
+    /// the authenticated connected peer (P1/P2). Legacy unsigned frames omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_public_key: Option<[u8; 32]>,
+    /// Ed25519 signature over canonical bytes of the request (including
+    /// `nonce`). Produced with the sender identity (P1). `None` for a legacy
+    /// unsigned frame. Base64 on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
+    pub signature: Option<Vec<u8>>,
 }
 
 impl InferRequest {
@@ -61,6 +78,9 @@ impl InferRequest {
             stream: false,
             priority: 128,
             session_id: None,
+            nonce: 0,
+            sender_public_key: None,
+            signature: None,
         }
     }
 
@@ -82,6 +102,27 @@ impl InferRequest {
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
         self
+    }
+
+    pub fn with_nonce(mut self, nonce: u64) -> Self {
+        self.nonce = nonce;
+        self
+    }
+
+    /// Signs this request with the node identity (P1). Sets the sender public
+    /// key and the Ed25519 signature over canonical bytes (which include the
+    /// `nonce`, so a captured request cannot be re-minted without the key).
+    /// Returns `self` so callers can chain.
+    pub fn sign(mut self, identity: &Identity) -> Self {
+        self.sender_public_key = Some(identity.public_key().to_bytes());
+        let bytes = canonical_infer_request_bytes(&self);
+        self.signature = Some(identity.sign(&bytes).to_bytes().to_vec());
+        self
+    }
+
+    /// Whether this frame carries a valid signature for `expected_peer`.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some() && self.sender_public_key.is_some()
     }
 }
 

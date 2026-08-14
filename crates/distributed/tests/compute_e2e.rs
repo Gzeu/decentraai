@@ -160,6 +160,8 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The worker advertises a real probe-derived advertisement over the wire.
     // Re-announce until the dialed connection settles and the coordinator's
@@ -349,6 +351,8 @@ async fn compute_path_falls_back_to_legacy_router_on_worker_failure() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The coordinator also trusts a "ghost" worker that is never connected:
     // the capability-aware scheduler will pick it, and the send must fail.
@@ -568,6 +572,8 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     )
     .unwrap();
     coordinator.set_compute_manager(coord_compute.clone());
+    // P1: sign routed requests so the worker authenticates them.
+    coordinator.set_signing_identity(coord_identity.signing_key_bytes());
 
     // The worker advertises `can_provision = true` over the wire until the
     // coordinator's registry sees it.
@@ -759,7 +765,6 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
 
     // ---- Client that routes the request regardless of headroom.
     let client_identity = Identity::generate();
-    let client_peer = libp2p_peer_id(&client_identity);
     let client_node = P2PNode::new(
         &client_identity,
         DEFAULT_MAX_MESSAGE_BYTES,
@@ -776,11 +781,17 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     async fn send(
         client_node: &P2PNode,
         worker_peer: PeerId,
-        client_peer: PeerId,
+        client_identity: &Identity,
     ) -> anyhow::Result<Vec<u8>> {
+        let client_peer = libp2p_peer_id(client_identity);
         let mut request = InferRequest::new(MODEL_HASH.to_string(), "hello".into(), 64);
         request = request.with_sender(client_peer);
         request.timeout_ms = 10_000;
+        // P1: sign so the worker authenticates the request before admitting it.
+        decentraai_protocol::sign_infer_request_with_key(
+            &client_identity.signing_key_bytes(),
+            &mut request,
+        );
         let payload = serialize_message(&request)?;
         client_node.request(worker_peer, payload).await
     }
@@ -789,7 +800,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     // for the newly dialed connection to settle (per AGENTS.md).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let rejected = loop {
-        match send(&client_node, worker_peer, client_peer).await {
+        match send(&client_node, worker_peer, &client_identity).await {
             Ok(bytes) => break bytes,
             Err(_) if std::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -821,7 +832,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     worker_compute
         .advertise_local(snapshot(), gpu(), vec![big_model], false)
         .await;
-    let admitted = send(&client_node, worker_peer, client_peer).await.unwrap();
+    let admitted = send(&client_node, worker_peer, &client_identity).await.unwrap();
     let reply: InferMessage = deserialize_message(&admitted, admitted.len()).unwrap();
     assert!(
         matches!(reply, InferMessage::InferAccepted { .. }),

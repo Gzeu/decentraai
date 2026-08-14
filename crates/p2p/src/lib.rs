@@ -281,8 +281,11 @@ enum Command {
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
+/// Called with the transport-authenticated connected peer and the request;
+/// `peer` is the real Noise-authenticated PeerId, NOT `req.sender_peer_id`
+/// (which is attacker-controllable payload, see P2).
 type InferHandler =
-    Arc<dyn Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+    Arc<dyn Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 /// Handler for inbound inference cancellations (see `P2PNode::set_on_cancel_request`).
 type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
@@ -327,7 +330,10 @@ impl P2PNode {
     /// P2PNode::request().
     pub fn set_on_infer_request<F>(&mut self, callback: F)
     where
-        F: Fn(decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>> + Send + Sync + 'static,
+        F: Fn(PeerId, decentraai_protocol::InferRequest) -> anyhow::Result<Vec<u8>>
+            + Send
+            + Sync
+            + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_infer.lock());
         *guard = Some(std::sync::Arc::new(callback));
@@ -573,7 +579,7 @@ impl P2PNode {
                                         // If a runtime on_infer callback has been registered, call it
                                         let guard = on_infer_clone.lock().await;
                                         if let Some(cb) = &*guard {
-                                            match cb(infer_req) {
+                                            match cb(peer, infer_req) {
                                                 Ok(bytes) => {
                                                     if swarm
                                                         .behaviour_mut()

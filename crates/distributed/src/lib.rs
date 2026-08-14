@@ -238,6 +238,10 @@ pub struct DistributedInference {
     /// per-request audit event (`routed`/`inference_completed`) capturing the
     /// request id, worker, model hash and outcome (M10). None disables audit.
     logs_dir: Option<PathBuf>,
+    /// Coordinator signing key bytes (P1). When set, outbound ``InferRequest``s
+    /// are signed so workers can authenticate them and reject spoofs / unsigned
+    /// traffic. `None` sends unsigned (legacy) frames.
+    signing_key: Option<[u8; 32]>,
 }
 
 impl DistributedInference {
@@ -273,7 +277,15 @@ impl DistributedInference {
             compute_manager: None,
             config,
             logs_dir: None,
+            signing_key: None,
         })
+    }
+
+    /// Sets the coordinator's signing key bytes (P1). With it set, every
+    /// outbound routed request is Ed25519-signed so workers can authenticate
+    /// it and reject spoofed/unsigned traffic.
+    pub fn set_signing_identity(&mut self, signing_key: [u8; 32]) {
+        self.signing_key = Some(signing_key);
     }
 
     /// Sets the security-log directory so routing records per-request audit
@@ -298,6 +310,14 @@ impl DistributedInference {
                     "status": if ok { "completed" } else { "failed" },
                 }),
             );
+        }
+    }
+
+    /// Ed25519-signs an outbound infer request with this node's signing key (P1).
+    /// No-op when no signing key is set (legacy unsigned traffic).
+    fn sign_request(&self, request: &mut InferRequest) {
+        if let Some(key) = &self.signing_key {
+            decentraai_protocol::sign_infer_request_with_key(key, request);
         }
     }
 
@@ -460,7 +480,27 @@ impl DistributedInference {
 
         // Register sync on_infer handler that enqueues the request and returns Accept
         self.p2p_node.set_on_infer_request(
-            move |req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
+            move |peer: libp2p::PeerId, req: decentraai_protocol::InferRequest| -> anyhow::Result<Vec<u8>> {
+                // P1/P2: verify the request is signed by the authenticated
+                // connected peer before accepting work. `peer` is the real
+                // Noise-authenticated PeerId; `req.sender_peer_id` is payload
+                // and never trusted. A failed signature or an unsigned frame
+                // when signing is required is answered terminal (never
+                // executed, never retried).
+                if !decentraai_protocol::verify_infer_request_signature(&peer, &req).is_ok() {
+                    let resp = InferResponse {
+                        request_id: req.request_id,
+                        trace_id: req.trace_id.clone(),
+                        worker_peer_id: local_peer,
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        output: "".to_string(),
+                        tokens_used: 0,
+                        processing_time_ms: 0,
+                        success: false,
+                        error: Some("unauthenticated inference request: bad or missing signature".to_string()),
+                    };
+                    return serialize_message(&InferMessage::InferResponse(resp));
+                }
                 // Only accept requests for the configured model.
                 if req.model_hash != model_hash_clone {
                     // On-demand provisioning (M14): a workload for a model we do
@@ -655,8 +695,10 @@ impl DistributedInference {
     /// The inference response from a worker, or an error if all workers fail
     pub async fn route_request(
         &self,
-        request: InferRequest,
+        mut request: InferRequest,
     ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
         // Capability-aware compute path: pick a worker that serves the model
         // and has RAM/VRAM headroom, and hold a reservation for the duration.
         // If the selected worker fails (offline, rejection, timeout), fall
@@ -800,9 +842,11 @@ impl DistributedInference {
     /// `InferProgress` chunk into `progress` as it arrives.
     pub async fn route_request_streamed(
         &self,
-        request: InferRequest,
+        mut request: InferRequest,
         progress: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
