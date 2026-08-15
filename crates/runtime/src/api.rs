@@ -802,6 +802,59 @@ async fn mcp_capability_search(
     }
 }
 
+/// Local capability filter for the MCP `find_local_models_by_capability` tool.
+/// Filters THIS node's models (from `fabric_model_list`) by their persisted
+/// registry claims — no Hub round-trip. `evidence` is "any" (verified or
+/// inferred) or "verified" (only verified claims). A model with no matching
+/// claim is never included (honest: absent = UNKNOWN).
+async fn mcp_local_capability_search(
+    state: &ApiState,
+    capability: &str,
+    evidence: &str,
+) -> serde_json::Value {
+    let Some(list) = fabric_model_list(state).await else {
+        return serde_json::json!({ "matched": 0, "models": [] });
+    };
+    filter_local_models_by_capability(&list, capability, evidence)
+}
+
+/// Pure filter: given an OpenAI-style model list (entries may carry
+/// `capability_claims`), keep only local models whose persisted claims satisfy
+/// the capability. `evidence` is "any" or "verified". A model with no matching
+/// claim is never included (honest: absent = UNKNOWN). Pure so tests can drive
+/// it with a synthetic list.
+fn filter_local_models_by_capability(
+    list: &serde_json::Value,
+    capability: &str,
+    evidence: &str,
+) -> serde_json::Value {
+    let require_verified = evidence == "verified";
+    let mut matched = Vec::new();
+    for m in list["data"].as_array().cloned().unwrap_or_default() {
+        let Some(claims) = m["capability_claims"].as_array() else {
+            continue; // no persisted claims -> UNKNOWN, not a match
+        };
+        let hit = claims.iter().find(|c| {
+            let cap = c["capability"].as_str().unwrap_or("");
+            let prov = c["provenance"].as_str().unwrap_or("");
+            cap.eq_ignore_ascii_case(capability)
+                && (!require_verified || prov.eq_ignore_ascii_case("verified"))
+        });
+        if let Some(hit) = hit {
+            matched.push(serde_json::json!({
+                "id": m["id"],
+                "evidence": hit["provenance"],
+            }));
+        }
+    }
+    serde_json::json!({
+        "capability": capability,
+        "evidence": if require_verified { "verified" } else { "any" },
+        "matched": matched.len(),
+        "models": matched,
+    })
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -2099,6 +2152,11 @@ async fn mcp_handler(
             }
         }
     }
+    // A `find_local_models_by_capability` call filters THIS node's models by
+    // persisted claims (no Hub round-trip). Precompute it here.
+    if let Some((capability, evidence)) = crate::mcp::local_capability_search_request(&raw) {
+        ctx.local_capability_search = mcp_local_capability_search(&state, &capability, &evidence).await;
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -2178,6 +2236,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         executions,
         peers,
         capability_search: serde_json::json!({ "matched": 0, "models": [] }),
+        local_capability_search: serde_json::json!({ "matched": 0, "models": [] }),
     }
 }
 
@@ -5258,6 +5317,46 @@ mod tests {
         let coding =
             hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Coding));
         assert_eq!(coding["matched"], 0);
+    }
+
+    #[test]
+    fn filter_local_models_by_capability_is_provenance_honest() {
+        // Two local models with persisted claims + one remote model with none.
+        let list = serde_json::json!({
+            "data": [
+                { "id": "ocr.gguf", "owned_by": "local",
+                  "capability_claims": [
+                      { "capability": "ocr", "provenance": "verified" }
+                  ] },
+                { "id": "vision.gguf", "owned_by": "local",
+                  "capability_claims": [
+                      { "capability": "vision", "provenance": "inferred" }
+                  ] },
+                { "id": "remote.gguf", "owned_by": "w1" } // no claims -> UNKNOWN
+            ]
+        });
+
+        // any evidence: both local matches qualify.
+        let r = filter_local_models_by_capability(&list, "ocr", "any");
+        assert_eq!(r["matched"], 1);
+        assert_eq!(r["models"][0]["id"], "ocr.gguf");
+        assert_eq!(r["models"][0]["evidence"], "verified");
+
+        let r = filter_local_models_by_capability(&list, "vision", "any");
+        assert_eq!(r["matched"], 1);
+        assert_eq!(r["models"][0]["evidence"], "inferred");
+
+        // verified-only: the inferred vision claim does NOT qualify.
+        let r = filter_local_models_by_capability(&list, "vision", "verified");
+        assert_eq!(r["matched"], 0);
+
+        // Case-insensitive capability matching.
+        let r = filter_local_models_by_capability(&list, "OCR", "any");
+        assert_eq!(r["matched"], 1);
+
+        // No matching capability and no-claims models are never included.
+        let r = filter_local_models_by_capability(&list, "coding", "any");
+        assert_eq!(r["matched"], 0);
     }
 
     #[tokio::test]

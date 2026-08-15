@@ -922,3 +922,21 @@ reached the planner. This wires the full loop end-to-end.
 - [x] Tests: fabric resolver real-verdict path (verified/inferred/missing/
   unknown); distributed coordinator resolves a verified OCR claim → decision
   records `satisfied=true, evidence="VERIFIED"`.
+
+## 30. Next-Gen Phase 7 — MCP Local Capability Search
+
+The fabric model list already exposes persisted `capability_claims`. This adds
+an agent-facing tool that answers "which of MY models can do X?" from that real
+data — no Hub round-trip, no privilege change.
+
+- [x] `find_local_models_by_capability` MCP tool — filters THIS node's models
+  by a required capability (snake_case) with optional `evidence` (`any` default,
+  or `verified`-only). Returns only models with real persisted claims; a model
+  with no claim is never included (honest: absent = UNKNOWN).
+- [x] Architecture preserved: the async HTTP handler precomputes the filter into
+  `McpContext.local_capability_search`; the MCP module stays pure
+  (`local_capability_search_request` extracts args).
+- [x] Pure `filter_local_models_by_capability` over the fabric model list
+  (case-insensitive, provenance-honest).
+- [x] Tests: tool dispatch, arg extraction (evidence defaults to `any`),
+  and the pure filter (any/verified/case-insensitive/no-claim honesty).

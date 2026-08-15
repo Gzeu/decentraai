@@ -44,6 +44,10 @@ pub struct McpContext {
     /// Precomputed by the HTTP layer, which performs the async Hub lookup;
     /// the protocol layer only translates it (no I/O here).
     pub capability_search: Value,
+    /// Result of a LOCAL capability search (`find_local_models_by_capability`).
+    /// Precomputed by the HTTP layer from the fabric model list + persisted
+    /// registry claims (no Hub round-trip); the protocol layer only translates.
+    pub local_capability_search: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -103,6 +107,26 @@ fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "find_local_models_by_capability",
+            description: "Filter THIS node's local models (on disk, from the registry) by a required capability (e.g. 'ocr', 'vision', 'coding'). Uses persisted capability claims written at pull time — no Hub round-trip. Returns only models with real evidence; a model with no claim is never included. Optionally require 'verified' evidence (default: any).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capability": {
+                        "type": "string",
+                        "description": "Required capability in snake_case, e.g. ocr, vision, coding, summarization, embeddings, tool_calling.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "enum": ["any", "verified"],
+                        "description": "'verified' keeps only models with a VERIFIED claim; 'any' (default) also includes inferred ones.",
+                    },
+                },
+                "required": ["capability"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -137,6 +161,36 @@ pub fn capability_search_request(raw: &str) -> Option<(String, Option<String>, u
         .unwrap_or(8)
         .clamp(1, 30);
     Some((capability, query, limit))
+}
+
+/// Extract the parameters of a `find_local_models_by_capability` call, if the
+/// incoming message is one. Pure — lets the HTTP layer precompute the local
+/// filter into [`McpContext::local_capability_search`]. Returns
+/// `(capability, evidence)` where evidence is "any" or "verified".
+pub fn local_capability_search_request(raw: &str) -> Option<(String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "find_local_models_by_capability" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let capability = args.get("capability").and_then(|c| c.as_str())?.to_string();
+    if capability.is_empty() {
+        return None;
+    }
+    let evidence = args
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "any".to_string());
+    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    Some((capability, evidence))
 }
 
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
@@ -217,6 +271,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "list_executions" => &ctx.executions,
         "list_peers" => &ctx.peers,
         "search_models_by_capability" => &ctx.capability_search,
+        "find_local_models_by_capability" => &ctx.local_capability_search,
         _ => return None,
     };
     Some(json!({
@@ -247,6 +302,7 @@ mod tests {
             executions: json!([{ "chosen_worker": "w1" }]),
             peers: json!([{ "peer_id": "p1" }]),
             capability_search: json!({ "query": "", "matched": 1, "models": [{ "id": "org/vision" }] }),
+            local_capability_search: json!({ "matched": 1, "models": [{ "id": "local.gguf", "evidence": "verified" }] }),
         }
     }
 
@@ -278,6 +334,7 @@ mod tests {
         assert!(names.contains(&"get_status"));
         assert!(names.contains(&"list_executions"));
         assert!(names.contains(&"search_models_by_capability"));
+        assert!(names.contains(&"find_local_models_by_capability"));
         // Each tool declares a JSON schema.
         assert!(tools.iter().all(|t| t["inputSchema"].is_object()));
     }
@@ -297,6 +354,35 @@ mod tests {
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("org/vision"), "must return the supplied snapshot");
         assert!(content.contains("\"matched\":1"));
+    }
+
+    #[test]
+    fn local_capability_search_returns_precomputed_local_filter() {
+        // Same pattern: HTTP layer precomputes the local-claims filter; the
+        // protocol layer returns it unchanged.
+        let r = call(r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find_local_models_by_capability","arguments":{"capability":"ocr","evidence":"verified"}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("local.gguf"), "must return the supplied snapshot");
+        assert!(content.contains("verified"));
+    }
+
+    #[test]
+    fn local_capability_search_request_parses_args_and_defaults_evidence() {
+        // Default evidence is "any" when omitted.
+        let (cap, ev) = local_capability_search_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_local_models_by_capability","arguments":{"capability":"ocr"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cap, "ocr");
+        assert_eq!(ev, "any");
+        // Explicit verified is honored.
+        let (_, ev) = local_capability_search_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_local_models_by_capability","arguments":{"capability":"vision","evidence":"verified"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, "verified");
+        // Non-matching methods yield None.
+        assert!(local_capability_search_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
     }
 
     #[test]
