@@ -1198,3 +1198,17 @@ Expose the Digital Twin fabric graph to external agents as a read-only MCP tool.
 - [x] Pure `fabric_graph_request` extractor + dispatch.
 - [x] Tests: tool listed, extractor matches only the tool, precomputed snapshot
   returned unchanged.
+
+## 43. Next-Gen Phase M — Policy Gate in CAN I RUN THIS?
+
+The unified fabric fit now honors the remote-sharing policy, reusing the
+existing `accepts_remote_inference` opt-in (no new permission system).
+
+- [x] `worker_capability_verdict_with_policy` — adds an explicit `policy` check:
+  a remote worker that has not opted into remote inference is a definitive
+  CANNOT_RUN (never a fabricated pass); the LOCAL node is always allowed its own
+  work. Threaded through `mcp_worker_capability` (model + variants) and
+  `mcp_intent_with_fit` using the real local peer + advertisement flag.
+- [x] `worker_capability_verdict` kept as a test-only convenience wrapper
+  (policy on) so existing tests are unchanged.
+- [x] Test: remote-no-opt-in → CANNOT_RUN via policy check; local always allowed.

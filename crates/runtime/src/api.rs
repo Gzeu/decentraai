@@ -883,7 +883,9 @@ async fn mcp_worker_capability(
     // Fetch the worker set once and reuse it for the requested model and for
     // every on-disk variant below (workers()/is_trusted are async I/O).
     let mut workers: Vec<(decentraai_compute::ComputeAdvertisement, bool)> = Vec::new();
+    let mut local_peer: Option<String> = None;
     if let Some(cm) = &state.compute {
+        local_peer = Some(cm.local_peer().to_string());
         for adv in cm.workers().await {
             let trusted = cm.is_trusted(&adv.peer_id).await;
             workers.push((adv, trusted));
@@ -892,13 +894,16 @@ async fn mcp_worker_capability(
 
     let mut results: Vec<WorkerCapResult> = Vec::new();
     for (adv, trusted) in &workers {
-        results.push(worker_capability_verdict(
+        let is_local = local_peer.as_deref() == Some(&adv.peer_id.to_string());
+        let accepts_remote_work = is_local || adv.accepts_remote_inference;
+        results.push(worker_capability_verdict_with_policy(
             adv,
             *trusted,
             model,
             capability,
             evidence,
             &claims,
+            accepts_remote_work,
         ));
     }
     let fit = aggregate_can_i_run(&results);
@@ -930,13 +935,16 @@ async fn mcp_worker_capability(
                         .collect();
                     let mut v_results: Vec<WorkerCapResult> = Vec::new();
                     for (adv, trusted) in &workers {
-                        v_results.push(worker_capability_verdict(
+                        let is_local = local_peer.as_deref() == Some(&adv.peer_id.to_string());
+                        let accepts_remote_work = is_local || adv.accepts_remote_inference;
+                        v_results.push(worker_capability_verdict_with_policy(
                             adv,
                             *trusted,
                             &file,
                             capability,
                             evidence,
                             &v_claims,
+                            accepts_remote_work,
                         ));
                     }
                     let v_fit = aggregate_can_i_run(&v_results);
@@ -1016,10 +1024,19 @@ async fn mcp_intent_with_fit(
                 let claims = vec![(cap_str.clone(), prov)];
                 let mut results = Vec::new();
                 if let Some(cm) = &state.compute {
+                    let local_peer = cm.local_peer().to_string();
                     for adv in cm.workers().await {
                         let trusted = cm.is_trusted(&adv.peer_id).await;
-                        results.push(worker_capability_verdict(
-                            &adv, trusted, &file, &cap_str, evidence, &claims,
+                        let accepts_remote_work =
+                            local_peer == adv.peer_id.to_string() || adv.accepts_remote_inference;
+                        results.push(worker_capability_verdict_with_policy(
+                            &adv,
+                            trusted,
+                            &file,
+                            &cap_str,
+                            evidence,
+                            &claims,
+                            accepts_remote_work,
                         ));
                     }
                 }
@@ -1820,6 +1837,7 @@ fn variant_quantization_from_file_name(file_name: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn worker_capability_verdict(
     adv: &decentraai_compute::ComputeAdvertisement,
     trusted: bool,
@@ -1827,6 +1845,25 @@ fn worker_capability_verdict(
     capability: &str,
     evidence: &str,
     claims: &[(String, String)],
+) -> WorkerCapResult {
+    // Test-only convenience: default to "this worker may serve this fabric's
+    // request" (policy gate on). Production uses the policy-aware variant.
+    worker_capability_verdict_with_policy(adv, trusted, model, capability, evidence, claims, true)
+}
+
+/// Policy-aware per-worker capability verdict (Phase M foundation). `accepts_remote_work`
+/// is true for the LOCAL node (which always serves its own work) or a remote
+/// worker that opted into remote inference (`accepts_remote_inference`). A
+/// remote worker that did NOT opt in cannot run this fabric's request — a
+/// definitive policy CANNOT_RUN, never a fabricated pass.
+fn worker_capability_verdict_with_policy(
+    adv: &decentraai_compute::ComputeAdvertisement,
+    trusted: bool,
+    model: &str,
+    capability: &str,
+    evidence: &str,
+    claims: &[(String, String)],
+    accepts_remote_work: bool,
 ) -> WorkerCapResult {
     let model_lower = model.to_lowercase();
     let matches_model = |m: &decentraai_compute::ServedModel| {
@@ -1931,6 +1968,22 @@ fn worker_capability_verdict(
         },
     });
 
+    // Policy (Phase M): a remote worker that has not opted into remote
+    // inference cannot serve a request from this fabric. The local node is
+    // always allowed its own work. This is a definitive policy gate, not a
+    // capability/telemetry guess.
+    let policy_pass = accepts_remote_work;
+    checks.push(WorkerCheck {
+        check: "policy",
+        pass: policy_pass,
+        state: if policy_pass { "allowed" } else { "remote_not_accepted" }.into(),
+        reason: if policy_pass {
+            "worker may serve this fabric's request (local or remote-opt-in)".into()
+        } else {
+            "worker does not accept remote inference (policy)".into()
+        },
+    });
+
     // Engine compatibility.
     let engine_pass = engine_compat == "compatible";
     checks.push(WorkerCheck {
@@ -2004,6 +2057,7 @@ fn worker_capability_verdict(
     let has_hard_fail = cap_hard_fail
         || !avail_pass
         || !trusted
+        || !policy_pass
         || !engine_pass
         || (ram_known && !ram_sufficient)
         || (est_vram_mb > 0 && vram_known && !vram_sufficient);
@@ -7096,6 +7150,24 @@ mod tests {
         assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
         let t = r.checks.iter().find(|c| c.check == "trusted").unwrap();
         assert!(!t.pass && t.state == "not_trusted");
+    }
+
+    #[test]
+    fn worker_cap_remote_not_accepting_inference_cannot_run() {
+        // Phase M policy: a remote worker that has NOT opted into remote
+        // inference cannot run a request from this fabric — a definitive
+        // CANNOT_RUN via the policy check, even though it is trusted, healthy,
+        // holds the model and has sufficient resources.
+        let peer = decentraai_p2p::PeerId::random();
+        let mut adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        adv.accepts_remote_inference = false;
+        let r = worker_capability_verdict_with_policy(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr(), false);
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun, "remote-no-opt-in must be CANNOT_RUN");
+        let p = r.checks.iter().find(|c| c.check == "policy").unwrap();
+        assert!(!p.pass && p.state == "remote_not_accepted");
+        // The LOCAL node is always allowed its own work regardless of the flag.
+        let r = worker_capability_verdict_with_policy(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr(), true);
+        assert_eq!(r.verdict, WorkerCapVerdict::CanRun, "local worker always allowed");
     }
 
     #[test]
