@@ -588,6 +588,7 @@ mod tests {
             transfer_mib: 0,
             local_peer: None,
             priority,
+            required_capability: None,
         }
     }
 

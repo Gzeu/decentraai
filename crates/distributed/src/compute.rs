@@ -766,6 +766,12 @@ impl ComputeManager {
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
             priority,
+            // Task B: capability requirements are additive plumbing. The
+            // coordinator does not yet carry a caller-provided requirement nor
+            // any per-model `ModelCapabilities`, so it records `None` — the
+            // fabric then records no (honest UNKNOWN) verdict. Routing is
+            // unchanged; wiring a real requirement in is future work.
+            required_capability: None,
         };
         // Mirror the planner the real routing path builds, so the recorded
         // decision shares the live network graph (M19) and objective weights.
@@ -980,6 +986,9 @@ impl ComputeManager {
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
             priority,
+            // Task B: same honest plumbing as `record_decision` — no real
+            // capability requirement is wired in yet, so `None`.
+            required_capability: None,
         };
 
         let result = planner.plan(&rfacts, &facts);

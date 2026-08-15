@@ -65,6 +65,13 @@ pub struct RequestFacts {
     /// Request priority 0..=255 (higher = more urgent). Drives priority-aware
     /// scoring: urgent work favors the lowest-latency, least-queued worker.
     pub priority: u8,
+    /// Optional required capability (snake_case name, e.g. `"ocr"`), the link
+    /// between "agent intent → capabilities → model → fabric plan". The planner
+    /// is engine-neutral and holds NO capability data, so it does not verify
+    /// this here — when present it records an honest UNKNOWN verdict in the
+    /// rationale and a reasoning note. `None` means no capability requirement.
+    /// Additive/optional so existing constructions default to no requirement.
+    pub required_capability: Option<String>,
 }
 
 /// Configurable objective weights for the planner's [`ExecutionPlanner::score`].
@@ -119,6 +126,27 @@ pub struct CandidateScore {
     pub locality: f32,
 }
 
+/// Honest verdict for a capability requirement carried on a request. The fabric
+/// has no capability data (engine-neutral), so it can only record that a
+/// requirement was requested and that it is UNVERIFIED — never that it is
+/// satisfied. A coordinator that holds real `ModelCapabilities` may overwrite
+/// this with an evidence-backed verdict; until then `satisfied` stays `false`
+/// with `evidence = "UNKNOWN"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityRequirementView {
+    /// Snake_case capability name, e.g. `"ocr"`.
+    pub capability: String,
+    /// Short human label for the capability. Derived from the name here (the
+    /// fabric has no capability taxonomy, so it cannot prettify beyond that).
+    pub label: String,
+    /// Whether the requirement is satisfied. Only ever `true` with real
+    /// evidence; the fabric leaves it `false`.
+    pub satisfied: bool,
+    /// Evidence provenance: `"VERIFIED"`, `"INFERRED"`, `"UNKNOWN"`, or
+    /// `"MISSING"`. `"UNKNOWN"` is the honest state when no data exists.
+    pub evidence: String,
+}
+
 /// Observability of a planning decision: the chosen worker's component scores
 /// and the margin over the runner-up.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +159,11 @@ pub struct PlannerRationale {
     pub runner_up_delta: Option<f32>,
     /// All eligible candidates ranked (score desc, PeerId asc).
     pub ranked: Vec<CandidateScore>,
+    /// Capability-requirement verdict for this request, when one was requested.
+    /// `None` when the request carried no capability requirement. Honest: never
+    /// claims satisfied without real evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_requirement: Option<CapabilityRequirementView>,
 }
 
 /// The planner's materialized decision plus the plan it chose.
@@ -242,6 +275,7 @@ impl ExecutionPlanner {
                 chosen: None,
                 runner_up_delta: None,
                 ranked: Vec::new(),
+                capability_requirement: capability_view(req),
             };
             return PlanResult {
                 plan: ExecutionPlan {
@@ -257,7 +291,10 @@ impl ExecutionPlanner {
                     }),
                     fallback_orders: Vec::new(),
                 },
-                reasoning: "no eligible worker serves this model".to_string(),
+                reasoning: append_capability_note(
+                    "no eligible worker serves this model",
+                    req,
+                ),
                 estimated_ms: 0,
                 rationale,
             };
@@ -281,9 +318,10 @@ impl ExecutionPlanner {
                 None
             },
             ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
+            capability_requirement: capability_view(req),
         };
         PlanResult {
-            reasoning: stage.1,
+            reasoning: append_capability_note(&stage.1, req),
             estimated_ms: est,
             plan,
             rationale,
@@ -410,6 +448,32 @@ impl ExecutionPlanner {
     }
 }
 
+/// Builds the honest capability-requirement verdict for a request, or `None`
+/// when no capability was required. The fabric holds no capability data
+/// (engine-neutral), so a requested capability is ALWAYS recorded as NOT
+/// satisfied with `evidence = "UNKNOWN"` — a requirement is never claimed
+/// satisfied without real evidence. A coordinator with real `ModelCapabilities`
+/// may replace this verdict; the fabric does not.
+fn capability_view(req: &RequestFacts) -> Option<CapabilityRequirementView> {
+    req.required_capability.as_ref().map(|cap| CapabilityRequirementView {
+        capability: cap.clone(),
+        label: cap.clone(),
+        satisfied: false,
+        evidence: "UNKNOWN".to_string(),
+    })
+}
+
+/// Appends an honest note to the reasoning when a capability requirement was
+/// requested but the fabric cannot verify it. Unchanged otherwise.
+fn append_capability_note(reasoning: &str, req: &RequestFacts) -> String {
+    match &req.required_capability {
+        Some(cap) => format!(
+            "{reasoning}; capability requirement '{cap}' was requested but the fabric does not verify capabilities here (evidence UNKNOWN)"
+        ),
+        None => reasoning.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +511,7 @@ mod tests {
             transfer_mib: 0,
             local_peer: None,
             priority: 0,
+            required_capability: None,
         }
     }
 
@@ -691,5 +756,64 @@ mod tests {
         let rj = serde_json::to_string(&p.rationale).unwrap();
         let rback: PlannerRationale = serde_json::from_str(&rj).unwrap();
         assert_eq!(rback, p.rationale);
+    }
+
+    #[test]
+    fn no_required_capability_records_none_verdict() {
+        // A request WITHOUT a capability requirement must not fabricate a
+        // verdict: the rationale field stays `None`.
+        let p = ExecutionPlanner::default().plan(
+            &req(),
+            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+        );
+        assert!(p.rationale.capability_requirement.is_none());
+    }
+
+    #[test]
+    fn required_capability_records_honest_unknown_verdict() {
+        // A request WITH a capability requirement records an honest UNKNOWN
+        // verdict: the fabric cannot verify capabilities (engine-neutral), so
+        // `satisfied` is false and the reasoning names the requirement. It
+        // never claims the capability is met.
+        let mut with_ocr = req();
+        with_ocr.required_capability = Some("ocr".to_string());
+        let p = ExecutionPlanner::default().plan(
+            &with_ocr,
+            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+        );
+
+        let view = p
+            .rationale
+            .capability_requirement
+            .expect("a requirement was requested, so a verdict must be recorded");
+        assert_eq!(view.capability, "ocr");
+        assert_eq!(view.label, "ocr");
+        assert!(!view.satisfied, "fabric cannot verify capabilities: never satisfied");
+        assert_eq!(view.evidence, "UNKNOWN");
+        assert!(
+            p.reasoning.contains("capability requirement 'ocr'"),
+            "reasoning must note the requested capability"
+        );
+        assert!(
+            p.reasoning.contains("does not verify capabilities"),
+            "reasoning must state the fabric does not verify it"
+        );
+    }
+
+    #[test]
+    fn capability_requirement_view_round_trips_serde() {
+        // The verdict must round-trip through serde_json, mirroring the
+        // PlannerRationale round-trip above, so a coordinator can persist /
+        // display the honest verdict.
+        let mut with_ocr = req();
+        with_ocr.required_capability = Some("ocr".to_string());
+        let p = ExecutionPlanner::default().plan(
+            &with_ocr,
+            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+        );
+        let view = p.rationale.capability_requirement.as_ref().unwrap();
+        let json = serde_json::to_string(view).unwrap();
+        let back: CapabilityRequirementView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *view);
     }
 }

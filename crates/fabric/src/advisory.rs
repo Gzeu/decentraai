@@ -257,6 +257,7 @@ mod tests {
             transfer_mib: 0,
             local_peer: None,
             priority: 0,
+            required_capability: None,
         }
     }
 
