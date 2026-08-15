@@ -1259,3 +1259,14 @@ coherent fabric decision from `/v1/decision`.
   model options (quantization, verdict badge, can-run workers), (3) historical
   (measured; UNKNOWN when insufficient). Empty → honest empty/UNKNOWN, never
   fabricated.
+
+## 47. Next-Gen Phase 5 — Recovery in the Unified Decision
+
+The unified decision now also answers "what happened when something failed?" by
+projecting the recent recovery timeline from the real decisions (reusing the
+existing `recovery_timeline` vocabulary — no second recovery engine).
+
+- [x] `/v1/decision` and MCP `decide` include a `recent_recovery` array: the
+  last few decisions' recovery timeline (outcome, recoveries, adaptation,
+  ordered event trace), each tagged with its request_id. Advisory-only — never
+  claims an action the runtime did not take.

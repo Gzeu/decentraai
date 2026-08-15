@@ -1124,6 +1124,9 @@ async fn unified_fabric_decision(
     // Historical measured execution statistics (Phase 2): real aggregates only,
     // UNKNOWN when insufficient.
     let mut historical: serde_json::Value = serde_json::json!({ "records": 0 });
+    // Recent recovery timeline (Phase 5): what happened when something failed —
+    // projected from the real decisions' trace using the existing vocabulary.
+    let mut recovery: Vec<serde_json::Value> = Vec::new();
     if let Some(cm) = &state.compute {
         local_peer = cm.local_peer().to_string();
         for adv in cm.workers().await {
@@ -1131,6 +1134,16 @@ async fn unified_fabric_decision(
             workers.push((adv, trusted));
         }
         historical = decentraai_distributed::execution_statistics(&cm.executions());
+        recovery = cm
+            .decisions()
+            .iter()
+            .take(5)
+            .map(|d| {
+                let mut r = decentraai_fabric::recovery_timeline(d);
+                r["request_id"] = serde_json::json!(d.request_id);
+                r
+            })
+            .collect();
     }
 
     let capabilities = decentraai_hub::intent::capabilities_for_intent(intent);
@@ -1228,6 +1241,7 @@ async fn unified_fabric_decision(
         },
         "why": best_why,
         "historical": historical,
+        "recent_recovery": recovery,
         "note": "coherent read-only projection of real fabric state; decision = first CAN_RUN (deterministic); reasons from real per-worker checks.",
     })
 }
@@ -6461,6 +6475,7 @@ mod tests {
         assert!(j["capabilities"].is_array());
         assert!(j["why"].is_array());
         assert!(j["historical"].is_object(), "historical present (Phase 2)");
+        assert!(j["recent_recovery"].is_array(), "recent_recovery present (Phase 5)");
         // decision is null (no workers/models) — honest, not invented.
         assert!(j["decision"].is_null());
 
