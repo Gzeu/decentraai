@@ -3117,12 +3117,15 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             cm.set_engine(engine);
         }
     }
-    // Remote-sharing opt-in: the advertisement carries whether this node
+// Remote-sharing opt-in: the advertisement carries whether this node
     // accepts inference routed from remote peers, so coordinators only ever
     // schedule remote workers that will actually serve the request.
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
         cm.set_accepts_remote_inference(config.inference.allow_remote_inference);
     }
+    // Part 17/22: persistent execution history (db/executions.jsonl) — the
+    // coordinator replays past executions on restart instead of losing them.
+    compute_manager.set_executions_path(Some(data_dir.join("db/executions.jsonl")));
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model
     // instead of only to workers that already serve it (M14).

@@ -268,6 +268,12 @@ pub struct ComputeManager {
     /// decisions + placements + outcomes surfaced by the dashboard EXECUTION
     /// view. `None` until `record_execution` is called.
     recent_executions: std::sync::Mutex<VecDeque<ExecutedPlan>>,
+    /// Optional append-only JSON-lines history file (`db/executions.jsonl`).
+    /// When set, every `record_execution` appends a best-effort line so the
+    /// fabric keeps execution history across restarts; `load_execution_history`
+    /// replays it back into `recent_executions` on startup. `None` keeps
+    /// execution history in-memory only (default).
+    executions_path: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Bounded, newest-first full autonomous execution decisions (M23 Full
     /// Autonomy): candidates, constraints, score, selected worker, KV affinity,
     /// engine capability, expected mode, fallback and lifecycle trace — the
@@ -314,6 +320,7 @@ impl ComputeManager {
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
+            executions_path: std::sync::Mutex::new(None),
             recent_decisions: std::sync::Mutex::new(VecDeque::new()),
             signing_key: None,
             breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
@@ -363,6 +370,63 @@ impl ComputeManager {
     /// Marks `peer` as trusted (eligible to run workloads).
     pub async fn add_trusted(&self, peer: PeerId) {
         self.scheduler.lock().await.add_trusted(peer);
+    }
+
+    /// Enables persistent execution history (Part 17/22). Every subsequent
+    /// `record_execution` appends a JSON-lines entry to `path`
+    /// (`db/executions.jsonl`) best-effort, and any history already in the
+    /// file is replayed into the in-memory ring so a restarted coordinator
+    /// keeps its execution trail. Pass `None` to keep history in-memory only.
+    pub fn set_executions_path(&self, path: Option<std::path::PathBuf>) {
+        let mut slot = self.executions_path.lock().unwrap();
+        *slot = path.clone();
+        if let Some(p) = path {
+            self.replay_execution_history(&p);
+        }
+    }
+
+    /// Replays `db/executions.jsonl` into the in-memory ring (oldest first,
+    /// capped at the ring bound), so history survives coordinator restarts.
+    /// Best-effort: a missing/corrupt file only logs and leaves the ring as is.
+    fn replay_execution_history(&self, path: &std::path::Path) {
+        const MAX_EXECUTIONS: usize = 128;
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return; // fresh install: no history yet
+        };
+        let mut ring = self.recent_executions.lock().unwrap();
+        for line in contents.lines() {
+            if let Ok(rec) = serde_json::from_str::<ExecutedPlan>(line) {
+                ring.push_back(rec);
+            }
+        }
+        while ring.len() > MAX_EXECUTIONS {
+            ring.pop_front();
+        }
+    }
+
+    /// Appends one execution record to the history file, best-effort (never
+    /// breaks the routing flow on a write error).
+    fn persist_execution(&self, rec: &ExecutedPlan) {
+        let path = self.executions_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, "failed to create executions history dir");
+                return;
+            }
+        }
+        let Ok(json) = serde_json::to_string(rec) else { return };
+        use std::io::Write;
+        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open executions history file");
+                return;
+            }
+        };
+        if let Err(e) = writeln!(f, "{json}") {
+            tracing::warn!(error = %e, "failed to append executions history");
+        }
     }
 
     /// Removes `peer` from the trusted set (no longer eligible to run
@@ -621,9 +685,14 @@ impl ComputeManager {
             est_ram_mb,
             est_vram_mb,
         });
+        let rec = ring.back().unwrap().clone();
         while ring.len() > MAX_EXECUTIONS {
             ring.pop_front();
         }
+        drop(ring);
+        // Part 17/22: persist best-effort so the execution trail survives
+        // restarts. Never blocks or breaks the routing flow.
+        self.persist_execution(&rec);
     }
 
     /// Snapshot of recent executed plans, newest-first (M23).
@@ -2235,6 +2304,65 @@ mod tests {
             c.prefix_worker.as_deref(),
             Some(worker.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn execution_history_persists_across_manager_restart() {
+        // Part 17/22: with a history file set, recorded executions are
+        // appended as JSON lines and replayed into a fresh manager, so the
+        // coordinator keeps its execution trail across restarts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db/executions.jsonl");
+
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        manager.set_executions_path(Some(path.clone()));
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (plan, placement) = manager
+            .plan_and_reserve(&req, 100, None, 0)
+            .await
+            .expect("plan");
+        manager.record_execution(
+            "persist-1",
+            &plan,
+            &placement,
+            None,
+            "succeeded",
+            ExecutionAttribution {
+                tokens_used: Some(99),
+                processing_time_ms: Some(500),
+                attempt: 1,
+            },
+        );
+
+        // The history file exists and carries the record.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("persist-1"), "history appended: {contents}");
+        let first: ExecutedPlan = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(first.tokens_used, Some(99));
+
+        // A fresh manager pointed at the same file replays the record.
+        let restarted = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        restarted.set_executions_path(Some(path.clone()));
+        let recs = restarted.executions();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].request_id, "persist-1");
+        assert_eq!(recs[0].tokens_used, Some(99));
     }
 
     #[tokio::test]
