@@ -1070,6 +1070,168 @@ async fn mcp_intent_with_fit(
     })
 }
 
+/// Build the worker-per-model fit for one model file against the live fabric.
+/// Pure given the worker set; returns per-worker verdicts.
+fn fabric_fit_for_model(
+    model_file: &str,
+    capability: &str,
+    evidence: &str,
+    claims: &[(String, String)],
+    workers: &[(decentraai_compute::ComputeAdvertisement, bool)],
+    local_peer: &str,
+) -> Vec<WorkerCapResult> {
+    let mut results = Vec::new();
+    for (adv, trusted) in workers {
+        let accepts_remote_work =
+            *local_peer == adv.peer_id.to_string() || adv.accepts_remote_inference;
+        results.push(worker_capability_verdict_with_policy(
+            adv,
+            *trusted,
+            model_file,
+            capability,
+            evidence,
+            claims,
+            accepts_remote_work,
+        ));
+    }
+    results
+}
+
+/// ONE coherent, explainable fabric decision (Phase 1 — Unified Decision).
+///
+/// Combines intent → capabilities → model options → per-variant fabric fit →
+/// chosen decision → why, by REUSING the existing capability resolver, the
+/// per-worker verdict, the aggregate, and the registry claims. It is a
+/// read-only projection, NOT a new planner or scoring system — the "best"
+/// choice is the first CAN_RUN (deterministic order), and every reason comes
+/// from the real per-worker checks. No fabricated telemetry.
+///
+/// `explicit_model` (optional) narrows the model options to that model file;
+/// otherwise all local models with a claim for each capability are considered.
+async fn unified_fabric_decision(
+    state: &ApiState,
+    intent: &str,
+    evidence: &str,
+    explicit_model: Option<&str>,
+) -> serde_json::Value {
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
+    let require_verified = evidence == "verified";
+
+    // Live worker set + local peer (I/O once).
+    let mut workers: Vec<(decentraai_compute::ComputeAdvertisement, bool)> = Vec::new();
+    let mut local_peer = String::new();
+    // Historical measured execution statistics (Phase 2): real aggregates only,
+    // UNKNOWN when insufficient.
+    let mut historical: serde_json::Value = serde_json::json!({ "records": 0 });
+    if let Some(cm) = &state.compute {
+        local_peer = cm.local_peer().to_string();
+        for adv in cm.workers().await {
+            let trusted = cm.is_trusted(&adv.peer_id).await;
+            workers.push((adv, trusted));
+        }
+        historical = decentraai_distributed::execution_statistics(&cm.executions());
+    }
+
+    let capabilities = decentraai_hub::intent::capabilities_for_intent(intent);
+
+    // capabilities → model_options → best decision.
+    let mut capabilities_out = Vec::new();
+    let mut best: Option<(String, String, String)> = None; // (cap, model, worker)
+    let mut best_why: Vec<String> = Vec::new();
+
+    for cap in capabilities {
+        let cap_str = serde_json::to_string(&cap)
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        // Candidate models: explicit one (if given) else all local models with
+        // a persisted claim for this capability.
+        let mut model_files: Vec<String> = Vec::new();
+        if let Some(explicit) = explicit_model {
+            model_files.push(explicit.to_string());
+        } else if let Some(reg) = &registry {
+            for m in reg.models_with_capability(&cap_str, require_verified) {
+                model_files.push(m.0.to_string());
+            }
+        }
+
+        let mut model_options = Vec::new();
+        for model_file in &model_files {
+            let claims: Vec<(String, String)> = registry
+                .as_ref()
+                .map(|reg| {
+                    claims_for_file_name(reg, model_file)
+                        .into_iter()
+                        .map(|c| (c.capability, c.provenance))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let results =
+                fabric_fit_for_model(model_file, &cap_str, evidence, &claims, &workers, &local_peer);
+            let fit = aggregate_can_i_run(&results);
+            let verdict = match fit.verdict {
+                WorkerCapVerdict::CanRun => "CAN_RUN",
+                WorkerCapVerdict::CannotRun => "CANNOT_RUN",
+                WorkerCapVerdict::Unknown => "UNKNOWN",
+            };
+            let chosen = fit.chosen_worker.clone();
+            // Record the first CAN_RUN as the fabric-wide best for this capability.
+            if best.is_none() && fit.verdict == WorkerCapVerdict::CanRun {
+                best = chosen
+                    .clone()
+                    .map(|w| (cap_str.clone(), model_file.clone(), w));
+                // Aggregate the best model's passing checks as the "why".
+                best_why = results
+                    .iter()
+                    .filter(|r| r.verdict == WorkerCapVerdict::CanRun)
+                    .flat_map(|r| r.checks.iter())
+                    .filter(|c| c.pass)
+                    .map(|c| format!("✓ {} — {}", c.check, c.state))
+                    .collect::<Vec<_>>();
+            }
+            model_options.push(serde_json::json!({
+                "model": model_file,
+                "quantization": variant_quantization_from_file_name(model_file),
+                "verdict": verdict,
+                "fit": fit.to_json(),
+                "can_run_workers": results
+                    .iter()
+                    .filter(|r| r.verdict == WorkerCapVerdict::CanRun)
+                    .map(|r| serde_json::json!({
+                        "peer_id": r.peer_id, "node_id": r.node_id, "node_name": r.node_name,
+                        "trusted": r.trusted, "engine": r.engine_compat,
+                        "ram_sufficient": r.ram_sufficient, "vram_sufficient": r.vram_sufficient,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+
+        capabilities_out.push(serde_json::json!({
+            "capability": cap_str,
+            "label": cap.label(),
+            "evidence": if require_verified { "verified" } else { "any" },
+            "model_options": model_options,
+        }));
+    }
+
+    serde_json::json!({
+        "request": intent,
+        "capabilities": capabilities_out,
+        "decision": match &best {
+            Some((cap, model, worker)) => serde_json::json!({
+                "capability": cap,
+                "model": model,
+                "worker": worker,
+            }),
+            None => serde_json::Value::Null,
+        },
+        "why": best_why,
+        "historical": historical,
+        "note": "coherent read-only projection of real fabric state; decision = first CAN_RUN (deterministic); reasons from real per-worker checks.",
+    })
+}
+
 /// Fabric graph projection for the MCP `get_fabric_graph` tool (Phase C). Same
 /// pure aggregation as `GET /v1/fabric`, read-only, no execution. Real state
 /// only — never fabricated nodes/models/capabilities.
@@ -2679,6 +2841,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/stats", get(stats_handler))
         .route("/v1/resources", get(resources_handler))
         .route("/v1/can_run", get(can_run_handler))
+        .route("/v1/decision", get(decision_handler))
         .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_detail_handler))
@@ -3753,6 +3916,36 @@ async fn can_run_handler(
         .unwrap_or("any");
     let evidence = if evidence == "verified" { "verified" } else { "any" };
     let body = mcp_worker_capability(&state, &model, &capability, evidence).await;
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// `GET /v1/decision?intent=...&evidence=any|verified&model=...` — the ONE
+/// coherent fabric decision (Phase 1): intent → capabilities → model options →
+/// fabric fit → chosen decision → why. Reuses the existing capability resolver,
+/// per-worker verdict and aggregate (no new planner/scoring). Read-only.
+async fn decision_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let intent = query.get("intent").cloned().unwrap_or_default();
+    if intent.trim().is_empty() {
+        return forbidden("missing intent");
+    }
+    let evidence = query
+        .get("evidence")
+        .map(String::as_str)
+        .unwrap_or("any");
+    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let model = query.get("model").map(String::as_str);
+    let body = unified_fabric_decision(&state, &intent, evidence, model).await;
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -6228,6 +6421,52 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let j: serde_json::Value = resp.json().await.unwrap();
         assert!(j["records"].is_number(), "records field present");
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_endpoint_requires_operator_and_returns_coherent_structure() {
+        // /v1/decision (Phase 1) is operator/admin-gated and returns a coherent
+        // read-only projection (request/capabilities/decision/why/historical).
+        // Without a compute manager the capabilities array is empty (honest) but
+        // the shape is stable.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401/403.
+        let resp = client
+            .get(format!("http://{api}/v1/decision?intent=ocr"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token -> 200 JSON with the coherent structure.
+        let resp = client
+            .get(format!("http://{api}/v1/decision?intent=ocr"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(j["request"], "ocr");
+        assert!(j["capabilities"].is_array());
+        assert!(j["why"].is_array());
+        assert!(j["historical"].is_object(), "historical present (Phase 2)");
+        // decision is null (no workers/models) — honest, not invented.
+        assert!(j["decision"].is_null());
+
+        // Missing intent -> 4xx.
+        let resp = client
+            .get(format!("http://{api}/v1/decision"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
 
         manager.lock().await.shutdown().await.unwrap();
     }

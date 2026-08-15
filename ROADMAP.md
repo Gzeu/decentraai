@@ -1212,3 +1212,26 @@ existing `accepts_remote_inference` opt-in (no new permission system).
 - [x] `worker_capability_verdict` kept as a test-only convenience wrapper
   (policy on) so existing tests are unchanged.
 - [x] Test: remote-no-opt-in → CANNOT_RUN via policy check; local always allowed.
+
+## 44. Next-Gen Phase 1+2 — Unified Fabric Decision + Historical Comparison
+
+Turn the independent capabilities into ONE coherent read-only fabric decision.
+
+**Phase 1 — Unified Fabric Decision**
+- [x] `unified_fabric_decision(state, intent, evidence, explicit_model)` — ONE
+  coherent projection: request → capabilities → model options (per model +
+  variant with CAN_RUN/CANNOT_RUN/UNKNOWN) → per-variant fabric fit →
+  chosen decision (first CAN_RUN, deterministic) → why (real per-worker passing
+  checks). Reuses the capability resolver, `worker_capability_verdict_with_policy`
+  (trust/policy/engine/ram/vram), `aggregate_can_i_run`, registry claims,
+  quantization. NOT a new planner/scoring system.
+- [x] `GET /v1/decision?intent=&evidence=&model=` (operator/admin, read-only).
+
+**Phase 2 — Historical comparison in the decision**
+- [x] The decision carries a `historical` block from the real
+  `execution_statistics` (measured throughput/latency/outcomes/retries per
+  model/worker); UNKNOWN when insufficient — never fabricated averages.
+
+**Tests (focused)**
+- [x] `/v1/decision` auth + coherent structure (request/capabilities/decision/
+  why/historical; decision null honestly when no workers).
