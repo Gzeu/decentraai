@@ -517,3 +517,72 @@ The following metrics are exposed for distributed inference:
 3. **Model-Specific Pricing**: Different reputation rates for different models
 4. **Priority Queues**: Support for priority-based request handling
 5. **Federated Learning**: Use inference results to improve models across network
+
+---
+
+# Research Note — Distributed Inference & Related Patterns (Phase 6)
+
+Date: 2026-08-16. Classification: ADOPT / ADAPT / EXPERIMENT / WATCH / IGNORE.
+Anchored to the current repo state: DecentraAI runs llama-server as an external
+subprocess (never FFI); all distributed flags
+(`tensor_parallel` / `expert_routing` / `prefill_decode_separation`) are gated
+`false` for every engine DecentraAI actually runs (pinned by tests in
+`crates/fabric/src/engine.rs`).
+
+## llama.cpp RPC / tensor-split
+
+- SOURCE: upstream `ggml-org/llama.cpp` `tools/rpc/README.md` (master).
+- WHAT IT DOES: a separate `ggml-rpc-server` process exposes host devices over
+  TCP/RDMA; the main llama-cli/server distributes model weights + KV cache across
+  local and remote devices in proportion to available memory (`--rpc
+  host:port,...`, optional `--tensor-split` and local tensor cache).
+- CURRENT DECENTRAAI STATE: the distributed `EngineKind::Vllm/Sglang` advertise
+  `tensor_parallel: true` in their capability table, but DecentraAI's production
+  engine is llama-server (single-worker, whole-request routing). Distributed
+  execution scaffolding (plan types `Sequential`/`FanOut`) exists but is only
+  emitted when an engine advertises the split capability, which no running engine
+  does. The fabric routes whole requests to one worker.
+- GAP: a real `ggml-rpc-server`/`--rpc` tensor-split path, with a 
+  two-node latency/throughput measurement.
+- BENEFIT: single large model larger than one node's VRAM could run across nodes.
+- RISK: the RPC backend is explicitly **proof-of-concept, fragile and insecure**
+  ("Never run the RPC server on an open network or in a sensitive environment!").
+  Version skew across llama.cpp builds, network latency/bandwidth sensitivity,
+  and failure behavior are unvalidated.
+- COST: spawn/manage `ggml-rpc-server` per node; build variants per accelerator;
+  substantial testing on real hardware.
+- RECOMMENDATION: **EXPERIMENT** (isolated, LAN-only, behind the existing
+  capability gate). Do NOT enable as a default; requires real two-node
+  measurements first (ROADMAP gate).
+
+## GPU scheduling / KV-cache locality
+
+- SOURCE: repository evidence (M19 `NetworkGraph`, M20 `SessionAccount`,
+  `KvPlanner`, `prefill_decode_separation` gate).
+- WHAT IT DOES: KV-aware routing already steers continuations to the worker that
+  holds the session's KV prefix, and the planner folds measured network cost into
+  scoring.
+- CURRENT STATE: M19/M20 verified on two-node LAN.
+- GAP / BENEFIT: none required now; mature patterns (prefill/decode separation,
+  expert routing) remain parked behind gates until a real engine advertises them.
+- RECOMMENDATION: **ADAPT** (already adopted); keep the gates honest.
+
+## OpenTelemetry GenAI + MCP + agent control plane
+
+- SOURCE: OTel GenAI semantic conventions (Phase 8), MCP read-only tools.
+- CURRENT STATE: `gen_ai.*` Prometheus projection + MCP `decide` / fabric graph /
+  worker capability / intent tools are live.
+- RECOMMENDATION: **ADAPT** (adopted); add OTel trace export only when an external
+  collector is actually used.
+
+## Self-healing distributed systems
+
+- SOURCE: repository (Phase H `recovery_timeline`, `adapt`/`orchestrate`,
+  bounded reconnect, request retry).
+- RECOMMENDATION: **ADOPT** (already implemented); keep advisory-only and honest.
+
+## Model routing
+
+- SOURCE: planner + unified decision (`decide`).
+- RECOMMENDATION: **ADAPT**; extend to explicit `intent -> capability -> model ->
+  variant -> worker -> reservation` once a mutation path is justified.
