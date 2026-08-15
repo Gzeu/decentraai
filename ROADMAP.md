@@ -1360,3 +1360,13 @@ without executing.
   same core).
 - [x] Tests: `plan_preview` plans without reserving (in_flight 0) + honest None
   for unknown model; `/v1/execute` dry-run 422 without a fabric model.
+
+## 55. Next-Gen — Dashboard dry-run preview button
+
+- [x] Decision card gains a "Preview (dry-run)" button (`previewDecision()`):
+  reuses the same intent/prompt/max_tokens/evidence/model inputs, POSTs
+  `/v1/execute` with `dry_run: true` (+ `confirm: true` for the mutation gate),
+  renders the real `would_execute` (model/worker/estimated_ms/stages/plan_id)
+  with a "no request sent · no reservation held" note; no real-run confirm
+  dialog (a preview is read-only). Errors render the real message + honest
+  "no eligible worker" case. Nothing fabricated.

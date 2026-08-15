@@ -604,12 +604,14 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
               <input id="dec-max" class="mono" type="number" min="1" step="1" value="256" title="max_tokens" style="width:72px;padding:4px 6px;font-size:12px">
               <label style="font-size:11px;color:var(--muted)"><input id="dec-stream" type="checkbox" checked> stream</label>
               <button class="btn small warn" onclick="executeDecision()">Execute (confirm)</button>
+              <button class="btn small" onclick="previewDecision()">Preview (dry-run)</button>
             </div>
             <div style="margin-top:6px">
               <textarea id="dec-prompt" class="mono" placeholder="prompt to run on the decided fabric (required)" rows="2" style="width:100%;padding:6px;font-size:12px;resize:vertical;font-family:monospace"></textarea>
             </div>
           </div>
           <div id="dec-exec" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+          <div id="dec-preview" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
         </div>
         <!-- Variant comparison: which on-disk variant of a model fits THIS
              fabric best, side-by-side, from the real /v1/can_run variants
@@ -2129,6 +2131,58 @@ async function executeDecision(){
   } else {
     renderExecError(con, j, status);
   }
+}
+
+// PREVIEW (T2): dry-run of /v1/execute. Read-only — never reserves a worker,
+// never runs inference. Still sends `confirm: true` + `dry_run: true` to pass
+// the backend's mutation-path gate, but no real confirm() dialog is needed
+// (a preview is safe). Renders exactly what the backend reported as
+// `would_execute`; never fabricates worker/plan/estimates.
+async function previewDecision(){
+  const intent = ($('dec-intent').value || '').trim();
+  const prompt = ($('dec-prompt').value || '').trim();
+  const ev = ($('dec-ev')||{}).value || 'any';
+  const maxRaw = $('dec-max').value || '256';
+  const maxTokens = parseInt(maxRaw, 10);
+  const model = ($('dec-model').value || '').trim();
+  if (!intent) { toast('enter an intent to preview', true); return; }
+  if (!prompt) { toast('enter a prompt to preview', true); return; }
+  const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
+  const body = { intent, prompt, max_tokens: mt, evidence: ev, dry_run: true, confirm: true };
+  if (model) body.model = model;
+  const pv = $('dec-preview');
+  if (!pv) return;
+  pv.innerHTML = '<span class="badge ok">previewing…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';
+  const authHeaders = Object.assign({}, headers, { 'Content-Type': 'application/json' });
+  const { ok, status, j } = await apiFetch('/v1/execute', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) });
+  if (!ok) {
+    // Honest error render: the real backend message, plus the explicit
+    // "no eligible worker on the fabric" case. Never invent a plan.
+    const err = (j && j.error && j.error.message) || (j && j.error && j.error.type) || ('HTTP ' + status);
+    pv.innerHTML = '<span class="badge bad">preview failed ('+status+')</span> <span class="mono">'+esc(String(err))+'</span>'+
+      '<div style="margin-top:6px" class="mono"><span class="badge faint">no request sent · no worker reserved</span></div>';
+    return;
+  }
+  if (!(j && j.dry_run)) {
+    pv.innerHTML = '<span class="badge bad">unexpected response</span> <span class="mono">dry-run flag missing — '+esc(String(j && j.error ? (j.error.message || 'error') : 'no would_execute'))+'</span>';
+    return;
+  }
+  const w = (j.would_execute) || {};
+  pv.innerHTML =
+    '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+      '<span class="badge warn">DRY-RUN</span>'+
+      '<span class="badge faint">preview only</span>'+
+      '<span class="mono">'+esc(w.model||'—')+'</span>'+
+      (w.worker ? '<span class="badge faint">'+esc(short(w.worker, 16))+'</span>' : '')+
+      (w.estimated_ms != null ? '<span class="mono" style="color:var(--faint)">~'+esc(String(w.estimated_ms))+' ms</span>' : '')+
+      (w.plan_id ? '<span class="mono" style="color:var(--faint)">plan '+esc(short(w.plan_id, 12))+'</span>' : '')+
+    '</div>'+
+    (w.model_hash ? '<div class="mono" style="color:var(--faint)">model hash '+esc(short(w.model_hash, 16))+'</div>' : '')+
+    (w.stages && w.stages.length
+      ? '<div class="mono" style="margin-top:4px;color:var(--fg)">stages: '+esc(String(w.stages.join(' → ')))+'</div>'
+      : '')+
+    '<div style="margin-top:6px" class="mono"><span class="badge faint">dry-run · no request sent · no reservation held</span></div>'+
+    ((j.note) ? '<div style="margin-top:4px" class="mono">'+esc(String(j.note))+'</div>' : '');
 }
 
 // Shared honest error renderer for /v1/execute failures: the real error
