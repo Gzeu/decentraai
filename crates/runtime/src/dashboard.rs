@@ -583,6 +583,33 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <div id="hub-status" style="margin-top:8px;font-size:12px;color:var(--muted)">search the Hub to discover models you can pull on this node</div>
           <table style="margin-top:8px"><thead><tr><th>Model</th><th>Category</th><th class="num">Downloads</th><th></th></tr></thead>
           <tbody id="hub-results"><tr><td colspan="4" class="empty">nothing searched yet</td></tr></tbody></table>
+          <!-- Model card (Issue #26 §7–§8, §22): real Hub metadata + honest
+               capability taxonomy with provenance + every GGUF variant with
+               size/SHA-256 + live fabric compatibility. Hidden until a model
+               is opened; nothing here is fabricated. -->
+          <div id="hub-detail" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:12px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+              <div>
+                <div style="font-weight:600" id="md-title"></div>
+                <div class="mono" style="font-size:11px;color:var(--muted)" id="md-meta"></div>
+              </div>
+              <button class="btn small" onclick="hubCloseDetail()">Close</button>
+            </div>
+            <div style="margin-top:8px;font-size:12px;color:var(--muted)" id="md-desc"></div>
+            <div style="margin-top:10px"><b style="font-size:12px">Capabilities</b>
+              <div id="md-caps" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+            </div>
+            <div style="margin-top:10px"><b style="font-size:12px">Tasks</b>
+              <div id="md-tasks" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+            </div>
+            <div style="margin-top:10px"><b style="font-size:12px">Variants</b>
+              <table style="margin-top:6px"><thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th><th></th></tr></thead>
+              <tbody id="md-variants"><tr><td colspan="4" class="empty">no variants reported</td></tr></tbody></table>
+            </div>
+            <div style="margin-top:10px"><b style="font-size:12px">Fabric compatibility <span id="md-fabric-note" style="color:var(--muted);font-weight:400"></span></b>
+              <div id="md-fabric" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1789,7 +1816,8 @@ function hubSearch(){
     .then(({ ok, j }) => {
       if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">search failed</span> ' + esc((j.error && j.error.message) || 'unknown'); return; }
       const rows = (j.models || []).map(m =>
-        '<tr><td>'+esc(m.id)+'</td><td>'+esc(m.pipeline_tag || '—')+'</td><td class="num">'+nfmt(m.downloads || 0)+'</td><td>'+
+        '<tr><td>'+esc(m.id)+'</td><td>'+esc(m.pipeline_tag || '—')+'</td><td class="num">'+nfmt(m.downloads || 0)+'</td><td style="white-space:nowrap">'+
+        '<button class="btn small" onclick="hubOpenDetail(\''+jsq(m.id)+'\')">Details</button> '+
         '<button class="btn small" id="hub-pull-'+safeId(m.id)+'" onclick="hubPull(\''+jsq(m.id)+'\')">Pull</button></td></tr>'
       ).join('');
       $('hub-results').innerHTML = rows || '<tr><td colspan="4" class="empty">no GGUF models found</td></tr>';
@@ -1822,6 +1850,65 @@ function hubPull(id){
 function safeId(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
 function jsq(s){ return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 function nfmt(n){ return n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
+// Model card (Issue #26 §7–§8, §22, §31): fetch real Hub metadata + honest
+// capability taxonomy + variants, and the live fabric view of who can run it.
+// The fabric list comes from the node's own compute registry — never mocked.
+function hubOpenDetail(id){
+  $('hub-status').innerHTML = 'loading model card for '+esc(id)+'…';
+  fetch('/api/admin/hub/model/'+encodeURIComponent(id), { headers })
+    .then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">model card failed</span> ' + esc((j.error && j.error.message) || 'unknown'); return; }
+      const md = j.metadata || {};
+      $('md-title').textContent = j.id || '';
+      $('md-meta').textContent = [md.pipeline_tag, md.license, md.params ? md.params+' params' : '', md.context_length ? 'ctx '+md.context_length : '', md.downloads ? nfmt(md.downloads)+' downloads' : '', md.likes ? md.likes+' likes' : ''].filter(Boolean).join(' · ');
+      $('md-desc').textContent = md.description || 'No description on the Hub.';
+      const claims = j.capabilities && j.capabilities.claims || [];
+      $('md-caps').innerHTML = claims.length ? claims.map(c =>
+        '<span class="badge" title="provenance: '+esc(c.provenance)+'">'+esc(c.label)+'</span>'
+      ).join('') : '<span class="muted">no capabilities classified</span>';
+      const tasks = j.capabilities && j.capabilities.tasks || [];
+      $('md-tasks').innerHTML = tasks.length ? tasks.map(t => esc(t.task)).join(' · ') : '—';
+      const variants = j.variants || [];
+      $('md-variants').innerHTML = variants.length ? variants.map(v =>
+        '<tr><td class="mono">'+esc(v.file)+'</td><td class="num">'+fmtMB((v.size_bytes||0)/1048576)+'</td><td class="mono">'+esc(short(v.sha256 || '', 12))+'</td><td>'+
+        '<button class="btn small" id="hub-pull-'+safeId(j.id+':'+v.file)+'" onclick="hubPullVariant(\''+jsq(j.id)+'\',\''+jsq(v.file)+'\')">Pull</button></td></tr>'
+      ).join('') : '<tr><td colspan="4" class="empty">no variants reported</td></tr>';
+      const fabric = j.fabric || [];
+      $('md-fabric-note').textContent = fabric.length ? ' — '+fabric.length+' node(s) have this model' : ' — no node has this model yet';
+      $('md-fabric').innerHTML = fabric.length ? fabric.map(f =>
+        '<div style="margin-top:4px">'+esc(f.node_name || f.node_id)+' · <code class="mono">'+esc(f.node_id)+'</code> · '+esc(f.status)+' · '+
+        (f.served ? '<span class="badge ok">served</span>' : '')+(f.available && !f.served ? '<span class="badge">on disk</span>' : '')+
+        (f.trusted ? '' : ' <span class="badge warn">untrusted</span>')+'</div>'
+      ).join('') : 'pull it here to make it available fabric-wide';
+      $('hub-detail').style.display = 'block';
+      $('hub-status').innerHTML = 'model card loaded';
+    })
+    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">model card error</span> '+esc(e); });
+}
+function hubPullVariant(id, file){
+  if (hubPulling[id+':'+file]) return;
+  hubPulling[id+':'+file] = true;
+  const btn = $('hub-pull-'+safeId(id+':'+file));
+  if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
+  $('hub-status').innerHTML = 'downloading '+esc(id)+' variant '+esc(file)+' — the node keeps serving';
+  fetch('/api/admin/hub/pull', {
+    method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ reference: 'hf:' + id, file: file }),
+  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">pull failed</span> ' + esc((j.error && j.error.message) || 'unknown'); }
+      else {
+        $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.file)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
+        toast('variant pulled: ' + short(j.file, 24));
+        refresh();
+      }
+      delete hubPulling[id+':'+file];
+      if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
+    })
+    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">pull error</span> '+esc(e); delete hubPulling[id+':'+file]; if (btn) { btn.disabled = false; btn.textContent = 'Pull'; } });
+}
+function hubCloseDetail(){ $('hub-detail').style.display = 'none'; }
 function renderObservability(s, c){
   const lat = (s && s.recent_requests || []).map(r => r.duration_ms);
   const tps = (s && s.recent_requests || []).map(r => r.tokens_per_second);

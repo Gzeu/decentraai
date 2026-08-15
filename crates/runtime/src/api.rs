@@ -781,10 +781,20 @@ async fn admin_hub_pull_handler(
         Some(r) if !r.is_empty() => r.to_string(),
         _ => return forbidden("missing reference (hf:org/repo[:file])"),
     };
-    let hf_ref = match decentraai_hub::HfRef::parse(&reference) {
+    // Optional explicit file variant (Issue #26 §22): when present it is
+    // appended to the reference so the verified downloader fetches exactly
+    // that GGUF instead of the auto-selected largest one.
+    let file = req.get("file").and_then(|v| v.as_str()).map(str::to_string);
+    let mut hf_ref = match decentraai_hub::HfRef::parse(&reference) {
         Ok(r) => r,
         Err(e) => return forbidden(&format!("bad reference: {e}")),
     };
+    if let Some(f) = file {
+        if !f.to_lowercase().ends_with(".gguf") {
+            return forbidden("file must end with .gguf");
+        }
+        hf_ref.file = Some(f);
+    }
     let models_dir = state.info.repo_root.join("models");
     if let Err(e) = std::fs::create_dir_all(&models_dir) {
         return forbidden(&format!("creating models dir: {e}"));
@@ -810,6 +820,25 @@ async fn admin_hub_pull_handler(
             0
         }
     };
+    // Issue #26 §25: make the fabric see the new model without a restart.
+    // Rebuild `available_models` from the refreshed registry and re-advertise
+    // through the compute manager; the periodic broadcaster picks up the new
+    // advertisement on its next heartbeat.
+    if let Some(cm) = &state.compute {
+        let ctx = cm
+            .last_local_advertisement_sync()
+            .and_then(|a| a.capability.served_models.first().map(|m| m.context_tokens))
+            .unwrap_or(0);
+        match cm.refresh_local_models(&registry_path, ctx).await {
+            Ok(adv) => {
+                tracing::info!(
+                    on_disk = adv.capability.available_models.len(),
+                    "re-advertised local model set after pull"
+                );
+            }
+            Err(e) => tracing::warn!("refresh_local_models after pull failed: {e:#}"),
+        }
+    }
     decentraai_audit::record_best_effort(
         &state.info.repo_root.join("logs"),
         "model_pulled",
@@ -822,6 +851,7 @@ async fn admin_hub_pull_handler(
     );
     let body = serde_json::json!({
         "reference": reference,
+        "file": hf_ref.file,
         "path": download.path.display().to_string(),
         "bytes": download.bytes,
         "sha256": download.sha256,
@@ -831,6 +861,125 @@ async fn admin_hub_pull_handler(
         body.to_string(),
     )
         .into_response()
+}
+
+/// Model Hub detail (Issue #26 §7–§8, §22, §31): `GET
+/// /api/admin/hub/model/{repo}` returns the enriched model card —
+/// real Hub metadata (description, license, context, params), the honest
+/// capability taxonomy with provenance, and every GGUF file variant with
+/// size + SHA-256 — plus the live fabric view of which nodes can run it.
+/// Master-gated. Pure serialization helpers keep the handler testable.
+async fn admin_hub_model_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(repo): AxumPath<String>,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let catalog = decentraai_hub::HubCatalog::new();
+    let detail = match catalog.model_detail(&repo).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let files = match catalog.list_gguf_files(&repo).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let caps = detail.capabilities();
+    let body = hub_model_body(&detail, &files, &caps, &state, &repo).await;
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Pure serialization of the model card (hub metadata + capabilities +
+/// variants + live fabric state). Tests drive it with synthetic inputs.
+async fn hub_model_body(
+    detail: &decentraai_hub::HubModelDetail,
+    files: &[decentraai_hub::HubModelFile],
+    caps: &decentraai_hub::ModelCapabilities,
+    state: &ApiState,
+    repo: &str,
+) -> serde_json::Value {
+    // Live fabric view: which trusted, ready workers have this model on disk
+    // or loaded, and their honest capacity for it. Never fabricated — if a
+    // worker is not in the compute registry, it is simply not listed.
+    let mut fabric_nodes = Vec::new();
+    if let Some(cm) = &state.compute {
+        let workers = cm.workers().await;
+        for w in workers {
+            let served = w
+                .capability
+                .served_models
+                .iter()
+                .any(|m| m.file_name == repo);
+            let available = w
+                .capability
+                .available_models
+                .iter()
+                .any(|m| m.file_name == repo);
+            if served || available {
+                fabric_nodes.push(serde_json::json!({
+                    "node_id": w.node_id,
+                    "node_name": w.node_name,
+                    "peer_id": w.peer_id.to_string(),
+                    "status": format!("{:?}", w.availability.status),
+                    "served": served,
+                    "available": available,
+                    "trusted": cm.is_trusted(&w.peer_id).await,
+                }));
+            }
+        }
+    }
+    serde_json::json!({
+        "id": repo,
+        "metadata": {
+            "pipeline_tag": detail.pipeline_tag.as_ref().map(|t| t.as_str()),
+            "tags": detail.tags,
+            "downloads": detail.downloads,
+            "likes": detail.likes,
+            "description": detail.description,
+            "license": detail.license,
+            "context_length": detail.context_length,
+            "params": detail.params,
+        },
+        "capabilities": {
+            "claims": caps.claims.iter().map(|c| serde_json::json!({
+                "capability": c.capability,
+                "label": c.capability.label(),
+                "provenance": c.provenance,
+            })).collect::<Vec<_>>(),
+            "tasks": caps.tasks.iter().map(|t| serde_json::json!({
+                "capability": t.capability,
+                "task": t.task,
+            })).collect::<Vec<_>>(),
+        },
+        "variants": files.iter().map(|f| serde_json::json!({
+            "file": f.path,
+            "size_bytes": f.size,
+            "sha256": f.lfs.as_ref().map(|l| l.oid.clone()),
+        })).collect::<Vec<_>>(),
+        "fabric": fabric_nodes,
+    })
 }
 
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
@@ -994,6 +1143,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/events", get(admin_audit_events_handler))
         // Part 16/22 - Model Hub (master-gated search + pull)
         .route("/api/admin/hub/search", get(admin_hub_search_handler))
+        .route("/api/admin/hub/model/{repo}", get(admin_hub_model_handler))
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
@@ -3976,6 +4126,87 @@ mod tests {
         assert!(arr[1]["pipeline_tag"].is_null());
     }
 
+    #[tokio::test]
+    async fn hub_model_body_serializes_metadata_capabilities_and_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master".into()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let detail = decentraai_hub::HubModelDetail {
+            id: "org/code-llm".into(),
+            pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+            tags: vec![
+                "gguf".into(),
+                "context-length:8192".into(),
+                "license:apache-2.0".into(),
+                "tools".into(),
+            ],
+            downloads: 99,
+            likes: 3,
+            description: Some("A coding chat model.".into()),
+            license: Some("apache-2.0".into()),
+            context_length: Some(8192),
+            params: Some("7B".into()),
+        }
+        .fill_from_tags();
+        let files = vec![
+            decentraai_hub::HubModelFile {
+                path: "q4_k_m.gguf".into(),
+                size: Some(491 * 1024 * 1024),
+                lfs: Some(decentraai_hub::HubLfs {
+                    oid: "abc123".into(),
+                }),
+            },
+            decentraai_hub::HubModelFile {
+                path: "q8_0.gguf".into(),
+                size: Some(1024 * 1024 * 1024),
+                lfs: None,
+            },
+        ];
+        let caps = detail.capabilities();
+        let body = hub_model_body(&detail, &files, &caps, &state, "org/code-llm").await;
+
+        // Real metadata surfaces, absent stays null.
+        assert_eq!(body["metadata"]["context_length"], 8192);
+        assert_eq!(body["metadata"]["params"], "7B");
+        assert_eq!(body["metadata"]["license"], "apache-2.0");
+        assert!(body["metadata"]["description"].is_string());
+
+        // `tools` tag -> VERIFIED tool calling claim.
+        let claims = body["capabilities"]["claims"].as_array().unwrap();
+        assert!(claims.iter().any(|c| {
+            c["capability"] == "tool_calling" && c["provenance"] == "verified"
+        }));
+
+        // `code` in the id -> INFERRED coding + its tasks.
+        assert!(claims.iter().any(|c| {
+            c["capability"] == "coding" && c["provenance"] == "inferred"
+        }));
+        let tasks = body["capabilities"]["tasks"].as_array().unwrap();
+        assert!(tasks.iter().any(|t| t["task"] == "repository understanding"));
+
+        // Variants carry file + size + sha256 when the Hub reported it.
+        let variants = body["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["file"], "q4_k_m.gguf");
+        assert_eq!(variants[0]["sha256"], "abc123");
+        assert!(variants[1]["sha256"].is_null(), "absent digest stays unknown");
+
+        // No compute manager attached -> empty fabric list (never fabricated).
+        assert!(body["fabric"].as_array().unwrap().is_empty());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
     #[test]
     fn refresh_registry_after_pull_scans_new_gguf() {
         let dir = tempfile::tempdir().unwrap();
@@ -4035,6 +4266,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_pull.status(), 403);
+
+        // An explicit variant must be a real .gguf file; bad extensions are
+        // rejected before any network call.
+        let bad_file = client
+            .post(format!("http://{api}/api/admin/hub/pull"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"reference":"hf:org/repo","file":"q4_k_m.bin"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_file.status(), 403);
+
+        // Model detail endpoint is also master-gated (no Hub call without a
+        // credential).
+        let no_auth_detail = client
+            .get(format!("http://{api}/api/admin/hub/model/org%2Frepo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth_detail.status(), 401);
 
         manager.lock().await.shutdown().await.unwrap();
     }

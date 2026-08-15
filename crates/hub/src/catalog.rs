@@ -118,6 +118,73 @@ pub struct HubModel {
     pub downloads: u64,
 }
 
+/// Enriched model metadata from the Hub model-card endpoint
+/// (`GET /api/models/{repo}`), used to build the model detail view.
+///
+/// All optional fields deserialize with `default` — the Hub does not report
+/// every field for every repo, and absent means UNKNOWN, never fabricated.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HubModelDetail {
+    pub id: String,
+    #[serde(default)]
+    pub pipeline_tag: Option<PipelineTag>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub likes: u64,
+    /// Model card description / README excerpt.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// License identifier when the Hub reports one (e.g. `apache-2.0`).
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Context window reported by the Hub in tags (`context-length:N`).
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// Parameter count reported by the Hub in tags (`params:7B`).
+    #[serde(default)]
+    pub params: Option<String>,
+}
+
+impl HubModelDetail {
+    /// The capability classification of this model from its real Hub
+    /// metadata (pipeline tag + tags + id), with honest provenance.
+    pub fn capabilities(&self) -> crate::capability::ModelCapabilities {
+        crate::capability::classify(
+            self.pipeline_tag.as_ref().map(|t| t.as_str()),
+            &self.tags,
+            &self.id,
+        )
+    }
+
+    /// Extract context-length / params / license from the raw Hub tag list.
+    /// Pure so tests can drive it without a Hub request.
+    pub fn fill_from_tags(mut self) -> Self {
+        for tag in &self.tags {
+            if self.context_length.is_none() {
+                if let Some(rest) = tag.strip_prefix("context-length:") {
+                    if let Ok(n) = rest.parse::<u32>() {
+                        self.context_length = Some(n);
+                    }
+                }
+            }
+            if self.params.is_none() {
+                if let Some(rest) = tag.strip_prefix("params:") {
+                    self.params = Some(rest.to_string());
+                }
+            }
+            if self.license.is_none() {
+                if let Some(rest) = tag.strip_prefix("license:") {
+                    self.license = Some(rest.to_string());
+                }
+            }
+        }
+        self
+    }
+}
+
 /// One file inside a repository's `main` branch tree.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HubModelFile {
@@ -211,6 +278,39 @@ impl HubCatalog {
             .filter(|f| f.path.to_lowercase().ends_with(".gguf"))
             .collect())
     }
+
+    /// Fetch enriched metadata for one repository (the model card endpoint).
+    ///
+    /// The Hub's `/models/{repo}` response carries tags like
+    /// `context-length:4096`, `params:7B`, `license:apache-2.0` plus the
+    /// README description; we surface them as OPTIONAL (UNKNOWN when absent).
+    /// This is the metadata backbone for the Hub model detail view.
+    pub async fn model_detail(&self, repo: &str) -> Result<HubModelDetail> {
+        let url = format!("{}/models/{}", self.api_base, repo);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("fetching model detail for '{repo}'"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "Hub model detail failed: HTTP {} for '{repo}' (repository may be private or missing)",
+                resp.status()
+            );
+        }
+        // The Hub's detail JSON is a superset of HubModel; the extra fields we
+        // care about (tags with context-length/params/license, downloads,
+        // likes, description) deserialize into HubModelDetail with defaults.
+        let detail: HubModelDetail = resp
+            .json()
+            .await
+            .with_context(|| format!("parsing model detail for '{repo}'"))?;
+
+        // Extract context-length / params / license from raw Hub tags, which
+        // are the most reliable place those values appear.
+        Ok(detail.fill_from_tags())
+    }
 }
 
 impl Default for HubCatalog {
@@ -279,5 +379,58 @@ mod tests {
             url,
             "https://api.test/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF/tree/main"
         );
+    }
+
+    #[test]
+    fn model_detail_extracts_context_params_license_from_tags() {
+        // The Hub detail endpoint returns raw tags; context-length/params/
+        // license are extracted from them (optional fields stay None when the
+        // Hub does not report them).
+        let json = serde_json::json!({
+            "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+            "pipeline_tag": "text-generation",
+            "tags": [
+                "gguf",
+                "conversational",
+                "context-length:32768",
+                "params:7B",
+                "license:apache-2.0",
+                "tools"
+            ],
+            "downloads": 1234,
+            "likes": 56,
+            "description": "A Qwen chat model."
+        });
+        let detail: HubModelDetail =
+            serde_json::from_value::<HubModelDetail>(json).unwrap().fill_from_tags();
+        assert_eq!(detail.id, "Qwen/Qwen2.5-7B-Instruct-GGUF");
+        assert_eq!(detail.context_length, Some(32768));
+        assert_eq!(detail.params.as_deref(), Some("7B"));
+        assert_eq!(detail.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(detail.downloads, 1234);
+        assert_eq!(detail.likes, 56);
+        assert!(detail.description.is_some());
+
+        // The `tools` tag yields VERIFIED tool-calling capability.
+        let caps = detail.capabilities();
+        assert!(caps.claims.iter().any(|c| {
+            c.capability == crate::capability::CapabilityKind::ToolCalling
+                && c.provenance == crate::capability::Provenance::Verified
+        }));
+    }
+
+    #[test]
+    fn model_detail_absent_metadata_stays_unknown() {
+        let json = serde_json::json!({
+            "id": "org/bare",
+            "tags": ["gguf"],
+            "downloads": 1
+        });
+        let detail: HubModelDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(detail.context_length, None, "absent -> UNKNOWN, never invented");
+        assert_eq!(detail.params, None);
+        assert_eq!(detail.license, None);
+        assert_eq!(detail.description, None);
+        assert_eq!(detail.likes, 0);
     }
 }

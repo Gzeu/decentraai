@@ -21,10 +21,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub mod capability;
 pub mod catalog;
 pub mod download;
 
-pub use catalog::{HubCatalog, HubModel, HubModelFile, PipelineTag};
+pub use capability::{CapabilityClaim, CapabilityKind, ModelCapabilities, Provenance};
+pub use catalog::{HubCatalog, HubLfs, HubModel, HubModelDetail, HubModelFile, PipelineTag};
 pub use download::download_model;
 
 /// Scheme prefix for a model reference accepted by the CLI, e.g.
