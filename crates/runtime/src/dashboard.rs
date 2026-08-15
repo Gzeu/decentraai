@@ -503,6 +503,27 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <h2>Workers (compute registry) <span class="count" id="workers-count"></span></h2>
           <div id="workers" class="worker-cards"><div class="empty">no workers yet (compute not attached)</div></div>
         </div>
+        <!-- RESOURCE PRESSURE (Part 17/22): honest aggregate of measured
+             load across the fabric — the local node's real SystemSnapshot
+             plus each worker's advertised availability. Every value is
+             MEASURED (system probe / heartbeat); nothing is invented. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Resource pressure <span class="count">MEASURED</span></h2>
+          <div class="grid cols-3">
+            <div class="card sub">
+              <h3 style="margin:0 0 6px">This node</h3>
+              <div id="pressure-local" class="empty">collecting…</div>
+            </div>
+            <div class="card sub">
+              <h3 style="margin:0 0 6px">Fabric aggregate</h3>
+              <div id="pressure-fabric" class="empty">no workers yet</div>
+            </div>
+            <div class="card sub">
+              <h3 style="margin:0 0 6px">Busiest worker</h3>
+              <div id="pressure-busiest" class="empty">no workers yet</div>
+            </div>
+          </div>
+        </div>
         <div class="card" style="margin-top:14px">
           <h2>Contributions <span class="count">M17 · real served work</span></h2>
           <table><thead><tr><th>Worker</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Online</th><th class="num">Verified</th><th class="num">Failed</th><th class="num">Score</th><th>Tier</th><th class="num">Reward</th></tr></thead>
@@ -1594,6 +1615,33 @@ function renderWorkers(c){
   ).join('');
   $('contributions').innerHTML = crel || '<tr><td colspan="9" class="empty">no contribution ledger yet</td></tr>';
 }
+// Resource pressure (Part 17/22): honest aggregate of MEASURED load.
+// Local values come from the live SystemSnapshot in /status; worker values
+// come from each advertisement's ComputeAvailability. Bars are raw numbers,
+// never smoothed or invented.
+function renderPressure(s, c){
+  const bar = (label, pct, extra) =>
+    '<div class="nc-bar"><span style="flex:none;width:58px">'+label+'</span><span class="track"><i class="'+(pct>80?'bad':pct>60?'warn':'')+'" style="width:'+Math.max(2,Math.min(100,pct))+'%"></i></span><span style="flex:none;text-align:right">'+extra+'</span></div>';
+  const sys = (s && s.system) || {};
+  const ramPct = sys.ram_total_gib > 0 ? Math.round(((sys.ram_total_gib - (sys.ram_available_gib||0)) / sys.ram_total_gib) * 100) : 0;
+  const local = bar('cpu', Math.round(sys.cpu_usage_percent||0), (sys.cpu_usage_percent||0).toFixed(1)+'% · '+sys.cpu_threads+' cores') +
+    bar('ram', ramPct, (sys.ram_available_gib||0).toFixed(1)+' / '+(sys.ram_total_gib||0).toFixed(1)+' GiB free') +
+    bar('swap', Math.min(100, Math.round((sys.used_swap_gib||0)*10)), (sys.used_swap_gib||0).toFixed(2)+' GiB used') +
+    bar('disk', Math.min(100, Math.max(0, 100 - Math.round((sys.disk_free_gib||0)*2))), (sys.disk_free_gib||0).toFixed(1)+' GiB free');
+  $('pressure-local').innerHTML = local;
+  const workers = (c && c.workers || []).filter(w => w.status !== 'Offline');
+  if (!workers.length) { $('pressure-fabric').innerHTML = '<div class="empty">no live workers to aggregate</div>'; $('pressure-busiest').innerHTML = '<div class="empty">no live workers to aggregate</div>'; return; }
+  const avg = xs => xs.length ? Math.round(xs.reduce((a,b)=>a+b,0)/xs.length) : 0;
+  const avgCpu = avg(workers.map(w => w.load_percent || 0));
+  const avgRam = avg(workers.map(w => w.ram_mb > 0 ? Math.round(((w.ram_mb - (w.available_ram_mb||0)) / w.ram_mb) * 100) : 0));
+  $('pressure-fabric').innerHTML = bar('cpu', avgCpu, avgCpu+'% avg') + bar('ram', avgRam, avgRam+'% avg') +
+    '<div class="mono" style="font-size:11.5px;color:var(--muted);margin-top:6px">'+workers.length+' live worker(s) · queue '+
+    workers.reduce((a,w)=>a+(w.queue_depth||0),0)+' · in-flight '+workers.reduce((a,w)=>a+(w.in_flight||0),0)+'</div>';
+  const busy = workers.slice().sort((a,b) => (b.load_percent||0) - (a.load_percent||0))[0];
+  const bRam = busy.ram_mb > 0 ? Math.round(((busy.ram_mb - (busy.available_ram_mb||0)) / busy.ram_mb) * 100) : 0;
+  $('pressure-busiest').innerHTML = '<div class="mono" style="margin-bottom:6px"><b>'+esc(busy.node_name || short(busy.peer_id, 14))+'</b> · '+esc(busy.status||'')+'</div>' +
+    bar('cpu', busy.load_percent||0, (busy.load_percent||0)+'%') + bar('ram', bRam, bRam+'% used');
+}
 function renderNetwork(n){
   // identity enrichment is self-contained here too (renderNetwork may run
   // before renderFabric on the first refresh cycle)
@@ -1995,7 +2043,7 @@ async function refresh(){
     renderRecovery(s, null, null);
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
-  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
+  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
   renderFabric(s, c, n, x);

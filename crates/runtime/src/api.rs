@@ -1086,8 +1086,11 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         },
         "system": {
             "cpu_threads": snapshot.logical_cpus,
+            "cpu_usage_percent": snapshot.cpu_usage_percent,
             "ram_total_gib": snapshot.total_memory_bytes as f64 / GIB,
             "ram_available_gib": snapshot.available_memory_bytes as f64 / GIB,
+            "used_swap_gib": snapshot.used_swap_bytes as f64 / GIB,
+            "disk_free_gib": snapshot.total_disk_free_bytes as f64 / GIB,
             "gpu": gpu,
         },
         "backend": backend,
@@ -3510,6 +3513,13 @@ mod tests {
         assert_eq!(status["recent_events"][0]["event"], "inference_started");
         assert!(status["available_models"].is_array());
         assert!(status["queue"]["serving"].is_null());
+        // Resource pressure (Part 17/22): the /status system block must carry
+        // the honest measured snapshot fields the dashboard renders.
+        assert!(status["system"]["cpu_usage_percent"].is_number());
+        assert!(status["system"]["ram_total_gib"].is_number());
+        assert!(status["system"]["ram_available_gib"].is_number());
+        assert!(status["system"]["used_swap_gib"].is_number());
+        assert!(status["system"]["disk_free_gib"].is_number());
 
         let peers: serde_json::Value = client
             .get(format!("http://{api}/v1/peers"))
