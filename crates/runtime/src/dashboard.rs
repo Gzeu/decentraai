@@ -581,6 +581,23 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           </div>
           <div id="cir-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
         </div>
+        <!-- DECISION (Phase 3): "What should I run?" — the ONE coherent fabric
+             decision from the real /v1/decision projection. Progressive
+             disclosure: decision banner + why first, then per-capability model
+             options, then historical. Everything is real backend state; empty
+             capabilities/options/history render honestly. -->
+        <div class="card" id="decision-card" style="margin-top:14px">
+          <h2>Decision <span class="count">what should I run? · fabric-wide</span></h2>
+          <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="dec-intent" class="mono" placeholder="I need OCR and summarization" style="min-width:260px;padding:4px 6px;font-size:12px">
+            <select id="dec-ev" class="mono" style="font-size:11px;padding:4px 4px">
+              <option value="any">evidence: any</option>
+              <option value="verified">evidence: verified</option>
+            </select>
+            <button class="btn small" onclick="decideNow()">decide</button>
+          </div>
+          <div id="dec-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+        </div>
         <!-- Variant comparison: which on-disk variant of a model fits THIS
              fabric best, side-by-side, from the real /v1/can_run variants
              projection. Never invents variants/sizes/fits/node identities. -->
@@ -1926,6 +1943,86 @@ function renderCanIRun(j, containerId, model, cap){
     reasons + chosen +
     (j.workers && j.workers.length ? '<div style="margin-top:8px"><b style="font-size:11px">per worker</b>'+perWorker+'</div>' : '')+
     (!j.workers || !j.workers.length ? '<div class="mono" style="margin-top:6px">no workers on the fabric</div>' : '');
+}
+
+// DECISION (Phase 3): "What should I run?" — the ONE coherent fabric decision
+// from the real /v1/decision projection. Progressive disclosure: decision
+// banner + why first, then per-capability model options, then historical.
+// Only real backend state is shown; empty capabilities/options/history render
+// as honest empty/UNKNOWN (never fabricated verdicts, workers or metrics).
+async function decideNow(){
+  const intent = ($('dec-intent').value || '').trim();
+  const ev = ($('dec-ev')||{}).value || 'any';
+  if (!intent) { toast('enter an intent', true); return; }
+  $('dec-result').innerHTML = '<span class="badge faint">deciding…</span>';
+  const { ok, status, j } = await apiFetch('/v1/decision?intent='+encodeURIComponent(intent)+'&evidence='+encodeURIComponent(ev), { headers });
+  const con = $('dec-result');
+  if (!con) return;
+  if (!ok) {
+    con.innerHTML = '<span class="badge warn">decision failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown');
+    return;
+  }
+  // ---- progressive disclosure part 1: the decision banner + why ----
+  let html = '';
+  if (j.decision) {
+    html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+      '<span class="badge ok">DECISION: '+esc(j.decision.model||'')+' on '+esc(short(j.decision.worker||'', 16))+
+      ' (cap '+esc(j.decision.capability||'')+')</span></div>';
+  } else {
+    html += '<span class="badge warn">no runnable decision on the fabric</span>';
+  }
+  const why = (j.why || []).map(r => '<li style="font-size:11px;margin-top:2px">'+esc(r)+'</li>').join('');
+  if (why) { html += '<ul style="margin:8px 0 0 14px;padding:0;list-style:none">'+why+'</ul>'; }
+
+  // ---- part 2: capabilities -> model options (progressive disclosure) ----
+  const caps = (j.capabilities || []);
+  if (caps.length) {
+    let capBlock = '';
+    caps.forEach(c => {
+      capBlock += '<div style="margin-top:10px;border-top:1px dashed var(--line);padding-top:8px"><b style="font-size:11px">'+esc(c.label || c.capability || '')+'</b> '+
+        '<span class="mono" style="font-size:10px;color:var(--faint)">'+esc(c.capability||'')+' · evidence '+esc(c.evidence||'')+'</span>';
+      const opts = (c.model_options || []);
+      if (!opts.length) {
+        capBlock += '<div class="mono" style="margin-top:4px;font-size:11px;color:var(--faint)">no model options reported for this capability</div>';
+      } else {
+        opts.forEach(o => {
+          const v = o.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN_RUN</span>'
+            : o.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT_RUN</span>'
+            : '<span class="badge warn">UNKNOWN</span>';
+          const workers = (o.can_run_workers || []);
+          const wLine = workers.length
+            ? workers.map(w =>
+                '<span class="badge '+(w.trusted?'ok':'faint')+'">'+esc(short(w.node_id||w.peer_id||'', 12))+' · '+
+                esc(w.node_name||'')+' · '+(w.trusted?'trusted':'untrusted')+' · '+esc(w.engine||'')+'</span>').join(' ')
+            : '<span class="badge faint">no runnable worker</span>';
+          capBlock += '<div style="margin-top:6px;padding-left:4px"><span class="mono" style="font-size:11px">'+esc(o.model||'')+' · '+
+            esc(o.quantization || '—')+'</span> '+v+'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+wLine+'</div></div>';
+        });
+      }
+      capBlock += '</div>';
+    });
+    html += capBlock;
+  } else {
+    html += '<div class="mono" style="margin-top:8px;color:var(--faint)">no capabilities matched the intent</div>';
+  }
+
+  // ---- part 3: historical (collapsible, honest) ----
+  const hist = (j.historical || {});
+  let histLine = '';
+  if (hist.records > 0) {
+    const out = hist.outcomes || {};
+    const m = hist.measured || {};
+    histLine = 'records '+esc(String(hist.records))+
+      ' · succeeded '+esc(String(out.succeeded ?? 0))+' / failed '+esc(String(out.failed ?? 0))+
+      ((m.avg_tokens_per_sec != null) ? ' · avg '+esc(String(m.avg_tokens_per_sec))+' tok/s' : '')+
+      ((m.avg_latency_ms != null) ? ' · avg '+esc(String(m.avg_latency_ms))+' ms' : '');
+  } else {
+    histLine = 'insufficient history (UNKNOWN)';
+  }
+  html += '<div style="margin-top:12px;border-top:1px dashed var(--line);padding-top:8px"><b style="font-size:11px">historical</b>'+
+    '<div class="mono" style="font-size:11px;color:var(--muted);margin-top:3px">'+histLine+'</div></div>';
+
+  con.innerHTML = html;
 }
 
 function renderModels(s, c){  const served = (s && s.node && s.node.served_models || []);

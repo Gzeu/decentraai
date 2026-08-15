@@ -1247,3 +1247,15 @@ full decision flow (reduces the need to chain many tools).
   `decision_request` extractor + dispatch.
 - [x] Tests: tool listed, arg parsing (evidence default + model optional),
   precomputed snapshot returned unchanged.
+
+## 46. Next-Gen Phase 3 — Digital Twin Decision View
+
+The dashboard gains a Decision card (progressive disclosure) rendering the ONE
+coherent fabric decision from `/v1/decision`.
+
+- [x] "Decision" card in the Models view: intent input + evidence selector +
+  "decide" button → `decideNow()`.
+- [x] Progressive disclosure: (1) decision banner + why, (2) capabilities →
+  model options (quantization, verdict badge, can-run workers), (3) historical
+  (measured; UNKNOWN when insufficient). Empty → honest empty/UNKNOWN, never
+  fabricated.
