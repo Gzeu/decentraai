@@ -478,6 +478,20 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <div class="metric"><div class="label">Last decision</div><div class="value" id="fabric-last" style="font-size:13px">&mdash;</div><div class="sub" id="fabric-last-sub"></div></div>
           </div>
         </div>
+        <!-- FABRIC GRAPH / DIGITAL TWIN (Phase C): a read-only projection of
+             real fabric state from /v1/fabric. Counts and lists are derived
+             from actual advertisements, claims, links and decisions — never
+             fabricated. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Fabric graph · digital twin <span class="count">projection of real state</span></h2>
+          <div class="grid cols-4">
+            <div class="metric"><div class="label">Nodes</div><div class="value" id="fabric-g-nodes">&mdash;</div></div>
+            <div class="metric"><div class="label">Models</div><div class="value" id="fabric-g-models">&mdash;</div></div>
+            <div class="metric"><div class="label">Capabilities</div><div class="value" id="fabric-g-caps">&mdash;</div></div>
+            <div class="metric"><div class="label">Executions</div><div class="value" id="fabric-g-execs">&mdash;</div></div>
+          </div>
+          <div id="fabric-graph" class="empty">fabric graph not loaded</div>
+        </div>
       </section>
 
       <!-- DECISIONS -->
@@ -2517,6 +2531,35 @@ function renderResources(r){
   }).join('');
   $('res-fabric').innerHTML = rows || '<div class="empty">no fabric workers advertised</div>';
 }
+// Fabric graph / digital twin (Phase C): read-only projection of real state.
+// Counts and lists are derived from actual advertisements, persisted claims,
+// measured links and recorded decisions — never fabricated.
+function renderFabricGraph(f){
+  if (!f) return;
+  const nodes = f.nodes || [];
+  const models = f.models || [];
+  const caps = f.capabilities || [];
+  const execs = f.executions || [];
+  $('fabric-g-nodes').textContent = nodes.length;
+  $('fabric-g-models').textContent = models.length;
+  $('fabric-g-caps').textContent = caps.length;
+  $('fabric-g-execs').textContent = execs.length;
+  const nodeHtml = nodes.map(n =>
+    '<div class="mono" style="font-size:11px;padding:3px 0">'+
+      '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
+      (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
+      ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
+      '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>'
+  ).join('');
+  const capHtml = caps.slice(0, 8).map(c =>
+    '<div class="mono" style="font-size:11px;padding:3px 0"><span class="badge accent">'+esc(c.capability)+'</span> '+c.models.length+' model(s) · '+c.nodes.length+' node(s)</div>'
+  ).join('');
+  $('fabric-graph').innerHTML =
+    '<div class="grid cols-2">'+
+      '<div><h3 style="margin:8px 0 4px">Nodes</h3>'+(nodeHtml || '<div class="empty">no nodes</div>')+'</div>'+
+      '<div><h3 style="margin:8px 0 4px">Capabilities</h3>'+(capHtml || '<div class="empty">no capabilities (UNKNOWN)</div>')+'</div>'+
+    '</div>';
+}
 function renderSettings(s){
   const r = (s && s.resources) || {};
   $('set-cpu').textContent = (s && s.system && s.system.cpu_threads ? s.system.cpu_threads+' threads' : '—') + ' · reserve '+r.reserve_cpu_cores+' core(s)';
@@ -2721,6 +2764,7 @@ async function refresh(){
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
   try { const rr = await (await fetch('/v1/resources', { headers })).json(); renderResources(rr); } catch (e) {}
+  try { const fg = await (await fetch('/v1/fabric', { headers })).json(); renderFabricGraph(fg); } catch (e) {}
   renderFabric(s, c, n, x);
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);

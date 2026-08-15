@@ -2559,7 +2559,8 @@ async fn openapi_handler() -> Response {
             "/v1/peers": { "get": { "operationId": "peers", "summary": "Tracked peers (verified/failed chunks, score)", "responses": { "200": { "description": "Peers" }, "401": { "description": "Unauthorized" } } } },
             "/v1/compute": { "get": { "operationId": "compute", "summary": "Workers/contributions (operator+)", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "Compute mesh" }, "403": { "description": "Client tokens forbidden (role separation)" } } } },
             "/v1/network": { "get": { "operationId": "network", "summary": "Per-peer link metrics (operator+)", "responses": { "200": { "description": "Network" }, "403": { "description": "Forbidden for client tokens" } } } },
-            "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions + autonomous execution decisions (operator+)", "responses": { "200": { "description": "Executions + decisions" }, "403": { "description": "Forbidden for client tokens" } } } },
+             "/v1/execution": { "get": { "operationId": "execution", "summary": "Recent planner decisions + autonomous execution decisions (operator+)", "responses": { "200": { "description": "Executions + decisions" }, "403": { "description": "Forbidden for client tokens" } } } },
+             "/v1/fabric": { "get": { "operationId": "fabricGraph", "summary": "Fabric graph / digital twin projection (operator+)", "responses": { "200": { "description": "Fabric graph" }, "403": { "description": "Forbidden for client tokens" } } } },
             "/api/admin/token/create": { "post": { "operationId": "adminCreateToken", "summary": "Create a subscription token (master only)", "responses": { "200": { "description": "Token (shown once)" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/revoke": { "post": { "operationId": "adminRevokeToken", "summary": "Revoke a token (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/token/list": { "get": { "operationId": "adminListTokens", "summary": "List tokens (master only)", "responses": { "200": { "description": "Token list" }, "401": { "description": "Unauthorized" } } } },
@@ -2590,6 +2591,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
         .route("/v1/resources", get(resources_handler))
         .route("/v1/can_run", get(can_run_handler))
@@ -3237,6 +3239,206 @@ async fn execution_handler(
         body["decisions"] = serde_json::json!(decisions);
         body["attached"] = serde_json::json!(true);
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// Pure projection of the conceptual fabric graph
+/// `NODE -> WORKER -> ENGINE -> MODEL -> CAPABILITY -> EXECUTION` from
+/// authoritative live state. It never fabricates: absent data yields empty
+/// arrays / UNKNOWN, never invented nodes, models, capabilities or
+/// executions, and a future node shows up automatically because every entry
+/// is derived from real advertisements, persisted capability claims, measured
+/// links and recorded decisions. This is a decision function (I/O and awaits
+/// happen in the handler) so tests drive it with synthetic inputs.
+fn fabric_graph_aggregate(
+    workers: &[(decentraai_distributed::ComputeAdvertisement, bool)],
+    registry: Option<&decentraai_registry::ModelRegistry>,
+    decisions: &[decentraai_fabric::ExecutionDecision],
+    network: &decentraai_fabric::NetworkGraph,
+    sessions_active: usize,
+) -> serde_json::Value {
+    // NODE -> WORKER: one node per real advertisement; identity fields stay
+    // separate (peer_id / node_id / node_name) and trust comes from the
+    // coordinator's real trust decision.
+    let nodes: Vec<serde_json::Value> = workers
+        .iter()
+        .map(|(w, trusted)| {
+            let served: Vec<String> =
+                w.capability.served_models.iter().map(|m| m.file_name.clone()).collect();
+            let available: Vec<String> =
+                w.capability.available_models.iter().map(|m| m.file_name.clone()).collect();
+            serde_json::json!({
+                "peer_id": w.peer_id.to_string(),
+                "node_id": w.node_id,
+                "node_name": w.node_name,
+                "trusted": *trusted,
+                "engine": w.capability.engine,
+                "health": format!("{:?}", w.availability.status),
+                "served_models": served,
+                "available_models": available,
+            })
+        })
+        .collect();
+
+    // MODEL: aggregate distinct file names across all workers (served +
+    // available), deduplicated; each maps to the set of node_ids holding it.
+    let mut models: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for (w, _) in workers {
+        // Legacy workers may advertise an empty node_id; fall back to the
+        // peer id so identity is never an empty string.
+        let node = if w.node_id.is_empty() { w.peer_id.to_string() } else { w.node_id.clone() };
+        for m in w
+            .capability
+            .served_models
+            .iter()
+            .chain(w.capability.available_models.iter())
+        {
+            models.entry(m.file_name.clone()).or_default().insert(node.clone());
+        }
+    }
+
+    // CAPABILITY: distinct capability names from real persisted claims only
+    // (the local registry). capability -> (model files, node ids holding them).
+    let mut caps: std::collections::BTreeMap<
+        String,
+        (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ),
+    > = std::collections::BTreeMap::new();
+    for (file, node_ids) in &models {
+        let claims = registry.map(|reg| claims_for_file_name(reg, file)).unwrap_or_default();
+        for claim in &claims {
+            let (model_set, node_set) = caps.entry(claim.capability.clone()).or_default();
+            model_set.insert(file.clone());
+            for n in node_ids {
+                node_set.insert(n.clone());
+            }
+        }
+    }
+
+    let models_json: Vec<serde_json::Value> = models
+        .iter()
+        .map(|(file, node_ids)| {
+            // Empty array = UNKNOWN capability data (never fabricated).
+            let capabilities: Vec<serde_json::Value> = registry
+                .map(|reg| claims_for_file_name(reg, file))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({ "capability": c.capability, "provenance": c.provenance })
+                })
+                .collect();
+            let nodes: Vec<String> = node_ids.iter().cloned().collect();
+            serde_json::json!({
+                "file": file,
+                "quantization": variant_quantization_from_file_name(file),
+                "capabilities": capabilities,
+                "nodes": nodes,
+            })
+        })
+        .collect();
+
+    let caps_json: Vec<serde_json::Value> = caps
+        .iter()
+        .map(|(name, (model_set, node_set))| {
+            serde_json::json!({
+                "capability": name,
+                "models": model_set.iter().cloned().collect::<Vec<_>>(),
+                "nodes": node_set.iter().cloned().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    // EXECUTION: projected from the real recorded decisions (request_id /
+    // model_hash / selected_worker / outcome / ts / capability_requirement)
+    // plus the pure recovery timeline — mirroring execution_handler.
+    let executions: Vec<serde_json::Value> = decisions
+        .iter()
+        .map(|d| {
+            let recovery = decentraai_fabric::recovery_timeline(d);
+            let mut v = serde_json::json!({
+                "request_id": d.request_id,
+                "model_hash": d.model_hash,
+                "selected_worker": d.selected_worker,
+                "outcome": d.outcome,
+                "ts": d.ts,
+            });
+            if let Some(cr) = &d.capability_requirement {
+                v["capability_requirement"] =
+                    serde_json::to_value(cr).unwrap_or(serde_json::Value::Null);
+            }
+            v["recovery"] = recovery;
+            v
+        })
+        .collect();
+
+    // NETWORK: measured links back to this coordinator (RTT / bandwidth /
+    // locality) — real only.
+    let network: Vec<serde_json::Value> = network
+        .peers()
+        .map(|(peer, link)| {
+            serde_json::json!({
+                "peer": peer,
+                "rtt_ms": link.rtt_us / 1000,
+                "bandwidth_mbps": link.bandwidth_mbps,
+                "locality": format!("{:?}", link.locality),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "nodes": nodes,
+        "models": models_json,
+        "capabilities": caps_json,
+        "executions": executions,
+        "network": network,
+        "kv": { "sessions_active": sessions_active },
+        "note": "Projection of real fabric state (NODE -> WORKER -> ENGINE -> MODEL -> CAPABILITY -> EXECUTION). Empty arrays are honest: absent data is never fabricated.",
+    })
+}
+
+/// `GET /v1/fabric` (Phase C — Fabric Graph / Digital Twin). A read-only
+/// projection of the conceptual fabric graph from authoritative live state.
+/// Operator/admin-gated (H4 role separation).
+async fn fabric_graph_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    // Best-effort local registry: source of persisted capability claims. A
+    // failure to load simply yields no claims (models become UNKNOWN), never a
+    // fabricated capability — mirroring fabric_model_list.
+    let registry =
+        decentraai_registry::ModelRegistry::load(&state.info.repo_root.join("db/registry.json"))
+            .ok();
+    let mut workers: Vec<(decentraai_distributed::ComputeAdvertisement, bool)> = Vec::new();
+    let mut decisions: Vec<decentraai_fabric::ExecutionDecision> = Vec::new();
+    let mut network = decentraai_fabric::NetworkGraph::new();
+    let mut sessions_active = 0usize;
+    if let Some(compute) = &state.compute {
+        for adv in compute.workers().await {
+            let trusted = compute.is_trusted(&adv.peer_id).await;
+            workers.push((adv, trusted));
+        }
+        decisions = compute.decisions();
+        sessions_active = compute.session_count();
+        network = compute.network_graph();
+    }
+    let body = fabric_graph_aggregate(
+        &workers,
+        registry.as_ref(),
+        &decisions,
+        &network,
+        sessions_active,
+    );
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -5939,6 +6141,116 @@ mod tests {
         assert!(j["records"].is_number(), "records field present");
 
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fabric_graph_requires_operator_and_returns_structure() {
+        // /v1/fabric is operator/admin-gated; without a compute manager it
+        // returns 200 JSON with the honest fabric-graph shape (empty arrays,
+        // never fabricated data).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401/403.
+        let resp = client
+            .get(format!("http://{api}/v1/fabric"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token -> 200 JSON with the fabric-graph structure.
+        let resp = client
+            .get(format!("http://{api}/v1/fabric"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert!(j["nodes"].is_array());
+        assert!(j["models"].is_array());
+        assert!(j["capabilities"].is_array());
+        assert!(j["executions"].is_array());
+        assert!(j["network"].is_array());
+        assert!(j["kv"]["sessions_active"].is_number());
+        assert!(j["note"].is_string());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn fabric_graph_aggregate_deduplicates_models_and_derives_capabilities() {
+        // Real, synthetic inputs drive the pure projection: two workers share
+        // one model file and hold different capabilities; aggregation must
+        // deduplicate the model, keep identity fields separate, and only
+        // surface capabilities that come from real registry claims.
+        let peer_a = decentraai_p2p::PeerId::random();
+        let peer_b = decentraai_p2p::PeerId::random();
+        let adv_a = cap_adv(&peer_a, "dca-node-a", "llama_server", 8192, Some(8192), (1024, 2048), (true, true));
+        let adv_b = cap_adv(&peer_b, "dca-node-b", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+
+        let reg = decentraai_registry::ModelRegistry {
+            version: 1,
+            root: "/fake".into(),
+            models: std::collections::BTreeMap::from([
+                (
+                    "qwen.gguf".to_string(),
+                    decentraai_registry::ModelRecord {
+                        relative_path: "qwen.gguf".into(),
+                        canonical_path: "/fake/qwen.gguf".into(),
+                        size_bytes: 100,
+                        modification_time: 0,
+                        extension: "gguf".into(),
+                        capability_claims: vec![
+                            decentraai_registry::CapabilityClaimRecord {
+                                capability: "ocr".into(),
+                                provenance: "verified".into(),
+                            },
+                        ],
+                    },
+                ),
+            ]),
+        };
+
+        let body = fabric_graph_aggregate(
+            &[(adv_a, true), (adv_b, false)],
+            Some(&reg),
+            &[],
+            &decentraai_fabric::NetworkGraph::new(),
+            0,
+        );
+
+        // Nodes: one per real worker, identity fields kept separate and real.
+        let nodes = body["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(nodes[0]["peer_id"], nodes[0]["node_id"]);
+        assert_eq!(nodes[0]["node_name"], "dca-node-a");
+        assert_eq!(nodes[0]["trusted"], true);
+        assert_eq!(nodes[1]["trusted"], false);
+        assert_eq!(nodes[0]["engine"], "llama_server");
+
+        // Models: the shared file appears once, with both holding node_ids.
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["file"], "qwen.gguf");
+        let model_nodes = models[0]["nodes"].as_array().unwrap();
+        assert_eq!(model_nodes.len(), 2);
+        assert_eq!(models[0]["capabilities"].as_array().unwrap()[0]["capability"], "ocr");
+
+        // Capabilities: only from real registry claims (ocr), with the model
+        // and both node ids attached.
+        let caps = body["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["capability"], "ocr");
+        assert_eq!(caps[0]["models"].as_array().unwrap().len(), 1);
+        assert_eq!(caps[0]["nodes"].as_array().unwrap().len(), 2);
+
+        // Network and executions stay empty-but-honest.
+        assert!(body["network"].as_array().unwrap().is_empty());
+        assert!(body["executions"].as_array().unwrap().is_empty());
+        assert_eq!(body["kv"]["sessions_active"], 0);
     }
 
     #[test]

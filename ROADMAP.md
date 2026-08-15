@@ -1164,3 +1164,24 @@ control plane (read-only).
 - [x] MCP `list_executions` now attaches a `recovery` timeline per execution
   (projected from the real decisions keyed by request_id) so agents can see the
   self-healing loop (recoveries, phase, adaptation, ordered event trace).
+
+## 41. Next-Gen Phase C — Fabric Graph / Digital Twin endpoint
+
+A projection of the conceptual fabric graph from authoritative live state
+(NODE → WORKER → ENGINE → MODEL → CAPABILITY → EXECUTION), the Digital Twin
+foundation. No fake nodes, no hardcoded names/IPs; future nodes work
+automatically.
+
+- [x] `GET /v1/fabric` (operator/admin): `nodes` (peer_id/node_id/node_name kept
+  separate, trust, engine, health, served/available models), `models`
+  (distinct, deduped, with INFERRED quantization + persisted capability claims +
+  holding nodes), `capabilities` (from real claims, with models + nodes),
+  `executions` (decisions with recovery timeline), `network` (measured links),
+  `kv` (sessions). Absent data = empty array (honest).
+- [x] Pure `fabric_graph_aggregate` helper (unit-testable), async handler does
+  only I/O. Reuses `variant_quantization_from_file_name` and
+  `claims_for_file_name`.
+- [x] Dashboard Fabric view gains a "Fabric graph · digital twin" card (counts +
+  compact node/capability lists, real state only).
+- [x] Tests: endpoint auth/JSON shape + pure aggregation (model dedup, identity
+  separation, capabilities from real claims only).
