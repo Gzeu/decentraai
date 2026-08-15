@@ -704,6 +704,10 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           </div>
         </div>
         <div class="card" style="margin-top:14px">
+          <h2>Historical execution <span class="count">deterministic, from measured history</span></h2>
+          <div id="hist-stats" style="margin-top:6px;font-size:12px;color:var(--muted)"><span class="muted">loading…</span></div>
+        </div>
+        <div class="card" style="margin-top:14px">
           <h2>Prometheus</h2>
           <div class="mono" style="font-size:12px;color:var(--muted)">Scrape <code>/metrics</code> on this port for counters &amp; gauges: <code>http://127.0.0.1:__API_PORT__/metrics</code></div>
         </div>
@@ -2414,6 +2418,33 @@ function renderObservability(s, c){
   $('obs-total-req').textContent = t.requests_completed || 0;
   $('obs-total-tok').textContent = t.tokens_total || 0;
   $('obs-total-fail').textContent = t.requests_failed || 0;
+  loadHistStats();
+}
+// Historical execution statistics (Phase N): deterministic aggregates from real
+// measured execution history via /v1/stats. Operator/admin-gated.
+async function loadHistStats(){
+  const con = $('hist-stats');
+  if (!con) return;
+  try {
+    const { ok, j } = await apiFetch('/v1/stats', { headers });
+    if (!ok) { con.innerHTML = '<span class="badge warn">stats unavailable ('+(j.error&&j.error.message||'')+')</span>'; return; }
+    if (!j.records) { con.innerHTML = '<span class="muted">no executed requests yet</span>'; return; }
+    const o = j.outcomes || {};
+    const m = j.measured || {};
+    const row = (label, v) => '<div class="metric"><div class="label">'+esc(label)+'</div><div class="value">'+v+'</div></div>';
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px">'+
+      row('Records', j.records)+
+      row('Succeeded', o.succeeded||0)+
+      row('Failed', o.failed||0)+
+      row('Retries', j.retries||0)+
+      row('Avg tok/s', m.avg_tokens_per_sec ? m.avg_tokens_per_sec.toFixed(1) : '—')+
+      row('Avg latency', m.avg_latency_ms ? m.avg_latency_ms.toFixed(0)+'ms' : '—')+
+      '</div>';
+    const pm = (j.per_model||[]).map(p =>
+      '<span class="badge" title="'+esc(p.succeeded)+' ok / '+esc(p.failed)+' fail">'+esc(p.model)+'</span> '+esc(p.total)).join(' · ');
+    if (pm) html += '<div style="margin-top:8px"><b style="font-size:11px">per model</b> '+pm+'</div>';
+    con.innerHTML = html;
+  } catch (e) { con.innerHTML = '<span class="badge warn">stats failed</span>'; }
 }
 function renderRecovery(s, c, x){
   const respawns = (s && s.engine_respawns) || 0;
