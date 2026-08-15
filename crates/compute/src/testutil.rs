@@ -42,6 +42,7 @@ pub(crate) fn test_advertisement(
                 context_tokens: 0,
             }],
             can_provision: false,
+            available_models: vec![],
         },
         availability: ComputeAvailability {
             available_ram_mb: avail_ram,

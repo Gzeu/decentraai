@@ -3961,6 +3961,7 @@ mod tests {
                     })
                     .collect(),
                 can_provision: false,
+                available_models: vec![],
             },
             availability: decentraai_distributed::compute::ComputeAvailability {
                 available_ram_mb: 8192,

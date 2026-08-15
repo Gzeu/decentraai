@@ -172,7 +172,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let adv = worker_compute
-            .advertise_local(snapshot(), gpu(), vec![served_model()], false)
+            .advertise_local(snapshot(), gpu(), vec![served_model()], vec![], false)
             .await;
         worker.p2p_node().announce(serialize_message(&adv).unwrap());
         if !coord_compute.workers().await.is_empty() {
@@ -587,7 +587,7 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let adv = worker_compute
-            .advertise_local(snapshot(), gpu(), vec![served_model()], true)
+            .advertise_local(snapshot(), gpu(), vec![served_model()], vec![], true)
             .await;
         worker.p2p_node().announce(serialize_message(&adv).unwrap());
         if !coord_compute.workers().await.is_empty() {
@@ -769,6 +769,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
             tiny_snapshot,
             GpuProbeStatus::Unavailable("no gpu".into()),
             vec![big_model.clone()],
+            vec![],
             false,
         )
         .await;
@@ -848,7 +849,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     // ...and admit the same workload once the advertised free capacity
     // actually fits it (positive control proving the gate is the cause).
     worker_compute
-        .advertise_local(snapshot(), gpu(), vec![big_model], false)
+        .advertise_local(snapshot(), gpu(), vec![big_model], vec![], false)
         .await;
     let admitted = send(&client_node, worker_peer, &client_identity, 5000)
         .await

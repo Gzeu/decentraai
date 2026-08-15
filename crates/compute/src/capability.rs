@@ -73,14 +73,24 @@ pub struct ComputeCapability {
     /// worker is eligible for a workload it does not yet serve, subject to
     /// the coordinator's `allow_provisioning` policy.
     pub can_provision: bool,
+    /// All models this node has on disk (registry), regardless of whether
+    /// they are currently loaded. Used by the coordinator's model picker
+    /// to discover what a worker can serve — the worker swaps its engine
+    /// on request to serve a model from its on-disk collection.
+    #[serde(default)]
+    pub available_models: Vec<ServedModel>,
 }
 
 impl ComputeCapability {
-    /// Whether this worker serves the given model hash.
+    /// Whether this worker serves the given model hash (currently loaded or
+    /// available on disk).
     pub fn has_model(&self, model_hash: &str) -> bool {
         self.served_models
             .iter()
             .any(|m| m.model_hash == model_hash)
+            || self.available_models
+                .iter()
+                .any(|m| m.model_hash == model_hash)
     }
 
     /// Whether this worker can handle `model_hash` either because it serves
@@ -120,6 +130,7 @@ mod tests {
                 context_tokens: 0,
             }],
             can_provision: false,
+            available_models: vec![],
         }
     }
 
@@ -128,6 +139,21 @@ mod tests {
         let cap = capability();
         assert!(cap.has_model("abc"));
         assert!(!cap.has_model("nope"));
+    }
+
+    #[test]
+    fn has_model_checks_available_models() {
+        let mut cap = capability();
+        assert!(!cap.has_model("available-on-disk"));
+        cap.available_models.push(ServedModel {
+            model_hash: "available-on-disk".into(),
+            file_name: "other.gguf".into(),
+            size_mb: 1024,
+            est_ram_mb: 128,
+            est_vram_mb: 0,
+            context_tokens: 4096,
+        });
+        assert!(cap.has_model("available-on-disk"));
     }
 
     #[test]

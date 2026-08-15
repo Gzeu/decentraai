@@ -1142,7 +1142,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             context_tokens: max_ctx,
         }];
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, can_provision)
+            .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
             .await;
         info!(
             peer_id = %local_peer_id,
@@ -3044,7 +3044,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, can_provision)
+            .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
             .await;
         info!(
             peer_id = %local_peer_id,
@@ -3246,7 +3246,7 @@ async fn spawn_compute_broadcaster(
                 .map(|w| w.capability.served_models.clone())
                 .unwrap_or_default();
             let adv = compute_manager
-                .advertise_local(snapshot, gpu, served_models, can_provision)
+                .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
                 .await;
             // P3: sign the advertisement when the node has a signing key set,
             // so recipients authenticate it (anti-spoof).

@@ -116,6 +116,7 @@ mod tests {
                     context_tokens: 0,
                 }],
                 can_provision: false,
+                available_models: vec![],
             },
             availability: ComputeAvailability {
                 available_ram_mb: 12 * 1024,

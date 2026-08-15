@@ -208,6 +208,7 @@ pub fn build_advertisement(
             engine: engine.to_string(),
             served_models,
             can_provision,
+            available_models: vec![],
         },
         availability: ComputeAvailability {
             available_ram_mb: snapshot.available_memory_bytes / MIB,
@@ -1018,13 +1019,14 @@ impl ComputeManager {
         snapshot: SystemSnapshot,
         gpu: GpuProbeStatus,
         served_models: Vec<ServedModel>,
+        available_models: Vec<ServedModel>,
         can_provision: bool,
     ) -> ComputeAdvertisement {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let adv = build_advertisement(
+        let mut adv = build_advertisement(
             self.local_peer,
             &self.node_name,
             &self.engine,
@@ -1037,6 +1039,7 @@ impl ComputeManager {
             now,
             self.metrics.snapshot(),
         );
+        adv.capability.available_models = available_models;
         self.scheduler.lock().await.upsert(adv.clone());
         *self.last_local_ad.lock().unwrap() = Some(adv.clone());
         adv
@@ -1440,7 +1443,7 @@ mod tests {
         let mut manager = ComputeManager::new(p, "n".into(), HashSet::from([p]));
         // Default is llama-server until an engine is explicitly selected.
         manager
-            .advertise_local(snapshot(), gpu(), vec![model()], false)
+            .advertise_local(snapshot(), gpu(), vec![model()], vec![], false)
             .await;
         assert_eq!(
             manager.last_local_advertisement_sync().unwrap().capability.engine,
@@ -1451,7 +1454,7 @@ mod tests {
         // parse it back to the honest kind (M22).
         manager.set_engine("vllm");
         manager
-            .advertise_local(snapshot(), gpu(), vec![model()], false)
+            .advertise_local(snapshot(), gpu(), vec![model()], vec![], false)
             .await;
         let adv = manager.last_local_advertisement_sync().unwrap();
         assert_eq!(adv.capability.engine, "vllm");
