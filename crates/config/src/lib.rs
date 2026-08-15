@@ -330,6 +330,16 @@ impl NodeConfig {
                 "non-local inference bind_address requires api_auth_required: true".into(),
             ));
         }
+        // Subscription tiers must never be silently disabled: when tiers are
+        // configured but api_auth_required is false, classify() treats every
+        // caller as Auth::Open and the per-tier model allowlist + rate limits
+        // are bypassed entirely. Require auth so the tier boundary is real.
+        if self.tiers.is_some() && !self.inference.api_auth_required {
+            return Err(ConfigError::Validation(
+                "subscription tiers require inference.api_auth_required: true (otherwise tier model allowlists and rate limits are silently disabled)"
+                    .into(),
+            ));
+        }
         if self.inference.allow_remote_inference && !self.network.private_swarm {
             return Err(ConfigError::Validation(
                 "remote inference requires private_swarm in the initial release".into(),
@@ -473,6 +483,24 @@ mod tests {
         std::fs::write(file.path(), bad).unwrap();
         let err = NodeConfig::load(file.path()).unwrap_err();
         assert!(err.to_string().contains("rate_limit_per_minute"));
+    }
+
+    #[test]
+    fn tiers_require_api_auth() {
+        // The example config is valid (tiers + api_auth_required: true).
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        // Flip auth off while tiers remain configured: must be rejected so the
+        // tier allowlist + rate limits can never be silently disabled.
+        let bad = raw.replace("api_auth_required: true", "api_auth_required: false");
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("tiers require"),
+            "tiers without api_auth_required must be rejected, got: {err}"
+        );
     }
 
     #[test]
