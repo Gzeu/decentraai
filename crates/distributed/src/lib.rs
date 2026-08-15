@@ -221,9 +221,20 @@ mod error {
         /// request must never be re-issued, because re-sending would
         /// duplicate non-idempotent work (re-generation, double token/KV
         /// accounting). A connection that never completed is safe to retry —
-        /// nothing was produced.
+        /// Whether re-sending this logical request to a DIFFERENT worker is
+        /// idempotency-safe. Inference is non-idempotent (each generation is
+        /// unique), so we must never re-execute a request whose outcome is
+        /// unknown. A `RequestTimeout` means the worker MAY have executed
+        /// (accepted and generated) while the response was lost or too slow —
+        /// re-sending to another worker duplicates the generation and its
+        /// token/KV accounting. Only a `P2PError` at the initial
+        /// request/response exchange is treated as likely-not-delivered
+        /// (connection refused before the worker started), so it remains
+        /// retryable. This gives at-most-once semantics for ambiguous
+        /// outcomes; clients wanting a fresh generation send a new
+        /// `request_id`/nonce.
         pub fn is_retryable(&self) -> bool {
-            matches!(self, DistributedError::P2PError(_) | DistributedError::RequestTimeout(_))
+            matches!(self, DistributedError::P2PError(_))
         }
 
         /// Stable machine-readable classification of this failure (M10
@@ -1913,13 +1924,19 @@ mod tests {
 
     #[test]
     fn error_retry_policy_is_idempotency_safe() {
-        // Connection-level failures are retryable.
+        // Connection-level failures before delivery are retryable (the worker
+        // almost certainly never started).
         assert!(DistributedError::P2PError(anyhow::anyhow!("conn refused")).is_retryable());
-        assert!(DistributedError::RequestTimeout(1000).is_retryable());
+        // A RequestTimeout means the worker MAY have executed while the
+        // response was lost/slow. Re-sending the same logical request to a
+        // different worker would re-generate (non-idempotent) and double its
+        // token/KV accounting, so it must NOT be retried (at-most-once).
+        assert!(!DistributedError::RequestTimeout(1000).is_retryable());
         // A definitive rejection or cancellation must never be duplicated.
         assert!(!DistributedError::WorkerRejected("w".into(), "cancelled".into()).is_retryable());
         assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
         assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
+        assert!(!DistributedError::AllWorkersFailed("w failed".into()).is_retryable());
     }
 
     #[test]
