@@ -102,7 +102,7 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         // P3: a signed compute advertisement is verified before being trusted.
         // The signer's public key must map to the advertisement's own peer_id
         // (an attacker cannot forge a signature for a peer they don't control).
-        if let Ok(signed) = deserialize_message::<SignedComputeAdvertisement>(request, request.len())
+        if let Ok(signed) = deserialize_message::<SignedComputeAdvertisement>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
         {
             if let Ok(inner) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
                 &signed.advertisement,
@@ -127,9 +127,10 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as a compute advertisement (legacy unsigned)
-        if let Ok(adv) =
-            deserialize_message::<decentraai_compute::ComputeAdvertisement>(request, request.len())
-        {
+        if let Ok(adv) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
+            request,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+        ) {
             if let Some(manager) = &self.compute_manager {
                 let manager = manager.clone();
                 tokio::spawn(async move {
@@ -141,7 +142,7 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as WorkerAnnouncement
-        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, request.len())
+        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
         {
             if let Some(manager) = &self.worker_manager {
                 manager.process_announcement(announcement)?;
@@ -151,7 +152,7 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
 
         // Try to deserialize as a generic InferMessage (progress/response/etc)
         if let Ok(InferMessage::InferPing { .. }) =
-            deserialize_message::<InferMessage>(request, request.len())
+            deserialize_message::<InferMessage>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
         {
             // Network probe (M19): a coordinator measures its own wall-clock
             // RTT to this worker by timing the round trip; we just reply with
@@ -165,7 +166,7 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as a generic InferMessage (progress/response/etc)
-        if let Ok(msg) = deserialize_message::<InferMessage>(request, request.len()) {
+        if let Ok(msg) = deserialize_message::<InferMessage>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES) {
             if let Some(tracker) = &self.tracker {
                 let _ = futures::executor::block_on(tracker.deliver(msg));
                 return Ok(Vec::new());
@@ -174,7 +175,7 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as InferRequest
-        if let Ok(infer_request) = deserialize_message::<InferRequest>(request, request.len()) {
+        if let Ok(infer_request) = deserialize_message::<InferRequest>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES) {
             if let Some(handler) = &self.infer_handler {
                 // The handler returns raw bytes so it may serialize an InferAccepted
                 // message and spawn background tasks for streaming progress.

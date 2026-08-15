@@ -422,7 +422,10 @@ impl WorkerManager {
     pub fn deserialize_announcement(bytes: &[u8]) -> anyhow::Result<WorkerAnnouncement> {
         use decentraai_protocol::{CURRENT_PROTOCOL_VERSION, deserialize_message};
 
-        let announcement: WorkerAnnouncement = deserialize_message(bytes, bytes.len())?;
+        let announcement: WorkerAnnouncement = deserialize_message(
+            bytes,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+        )?;
 
         // Verify protocol version
         if CURRENT_PROTOCOL_VERSION != 1 {

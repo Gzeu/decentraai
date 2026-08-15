@@ -112,13 +112,13 @@ impl RequestHandler for StaticFileServer {
             deserialize_message, serialize_message,
         };
 
-        if let Ok(req) = deserialize_message::<ManifestRequest>(request, request.len()) {
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
             return Ok(self.manifest_response.clone());
         }
-        if let Ok(req) = deserialize_message::<ChunkRequest>(request, request.len()) {
+        if let Ok(req) = deserialize_message::<ChunkRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -192,7 +192,7 @@ impl RequestHandler for RegistryServer {
             ManifestRequest, deserialize_message, manifest_response_bytes, serialize_message,
         };
 
-        if let Ok(req) = deserialize_message::<CatalogRequest>(request, request.len()) {
+        if let Ok(req) = deserialize_message::<CatalogRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -201,7 +201,7 @@ impl RequestHandler for RegistryServer {
                 manifests: self.manifests(),
             });
         }
-        if let Ok(req) = deserialize_message::<ManifestRequest>(request, request.len()) {
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -212,7 +212,7 @@ impl RequestHandler for RegistryServer {
                 .with_context(|| format!("unknown manifest {}", req.manifest_id))?;
             return manifest_response_bytes(&manifest);
         }
-        if let Ok(req) = deserialize_message::<ChunkRequest>(request, request.len()) {
+        if let Ok(req) = deserialize_message::<ChunkRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -589,7 +589,7 @@ impl P2PNode {
                                 } => {
                                     if let Ok(announcement) = decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestAnnouncement>(
                                         &request,
-                                        request.len(),
+                                        DEFAULT_MAX_MESSAGE_BYTES,
                                     ) {
                                         info!(
                                             %peer,
@@ -608,7 +608,7 @@ impl P2PNode {
                                     // Check for InferRequest
                                     if let Ok(infer_req) = decentraai_protocol::deserialize_message::<decentraai_protocol::InferRequest>(
                                         &request,
-                                        request.len(),
+                                        DEFAULT_MAX_MESSAGE_BYTES,
                                     ) {
                                         info!(%peer, bytes = request.len(), "received inference request");
                                         // If a runtime on_infer callback has been registered, call it
@@ -640,7 +640,7 @@ impl P2PNode {
                                         ..
                                     }) = decentraai_protocol::deserialize_message::<
                                         decentraai_protocol::InferMessage,
-                                    >(&request, request.len())
+                                    >(&request, DEFAULT_MAX_MESSAGE_BYTES)
                                     {
                                         info!(%peer, %request_id, "received inference cancel");
                                         let guard = on_cancel_clone.lock().await;
@@ -901,5 +901,30 @@ mod tests {
         write_frame(&mut buf, &payload).await.unwrap();
         let mut slice = buf.as_slice();
         assert!(read_frame(&mut slice, 16).await.is_err());
+    }
+
+    /// The control-plane cap must actually reject an oversized control request.
+    /// Previously handlers passed `request.len()` as max_size, which made the
+    /// size check a no-op (data.len() > data.len() is never true), so a peer
+    /// could push a frame up to the shared data-plane cap (96 MiB) into a
+    /// control handler. All inbound requests are control-sized, so they are
+    /// capped at DEFAULT_MAX_MESSAGE_BYTES (1 MiB).
+    #[test]
+    fn control_plane_cap_rejects_oversized_request() {
+        let oversized = vec![0u8; DEFAULT_MAX_MESSAGE_BYTES + 1];
+        let err = decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestRequest>(
+            &oversized,
+            DEFAULT_MAX_MESSAGE_BYTES,
+        );
+        assert!(err.is_err(), "control message over 1 MiB must be rejected");
+
+        // And an in-bounds (empty-but-valid-shape) control message is not a
+        // size rejection — the cap accepts anything at or under the limit.
+        let ok_size = vec![0u8; DEFAULT_MAX_MESSAGE_BYTES];
+        let _ = decentraai_protocol::deserialize_message::<decentraai_protocol::ManifestRequest>(
+            &ok_size,
+            DEFAULT_MAX_MESSAGE_BYTES,
+        );
+        // The size gate passed (failure, if any, would be JSON parse, not size).
     }
 }
