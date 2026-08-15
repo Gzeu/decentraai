@@ -209,6 +209,21 @@ pub struct HubCatalog {
 }
 
 impl HubCatalog {
+    fn get_token() -> Option<String> {
+        std::env::var("HF_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    fn apply_auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(token) = Self::get_token() {
+            req.bearer_auth(token.trim())
+        } else {
+            req
+        }
+    }
+
     /// Connect to the production Hub API.
     pub fn new() -> Self {
         HubCatalog::with_base(DEFAULT_API_BASE.to_string())
@@ -234,9 +249,7 @@ impl HubCatalog {
             urlencode(query),
             limit
         );
-        let resp = self
-            .client
-            .get(&url)
+        let resp = Self::apply_auth(self.client.get(&url))
             .send()
             .await
             .with_context(|| format!("searching Hub for '{query}'"))?;
@@ -257,9 +270,7 @@ impl HubCatalog {
     /// List the GGUF files of a repository (with sizes + SHA-256 digests).
     pub async fn list_gguf_files(&self, repo: &str) -> Result<Vec<HubModelFile>> {
         let url = format!("{}/models/{}/tree/main", self.api_base, repo);
-        let resp = self
-            .client
-            .get(&url)
+        let resp = Self::apply_auth(self.client.get(&url))
             .send()
             .await
             .with_context(|| format!("listing files of '{repo}'"))?;
@@ -287,9 +298,7 @@ impl HubCatalog {
     /// This is the metadata backbone for the Hub model detail view.
     pub async fn model_detail(&self, repo: &str) -> Result<HubModelDetail> {
         let url = format!("{}/models/{}", self.api_base, repo);
-        let resp = self
-            .client
-            .get(&url)
+        let resp = Self::apply_auth(self.client.get(&url))
             .send()
             .await
             .with_context(|| format!("fetching model detail for '{repo}'"))?;

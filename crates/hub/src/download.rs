@@ -98,8 +98,13 @@ pub async fn download_verified(
     expected_sha256: Option<&str>,
 ) -> Result<DownloadedModel> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
+    let mut req = client.get(url);
+    if let Ok(token) = std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN")) {
+        if !token.trim().is_empty() {
+            req = req.bearer_auth(token.trim());
+        }
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("requesting {url}"))?;

@@ -580,9 +580,23 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <input id="hub-q" type="text" placeholder="search GGUF models on HuggingFace, e.g. Qwen" style="flex:1;min-width:220px;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg)">
             <button class="btn" id="hub-search-btn" onclick="hubSearch()">Search</button>
           </div>
-          <div id="hub-status" style="margin-top:8px;font-size:12px;color:var(--muted)">search the Hub to discover models you can pull on this node</div>
-          <table style="margin-top:8px"><thead><tr><th>Model</th><th>Category</th><th class="num">Downloads</th><th></th></tr></thead>
-          <tbody id="hub-results"><tr><td colspan="4" class="empty">nothing searched yet</td></tr></tbody></table>
+           <div id="hub-status" style="margin-top:8px;font-size:12px;color:var(--muted)">search the Hub to discover models you can pull on this node</div>
+           <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+             <button class="btn small" id="hub-compare-btn" onclick="hubCompareSelected()" disabled>Compare Selected (0)</button>
+             <button class="btn small faint" onclick="hubClearCompare()">Clear Selection</button>
+             <span style="font-size:12px;color:var(--muted)" id="hub-compare-status">select 1 or more models to compare side-by-side</span>
+           </div>
+           <table style="margin-top:8px"><thead><tr><th style="width:30px">Compare</th><th>Model</th><th>Category</th><th class="num">Downloads</th><th></th></tr></thead>
+           <tbody id="hub-results"><tr><td colspan="5" class="empty">nothing searched yet</td></tr></tbody></table>
+
+           <!-- Model comparison panel (Model Comparison feature) -->
+           <div id="hub-compare-panel" style="display:none;margin-top:14px;border:1px solid var(--border);border-radius:8px;padding:12px">
+             <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+               <h3 style="margin:0;font-size:15px">Model Comparison (<span id="compare-panel-count">0</span> models)</h3>
+               <button class="btn small" onclick="hubCloseCompare()">Close Comparison</button>
+             </div>
+             <div id="hub-compare-content" style="overflow-x:auto;margin-top:10px"></div>
+           </div>
           <!-- Model card (Issue #26 §7–§8, §22): real Hub metadata + honest
                capability taxonomy with provenance + every GGUF variant with
                size/SHA-256 + live fabric compatibility. Hidden until a model
@@ -1808,106 +1822,248 @@ function renderModels(s, c){
 // endpoints. `hubResults` state is local; a pull is long-running so the
 // button shows a spinner and the row is locked until it resolves.
 let hubPulling = {};
-function hubSearch(){
+let hubSelectedModels = {};
+function hubToggleCompare(id, chk){
+  if (chk.checked) { hubSelectedModels[id] = true; } else { delete hubSelectedModels[id]; }
+  updateCompareUI();
+}
+function updateCompareUI(){
+  const keys = Object.keys(hubSelectedModels);
+  const count = keys.length;
+  const btn = $('hub-compare-btn');
+  if (btn) {
+    btn.disabled = count === 0;
+    btn.textContent = 'Compare Selected (' + count + ')';
+  }
+  const status = $('hub-compare-status');
+  if (status) {
+    status.textContent = count > 0 ? count + ' model(s) selected for side-by-side comparison' : 'select 1 or more models to compare side-by-side';
+  }
+}
+function hubClearCompare(){
+  hubSelectedModels = {};
+  document.querySelectorAll('.hub-compare-chk').forEach(el => el.checked = false);
+  updateCompareUI();
+  hubCloseCompare();
+}
+function hubCloseCompare(){
+  const panel = $('hub-compare-panel');
+  if (panel) { panel.style.display = 'none'; }
+}
+async function apiFetch(url, options={}){
+  try {
+    const r = await fetch(url, options);
+    const text = await r.text();
+    let j = {};
+    try { j = JSON.parse(text); } catch (e) { j = { error: { message: text || r.statusText || 'HTTP ' + r.status } }; }
+    return { ok: r.ok, status: r.status, j };
+  } catch (e) {
+    return { ok: false, status: 0, j: { error: { message: e.message || 'network error' } } };
+  }
+}
+function hubCompareSelected(){
+  const keys = Object.keys(hubSelectedModels);
+  if (keys.length === 0) { toast('select at least one model to compare', true); return; }
+  const query = keys.map(k => encodeURIComponent(k)).join(',');
+  $('hub-status').innerHTML = 'loading comparison for '+keys.length+' model(s)…';
+  apiFetch('/api/admin/hub/compare?repos=' + query, { headers }).then(({ ok, status, j }) => {
+    if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">comparison failed ('+status+')</span> ' + esc((j.error && j.error.message) || 'unknown error'); return; }
+    const models = j.models || [];
+    renderComparisonTable(models);
+    $('hub-compare-panel').style.display = 'block';
+    $('compare-panel-count').textContent = models.length;
+    $('hub-status').innerHTML = 'comparison loaded successfully';
+  });
+}
+function renderComparisonTable(models){
+  if (!models.length) { $('hub-compare-content').innerHTML = '<div class="empty">no models to compare</div>'; return; }
+  let html = '<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:1px solid var(--border)"><th>Attribute</th>';
+  models.forEach(m => {
+    html += '<th style="text-align:left;padding:6px;min-width:200px"><b>'+esc(m.id || m.error)+'</b></th>';
+  });
+  html += '</tr></thead><tbody>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">Pipeline &amp; Tags</td>';
+  models.forEach(m => {
+    const md = m.metadata || {};
+    const tags = (md.tags || []).slice(0, 5).join(', ');
+    html += '<td style="padding:6px"><span class="badge">'+esc(md.pipeline_tag || '—')+'</span><div class="sub" style="font-size:11px;margin-top:2px">'+esc(tags || 'no tags')+'</div></td>';
+  });
+  html += '</tr>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">Specs / License</td>';
+  models.forEach(m => {
+    const md = m.metadata || {};
+    html += '<td style="padding:6px">License: <b>'+esc(md.license || 'Unknown')+'</b><br>Params: <b>'+esc(md.params || '—')+'</b><br>Context: <b>'+(md.context_length || '—')+'</b><br>Downloads: '+nfmt(md.downloads || 0)+' · Likes: '+(md.likes || 0)+'</td>';
+  });
+  html += '</tr>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">Capabilities</td>';
+  models.forEach(m => {
+    const claims = (m.capabilities && m.capabilities.claims) || [];
+    const capsStr = claims.length ? claims.map(c => '<span class="badge" title="provenance: '+esc(c.provenance)+'">'+esc(c.label)+' ('+esc(c.provenance)+')</span>').join(' ') : '<span class="muted">none</span>';
+    html += '<td style="padding:6px">'+capsStr+'</td>';
+  });
+  html += '</tr>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">GGUF Variants &amp; Fit</td>';
+  models.forEach(m => {
+    const variants = m.variants || [];
+    const vStr = variants.length ? variants.map(v => 
+      '<div style="margin-bottom:6px;border-bottom:1px dashed var(--border);padding-bottom:4px">'+
+      '<b class="mono">'+esc(v.file)+'</b><br>'+
+      'Size: '+fmtMB((v.size_bytes||0)/1048576)+' · Est. RAM: ~'+fmtMB(v.est_ram_mb)+'<br>'+
+      '<span class="badge '+(v.fit_classification==='BEST FIT'||v.fit_classification==='GOOD FIT'?'ok':'warn')+'">'+esc(v.fit_classification)+'</span>'+
+      (v.local_fit ? ' <span class="badge ok">local fit</span>' : ' <span class="badge warn">exceeds local RAM</span>')+
+      '</div>'
+    ).join('') : '<span class="muted">no variants</span>';
+    html += '<td style="padding:6px">'+vStr+'</td>';
+  });
+  html += '</tr>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">Fit Trade-offs &amp; Why</td>';
+  models.forEach(m => {
+    const variants = m.variants || [];
+    let reasonsHtml = '';
+    variants.forEach(v => {
+      const reasons = v.fit_reasons || [];
+      reasonsHtml += '<div style="margin-bottom:6px"><b class="mono" style="font-size:10px">'+esc(v.file)+'</b><ul style="margin:2px 0 0 14px;padding:0;font-size:11px">';
+      reasons.forEach(r => {
+        reasonsHtml += '<li style="color:'+(r.pass?'var(--ok, #22c55e)':'var(--warn, #f59e0b)')+'">'+(r.pass?'✓':'✗')+' <b>'+esc(r.check)+'</b>: '+esc(r.reason)+' <span style="font-size:9px;color:var(--muted)">['+esc(r.provenance)+']</span></li>';
+      });
+      reasonsHtml += '</ul></div>';
+    });
+    html += '<td style="padding:6px">'+(reasonsHtml || '<span class="muted">—</span>')+'</td>';
+  });
+  html += '</tr>';
+
+  html += '<tr style="border-bottom:1px solid var(--border)"><td style="font-weight:600;padding:6px">Fabric Nodes</td>';
+  models.forEach(m => {
+    const fabric = m.fabric || [];
+    const fStr = fabric.length ? fabric.map(f =>
+      '<div style="margin-top:2px">'+esc(f.node_name || f.node_id)+' ('+esc(f.status)+') '+
+      (f.served ? '<span class="badge ok">served</span>' : '')+
+      (f.available && !f.served ? '<span class="badge">on disk</span>' : '')+
+      (!f.trusted ? ' <span class="badge warn">untrusted</span>' : '')+'</div>'
+    ).join('') : '<span class="muted">not present on fabric nodes</span>';
+    html += '<td style="padding:6px">'+fStr+'</td>';
+  });
+  html += '</tr>';
+
+  html += '</tbody></table>';
+  $('hub-compare-content').innerHTML = html;
+}
+async function hubSearch(){
   const q = ($('hub-q').value || '').trim();
   if (!q) { toast('type a model name to search', true); return; }
   $('hub-status').innerHTML = 'searching HuggingFace for “'+esc(q)+'”…';
-  fetch('/api/admin/hub/search?query='+encodeURIComponent(q)+'&limit=8', { headers })
-    .then(r => r.json().then(j => ({ ok: r.ok, j })))
-    .then(({ ok, j }) => {
-      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">search failed</span> ' + esc((j.error && j.error.message) || 'unknown'); return; }
-      const rows = (j.models || []).map(m =>
-        '<tr><td>'+esc(m.id)+'</td><td>'+esc(m.pipeline_tag || '—')+'</td><td class="num">'+nfmt(m.downloads || 0)+'</td><td style="white-space:nowrap">'+
-        '<button class="btn small" onclick="hubOpenDetail(\''+jsq(m.id)+'\')">Details</button> '+
-        '<button class="btn small" id="hub-pull-'+safeId(m.id)+'" onclick="hubPull(\''+jsq(m.id)+'\')">Pull</button></td></tr>'
-      ).join('');
-      $('hub-results').innerHTML = rows || '<tr><td colspan="4" class="empty">no GGUF models found</td></tr>';
-      $('hub-status').innerHTML = 'search returned '+(j.models || []).length+' GGUF model(s)';
-    })
-    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">search error</span> '+esc(e); });
+  const { ok, status, j } = await apiFetch('/api/admin/hub/search?query='+encodeURIComponent(q)+'&limit=8', { headers });
+  if (!ok) {
+    $('hub-status').innerHTML = '<span class="badge warn">search failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
+    return;
+  }
+  const models = j.models || [];
+  const rows = models.map(m =>
+    '<tr><td><input type="checkbox" class="hub-compare-chk" value="'+esc(m.id)+'" '+(hubSelectedModels[m.id]?'checked':'')+
+    ' onchange="hubToggleCompare(\''+jsq(m.id)+'\', this)"></td>'+
+    '<td>'+esc(m.id)+'</td><td>'+esc(m.pipeline_tag || '—')+'</td><td class="num">'+nfmt(m.downloads || 0)+'</td><td style="white-space:nowrap">'+
+    '<button class="btn small" onclick="hubOpenDetail(\''+jsq(m.id)+'\')">Details</button> '+
+    '<button class="btn small" id="hub-pull-'+safeId(m.id)+'" onclick="hubPull(\''+jsq(m.id)+'\')">Pull</button></td></tr>'
+  ).join('');
+  $('hub-results').innerHTML = rows || '<tr><td colspan="5" class="empty">no GGUF models found for “'+esc(q)+'”</td></tr>';
+  $('hub-status').innerHTML = 'search returned '+models.length+' GGUF model(s)';
 }
-function hubPull(id){
+async function hubPull(id){
   if (hubPulling[id]) return;
   hubPulling[id] = true;
   const btn = $('hub-pull-'+safeId(id));
   if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
   $('hub-status').innerHTML = 'downloading '+esc(id)+' — large models take a while; the node keeps serving';
-  fetch('/api/admin/hub/pull', {
+  const { ok, status, j } = await apiFetch('/api/admin/hub/pull', {
     method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ reference: 'hf:' + id }),
-  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
-    .then(({ ok, j }) => {
-      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">pull failed</span> ' + esc((j.error && j.error.message) || 'unknown'); }
-      else {
-        $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.reference)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
-        toast('model pulled: ' + short(j.reference, 24));
-        refresh();
-      }
-      delete hubPulling[id];
-      if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
-    })
-    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">pull error</span> '+esc(e); delete hubPulling[id]; if (btn) { btn.disabled = false; btn.textContent = 'Pull'; } });
+  });
+  if (!ok) {
+    $('hub-status').innerHTML = '<span class="badge warn">pull failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
+  } else {
+    $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.reference)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
+    toast('model pulled: ' + short(j.reference, 24));
+    refresh();
+  }
+  delete hubPulling[id];
+  if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
 }
 function safeId(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
-function jsq(s){ return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+// Escape a value for a single-quoted JS string literal inside a double-quoted
+// HTML attribute (e.g. onclick="fn('…')"). Must neutralize BOTH contexts a
+// hostile model/repo name can target:
+//   - the JS string terminator `'` (and the JS escape backslash), and
+//   - the HTML double-quoted attribute terminator `"` plus the HTML specials
+//     &<> .
+// Order matters: `&` is encoded first so the entities produced by later steps
+// are never double-encoded.
+function jsq(s){ return String(s ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/"/g, '&quot;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/\\/g, '\\\\')
+  .replace(/'/g, "\\'"); }
 function nfmt(n){ return n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
 // Model card (Issue #26 §7–§8, §22, §31): fetch real Hub metadata + honest
 // capability taxonomy + variants, and the live fabric view of who can run it.
 // The fabric list comes from the node's own compute registry — never mocked.
-function hubOpenDetail(id){
+async function hubOpenDetail(id){
   $('hub-status').innerHTML = 'loading model card for '+esc(id)+'…';
-  fetch('/api/admin/hub/model/'+encodeURIComponent(id), { headers })
-    .then(r => r.json().then(j => ({ ok: r.ok, j })))
-    .then(({ ok, j }) => {
-      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">model card failed</span> ' + esc((j.error && j.error.message) || 'unknown'); return; }
-      const md = j.metadata || {};
-      $('md-title').textContent = j.id || '';
-      $('md-meta').textContent = [md.pipeline_tag, md.license, md.params ? md.params+' params' : '', md.context_length ? 'ctx '+md.context_length : '', md.downloads ? nfmt(md.downloads)+' downloads' : '', md.likes ? md.likes+' likes' : ''].filter(Boolean).join(' · ');
-      $('md-desc').textContent = md.description || 'No description on the Hub.';
-      const claims = j.capabilities && j.capabilities.claims || [];
-      $('md-caps').innerHTML = claims.length ? claims.map(c =>
-        '<span class="badge" title="provenance: '+esc(c.provenance)+'">'+esc(c.label)+'</span>'
-      ).join('') : '<span class="muted">no capabilities classified</span>';
-      const tasks = j.capabilities && j.capabilities.tasks || [];
-      $('md-tasks').innerHTML = tasks.length ? tasks.map(t => esc(t.task)).join(' · ') : '—';
-      const variants = j.variants || [];
-      $('md-variants').innerHTML = variants.length ? variants.map(v =>
-        '<tr><td class="mono">'+esc(v.file)+'<div class="sub" style="font-size:10px">'+(v.local_fit?'<span class="badge ok" style="font-size:9px">Can run locally (~'+fmtMB(v.est_ram_mb)+')</span>':'<span class="badge warn" style="font-size:9px">Needs ~'+fmtMB(v.est_ram_mb)+' RAM/VRAM</span>')+(v.fabric_fit_nodes && v.fabric_fit_nodes.length ? ' · '+v.fabric_fit_nodes.length+' fabric node(s) fit' : '')+'</div></td><td class="num">'+fmtMB((v.size_bytes||0)/1048576)+'</td><td class="mono">'+esc(short(v.sha256 || '', 12))+'</td><td>'+
-        '<button class="btn small" id="hub-pull-'+safeId(j.id+':'+v.file)+'" onclick="hubPullVariant(\''+jsq(j.id)+'\',\''+jsq(v.file)+'\')">Pull</button></td></tr>'
-      ).join('') : '<tr><td colspan="4" class="empty">no variants reported</td></tr>';
-      const fabric = j.fabric || [];
-      $('md-fabric-note').textContent = fabric.length ? ' — '+fabric.length+' node(s) have this model' : ' — no node has this model yet';
-      $('md-fabric').innerHTML = fabric.length ? fabric.map(f =>
-        '<div style="margin-top:4px">'+esc(f.node_name || f.node_id)+' · <code class="mono">'+esc(f.node_id)+'</code> · '+esc(f.status)+' · '+
-        (f.served ? '<span class="badge ok">served</span>' : '')+(f.available && !f.served ? '<span class="badge">on disk</span>' : '')+
-        (f.trusted ? '' : ' <span class="badge warn">untrusted</span>')+'</div>'
-      ).join('') : 'pull it here to make it available fabric-wide';
-      $('hub-detail').style.display = 'block';
-      $('hub-status').innerHTML = 'model card loaded';
-    })
-    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">model card error</span> '+esc(e); });
+  const { ok, status, j } = await apiFetch('/api/admin/hub/model/'+encodeURIComponent(id), { headers });
+  if (!ok) {
+    $('hub-status').innerHTML = '<span class="badge warn">model card failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
+    return;
+  }
+  const md = j.metadata || {};
+  $('md-title').textContent = j.id || '';
+  $('md-meta').textContent = [md.pipeline_tag, md.license, md.params ? md.params+' params' : '', md.context_length ? 'ctx '+md.context_length : '', md.downloads ? nfmt(md.downloads)+' downloads' : '', md.likes ? md.likes+' likes' : ''].filter(Boolean).join(' · ');
+  $('md-desc').textContent = md.description || 'No description on the Hub.';
+  const claims = j.capabilities && j.capabilities.claims || [];
+  $('md-caps').innerHTML = claims.length ? claims.map(c =>
+    '<span class="badge" title="provenance: '+esc(c.provenance)+'">'+esc(c.label)+'</span>'
+  ).join('') : '<span class="muted">no capabilities classified</span>';
+  const tasks = j.capabilities && j.capabilities.tasks || [];
+  $('md-tasks').innerHTML = tasks.length ? tasks.map(t => esc(t.task)).join(' · ') : '—';
+  const variants = j.variants || [];
+  $('md-variants').innerHTML = variants.length ? variants.map(v =>
+    '<tr><td class="mono">'+esc(v.file)+'<div class="sub" style="font-size:10px">'+(v.local_fit?'<span class="badge ok" style="font-size:9px">Can run locally (~'+fmtMB(v.est_ram_mb)+')</span>':'<span class="badge warn" style="font-size:9px">Needs ~'+fmtMB(v.est_ram_mb)+' RAM/VRAM</span>')+(v.fabric_fit_nodes && v.fabric_fit_nodes.length ? ' · '+v.fabric_fit_nodes.length+' fabric node(s) fit' : '')+'</div></td><td class="num">'+fmtMB((v.size_bytes||0)/1048576)+'</td><td class="mono">'+esc(short(v.sha256 || '', 12))+'</td><td>'+
+    '<button class="btn small" id="hub-pull-'+safeId(j.id+':'+v.file)+'" onclick="hubPullVariant(\''+jsq(j.id)+'\',\''+jsq(v.file)+'\')">Pull</button></td></tr>'
+  ).join('') : '<tr><td colspan="4" class="empty">no variants reported</td></tr>';
+  const fabric = j.fabric || [];
+  $('md-fabric-note').textContent = fabric.length ? ' — '+fabric.length+' node(s) have this model' : ' — no node has this model yet';
+  $('md-fabric').innerHTML = fabric.length ? fabric.map(f =>
+    '<div style="margin-top:4px">'+esc(f.node_name || f.node_id)+' · <code class="mono">'+esc(f.node_id)+'</code> · '+esc(f.status)+' · '+
+    (f.served ? '<span class="badge ok">served</span>' : '')+(f.available && !f.served ? '<span class="badge">on disk</span>' : '')+
+    (f.trusted ? '' : ' <span class="badge warn">untrusted</span>')+'</div>'
+  ).join('') : 'pull it here to make it available fabric-wide';
+  $('hub-detail').style.display = 'block';
+  $('hub-status').innerHTML = 'model card loaded';
 }
-function hubPullVariant(id, file){
+async function hubPullVariant(id, file){
   if (hubPulling[id+':'+file]) return;
   hubPulling[id+':'+file] = true;
   const btn = $('hub-pull-'+safeId(id+':'+file));
   if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
   $('hub-status').innerHTML = 'downloading '+esc(id)+' variant '+esc(file)+' — the node keeps serving';
-  fetch('/api/admin/hub/pull', {
+  const { ok, status, j } = await apiFetch('/api/admin/hub/pull', {
     method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ reference: 'hf:' + id, file: file }),
-  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
-    .then(({ ok, j }) => {
-      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">pull failed</span> ' + esc((j.error && j.error.message) || 'unknown'); }
-      else {
-        $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.file)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
-        toast('variant pulled: ' + short(j.file, 24));
-        refresh();
-      }
-      delete hubPulling[id+':'+file];
-      if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
-    })
-    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">pull error</span> '+esc(e); delete hubPulling[id+':'+file]; if (btn) { btn.disabled = false; btn.textContent = 'Pull'; } });
+  });
+  if (!ok) {
+    $('hub-status').innerHTML = '<span class="badge warn">pull failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
+  } else {
+    $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.file)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
+    toast('variant pulled: ' + short(j.file, 24));
+    refresh();
+  }
+  delete hubPulling[id+':'+file];
+  if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
 }
 function hubCloseDetail(){ $('hub-detail').style.display = 'none'; }
 function removeModel(path){

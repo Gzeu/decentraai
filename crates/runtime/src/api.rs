@@ -911,6 +911,305 @@ async fn admin_hub_model_handler(
         .into_response()
 }
 
+/// Model Hub comparison (Model Comparison feature): `GET
+/// /api/admin/hub/compare?repos=org/repo1,org/repo2` compares multiple models
+/// side-by-side with honest metadata, capabilities, variants, resource fit,
+/// explainable fit reasons, and fabric node availability. Master-gated.
+async fn admin_hub_compare_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let repos_str = params.get("repos").map(|s| s.as_str()).unwrap_or("");
+    if repos_str.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": {"message": "missing 'repos' query parameter", "type": "validation_error"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+
+    let repos: Vec<&str> = repos_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if repos.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": {"message": "no valid repositories provided", "type": "validation_error"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+
+    let catalog = decentraai_hub::HubCatalog::new();
+    let mut compared_models = Vec::new();
+
+    for repo in repos {
+        let detail = match catalog.model_detail(repo).await {
+            Ok(d) => d,
+            Err(e) => {
+                compared_models.push(serde_json::json!({
+                    "id": repo,
+                    "error": e.to_string(),
+                }));
+                continue;
+            }
+        };
+        let files = match catalog.list_gguf_files(repo).await {
+            Ok(f) => f,
+            Err(e) => {
+                compared_models.push(serde_json::json!({
+                    "id": repo,
+                    "error": e.to_string(),
+                }));
+                continue;
+            }
+        };
+        let caps = detail.capabilities();
+        let model_json = hub_compare_model_body(&detail, &files, &caps, &state, repo).await;
+        compared_models.push(model_json);
+    }
+
+    let body = serde_json::json!({
+        "models": compared_models,
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Outcome of a Model Hub "can I run this" decision.
+///
+/// Honesty invariants (§49):
+/// - RAM is compared against a RAM estimate, VRAM against a VRAM estimate —
+///   the two resources are never treated as interchangeable.
+/// - Only *trusted* workers credit toward "a compatible worker exists on the
+///   fabric"; an untrusted worker's advertised capacity is not usable yet.
+struct ResourceFit {
+    ram_sufficient: bool,
+    vram_sufficient: bool,
+    local_fit: bool,
+    trusted_worker_can_run: bool,
+    classification: &'static str,
+}
+
+/// Pure resource-fit decision for the Model Hub "Models I can run" view.
+///
+/// Separated from I/O (per AGENTS.md) so the honesty invariants are driven by
+/// synthetic inputs in tests, not by live hardware. `est_ram_mb`/`est_vram_mb`
+/// are per-resource estimates already derived from the model's file size.
+fn resource_fit(
+    local_avail_ram_mb: u64,
+    local_free_vram_mb: Option<u64>,
+    est_ram_mb: u64,
+    est_vram_mb: u64,
+    trusted_worker_count: usize,
+) -> ResourceFit {
+    let ram_sufficient = local_avail_ram_mb >= est_ram_mb;
+    let vram_sufficient = match local_free_vram_mb {
+        Some(v) => v >= est_vram_mb,
+        None => false,
+    };
+    // A node can run the model if either resource it could use is sufficient;
+    // the per-resource checks above already compared each against its OWN
+    // estimate, so this OR is not a resource-mix.
+    let local_fit = ram_sufficient || vram_sufficient;
+    let trusted_worker_can_run = trusted_worker_count > 0;
+    let classification = if local_fit && trusted_worker_can_run {
+        "BEST FIT"
+    } else if trusted_worker_can_run {
+        "GOOD FIT"
+    } else if local_fit {
+        "LIMITED"
+    } else {
+        "NOT AVAILABLE"
+    };
+    ResourceFit {
+        ram_sufficient,
+        vram_sufficient,
+        local_fit,
+        trusted_worker_can_run,
+        classification,
+    }
+}
+
+/// Pure serialization of a model comparison entry, incorporating variants with
+/// explainable fit classification and reasons, capabilities, and fabric availability.
+async fn hub_compare_model_body(
+    detail: &decentraai_hub::HubModelDetail,
+    files: &[decentraai_hub::HubModelFile],
+    caps: &decentraai_hub::ModelCapabilities,
+    state: &ApiState,
+    repo: &str,
+) -> serde_json::Value {
+    let mut fabric_nodes = Vec::new();
+    if let Some(cm) = &state.compute {
+        let workers = cm.workers().await;
+        for w in workers {
+            let served = w.capability.served_models.iter().any(|m| m.file_name == repo);
+            let available = w.capability.available_models.iter().any(|m| m.file_name == repo);
+            if served || available {
+                fabric_nodes.push(serde_json::json!({
+                    "node_id": w.node_id,
+                    "node_name": w.node_name,
+                    "peer_id": w.peer_id.to_string(),
+                    "status": format!("{:?}", w.availability.status),
+                    "served": served,
+                    "available": available,
+                    "trusted": cm.is_trusted(&w.peer_id).await,
+                }));
+            }
+        }
+    }
+    let local_snapshot = decentraai_system_probe::SystemSnapshot::collect();
+    let local_avail_ram_mb = local_snapshot.available_memory_bytes / (1024 * 1024);
+    let local_vram_mb = match decentraai_system_probe::probe_gpu() {
+        decentraai_system_probe::GpuProbeStatus::Nvidia(gpu) => Some(gpu.free_vram_mib),
+        _ => None,
+    };
+    let has_gpu = local_vram_mb.is_some();
+
+    let mut fabric_variants = Vec::new();
+    for f in files {
+        let size = f.size.unwrap_or(0);
+        // RAM and VRAM are separate, non-interchangeable resources: a model's
+        // weights occupy ~file size when offloaded to VRAM, and ~1.2x file
+        // size when loaded into system RAM. Each resource is compared against
+        // its OWN estimate — never mixed (honesty §49).
+        let est_ram_mb = (size * 120 / 100) / (1024 * 1024);
+        let est_vram_mb = (size * 105 / 100) / (1024 * 1024);
+        let mut can_run_workers = Vec::new();
+        let mut trusted_worker_count = 0usize;
+        if let Some(cm) = &state.compute {
+            for w in cm.workers().await {
+                let w_ram = w.availability.available_ram_mb;
+                let w_vram = w.availability.available_vram_mb.unwrap_or(0);
+                if w_ram >= est_ram_mb || w_vram >= est_vram_mb {
+                    can_run_workers.push(serde_json::json!({
+                        "node_id": w.node_id,
+                        "node_name": w.node_name,
+                        "peer_id": w.peer_id.to_string(),
+                        "ram_ok": w_ram >= est_ram_mb,
+                        "vram_ok": w_vram >= est_vram_mb,
+                    }));
+                    if cm.is_trusted(&w.peer_id).await {
+                        trusted_worker_count += 1;
+                    }
+                }
+            }
+        }
+        let model_available_on_fabric = !fabric_nodes.is_empty();
+
+        // Pure decision: keeps the honesty invariants (separate RAM/VRAM
+        // estimates, trusted-only worker credit, classification) testable
+        // without I/O.
+        let fit = resource_fit(
+            local_avail_ram_mb,
+            local_vram_mb,
+            est_ram_mb,
+            est_vram_mb,
+            trusted_worker_count,
+        );
+        let ram_sufficient = fit.ram_sufficient;
+        let vram_sufficient = fit.vram_sufficient;
+        let local_fit = fit.local_fit;
+        let trusted_worker_can_run = fit.trusted_worker_can_run;
+
+        let mut reasons = Vec::new();
+        reasons.push(serde_json::json!({
+            "check": "ram_sufficient",
+            "pass": ram_sufficient,
+            "provenance": "ESTIMATED",
+            "reason": format!("Local available RAM ({} MB) vs estimated requirement ({} MB)", local_avail_ram_mb, est_ram_mb)
+        }));
+        if has_gpu {
+            reasons.push(serde_json::json!({
+                "check": "vram_sufficient",
+                "pass": vram_sufficient,
+                "provenance": "ESTIMATED",
+                "reason": format!("Local free VRAM ({} MB) vs estimated requirement ({} MB)", local_vram_mb.unwrap_or(0), est_vram_mb)
+            }));
+        } else {
+            reasons.push(serde_json::json!({
+                "check": "vram_sufficient",
+                "pass": false,
+                "provenance": "MEASURED",
+                "reason": "No discrete GPU detected on local node (CPU-only execution)"
+            }));
+        }
+        // Honest pass: only *trusted* workers count toward "compatible worker
+        // found on fabric" — an untrusted worker's advertised capacity is not a
+        // resource this operator can actually use yet.
+        reasons.push(serde_json::json!({
+            "check": "trusted_worker_available",
+            "pass": trusted_worker_can_run,
+            "provenance": "VERIFIED",
+            "reason": format!("{} compatible worker(s) found on fabric ({} trusted)", can_run_workers.len(), trusted_worker_count)
+        }));
+        reasons.push(serde_json::json!({
+            "check": "model_available",
+            "pass": model_available_on_fabric || local_fit,
+            "provenance": "VERIFIED",
+            "reason": if model_available_on_fabric { "Model reported on fabric nodes" } else { "Model not yet present on fabric" }
+        }));
+        // The bundled engine is llama-server and serves GGUF by construction.
+        // That is an ESTIMATED capability derived from the fixed engine
+        // choice, not a per-model runtime verification — never VERIFIED.
+        reasons.push(serde_json::json!({
+            "check": "compatible_engine",
+            "pass": true,
+            "provenance": "ESTIMATED",
+            "reason": "llama-server (bundled engine) serves GGUF models"
+        }));
+
+        let fit_classification = fit.classification;
+
+        fabric_variants.push(serde_json::json!({
+            "file": f.path,
+            "size_bytes": f.size,
+            "sha256": f.lfs.as_ref().map(|l| l.oid.clone()),
+            "est_ram_mb": est_ram_mb,
+            "local_fit": local_fit,
+            "fabric_fit_nodes": can_run_workers,
+            "fit_classification": fit_classification,
+            "fit_reasons": reasons,
+        }));
+    }
+
+    serde_json::json!({
+        "id": repo,
+        "metadata": {
+            "pipeline_tag": detail.pipeline_tag.as_ref().map(|t| t.as_str()),
+            "tags": detail.tags,
+            "downloads": detail.downloads,
+            "likes": detail.likes,
+            "description": detail.description,
+            "license": detail.license,
+            "context_length": detail.context_length,
+            "params": detail.params,
+        },
+        "capabilities": {
+            "claims": caps.claims.iter().map(|c| serde_json::json!({
+                "capability": c.capability,
+                "label": c.capability.label(),
+                "provenance": c.provenance,
+            })).collect::<Vec<_>>(),
+            "tasks": caps.tasks.iter().map(|t| serde_json::json!({
+                "capability": t.capability,
+                "task": t.task,
+            })).collect::<Vec<_>>(),
+        },
+        "variants": fabric_variants,
+        "fabric": fabric_nodes,
+    })
+}
+
 /// Pure serialization of the model card (hub metadata + capabilities +
 /// variants + live fabric state). Tests drive it with synthetic inputs.
 async fn hub_model_body(
@@ -1295,6 +1594,7 @@ pub fn build_router(state: ApiState) -> Router {
         // Part 16/22 - Model Hub (master-gated search + pull)
         .route("/api/admin/hub/search", get(admin_hub_search_handler))
         .route("/api/admin/hub/model/{repo}", get(admin_hub_model_handler))
+        .route("/api/admin/hub/compare", get(admin_hub_compare_handler))
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
         // Model removal (Issue #26): master-gated delete from registry + disk
         .route("/api/admin/models/remove", post(admin_models_remove_handler))
@@ -4131,6 +4431,104 @@ mod tests {
             "system prompt must reach the backend"
         );
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_compare_model_body_includes_fit_classification_and_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master".into()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let detail = decentraai_hub::HubModelDetail {
+            id: "org/test-model".into(),
+            pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+            tags: vec!["gguf".into()],
+            downloads: 10,
+            likes: 1,
+            description: Some("Test".into()),
+            license: Some("mit".into()),
+            context_length: Some(4096),
+            params: Some("1B".into()),
+        }
+        .fill_from_tags();
+        let files = vec![
+            decentraai_hub::HubModelFile {
+                path: "q4_k_m.gguf".into(),
+                size: Some(100 * 1024 * 1024),
+                lfs: None,
+            },
+        ];
+        let caps = detail.capabilities();
+        let body = hub_compare_model_body(&detail, &files, &caps, &state, "org/test-model").await;
+        assert_eq!(body["id"], "org/test-model");
+        let variants = body["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 1);
+        assert!(variants[0]["fit_classification"].is_string());
+        let reasons = variants[0]["fit_reasons"].as_array().unwrap();
+        assert!(!reasons.is_empty());
+        assert!(reasons.iter().any(|r| r["check"] == "ram_sufficient"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// Honesty invariants of the pure fit decision (§49). RAM and VRAM are
+    /// compared against their OWN estimates — never mixed — and an untrusted
+    /// worker must not credit toward "compatible worker on fabric".
+    #[test]
+    fn resource_fit_never_mixes_ram_and_vram() {
+        // est_ram = 1200MB, est_vram = 1050MB.
+        let est_ram = 1200;
+        let est_vram = 1050;
+
+        // VRAM alone is not enough if the RAM estimate is unmet (CPU cannot
+        // offload the whole model); conversely RAM alone suffices for CPU load.
+        let cpu_only = resource_fit(2000, Some(0), est_ram, est_vram, 0);
+        assert!(cpu_only.ram_sufficient);
+        assert!(!cpu_only.vram_sufficient);
+        assert!(cpu_only.local_fit);
+
+        // A big VRAM pool must be compared against the VRAM estimate, not the
+        // (larger) RAM estimate — this is the original false-confidence bug.
+        let big_vram_small_ram = resource_fit(500, Some(1500), est_ram, est_vram, 0);
+        assert!(!big_vram_small_ram.ram_sufficient);
+        assert!(big_vram_small_ram.vram_sufficient);
+        assert!(big_vram_small_ram.local_fit, "GPU can host it");
+    }
+
+    #[test]
+    fn resource_fit_trusted_only_and_classification() {
+        let est_ram = 1000;
+        let est_vram = 900;
+
+        // Untrusted workers advertise capacity, but must not make it
+        // "compatible worker available" nor bump the classification.
+        let untrusted_only = resource_fit(0, None, est_ram, est_vram, 0);
+        assert!(!untrusted_only.trusted_worker_can_run);
+        assert_eq!(untrusted_only.classification, "NOT AVAILABLE");
+
+        // A trusted worker alone (no local fit) is a GOOD FIT via the fabric.
+        let trusted_remote = resource_fit(0, None, est_ram, est_vram, 1);
+        assert!(trusted_remote.trusted_worker_can_run);
+        assert_eq!(trusted_remote.classification, "GOOD FIT");
+
+        // Local fit + trusted worker = BEST FIT.
+        let best = resource_fit(2000, None, est_ram, est_vram, 2);
+        assert!(best.local_fit);
+        assert!(best.trusted_worker_can_run);
+        assert_eq!(best.classification, "BEST FIT");
+
+        // Local fit but no trusted worker is LIMITED (local-only).
+        let local_only = resource_fit(2000, None, est_ram, est_vram, 0);
+        assert!(local_only.local_fit);
+        assert_eq!(local_only.classification, "LIMITED");
     }
 
     #[tokio::test]
