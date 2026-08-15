@@ -832,3 +832,29 @@ Model Hub card, so "can this model do X?" is answered visibly and honestly.
   MISSING) and why.
 - [x] Tests for the fit verdict covering the honesty rules (inferred never
   satisfies verified; absent capability is missing; no `requires` → null).
+
+## 26. Next-Gen Phase 1/7 — Capability Fit on Model Comparison + Planner Plumbing
+
+Two additive steps that extend the capability fabric end-to-end (operator UI and
+execution decision observability), both honest by construction.
+
+**Comparison capability fit**
+- [x] `GET /api/admin/hub/compare?repos=...&requires=ocr` now adds a
+  `capabilities.fit` verdict per compared model (same provenance-aware engine
+  and honesty rules as the single-model card), plus a top-level `requires`.
+- [x] Dashboard Model Comparison gains a "Capability fit" selector + per-model
+  verdict checklist, reusing the model-card style.
+- [x] Tests for the compare fit verdict covering the honesty rules.
+
+**Planner capability-requirement plumbing (Phase L foundation)**
+- [x] `RequestFacts.required_capability: Option<String>` — an optional required
+  capability on the planner input.
+- [x] `PlannerRationale.capability_requirement: Option<CapabilityRequirementView>`
+  — records an honest verdict (`satisfied: false`, `evidence: "UNKNOWN"`) plus a
+  reasoning note when a requirement is present. The engine-neutral fabric never
+  claims satisfaction without real evidence; a coordinator with real
+  `ModelCapabilities` may later overwrite it.
+- [x] The two `RequestFacts` construction sites in `compute.rs` updated
+  (requirement `None` today — routing/protocol untouched).
+- [x] Tests: no requirement → None verdict; requirement → honest UNKNOWN;
+  serde round-trip.

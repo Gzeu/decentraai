@@ -990,6 +990,11 @@ async fn admin_hub_compare_handler(
     if let Err(e) = state.require_master(&headers) {
         return e.into_response();
     }
+    // Optional capability fit query: `?requires=ocr` asks each compared
+    // model for an honest provenance-aware verdict of whether it can do OCR.
+    let requires = params
+        .get("requires")
+        .and_then(|v| v.parse::<decentraai_hub::CapabilityKind>().ok());
     let repos_str = params.get("repos").map(|s| s.as_str()).unwrap_or("");
     if repos_str.is_empty() {
         return (
@@ -1037,12 +1042,16 @@ async fn admin_hub_compare_handler(
             }
         };
         let caps = detail.capabilities();
-        let model_json = hub_compare_model_body(&detail, &files, &caps, &state, repo).await;
+        let model_json =
+            hub_compare_model_body(&detail, &files, &caps, &state, repo, requires).await;
         compared_models.push(model_json);
     }
 
     let body = serde_json::json!({
         "models": compared_models,
+        // What capability the comparison was asked about, so the UI can label
+        // the fit verdicts. Null when no `requires` was supplied.
+        "requires": requires.map(|cap| cap.label()),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -1114,6 +1123,7 @@ async fn hub_compare_model_body(
     caps: &decentraai_hub::ModelCapabilities,
     state: &ApiState,
     repo: &str,
+    requires: Option<decentraai_hub::CapabilityKind>,
 ) -> serde_json::Value {
     let mut fabric_nodes = Vec::new();
     if let Some(cm) = &state.compute {
@@ -1267,6 +1277,27 @@ async fn hub_compare_model_body(
                 "capability": t.capability,
                 "task": t.task,
             })).collect::<Vec<_>>(),
+            // When a `requires` capability was supplied, an honest,
+            // provenance-aware verdict of whether this model satisfies it.
+            "fit": requires.map(|cap| {
+                let m = decentraai_hub::match_requirements(
+                    caps,
+                    &[decentraai_hub::CapabilityRequirement {
+                        capability: cap,
+                        evidence: decentraai_hub::EvidenceLevel::Verified,
+                    }],
+                );
+                serde_json::json!({
+                    "capability": cap,
+                    "label": cap.label(),
+                    "satisfied": m.is_satisfied(),
+                    "checks": m.checks.iter().map(|c| serde_json::json!({
+                        "capability": c.capability,
+                        "status": serde_json::to_value(&c.status).unwrap_or_default(),
+                        "reason": c.reason,
+                    })).collect::<Vec<_>>(),
+                })
+            }),
         },
         "variants": fabric_variants,
         "fabric": fabric_nodes,
@@ -4768,7 +4799,7 @@ mod tests {
             },
         ];
         let caps = detail.capabilities();
-        let body = hub_compare_model_body(&detail, &files, &caps, &state, "org/test-model").await;
+        let body = hub_compare_model_body(&detail, &files, &caps, &state, "org/test-model", None).await;
         assert_eq!(body["id"], "org/test-model");
         let variants = body["variants"].as_array().unwrap();
         assert_eq!(variants.len(), 1);
@@ -4776,6 +4807,84 @@ mod tests {
         let reasons = variants[0]["fit_reasons"].as_array().unwrap();
         assert!(!reasons.is_empty());
         assert!(reasons.iter().any(|r| r["check"] == "ram_sufficient"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// The comparison model body reports an honest, provenance-aware fit verdict
+    /// per compared model when a `requires` capability is supplied, and `null`
+    /// when it is not. Mirrors the model-card verdict: a VERIFIED claim
+    /// satisfies, an INFERRED-only claim never satisfies a VERIFIED requirement,
+    /// and `None` -> null. Pure (no network); hub detail built as a struct.
+    #[tokio::test]
+    async fn hub_compare_model_body_reports_requires_fit_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master".into()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let files = vec![];
+        let make_detail = |id: String, tags: Vec<String>| decentraai_hub::HubModelDetail {
+            id,
+            pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+            tags,
+            downloads: 0,
+            likes: 0,
+            description: None,
+            license: None,
+            context_length: None,
+            params: None,
+        };
+
+        // VERIFIED OCR via the `ocr` tag: a Verified requirement is satisfied.
+        let verified = make_detail("org/scanner".into(), vec!["gguf".into(), "ocr".into()]);
+        let caps = verified.capabilities();
+        let body = hub_compare_model_body(
+            &verified,
+            &files,
+            &caps,
+            &state,
+            "org/scanner",
+            Some(decentraai_hub::CapabilityKind::Ocr),
+        )
+        .await;
+        let fit = body["capabilities"]["fit"].clone();
+        assert_eq!(fit["capability"], "ocr");
+        assert_eq!(fit["satisfied"], true, "verified claim must satisfy verified requirement");
+        assert_eq!(fit["checks"][0]["status"]["satisfied"]["provenance"], "verified");
+
+        // INFERRED coding only (id heuristic) must NOT satisfy Verified.
+        let inferred = make_detail("org/codestral".into(), vec!["gguf".into()]);
+        let caps = inferred.capabilities();
+        let body = hub_compare_model_body(
+            &inferred,
+            &files,
+            &caps,
+            &state,
+            "org/codestral",
+            Some(decentraai_hub::CapabilityKind::Coding),
+        )
+        .await;
+        let fit = body["capabilities"]["fit"].clone();
+        assert_eq!(fit["capability"], "coding");
+        assert_eq!(fit["satisfied"], false, "inferred-only must not satisfy verified");
+        assert_eq!(
+            fit["checks"][0]["status"]["insufficient_provenance"]["found"],
+            "inferred"
+        );
+
+        // No requires -> fit is null.
+        let body =
+            hub_compare_model_body(&inferred, &files, &caps, &state, "org/codestral", None).await;
+        assert!(body["capabilities"]["fit"].is_null());
+
         manager.lock().await.shutdown().await.unwrap();
     }
 

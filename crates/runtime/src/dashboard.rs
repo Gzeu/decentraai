@@ -595,6 +595,15 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
                <h3 style="margin:0;font-size:15px">Model Comparison (<span id="compare-panel-count">0</span> models)</h3>
                <button class="btn small" onclick="hubCloseCompare()">Close Comparison</button>
              </div>
+             <div style="margin-top:10px"><b style="font-size:12px">Capability fit</b>
+               <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                 <span class="mono" style="font-size:11px;color:var(--muted)">can these models do</span>
+                 <select id="compare-fit-cap" class="mono" style="font-size:11px;padding:2px 4px"></select>
+                 <button class="btn small" onclick="hubCompareFit()">check</button>
+                 <span id="compare-fit-note" class="mono" style="font-size:10.5px;color:var(--faint)"></span>
+               </div>
+               <div id="compare-fit" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+             </div>
              <div id="hub-compare-content" style="overflow-x:auto;margin-top:10px"></div>
            </div>
           <!-- Model card (Issue #26 §7–§8, §22): real Hub metadata + honest
@@ -1874,16 +1883,27 @@ function hubCompareSelected(){
   const keys = Object.keys(hubSelectedModels);
   if (keys.length === 0) { toast('select at least one model to compare', true); return; }
   const query = keys.map(k => encodeURIComponent(k)).join(',');
+  hubCompareRepos = keys.slice();
   $('hub-status').innerHTML = 'loading comparison for '+keys.length+' model(s)…';
   apiFetch('/api/admin/hub/compare?repos=' + query, { headers }).then(({ ok, status, j }) => {
     if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">comparison failed ('+status+')</span> ' + esc((j.error && j.error.message) || 'unknown error'); return; }
     const models = j.models || [];
     renderComparisonTable(models);
+    // Capability fit: populate the dropdown from the KNOWN taxonomy (all
+    // snake_case capability labels), not from invented state.
+    var fitSel = $('compare-fit-cap');
+    if (fitSel && fitSel.options.length === 0) {
+      var known = ['ocr','vision','coding','summarization','translation','embeddings','tool_calling','structured_output','reasoning','speech_to_text','text_to_speech','image_generation','classification','multimodal'];
+      known.forEach(function(k){ var o = document.createElement('option'); o.value = k; o.textContent = k; fitSel.appendChild(o); });
+    }
+    $('compare-fit').innerHTML = '';
+    $('compare-fit-note').textContent = '';
     $('hub-compare-panel').style.display = 'block';
     $('compare-panel-count').textContent = models.length;
     $('hub-status').innerHTML = 'comparison loaded successfully';
   });
 }
+var hubCompareRepos = [];
 function renderComparisonTable(models){
   if (!models.length) { $('hub-compare-content').innerHTML = '<div class="empty">no models to compare</div>'; return; }
   let html = '<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:1px solid var(--border)"><th>Attribute</th>';
@@ -1961,6 +1981,37 @@ function renderComparisonTable(models){
 
   html += '</tbody></table>';
   $('hub-compare-content').innerHTML = html;
+}
+// Capability fit check for the comparison view: re-fetch with `requires=<cap>`
+// and render the honest provenance-aware verdict (VERIFIED vs INFERRED vs
+// MISSING) for EACH compared model. Mirrors the model-card hubCheckFit honesty
+// rules: an INFERRED claim never satisfies a VERIFIED requirement.
+async function hubCompareFit(){
+  var cap = ($('compare-fit-cap') || {}).value || '';
+  if (!cap) return;
+  if (!hubCompareRepos.length) { toast('compare models first', true); return; }
+  var query = hubCompareRepos.map(k => encodeURIComponent(k)).join(',');
+  $('compare-fit-note').textContent = 'checking '+esc(cap)+'…';
+  const { ok, j } = await apiFetch('/api/admin/hub/compare?repos=' + query + '&requires=' + encodeURIComponent(cap), { headers });
+  $('compare-fit-note').textContent = '';
+  if (!ok) { $('compare-fit').innerHTML = '<span class="badge warn">check failed</span>'; return; }
+  var models = j.models || [];
+  if (!models.length) { $('compare-fit').innerHTML = '<span class="muted">no models to compare</span>'; return; }
+  var html = '';
+  models.forEach(function(m){
+    var fit = (m.capabilities && m.capabilities.fit) || null;
+    if (!fit) { html += '<div style="margin-bottom:8px"><b>'+esc(m.id || m.error)+'</b>: <span class="muted">no verdict available</span></div>'; return; }
+    var badge = fit.satisfied ? '<span class="badge ok">satisfied</span>' : '<span class="badge warn">not satisfied</span>';
+    var checks = (fit.checks || []).map(function(c){
+      var sat = (c.status && c.status.satisfied) ? true : false;
+      var color = sat ? 'var(--ok,#22c55e)' : 'var(--warn,#f59e0b)';
+      var mark = sat ? '✓' : '✗';
+      return '<div style="margin-top:3px"><span style="color:'+color+'">'+mark+'</span> <b class="mono">'+esc(c.capability)+'</b>: '+esc(c.reason||'')+'</div>';
+    }).join('');
+    html += '<div style="margin-bottom:10px;border-bottom:1px dashed var(--border);padding-bottom:6px">'+
+      '<b>'+esc(m.id || m.error)+'</b>: '+badge+' — requires <b class="mono">'+esc(fit.label||fit.capability)+'</b> (VERIFIED evidence)'+checks+'</div>';
+  });
+  $('compare-fit').innerHTML = html;
 }
 async function hubSearch(){
   const q = ($('hub-q').value || '').trim();
