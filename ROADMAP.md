@@ -1270,3 +1270,25 @@ existing `recovery_timeline` vocabulary — no second recovery engine).
   last few decisions' recovery timeline (outcome, recoveries, adaptation,
   ordered event trace), each tagged with its request_id. Advisory-only — never
   claims an action the runtime did not take.
+
+## 48. Next-Gen — decide → reserve → execute (mutation path)
+
+The read-only fabric OS gains its first confirmed mutation: run a real inference
+for an intent through the existing decide → plan_and_reserve → route_request
+path. Reuses authoritative systems; no new planner/ledger/engine.
+
+- [x] `POST /v1/execute` (master-gated, MUTATING): `{ intent, prompt, max_tokens,
+  stream?, model?, evidence?, confirm: true }`. Refuses without `confirm: true`
+  (mutation safety). Flow: `unified_fabric_decision` → chosen model →
+  `resolve_model_hash` (from real advertisements) → `DistributedInference::route_request`
+  (reserve + route + audit + recovery). Returns the decision + real inference
+  result (output, tokens, worker) or a clear honest error.
+- [x] `resolve_model_hash(file_name)` — resolves a real BLAKE3 hash from fabric
+  advertisements; `None` honestly when the fabric does not hold the model.
+- [x] Shared `run_execute_decision` core (handler + MCP both call it; the core
+  enforces `confirm: true` so no caller bypasses it).
+- [x] MCP `execute_decision { intent, prompt, max_tokens, ..., confirm: true }`
+  — precomputes the execution into the context (status/ok/body), mutation
+  safety enforced by the same core. Reuses existing master auth.
+- [x] Tests (focused): refuse without confirm; honest 422 when no runnable
+  decision (never a fabricated run); MCP tool listed, arg parsing, snapshot.

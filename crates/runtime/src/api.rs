@@ -1276,6 +1276,191 @@ async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
     )
 }
 
+/// Resolve a BLAKE3 `model_hash` for a model file name from the live fabric
+/// advertisements (served or on-disk). `None` when no worker advertises the
+/// model (honest: cannot execute a model the fabric does not hold).
+async fn resolve_model_hash(
+    state: &ApiState,
+    file_name: &str,
+) -> Option<String> {
+    let cm = state.compute.as_ref()?;
+    let workers = cm.workers().await;
+    for adv in workers {
+        for m in adv
+            .capability
+            .served_models
+            .iter()
+            .chain(adv.capability.available_models.iter())
+        {
+            let f = m.file_name.to_lowercase();
+            let target = file_name.to_lowercase();
+            if f == target || f.ends_with(&target) || target.ends_with(&f) {
+                return Some(m.model_hash.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Execute a decided plan — the mutation step of `decide → reserve → execute`.
+/// Requires an explicit `confirm: true` (mutating: reserves a worker and runs a
+/// real inference). Reuses the existing `plan_and_reserve` + `route_request`
+/// path (via `DistributedInference`); it does NOT introduce a new planner,
+/// reservation ledger, or execution engine.
+///
+/// Input (JSON body):
+///   { "intent": "...", "prompt": "...", "max_tokens": N, "stream": bool,
+///     "model": "file.gguf" (optional), "evidence": "any|verified",
+///     "confirm": true }
+///
+/// Returns the unified decision + the chosen model + the real inference result
+/// (or a clear error). Without `confirm: true` it refuses (mutation safety).
+async fn execute_decision_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    run_execute_decision(&state, &req).await
+}
+
+/// Core decide→reserve→execute logic, shared by the HTTP handler and the MCP
+/// `execute_decision` tool. Enforces the mutation-safety confirmation itself
+/// (so no caller can bypass it) and requires the node master token (checked by
+/// the HTTP layer; MCP runs behind the same master-gated boundary).
+async fn run_execute_decision(
+    state: &ApiState,
+    req: &serde_json::Value,
+) -> Response {
+    // Mutation safety: explicit confirmation is required.
+    if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return forbidden("mutating execution requires \"confirm\": true");
+    }
+    let intent = req.get("intent").and_then(|i| i.as_str()).unwrap_or_default();
+    if intent.trim().is_empty() {
+        return forbidden("missing intent");
+    }
+    let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return forbidden("missing prompt");
+    }
+    let max_tokens = req
+        .get("max_tokens")
+        .and_then(|m| m.as_u64())
+        .unwrap_or(1024)
+        .min(4096) as u32;
+    let stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let evidence = req
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .unwrap_or("any");
+    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let explicit_model = req.get("model").and_then(|m| m.as_str());
+
+    // decide: pick the first CAN_RUN model/worker from the unified projection.
+    let decision = unified_fabric_decision(state, intent, evidence, explicit_model).await;
+    let chosen_model = decision["decision"]["model"].as_str().map(str::to_string);
+
+    // reserve+execute requires a real, advertised model hash.
+    let Some(model) = chosen_model else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": "no runnable decision on the fabric for this intent (nothing to execute)", "type": "unprocessable" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+    let Some(model_hash) = resolve_model_hash(state, &model).await else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": format!("chosen model '{model}' has no advertised model hash on the fabric"), "type": "unprocessable" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+
+    // Execute through the existing fabric router (reserve + route + audit).
+    let distributed = match &state.distributed {
+        Some(d) => d.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": { "message": "fabric router unavailable", "type": "server_error" },
+                    "decision": decision,
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let mut request = decentraai_distributed::InferRequest::new(
+        model_hash.clone(),
+        prompt.to_string(),
+        max_tokens,
+    )
+    .with_sender(distributed.p2p_node().local_peer_id())
+    .with_streaming(stream);
+    request.timeout_ms = 120_000;
+
+    let started = std::time::Instant::now();
+    match distributed.route_request(request).await {
+        Ok(resp) => {
+            state.record_inference(
+                "/v1/execute",
+                started.elapsed(),
+                format!(
+                    "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                    resp.tokens_used
+                )
+                .as_bytes(),
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "decision": decision,
+                    "executed": {
+                        "model": model,
+                        "model_hash": model_hash,
+                        "output": resp.output,
+                        "tokens_used": resp.tokens_used,
+                        "processing_time_ms": resp.processing_time_ms,
+                        "worker": resp.worker_peer_id.to_string(),
+                    },
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": e.to_string(), "type": "execution_error" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response(),
+    }
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -2856,6 +3041,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/resources", get(resources_handler))
         .route("/v1/can_run", get(can_run_handler))
         .route("/v1/decision", get(decision_handler))
+        .route("/v1/execute", post(execute_decision_handler))
         .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_detail_handler))
@@ -3226,6 +3412,24 @@ async fn mcp_handler(
     if let Some((intent, evidence, model)) = crate::mcp::decision_request(&raw) {
         ctx.decision = unified_fabric_decision(&state, &intent, &evidence, model.as_deref()).await;
     }
+    // An `execute_decision` call is a CONFIRMED mutation: run it and capture
+    // the resulting Response (body) into the context. It requires the same
+    // master token as the HTTP boundary, and `run_execute_decision` enforces
+    // `confirm: true` itself (no bypass).
+    if let Some(args) = crate::mcp::execution_request(&raw) {
+        let resp = run_execute_decision(&state, &args).await;
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+        ctx.execution = serde_json::json!({
+            "status": parts.status.as_u16(),
+            "ok": parts.status.is_success(),
+            "body": payload,
+        });
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -3336,6 +3540,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         intent_fit: serde_json::json!({}),
         fabric_graph: serde_json::json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": {} }),
         decision: serde_json::json!({ "request": "", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
+        execution: serde_json::json!({}),
     }
 }
 
@@ -6487,6 +6692,68 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_client_error());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_decision_requires_confirmation_and_honest_decision() {
+        // /v1/execute is the mutation step of decide→reserve→execute. It must
+        // (a) require master auth, (b) refuse without explicit "confirm": true
+        // (mutation safety), and (c) with confirmation but no runnable fabric
+        // decision return an honest unprocessable (not a fabricated run).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{api}/v1/execute");
+        let body = |confirm: bool| {
+            serde_json::json!({
+                "intent": "OCR these images",
+                "prompt": "read the text",
+                "max_tokens": 64,
+                "confirm": confirm,
+            })
+            .to_string()
+        };
+
+        // Unauthenticated -> 401/403.
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body(true))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // Authenticated but no explicit confirmation -> refused (mutation safety).
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth("master")
+            .body(body(false))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "must refuse without confirm");
+
+        // Confirmed but no runnable fabric decision -> honest unprocessable,
+        // never a fabricated execution.
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth("master")
+            .body(body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            j["error"]["message"].as_str().unwrap().contains("no runnable decision"),
+            "honest error: {j}"
+        );
+        assert!(j["decision"].is_object(), "decision carried for explanation");
 
         manager.lock().await.shutdown().await.unwrap();
     }

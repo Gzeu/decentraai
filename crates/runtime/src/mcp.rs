@@ -68,6 +68,9 @@ pub struct McpContext {
     /// capabilities → model options → fabric fit → decision → why → historical.
     /// Precomputed by the HTTP layer; the protocol layer only translates.
     pub decision: Value,
+    /// Result of `execute_decision`: a confirmed decide→reserve→execute run.
+    /// MUTATING — requires explicit `confirm: true`; the HTTP layer enforces it.
+    pub execution: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -227,6 +230,24 @@ fn all_tools() -> Vec<ToolDef> {
                     "model": { "type": "string", "description": "Optional: narrow to a specific model file." },
                 },
                 "required": ["intent"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "execute_decision",
+            description: "MUTATING — decide→reserve→execute. Runs a real inference for an intent on the fabric's chosen model (from the unified decision), reserving a worker and routing the request through the existing fabric router. Requires explicit \"confirm\": true (mutation safety; refused otherwise) and the node master token. Returns the decision + the real inference result (output, tokens, worker) or a clear error. Never claim a run happened unless it did.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string", "description": "A natural-language intent, e.g. 'OCR these images'." },
+                    "prompt": { "type": "string", "description": "The actual prompt to run." },
+                    "max_tokens": { "type": "integer", "description": "Max tokens to generate (default 1024, cap 4096)." },
+                    "stream": { "type": "boolean", "description": "Whether to stream (default false)." },
+                    "model": { "type": "string", "description": "Optional: narrow to a specific model file." },
+                    "evidence": { "type": "string", "enum": ["any", "verified"], "description": "Evidence filter for the decision." },
+                    "confirm": { "type": "boolean", "description": "MUST be true to execute (mutation safety)." },
+                },
+                "required": ["intent", "prompt", "confirm"],
                 "additionalProperties": false,
             }),
         },
@@ -435,6 +456,31 @@ pub fn decision_request(raw: &str) -> Option<(String, String, Option<String>)> {
     Some((intent, evidence, model))
 }
 
+/// Extract the parameters of an `execute_decision` call, if the incoming
+/// message is one. Pure — lets the HTTP layer precompute the confirmed
+/// execution into [`McpContext::execution`]. Returns the args Value (the HTTP
+/// layer enforces `confirm: true` and master auth).
+pub fn execution_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "execute_decision" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?.clone();
+    if args.get("intent").and_then(|i| i.as_str()).unwrap_or("").is_empty()
+        || args.get("prompt").and_then(|p| p.as_str()).unwrap_or("").is_empty()
+    {
+        return None;
+    }
+    Some(args)
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -587,6 +633,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "resolve_intent_with_fit" => &ctx.intent_fit,
         "get_fabric_graph" => &ctx.fabric_graph,
         "decide" => &ctx.decision,
+        "execute_decision" => &ctx.execution,
         _ => return None,
     };
     Some(json!({
@@ -623,6 +670,7 @@ mod tests {
             intent_fit: json!({ "intent": "i", "capabilities": [] }),
             fabric_graph: json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": { "sessions_active": 0 } }),
             decision: json!({ "request": "ocr", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
+            execution: json!({}),
         }
     }
 
@@ -1037,5 +1085,45 @@ mod tests {
         assert!(content.contains("\"request\":\"ocr\""));
         assert!(content.contains("\"capabilities\":[]"));
         assert!(content.contains("\"why\":[]"));
+    }
+
+    #[test]
+    fn tools_list_exposes_execute_decision() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let d = tools.iter().find(|t| t["name"] == "execute_decision").unwrap();
+        let required = d["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|r| r == "confirm"));
+        assert!(required.iter().any(|r| r == "prompt"));
+        assert!(d["description"].as_str().unwrap().contains("MUTATING"));
+    }
+
+    #[test]
+    fn execution_request_parses_args_and_requires_intent_prompt() {
+        let args = execution_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","prompt":"read","confirm":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(args["intent"], "ocr");
+        assert_eq!(args["prompt"], "read");
+        assert_eq!(args["confirm"], true);
+        // Missing prompt -> None.
+        assert!(execution_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","confirm":true}}}"#
+        )
+        .is_none());
+        assert!(execution_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+    }
+
+    #[test]
+    fn execute_decision_returns_precomputed_execution() {
+        // The protocol layer returns the HTTP-precomputed execution snapshot.
+        let mut c = ctx();
+        c.execution = json!({ "status": 422, "ok": false, "body": { "error": { "message": "no runnable decision" } } });
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","prompt":"read","confirm":true}}}"#)
+            .unwrap();
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"status\":422"));
+        assert!(content.contains("no runnable decision"));
     }
 }
