@@ -597,6 +597,19 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <button class="btn small" onclick="decideNow()">decide</button>
           </div>
           <div id="dec-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+          <div style="margin-top:10px;border-top:1px dashed var(--line);padding-top:8px">
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+              <label style="font-size:11px;color:var(--muted)">execute</label>
+              <input id="dec-model" class="mono" placeholder="model (optional, file.gguf)" style="min-width:120px;padding:4px 6px;font-size:12px">
+              <input id="dec-max" class="mono" type="number" min="1" step="1" value="256" title="max_tokens" style="width:72px;padding:4px 6px;font-size:12px">
+              <label style="font-size:11px;color:var(--muted)"><input id="dec-stream" type="checkbox" checked> stream</label>
+              <button class="btn small warn" onclick="executeDecision()">Execute (confirm)</button>
+            </div>
+            <div style="margin-top:6px">
+              <textarea id="dec-prompt" class="mono" placeholder="prompt to run on the decided fabric (required)" rows="2" style="width:100%;padding:6px;font-size:12px;resize:vertical;font-family:monospace"></textarea>
+            </div>
+          </div>
+          <div id="dec-exec" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
         </div>
         <!-- Variant comparison: which on-disk variant of a model fits THIS
              fabric best, side-by-side, from the real /v1/can_run variants
@@ -2023,6 +2036,118 @@ async function decideNow(){
     '<div class="mono" style="font-size:11px;color:var(--muted);margin-top:3px">'+histLine+'</div></div>';
 
   con.innerHTML = html;
+}
+
+// EXECUTE (T3): run the decided intent on the fabric with explicit UI
+// confirmation and streamed output. MUTATING: gated on the master token
+// (headers) and `confirm: true`. Only real backend state/streamed output is
+// rendered — never fabricated output, workers or token counts. Confirmation is
+// a genuine confirm() dialog, matching the backend's confirm:true requirement.
+async function executeDecision(){
+  const intent = ($('dec-intent').value || '').trim();
+  const prompt = ($('dec-prompt').value || '').trim();
+  const ev = ($('dec-ev')||{}).value || 'any';
+  const maxRaw = $('dec-max').value || '256';
+  const maxTokens = parseInt(maxRaw, 10);
+  const stream = !!($('dec-stream')||{}).checked;
+  const model = ($('dec-model').value || '').trim();
+  if (!intent) { toast('enter an intent to execute', true); return; }
+  if (!prompt) { toast('enter a prompt to execute', true); return; }
+  const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
+  if (!confirm('Run this on the fabric? This reserves a worker and runs real inference.')) return;
+  const body = { intent, prompt, max_tokens: mt, stream, evidence: ev, confirm: true };
+  if (model) body.model = model;
+  const con = $('dec-exec');
+  if (!con) return;
+  con.innerHTML = '<span class="badge ok">EXECUTING…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';
+  const authHeaders = Object.assign({}, headers, { 'Content-Type': 'application/json' });
+
+  if (stream) {
+    // ---- streaming path: read the SSE body incrementally ----
+    let resp;
+    try {
+      resp = await fetch('/v1/execute', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) });
+    } catch (e) {
+      con.innerHTML = '<span class="badge bad">execute failed</span> <span class="mono">'+esc(e && e.message ? e.message : 'network error')+'</span>';
+      return;
+    }
+    const ct = (resp.headers.get('content-type') || '');
+    if (!resp.ok || ct.indexOf('text/event-stream') !== 0) {
+      // non-SSE (JSON) error payload — parse and render error + replan honestly
+      let j = {};
+      try { j = await resp.json(); } catch (e) { j = { error: { message: 'HTTP ' + resp.status } }; }
+      renderExecError(con, j, resp.ok ? 200 : resp.status);
+      return;
+    }
+    let outHtml = '<span class="badge ok">streaming…</span><div class="mono" style="margin-top:6px;white-space:pre-wrap">';
+    let done = false;
+    try {
+      const reader = resp.body.getReader(), dec = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { done: d, value } = await reader.read();
+        if (d) break;
+        buffer += dec.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') { done = true; break; }
+          let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
+          if (ev.error && ev.error.message) {
+            outHtml += '</div><div style="margin-top:6px"><span class="badge bad">stream error</span> '+esc(ev.error.message)+'</div>';
+            con.innerHTML = outHtml; return;
+          }
+          const delta = ev.choices && ev.choices[0] && ev.choices[0].delta && ev.choices[0].delta.content;
+          if (delta) outHtml += esc(delta);
+          if (ev.usage && ev.usage.completion_tokens != null) outHtml += '</div><div style="margin-top:6px" class="mono">'+esc(String(ev.usage.completion_tokens))+' tokens</div>';
+        }
+        con.innerHTML = outHtml;
+      }
+    } catch (e) {
+      outHtml += '</div><div style="margin-top:6px"><span class="badge bad">stream interrupted</span> '+esc(e && e.message ? e.message : String(e))+'</div>';
+      con.innerHTML = outHtml; return;
+    }
+    outHtml += done ? '</div><div style="margin-top:6px"><span class="badge faint">[DONE]</span></div>' : '</div><div style="margin-top:6px"><span class="badge warn">stream closed without [DONE]</span></div>';
+    con.innerHTML = outHtml;
+    return;
+  }
+
+  // ---- non-streaming path: JSON response via apiFetch ----
+  const { ok, status, j } = await apiFetch('/v1/execute', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) });
+  if (ok && j && j.executed) {
+    const ex = j.executed;
+    con.innerHTML =
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+        '<span class="badge ok">EXECUTED</span>'+
+        '<span class="mono">'+esc(ex.model||'')+'</span>'+
+        (ex.worker ? '<span class="badge faint">'+esc(short(ex.worker, 16))+'</span>' : '')+
+        '<span class="mono" style="color:var(--faint)">'+esc(String(ex.tokens_used ?? '—'))+' tokens</span></div>'+
+      '<div class="mono" style="margin-top:8px;white-space:pre-wrap;color:var(--fg)">'+esc(ex.output||'')+'</div>';
+  } else {
+    renderExecError(con, j, status);
+  }
+}
+
+// Shared honest error renderer for /v1/execute failures: the real error
+// message plus, when present, the replan advisory (never fabricated).
+function renderExecError(con, j, status){
+  if (!con) return;
+  const err = (j && j.error && j.error.message) || (j && j.error && j.error.type) || ('HTTP ' + status);
+  const msg = String(err || '');
+  const missingConfirm = /confirm/i.test(msg);
+  const replan = (j && j.replan) || {};
+  const replanHtml = (replan.advisory)
+    ? '<div style="margin-top:6px" class="mono"><span class="badge warn">replan: '+esc(String(replan.advisory))+'</span>'+
+      (replan.retryable != null ? ' · retryable '+esc(String(replan.retryable)) : '')+
+      ((replan.eligible_alternatives && replan.eligible_alternatives.length) ? ' · '+esc(String(replan.eligible_alternatives.length))+' eligible' : '')+
+      (replan.note ? ' · '+esc(String(replan.note)) : '')+'</div>'
+    : '';
+  con.innerHTML = '<span class="badge bad">execute failed (' + status + ')</span> <span class="mono">'+esc(msg)+'</span>'+
+    (missingConfirm ? '<div style="margin-top:6px" class="mono"><span class="badge warn">mutation refused: confirm not accepted</span></div>' : '')+
+    replanHtml;
 }
 
 function renderModels(s, c){  const served = (s && s.node && s.node.served_models || []);

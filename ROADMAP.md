@@ -1306,3 +1306,16 @@ loop with the two missing steps.
   `replan` advisory derived from the existing `adapt()` vocabulary (retryable +
   eligible alternatives → REPLAN_AVAILABLE; else NO_ALTERNATIVE/ABORT).
   Advisory-only — never claims an action the router did not take.
+
+## 50. Next-Gen — Dashboard Execute (confirm + streaming)
+
+The operator can now run a decided intent on the fabric from the dashboard.
+
+- [x] Decision card gains Execute controls: optional model, max_tokens, stream
+  checkbox, prompt textarea, and an "Execute (confirm)" button. A real UI
+  `confirm()` dialog (matching the backend `confirm: true`) precedes the run.
+- [x] `executeDecision()`: non-streaming path renders the real `executed`
+  (model/worker/tokens/output); streaming path consumes SSE via
+  `getReader`/`TextDecoder`, appends `delta.content` incrementally, records the
+  trailing `usage`, shows `[DONE]` (or an honest "stream closed" warning). Errors
+  render the real message + replan advisory. No fabricated output/worker/tokens.
