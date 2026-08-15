@@ -1796,6 +1796,32 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     body.push_str("# TYPE decentraai_model_loaded gauge\n");
     body.push_str(&format!("decentraai_model_loaded {}\n", if loaded { 1 } else { 0 }));
 
+    // Fabric observability: real coordinator state (workers, trust, sessions).
+    // The monitoring crate is NOT wired here — these are measured live from the
+    // compute manager, matching the /v1/compute view.
+    let mut fabric_workers_total = 0u64;
+    let mut fabric_trusted_total = 0u64;
+    let mut fabric_sessions_active = 0u64;
+    if let Some(compute) = &state.compute {
+        let workers = compute.workers().await;
+        fabric_workers_total = workers.len() as u64;
+        for w in &workers {
+            if compute.is_trusted(&w.peer_id).await {
+                fabric_trusted_total += 1;
+            }
+        }
+        fabric_sessions_active = compute.session_count() as u64;
+    }
+    body.push_str("# HELP decentraai_fabric_workers_total Workers currently on the fabric.\n");
+    body.push_str("# TYPE decentraai_fabric_workers_total gauge\n");
+    body.push_str(&format!("decentraai_fabric_workers_total {fabric_workers_total}\n"));
+    body.push_str("# HELP decentraai_fabric_trusted_workers_total Trusted workers on the fabric.\n");
+    body.push_str("# TYPE decentraai_fabric_trusted_workers_total gauge\n");
+    body.push_str(&format!("decentraai_fabric_trusted_workers_total {fabric_trusted_total}\n"));
+    body.push_str("# HELP decentraai_fabric_sessions_active Active KV sessions tracked by the coordinator.\n");
+    body.push_str("# TYPE decentraai_fabric_sessions_active gauge\n");
+    body.push_str(&format!("decentraai_fabric_sessions_active {fabric_sessions_active}\n"));
+
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
@@ -4418,6 +4444,9 @@ mod tests {
             "decentraai_queue_serving",
             "decentraai_uptime_seconds",
             "decentraai_model_loaded",
+            "decentraai_fabric_workers_total",
+            "decentraai_fabric_trusted_workers_total",
+            "decentraai_fabric_sessions_active",
             "# HELP",
             "# TYPE",
         ] {
