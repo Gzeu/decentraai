@@ -1898,7 +1898,7 @@ pub struct DistributedStats {
 /// the model engine; this is the conservative ~4 chars/token approximation the
 /// KV-aware planner (M20) uses to steer long-context requests to KV-rich
 /// workers. It need not be exact — only proportionate.
-fn prompt_token_estimate(prompt: &str) -> u32 {
+pub fn prompt_token_estimate(prompt: &str) -> u32 {
     (prompt.chars().count() as u32).div_ceil(4)
 }
 

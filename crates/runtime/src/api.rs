@@ -1387,6 +1387,57 @@ async fn execute_decision_stream(
             .into_response();
     };
 
+    // DRY-RUN: show exactly what would be reserved/routed without executing.
+    // Requires the same confirm gate (it is part of the mutation path), but
+    // never sends a request or holds a reservation.
+    if req.get("dry_run").and_then(|d| d.as_bool()).unwrap_or(false) {
+        let prompt_tokens = decentraai_distributed::prompt_token_estimate(prompt);
+        let preview = match &state.compute {
+            Some(cm) => {
+                cm.plan_preview(
+                    &model_hash,
+                    prompt_tokens,
+                    req.get("session_id").and_then(|s| s.as_str()),
+                    req.get("priority").and_then(|p| p.as_u64()).unwrap_or(0) as u8,
+                )
+                .await
+            }
+            None => None,
+        };
+        return match preview {
+            Some((plan, worker, est_ms)) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "dry_run": true,
+                    "decision": decision,
+                    "would_execute": {
+                        "model": model,
+                        "model_hash": model_hash,
+                        "worker": worker,
+                        "estimated_ms": est_ms,
+                        "plan_id": plan.plan_id,
+                        "stages": plan.stage_count(),
+                    },
+                    "note": "dry-run preview only — no request sent, no reservation held",
+                })
+                .to_string(),
+            )
+                .into_response(),
+            None => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": { "message": "no eligible worker on the fabric for this model (nothing would be executed)", "type": "unprocessable" },
+                    "decision": decision,
+                    "dry_run": true,
+                })
+                .to_string(),
+            )
+                .into_response(),
+        };
+    }
+
     let Some(distributed) = state.distributed.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7029,6 +7080,26 @@ mod tests {
             "honest error: {j}"
         );
         assert!(j["decision"].is_object(), "decision carried for explanation");
+
+        // Dry-run: without a compute manager there is no model on the fabric, so
+        // dry-run honestly returns 422 (nothing would have been executed) — never
+        // a fabricated plan.
+        let dry = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth("master")
+            .body(serde_json::json!({
+                "intent": "OCR these images",
+                "prompt": "read the text",
+                "max_tokens": 64,
+                "confirm": true,
+                "dry_run": true,
+            })
+            .to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dry.status(), 422, "dry-run with no fabric model is honest 422");
 
         manager.lock().await.shutdown().await.unwrap();
     }

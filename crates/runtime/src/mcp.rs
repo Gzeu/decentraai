@@ -235,7 +235,7 @@ fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "execute_decision",
-            description: "MUTATING — decide→reserve→execute. Runs a real inference for an intent on the fabric's chosen model (from the unified decision), reserving a worker and routing the request through the existing fabric router. Requires explicit \"confirm\": true (mutation safety; refused otherwise) and the node master token. Returns the decision + the real inference result (output, tokens, worker) or a clear error. Never claim a run happened unless it did.",
+            description: "MUTATING — decide→reserve→execute. Runs a real inference for an intent on the fabric's chosen model (from the unified decision), reserving a worker and routing the request through the existing fabric router. Requires explicit \"confirm\": true (mutation safety; refused otherwise) and the node master token. Set \"dry_run\": true to preview what would be reserved/routed WITHOUT executing (no request, no reservation). Returns the decision + the real inference result (output, tokens, worker) or a clear error. Never claim a run happened unless it did.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -246,6 +246,7 @@ fn all_tools() -> Vec<ToolDef> {
                     "model": { "type": "string", "description": "Optional: narrow to a specific model file." },
                     "evidence": { "type": "string", "enum": ["any", "verified"], "description": "Evidence filter for the decision." },
                     "session_id": { "type": "string", "description": "Optional: links this run to an earlier one for KV-cache locality (continuation)." },
+                    "dry_run": { "type": "boolean", "description": "If true, preview what would be reserved/routed WITHOUT executing (no request, no reservation). Requires confirm:true too." },
                     "confirm": { "type": "boolean", "description": "MUST be true to execute (mutation safety)." },
                 },
                 "required": ["intent", "prompt", "confirm"],

@@ -1341,3 +1341,22 @@ The operator can now run a decided intent on the fabric from the dashboard.
   from the actual router response) and the `historical` stats updated after the
   run (UNKNOWN when no compute manager). Completes the
   execute → measure → history loop with real, not fabricated, numbers.
+
+## 54. Next-Gen — dry-run for execute (mutation preview)
+
+Safety preview before a real mutation: show exactly what would be reserved/routed
+without executing.
+
+- [x] `ComputeManager::plan_preview(model_hash, prompt_tokens, session_id,
+  priority)` — builds the same `ExecutionPlan` the coordinator would use via
+  `fabric_facts` + the fabric planner, WITHOUT reserving or sending anything.
+  Returns `(plan, chosen_worker, estimated_ms)` or `None` (no eligible worker).
+  Read-only; `in_flight` stays 0.
+- [x] `/v1/execute` with `dry_run: true` (still requires `confirm: true`)
+  returns the dry-run preview (`would_execute`: model/worker/estimated_ms/plan)
+  instead of routing; never sends a request or holds a reservation. Honest 422
+  when no eligible worker.
+- [x] MCP `execute_decision` documents + accepts `dry_run` (flows through the
+  same core).
+- [x] Tests: `plan_preview` plans without reserving (in_flight 0) + honest None
+  for unknown model; `/v1/execute` dry-run 422 without a fabric model.

@@ -1056,6 +1056,60 @@ impl ComputeManager {
         }
     }
 
+    /// DRY-RUN planning preview: builds the same `ExecutionPlan` the
+    /// coordinator would use for `model_hash` (via `fabric_facts` + the fabric
+    /// planner) WITHOUT reserving any worker or sending any request. Returns
+    /// the chosen plan + its selected worker + estimated cost, or `None` when
+    /// the fabric finds no eligible worker. Read-only; never mutates state.
+    ///
+    /// This is the "what would the router do?" preview used by the confirmed
+    /// mutation path's dry-run mode — it lets an operator see exactly what
+    /// would be reserved/routed before actually executing.
+    pub async fn plan_preview(
+        &self,
+        model_hash: &str,
+        prompt_tokens: u32,
+        session_id: Option<&str>,
+        priority: u8,
+    ) -> Option<(decentraai_fabric::ExecutionPlan, String, u32)> {
+        let req = self.requirements_for(model_hash).await?;
+        let facts = self.fabric_facts(model_hash).await;
+        if facts.is_empty() {
+            return None;
+        }
+        let (is_continuation, prefix_resident_on) = match session_id {
+            Some(sid) => match self.session_residency(sid) {
+                Some(w) => (true, Some(w.to_string())),
+                None => (false, None),
+            },
+            None => (false, None),
+        };
+        let rfacts = decentraai_fabric::RequestFacts {
+            model_hash: req.model_hash.clone(),
+            est_ram_mb: req.est_ram_mb,
+            est_vram_mb: req.est_vram_mb,
+            context: decentraai_fabric::ContextProfile {
+                prompt_tokens,
+                max_output_tokens: req.max_tokens,
+                is_continuation,
+                prefix_resident_on,
+            },
+            transfer_mib: 0,
+            local_peer: Some(self.local_peer.to_string()),
+            priority,
+            required_capability: req.required_capability.clone(),
+            capability_claims: self.capability_claims_for_model(model_hash),
+        };
+        let planner = decentraai_fabric::ExecutionPlanner {
+            network: self.network.lock().unwrap().clone(),
+            allow_multi_stage: true,
+            ..Default::default()
+        };
+        let result = planner.plan(&rfacts, &facts);
+        let worker = result.plan.workers().first()?.clone();
+        Some((result.plan, worker, result.estimated_ms))
+    }
+
     /// The scheduler's best placement that is NOT this coordinator
     /// (a routed request must never be sent to the local node over P2P).
     async fn select_pub_remote(&self, req: &WorkloadRequirements) -> Option<Placement> {
@@ -2099,6 +2153,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn plan_preview_plans_without_reserving() {
+        // DRY-RUN: plan_preview builds the same plan the coordinator would use
+        // but must NOT hold any reservation (in_flight stays 0).
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let adv = build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+        manager.record_rtt(&worker, 2_000, 1_000);
+
+        let (plan, chosen_worker, est_ms) = manager
+            .plan_preview("abc", 200, None, 0)
+            .await
+            .expect("preview finds the worker");
+        assert_eq!(plan.stage_count(), 1);
+        assert_eq!(chosen_worker, worker.to_string());
+        assert!(est_ms > 0);
+        // Crucially: no reservation is held by a dry-run preview.
+        assert_eq!(
+            manager.in_flight(&worker).await,
+            0,
+            "plan_preview must not reserve"
+        );
+
+        // No known model -> None (honest).
+        assert!(manager.plan_preview("missing", 10, None, 0).await.is_none());
+    }
     #[tokio::test]
     async fn plan_and_reserve_never_selects_local_node() {
         let local = peer();
