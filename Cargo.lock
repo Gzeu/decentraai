@@ -1050,6 +1050,7 @@ name = "decentraai-fabric"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "decentraai-compute",
  "serde",
  "serde_json",
  "tempfile",

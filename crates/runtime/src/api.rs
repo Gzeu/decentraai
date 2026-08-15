@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -809,7 +809,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
-        .route("/v1/models", get(proxy_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/v1/models/{id}", get(model_detail_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
         // P3 - Admin dashboard endpoints
@@ -1509,6 +1510,134 @@ fn tag_remote_response(
     response.headers_mut().insert("x-decentra-node", n);
 }
 
+/// Builds the OpenAI `GET /v1/models` list across the whole fabric.
+///
+/// Each model appears once with an `id` the client can send back as `model`
+/// (the file name — the same key the chat router resolves). `owned_by` names
+/// the node that holds it so a caller (or the Command Deck) can see at a
+/// glance *where* a model lives. Local copies win on duplicates; remote
+/// entries only come from workers that accept remote inference (a client must
+/// be able to actually reach them through this coordinator).
+async fn fabric_model_list(
+    state: &ApiState,
+) -> Option<serde_json::Value> {
+    let compute = state.compute.as_ref()?;
+    let local_peer = compute.local_peer();
+    let workers = compute.workers().await;
+    // id (file name) → (owned_by, is_local)
+    let mut seen: std::collections::BTreeMap<String, (String, bool)> =
+        std::collections::BTreeMap::new();
+    for w in &workers {
+        let is_local = w.peer_id == local_peer;
+        if !is_local && !w.accepts_remote_inference {
+            continue;
+        }
+        let owned_by = if is_local {
+            "local".to_string()
+        } else {
+            w.node_id.clone()
+        };
+        for m in w
+            .capability
+            .served_models
+            .iter()
+            .chain(w.capability.available_models.iter())
+        {
+            match seen.get(&m.file_name) {
+                Some((_, true)) => {} // local already wins
+                Some(_) if is_local => {
+                    seen.insert(m.file_name.clone(), (owned_by.clone(), true));
+                }
+                None => {
+                    seen.insert(m.file_name.clone(), (owned_by.clone(), is_local));
+                }
+                _ => {}
+            }
+        }
+    }
+    let data: Vec<serde_json::Value> = seen
+        .into_iter()
+        .map(|(id, (owned_by, _))| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": owned_by,
+            })
+        })
+        .collect();
+    Some(serde_json::json!({ "object": "list", "data": data }))
+}
+
+/// `GET /v1/models` — OpenAI model list. With the fabric attached this is the
+/// fabric-wide view (models served *or* available on disk across all trusted
+/// workers); without the fabric it is the plain backend passthrough, so a
+/// standalone `serve start` behaves exactly as before.
+async fn models_handler(
+    State(state): State<ApiState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if state.compute.is_some() {
+        if let Some(list) = fabric_model_list(&state).await {
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                list.to_string(),
+            )
+                .into_response();
+        }
+    }
+    // Fall back to the backend passthrough (standalone node, no fabric).
+    proxy_with_auth(State(state), method, uri, headers, body, auth).await
+}
+
+/// `GET /v1/models/{id}` — OpenAI single-model view over the fabric list.
+/// Returns the model entry when it exists anywhere on the fabric, else 404.
+async fn model_detail_handler(
+    State(state): State<ApiState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(model_id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(list) = fabric_model_list(&state).await {
+        let found = list["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["id"].as_str() == Some(model_id.as_str()))
+            .cloned();
+        if let Some(entry) = found {
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                entry.to_string(),
+            )
+                .into_response();
+        }
+        let body = serde_json::json!({
+            "error": {"message": format!("model '{model_id}' not found on the fabric"), "type": "not_found"}
+        });
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+    }
+    proxy_with_auth(State(state), method, uri, headers, body, auth).await
+}
+
 async fn proxy_handler(
     State(state): State<ApiState>,
     method: Method,
@@ -1520,6 +1649,20 @@ async fn proxy_handler(
         Ok(auth) => auth,
         Err(e) => return e.into_response(),
     };
+    proxy_with_auth(State(state), method, uri, headers, body, auth).await
+}
+
+/// The actual proxy logic. Auth is passed in so callers that already
+/// classified (the fabric model views) reuse the result instead of double
+/// classifying.
+async fn proxy_with_auth(
+    State(state): State<ApiState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+    auth: Auth,
+) -> Response {
     let is_inference = method == Method::POST
         && (uri.path() == "/v1/completions" || uri.path() == "/v1/chat/completions");
     // The body the proxy will actually forward (caller sampling defaults
@@ -2572,6 +2715,130 @@ mod tests {
         assert_eq!(cj["object"], "chat.completion");
         assert_eq!(cj["choices"][0]["message"]["content"], "Hello from the node");
         assert_eq!(cj["usage"]["total_tokens"], 8);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fabric_models_endpoint_lists_served_and_available_across_workers() {
+        // Part 3/17: GET /v1/models must be fabric-wide — a coordinator with
+        // the fabric attached advertises what each worker serves AND what it
+        // has on disk (available_models), so an external OpenAI client can
+        // discover any model it could ask for by file name.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+
+        let local_peer = decentraai_p2p::PeerId::random();
+        let remote_peer = decentraai_p2p::PeerId::random();
+        let compute = Arc::new(decentraai_distributed::ComputeManager::new(
+            local_peer,
+            "coordinator".into(),
+            std::collections::HashSet::from([remote_peer]),
+        ));
+        // A remote trusted worker that serves a model and has another on disk.
+        let remote_adv = decentraai_distributed::ComputeAdvertisement {
+            peer_id: remote_peer,
+            node_name: "remote-worker".into(),
+            capability: decentraai_compute::ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 16 * 1024,
+                gpu: None,
+                engine: "llama_server".into(),
+                served_models: vec![decentraai_compute::ServedModel {
+                    model_hash: "hash-served".into(),
+                    file_name: "served-model.gguf".into(),
+                    size_mb: 2048,
+                    est_ram_mb: 4096,
+                    est_vram_mb: 0,
+                    context_tokens: 4096,
+                }],
+                can_provision: false,
+                available_models: vec![decentraai_compute::ServedModel {
+                    model_hash: "hash-disk".into(),
+                    file_name: "on-disk-model.gguf".into(),
+                    size_mb: 1024,
+                    est_ram_mb: 2048,
+                    est_vram_mb: 0,
+                    context_tokens: 0,
+                }],
+            },
+            availability: decentraai_compute::ComputeAvailability {
+                available_ram_mb: 8192,
+                available_vram_mb: None,
+                load_percent: 5,
+                queue_depth: 0,
+                tokens_per_second: 10,
+                current_latency_ms: 50,
+                status: decentraai_compute::WorkerHealth::Ready,
+            },
+            announced_at_ms: 1_700_000_000_000,
+            accepts_remote_inference: true,
+            node_id: "dca-REMOTE".into(),
+        };
+        compute.process_advertisement(remote_adv).await;
+
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+
+        // Fabric list includes both the served model and the on-disk one.
+        let models = client.get(format!("{base}/v1/models")).send().await.unwrap();
+        assert_eq!(models.status(), 200);
+        let mj: serde_json::Value = models.json().await.unwrap();
+        assert_eq!(mj["object"], "list");
+        let ids: Vec<&str> = mj["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"served-model.gguf"),
+            "served model must be listed: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"on-disk-model.gguf"),
+            "on-disk available model must be listed: {ids:?}"
+        );
+        let remote_entry = mj["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "served-model.gguf")
+            .unwrap();
+        assert_eq!(remote_entry["owned_by"], "dca-REMOTE");
+
+        // Detail view resolves the model by id.
+        let detail = client
+            .get(format!("{base}/v1/models/served-model.gguf"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), 200);
+        let dj: serde_json::Value = detail.json().await.unwrap();
+        assert_eq!(dj["id"], "served-model.gguf");
+        assert_eq!(dj["owned_by"], "dca-REMOTE");
+
+        // Unknown model id → 404 with an OpenAI-style error body.
+        let missing = client
+            .get(format!("{base}/v1/models/nope.gguf"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+        let xj: serde_json::Value = missing.json().await.unwrap();
+        assert!(xj["error"]["message"].as_str().unwrap().contains("nope.gguf"));
+
         manager.lock().await.shutdown().await.unwrap();
     }
 

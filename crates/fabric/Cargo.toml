@@ -10,6 +10,10 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
+# WorkerFacts carries the on-disk model set (Vec<ServedModel>) so the planner
+# can discover what a worker COULD serve, not just what is loaded. ServedModel
+# is a pure serde-serializable type; no I/O enters this crate.
+decentraai-compute = { path = "../compute" }
 
 [dev-dependencies]
 tempfile.workspace = true

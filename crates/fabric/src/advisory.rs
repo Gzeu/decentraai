@@ -230,6 +230,7 @@ mod tests {
             available_ram_mb: 4096,
             available_vram_mb: 0,
             serves_model: true,
+            available_models: vec![],
             capabilities: EngineCapabilities::conservative(),
             kv: KVCacheState::Empty,
         }

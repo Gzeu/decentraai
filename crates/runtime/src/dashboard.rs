@@ -543,6 +543,12 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <table><thead><tr><th>Model</th><th class="num">Size</th></tr></thead>
           <tbody id="registry-models"><tr><td colspan="2" class="empty">no indexed models</td></tr></tbody></table>
         </div>
+        <div class="card" style="margin-top:14px">
+          <h2>On disk across the fabric <span class="count" id="disk-models-count"></span></h2>
+          <table><thead><tr><th>Model</th><th>Worker</th><th class="num">Size</th><th>State</th></tr></thead>
+          <tbody id="disk-models"><tr><td colspan="4" class="empty">no on-disk models reported by workers</td></tr></tbody></table>
+          <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="disk-models-status"></div>
+        </div>
       </section>
 
       <!-- OBSERVABILITY -->
@@ -1637,7 +1643,7 @@ function renderDecisions(x){
   }).join('');
   $('decisions').innerHTML = cards;
 }
-function renderModels(s){
+function renderModels(s, c){
   const served = (s && s.node && s.node.served_models || []);
   const rows = served.map(m =>
     '<tr><td>'+esc(m.name||'')+'</td><td>'+esc((s && s.node && s.node.engine)||'')+'</td><td class="num">'+(m.context_tokens||'—')+'</td><td class="num">'+fmtMB(m.est_ram_mb)+'</td><td class="num">'+(m.est_vram_mb?fmtMB(m.est_vram_mb):'—')+'</td><td>'+(s.model===m.name?'<span class="badge ok">loaded</span>':'<span class="badge faint">-</span>')+'</td></tr>'
@@ -1649,6 +1655,28 @@ function renderModels(s){
   $('registry-models').innerHTML = reg.map(m =>
     '<tr><td>'+esc(m.name)+'</td><td class="num">'+(m.size_bytes/1073741824).toFixed(2)+' GiB</td></tr>'
   ).join('') || '<tr><td colspan="2" class="empty">no indexed models</td></tr>';
+  // On-disk models reported by every fabric worker (Part 3/17): the honest
+  // "could serve" set, distinct from what is currently loaded.
+  const workers = (c && c.workers || []);
+  const disk = [];
+  workers.forEach(w => {
+    (w.available_models || []).forEach(m => {
+      disk.push({
+        file: m.file_name || '', size: m.size_mb || 0,
+        node: w.node_name || w.node_id || short(w.peer_id, 12),
+        serving: (w.served_models || []).some(sm => sm.file_name === m.file_name),
+      });
+    });
+  });
+  disk.sort((a, b) => a.file.localeCompare(b.file));
+  $('disk-models').innerHTML = disk.map(d =>
+    '<tr><td>'+esc(d.file)+'</td><td>'+esc(d.node)+'</td><td class="num">'+fmtMB(d.size)+'</td><td>'+
+    (d.serving ? '<span class="badge ok">serving</span>' : '<span class="badge faint">on disk</span>')+'</td></tr>'
+  ).join('') || '<tr><td colspan="4" class="empty">no on-disk models reported by workers</td></tr>';
+  $('disk-models-count').textContent = disk.length;
+  $('disk-models-status').innerHTML = disk.length
+    ? 'workers report models they can swap in on request — ask for any of these by file name'
+    : 'workers only report models they currently serve';
 }
 function renderObservability(s, c){
   const lat = (s && s.recent_requests || []).map(r => r.duration_ms);
@@ -1792,14 +1820,14 @@ async function refresh(){
       chatModel.value = activeModel;
     }
     populateChatModels(s, c);
-    renderModels(s);
+    renderModels(s, c);
     renderDiag(s, null, null);
     renderSettings(s);
     renderObservability(s, null);
     renderRecovery(s, null, null);
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
-  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderObservability(s, c); renderRecovery(s, c, null); } catch (e) {}
+  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
   renderFabric(s, c, n, x);

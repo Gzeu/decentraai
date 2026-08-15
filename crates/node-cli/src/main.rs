@@ -1193,14 +1193,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             ),
             context_tokens: max_ctx,
         }];
+        let available_models =
+            build_available_models(&registry_path, config.inference.max_context_tokens)?;
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
+            .advertise_local(snapshot, gpu, served_models, available_models, can_provision)
             .await;
         info!(
             peer_id = %local_peer_id,
             node_name = %adv.node_name,
             model = %model_name,
             models = ?adv.capability.served_models.iter().map(|m| &m.model_hash).collect::<Vec<_>>(),
+            on_disk = adv.capability.available_models.len(),
             can_provision,
             "registered as distributed compute worker"
         );
@@ -3221,15 +3224,18 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
             &model_name,
             config.inference.max_context_tokens,
         )?;
+        let available_models =
+            build_available_models(&registry_path, config.inference.max_context_tokens)?;
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
+            .advertise_local(snapshot, gpu, served_models, available_models, can_provision)
             .await;
         info!(
             peer_id = %local_peer_id,
             node_name = %adv.node_name,
             models = ?adv.capability.served_models.iter().map(|m| &m.model_hash).collect::<Vec<_>>(),
+            on_disk = adv.capability.available_models.len(),
             can_provision,
             "registered as distributed compute worker"
         );
@@ -3360,6 +3366,64 @@ fn build_served_models(
     }])
 }
 
+/// All models this node has on disk, as `ServedModel` capability claims.
+///
+/// This feeds the advertisement's `available_models` channel: it tells the
+/// fabric *what this worker could serve*, not just what is currently loaded.
+/// The coordinator's model picker and planner can then route a workload to a
+/// worker that holds the model on disk but has not loaded it yet (the worker
+/// swaps its engine on demand), instead of pretending the model does not
+/// exist outside the served set.
+///
+/// The BLAKE3 content hash is computed with a streaming hasher so a large
+/// model (e.g. 4 GiB Mistral) never gets read into RAM wholesale; this runs
+/// once at worker registration, not on every heartbeat.
+fn build_available_models(
+    registry_path: &std::path::Path,
+    context_tokens: u32,
+) -> Result<Vec<decentraai_compute::ServedModel>> {
+    use decentraai_registry::ModelRegistry;
+    use std::io::Read;
+
+    if !registry_path.exists() {
+        return Ok(vec![]);
+    }
+    let registry = ModelRegistry::load(registry_path)?;
+    let gpu_present = matches!(
+        decentraai_system_probe::probe_gpu(),
+        decentraai_system_probe::GpuProbeStatus::Nvidia(_)
+    );
+    let mut models = Vec::new();
+    for record in registry.models.values() {
+        let file = std::path::Path::new(&record.canonical_path);
+        // Hash streamingly (BLAKE3), never loading the whole file.
+        let mut hasher = blake3::Hasher::new();
+        let mut f = match std::fs::File::open(file) {
+            Ok(f) => f,
+            Err(_) => continue, // gone from disk; registry scan will prune it
+        };
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let model_hash = hasher.finalize().to_hex().to_string();
+        let size_mb = (record.size_bytes / (1024 * 1024)).max(1);
+        models.push(decentraai_compute::ServedModel {
+            model_hash,
+            file_name: record.relative_path.clone(),
+            size_mb,
+            est_ram_mb: size_mb / 4 + 1024,
+            est_vram_mb: if gpu_present { size_mb } else { 0 },
+            context_tokens,
+        });
+    }
+    Ok(models)
+}
+
 /// Re-probes this node's hardware and re-broadcasts the compute
 /// advertisement on the heartbeat interval, so coordinators never see this
 /// worker go stale. Fire-and-forget; a failing probe just skips a beat.
@@ -3417,16 +3481,29 @@ async fn spawn_compute_broadcaster(
             }
             let snapshot = SystemSnapshot::collect();
             let gpu = probe_gpu();
-            // Advertise the latest probe; served_models come from the last
-            // full advertisement stored in the manager.
+            // Advertise the latest probe; served_models and available_models
+            // come from the last full advertisement stored in the manager (the
+            // on-disk model set is recomputed at registration, not re-hashed on
+            // every heartbeat).
             let workers = compute_manager.workers().await;
-            let served_models = workers
+            let (served_models, available_models) = workers
                 .iter()
                 .find(|w| w.peer_id == compute_manager.local_peer())
-                .map(|w| w.capability.served_models.clone())
+                .map(|w| {
+                    (
+                        w.capability.served_models.clone(),
+                        w.capability.available_models.clone(),
+                    )
+                })
                 .unwrap_or_default();
             let adv = compute_manager
-                .advertise_local(snapshot, gpu, served_models, vec![], can_provision)
+                .advertise_local(
+                    snapshot,
+                    gpu,
+                    served_models,
+                    available_models,
+                    can_provision,
+                )
                 .await;
             // P3: sign the advertisement when the node has a signing key set,
             // so recipients authenticate it (anti-spoof).

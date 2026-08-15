@@ -39,6 +39,11 @@ pub struct WorkerFacts {
     pub available_ram_mb: u64,
     pub available_vram_mb: u64,
     pub serves_model: bool,
+    /// Models this worker has on disk (registry), not currently loaded.
+    /// Lets the coordinator discover what a worker COULD serve (it swaps its
+    /// engine on request), distinct from `serves_model` which only tells what
+    /// is loaded right now.
+    pub available_models: Vec<decentraai_compute::ServedModel>,
     /// Engine-reported capabilities (probed; defaults conservative).
     pub capabilities: EngineCapabilities,
     /// KV state for the model on this worker.
@@ -399,6 +404,7 @@ mod tests {
             available_ram_mb: 4096,
             available_vram_mb: 0,
             serves_model: true,
+            available_models: vec![],
             capabilities: EngineCapabilities::conservative(),
             kv: KVCacheState::Empty,
         }

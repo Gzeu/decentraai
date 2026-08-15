@@ -797,6 +797,7 @@ impl ComputeManager {
                     available_ram_mb: a.available_ram_mb,
                     available_vram_mb: a.available_vram_mb.unwrap_or(0),
                     serves_model: cap.serves_or_provisions(model_hash),
+                    available_models: cap.available_models.clone(),
                     capabilities: decentraai_fabric::EngineKind::parse(&cap.engine)
                         .advertised_capabilities(),
                     kv: self.kv_state_for(&adv.peer_id, model_hash),
@@ -1134,6 +1135,11 @@ pub struct WorkerMetricRow {
     pub engine: String,
     /// Models this node serves, with their real KV context window.
     pub served_models: Vec<MetricServedModel>,
+    /// Models this node has on disk (registry) but is not serving right now —
+    /// the honest "could serve" set. Distinct from `served_models`: a worker
+    /// can swap its engine on request, so the coordinator (and dashboard)
+    /// must be able to see what it COULD run, not just what is loaded.
+    pub available_models: Vec<MetricServedModel>,
     /// Seconds since this worker's last heartbeat (registry staleness).
     pub last_seen_secs: u64,
     /// Whether the node accepts inference routed from remote peers (its
@@ -1276,6 +1282,17 @@ impl ComputeManager {
                 served_models: adv
                     .capability
                     .served_models
+                    .iter()
+                    .map(|m| MetricServedModel {
+                        file_name: m.file_name.clone(),
+                        size_mb: m.size_mb,
+                        model_hash: m.model_hash.clone(),
+                        context_tokens: m.context_tokens,
+                    })
+                    .collect(),
+                available_models: adv
+                    .capability
+                    .available_models
                     .iter()
                     .map(|m| MetricServedModel {
                         file_name: m.file_name.clone(),
@@ -1461,6 +1478,37 @@ mod tests {
         let facts = manager.fabric_facts("abc").await;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].engine, decentraai_fabric::EngineKind::Vllm);
+    }
+
+    #[tokio::test]
+    async fn available_models_flow_into_advertisement_and_facts() {
+        // Regression for the fabric model view: the `available_models` channel
+        // (models on disk, not currently loaded) must reach the advertisement
+        // and the planner's WorkerFacts, so the coordinator can discover what a
+        // worker COULD serve, not just what it has loaded.
+        let p = peer();
+        let manager = ComputeManager::new(p, "n".into(), HashSet::from([p]));
+        let on_disk = vec![decentraai_compute::ServedModel {
+            model_hash: "hash-b".into(),
+            file_name: "other-model.gguf".into(),
+            size_mb: 500,
+            est_ram_mb: 1200,
+            est_vram_mb: 0,
+            context_tokens: 0,
+        }];
+        manager
+            .advertise_local(snapshot(), gpu(), vec![model()], on_disk, false)
+            .await;
+        let adv = manager.last_local_advertisement_sync().unwrap();
+        assert_eq!(adv.capability.available_models.len(), 1);
+        assert_eq!(adv.capability.available_models[0].file_name, "other-model.gguf");
+        assert_eq!(adv.capability.served_models.len(), 1, "served set unchanged");
+
+        // The planner facts carry the full on-disk collection too.
+        let facts = manager.fabric_facts("abc").await;
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].available_models.len(), 1);
+        assert_eq!(facts[0].available_models[0].file_name, "other-model.gguf");
     }
 
     #[test]
@@ -1944,6 +1992,43 @@ mod tests {
         assert_eq!(report.workers[0].in_flight, 1);
         assert!(report.workers[0].reserved_ram_mb >= 256);
         manager.release(placement.reservation.reservation_id).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_report_separates_served_from_available_models() {
+        // Part 3/17: the compute metrics view must expose what each worker has
+        // on disk (available_models) next to what it serves, so the dashboard
+        // and model picker can discover any model a worker COULD run.
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let mut adv = build_advertisement(
+            p,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        adv.capability.available_models = vec![decentraai_compute::ServedModel {
+            model_hash: "on-disk-hash".into(),
+            file_name: "on-disk.gguf".into(),
+            size_mb: 700,
+            est_ram_mb: 1400,
+            est_vram_mb: 0,
+            context_tokens: 0,
+        }];
+        manager.process_advertisement(adv).await;
+        let report = manager.metrics_report().await;
+        let row = &report.workers[0];
+        assert_eq!(row.served_models.len(), 1, "served model still listed");
+        assert_eq!(row.served_models[0].file_name, model().file_name);
+        assert_eq!(row.available_models.len(), 1);
+        assert_eq!(row.available_models[0].file_name, "on-disk.gguf");
+        assert_eq!(row.available_models[0].model_hash, "on-disk-hash");
     }
 
     #[tokio::test]
