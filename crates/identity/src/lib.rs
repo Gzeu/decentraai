@@ -73,11 +73,51 @@ impl Identity {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating directory {}", parent.display()))?;
         }
-
-        fs::write(path, self.signing_key.to_bytes())
+        // Atomic, permission-safe write: the key must never exist with default
+        // (world-readable) permissions, even for an instant, and a partially
+        // written key must never be readable. tmp + fsync + rename matches the
+        // persistence pattern used elsewhere in the repo (AGENTS.md §4).
+        let bytes = self.signing_key.to_bytes();
+        Self::atomic_write_0600(path, &bytes)
             .with_context(|| format!("writing identity to {}", path.display()))?;
+        Ok(())
+    }
 
-        // Set 0600 permissions on Unix for security
+    /// Writes `bytes` to `path` atomically (tmp + fsync + rename) with mode
+    /// 0600 on Unix. The secret key file is created permission-safe from the
+    /// first byte, so no other user can read it during or after the write.
+    fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        {
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts
+                .open(&tmp)
+                .with_context(|| format!("opening temp file {}", tmp.display()))?;
+            f.write_all(bytes)
+                .with_context(|| format!("writing temp file {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("syncing temp file {}", tmp.display()))?;
+        }
+        fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                tmp.display(),
+                path.display()
+            )
+        })?;
+        // Durability: fsync the parent directory so the rename is persistent.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        // Defense in depth: force 0600 even if the mode flag was not honored.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -88,7 +128,6 @@ impl Identity {
             fs::set_permissions(path, perms)
                 .with_context(|| format!("setting permissions for {}", path.display()))?;
         }
-
         Ok(())
     }
 
@@ -220,5 +259,27 @@ mod tests {
         let perms = fs::metadata(&identity_path).unwrap().permissions();
         let mode = perms.mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_is_atomic_and_leaves_no_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let identity_path = temp_dir.path().join("key.pem");
+
+        let identity = Identity::generate();
+        identity.save(&identity_path).unwrap();
+
+        // Atomic write: no partially-written temp file is left behind.
+        assert!(
+            !identity_path.with_extension("tmp").exists(),
+            "temp file must be renamed away after save"
+        );
+        // The real key is 0600 and reloadable.
+        let perms = fs::metadata(&identity_path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+        assert!(Identity::load(&identity_path).is_ok());
     }
 }
