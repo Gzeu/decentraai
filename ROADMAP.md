@@ -1152,3 +1152,15 @@ reusing authoritative structures.
 - [x] `ExecutionDecision.last_orchestration` (serde-tagged) + `/v1/execution`
   attaches a `recovery` timeline per decision; Dashboard decisions cards render
   a "self-healed ×N / no recovery" badge + phase list.
+
+## 40. Next-Gen Phase H/N — Perf Provenance + Recovery in the Agent Control Plane
+
+Surface the perf-provenance and recovery-timeline work through the MCP / agent
+control plane (read-only).
+
+- [x] `WorkerMetricRow.perf_measured` — honest MEASURED/ESTIMATED perf marker
+  on every worker row in `metrics_report`, flowing into MCP `list_workers` and
+  `/v1/compute`. Never affects scheduling.
+- [x] MCP `list_executions` now attaches a `recovery` timeline per execution
+  (projected from the real decisions keyed by request_id) so agents can see the
+  self-healing loop (recoveries, phase, adaptation, ordered event trace).

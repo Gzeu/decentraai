@@ -1355,6 +1355,10 @@ pub struct WorkerMetricRow {
     pub queue_depth: u32,
     pub tokens_per_second: u32,
     pub current_latency_ms: u32,
+    /// Whether `tokens_per_second`/`current_latency_ms` reflect real measured
+    /// completions (EWMA) vs an estimated/zero baseline. Honest provenance;
+    /// never affects scheduling.
+    pub perf_measured: bool,
     pub available_ram_mb: u64,
     pub available_vram_mb: Option<u64>,
     pub in_flight: usize,
@@ -1640,6 +1644,8 @@ impl ComputeManager {
                 queue_depth: adv.availability.queue_depth,
                 tokens_per_second: adv.availability.tokens_per_second,
                 current_latency_ms: adv.availability.current_latency_ms,
+                perf_measured: adv.availability.tokens_per_second > 0
+                    || adv.availability.current_latency_ms > 0,
                 available_ram_mb: adv.availability.available_ram_mb,
                 available_vram_mb: adv.availability.available_vram_mb,
                 in_flight: self.in_flight(&adv.peer_id).await,

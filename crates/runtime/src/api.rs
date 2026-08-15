@@ -3000,8 +3000,31 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
     if let Some(compute) = &state.compute {
         let report = compute.metrics_report().await;
         workers = serde_json::to_value(report.workers).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-        executions =
-            serde_json::to_value(compute.executions()).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        // Executions with an attached `recovery` timeline (Phase H) so MCP
+        // agents can see the self-healing loop. The recovery is projected from
+        // the real autonomous decisions keyed by request_id.
+        let decisions = compute.decisions();
+        let recovery_by_req: std::collections::HashMap<String, serde_json::Value> = decisions
+            .iter()
+            .map(|d| {
+                (
+                    d.request_id.clone(),
+                    decentraai_fabric::recovery_timeline(d),
+                )
+            })
+            .collect();
+        let execs: Vec<serde_json::Value> = compute
+            .executions()
+            .into_iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(&e).unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(r) = recovery_by_req.get(&e.request_id) {
+                    v["recovery"] = r.clone();
+                }
+                v
+            })
+            .collect();
+        executions = serde_json::Value::Array(execs);
     }
     let models = fabric_model_list(state)
         .await
