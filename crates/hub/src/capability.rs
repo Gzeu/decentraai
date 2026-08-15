@@ -184,8 +184,13 @@ pub fn classify(
     // --- VERIFIED from the Hub pipeline tag ---
     match pipeline_tag {
         Some("text-generation") | Some("text2text-generation") => {
+            // The Hub states the model *generates text* — that is VERIFIED.
+            // Whether it is a *chat* model (multi-turn conversational
+            // template) is NOT stated by this pipeline tag, so Chat is only
+            // INFERRED. Honesty rule (§49): never claim a capability the
+            // metadata does not state explicitly.
             claims.push(claim(CapabilityKind::TextGeneration, Provenance::Verified));
-            claims.push(claim(CapabilityKind::Chat, Provenance::Verified));
+            claims.push(claim(CapabilityKind::Chat, Provenance::Inferred));
         }
         Some("image-text-to-text") | Some("image-to-text") | Some("visual-question-answering") => {
             claims.push(claim(CapabilityKind::Vision, Provenance::Verified));
@@ -224,9 +229,12 @@ pub fn classify(
     // --- VERIFIED from Hub tags the model itself declares ---
     let has = |needle: &str| tags.iter().any(|t| t.eq_ignore_ascii_case(needle));
     if has("tools") || has("tool-calling") || has("function-calling") {
+        // The tag states tool/function calling — that is VERIFIED. "Agents"
+        // implies a broader autonomous capability beyond the tag, so it is
+        // only INFERRED (honesty rule §49: never invent).
         claims.push(claim(CapabilityKind::ToolCalling, Provenance::Verified));
         claims.push(claim(CapabilityKind::FunctionCalling, Provenance::Verified));
-        claims.push(claim(CapabilityKind::Agents, Provenance::Verified));
+        claims.push(claim(CapabilityKind::Agents, Provenance::Inferred));
     }
     if has("structured-output") || has("json-mode") || has("json") {
         claims.push(claim(CapabilityKind::StructuredOutput, Provenance::Verified));
@@ -330,14 +338,20 @@ mod tests {
     }
 
     #[test]
-    fn text_generation_pipeline_is_verified_chat() {
+    fn text_generation_pipeline_verified_generation_but_not_verified_chat() {
         let caps = classify(Some("text-generation"), &tags(&["gguf"]), "org/any-model");
-        assert!(caps.claims.iter().any(|c| {
-            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Verified
-        }));
+        // The pipeline tag states text generation — VERIFIED.
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::TextGeneration
                 && c.provenance == Provenance::Verified
+        }));
+        // It does NOT state chat capability — Chat must never be VERIFIED
+        // (honesty §49), only INFERRED.
+        assert!(caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Inferred
+        }));
+        assert!(!caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Verified
         }));
         assert!(caps.tasks.is_empty(), "plain chat exposes no task filters");
     }
@@ -355,6 +369,14 @@ mod tests {
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::StructuredOutput
                 && c.provenance == Provenance::Verified
+        }));
+        // The tag states tool/function calling (VERIFIED) but not full agentic
+        // capability — Agents must be INFERRED, never VERIFIED (honesty §49).
+        assert!(caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Agents && c.provenance == Provenance::Inferred
+        }));
+        assert!(!caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Agents && c.provenance == Provenance::Verified
         }));
         // Tool calling exposes task filters.
         assert!(caps
