@@ -817,3 +817,18 @@ identity/registry/privilege, ADR-004/ADR-005).
   into `McpContext.capability_search`; the MCP module stays I/O-free and pure
   (`capability_search_request` tells the handler whether a lookup is needed).
 - [x] Tests for the tool dispatch + request-arg extraction (pure, no network).
+
+## 25. Next-Gen Phase 1 — Capability Fit on the Model Card
+
+Puts the provenance-aware capability matcher in front of the operator on the
+Model Hub card, so "can this model do X?" is answered visibly and honestly.
+
+- [x] `GET /api/admin/hub/model/{repo}?requires=ocr` — the model card now
+  includes a `capabilities.fit` verdict: whether the model satisfies the
+  requested capability at VERIFIED evidence, with a per-requirement checklist
+  (`satisfied` / `insufficient_provenance` / `missing`) and a human reason.
+- [x] Dashboard "Capability fit" block on the model card: pick a capability
+  from the known taxonomy and see the honest verdict (VERIFIED vs INFERRED vs
+  MISSING) and why.
+- [x] Tests for the fit verdict covering the honesty rules (inferred never
+  satisfies verified; absent capability is missing; no `requires` → null).

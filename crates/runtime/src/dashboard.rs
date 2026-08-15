@@ -616,6 +616,15 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <div style="margin-top:10px"><b style="font-size:12px">Tasks</b>
               <div id="md-tasks" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
             </div>
+            <div style="margin-top:10px"><b style="font-size:12px">Capability fit</b>
+              <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <span class="mono" style="font-size:11px;color:var(--muted)">can this model do</span>
+                <select id="md-fit-cap" class="mono" style="font-size:11px;padding:2px 4px"></select>
+                <button class="btn small" onclick="hubCheckFit()">check</button>
+                <span id="md-fit-note" class="mono" style="font-size:10.5px;color:var(--faint)"></span>
+              </div>
+              <div id="md-fit" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+            </div>
             <div style="margin-top:10px"><b style="font-size:12px">Variants</b>
               <table style="margin-top:6px"><thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th><th></th></tr></thead>
               <tbody id="md-variants"><tr><td colspan="4" class="empty">no variants reported</td></tr></tbody></table>
@@ -2042,8 +2051,39 @@ async function hubOpenDetail(id){
     (f.served ? '<span class="badge ok">served</span>' : '')+(f.available && !f.served ? '<span class="badge">on disk</span>' : '')+
     (f.trusted ? '' : ' <span class="badge warn">untrusted</span>')+'</div>'
   ).join('') : 'pull it here to make it available fabric-wide';
+  // Capability fit: populate the dropdown from the KNOWN taxonomy (all
+  // snake_case capability labels), not from invented state.
+  var fitSel = $('md-fit-cap');
+  if (fitSel && fitSel.options.length === 0) {
+    var known = ['ocr','vision','coding','summarization','translation','embeddings','tool_calling','structured_output','reasoning','speech_to_text','text_to_speech','image_generation','classification','multimodal'];
+    known.forEach(function(k){ var o = document.createElement('option'); o.value = k; o.textContent = k; fitSel.appendChild(o); });
+  }
+  $('md-fit').innerHTML = '';
+  $('md-fit-note').textContent = '';
+  hubFitCache = j.id || '';
   $('hub-detail').style.display = 'block';
   $('hub-status').innerHTML = 'model card loaded';
+}
+var hubFitCache = '';
+// Capability fit check: ask the model card "can this model do X?" and render
+// the honest provenance-aware verdict (VERIFIED vs INFERRED vs MISSING).
+async function hubCheckFit(){
+  var cap = ($('md-fit-cap') || {}).value || '';
+  if (!cap) return;
+  var id = hubFitCache;
+  $('md-fit-note').textContent = 'checking '+esc(cap)+'…';
+  const { ok, j } = await apiFetch('/api/admin/hub/model/'+encodeURIComponent(id)+'?requires='+encodeURIComponent(cap), { headers });
+  $('md-fit-note').textContent = '';
+  if (!ok) { $('md-fit').innerHTML = '<span class="badge warn">check failed</span>'; return; }
+  var fit = (j.capabilities && j.capabilities.fit) || null;
+  if (!fit) { $('md-fit').innerHTML = '<span class="muted">no verdict available</span>'; return; }
+  var badge = fit.satisfied ? '<span class="badge ok">satisfied</span>' : '<span class="badge warn">not satisfied</span>';
+  var checks = (fit.checks || []).map(function(c){
+    var color = (c.status && c.status.satisfied) ? 'var(--ok,#22c55e)' : 'var(--warn,#f59e0b)';
+    var mark = (c.status && c.status.satisfied) ? '✓' : '✗';
+    return '<div style="margin-top:3px"><span style="color:'+color+'">'+mark+'</span> <b class="mono">'+esc(c.capability)+'</b>: '+esc(c.reason||'')+'</div>';
+  }).join('');
+  $('md-fit').innerHTML = '<div>'+badge+' — requires <b class="mono">'+esc(fit.label||fit.capability)+'</b> (VERIFIED evidence)</div>'+checks;
 }
 async function hubPullVariant(id, file){
   if (hubPulling[id+':'+file]) return;

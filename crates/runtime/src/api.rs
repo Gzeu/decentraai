@@ -933,11 +933,17 @@ async fn admin_hub_pull_handler(
 async fn admin_hub_model_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     AxumPath(repo): AxumPath<String>,
 ) -> Response {
     if let Err(e) = state.require_master(&headers) {
         return e.into_response();
     }
+    // Optional capability fit query: `?requires=ocr` asks the model card for
+    // an honest provenance-aware verdict of whether this model can do OCR.
+    let requires = query
+        .get("requires")
+        .and_then(|v| v.parse::<decentraai_hub::CapabilityKind>().ok());
     let catalog = decentraai_hub::HubCatalog::new();
     let detail = match catalog.model_detail(&repo).await {
         Ok(d) => d,
@@ -964,7 +970,7 @@ async fn admin_hub_model_handler(
         }
     };
     let caps = detail.capabilities();
-    let body = hub_model_body(&detail, &files, &caps, &state, &repo).await;
+    let body = hub_model_body(&detail, &files, &caps, &state, &repo, requires).await;
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -1275,6 +1281,7 @@ async fn hub_model_body(
     caps: &decentraai_hub::ModelCapabilities,
     state: &ApiState,
     repo: &str,
+    requires: Option<decentraai_hub::CapabilityKind>,
 ) -> serde_json::Value {
     // Live fabric view: which trusted, ready workers have this model on disk
     // or loaded, and their honest capacity for it. Never fabricated — if a
@@ -1362,6 +1369,27 @@ async fn hub_model_body(
                 "capability": t.capability,
                 "task": t.task,
             })).collect::<Vec<_>>(),
+            // When a `requires` capability was supplied, an honest,
+            // provenance-aware verdict of whether this model satisfies it.
+            "fit": requires.map(|cap| {
+                let m = decentraai_hub::match_requirements(
+                    caps,
+                    &[decentraai_hub::CapabilityRequirement {
+                        capability: cap,
+                        evidence: decentraai_hub::EvidenceLevel::Verified,
+                    }],
+                );
+                serde_json::json!({
+                    "capability": cap,
+                    "label": cap.label(),
+                    "satisfied": m.is_satisfied(),
+                    "checks": m.checks.iter().map(|c| serde_json::json!({
+                        "capability": c.capability,
+                        "status": serde_json::to_value(&c.status).unwrap_or_default(),
+                        "reason": c.reason,
+                    })).collect::<Vec<_>>(),
+                })
+            }),
         },
         "variants": fabric_variants,
         "fabric": fabric_nodes,
@@ -5037,7 +5065,7 @@ mod tests {
             },
         ];
         let caps = detail.capabilities();
-        let body = hub_model_body(&detail, &files, &caps, &state, "org/code-llm").await;
+        let body = hub_model_body(&detail, &files, &caps, &state, "org/code-llm", None).await;
 
         // Real metadata surfaces, absent stays null.
         assert_eq!(body["metadata"]["context_length"], 8192);
@@ -5067,6 +5095,77 @@ mod tests {
 
         // No compute manager attached -> empty fabric list (never fabricated).
         assert!(body["fabric"].as_array().unwrap().is_empty());
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_model_body_reports_requires_capability_fit_with_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master".into()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        // This model has a `tools` tag (VERIFIED tool calling) and a `code`
+        // id (INFERRED coding), but no OCR evidence.
+        let detail = decentraai_hub::HubModelDetail {
+            id: "org/codestral".to_string(),
+            pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+            tags: vec!["gguf".into(), "tools".into()],
+            downloads: 10,
+            likes: 0,
+            description: None,
+            license: None,
+            context_length: None,
+            params: None,
+        };
+        let files = vec![];
+        let caps = detail.capabilities();
+
+        // requires=coding: INFERRED only, so a VERIFIED requirement is not
+        // satisfied — honest, reported as insufficient provenance.
+        let body = hub_model_body(
+            &detail,
+            &files,
+            &caps,
+            &state,
+            "org/codestral",
+            Some(decentraai_hub::CapabilityKind::Coding),
+        )
+        .await;
+        let fit = body["capabilities"]["fit"].clone();
+        assert_eq!(fit["capability"], "coding");
+        assert_eq!(fit["satisfied"], false, "inferred-only must not satisfy verified");
+        assert_eq!(
+            fit["checks"][0]["status"]["insufficient_provenance"]["found"],
+            "inferred"
+        );
+
+        // requires=ocr: no OCR evidence at all -> Missing, never satisfied.
+        let body = hub_model_body(
+            &detail,
+            &files,
+            &caps,
+            &state,
+            "org/codestral",
+            Some(decentraai_hub::CapabilityKind::Ocr),
+        )
+        .await;
+        let fit = body["capabilities"]["fit"].clone();
+        assert_eq!(fit["satisfied"], false);
+        assert_eq!(fit["checks"][0]["status"], "missing");
+
+        // No requires -> fit is null.
+        let body = hub_model_body(&detail, &files, &caps, &state, "org/codestral", None).await;
+        assert!(body["capabilities"]["fit"].is_null());
 
         manager.lock().await.shutdown().await.unwrap();
     }
