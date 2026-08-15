@@ -568,9 +568,9 @@ impl ComputeManager {
         request_id: &str,
         plan: &decentraai_fabric::ExecutionPlan,
         placement: &Placement,
-        is_continuation: bool,
-        prefix_worker: Option<String>,
+        continuation: Option<String>,
         outcome: &str,
+        attribution: ExecutionAttribution,
     ) {
         const MAX_EXECUTIONS: usize = 128;
         let mut ring = self.recent_executions.lock().unwrap();
@@ -591,6 +591,11 @@ impl ComputeManager {
                 KVCacheState::Unknown => "unknown".to_string(),
             }
         };
+        let (est_ram_mb, est_vram_mb) = plan.reservation_budget();
+        let (is_continuation, prefix_worker) = (
+            continuation.is_some(),
+            continuation.map(|p| p.to_string()),
+        );
         ring.push_back(ExecutedPlan {
             request_id: request_id.to_string(),
             plan_id: plan.plan_id.clone(),
@@ -610,6 +615,11 @@ impl ComputeManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            tokens_used: attribution.tokens_used,
+            processing_time_ms: attribution.processing_time_ms,
+            attempt: attribution.attempt,
+            est_ram_mb,
+            est_vram_mb,
         });
         while ring.len() > MAX_EXECUTIONS {
             ring.pop_front();
@@ -1240,6 +1250,35 @@ pub struct ExecutedPlan {
     pub reasoning: String,
     /// Wall-clock timestamp (unix seconds) when the decision was recorded.
     pub ts: u64,
+    /// ---- Resource attribution (Part 9/17): honest measured usage ----
+    /// Total tokens the worker reported for this request (real `usage`),
+    /// `None` when no worker response was received (e.g. transport failure).
+    pub tokens_used: Option<u32>,
+    /// Wall-clock processing time the worker measured, ms, excluding queue
+    /// time (real `processing_time_ms`); `None` on transport failure.
+    pub processing_time_ms: Option<u32>,
+    /// Which retry attempt produced this outcome (0 = first placement).
+    pub attempt: u32,
+    /// Total RAM/VRAM budget the plan reserved across its stages (MiB),
+    /// from `ExecutionPlan::reservation_budget` — the attribution baseline
+    /// before measured usage replaces it.
+    pub est_ram_mb: u64,
+    pub est_vram_mb: u64,
+}
+
+/// Measured usage a worker reports back for one request (Part 9/17). Kept
+/// as a single struct so `record_execution` stays under the argument budget
+/// and callers pass attribution in one place. All fields are honest: `None`
+/// on transport failure (no worker response), never invented.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionAttribution {
+    /// Total tokens the worker reported (input + output).
+    pub tokens_used: Option<u32>,
+    /// Wall-clock processing time measured by the worker, ms, excluding
+    /// queue time.
+    pub processing_time_ms: Option<u32>,
+    /// Which retry attempt produced the outcome (0 = first placement).
+    pub attempt: u32,
 }
 
 impl ComputeManager {
@@ -2135,22 +2174,40 @@ mod tests {
             .record_session_usage("s1", &worker, "abc", 500)
             .await;
 
-        manager.record_execution("r1", &plan, &placement, false, None, "succeeded");
+        manager.record_execution(
+            "r1",
+            &plan,
+            &placement,
+            None,
+            "succeeded",
+            ExecutionAttribution {
+                tokens_used: Some(321),
+                processing_time_ms: Some(1234),
+                attempt: 0,
+            },
+        );
         let recs = manager.executions();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].request_id, "r1");
         assert_eq!(recs[0].selected_worker, worker.to_string());
         assert_eq!(recs[0].network_rtt_ms, 50);
         assert_eq!(recs[0].kv_headroom, "500/2048");
+        // Part 9/17 attribution: measured usage from the worker response is
+        // recorded next to the planned reservation budget.
+        assert_eq!(recs[0].tokens_used, Some(321));
+        assert_eq!(recs[0].processing_time_ms, Some(1234));
+        assert_eq!(recs[0].attempt, 0);
+        assert!(recs[0].est_ram_mb >= 256, "reservation budget carried");
+        assert_eq!(recs[0].est_vram_mb, 3072);
         // Ring buffer bounds.
         for i in 0..150 {
             manager.record_execution(
                 &format!("r{i}"),
                 &plan,
                 &placement,
-                false,
                 None,
                 "succeeded",
+                ExecutionAttribution::default(),
             );
         }
         assert!(manager.executions().len() <= 128);
@@ -2163,9 +2220,13 @@ mod tests {
             "c1",
             &cont.0,
             &cont.1,
-            true,
             Some(worker.to_string()),
             "succeeded",
+            ExecutionAttribution {
+                tokens_used: Some(77),
+                processing_time_ms: Some(888),
+                attempt: 0,
+            },
         );
         let recs = manager.executions();
         let c = recs.iter().find(|r| r.request_id == "c1").unwrap();

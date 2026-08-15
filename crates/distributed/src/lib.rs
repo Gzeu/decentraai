@@ -90,7 +90,8 @@ pub mod worker;
 
 pub use compute::{
     ComputeAdvertisement, ComputeManager, ComputeMetricsReport, ContributionProfile,
-    ContributionRow, LivePerf, RuntimeMetrics, WorkerMetricRow, build_advertisement, short_node_id,
+    ContributionRow, ExecutionAttribution, LivePerf, RuntimeMetrics, WorkerMetricRow,
+    build_advertisement, short_node_id,
 };
 pub use config::InferenceConfig;
 pub use error::DistributedError;
@@ -346,8 +347,18 @@ impl DistributedInference {
     }
 
     /// Best-effort per-request audit event (M10): request id, session, worker,
-    /// model hash and outcome. Never breaks the routing flow on a write error.
-    fn audit_routed(&self, request: &InferRequest, worker: &libp2p::PeerId, ok: bool) {
+    /// model hash and outcome, plus resource attribution when the worker
+    /// reported measured usage. Never breaks the routing flow on a write
+    /// error; prompts and outputs are never audit material.
+    fn audit_routed(
+        &self,
+        request: &InferRequest,
+        worker: &libp2p::PeerId,
+        ok: bool,
+        tokens_used: Option<u32>,
+        processing_time_ms: Option<u32>,
+        attempt: u32,
+    ) {
         if let Some(logs_dir) = &self.logs_dir {
             decentraai_audit::record_best_effort(
                 logs_dir,
@@ -359,6 +370,11 @@ impl DistributedInference {
                     "worker_id": worker.to_string(),
                     "model_hash": request.model_hash,
                     "status": if ok { "completed" } else { "failed" },
+                    "attempt": attempt,
+                    // Part 9/17 attribution: real measured usage (None on
+                    // transport failure), never invented.
+                    "tokens_used": tokens_used,
+                    "processing_time_ms": processing_time_ms,
                 }),
             );
         }
@@ -1026,12 +1042,22 @@ impl DistributedInference {
                         &request.request_id.to_string(),
                         &plan,
                         &placement,
-                        cont.is_some(),
                         cont.map(|p| p.to_string()),
                         if result.is_ok() {
                             "succeeded"
                         } else {
                             "failed"
+                        },
+                        ExecutionAttribution {
+                            tokens_used: result
+                                .as_ref()
+                                .ok()
+                                .map(|resp| resp.tokens_used),
+                            processing_time_ms: result
+                                .as_ref()
+                                .ok()
+                                .map(|resp| resp.processing_time_ms),
+                            attempt,
                         },
                     );
                     // M23 Full Autonomy: correlate the recorded autonomous
@@ -1078,11 +1104,15 @@ impl DistributedInference {
                         compute.record_breaker_failure(&placement.worker);
                     }
                     // M10: per-request audit event tying request, worker and
-                    // model hash to the observed outcome.
+                    // model hash to the observed outcome, with resource
+                    // attribution from the real worker response.
                     self.audit_routed(
                         &request,
                         &placement.worker,
                         result.is_ok(),
+                        result.as_ref().ok().map(|r| r.tokens_used),
+                        result.as_ref().ok().map(|r| r.processing_time_ms),
+                        attempt,
                     );
                     let success = result.is_ok();
                     if success {
@@ -1230,12 +1260,24 @@ impl DistributedInference {
                         &request.request_id.to_string(),
                         &plan,
                         &placement,
-                        cont.is_some(),
                         cont.map(|p| p.to_string()),
                         if result.is_ok() {
                             "succeeded"
                         } else {
                             "failed"
+                        },
+                        ExecutionAttribution {
+                            tokens_used: result
+                                .as_ref()
+                                .ok()
+                                .map(|resp| resp.tokens_used),
+                            processing_time_ms: result
+                                .as_ref()
+                                .ok()
+                                .map(|resp| resp.processing_time_ms),
+                            // The streaming path is intentionally single-attempt
+                            // (retrying mid-stream would duplicate partial output).
+                            attempt: 0,
                         },
                     );
                     // M23 Full Autonomy: correlate the recorded autonomous
@@ -1278,7 +1320,14 @@ impl DistributedInference {
                         compute.record_breaker_failure(&placement.worker);
                     }
                     // M10: per-request audit event (streaming path).
-                    self.audit_routed(&request, &placement.worker, result.is_ok());
+                    self.audit_routed(
+                        &request,
+                        &placement.worker,
+                        result.is_ok(),
+                        result.as_ref().ok().map(|r| r.tokens_used),
+                        result.as_ref().ok().map(|r| r.processing_time_ms),
+                        0,
+                    );
                     if result.is_ok() {
                         return result;
                     }
@@ -1940,8 +1989,9 @@ mod tests {
         req.session_id = Some("sess1".into());
 
         // Routing a completed request writes an inference_completed audit event
-        // carrying request/worker/model-hash/status correlation fields (M10).
-        distributed.audit_routed(&req, &worker, true);
+        // carrying request/worker/model-hash/status correlation fields (M10),
+        // plus resource attribution (tokens/time/attempt) when known.
+        distributed.audit_routed(&req, &worker, true, Some(42), Some(1337), 2);
         let line = std::fs::read_to_string(logs_dir.join("audit.jsonl")).unwrap();
         let event: serde_json::Value =
             serde_json::from_str(line.lines().next().unwrap()).unwrap();
@@ -1951,5 +2001,8 @@ mod tests {
         assert_eq!(event["details"]["worker_id"], worker.to_string());
         assert_eq!(event["details"]["model_hash"], "modelhash");
         assert_eq!(event["details"]["status"], "completed");
+        assert_eq!(event["details"]["tokens_used"], 42);
+        assert_eq!(event["details"]["processing_time_ms"], 1337);
+        assert_eq!(event["details"]["attempt"], 2);
     }
 }

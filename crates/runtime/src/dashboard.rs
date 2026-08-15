@@ -492,8 +492,8 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <section class="view" id="view-execution">
         <div class="card">
           <h2>Execution (planner decisions) <span class="count" id="exec-count"></span></h2>
-          <table><thead><tr><th>Req</th><th>Worker</th><th class="num">Score</th><th class="num">Stages</th><th>Cont</th><th class="num">RTT</th><th>KV</th><th>Outcome</th><th>Reasoning</th></tr></thead>
-          <tbody id="execution"><tr><td colspan="9" class="empty">no executions yet</td></tr></tbody></table>
+          <table><thead><tr><th>Req</th><th>Worker</th><th class="num">Score</th><th class="num">Stages</th><th>Cont</th><th class="num">RTT</th><th>KV</th><th>Usage</th><th>Outcome</th><th>Reasoning</th></tr></thead>
+          <tbody id="execution"><tr><td colspan="10" class="empty">no executions yet</td></tr></tbody></table>
         </div>
       </section>
 
@@ -1581,12 +1581,17 @@ function renderPeers(p){
 }
 function renderExecutions(x){
   const ex = (x && x.executions || []).slice(0, 14);
-  const rows = ex.map(e =>
-    '<tr><td><code>'+short(e.request_id, 8)+'</code></td><td><code>'+short(e.selected_worker, 10)+'</code></td><td class="num">'+e.score.toFixed(2)+'</td><td class="num">'+e.stages+'</td>'+
+  const rows = ex.map(e => {
+    // Part 9/17 resource attribution: real measured usage when the worker
+    // reported it, else a dash — never invented.
+    const usage = (e.tokens_used !== undefined && e.tokens_used !== null)
+      ? e.tokens_used + ' tok · ' + e.processing_time_ms + 'ms' + (e.attempt ? ' · attempt ' + e.attempt : '')
+      : '—';
+    return '<tr><td><code>'+short(e.request_id, 8)+'</code></td><td><code>'+short(e.selected_worker, 10)+'</code></td><td class="num">'+e.score.toFixed(2)+'</td><td class="num">'+e.stages+'</td>'+
     '<td>'+(e.is_continuation ? '<span class="badge accent">cont</span>' : '<span class="badge faint">cold</span>')+'</td><td class="num">'+e.network_rtt_ms+'ms</td>'+
-    '<td class="mono">'+esc(e.kv_headroom || '—')+'</td><td>'+outcomeBadge(e.outcome)+'</td><td class="mono" style="font-size:11px">'+esc(e.reasoning || '')+'</td></tr>'
-  ).join('');
-  $('execution').innerHTML = rows || '<tr><td colspan="9" class="empty">no executions yet</td></tr>';
+    '<td class="mono">'+esc(e.kv_headroom || '—')+'</td><td class="mono">'+esc(usage)+'</td><td>'+outcomeBadge(e.outcome)+'</td><td class="mono" style="font-size:11px">'+esc(e.reasoning || '')+'</td></tr>';
+  }).join('');
+  $('execution').innerHTML = rows || '<tr><td colspan="10" class="empty">no executions yet</td></tr>';
   $('exec-count').textContent = (x && x.executions || []).length;
 }
 function outcomeBadge(o){
