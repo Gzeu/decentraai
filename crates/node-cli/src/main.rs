@@ -1056,6 +1056,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
 
     // Serve manifests/chunks off the registry if one exists (model sharing).
     let registry_path = data_dir.join("db/registry.json");
+    // Let the coordinator resolve persisted capability claims for a model, so
+    // capability-requirement verdicts on decisions are real (not UNKNOWN) when
+    // a model was pulled with Hub metadata.
+    compute_manager.set_registry_path(registry_path.clone());
     if registry_path.exists() {
         if let Ok(reg) = ModelRegistry::load(&registry_path) {
             chained_handler = chained_handler.add_handler(Arc::new(RegistryServer::new(reg)));

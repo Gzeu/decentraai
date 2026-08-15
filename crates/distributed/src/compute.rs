@@ -294,6 +294,11 @@ pub struct ComputeManager {
     /// request; the local node always accepts its own work regardless.
     /// Atomic so the shared `Arc<ComputeManager>` can flip it at runtime.
     accepts_remote_inference: std::sync::atomic::AtomicBool,
+    /// Local model registry path (`db/registry.json`), when known, so the
+    /// coordinator can resolve persisted capability claims for a model to give
+    /// a real capability-requirement verdict. `None` = no registry wired yet
+    /// (honest: claims resolution degrades to UNKNOWN).
+    registry_path: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ComputeManager {
@@ -327,6 +332,7 @@ impl ComputeManager {
                 crate::breaker::BreakerConfig::default(),
             )),
             accepts_remote_inference: std::sync::atomic::AtomicBool::new(false),
+            registry_path: std::sync::Mutex::new(None),
         }
     }
 
@@ -766,12 +772,12 @@ impl ComputeManager {
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
             priority,
-            // Task B: capability requirements are additive plumbing. The
-            // coordinator does not yet carry a caller-provided requirement nor
-            // any per-model `ModelCapabilities`, so it records `None` — the
-            // fabric then records no (honest UNKNOWN) verdict. Routing is
-            // unchanged; wiring a real requirement in is future work.
-            required_capability: None,
+            // Capability requirement: carried from the request (if any) and
+            // resolved against the local registry's persisted claims so the
+            // decision records a REAL verdict (VERIFIED/INFERRED/MISSING) when
+            // data exists, honest UNKNOWN otherwise. Routing is unchanged.
+            required_capability: req.required_capability.clone(),
+            capability_claims: self.capability_claims_for_model(&req.model_hash),
         };
         // Mirror the planner the real routing path builds, so the recorded
         // decision shares the live network graph (M19) and objective weights.
@@ -986,9 +992,11 @@ impl ComputeManager {
             transfer_mib: 0,
             local_peer: Some(self.local_peer.to_string()),
             priority,
-            // Task B: same honest plumbing as `record_decision` — no real
-            // capability requirement is wired in yet, so `None`.
-            required_capability: None,
+            // Capability requirement carried from the request, resolved against
+            // the local registry's persisted claims so the planner records a
+            // REAL verdict when data exists (honest UNKNOWN otherwise).
+            required_capability: req.required_capability.clone(),
+            capability_claims: self.capability_claims_for_model(&req.model_hash),
         };
 
         let result = planner.plan(&rfacts, &facts);
@@ -1168,8 +1176,7 @@ impl ComputeManager {
         &self,
         registry_path: &std::path::Path,
         context_tokens: u32,
-    ) -> anyhow::Result<ComputeAdvertisement> {
-        use decentraai_registry::ModelRegistry;
+    ) -> anyhow::Result<ComputeAdvertisement> {        use decentraai_registry::ModelRegistry;
         use std::io::Read;
 
         let gpu_present = matches!(
@@ -1235,6 +1242,65 @@ impl ComputeManager {
         Ok(adv)
     }
 
+    /// Records the local registry path so the coordinator can resolve persisted
+    /// capability claims for a model (best-effort; `None` keeps UNKNOWN).
+    pub fn set_registry_path(&self, path: std::path::PathBuf) {
+        *self.registry_path.lock().unwrap() = Some(path);
+    }
+
+    /// Resolves persisted capability claims for a model identified by its
+    /// BLAKE3 `model_hash`. The registry stores records keyed by relative path
+    /// (which ends in a file name), so we first map the hash → file name via
+    /// the last local advertisement's served/available models, then look up the
+    /// registry. Returns `(capability snake_case, provenance)` pairs, or empty
+    /// when the hash/file is unknown, the registry is unavailable, or the model
+    /// has no claims (honest: empty = UNKNOWN, never fabricated).
+    fn capability_claims_for_model(
+        &self,
+        model_hash: &str,
+    ) -> Vec<(String, String)> {
+        let Some(adv) = self.last_local_advertisement_sync() else {
+            return Vec::new();
+        };
+        let file_name = adv
+            .capability
+            .served_models
+            .iter()
+            .chain(adv.capability.available_models.iter())
+            .find(|m| m.model_hash == model_hash)
+            .map(|m| m.file_name.as_str());
+        let Some(file_name) = file_name else {
+            return Vec::new();
+        };
+        self.capability_claims_for_file(file_name)
+    }
+
+    /// Resolves persisted capability claims for a model file name (the registry
+    /// stores records keyed by relative path, which ends in the file name).
+    fn capability_claims_for_file(
+        &self,
+        file_name: &str,
+    ) -> Vec<(String, String)> {
+        let Some(path) = self.registry_path.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let Ok(registry) = decentraai_registry::ModelRegistry::load(&path) else {
+            return Vec::new();
+        };
+        let Some(record) = registry
+            .models
+            .values()
+            .find(|r| r.relative_path.ends_with(file_name))
+        else {
+            return Vec::new();
+        };
+        record
+            .capability_claims
+            .iter()
+            .map(|c| (c.capability.clone(), c.provenance.clone()))
+            .collect()
+    }
+
     /// Shared handle to the node's live perf metrics. The worker's streaming
     /// task records real completions into it so subsequent advertisements
     /// (and therefore coordinator scheduling) reflect measured throughput and
@@ -1243,7 +1309,6 @@ impl ComputeManager {
         self.metrics.clone()
     }
 }
-
 /// Convenience: derive a `GpuSpec` and free-VRAM from a `GpuSnapshot`.
 pub fn gpu_from_snapshot(info: &GpuSnapshot) -> (Option<GpuSpec>, Option<u64>) {
     (
@@ -2573,5 +2638,85 @@ mod tests {
                 .await;
         }
         assert!(manager.decisions().len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn record_decision_resolves_real_capability_verdict_from_registry() {
+        // The coordinator resolves a requirement against the local registry's
+        // persisted claims, so the decision carries a REAL verdict — not
+        // UNKNOWN — when the data exists.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("model.gguf"), b"GGUF magic").unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        {
+            let mut reg =
+                decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+            reg.scan_directory(&models_dir).unwrap();
+            reg.set_capability_claims(
+                "model.gguf",
+                vec![decentraai_registry::CapabilityClaimRecord {
+                    capability: "ocr".into(),
+                    provenance: "verified".into(),
+                }],
+            )
+            .unwrap();
+            reg.save(&registry_path).unwrap();
+        }
+
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        // Build the LOCAL advertisement from the registry (sets the hash and
+        // the last_local_ad so claims resolution can map hash -> file name).
+        manager.set_registry_path(registry_path.clone());
+        let adv = manager
+            .refresh_local_models(&registry_path, 4096)
+            .await
+            .unwrap();
+        let model_hash = adv.capability.available_models[0].model_hash.clone();
+
+        // A remote worker that serves the model, so the planner has an eligible
+        // candidate to record a decision against.
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![ServedModel {
+                    model_hash: model_hash.clone(),
+                    context_tokens: 4096,
+                    est_vram_mb: 0,
+                    ..model()
+                }],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+
+        let mut req = manager
+            .requirements_for(&model_hash)
+            .await
+            .expect("advertised model yields requirements");
+        req.required_capability = Some("ocr".to_string());
+        manager
+            .record_decision("r-cap", &req, 100, None, 128, true)
+            .await;
+
+        let d = &manager.decisions()[0];
+        let view = d
+            .capability_requirement
+            .as_ref()
+            .expect("requirement requested -> verdict present");
+        // Real claim resolution: the registry says the model can do OCR with
+        // verified evidence — so the decision records satisfied at VERIFIED.
+        assert!(view.satisfied, "verified claim -> satisfied");
+        assert_eq!(view.evidence, "VERIFIED");
     }
 }

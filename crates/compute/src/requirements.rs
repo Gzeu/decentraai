@@ -16,6 +16,11 @@ pub struct WorkloadRequirements {
     pub max_tokens: u32,
     pub stream: bool,
     pub priority: u8,
+    /// Optional required capability (snake_case name, e.g. `"ocr"`), carried so
+    /// the coordinator can surface an honest capability-requirement verdict on
+    /// the execution decision. `None` = no requirement. Protocol-agnostic and
+    /// additive (does not touch the signed P2P `InferRequest` frame).
+    pub required_capability: Option<String>,
 }
 
 impl WorkloadRequirements {
@@ -27,6 +32,7 @@ impl WorkloadRequirements {
             max_tokens: 1024,
             stream: true,
             priority: 128,
+            required_capability: None,
         }
     }
 }

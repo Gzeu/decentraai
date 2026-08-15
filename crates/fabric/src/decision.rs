@@ -596,6 +596,7 @@ mod tests {
             local_peer: None,
             priority,
             required_capability: None,
+            capability_claims: Vec::new(),
         }
     }
 

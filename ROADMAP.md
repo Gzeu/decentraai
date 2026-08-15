@@ -901,3 +901,24 @@ evidence-backed verdict from supplied claims.
 - [x] Tests: registry claims persistence/rescan/save-load; pull mapping helpers
   (snake_case, relative path, suffix match); resolver honesty rules (verified /
   inferred / missing / case-insensitive / pure).
+
+## 29. Next-Gen Phase L — Coordinator Resolves Real Capability Verdict
+
+The persisted claims + resolver existed, but the coordinator still recorded
+UNKNOWN because a caller-provided requirement and the registry claims never
+reached the planner. This wires the full loop end-to-end.
+
+- [x] `WorkloadRequirements.required_capability: Option<String>` — a
+  protocol-agnostic, additive carrier for an optional required capability (does
+  not touch the signed P2P `InferRequest` frame).
+- [x] `RequestFacts.capability_claims: Vec<(String, String)>` — the planner now
+  resolves a REAL verdict from supplied claims instead of always UNKNOWN.
+- [x] `ComputeManager.set_registry_path` + `capability_claims_for_model` — the
+  coordinator maps model hash → file name (via the local advertisement) → the
+  registry's persisted claims, and passes them into both `record_decision` and
+  `plan_and_reserve`.
+- [x] `admin_hub_pull_handler` sets the registry path on the compute manager so
+  a pulled model's claims are immediately resolvable.
+- [x] Tests: fabric resolver real-verdict path (verified/inferred/missing/
+  unknown); distributed coordinator resolves a verified OCR claim → decision
+  records `satisfied=true, evidence="VERIFIED"`.

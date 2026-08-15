@@ -961,6 +961,9 @@ async fn admin_hub_pull_handler(
     };
     // Refresh the local registry so the new model is immediately usable.
     let registry_path = state.info.repo_root.join("db/registry.json");
+    if let Some(cm) = &state.compute {
+        cm.set_registry_path(registry_path.clone());
+    }
     let _count = match refresh_registry_after_pull(&models_dir, &registry_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1632,6 +1635,7 @@ async fn admin_models_remove_handler(
     // as removed from the registry. This ensures the model is no longer
     // advertised to the fabric.
     if let Some(cm) = &state.compute {
+        cm.set_registry_path(registry_path.clone());
         let ctx = (record.size_bytes / 1024 / 1024) as u32; // Estimate context from size
         if let Err(e) = cm.refresh_local_models(&registry_path, ctx).await {
             tracing::warn!("failed to refresh fabric advertisement after removal: {e:#}");

@@ -72,6 +72,13 @@ pub struct RequestFacts {
     /// rationale and a reasoning note. `None` means no capability requirement.
     /// Additive/optional so existing constructions default to no requirement.
     pub required_capability: Option<String>,
+    /// Persisted capability claims for the requested model, as `(capability
+    /// snake_case, provenance "verified"|"inferred")`. Supplied by a coordinator
+    /// that has real data (e.g. the local registry projection). When present
+    /// AND `required_capability` is set, the planner resolves a real
+    /// evidence-backed verdict instead of UNKNOWN. Empty = no data (honest
+    /// UNKNOWN). Additive; defaults empty.
+    pub capability_claims: Vec<(String, String)>,
 }
 
 /// Configurable objective weights for the planner's [`ExecutionPlanner::score`].
@@ -275,7 +282,7 @@ impl ExecutionPlanner {
                 chosen: None,
                 runner_up_delta: None,
                 ranked: Vec::new(),
-                capability_requirement: capability_view(req, None),
+                capability_requirement: capability_view(req, &req.capability_claims),
             };
             return PlanResult {
                 plan: ExecutionPlan {
@@ -318,7 +325,7 @@ impl ExecutionPlanner {
                 None
             },
             ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
-            capability_requirement: capability_view(req, None),
+            capability_requirement: capability_view(req, &req.capability_claims),
         };
         PlanResult {
             reasoning: append_capability_note(&stage.1, req),
@@ -510,18 +517,22 @@ pub fn resolve_capability_requirement(
 ///   without real evidence. A coordinator with real claims may resolve it.
 fn capability_view(
     req: &RequestFacts,
-    claims: Option<&[(&str, &str)]>,
+    claims: &[(String, String)],
 ) -> Option<CapabilityRequirementView> {
     req.required_capability.as_ref().map(|cap| {
-        match claims.filter(|c| !c.is_empty()) {
-            Some(c) => resolve_capability_requirement(cap, c),
-            None => CapabilityRequirementView {
+        if claims.is_empty() {
+            return CapabilityRequirementView {
                 capability: cap.clone(),
                 label: cap.replace('_', " "),
                 satisfied: false,
                 evidence: "UNKNOWN".to_string(),
-            },
+            };
         }
+        let refs: Vec<(&str, &str)> = claims
+            .iter()
+            .map(|(c, p)| (c.as_str(), p.as_str()))
+            .collect();
+        resolve_capability_requirement(cap, &refs)
     })
 }
 
@@ -574,6 +585,7 @@ mod tests {
             local_peer: None,
             priority: 0,
             required_capability: None,
+            capability_claims: Vec::new(),
         }
     }
 
@@ -863,8 +875,42 @@ mod tests {
     }
 
     #[test]
+    fn capability_requirement_with_real_claims_resolves_evidence_backed_verdict() {
+        // A request with a requirement AND real persisted claims (supplied by a
+        // coordinator) resolves an evidence-backed verdict instead of UNKNOWN.
+        let ws = || vec![worker_facts("a", 180, 50, 10)];
+        let run = |claims: Vec<(String, String)>| {
+            let mut r = req();
+            r.required_capability = Some("ocr".to_string());
+            r.capability_claims = claims;
+            ExecutionPlanner::default().plan(&r, &ws()).rationale
+                .capability_requirement
+                .expect("requirement requested -> verdict present")
+        };
+
+        // Verified claim -> satisfied at VERIFIED.
+        let v = run(vec![("ocr".to_string(), "verified".to_string())]);
+        assert!(v.satisfied);
+        assert_eq!(v.evidence, "VERIFIED");
+
+        // Only inferred claim -> NOT satisfied, INFERRED (never a false pass).
+        let v = run(vec![("ocr".to_string(), "inferred".to_string())]);
+        assert!(!v.satisfied);
+        assert_eq!(v.evidence, "INFERRED");
+
+        // No matching capability -> MISSING.
+        let v = run(vec![("coding".to_string(), "verified".to_string())]);
+        assert!(!v.satisfied);
+        assert_eq!(v.evidence, "MISSING");
+
+        // Empty claims (no data) -> honest UNKNOWN (unchanged fallback).
+        let v = run(vec![]);
+        assert!(!v.satisfied);
+        assert_eq!(v.evidence, "UNKNOWN");
+    }
+
+    #[test]
     fn capability_requirement_view_round_trips_serde() {
-        // The verdict must round-trip through serde_json, mirroring the
         // PlannerRationale round-trip above, so a coordinator can persist /
         // display the honest verdict.
         let mut with_ocr = req();
@@ -881,10 +927,10 @@ mod tests {
 
     #[test]
     fn resolve_requirement_with_no_claims_stays_unknown() {
-        // A requirement with empty/None claims keeps the honest UNKNOWN fallback.
+        // A requirement with empty claims keeps the honest UNKNOWN fallback.
         let mut with_ocr = req();
         with_ocr.required_capability = Some("ocr".to_string());
-        let view = capability_view(&with_ocr, Some(&[])).unwrap();
+        let view = capability_view(&with_ocr, &[]).unwrap();
         assert!(!view.satisfied);
         assert_eq!(view.evidence, "UNKNOWN");
     }
