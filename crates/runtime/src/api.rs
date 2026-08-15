@@ -1327,7 +1327,142 @@ async fn execute_decision_handler(
         Ok(v) => v,
         Err(_) => return forbidden("invalid JSON"),
     };
+    // STREAM step: when the caller asks for a stream, emit SSE from the
+    // fabric router instead of a single buffered JSON body.
+    if req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false) {
+        return execute_decision_stream(&state, &req).await;
+    }
     run_execute_decision(&state, &req).await
+}
+
+/// The STREAM step of decide→confirm→reserve→execute: run the decided model on
+/// the fabric and stream the output as SSE (like the chat proxy's remote route),
+/// reusing `route_request_streamed`. Enforces `confirm: true` (mutation safety).
+async fn execute_decision_stream(
+    state: &ApiState,
+    req: &serde_json::Value,
+) -> Response {
+    // Mutation safety: explicit confirmation is required.
+    if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return forbidden("mutating execution requires \"confirm\": true");
+    }
+    let intent = req.get("intent").and_then(|i| i.as_str()).unwrap_or_default();
+    let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
+    if intent.trim().is_empty() || prompt.trim().is_empty() {
+        return forbidden("missing intent and/or prompt");
+    }
+    let max_tokens = req
+        .get("max_tokens")
+        .and_then(|m| m.as_u64())
+        .unwrap_or(1024)
+        .min(4096) as u32;
+    let evidence = req.get("evidence").and_then(|e| e.as_str()).unwrap_or("any");
+    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let explicit_model = req.get("model").and_then(|m| m.as_str());
+
+    // decide → chosen model.
+    let decision = unified_fabric_decision(state, intent, evidence, explicit_model).await;
+    let Some(model) = decision["decision"]["model"].as_str().map(str::to_string) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": "no runnable decision on the fabric for this intent (nothing to execute)", "type": "unprocessable" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+    let Some(model_hash) = resolve_model_hash(state, &model).await else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": format!("chosen model '{model}' has no advertised model hash on the fabric"), "type": "unprocessable" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+
+    let Some(distributed) = state.distributed.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": { "message": "fabric router unavailable", "type": "server_error" },
+                "decision": decision,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+
+    let mut request = decentraai_distributed::InferRequest::new(
+        model_hash.clone(),
+        prompt.to_string(),
+        max_tokens,
+    )
+    .with_sender(distributed.p2p_node().local_peer_id())
+    .with_streaming(true);
+    request.timeout_ms = 120_000;
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let dist = distributed.clone();
+    let resp_task = tokio::spawn(async move {
+        dist.route_request_streamed(request, progress_tx).await
+    });
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let state2 = state.clone();
+    let started = std::time::Instant::now();
+    let model2 = model.clone();
+    tokio::spawn(async move {
+        while let Some(chunk) = progress_rx.recv().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            let payload = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+                serde_json::to_string(&chunk).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            if body_tx.send(Ok(Bytes::from(payload))).await.is_err() {
+                break;
+            }
+        }
+        let final_event = match resp_task.await {
+            Ok(Ok(resp)) => {
+                let usage = format!(
+                    "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                    resp.tokens_used
+                );
+                state2.record_inference("/v1/execute", started.elapsed(), usage.as_bytes());
+                format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"model\":{},\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}\n\n",
+                    serde_json::to_string(&model2).unwrap_or_else(|_| "\"\"".to_string()),
+                    resp.tokens_used
+                )
+            }
+            Ok(Err(_)) => {
+                state2.requests_failed.fetch_add(1, Ordering::SeqCst);
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n"
+                    .to_string()
+            }
+            Err(_) => String::new(),
+        };
+        let _ = body_tx.send(Ok(Bytes::from(final_event))).await;
+        let _ = body_tx.send(Ok(Bytes::from("data: [DONE]\n\n".to_string()))).await;
+    });
+    let body = Body::from_stream(futures::stream::unfold(body_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 /// Core decide→reserve→execute logic, shared by the HTTP handler and the MCP
@@ -1448,16 +1583,60 @@ async fn run_execute_decision(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "error": { "message": e.to_string(), "type": "execution_error" },
-                "decision": decision,
-            })
-            .to_string(),
-        )
-            .into_response(),
+        Err(e) => {
+            // REPLAN advisory (Phase H vocabulary): on a retryable transport
+            // failure with remaining eligible workers, advise a retry/replan
+            // onto an alternative; otherwise abort. This is advisory-only — the
+            // router already retried internally; we never claim an action the
+            // runtime did not take.
+            let retryable = e.is_retryable();
+            let alternatives = decision["capabilities"]
+                .as_array()
+                .map(|caps| {
+                    caps.iter()
+                        .flat_map(|c| c["model_options"].as_array().cloned().unwrap_or_default())
+                        .filter(|m| m["verdict"] == "CAN_RUN")
+                        .count()
+                })
+                .unwrap_or(0);
+            let adv = decentraai_fabric::decision::adapt(
+                false,         // outcome_ok
+                retryable,     // retryable
+                false,         // cancelled
+                0,             // tokens_emitted (no output was returned)
+                alternatives,  // eligible_after_primary
+                1,             // replan_budget
+                false,         // is_continuation
+            );
+            let replan = match adv {
+                decentraai_fabric::decision::Adaptation::Retry
+                | decentraai_fabric::decision::Adaptation::Replan => {
+                    if alternatives > 0 {
+                        "REPLAN_AVAILABLE"
+                    } else {
+                        "NO_ALTERNATIVE"
+                    }
+                }
+                decentraai_fabric::decision::Adaptation::Abort => "ABORT",
+                decentraai_fabric::decision::Adaptation::Continue => "NO_RETRY_NEEDED",
+            };
+            (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": { "message": e.to_string(), "type": "execution_error" },
+                    "decision": decision,
+                    "replan": {
+                        "advisory": replan,
+                        "retryable": retryable,
+                        "eligible_alternatives": alternatives,
+                        "note": "advisory only; the router already applied its own retry/fallback",
+                    },
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
     }
 }
 

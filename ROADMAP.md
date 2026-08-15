@@ -1292,3 +1292,17 @@ path. Reuses authoritative systems; no new planner/ledger/engine.
   safety enforced by the same core. Reuses existing master auth.
 - [x] Tests (focused): refuse without confirm; honest 422 when no runnable
   decision (never a fabricated run); MCP tool listed, arg parsing, snapshot.
+
+## 49. Next-Gen — STREAM + REPLAN steps
+
+Complete the decide→confirm→reserve→execute→stream→measure→history→recovery→replan
+loop with the two missing steps.
+
+- [x] **STREAM**: `POST /v1/execute` with `stream: true` now emits SSE from the
+  fabric router (`route_request_streamed`), reusing the chat proxy's streaming
+  pattern — real incremental output + trailing usage, mutation-safety `confirm`
+  enforced. Non-streaming JSON path unchanged (used by MCP).
+- [x] **REPLAN (advisory)**: on execution failure the response carries a
+  `replan` advisory derived from the existing `adapt()` vocabulary (retryable +
+  eligible alternatives → REPLAN_AVAILABLE; else NO_ALTERNATIVE/ABORT).
+  Advisory-only — never claims an action the router did not take.
