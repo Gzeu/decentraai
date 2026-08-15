@@ -60,6 +60,10 @@ pub struct McpContext {
     /// fabric fit (CAN I RUN THIS?). Precomputed by the HTTP layer; the
     /// protocol layer only translates. Empty until wired.
     pub intent_fit: Value,
+    /// Result of `get_fabric_graph`: the fabric graph / digital twin projection
+    /// (nodes, models, capabilities, executions, network, kv). Precomputed by
+    /// the HTTP layer; the protocol layer only translates.
+    pub fabric_graph: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -203,6 +207,11 @@ fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "get_fabric_graph",
+            description: "Project the current fabric graph (Digital Twin): real nodes (peer_id/node_id/node_name kept separate), models with their INFERRED quantization and persisted capability claims, the capabilities known across the fabric, recent executions with their recovery timeline, measured network links, and KV session count. Read-only projection of real fabric state — no fake nodes, no hardcoded names; empty arrays are honest. Future nodes appear automatically.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
     ]
 }
 
@@ -304,8 +313,7 @@ pub fn worker_capability_request(raw: &str) -> Option<(String, String, String)> 
 /// is one. Pure — lets the HTTP layer precompute the resolution into
 /// [`McpContext::intent_resolution`]. Returns `(intent, evidence)` where
 /// evidence defaults to "any".
-pub fn intent_request(raw: &str) -> Option<(String, String)> {
-    let msg: Value = serde_json::from_str(raw).ok()?;
+pub fn intent_request(raw: &str) -> Option<(String, String)> {    let msg: Value = serde_json::from_str(raw).ok()?;
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return None;
     }
@@ -359,6 +367,24 @@ pub fn intent_fit_request(raw: &str) -> Option<(String, String)> {
         .unwrap_or_else(|| "any".to_string());
     let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
     Some((intent, evidence))
+}
+
+/// Whether the incoming message is a `get_fabric_graph` tool call. Pure — lets
+/// the HTTP layer precompute the fabric-graph projection into
+/// [`McpContext::fabric_graph`]. Returns `Some(())` when it is, else `None`.
+pub fn fabric_graph_request(raw: &str) -> Option<()> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "get_fabric_graph" {
+        return None;
+    }
+    Some(())
 }
 
 /// Pure, deterministic intent → capability → local-model resolution.
@@ -511,6 +537,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_worker_capability" => &ctx.worker_capability,
         "resolve_intent" => &ctx.intent_resolution,
         "resolve_intent_with_fit" => &ctx.intent_fit,
+        "get_fabric_graph" => &ctx.fabric_graph,
         _ => return None,
     };
     Some(json!({
@@ -545,6 +572,7 @@ mod tests {
             worker_capability: json!({ "model": "m", "capability": "ocr", "fit": { "verdict": "CAN_RUN", "counts": { "can_run": 1 } }, "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
             intent_resolution: json!({}),
             intent_fit: json!({ "intent": "i", "capabilities": [] }),
+            fabric_graph: json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": { "sessions_active": 0 } }),
         }
     }
 
@@ -884,5 +912,37 @@ mod tests {
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("ocr and summarization"));
         assert!(content.contains("\"verdict\":\"CAN_RUN\""));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_fabric_graph() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let g = tools.iter().find(|t| t["name"] == "get_fabric_graph").unwrap();
+        assert!(g["inputSchema"].is_object());
+        assert!(g["description"]
+            .as_str()
+            .unwrap()
+            .contains("fabric graph"));
+    }
+
+    #[test]
+    fn fabric_graph_request_matches_only_the_tool() {
+        assert!(fabric_graph_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_fabric_graph","arguments":{}}}"#
+        )
+        .is_some());
+        assert!(fabric_graph_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+        assert!(fabric_graph_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#).is_none());
+    }
+
+    #[test]
+    fn get_fabric_graph_returns_precomputed_projection() {
+        // The protocol layer returns the HTTP-precomputed fabric graph unchanged.
+        let r = call(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"get_fabric_graph","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"nodes\":[]"));
+        assert!(content.contains("\"capabilities\":[]"));
+        assert!(content.contains("\"sessions_active\":0"));
     }
 }

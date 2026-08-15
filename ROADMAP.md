@@ -1185,3 +1185,16 @@ automatically.
   compact node/capability lists, real state only).
 - [x] Tests: endpoint auth/JSON shape + pure aggregation (model dedup, identity
   separation, capabilities from real claims only).
+
+## 42. Next-Gen Phase C — Fabric Graph in the Agent Control Plane
+
+Expose the Digital Twin fabric graph to external agents as a read-only MCP tool.
+
+- [x] `get_fabric_graph` MCP tool (read-only, no args): returns the same real
+  projection as `GET /v1/fabric` (nodes with identity kept separate, models with
+  INFERRED quantization + persisted claims, capabilities, executions with
+  recovery timeline, network, kv). Precomputed by the HTTP layer via
+  `mcp_fabric_graph` (reuses `fabric_graph_aggregate`).
+- [x] Pure `fabric_graph_request` extractor + dispatch.
+- [x] Tests: tool listed, extractor matches only the tool, precomputed snapshot
+  returned unchanged.

@@ -1053,6 +1053,36 @@ async fn mcp_intent_with_fit(
     })
 }
 
+/// Fabric graph projection for the MCP `get_fabric_graph` tool (Phase C). Same
+/// pure aggregation as `GET /v1/fabric`, read-only, no execution. Real state
+/// only — never fabricated nodes/models/capabilities.
+async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
+    let registry = decentraai_registry::ModelRegistry::load(
+        &state.info.repo_root.join("db/registry.json"),
+    )
+    .ok();
+    let mut workers: Vec<(decentraai_distributed::ComputeAdvertisement, bool)> = Vec::new();
+    let mut decisions: Vec<decentraai_fabric::ExecutionDecision> = Vec::new();
+    let mut network = decentraai_fabric::NetworkGraph::new();
+    let mut sessions_active = 0usize;
+    if let Some(compute) = &state.compute {
+        for adv in compute.workers().await {
+            let trusted = compute.is_trusted(&adv.peer_id).await;
+            workers.push((adv, trusted));
+        }
+        decisions = compute.decisions();
+        sessions_active = compute.session_count();
+        network = compute.network_graph();
+    }
+    fabric_graph_aggregate(
+        &workers,
+        registry.as_ref(),
+        &decisions,
+        &network,
+        sessions_active,
+    )
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -2957,6 +2987,10 @@ async fn mcp_handler(
     if let Some((intent, evidence)) = crate::mcp::intent_fit_request(&raw) {
         ctx.intent_fit = mcp_intent_with_fit(&state, &intent, &evidence).await;
     }
+    // A `get_fabric_graph` call projects the whole fabric graph (Digital Twin).
+    if crate::mcp::fabric_graph_request(&raw).is_some() {
+        ctx.fabric_graph = mcp_fabric_graph(&state).await;
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -3065,6 +3099,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         // honest no-op rather than a fabricated resolution.
         intent_resolution: serde_json::json!({}),
         intent_fit: serde_json::json!({}),
+        fabric_graph: serde_json::json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": {} }),
     }
 }
 
