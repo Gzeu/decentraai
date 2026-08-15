@@ -1192,6 +1192,12 @@ impl ComputeManager {
                     model_hash,
                     file_name: record.relative_path.clone(),
                     size_mb,
+                    // NOTE: this is the GPU-offload *working-set* RAM estimate
+                    // (a worker offloading the weights holds only a fraction
+                    // in system RAM), NOT the full-load footprint from
+                    // decentraai_compute::estimate_ram_mb. Do not swap the two
+                    // without validating placement on hardware — they model
+                    // different load modes (GPU offload vs CPU full-load).
                     est_ram_mb: size_mb / 4 + 1024,
                     est_vram_mb: if gpu_present { size_mb } else { 0 },
                     context_tokens,

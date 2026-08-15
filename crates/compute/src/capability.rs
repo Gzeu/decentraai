@@ -52,6 +52,21 @@ impl ServedModel {
         let kv_mib = (u64::from(ctx) / 256).max(1);
         model_mib + kv_mib
     }
+
+    /// Pure, conservative estimate of the host RAM footprint (MiB) to LOAD a
+    /// GGUF model fully into system memory — the CPU-only execution case.
+    ///
+    /// A Q4/Q5 GGUF's weights are ~the file size; loading into RAM needs that
+    /// plus page/buffer overhead, so we budget 120% of the file. This is the
+    /// single authoritative full-load RAM estimator; the "Models I can run"
+    /// hub view routes through it. A worker that GPU-offloads the weights
+    /// holds only a *working set* in RAM, which is a different (smaller) load
+    /// mode — the distributed scheduler uses its own heuristic for that case
+    /// and it must be validated on hardware, not swapped in blindly.
+    pub fn estimate_ram_mb(model_size_bytes: u64) -> u64 {
+        let mib = (model_size_bytes / (1024 * 1024)).max(1);
+        mib * 120 / 100
+    }
 }
 
 /// Immutable capability of a worker. Advertised on registration and changes
@@ -193,5 +208,16 @@ mod tests {
         assert!(small > 0);
         assert!(big > small, "larger model must advertise more VRAM");
         assert!(small >= (2048 + (4096 / 256)) as u64, "model MiB + KV headroom");
+    }
+
+    #[test]
+    fn estimate_ram_is_full_load_footprint() {
+        // Full-load RAM = 120% of the model bytes, monotone and floor-1.
+        let small = ServedModel::estimate_ram_mb(1 << 30); // 1 GiB
+        let big = ServedModel::estimate_ram_mb(8 << 30); // 8 GiB
+        assert_eq!(small, 1024 * 120 / 100);
+        assert!(big > small, "larger model needs more full-load RAM");
+        // A tiny file still gets a floor of at least 1 MiB budget.
+        assert!(ServedModel::estimate_ram_mb(1) >= 1);
     }
 }

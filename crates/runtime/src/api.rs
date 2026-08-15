@@ -1078,11 +1078,7 @@ async fn hub_compare_model_body(
     let mut fabric_variants = Vec::new();
     for f in files {
         let size = f.size.unwrap_or(0);
-        // RAM and VRAM are separate, non-interchangeable resources: a model's
-        // weights occupy ~file size when offloaded to VRAM, and ~1.2x file
-        // size when loaded into system RAM. Each resource is compared against
-        // its OWN estimate — never mixed (honesty §49).
-        let est_ram_mb = (size * 120 / 100) / (1024 * 1024);
+        let est_ram_mb = decentraai_compute::ServedModel::estimate_ram_mb(size);
         let est_vram_mb = (size * 105 / 100) / (1024 * 1024);
         let mut can_run_workers = Vec::new();
         let mut trusted_worker_count = 0usize;
