@@ -1210,6 +1210,7 @@ dependencies = [
  "decentraai-config",
  "decentraai-distributed",
  "decentraai-fabric",
+ "decentraai-hub",
  "decentraai-p2p",
  "decentraai-registry",
  "decentraai-system-probe",

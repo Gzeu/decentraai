@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -687,6 +687,152 @@ async fn admin_token_revoke_handler(
         .into_response()
 }
 
+/// Model Hub search (Part 16/22): `GET /api/admin/hub/search?query=…&limit=…`
+/// queries HuggingFace for GGUF models. Master-gated; the dashboard Model Hub
+/// card calls this to let operators discover models to pull, on-device.
+async fn admin_hub_search_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let q = query.get("query").cloned().unwrap_or_default();
+    if q.trim().is_empty() {
+        return forbidden("missing query");
+    }
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .min(30);
+    let catalog = decentraai_hub::HubCatalog::new();
+    match catalog.search(&q, limit).await {
+        Ok(models) => {
+            let body = hub_search_body(&q, &models);
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}})
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+/// Serialize a Hub search result for the admin API. Pure, so tests can
+/// drive it with synthetic models.
+fn hub_search_body(query: &str, models: &[decentraai_hub::HubModel]) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "models": models.iter().map(|m| serde_json::json!({
+            "id": m.id,
+            "pipeline_tag": m.pipeline_tag.as_ref().map(|t| t.as_str()),
+            "tags": m.tags,
+            "downloads": m.downloads,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Refresh the local registry after a model pull. Pure-ish (filesystem only,
+/// no network): scans the models dir and saves the registry atomically.
+fn refresh_registry_after_pull(
+    models_dir: &std::path::Path,
+    registry_path: &std::path::Path,
+) -> Result<usize> {
+    let mut registry = if registry_path.exists() {
+        match decentraai_registry::ModelRegistry::load(registry_path) {
+            Ok(r) => r,
+            Err(_) => decentraai_registry::ModelRegistry::new(models_dir.to_path_buf())?,
+        }
+    } else {
+        decentraai_registry::ModelRegistry::new(models_dir.to_path_buf())?
+    };
+    let count = registry.scan_directory(models_dir)?;
+    registry.save(registry_path)?;
+    Ok(count)
+}
+
+/// Model Hub pull (Part 16/22): `POST /api/admin/hub/pull` with
+/// `{"reference":"hf:org/repo[:file]"}` downloads a verified GGUF into the
+/// node's models dir and refreshes the local registry, so the model becomes
+/// servable immediately. Master-gated; long-running (streams nothing, the
+/// dashboard shows a spinner until it resolves).
+async fn admin_hub_pull_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let reference = match req.get("reference").and_then(|v| v.as_str()) {
+        Some(r) if !r.is_empty() => r.to_string(),
+        _ => return forbidden("missing reference (hf:org/repo[:file])"),
+    };
+    let hf_ref = match decentraai_hub::HfRef::parse(&reference) {
+        Ok(r) => r,
+        Err(e) => return forbidden(&format!("bad reference: {e}")),
+    };
+    let models_dir = state.info.repo_root.join("models");
+    if let Err(e) = std::fs::create_dir_all(&models_dir) {
+        return forbidden(&format!("creating models dir: {e}"));
+    }
+    let download = match decentraai_hub::download_model(&hf_ref, &models_dir).await {
+        Ok(d) => d,
+        Err(e) => {
+            let body = serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}});
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response();
+        }
+    };
+    // Refresh the local registry so the new model is immediately usable.
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let _count = match refresh_registry_after_pull(&models_dir, &registry_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("registry refresh after pull failed: {e:#}");
+            0
+        }
+    };
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "model_pulled",
+        serde_json::json!({
+            "reference": reference,
+            "path": download.path.display().to_string(),
+            "bytes": download.bytes,
+            "sha256": download.sha256,
+        }),
+    );
+    let body = serde_json::json!({
+        "reference": reference,
+        "path": download.path.display().to_string(),
+        "bytes": download.bytes,
+        "sha256": download.sha256,
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
 /// admin endpoints. `peer_id` must be a valid base58 PeerId.
 fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
@@ -846,6 +992,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
         .route("/api/admin/worker/revoke", post(admin_worker_revoke_handler))
         .route("/api/admin/events", get(admin_audit_events_handler))
+        // Part 16/22 - Model Hub (master-gated search + pull)
+        .route("/api/admin/hub/search", get(admin_hub_search_handler))
+        .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
@@ -3788,6 +3937,95 @@ mod tests {
         assert_eq!(dev_row["expired"], false);
         assert_eq!(dev_row["requests"], 0, "usage starts at zero");
         assert_eq!(dev_row["tokens_generated"], 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn hub_search_body_serializes_downloads_tags_and_pipeline() {
+        let models = vec![
+            decentraai_hub::HubModel {
+                id: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(),
+                pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+                tags: vec!["gguf".to_string(), "conversational".to_string()],
+                downloads: 42_000,
+            },
+            decentraai_hub::HubModel {
+                id: "org/other-model".to_string(),
+                pipeline_tag: None,
+                tags: vec![],
+                downloads: 7,
+            },
+        ];
+        let body = hub_search_body("qwen", &models);
+        assert_eq!(body["query"], "qwen");
+        let arr = body["models"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "Qwen/Qwen2.5-1.5B-Instruct-GGUF");
+        assert_eq!(arr[0]["pipeline_tag"], "text-generation");
+        assert_eq!(arr[0]["downloads"], 42_000);
+        assert!(arr[1]["pipeline_tag"].is_null());
+    }
+
+    #[test]
+    fn refresh_registry_after_pull_scans_new_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // Fake GGUF (the registry only checks the extension).
+        std::fs::write(models_dir.join("fresh-model.gguf"), b"not a real model").unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let count = refresh_registry_after_pull(&models_dir, &registry_path).unwrap();
+        assert_eq!(count, 1);
+        let loaded = decentraai_registry::ModelRegistry::load(&registry_path).unwrap();
+        assert!(loaded.models.contains_key("fresh-model.gguf"));
+    }
+
+    #[tokio::test]
+    async fn admin_hub_endpoints_require_master_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Without credentials both endpoints are rejected before any Hub call.
+        let no_auth_search = client
+            .get(format!("http://{api}/api/admin/hub/search?query=qwen"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth_search.status(), 401);
+        let no_auth_pull = client
+            .post(format!("http://{api}/api/admin/hub/pull"))
+            .body(r#"{"reference":"hf:org/repo"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth_pull.status(), 401);
+
+        // With credentials but an unparseable reference, the pull rejects
+        // locally (no network touched).
+        let bad_pull = client
+            .post(format!("http://{api}/api/admin/hub/pull"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"reference":"not-a-reference"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_pull.status(), 403);
+
         manager.lock().await.shutdown().await.unwrap();
     }
 

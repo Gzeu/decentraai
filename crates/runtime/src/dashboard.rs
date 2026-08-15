@@ -549,6 +549,20 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <tbody id="disk-models"><tr><td colspan="4" class="empty">no on-disk models reported by workers</td></tr></tbody></table>
           <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="disk-models-status"></div>
         </div>
+        <!-- MODEL HUB (Part 16/22): search HuggingFace and pull a model
+             straight into this node's registry, then serve it. The search
+             and pull calls are master-gated admin endpoints; the hub never
+             runs unattended. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Model Hub</h2>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="hub-q" type="text" placeholder="search GGUF models on HuggingFace, e.g. Qwen" style="flex:1;min-width:220px;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg)">
+            <button class="btn" id="hub-search-btn" onclick="hubSearch()">Search</button>
+          </div>
+          <div id="hub-status" style="margin-top:8px;font-size:12px;color:var(--muted)">search the Hub to discover models you can pull on this node</div>
+          <table style="margin-top:8px"><thead><tr><th>Model</th><th>Category</th><th class="num">Downloads</th><th></th></tr></thead>
+          <tbody id="hub-results"><tr><td colspan="4" class="empty">nothing searched yet</td></tr></tbody></table>
+        </div>
       </section>
 
       <!-- OBSERVABILITY -->
@@ -1714,6 +1728,52 @@ function renderModels(s, c){
     ? 'workers report models they can swap in on request — ask for any of these by file name'
     : 'workers only report models they currently serve';
 }
+// Model Hub (Part 16/22): search + pull against the master-gated admin
+// endpoints. `hubResults` state is local; a pull is long-running so the
+// button shows a spinner and the row is locked until it resolves.
+let hubPulling = {};
+function hubSearch(){
+  const q = ($('hub-q').value || '').trim();
+  if (!q) { toast('type a model name to search', true); return; }
+  $('hub-status').innerHTML = 'searching HuggingFace for “'+esc(q)+'”…';
+  fetch('/api/admin/hub/search?query='+encodeURIComponent(q)+'&limit=8', { headers })
+    .then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">search failed</span> ' + esc((j.error && j.error.message) || 'unknown'); return; }
+      const rows = (j.models || []).map(m =>
+        '<tr><td>'+esc(m.id)+'</td><td>'+esc(m.pipeline_tag || '—')+'</td><td class="num">'+nfmt(m.downloads || 0)+'</td><td>'+
+        '<button class="btn small" id="hub-pull-'+safeId(m.id)+'" onclick="hubPull(\''+jsq(m.id)+'\')">Pull</button></td></tr>'
+      ).join('');
+      $('hub-results').innerHTML = rows || '<tr><td colspan="4" class="empty">no GGUF models found</td></tr>';
+      $('hub-status').innerHTML = 'search returned '+(j.models || []).length+' GGUF model(s)';
+    })
+    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">search error</span> '+esc(e); });
+}
+function hubPull(id){
+  if (hubPulling[id]) return;
+  hubPulling[id] = true;
+  const btn = $('hub-pull-'+safeId(id));
+  if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
+  $('hub-status').innerHTML = 'downloading '+esc(id)+' — large models take a while; the node keeps serving';
+  fetch('/api/admin/hub/pull', {
+    method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ reference: 'hf:' + id }),
+  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (!ok) { $('hub-status').innerHTML = '<span class="badge warn">pull failed</span> ' + esc((j.error && j.error.message) || 'unknown'); }
+      else {
+        $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.reference)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
+        toast('model pulled: ' + short(j.reference, 24));
+        refresh();
+      }
+      delete hubPulling[id];
+      if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
+    })
+    .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">pull error</span> '+esc(e); delete hubPulling[id]; if (btn) { btn.disabled = false; btn.textContent = 'Pull'; } });
+}
+function safeId(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+function jsq(s){ return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+function nfmt(n){ return n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
 function renderObservability(s, c){
   const lat = (s && s.recent_requests || []).map(r => r.duration_ms);
   const tps = (s && s.recent_requests || []).map(r => r.tokens_per_second);
