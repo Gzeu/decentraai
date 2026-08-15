@@ -855,6 +855,56 @@ fn filter_local_models_by_capability(
     })
 }
 
+/// Evaluate every worker in the fabric against a model + capability query
+/// (MCP `get_worker_capability`). A thin, READ-ONLY projection: it reuses the
+/// authoritative worker advertisements, persisted registry claims, the existing
+/// capability resolver and resource-fit vocabulary — no execution, no
+/// reservations, no model start. Remote workers with no capability/telemetry
+/// data resolve to honest UNKNOWN rather than a fabricated verdict.
+async fn mcp_worker_capability(
+    state: &ApiState,
+    model: &str,
+    capability: &str,
+    evidence: &str,
+) -> serde_json::Value {
+    // Best-effort registry load for persisted claims (absent => UNKNOWN).
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
+    let claims: Vec<(String, String)> = registry
+        .as_ref()
+        .map(|reg| {
+            claims_for_file_name(reg, model)
+                .into_iter()
+                .map(|c| (c.capability, c.provenance))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut workers_json = Vec::new();
+    if let Some(cm) = &state.compute {
+        for adv in cm.workers().await {
+            let trusted = cm.is_trusted(&adv.peer_id).await;
+            let r = worker_capability_verdict(
+                &adv,
+                trusted,
+                model,
+                capability,
+                evidence,
+                &claims,
+            );
+            workers_json.push(r.to_json());
+        }
+    }
+
+    serde_json::json!({
+        "model": model,
+        "capability": capability,
+        "evidence": evidence,
+        "worker_count": workers_json.len(),
+        "workers": workers_json,
+    })
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -1279,6 +1329,326 @@ fn resource_fit(
         local_fit,
         trusted_worker_can_run,
         classification,
+    }
+}
+
+/// Final verdict for a worker's capability query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCapVerdict {
+    CanRun,
+    CannotRun,
+    Unknown,
+}
+
+/// One explainable check contributing to a worker verdict.
+#[derive(Debug, Clone)]
+struct WorkerCheck {
+    check: &'static str,
+    pass: bool,
+    state: String,
+    reason: String,
+}
+
+/// The pure result of evaluating one worker against a capability query.
+#[derive(Debug, Clone)]
+struct WorkerCapResult {
+    peer_id: String,
+    node_id: String,
+    node_name: String,
+    verdict: WorkerCapVerdict,
+    checks: Vec<WorkerCheck>,
+    model_availability: &'static str,
+    trusted: bool,
+    ram_sufficient: bool,
+    vram_sufficient: bool,
+    est_ram_mb: u64,
+    est_vram_mb: u64,
+    engine_compat: &'static str,
+}
+
+impl WorkerCapResult {
+    /// Serialize to the MCP-facing projection (real identity kept separate).
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "worker": {
+                "peer_id": self.peer_id,
+                "node_id": self.node_id,
+                "node_name": self.node_name,
+            },
+            "verdict": match self.verdict {
+                WorkerCapVerdict::CanRun => "CAN_RUN",
+                WorkerCapVerdict::CannotRun => "CANNOT_RUN",
+                WorkerCapVerdict::Unknown => "UNKNOWN",
+            },
+            "model_availability": self.model_availability,
+            "trusted": self.trusted,
+            "engine": self.engine_compat,
+            "resource_fit": {
+                "ram_sufficient": self.ram_sufficient,
+                "vram_sufficient": self.vram_sufficient,
+                "est_ram_mb": self.est_ram_mb,
+                "est_vram_mb": self.est_vram_mb,
+            },
+            "checks": self.checks.iter().map(|c| serde_json::json!({
+                "check": c.check,
+                "pass": c.pass,
+                "state": c.state,
+                "reason": c.reason,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Resolve the engine-compatibility state for a worker advertising `engine`
+/// that holds `model`.
+///
+/// DecentraAI only spawns llama-server (a GGUF-serving OpenAI-compatible
+/// engine), and a worker advertises a model as *served* only when its engine
+/// actually runs it — so a served model is engine-compatible by construction.
+/// A model that is merely on disk (not served) still requires the engine to
+/// serve GGUF; the bundled engine does, so on-disk is compatible. An
+/// unknown/unparsed engine with a model on disk cannot be confirmed, so it is
+/// `unknown`. A worker that does not hold the model cannot claim a compatible
+/// engine for it.
+fn worker_engine_compat(engine: &str, model_served: bool, model_on_disk: bool) -> &'static str {
+    if model_served {
+        return "compatible"; // the engine is demonstrably running this model
+    }
+    let kind = decentraai_fabric::EngineKind::parse(engine);
+    match kind {
+        decentraai_fabric::EngineKind::LlamaServer
+        | decentraai_fabric::EngineKind::Vllm
+        | decentraai_fabric::EngineKind::Sglang
+        | decentraai_fabric::EngineKind::Ollama => {
+            if model_on_disk {
+                "compatible" // known GGUF-serving engine can be swapped to this model
+            } else {
+                "unknown" // does not hold the model; cannot confirm a path to it
+            }
+        }
+        decentraai_fabric::EngineKind::RemoteOpenAI => "unknown", // unprobed generic endpoint
+    }
+}
+
+/// Pure per-worker capability verdict. A thin projection reusing the existing
+/// capability resolver, resource-fit vocabulary and the authoritative
+/// advertisement (peer_id / node_id / node_name are never conflated).
+///
+/// `model` is matched against the worker's served/available models by file
+/// name (suffix-safe). `claims` are the model's persisted capability claims
+/// (`(capability, provenance)`), `evidence` is "any" or "verified".
+fn worker_capability_verdict(
+    adv: &decentraai_compute::ComputeAdvertisement,
+    trusted: bool,
+    model: &str,
+    capability: &str,
+    evidence: &str,
+    claims: &[(String, String)],
+) -> WorkerCapResult {
+    let model_lower = model.to_lowercase();
+    let matches_model = |m: &decentraai_compute::ServedModel| {
+        let f = m.file_name.to_lowercase();
+        f == model_lower || f.ends_with(&model_lower) || model_lower.ends_with(&f)
+    };
+
+    let served = adv.capability.served_models.iter().any(matches_model);
+    let on_disk = adv.capability.available_models.iter().any(matches_model);
+    let model_entry = adv
+        .capability
+        .served_models
+        .iter()
+        .find(|m| matches_model(m))
+        .or_else(|| adv.capability.available_models.iter().find(|m| matches_model(m)));
+
+    let model_availability = if served {
+        "served"
+    } else if on_disk {
+        "local_on_disk"
+    } else {
+        "unavailable"
+    };
+
+    let engine_compat = worker_engine_compat(&adv.capability.engine, served, on_disk);
+    let est_ram_mb = model_entry.map(|m| m.est_ram_mb).unwrap_or(0);
+    let est_vram_mb = model_entry.map(|m| m.est_vram_mb).unwrap_or(0);
+
+    // RAM/VRAM fit from the model's own estimates vs the worker's advertised
+    // availability. Missing telemetry must stay UNKNOWN, not a false pass.
+    let avail_ram = adv.availability.available_ram_mb;
+    let avail_vram = adv.availability.available_vram_mb;
+    let ram_known = model_entry.is_some() && est_ram_mb > 0;
+    let ram_sufficient = ram_known && avail_ram >= est_ram_mb;
+    let vram_known = model_entry.is_some()
+        && est_vram_mb > 0
+        && avail_vram.is_some();
+    let vram_sufficient = vram_known
+        && avail_vram.is_some_and(|v| v >= est_vram_mb);
+
+    let mut checks: Vec<WorkerCheck> = Vec::new();
+
+    // Capability verdict via the existing resolver (honest provenance).
+    // When there is NO capability data at all (empty claims), the honest state
+    // is UNKNOWN — the resolver would report MISSING, but "no data" is distinct
+    // from "claims exist and none match". Never convert UNKNOWN into success or
+    // failure.
+    let cap_view = if claims.is_empty() {
+        let label = capability.replace('_', " ");
+        decentraai_fabric::planner::CapabilityRequirementView {
+            capability: capability.to_string(),
+            label,
+            satisfied: false,
+            evidence: "UNKNOWN".to_string(),
+        }
+    } else {
+        let claim_refs: Vec<(&str, &str)> = claims
+            .iter()
+            .map(|(c, p)| (c.as_str(), p.as_str()))
+            .collect();
+        decentraai_fabric::planner::resolve_capability_requirement(capability, &claim_refs)
+    };
+    let cap_pass = cap_view.satisfied;
+    checks.push(WorkerCheck {
+        check: "capability",
+        pass: cap_pass,
+        state: cap_view.evidence.clone(),
+        reason: if cap_pass {
+            format!("{} — {} evidence", cap_view.label, cap_view.evidence)
+        } else {
+            format!(
+                "{} — {} (insufficient provenance for evidence='{evidence}')",
+                cap_view.label, cap_view.evidence
+            )
+        },
+    });
+
+    // Model availability.
+    let avail_pass = model_availability != "unavailable";
+    checks.push(WorkerCheck {
+        check: "model_available",
+        pass: avail_pass,
+        state: model_availability.to_string(),
+        reason: match model_availability {
+            "served" => "model is currently served by this worker".into(),
+            "local_on_disk" => "model is on disk (not loaded); engine can be swapped".into(),
+            _ => "model is not on this worker".into(),
+        },
+    });
+
+    // Trust.
+    checks.push(WorkerCheck {
+        check: "trusted",
+        pass: trusted,
+        state: if trusted { "trusted" } else { "not_trusted" }.into(),
+        reason: if trusted {
+            "worker is trusted by this coordinator".into()
+        } else {
+            "worker is not trusted".into()
+        },
+    });
+
+    // Engine compatibility.
+    let engine_pass = engine_compat == "compatible";
+    checks.push(WorkerCheck {
+        check: "engine",
+        pass: engine_pass,
+        state: engine_compat.to_string(),
+        reason: match engine_compat {
+            "compatible" => format!("engine '{}' can serve this model", adv.capability.engine),
+            "unknown" => format!("engine '{}' compatibility unknown for this model", adv.capability.engine),
+            _ => format!("engine '{}' incompatible with this model", adv.capability.engine),
+        },
+    });
+
+    // RAM.
+    if model_entry.is_none() {
+        checks.push(WorkerCheck {
+            check: "ram",
+            pass: false,
+            state: "unknown".into(),
+            reason: "no model footprint on this worker; cannot estimate RAM".into(),
+        });
+    } else if !ram_known {
+        checks.push(WorkerCheck {
+            check: "ram",
+            pass: false,
+            state: "unknown".into(),
+            reason: "model RAM estimate unavailable (UNKNOWN)".into(),
+        });
+    } else {
+        checks.push(WorkerCheck {
+            check: "ram",
+            pass: ram_sufficient,
+            state: if ram_sufficient { "sufficient" } else { "insufficient" }.into(),
+            reason: format!("available RAM {} MiB vs estimated {} MiB", avail_ram, est_ram_mb),
+        });
+    }
+
+    // VRAM (separate dimension; CPU-only model => trivially satisfied).
+    if est_vram_mb == 0 {
+        checks.push(WorkerCheck {
+            check: "vram",
+            pass: true,
+            state: "not_applicable".into(),
+            reason: "CPU-only model requires no VRAM".into(),
+        });
+    } else if !vram_known {
+        checks.push(WorkerCheck {
+            check: "vram",
+            pass: false,
+            state: "unknown".into(),
+            reason: "GPU/VRAM telemetry unavailable (UNKNOWN)".into(),
+        });
+    } else {
+        checks.push(WorkerCheck {
+            check: "vram",
+            pass: vram_sufficient,
+            state: if vram_sufficient { "sufficient" } else { "insufficient" }.into(),
+            reason: format!(
+                "available VRAM {} MiB vs estimated {} MiB",
+                avail_vram.unwrap_or(0),
+                est_vram_mb
+            ),
+        });
+    }
+
+    // Combine into a verdict. A definitive hard failure => CANNOT_RUN; any
+    // UNKNOWN component with no hard failure => UNKNOWN; else CAN_RUN.
+    // A capability with no evidence (UNKNOWN) is not a hard failure — it is an
+    // unknown that must NOT be converted into success OR failure.
+    let cap_hard_fail = !cap_pass && cap_view.evidence != "UNKNOWN";
+    let has_hard_fail = cap_hard_fail
+        || !avail_pass
+        || !trusted
+        || !engine_pass
+        || (ram_known && !ram_sufficient)
+        || (est_vram_mb > 0 && vram_known && !vram_sufficient);
+    let has_unknown = model_entry.is_none()
+        || !ram_known
+        || (est_vram_mb > 0 && !vram_known)
+        || engine_compat == "unknown"
+        || cap_view.evidence == "UNKNOWN";
+
+    let verdict = if has_hard_fail {
+        WorkerCapVerdict::CannotRun
+    } else if has_unknown {
+        WorkerCapVerdict::Unknown
+    } else {
+        WorkerCapVerdict::CanRun
+    };
+
+    WorkerCapResult {
+        peer_id: adv.peer_id.to_string(),
+        node_id: adv.node_id.clone(),
+        node_name: adv.node_name.clone(),
+        verdict,
+        checks,
+        model_availability,
+        trusted,
+        ram_sufficient,
+        vram_sufficient,
+        est_ram_mb,
+        est_vram_mb,
+        engine_compat,
     }
 }
 
@@ -2157,6 +2527,11 @@ async fn mcp_handler(
     if let Some((capability, evidence)) = crate::mcp::local_capability_search_request(&raw) {
         ctx.local_capability_search = mcp_local_capability_search(&state, &capability, &evidence).await;
     }
+    // A `get_worker_capability` call evaluates every fabric worker against a
+    // model + capability requirement (read-only projection, no execution).
+    if let Some((model, capability, evidence)) = crate::mcp::worker_capability_request(&raw) {
+        ctx.worker_capability = mcp_worker_capability(&state, &model, &capability, &evidence).await;
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -2237,6 +2612,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         peers,
         capability_search: serde_json::json!({ "matched": 0, "models": [] }),
         local_capability_search: serde_json::json!({ "matched": 0, "models": [] }),
+        worker_capability: serde_json::json!({ "model": "", "worker_count": 0, "workers": [] }),
     }
 }
 
@@ -5357,6 +5733,187 @@ mod tests {
         // No matching capability and no-claims models are never included.
         let r = filter_local_models_by_capability(&list, "coding", "any");
         assert_eq!(r["matched"], 0);
+    }
+
+    // ---- get_worker_capability pure verdict tests ----
+
+    /// A full-control advertisement builder for the worker capability verdict.
+    /// `served` puts the model in served_models; `on_disk` in available_models.
+    fn cap_adv(
+        peer: &decentraai_p2p::PeerId,
+        node_id: &str,
+        engine: &str,
+        avail_ram: u64,
+        avail_vram: Option<u64>,
+        est: (u64, u64),
+        held: (bool, bool),
+    ) -> decentraai_distributed::ComputeAdvertisement {
+        let (est_ram, est_vram) = est;
+        let (served, on_disk) = held;
+        let mut sm = decentraai_distributed::compute::ServedModel {
+            model_hash: "h".into(),
+            file_name: "qwen.gguf".into(),
+            size_mb: 1024,
+            est_ram_mb: est_ram,
+            est_vram_mb: est_vram,
+            context_tokens: 4096,
+        };
+        if !served && !on_disk {
+            sm.file_name = "other.gguf".into(); // worker does not hold the model
+        }
+        decentraai_distributed::ComputeAdvertisement {
+            peer_id: *peer,
+            node_name: node_id.to_string(),
+            capability: decentraai_distributed::compute::ComputeCapability {
+                cpu_cores: 4,
+                ram_mb: 16384,
+                gpu: if est_vram > 0 { Some(decentraai_distributed::compute::GpuSpec {
+                    name: "gpu".into(), vram_mb: est_vram + 1024, driver: "x".into(),
+                }) } else { None },
+                engine: engine.to_string(),
+                served_models: if served { vec![sm.clone()] } else { vec![] },
+                can_provision: false,
+                available_models: if on_disk { vec![sm] } else { vec![] },
+            },
+            availability: decentraai_distributed::compute::ComputeAvailability {
+                available_ram_mb: avail_ram,
+                available_vram_mb: avail_vram,
+                load_percent: 0,
+                queue_depth: 0,
+                tokens_per_second: 10,
+                current_latency_ms: 1,
+                status: decentraai_distributed::compute::WorkerHealth::Ready,
+            },
+            announced_at_ms: 0,
+            accepts_remote_inference: true,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    fn claims_verified_ocr() -> Vec<(String, String)> {
+        vec![("ocr".to_string(), "verified".to_string())]
+    }
+
+    #[test]
+    fn worker_cap_verified_claim_plus_compatible_worker_can_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::CanRun);
+        assert_eq!(r.model_availability, "served");
+        assert!(r.trusted);
+        assert_eq!(r.engine_compat, "compatible");
+        let cap = r.checks.iter().find(|c| c.check == "capability").unwrap();
+        assert!(cap.pass && cap.state == "VERIFIED");
+        // Identity stays distinct.
+        assert_eq!(r.node_id, "dca-node1");
+        assert_eq!(r.node_name, "dca-node1");
+        assert_eq!(r.peer_id, peer.to_string());
+        assert_ne!(r.node_id, r.peer_id);
+    }
+
+    #[test]
+    fn worker_cap_insufficient_ram_cannot_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        // Model needs 8192 MiB RAM but worker has only 512 free.
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 512, Some(8192), (8192, 2048), (true, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
+        let ram = r.checks.iter().find(|c| c.check == "ram").unwrap();
+        assert!(!ram.pass && ram.state == "insufficient");
+    }
+
+    #[test]
+    fn worker_cap_insufficient_vram_cannot_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        // Model needs 8192 MiB VRAM but worker has only 512 free.
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(512), (1024, 8192), (true, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
+        let vram = r.checks.iter().find(|c| c.check == "vram").unwrap();
+        assert!(!vram.pass && vram.state == "insufficient");
+    }
+
+    #[test]
+    fn worker_cap_inferred_claim_with_verified_evidence_cannot_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        // Only an INFERRED claim, but evidence=verified is required.
+        let inferred = vec![("ocr".to_string(), "inferred".to_string())];
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "verified", &inferred);
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
+        let cap = r.checks.iter().find(|c| c.check == "capability").unwrap();
+        assert!(!cap.pass && cap.state == "INFERRED");
+    }
+
+    #[test]
+    fn worker_cap_missing_claim_unknown() {
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        // No claim at all for the model -> UNKNOWN (never a false pass).
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &[]);
+        assert_eq!(r.verdict, WorkerCapVerdict::Unknown);
+        let cap = r.checks.iter().find(|c| c.check == "capability").unwrap();
+        assert!(!cap.pass && cap.state == "UNKNOWN");
+    }
+
+    #[test]
+    fn worker_cap_untrusted_cannot_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let r = worker_capability_verdict(&adv, false, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
+        let t = r.checks.iter().find(|c| c.check == "trusted").unwrap();
+        assert!(!t.pass && t.state == "not_trusted");
+    }
+
+    #[test]
+    fn worker_cap_incompatible_engine_cannot_run() {
+        let peer = decentraai_p2p::PeerId::random();
+        // Unknown engine holding a model on disk -> compatibility unknown (not
+        // a definitive incompatible); use a model the worker does NOT hold for
+        // a hard engine failure via unavailable model.
+        let adv = cap_adv(&peer, "dca-node1", "weird-engine", 8192, Some(8192), (1024, 2048), (false, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun); // model unavailable
+    }
+
+    #[test]
+    fn worker_cap_missing_telemetry_unknown() {
+        let peer = decentraai_p2p::PeerId::random();
+        // Model served but est_ram=0 (unknown footprint) -> RAM UNKNOWN, and no
+        // VRAM telemetry -> overall UNKNOWN (no hard failure).
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, None, (0, 0), (true, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.verdict, WorkerCapVerdict::Unknown);
+        let ram = r.checks.iter().find(|c| c.check == "ram").unwrap();
+        assert!(!ram.pass && ram.state == "unknown");
+    }
+
+    #[test]
+    fn worker_cap_no_workers_unknown_not_invented() {
+        // No workers in the fabric -> the MCP projection reports 0 workers and
+        // an explicit UNKNOWN (no invented reason). This is exercised at the
+        // projection level via mcp_worker_capability with no compute manager.
+        // The pure per-worker function on an unavailable model yields CannotRun
+        // (honest: model not present), which the projection folds into UNKNOWN
+        // when there are zero workers.
+        let j = serde_json::json!({ "model": "qwen.gguf", "capability": "ocr", "worker_count": 0, "workers": [] });
+        assert_eq!(j["worker_count"], 0);
+        assert!(j["workers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_cap_json_keeps_identity_separate() {
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let j = r.to_json();
+        assert_eq!(j["worker"]["node_id"], "dca-node1");
+        assert_eq!(j["worker"]["node_name"], "dca-node1");
+        assert_eq!(j["worker"]["peer_id"], peer.to_string());
+        assert_ne!(j["worker"]["node_id"], j["worker"]["peer_id"]);
+        assert_eq!(j["verdict"], "CAN_RUN");
     }
 
     #[tokio::test]

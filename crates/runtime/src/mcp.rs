@@ -48,6 +48,10 @@ pub struct McpContext {
     /// Precomputed by the HTTP layer from the fabric model list + persisted
     /// registry claims (no Hub round-trip); the protocol layer only translates.
     pub local_capability_search: Value,
+    /// Result of `get_worker_capability`: which fabric workers can run a model
+    /// for a required capability, with explainable reasons. Precomputed by the
+    /// HTTP layer; the protocol layer only translates.
+    pub worker_capability: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -127,6 +131,30 @@ fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "get_worker_capability",
+            description: "Ask which workers in THIS fabric can run a model for a required capability. Returns, per worker: real identity (peer_id/node_id/node_name kept separate), model availability (served/on-disk/unavailable), trust, engine compatibility, RAM/VRAM fit, the capability provenance, and an explainable CAN_RUN / CANNOT_RUN / UNKNOWN verdict. Read-only — never triggers execution or reservations.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "string",
+                        "description": "Model file name or id (e.g. 'qwen2.5-7b-instruct-q4_k_m.gguf').",
+                    },
+                    "capability": {
+                        "type": "string",
+                        "description": "Required capability in snake_case, e.g. ocr, vision, coding, summarization.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "enum": ["any", "verified"],
+                        "description": "'verified' requires a VERIFIED claim; 'any' (default) accepts inferred too.",
+                    },
+                },
+                "required": ["model", "capability"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -191,6 +219,37 @@ pub fn local_capability_search_request(raw: &str) -> Option<(String, String)> {
         .unwrap_or_else(|| "any".to_string());
     let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
     Some((capability, evidence))
+}
+
+/// Extract the parameters of a `get_worker_capability` call, if the incoming
+/// message is one. Pure — lets the HTTP layer precompute the per-worker
+/// verdict into [`McpContext::worker_capability`]. Returns
+/// `(model, capability, evidence)`.
+pub fn worker_capability_request(raw: &str) -> Option<(String, String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "get_worker_capability" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let model = args.get("model").and_then(|m| m.as_str())?.to_string();
+    let capability = args.get("capability").and_then(|c| c.as_str())?.to_string();
+    if model.is_empty() || capability.is_empty() {
+        return None;
+    }
+    let evidence = args
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "any".to_string());
+    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    Some((model, capability, evidence))
 }
 
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
@@ -272,6 +331,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "list_peers" => &ctx.peers,
         "search_models_by_capability" => &ctx.capability_search,
         "find_local_models_by_capability" => &ctx.local_capability_search,
+        "get_worker_capability" => &ctx.worker_capability,
         _ => return None,
     };
     Some(json!({
@@ -303,6 +363,7 @@ mod tests {
             peers: json!([{ "peer_id": "p1" }]),
             capability_search: json!({ "query": "", "matched": 1, "models": [{ "id": "org/vision" }] }),
             local_capability_search: json!({ "matched": 1, "models": [{ "id": "local.gguf", "evidence": "verified" }] }),
+            worker_capability: json!({ "model": "m", "capability": "ocr", "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
         }
     }
 
@@ -335,6 +396,7 @@ mod tests {
         assert!(names.contains(&"list_executions"));
         assert!(names.contains(&"search_models_by_capability"));
         assert!(names.contains(&"find_local_models_by_capability"));
+        assert!(names.contains(&"get_worker_capability"));
         // Each tool declares a JSON schema.
         assert!(tools.iter().all(|t| t["inputSchema"].is_object()));
     }
@@ -383,6 +445,33 @@ mod tests {
         assert_eq!(ev, "verified");
         // Non-matching methods yield None.
         assert!(local_capability_search_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+    }
+
+    #[test]
+    fn get_worker_capability_returns_precomputed_verdict() {
+        // HTTP layer precomputes the per-worker verdict; protocol returns it.
+        let r = call(r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_worker_capability","arguments":{"model":"qwen.gguf","capability":"ocr","evidence":"verified"}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("CAN_RUN"), "must return the supplied snapshot");
+        assert!(content.contains("\"node_id\":\"w1\""));
+    }
+
+    #[test]
+    fn worker_capability_request_parses_args_and_defaults_evidence() {
+        let (m, c, ev) = worker_capability_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_worker_capability","arguments":{"model":"qwen.gguf","capability":"ocr"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(m, "qwen.gguf");
+        assert_eq!(c, "ocr");
+        assert_eq!(ev, "any");
+        // Explicit verified honored; non-matching method -> None.
+        let (_, _, ev) = worker_capability_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_worker_capability","arguments":{"model":"qwen.gguf","capability":"ocr","evidence":"verified"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, "verified");
+        assert!(worker_capability_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
     }
 
     #[test]

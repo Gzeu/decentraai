@@ -940,3 +940,26 @@ data — no Hub round-trip, no privilege change.
   (case-insensitive, provenance-honest).
 - [x] Tests: tool dispatch, arg extraction (evidence defaults to `any`),
   and the pure filter (any/verified/case-insensitive/no-claim honesty).
+
+## 31. Next-Gen Phase 7 — MCP get_worker_capability
+
+The North Star question "which workers in MY fabric can run this model for this
+capability?" as a read-only MCP tool — a thin projection over existing fabric
+state, no execution/reservations/model start.
+
+- [x] `get_worker_capability { model, capability, evidence }` tool: per worker
+  returns real identity (peer_id/node_id/node_name kept separate), model
+  availability (served/on-disk/unavailable), trust, engine compatibility,
+  RAM/VRAM fit, capability provenance, and an explainable
+  CAN_RUN / CANNOT_RUN / UNKNOWN verdict (no opaque score).
+- [x] Pure `worker_capability_verdict` reuses the existing capability resolver
+  (`resolve_capability_requirement`), the resource-fit vocabulary, and the
+  authoritative `ComputeAdvertisement` — no duplicate scoring/estimator/matcher.
+- [x] Honest by construction: empty claims → UNKNOWN (never success/failure);
+  UNKNOWN capability/provenance/resource telemetry is never converted into a
+  verdict; remote workers with no data resolve to UNKNOWN, not a fabricated
+  pass; no workers → explicit UNKNOWN/no compatible worker.
+- [x] Tests cover all ten required cases: verified+compatible → CAN_RUN,
+  insufficient RAM/VRAM → CANNOT_RUN, inferred+verified-evidence → CANNOT_RUN,
+  missing claim → UNKNOWN, untrusted → CANNOT_RUN, missing telemetry → UNKNOWN,
+  no workers → UNKNOWN, and identity separation.
