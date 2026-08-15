@@ -950,6 +950,40 @@ async fn hub_model_body(
             }
         }
     }
+    let local_snapshot = decentraai_system_probe::SystemSnapshot::collect();
+    let local_avail_ram_mb = local_snapshot.available_memory_bytes / (1024 * 1024);
+    let local_vram_mb = match decentraai_system_probe::probe_gpu() {
+        decentraai_system_probe::GpuProbeStatus::Nvidia(gpu) => Some(gpu.free_vram_mib),
+        _ => None,
+    };
+
+    let mut fabric_variants = Vec::new();
+    for f in files {
+        let size = f.size.unwrap_or(0);
+        let est_ram_mb = (size * 120 / 100) / (1024 * 1024);
+        let mut can_run_workers = Vec::new();
+        if let Some(cm) = &state.compute {
+            for w in cm.workers().await {
+                let w_ram = w.availability.available_ram_mb;
+                let w_vram = w.availability.available_vram_mb.unwrap_or(0);
+                if w_ram >= est_ram_mb || w_vram >= est_ram_mb {
+                    can_run_workers.push(serde_json::json!({
+                        "node_id": w.node_id,
+                        "node_name": w.node_name,
+                    }));
+                }
+            }
+        }
+        fabric_variants.push(serde_json::json!({
+            "file": f.path,
+            "size_bytes": f.size,
+            "sha256": f.lfs.as_ref().map(|l| l.oid.clone()),
+            "est_ram_mb": est_ram_mb,
+            "local_fit": local_avail_ram_mb >= est_ram_mb || local_vram_mb.unwrap_or(0) >= est_ram_mb,
+            "fabric_fit_nodes": can_run_workers,
+        }));
+    }
+
     serde_json::json!({
         "id": repo,
         "metadata": {
@@ -973,11 +1007,7 @@ async fn hub_model_body(
                 "task": t.task,
             })).collect::<Vec<_>>(),
         },
-        "variants": files.iter().map(|f| serde_json::json!({
-            "file": f.path,
-            "size_bytes": f.size,
-            "sha256": f.lfs.as_ref().map(|l| l.oid.clone()),
-        })).collect::<Vec<_>>(),
+        "variants": fabric_variants,
         "fabric": fabric_nodes,
     })
 }

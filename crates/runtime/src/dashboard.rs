@@ -1872,7 +1872,7 @@ function hubOpenDetail(id){
       $('md-tasks').innerHTML = tasks.length ? tasks.map(t => esc(t.task)).join(' · ') : '—';
       const variants = j.variants || [];
       $('md-variants').innerHTML = variants.length ? variants.map(v =>
-        '<tr><td class="mono">'+esc(v.file)+'</td><td class="num">'+fmtMB((v.size_bytes||0)/1048576)+'</td><td class="mono">'+esc(short(v.sha256 || '', 12))+'</td><td>'+
+        '<tr><td class="mono">'+esc(v.file)+'<div class="sub" style="font-size:10px">'+(v.local_fit?'<span class="badge ok" style="font-size:9px">Can run locally (~'+fmtMB(v.est_ram_mb)+')</span>':'<span class="badge warn" style="font-size:9px">Needs ~'+fmtMB(v.est_ram_mb)+' RAM/VRAM</span>')+(v.fabric_fit_nodes && v.fabric_fit_nodes.length ? ' · '+v.fabric_fit_nodes.length+' fabric node(s) fit' : '')+'</div></td><td class="num">'+fmtMB((v.size_bytes||0)/1048576)+'</td><td class="mono">'+esc(short(v.sha256 || '', 12))+'</td><td>'+
         '<button class="btn small" id="hub-pull-'+safeId(j.id+':'+v.file)+'" onclick="hubPullVariant(\''+jsq(j.id)+'\',\''+jsq(v.file)+'\')">Pull</button></td></tr>'
       ).join('') : '<tr><td colspan="4" class="empty">no variants reported</td></tr>';
       const fabric = j.fabric || [];
