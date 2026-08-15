@@ -774,3 +774,28 @@ Turn DecentraAI into an installable app; the normal user flow is
   the model backend deterministically before it is ready.
 - [x] systemd user unit + installer + uninstaller + `.desktop` launcher +
   auto-start on boot/reboot (user lingering).
+
+## 23. Next-Gen Phase 1 — Capability Requirements & Provenance Matching
+
+The Hub already classifies models into a capability taxonomy with VERIFIED /
+INFERRED provenance. What was missing was a way to *ask the Hub* "which models
+can do X?" with an explainable, provenance-aware verdict instead of manually
+naming a model. This is the foundation of the Next-Gen capability fabric,
+intent planning, and the agent control plane's "which models can run this?"
+
+- [x] `CapabilityRequirement` — a required capability plus a minimum evidence
+  level (`EvidenceLevel::Verified` / `EvidenceLevel::Any`).
+- [x] `match_requirements` / `satisfies_any` — pure, deterministic matching of a
+  model's capabilities against a requirement set, returning a per-requirement
+  checklist (`Satisfied` / `InsufficientProvenance` / `Missing`) with a human
+  reason for each. No opaque score.
+- [x] Honesty guarantees: an INFERRED claim never satisfies a VERIFIED
+  requirement (reported as `InsufficientProvenance`); an absent capability is
+  `Missing` (UNKNOWN), never assumed satisfied; a model's unrequested
+  capabilities are surfaced separately as `extra`.
+- [x] `CapabilityKind::from_str` — parse the snake_case serialized form so API /
+  MCP can express capability filters.
+- [x] Hub search capability filter — `GET /api/admin/hub/search?capability=ocr`
+  returns only models whose real metadata supports that capability (with
+  `matched`/`total` counts), dropping models that cannot back the claim.
+- [x] Tests for every honesty rule + the API filter (pure, no hardware).

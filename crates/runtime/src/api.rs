@@ -707,10 +707,16 @@ async fn admin_hub_search_handler(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(8)
         .min(30);
+    // Optional capability filter: keep only models whose real metadata supports
+    // the requested capability (e.g. `capability=ocr`). Unsupported or invalid
+    // capability values yield an empty filtered set, never a false positive.
+    let capability = query
+        .get("capability")
+        .and_then(|v| v.parse::<decentraai_hub::CapabilityKind>().ok());
     let catalog = decentraai_hub::HubCatalog::new();
     match catalog.search(&q, limit).await {
         Ok(models) => {
-            let body = hub_search_body(&q, &models);
+            let body = hub_search_body(&q, &models, capability);
             (
                 [(header::CONTENT_TYPE, "application/json")],
                 body.to_string(),
@@ -729,10 +735,45 @@ async fn admin_hub_search_handler(
 
 /// Serialize a Hub search result for the admin API. Pure, so tests can
 /// drive it with synthetic models.
-fn hub_search_body(query: &str, models: &[decentraai_hub::HubModel]) -> serde_json::Value {
+///
+/// When `capability` is supplied, models are filtered to those whose real Hub
+/// metadata supports that capability (via the provenance-aware matcher); the
+/// kept hits carry the matching evidence so the operator sees why each model
+/// qualified.
+fn hub_search_body(
+    query: &str,
+    models: &[decentraai_hub::HubModel],
+    capability: Option<decentraai_hub::CapabilityKind>,
+) -> serde_json::Value {
+    let req = capability.map(|cap| vec![decentraai_hub::CapabilityRequirement {
+        capability: cap,
+        evidence: decentraai_hub::EvidenceLevel::Any,
+    }]);
+
+    let filtered: Vec<&decentraai_hub::HubModel> = models
+        .iter()
+        .filter(|m| match &req {
+            Some(r) => {
+                // Classify this model from its own metadata and check the
+                // required capability. A model that does not claim it is
+                // dropped (UNKNOWN is not satisfied, never fabricated).
+                let caps = decentraai_hub::capability::classify(
+                    m.pipeline_tag.as_ref().map(|t| t.as_str()),
+                    &m.tags,
+                    &m.id,
+                );
+                decentraai_hub::satisfies_any(&caps, r)
+            }
+            None => true,
+        })
+        .collect();
+
     serde_json::json!({
         "query": query,
-        "models": models.iter().map(|m| serde_json::json!({
+        "capability_filter": capability.map(|c| c.label()),
+        "total": models.len(),
+        "matched": filtered.len(),
+        "models": filtered.iter().map(|m| serde_json::json!({
             "id": m.id,
             "pipeline_tag": m.pipeline_tag.as_ref().map(|t| t.as_str()),
             "tags": m.tags,
@@ -4858,14 +4899,55 @@ mod tests {
                 downloads: 7,
             },
         ];
-        let body = hub_search_body("qwen", &models);
+        let body = hub_search_body("qwen", &models, None);
         assert_eq!(body["query"], "qwen");
+        assert!(body["capability_filter"].is_null());
         let arr = body["models"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["id"], "Qwen/Qwen2.5-1.5B-Instruct-GGUF");
         assert_eq!(arr[0]["pipeline_tag"], "text-generation");
         assert_eq!(arr[0]["downloads"], 42_000);
         assert!(arr[1]["pipeline_tag"].is_null());
+    }
+
+    #[test]
+    fn hub_search_body_filters_by_capability_with_honest_provenance() {
+        // A text-generation model claims no OCR capability: a capability=ocr
+        // filter must drop it (UNKNOWN is not satisfied), never claim a false
+        // positive. A model whose metadata states vision support is kept.
+        let models = vec![
+            decentraai_hub::HubModel {
+                id: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(),
+                pipeline_tag: Some(decentraai_hub::PipelineTag::TextGeneration),
+                tags: vec!["gguf".to_string(), "conversational".to_string()],
+                downloads: 42_000,
+            },
+            decentraai_hub::HubModel {
+                id: "org/vision-model".to_string(),
+                pipeline_tag: Some(decentraai_hub::PipelineTag::ImageTextToText),
+                tags: vec!["gguf".to_string(), "vision".to_string()],
+                downloads: 7,
+            },
+        ];
+        // OCR: neither model claims OCR evidence (text-generation has none;
+        // image-text-to-text pipeline yields Vision/Multimodal, NOT OCR). An
+        // honest filter returns zero rather than fabricate OCR support.
+        let ocr = hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Ocr));
+        let arr = ocr["models"].as_array().unwrap();
+        assert_eq!(arr.len(), 0, "no model has OCR evidence");
+        assert_eq!(ocr["matched"], 0);
+        assert_eq!(ocr["total"], 2);
+
+        // Vision: the image-text-to-text model qualifies (verified pipeline).
+        let vision =
+            hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Vision));
+        assert_eq!(vision["matched"], 1);
+        assert_eq!(vision["models"][0]["id"], "org/vision-model");
+
+        // Coding is not claimed by either model (no name/tag hint) -> 0 hits.
+        let coding =
+            hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Coding));
+        assert_eq!(coding["matched"], 0);
     }
 
     #[tokio::test]

@@ -18,10 +18,9 @@
 use serde::Serialize;
 
 /// A capability category a model may genuinely have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityKind {
-    Chat,
+pub enum CapabilityKind {    Chat,
     TextGeneration,
     Reasoning,
     Coding,
@@ -80,6 +79,43 @@ impl CapabilityKind {
             CapabilityKind::SmallModels => "small models",
             CapabilityKind::Experimental => "experimental",
         }
+    }
+}
+
+impl std::str::FromStr for CapabilityKind {
+    type Err = ();
+    /// Parse a capability from its snake_case serialized form (e.g. `ocr`,
+    /// `text_generation`, `tool_calling`). Unknown strings error.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "chat" => CapabilityKind::Chat,
+            "text_generation" => CapabilityKind::TextGeneration,
+            "reasoning" => CapabilityKind::Reasoning,
+            "coding" => CapabilityKind::Coding,
+            "agents" => CapabilityKind::Agents,
+            "tool_calling" => CapabilityKind::ToolCalling,
+            "function_calling" => CapabilityKind::FunctionCalling,
+            "structured_output" => CapabilityKind::StructuredOutput,
+            "vision" => CapabilityKind::Vision,
+            "multimodal" => CapabilityKind::Multimodal,
+            "ocr" => CapabilityKind::Ocr,
+            "document_understanding" => CapabilityKind::DocumentUnderstanding,
+            "embeddings" => CapabilityKind::Embeddings,
+            "reranking" => CapabilityKind::Reranking,
+            "retrieval" => CapabilityKind::Retrieval,
+            "speech_to_text" => CapabilityKind::SpeechToText,
+            "text_to_speech" => CapabilityKind::TextToSpeech,
+            "audio" => CapabilityKind::Audio,
+            "translation" => CapabilityKind::Translation,
+            "summarization" => CapabilityKind::Summarization,
+            "classification" => CapabilityKind::Classification,
+            "image_generation" => CapabilityKind::ImageGeneration,
+            "video" => CapabilityKind::Video,
+            "local" => CapabilityKind::Local,
+            "small_models" => CapabilityKind::SmallModels,
+            "experimental" => CapabilityKind::Experimental,
+            _ => return Err(()),
+        })
     }
 }
 

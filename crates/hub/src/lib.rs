@@ -24,10 +24,15 @@ use serde::{Deserialize, Serialize};
 pub mod capability;
 pub mod catalog;
 pub mod download;
+pub mod requirements;
 
 pub use capability::{CapabilityClaim, CapabilityKind, ModelCapabilities, Provenance};
 pub use catalog::{HubCatalog, HubLfs, HubModel, HubModelDetail, HubModelFile, PipelineTag};
 pub use download::download_model;
+pub use requirements::{
+    CapabilityMatch, CapabilityRequirement, EvidenceLevel, RequirementCheck, RequirementStatus,
+    match_requirements, satisfies_any,
+};
 
 /// Scheme prefix for a model reference accepted by the CLI, e.g.
 /// `hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF:q4_k_m.gguf`.
