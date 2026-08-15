@@ -1,0 +1,254 @@
+//! Read-only MCP (Model Context Protocol) server for DecentraAI.
+//!
+//! A thin translation layer that exposes the node's EXISTING fabric data to
+//! external AI agents as MCP tools. It creates no new token/identity/registry:
+//! authentication is enforced by the caller (the existing `dsk_` master token,
+//! see [`crate::api`]) and every tool reads a caller-supplied data snapshot.
+//!
+//! The module is intentionally I/O-free and deterministic: the HTTP handler
+//! builds an [`McpContext`] snapshot from the live API state and this module
+//! turns it into a JSON-RPC 2.0 MCP exchange. This keeps the protocol logic
+//! unit-testable without a network or a running node.
+//!
+//! Protocol: Model Context Protocol (2025-06-18), JSON-RPC 2.0 over HTTP POST.
+//! Only read-only tools are exposed in this first cut.
+
+use serde_json::{Value, json};
+
+/// Protocol version this server negotiates.
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Server implementation identity reported during `initialize`.
+pub fn server_info() -> Value {
+    json!({
+        "name": "decentraai-mcp",
+        "version": "1.0.0",
+    })
+}
+
+/// Snapshot of live node data supplied by the HTTP layer. Each field is the
+/// already-serialized real state (never fabricated) that a tool returns.
+#[derive(Debug, Clone, Default)]
+pub struct McpContext {
+    /// Node status (loaded model, queue, requests, uptime).
+    pub status: Value,
+    /// Fabric workers + resources + trust.
+    pub workers: Value,
+    /// Fabric-wide served/available models.
+    pub models: Value,
+    /// Recent execution decisions.
+    pub executions: Value,
+    /// Network peers + measured links.
+    pub peers: Value,
+}
+
+/// A single MCP tool definition (name + description + JSON-Schema input).
+struct ToolDef {
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+}
+
+fn all_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "get_status",
+            description: "Node status: model loaded, inference queue, requests served/failed, tokens generated, uptime, worker count.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_workers",
+            description: "Every worker on the fabric with its advertised resources (CPU/RAM/VRAM), health, load, model(s) served, and trust status.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_models",
+            description: "Models available on the fabric, split into served (currently loadable) and on-disk, with the node(s) that hold them.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_executions",
+            description: "Recent autonomous execution decisions: which worker ran what, the planner's reasoning (network/KV/capability), and the outcome.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_peers",
+            description: "Connected P2P peers and measured network links (RTT, bandwidth, locality).",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+    ]
+}
+
+/// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
+/// Returns `None` for notifications (no `id`), which MCP clients do not await.
+pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
+    let msg: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(error_response(Value::Null, -32700, "Parse error"));
+        }
+    };
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let is_notification = msg.get("id").is_none();
+    let method = match msg.get("method").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => {
+            return Some(error_response(id, -32600, "Invalid Request: missing method"));
+        }
+    };
+
+    let outcome = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": server_info(),
+            "instructions": "DecentraAI exposes its local model fabric to AI agents. All tools are read-only. Authentication: the same dsk_ Bearer token as the rest of the API."
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({
+            "tools": all_tools()
+                .iter()
+                .map(|t| json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                }))
+                .collect::<Vec<_>>()
+        })),
+        "tools/call" => match msg
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            Some(name) => match call_tool(
+                ctx,
+                name,
+                msg.get("params").and_then(|p| p.get("arguments")).cloned(),
+            ) {
+                Some(result) => Ok(result),
+                None => Err((-32602, format!("unknown tool: {name}"))),
+            },
+            None => Err((-32602, "tools/call requires a tool name".to_string())),
+        },
+        "notifications/initialized" => {
+            // Notification: no response.
+            return None;
+        }
+        _ => return Some(error_response(id, -32601, format!("Method not found: {method}"))),
+    };
+
+    if is_notification {
+        // A notification with an unrecognized method yields no response.
+        return None;
+    }
+    Some(match outcome {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => error_response(id, code, message),
+    })
+}
+
+/// Dispatches a read-only tool call. Returns `None` for an unknown tool name
+/// so the caller can emit a clean `-32602` error.
+fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value> {
+    let data = match name {
+        "get_status" => &ctx.status,
+        "list_workers" => &ctx.workers,
+        "list_models" => &ctx.models,
+        "list_executions" => &ctx.executions,
+        "list_peers" => &ctx.peers,
+        _ => return None,
+    };
+    Some(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string()),
+        }],
+    }))
+}
+
+fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message.into() },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> McpContext {
+        McpContext {
+            status: json!({ "model_loaded": true }),
+            workers: json!([{ "node_id": "w1", "trusted": true }]),
+            models: json!([{ "file_name": "model.gguf" }]),
+            executions: json!([{ "chosen_worker": "w1" }]),
+            peers: json!([{ "peer_id": "p1" }]),
+        }
+    }
+
+    fn call(msg: &str) -> Value {
+        handle_message(&ctx(), msg).unwrap()
+    }
+
+    #[test]
+    fn initialize_negotiates_protocol() {
+        let r = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#);
+        assert_eq!(r["id"], 1);
+        assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert!(r["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(r["result"]["serverInfo"]["name"], "decentraai-mcp");
+    }
+
+    #[test]
+    fn ping_returns_empty_result() {
+        let r = call(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
+        assert_eq!(r["result"], json!({}));
+    }
+
+    #[test]
+    fn tools_list_exposes_read_only_tools() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"list_workers"));
+        assert!(names.contains(&"get_status"));
+        assert!(names.contains(&"list_executions"));
+        // Each tool declares a JSON schema.
+        assert!(tools.iter().all(|t| t["inputSchema"].is_object()));
+    }
+
+    #[test]
+    fn tools_call_returns_real_snapshot_data() {
+        let r = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_workers","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("w1"), "must return the supplied snapshot");
+    }
+
+    #[test]
+    fn unknown_tool_is_invalid_params() {
+        let r = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#);
+        assert_eq!(r["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn unknown_method_is_method_not_found() {
+        let r = call(r#"{"jsonrpc":"2.0","id":6,"method":"bogus"}"#);
+        assert_eq!(r["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn initialized_notification_yields_no_response() {
+        assert!(
+            handle_message(&ctx(), r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_error_is_reported() {
+        let r = handle_message(&ctx(), "not json").unwrap();
+        assert_eq!(r["error"]["code"], -32700);
+    }
+}

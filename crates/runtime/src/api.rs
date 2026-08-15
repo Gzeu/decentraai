@@ -1570,6 +1570,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/mcp", post(mcp_handler))
         .route("/v1/token", get(token_handler))
         .route("/v1/peers", get(peers_handler))
         .route("/v1/compute", get(compute_handler))
@@ -1800,6 +1801,103 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         body,
     )
         .into_response()
+}
+
+/// MCP (Model Context Protocol) read-only endpoint: `POST /mcp` speaking
+/// JSON-RPC 2.0 over HTTP. Exposes the node's live fabric to external AI
+/// agents as read-only tools. Reuses the existing `dsk_` Bearer auth (same
+/// boundary as the operational /v1/* views it wraps) — no new token system.
+async fn mcp_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Operational control-plane data: operator/admin role required, matching
+    // /v1/compute, /v1/network and /v1/execution which MCP wraps.
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let raw = String::from_utf8_lossy(&body);
+    let ctx = mcp_context(&state).await;
+    let response = crate::mcp::handle_message(&ctx, &raw);
+    let json = response.unwrap_or_else(|| serde_json::json!({}));
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// Builds the MCP data snapshot from the live API state. All values are real
+/// node state (never fabricated); the MCP layer only translates them.
+async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
+    use crate::mcp::McpContext;
+    // Status: model loaded, queue, request counters, uptime, worker count.
+    let (loaded, backend) = {
+        let manager = state.manager.lock().await;
+        (
+            manager.is_loaded(),
+            manager.base_url().unwrap_or_else(|| state.backend_url.clone()),
+        )
+    };
+    let (serving, waiting) = state.queue.snapshot();
+    let worker_count = match &state.compute {
+        Some(cm) => cm.workers().await.len(),
+        None => 0,
+    };
+    let status = serde_json::json!({
+        "model": state.info.model_name,
+        "model_loaded": loaded,
+        "backend_url": backend,
+        "serving": serving.is_some(),
+        "queue_waiting": waiting.len(),
+        "requests_served": state.requests_served.load(Ordering::SeqCst),
+        "requests_failed": state.requests_failed.load(Ordering::SeqCst),
+        "tokens_generated": state.tokens_generated.load(Ordering::SeqCst),
+        "uptime_secs": state.started_at.elapsed().as_secs(),
+        "worker_count": worker_count,
+    });
+
+    // Workers + models + executions come from the live compute manager.
+    let mut workers = serde_json::Value::Array(Vec::new());
+    let mut executions = serde_json::Value::Array(Vec::new());
+    if let Some(compute) = &state.compute {
+        let report = compute.metrics_report().await;
+        workers = serde_json::to_value(report.workers).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        executions =
+            serde_json::to_value(compute.executions()).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    }
+    let models = fabric_model_list(state)
+        .await
+        .unwrap_or_else(|| serde_json::json!({ "data": [] }));
+
+    // Peers + measured network links.
+    let mut peers = serde_json::Value::Array(Vec::new());
+    if let Some(p2p) = &state.p2p {
+        let snapshot = p2p.peers_snapshot().await;
+        peers = serde_json::json!(snapshot.connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+    }
+    if let Some(compute) = &state.compute {
+        let graph = compute.network_graph();
+        if let Some(arr) = peers.as_array_mut() {
+            for (peer, link) in graph.peers() {
+                arr.push(serde_json::json!({
+                    "peer": peer,
+                    "rtt_ms": link.rtt_us / 1000,
+                    "bandwidth_mbps": link.bandwidth_mbps,
+                    "locality": format!("{:?}", link.locality),
+                }));
+            }
+        }
+    }
+
+    McpContext {
+        status,
+        workers,
+        models,
+        executions,
+        peers,
+    }
 }
 
 /// Returns the API token itself: the dashboard is loopback-only and its
@@ -3614,6 +3712,74 @@ mod tests {
         assert_eq!(missing.status(), 404);
         let xj: serde_json::Value = missing.json().await.unwrap();
         assert!(xj["error"]["message"].as_str().unwrap().contains("nope.gguf"));
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// MCP endpoint: requires the master token (same boundary as the
+    /// operational /v1 views) and negotiates + lists read-only tools over
+    /// JSON-RPC. Read-only tools return the live fabric snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_endpoint_is_auth_gated_and_lists_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("mcp-master".into()), None).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+
+        // No auth → 401 (same boundary as the operational /v1 views).
+        let anon = client
+            .post(format!("{base}/mcp"))
+            .header("Content-Type", "application/json")
+            .body(init)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), 401);
+
+        // Master token → initialize negotiates the protocol and tools/list.
+        let with_auth = |body: &str| {
+            client
+                .post(format!("{base}/mcp"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer mcp-master")
+                .body(body.to_string())
+        };
+        let resp = with_auth(init).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(j["result"]["protocolVersion"], "2025-06-18");
+        assert!(j["result"]["capabilities"]["tools"].is_object());
+
+        let list = with_auth(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await
+            .unwrap();
+        let lj: serde_json::Value = list.json().await.unwrap();
+        let names: Vec<&str> = lj["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"get_status"));
+        assert!(names.contains(&"list_workers"));
+        assert!(names.contains(&"list_executions"));
+
+        // A read-only tool call returns the live snapshot (real node state).
+        let call = with_auth(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+        let cj: serde_json::Value = call.json().await.unwrap();
+        let text = cj["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("model_loaded"),
+            "tool must return the live status snapshot: {text}"
+        );
 
         manager.lock().await.shutdown().await.unwrap();
     }

@@ -391,6 +391,22 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"tinyllama","messages":[{"role":"user","content":"Hello"}],"max_tokens":20}'
 ```
 
+### 0.2. MCP for external AI agents
+
+A running node exposes its fabric to external AI agents over the [Model Context
+Protocol](https://modelcontextprotocol.io) as a read-only JSON-RPC endpoint:
+`POST /mcp` on the API port, authenticated with the same `dsk_` Bearer token.
+Negotiate with `initialize`, then `tools/list` / `tools/call`. Read-only tools:
+`get_status`, `list_workers`, `list_models`, `list_executions`, `list_peers`.
+No new token/identity system — MCP is a thin translation over the existing API.
+
+```bash
+TOKEN=$(cat ~/.decentraai/runtime/api.token)
+curl -s http://127.0.0.1:8080/mcp -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
 When the node runs as a fabric node (`decentraai node` with a compute
 manager), the chat proxy can also serve models advertised by *trusted remote
 workers*. The chat model picker offers **Auto (best available)** (default:

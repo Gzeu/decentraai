@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod dashboard;
+pub mod mcp;
 pub mod queue;
 
 use anyhow::{Context, Result, bail};
