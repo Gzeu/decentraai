@@ -1319,3 +1319,10 @@ The operator can now run a decided intent on the fabric from the dashboard.
   `getReader`/`TextDecoder`, appends `delta.content` incrementally, records the
   trailing `usage`, shows `[DONE]` (or an honest "stream closed" warning). Errors
   render the real message + replan advisory. No fabricated output/worker/tokens.
+
+## 51. Next-Gen — session/continuation in execute (KV locality)
+
+- [x] `/v1/execute` (stream + non-stream) and MCP `execute_decision` accept an
+  optional `session_id` → `InferRequest.with_session`, so a run links to an
+  earlier one and the fabric router steers back to the worker holding the
+  session's KV prefix (continuation / cache locality, reusing M20).

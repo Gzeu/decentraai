@@ -245,6 +245,7 @@ fn all_tools() -> Vec<ToolDef> {
                     "stream": { "type": "boolean", "description": "Whether to stream (default false)." },
                     "model": { "type": "string", "description": "Optional: narrow to a specific model file." },
                     "evidence": { "type": "string", "enum": ["any", "verified"], "description": "Evidence filter for the decision." },
+                    "session_id": { "type": "string", "description": "Optional: links this run to an earlier one for KV-cache locality (continuation)." },
                     "confirm": { "type": "boolean", "description": "MUST be true to execute (mutation safety)." },
                 },
                 "required": ["intent", "prompt", "confirm"],

@@ -1408,6 +1408,9 @@ async fn execute_decision_stream(
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(true);
     request.timeout_ms = 120_000;
+    if let Some(sid) = req.get("session_id").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+        request = request.with_session(sid.to_string());
+    }
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let dist = distributed.clone();
@@ -1552,7 +1555,12 @@ async fn run_execute_decision(
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(stream);
     request.timeout_ms = 120_000;
-
+    // Continuation support (KV locality): an optional session_id links this run
+    // to an earlier one, steering the fabric router back to the worker holding
+    // the session's KV prefix.
+    if let Some(sid) = req.get("session_id").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+        request = request.with_session(sid.to_string());
+    }
     let started = std::time::Instant::now();
     match distributed.route_request(request).await {
         Ok(resp) => {
