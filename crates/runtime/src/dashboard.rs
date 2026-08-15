@@ -561,8 +561,8 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Local registry</h2>
-          <table><thead><tr><th>Model</th><th class="num">Size</th></tr></thead>
-          <tbody id="registry-models"><tr><td colspan="2" class="empty">no indexed models</td></tr></tbody></table>
+          <table><thead><tr><th>Model</th><th class="num">Size</th><th></th></tr></thead>
+          <tbody id="registry-models"><tr><td colspan="3" class="empty">no indexed models</td></tr></tbody></table>
         </div>
         <div class="card" style="margin-top:14px">
           <h2>On disk across the fabric <span class="count" id="disk-models-count"></span></h2>
@@ -1778,8 +1778,9 @@ function renderModels(s, c){
   $('models-status').innerHTML = 'active model: '+esc(s.model||'')+(s.model_loaded?' · <span class="badge ok">loaded</span>':' · <span class="badge faint">unloaded</span>');
   const reg = (s && s.available_models || []);
   $('registry-models').innerHTML = reg.map(m =>
-    '<tr><td>'+esc(m.name)+'</td><td class="num">'+(m.size_bytes/1073741824).toFixed(2)+' GiB</td></tr>'
-  ).join('') || '<tr><td colspan="2" class="empty">no indexed models</td></tr>';
+    '<tr><td>'+esc(m.name)+'</td><td class="num">'+(m.size_bytes/1073741824).toFixed(2)+' GiB</td><td>'+
+    '<button class="btn small warn" onclick="removeModel(\''+jsq(m.name)+'\')">Delete</button></td></tr>'
+  ).join('') || '<tr><td colspan="3" class="empty">no indexed models</td></tr>';
   // On-disk models reported by every fabric worker (Part 3/17): the honest
   // "could serve" set, distinct from what is currently loaded.
   const workers = (c && c.workers || []);
@@ -1909,6 +1910,21 @@ function hubPullVariant(id, file){
     .catch(e => { $('hub-status').innerHTML = '<span class="badge warn">pull error</span> '+esc(e); delete hubPulling[id+':'+file]; if (btn) { btn.disabled = false; btn.textContent = 'Pull'; } });
 }
 function hubCloseDetail(){ $('hub-detail').style.display = 'none'; }
+function removeModel(path){
+  if (!confirm('Are you sure you want to delete model ' + path + ' from disk?')) return;
+  fetch('/api/admin/models/remove', {
+    method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ path: path }),
+  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (!ok) { toast('Delete failed: ' + ((j.error && j.error.message) || 'unknown'), true); }
+      else {
+        toast('Model deleted: ' + path);
+        refresh();
+      }
+    })
+    .catch(e => { toast('Delete error: ' + e, true); });
+}
 function renderObservability(s, c){
   const lat = (s && s.recent_requests || []).map(r => r.duration_ms);
   const tps = (s && s.recent_requests || []).map(r => r.tokens_per_second);

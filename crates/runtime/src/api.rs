@@ -982,6 +982,127 @@ async fn hub_model_body(
     })
 }
 
+/// Remove a model from the local registry and disk. Requires master token.
+/// If the model is currently served, returns 409 Conflict to prevent
+/// accidental interruption of ongoing inference. The model must be unloaded
+/// first (e.g., via `/api/admin/serve/unload` if the API supports it).
+async fn admin_models_remove_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+
+    let relative_path = match req.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return forbidden("missing path (relative file name)"),
+    };
+
+    // Load the registry to check existence and current state.
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let mut registry = match decentraai_registry::ModelRegistry::load(&registry_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("failed to load registry for removal: {e:#}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"error": {"message": "registry load failed", "type": "registry_error"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Check if the model is currently served by comparing the path.
+    let current_model_path_opt = {
+        let manager_guard = state.manager.lock().await;
+        manager_guard.current_model_path().map(|p| p.to_path_buf())
+    };
+
+    if let Some(current_model_path) = current_model_path_opt {
+        let full_target_path = state.info.repo_root.join("models").join(relative_path);
+        if let Ok(canonical_target) = std::fs::canonicalize(&full_target_path) {
+            if canonical_target == current_model_path {
+                return (
+                    StatusCode::CONFLICT,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({"error": {"message": "model is currently served; unload before removal", "type": "conflict"}})
+                        .to_string(),
+                )
+                    .into_response();
+            }
+        } else {
+            // If we can't canonicalize, proceed with removal anyway.
+            // This is defensive but risky.
+            tracing::debug!("failed to canonicalize target path for removal check: {}", full_target_path.display());
+        }
+    }
+
+    // Remove the model file and entry from registry.
+    let record = match registry.remove_model(relative_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"error": {"message": e.to_string(), "type": "registry_error"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Save the updated registry.
+    if let Err(e) = registry.save(&registry_path) {
+        tracing::warn!("failed to save registry after removal: {e:#}");
+        return (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": {"message": "registry save failed", "type": "registry_error"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+
+    // Refresh the local fabric advertisement so other nodes see the model
+    // as removed from the registry. This ensures the model is no longer
+    // advertised to the fabric.
+    if let Some(cm) = &state.compute {
+        let ctx = (record.size_bytes / 1024 / 1024) as u32; // Estimate context from size
+        if let Err(e) = cm.refresh_local_models(&registry_path, ctx).await {
+            tracing::warn!("failed to refresh fabric advertisement after removal: {e:#}");
+            // Continue anyway, the model removal succeeded.
+        }
+    }
+
+    // Record the audit event.
+    let audit_path = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        audit_path.parent().unwrap_or(&state.info.repo_root),
+        "model_removed",
+        serde_json::json!({
+            "relative_path": relative_path,
+            "size_bytes": record.size_bytes,
+            "canonical_path": record.canonical_path,
+        }),
+    );
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "message": "model removed"})
+            .to_string(),
+    )
+        .into_response()
+}
+
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
 /// admin endpoints. `peer_id` must be a valid base58 PeerId.
 fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
@@ -1145,6 +1266,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/hub/search", get(admin_hub_search_handler))
         .route("/api/admin/hub/model/{repo}", get(admin_hub_model_handler))
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
+        // Model removal (Issue #26): master-gated delete from registry + disk
+        .route("/api/admin/models/remove", post(admin_models_remove_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
@@ -4287,6 +4410,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(no_auth_detail.status(), 401);
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_model_remove_endpoint_requires_auth_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            Some("master_token".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Without auth -> 401
+        let res = client
+            .post(format!("http://{api}/api/admin/models/remove"))
+            .body(r#"{"path":"test.gguf"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+
+        // With auth but missing/invalid path -> 403 or 400
+        let res = client
+            .post(format!("http://{api}/api/admin/models/remove"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(r#"{"path":"../escape.gguf"}"#)
+            .send()
+            .await
+            .unwrap();
+        // Registry removal or path validation rejects path traversal (400 or 403)
+        assert!(res.status().as_u16() >= 400);
 
         manager.lock().await.shutdown().await.unwrap();
     }

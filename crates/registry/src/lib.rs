@@ -173,6 +173,40 @@ impl ModelRegistry {
         models
     }
 
+    /// Removes a model from the registry and deletes the underlying file.
+    ///
+    /// Security: the caller must supply a relative path — any attempt to
+    /// escape the registry root via `..` or absolute path is rejected both
+    /// syntactically (reject `..` and leading `/`) and structurally (the
+    /// canonical path must still start with the registry root).
+    pub fn remove_model(&mut self, relative_path: &str) -> Result<ModelRecord> {
+        if relative_path.contains("..") || relative_path.starts_with('/') {
+            anyhow::bail!("invalid relative path: {}", relative_path);
+        }
+        let _record = self.models.get(relative_path).cloned().ok_or_else(|| {
+            anyhow::anyhow!("model not found in registry: {}", relative_path)
+        })?;
+
+        let full_path = PathBuf::from(&self.root).join(relative_path);
+        let canonical = fs::canonicalize(&full_path)
+            .with_context(|| format!("canonicalizing {}", full_path.display()))?;
+
+        let root = PathBuf::from(&self.root);
+        if !canonical.starts_with(&root) {
+            anyhow::bail!(
+                "canonical path {} escapes registry root {}",
+                canonical.display(),
+                root.display()
+            );
+        }
+
+        fs::remove_file(&canonical)
+            .with_context(|| format!("removing file {}", canonical.display()))?;
+
+        let removed = self.models.remove(relative_path).expect("exists by lookup above");
+        Ok(removed)
+    }
+
     #[allow(dead_code)]
     pub fn get_model(&self, relative_path: &str) -> Option<&ModelRecord> {
         self.models.get(relative_path)

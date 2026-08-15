@@ -419,6 +419,12 @@ impl ServeManager {
         self.server.is_some()
     }
 
+    /// Returns the path of the model currently managed by this instance,
+    /// if one was configured (i.e. when M24 engine supervisor restarts are enabled).
+    pub fn current_model_path(&self) -> Option<&Path> {
+        self.restart_config.as_ref().map(|c| c.model_path.as_ref())
+    }
+
     pub fn base_url(&self) -> Option<String> {
         self.server.as_ref().map(|s| s.base_url())
     }
