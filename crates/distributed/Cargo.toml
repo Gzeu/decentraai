@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 futures.workspace = true
 libp2p.workspace = true
 serde.workspace = true

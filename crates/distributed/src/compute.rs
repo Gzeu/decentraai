@@ -1147,6 +1147,79 @@ impl ComputeManager {
         self.last_local_ad.lock().unwrap().clone()
     }
 
+    /// Refreshes this node's on-disk model set after a model install/removal
+    /// (Issue #26 §25): re-scans the local registry, rebuilds `available_models`
+    /// with fresh BLAKE3 hashes, and re-advertises so coordinators see the new
+    /// fabric reality without a node restart. `served_models` is preserved from
+    /// the previous local advertisement (a pull does not load anything).
+    ///
+    /// The caller is expected to broadcast the returned advertisement (the
+    /// periodic broadcaster picks it up on the next heartbeat as well).
+    pub async fn refresh_local_models(
+        &self,
+        registry_path: &std::path::Path,
+        context_tokens: u32,
+    ) -> anyhow::Result<ComputeAdvertisement> {
+        use decentraai_registry::ModelRegistry;
+        use std::io::Read;
+
+        let gpu_present = matches!(
+            decentraai_system_probe::probe_gpu(),
+            decentraai_system_probe::GpuProbeStatus::Nvidia(_)
+        );
+        let mut available_models = Vec::new();
+        if registry_path.exists() {
+            let registry = ModelRegistry::load(registry_path)?;
+            for record in registry.models.values() {
+                let file = std::path::Path::new(&record.canonical_path);
+                // Hash streamingly (BLAKE3), never loading the whole file.
+                let mut hasher = blake3::Hasher::new();
+                let mut f = match std::fs::File::open(file) {
+                    Ok(f) => f,
+                    Err(_) => continue, // gone from disk; registry scan prunes it
+                };
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let model_hash = hasher.finalize().to_hex().to_string();
+                let size_mb = (record.size_bytes / (1024 * 1024)).max(1);
+                available_models.push(ServedModel {
+                    model_hash,
+                    file_name: record.relative_path.clone(),
+                    size_mb,
+                    est_ram_mb: size_mb / 4 + 1024,
+                    est_vram_mb: if gpu_present { size_mb } else { 0 },
+                    context_tokens,
+                });
+            }
+        }
+        let served_models = self
+            .last_local_advertisement_sync()
+            .map(|a| a.capability.served_models)
+            .unwrap_or_default();
+        let snapshot = decentraai_system_probe::SystemSnapshot::collect();
+        let gpu = decentraai_system_probe::probe_gpu();
+        let can_provision = self
+            .last_local_advertisement_sync()
+            .map(|a| a.capability.can_provision)
+            .unwrap_or(false);
+        let adv = self
+            .advertise_local(
+                snapshot,
+                gpu,
+                served_models,
+                available_models,
+                can_provision,
+            )
+            .await;
+        Ok(adv)
+    }
+
     /// Shared handle to the node's live perf metrics. The worker's streaming
     /// task records real completions into it so subsequent advertisements
     /// (and therefore coordinator scheduling) reflect measured throughput and
@@ -1617,6 +1690,51 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].available_models.len(), 1);
         assert_eq!(facts[0].available_models[0].file_name, "other-model.gguf");
+    }
+
+    #[tokio::test]
+    async fn refresh_local_models_readvertises_after_install() {
+        // Issue #26 §25: a model installed through the Hub must reach the
+        // fabric without a node restart. refresh_local_models re-scans the
+        // registry, rebuilds available_models and re-advertises.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("fresh.gguf"), b"not a real gguf").unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        {
+            let mut reg = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+            reg.scan_directory(&models_dir).unwrap();
+            reg.save(&registry_path).unwrap();
+        }
+
+        let p = peer();
+        let manager = ComputeManager::new(p, "n".into(), HashSet::from([p]));
+        // Before any install there is no local advertisement.
+        assert!(manager.last_local_advertisement_sync().is_none());
+
+        let adv = manager.refresh_local_models(&registry_path, 4096).await.unwrap();
+        assert_eq!(adv.capability.available_models.len(), 1);
+        assert_eq!(adv.capability.available_models[0].file_name, "fresh.gguf");
+        assert_eq!(adv.capability.available_models[0].context_tokens, 4096);
+        assert!(manager.last_local_advertisement_sync().is_some());
+
+        // A second refresh after adding another file picks it up without
+        // losing the earlier one.
+        std::fs::write(models_dir.join("second.gguf"), b"another").unwrap();
+        let mut reg = decentraai_registry::ModelRegistry::load(&registry_path).unwrap();
+        reg.scan_directory(&models_dir).unwrap();
+        reg.save(&registry_path).unwrap();
+        let adv2 = manager.refresh_local_models(&registry_path, 4096).await.unwrap();
+        let names: Vec<_> = adv2
+            .capability
+            .available_models
+            .iter()
+            .map(|m| m.file_name.as_str())
+            .collect();
+        assert!(names.contains(&"fresh.gguf"));
+        assert!(names.contains(&"second.gguf"));
     }
 
     #[test]
