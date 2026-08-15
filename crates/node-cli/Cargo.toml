@@ -18,6 +18,7 @@ decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }
 decentraai-distributed = { path = "../distributed" }
+decentraai-hub = { path = "../hub" }
 decentraai-identity = { path = "../identity" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-manifest = { path = "../manifest" }

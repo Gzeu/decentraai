@@ -159,6 +159,31 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
 With mDNS discovery already auto-dialing LAN peers, two nodes that both
 run `decentraai swarm start` now exchange models with zero manual steps.
 
+## 11. HuggingFace Hub catalog + on-demand download (DONE)
+
+The swarm is no longer limited to models that already exist on a peer:
+operators can search the HuggingFace Hub and pull verified GGUF artifacts
+straight into the local registry.
+
+- [x] `decentraai-hub` crate (no external engine deps): `HfRef` reference
+  parsing (`hf:org/repo` or `hf:org/repo:file.gguf`), `HubCatalog` search
+  (filter=gguf) + per-repo GGUF tree listing (sizes, LFS SHA-256), and
+  verified download (`download_model`/`download_verified`: SHA-256 enforced
+  from the Hub tree API, staged `.part` write + atomic rename, so no
+  partial/corrupted artifact ever enters the registry)
+- [x] `decentraai model search <query>` — list GGUF models from the Hub with
+  their pipeline category/tool (`--category` filter, `--categories` to
+  discover what tool types exist)
+- [x] `decentraai model pull hf:org/repo[:file.gguf]` — download into
+  `~/.decentraai/models` and refresh the registry; an unpinned repo auto-picks
+  the largest GGUF (deterministic "best quantization" default, matching the
+  fabric picker's size heuristic)
+- [x] CLI parse tests for `model search`/`model pull`
+
+Verified live against the production Hub API (search, tree, resolve/CDN
+redirect) and an end-to-end Qwen2.5-0.5B download (auto-pick + pinned file,
+sha256 verified, registry refreshed).
+
 ## 12. Compute Sharing (M11–M13, DONE)
 
 DecentraAI's core product is people sharing **compute/GPU capacity**, not

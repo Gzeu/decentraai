@@ -955,6 +955,7 @@ dependencies = [
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-distributed",
+ "decentraai-hub",
  "decentraai-identity",
  "decentraai-inference-adapter",
  "decentraai-manifest",

@@ -38,6 +38,13 @@ enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    /// Search and download models from the HuggingFace Hub (verified
+    /// downloads: the Hub's SHA-256 is enforced before the file lands in the
+    /// local registry).
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     Swarm {
         #[command(subcommand)]
         command: SwarmCommand,
@@ -173,6 +180,36 @@ struct ScanArgs {
 enum RegistryCommand {
     Scan(ScanArgs),
     List {
+        #[arg(long, default_value = "~/.decentraai/db/registry.json")]
+        registry: String,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Search the HuggingFace Hub for GGUF models. Results can be filtered by
+    /// pipeline category (text-generation, text-to-image, ...) with --category,
+    /// or listed by category with --categories.
+    Search {
+        /// Search query, e.g. "Qwen2.5" or "mistral".
+        query: String,
+        /// Filter by pipeline category/tool, e.g. --category text-generation.
+        #[arg(long)]
+        category: Option<String>,
+        /// List the distinct categories (pipeline tags) found for the query
+        /// instead of the models.
+        #[arg(long)]
+        categories: bool,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Download a model reference from the Hub into the local models/ dir and
+    /// refresh the registry. Accepts `hf:org/repo` (auto-picks the largest
+    /// GGUF) or `hf:org/repo:file.gguf` (pins a specific file).
+    Pull {
+        /// Hub reference: `hf:org/repo` or `hf:org/repo:file.gguf`.
+        reference: String,
+        #[arg(long, default_value = "~/.decentraai/models")]
+        models_dir: String,
         #[arg(long, default_value = "~/.decentraai/db/registry.json")]
         registry: String,
     },
@@ -363,6 +400,21 @@ async fn main() -> Result<()> {
         Command::Registry {
             command: RegistryCommand::List { registry },
         } => list_registry(registry),
+        Command::Model {
+            command: ModelCommand::Search {
+                query,
+                category,
+                categories,
+                limit,
+            },
+        } => model_search(query, category, categories, limit).await,
+        Command::Model {
+            command: ModelCommand::Pull {
+                reference,
+                models_dir,
+                registry,
+            },
+        } => model_pull(reference, models_dir, registry).await,
         Command::Swarm {
             command: SwarmCommand::Start { config },
         } => swarm_start(config).await,
@@ -1501,6 +1553,134 @@ fn list_registry(registry: String) -> Result<()> {
             model.relative_path, model.size_bytes, model.modification_time, model.extension
         );
     }
+    Ok(())
+}
+
+/// Search the HuggingFace Hub for GGUF models (ModelCommand::Search).
+///
+/// The Hub search API accepts a `filter=gguf` so every hit is a GGUF repo
+/// that DecentraAI can actually serve. `--category` narrows by pipeline tag
+/// (the model's tool/use-case); `--categories` instead prints the distinct
+/// categories found, so a user can discover "what kinds of tools are out
+/// there" before picking one.
+async fn model_search(
+    query: String,
+    category: Option<String>,
+    categories: bool,
+    limit: usize,
+) -> Result<()> {
+    let catalog = decentraai_hub::HubCatalog::new();
+    let models = catalog
+        .search(&query, limit)
+        .await
+        .with_context(|| format!("searching HuggingFace Hub for '{query}'"))?;
+
+    if categories {
+        // Distinct category → count, sorted by popularity of first sighting.
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for m in &models {
+            let tag = m
+                .pipeline_tag
+                .as_ref()
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            match seen.iter_mut().find(|(name, _)| *name == tag) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((tag, 1)),
+            }
+        }
+        seen.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("Categories for '{query}' ({} models):", models.len());
+        for (tag, count) in seen {
+            println!("  {tag:<45} {count} model(s)");
+        }
+        println!(
+            "\nFilter with: decentraai model search \"{query}\" --category <category>"
+        );
+        return Ok(());
+    }
+
+    println!("Models for '{query}' ({}, filter=gguf):", models.len());
+    let mut shown = 0;
+    for m in &models {
+        let tag = m
+            .pipeline_tag
+            .as_ref()
+            .map(|t| t.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if let Some(cat) = &category {
+            if !tag.eq_ignore_ascii_case(cat) {
+                continue;
+            }
+        }
+        shown += 1;
+        println!(
+            "  {:<60} {:<40} {} downloads",
+            m.id, tag, m.downloads
+        );
+    }
+    if shown == 0 && category.is_some() {
+        println!(
+            "  (no matches in category '{}'; use --categories to see what exists)",
+            category.as_deref().unwrap_or_default()
+        );
+    }
+    println!("\nDownload with: decentraai model pull hf:ORG/REPO");
+    Ok(())
+}
+
+/// Download a model from the HuggingFace Hub into the local models/ dir and
+/// refresh the registry (ModelCommand::Pull).
+///
+/// A Hub reference is `hf:org/repo` or `hf:org/repo:file.gguf`. The download
+/// is verified against the Hub's SHA-256 before the file is atomically renamed
+/// into place (no partial/ corrupted model ever enters the registry).
+async fn model_pull(reference: String, models_dir: String, registry: String) -> Result<()> {
+    let hf_ref = decentraai_hub::HfRef::parse(&reference)?;
+    let models_dir = expand_tilde(&models_dir);
+    fs::create_dir_all(&models_dir)
+        .with_context(|| format!("creating models dir {}", models_dir.display()))?;
+
+    println!(
+        "Downloading {} ({} / {}) ...",
+        reference,
+        hf_ref.repo,
+        hf_ref.file.as_deref().unwrap_or("auto (largest GGUF)")
+    );
+    let dl = decentraai_hub::download_model(&hf_ref, &models_dir).await?;
+    println!(
+        "Downloaded {} ({} bytes, sha256 {})",
+        dl.path.display(),
+        dl.bytes,
+        dl.sha256
+    );
+
+    // Refresh the registry so the new model is immediately usable/servable.
+    let registry_path = expand_tilde(&registry);
+    let registry_dir = registry_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid registry path"))?;
+    fs::create_dir_all(registry_dir)
+        .with_context(|| format!("creating registry directory {}", registry_dir.display()))?;
+    let mut registry = if registry_path.exists() {
+        ModelRegistry::load(&registry_path).with_context(|| {
+            format!("loading existing registry from {}", registry_path.display())
+        })?
+    } else {
+        ModelRegistry::new(models_dir.clone())
+            .with_context(|| format!("creating new registry for {}", models_dir.display()))?
+    };
+    let count = registry
+        .scan_directory(&models_dir)
+        .with_context(|| format!("scanning directory {}", models_dir.display()))?;
+    registry
+        .save(&registry_path)
+        .with_context(|| format!("saving registry to {}", registry_path.display()))?;
+    println!(
+        "Registry updated: {} models at {}",
+        count,
+        registry_path.display()
+    );
     Ok(())
 }
 
@@ -3613,6 +3793,57 @@ mod tests {
             cli.command,
             Command::Registry {
                 command: RegistryCommand::Scan(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_model_search_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "model",
+            "search",
+            "qwen",
+            "--category",
+            "text-generation",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Model {
+                command: ModelCommand::Search { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_model_search_categories_flag() {
+        let cli =
+            Cli::try_parse_from(["decentraai", "model", "search", "mistral", "--categories"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Model {
+                command: ModelCommand::Search { categories: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_model_pull_command() {
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "model",
+            "pull",
+            "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Model {
+                command: ModelCommand::Pull { .. }
             }
         ));
     }

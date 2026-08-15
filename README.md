@@ -217,6 +217,22 @@ decentraai pull --from /ip4/192.168.0.113/tcp/37079/p2p/12D3KooW... --model tiny
 decentraai registry scan --directory ~/.decentraai/models
 ```
 
+New models can also come straight from the HuggingFace Hub, verified against
+the Hub's SHA-256 before they land in the registry:
+```bash
+# search GGUF models and see what tool categories exist:
+decentraai model search qwen --limit 10
+decentraai model search llama --categories          # text-generation, question-answering, ...
+decentraai model search llama --category text-generation
+
+# download (auto-picks the largest GGUF, or pin a specific file):
+decentraai model pull hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF
+decentraai model pull hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF:qwen2.5-1.5b-instruct-q4_k_m.gguf
+#   Downloading hf:... (Qwen/... / auto (largest GGUF)) ...
+#   Downloaded ~/.decentraai/models/qwen2.5-...gguf (N bytes, sha256 ...)
+#   Registry updated: N models at ~/.decentraai/db/registry.json
+```
+
 Note: the address is a real multiaddr — do not keep the literal `<PORT>`/
 `<PEER_ID>` placeholders; quote the whole address if your shell complains.
 Testing pull on a single machine requires a second data dir with a second
