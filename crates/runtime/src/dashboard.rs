@@ -650,6 +650,18 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <div style="margin-top:10px;font-size:12px;color:var(--muted)">
             Base URL: <code id="dev-base-url" style="word-break:break-all"></code> · model ids = file names (see Models). Point Open WebUI, OpenClaw or any OpenAI SDK at this endpoint with a created token as the API key.
           </div>
+          <div style="margin-top:14px">
+            <div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px">Config generator <span class="count">copy-paste client code</span></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="ghost cfg-tab active" data-cfg="curl">curl</button>
+              <button class="ghost cfg-tab" data-cfg="python">Python SDK</button>
+              <button class="ghost cfg-tab" data-cfg="js">JavaScript</button>
+              <button class="ghost cfg-tab" data-cfg="openclaw">OpenClaw</button>
+              <button class="ghost cfg-tab" data-cfg="webui">Open WebUI</button>
+              <button class="ghost" onclick="copyDev('cfg-out')">Copy</button>
+            </div>
+            <pre id="cfg-out" class="mono" style="margin-top:8px;padding:10px;background:rgba(0,0,0,.25);border-radius:8px;overflow:auto;font-size:11.5px;white-space:pre-wrap;word-break:break-all"></pre>
+          </div>
         </div>
       </section>
 
@@ -1785,6 +1797,7 @@ function renderSecurity(){
   const ep = (location.protocol + '//' + location.host);
   $('dev-endpoint').textContent = ep + '/v1';
   $('dev-base-url').textContent = ep;
+  buildCfg();
 }
 window.copyDev = id => {
   const el = $(id);
@@ -1792,6 +1805,58 @@ window.copyDev = id => {
   if (!txt || txt === 'create a token above — the plaintext is shown once') { toast('nothing to copy yet — create a token first', true); return; }
   navigator.clipboard.writeText(txt).then(() => toast('copied: ' + short(txt, 24)));
 };
+// ---- config generator (Part 13/22): copy-paste client snippets that point
+// at this node's real OpenAI-compatible /v1 endpoint. Pure frontend string
+// building from live state — no backend call, no secret stored anywhere.
+const cfgTemplates = {
+  curl: (ep, key) => `curl ${ep}/v1/chat/completions \\
+  -H "Authorization: Bearer ${key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"<model-file-name.gguf>","messages":[{"role":"user","content":"Hello DecentraAI"}]}'`,
+  python: (ep, key) => `from openai import OpenAI
+
+client = OpenAI(base_url="${ep}/v1", api_key="${key}")
+r = client.chat.completions.create(
+    model="<model-file-name.gguf>",
+    messages=[{"role": "user", "content": "Hello DecentraAI"}],
+)
+print(r.choices[0].message.content)`,
+  js: (ep, key) => `const r = await fetch("${ep}/v1/chat/completions", {
+  method: "POST",
+  headers: { "Authorization": "Bearer ${key}", "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "<model-file-name.gguf>",
+    messages: [{ role: "user", content: "Hello DecentraAI" }],
+    stream: true,
+  }),
+});
+const reader = r.body.getReader(); // SSE chunks as they arrive`,
+  openclaw: (ep, key) => `# OpenClaw — OpenAI-compatible provider pointing at this node
+providers:
+  decentraai:
+    type: openai
+    base_url: ${ep}/v1
+    api_key: ${key}
+    models:
+      - "<model-file-name.gguf>"`,
+  webui: (ep, key) => `# Open WebUI — "Admin → Settings → Connections → OpenAI API"
+# URL:  ${ep}/v1
+# Key:  ${key}   (the token you created above)
+# Model: <model-file-name.gguf>`,
+};
+let cfgTab = 'curl';
+window.selectCfg = tab => {
+  cfgTab = tab;
+  document.querySelectorAll('.cfg-tab').forEach(b => b.classList.toggle('active', b.dataset.cfg === tab));
+  buildCfg();
+};
+function buildCfg(){
+  const ep = location.protocol + '//' + location.host;
+  const key = token || '<your-created-token>';
+  const tpl = cfgTemplates[cfgTab];
+  $('cfg-out').textContent = tpl ? tpl(ep, key) : '';
+}
+document.querySelectorAll('.cfg-tab').forEach(b => b.addEventListener('click', () => selectCfg(b.dataset.cfg)));
 window.revokeToken = async e => {
   const name = e.target.dataset.n;
   const r = await fetch('/api/admin/token/revoke', { method:'POST', headers, body: JSON.stringify({ name }) });
