@@ -568,6 +568,10 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <div id="cir-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
         </div>
         <div class="card" style="margin-top:14px">
+          <h2>Capability overview <span class="count">local, on-disk</span></h2>
+          <div id="cap-overview" style="margin-top:6px;font-size:12px;color:var(--muted)"><span class="muted">loading…</span></div>
+        </div>
+        <div class="card" style="margin-top:14px">
           <h2>Served models <span class="count" id="models-count"></span></h2>
           <table><thead><tr><th>Model</th><th>Engine</th><th class="num">Context</th><th class="num">RAM</th><th class="num">VRAM</th><th>Active</th></tr></thead>
           <tbody id="models"><tr><td colspan="6" class="empty">no served models advertised</td></tr></tbody></table>
@@ -654,6 +658,16 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
                 <span class="mono" style="font-size:11px;color:var(--muted)">fabric-wide fit for the selected capability, from local claims (no Hub round-trip)</span>
               </div>
               <div id="md-cir" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+            </div>
+            <div style="margin-top:10px"><b style="font-size:12px">CAN I RUN THIS? — on-disk variants (fabric)</b>
+              <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <span class="mono" style="font-size:11px;color:var(--muted)">on-disk file</span>
+                <input id="md-vf-file" type="text" class="mono" placeholder="e.g. qwen2.5-7b-instruct-q4_k_m.gguf" style="font-size:11px;padding:2px 4px;width:280px">
+                <select id="md-vf-cap" class="mono" style="font-size:11px;padding:2px 4px"></select>
+                <button class="btn small" onclick="loadVariantFit()">Load variant fit</button>
+              </div>
+              <div class="mono" style="font-size:10.5px;color:var(--faint);margin-top:4px">per-variant fabric fit from the real on-disk GGUF files this fabric shares (matches by file name)</div>
+              <div id="md-variant-fit" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
             </div>
             <div style="margin-top:10px"><b style="font-size:12px">Variants</b>
               <table style="margin-top:6px"><thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th><th></th></tr></thead>
@@ -2180,6 +2194,18 @@ async function hubOpenDetail(id){
     var known = ['ocr','vision','coding','summarization','translation','embeddings','tool_calling','structured_output','reasoning','speech_to_text','text_to_speech','image_generation','classification','multimodal'];
     known.forEach(function(k){ var o = document.createElement('option'); o.value = k; o.textContent = k; fitSel.appendChild(o); });
   }
+  // On-disk variant fit selector: same KNOWN taxonomy (never invented), and
+  // default the file name to the repo id (the backend matches by file-name
+  // suffix, so the operator can correct it to the real on-disk file).
+  var vfCap = $('md-vf-cap');
+  if (vfCap && vfCap.options.length === 0) {
+    var knownVf = ['ocr','vision','coding','summarization','translation','embeddings','tool_calling','structured_output','reasoning','speech_to_text','text_to_speech','image_generation','classification','multimodal'];
+    knownVf.forEach(function(k){ var o = document.createElement('option'); o.value = k; o.textContent = k; vfCap.appendChild(o); });
+  }
+  if (vfCap) vfCap.value = (fitSel && fitSel.value) || '';
+  var vfFile = $('md-vf-file');
+  if (vfFile) vfFile.value = j.id || '';
+  $('md-variant-fit').innerHTML = '';
   $('md-fit').innerHTML = '';
   $('md-fit-note').textContent = '';
   hubFitCache = j.id || '';
@@ -2220,6 +2246,56 @@ async function hubCanIRunLocal(){
   const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(model)+'&capability='+encodeURIComponent(cap)+'&evidence=any', { headers });
   if (!ok) { $('md-cir').innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
   renderCanIRun(j, 'md-cir', model, cap);
+}
+// CAN I RUN THIS? — on-disk variants (fabric). Fetches the real /v1/can_run
+// projection for a typed on-disk file name and renders each real on-disk GGUF
+// variant with its per-variant fabric verdict. Never fabricates: an empty
+// variants array renders "no on-disk variants on this fabric", and backend
+// errors render as-is.
+async function loadVariantFit(){
+  var file = (($('md-vf-file') || {}).value || '').trim();
+  var cap = ($('md-vf-cap') || {}).value || '';
+  var con = $('md-variant-fit');
+  if (!file) { toast('enter an on-disk file name to check', true); return; }
+  if (!con) return;
+  con.innerHTML = '<span class="mono" style="font-size:11px;color:var(--faint)">checking '+esc(file)+'…</span>';
+  const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(file)+'&capability='+encodeURIComponent(cap)+'&evidence=any', { headers });
+  if (!ok) { con.innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
+  var variants = (j && j.variants) || [];
+  if (!variants.length) { con.innerHTML = '<span class="mono" style="font-size:11px;color:var(--muted)">no on-disk variants on this fabric</span>'; return; }
+  con.innerHTML = variants.map(function(v){
+    var q = v.quantization || '—';
+    var size = v.size_bytes ? fmtMB(v.size_bytes / 1048576) : '—';
+    var fit = (v.fit || {});
+    var badge = fit.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN_RUN</span>'
+      : fit.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT_RUN</span>'
+      : '<span class="badge warn">UNKNOWN</span>';
+    var counts = fit.counts || {};
+    var reasons = (fit.reasons || []).map(function(r){ return '<div class="mono" style="font-size:11px;margin-top:2px">• '+esc(r)+'</div>'; }).join('');
+    var chosen = fit.chosen_worker ? '<div style="margin-top:4px">chosen worker: <code>'+esc(short(fit.chosen_worker, 16))+'</code></div>' : '';
+    var perWorker = '';
+    (v.workers || []).forEach(function(w){
+      var wv = w.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN_RUN</span>' : w.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT_RUN</span>' : '<span class="badge warn">UNKNOWN</span>';
+      var id = (w.worker || {});
+      var checks = (w.checks || []).filter(function(c){ return !c.pass; }).map(function(c){
+        return '<li style="font-size:11px"><span class="warn">✗</span> '+esc(c.check)+' — '+esc(c.state)+'</li>';
+      }).join('');
+      perWorker += '<div style="margin-top:6px;border-top:1px dashed var(--border);padding-top:4px">'+
+        '<code>'+esc(short(id.node_id||id.peer_id||'', 14))+'</code> · '+esc(id.node_name||'')+' · '+wv+' · '+
+        'model '+esc(w.model_availability||'')+' · '+(w.trusted?'<span class="badge ok">trusted</span>':'<span class="badge warn">untrusted</span>')+' · engine '+esc(w.engine||'')+
+        (checks?'<ul style="margin:4px 0 0 14px;padding:0">'+checks+'</ul>':'')+'</div>';
+    });
+    return '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px">'+
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+        '<span class="mono" style="font-size:11.5px">'+esc(v.file||'')+'</span> '+badge+
+        ' <span class="mono" style="font-size:11px;color:var(--muted)">'+esc(q)+' · '+size+'</span>'+
+        ' <span class="mono" style="font-size:11px;color:var(--faint)">'+counts.can_run+' can / '+counts.cannot_run+' cannot / '+counts.unknown+' unknown</span>'+
+      '</div>'+
+      reasons + chosen +
+      (v.workers && v.workers.length ? '<div style="margin-top:6px"><b style="font-size:11px">per worker</b>'+perWorker+'</div>' : '')+
+      (!v.workers || !v.workers.length ? '<div class="mono" style="font-size:11px;color:var(--faint)">no workers on the fabric</div>' : '')+
+    '</div>';
+  }).join('');
 }
 async function hubPullVariant(id, file){
   if (hubPulling[id+':'+file]) return;
@@ -2423,6 +2499,22 @@ $('tok-create').addEventListener('click', async () => {
 });
 
 // ---- main refresh (every 3s, real data only) -------------------------------
+// Capability overview (Digital Twin): the distinct capabilities known across
+// on-disk models, with verified/inferred model counts, from /v1/capabilities.
+async function loadCapOverview(){
+  const con = $('cap-overview');
+  if (!con) return;
+  try {
+    const j = await (await fetch('/v1/capabilities', { headers })).json();
+    const caps = j.capabilities || [];
+    if (!caps.length) { con.innerHTML = '<span class="muted">no capability claims yet — pull models from the Hub to record them</span>'; return; }
+    con.innerHTML = caps.map(c =>
+      '<span class="badge" title="'+esc(c.verified_models)+' verified · '+esc(c.inferred_models)+' inferred model(s)">'+esc(c.capability)+'</span> '+
+      '<span class="mono" style="font-size:10px;color:var(--faint)">'+esc(c.verified_models)+'✓ / '+esc(c.inferred_models)+'~</span>'
+    ).join(' ');
+  } catch (e) { con.innerHTML = '<span class="badge warn">capability overview failed</span>'; }
+}
+
 async function refresh(){
   let s = null, c = null, n = null, x = null;
   try { s = await (await fetch('/status')).json(); } catch (e) {}
@@ -2484,6 +2576,7 @@ async function refresh(){
   renderFabric(s, c, n, x);
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);
+  loadCapOverview();
 }
 setStageVisible(true);
 // Build the chat model selector once, from real data only:

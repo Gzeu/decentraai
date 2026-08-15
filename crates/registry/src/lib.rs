@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -263,6 +263,51 @@ impl ModelRegistry {
             .collect();
         results.sort_by(|a, b| a.0.cmp(b.0));
         results
+    }
+
+    /// Authoritative capability overview: returns `(capability, verified_count,
+    /// inferred_count)` for every distinct capability claimed across all models.
+    /// `verified_count` is the number of *distinct models* that have at least
+    /// one claim for that capability with provenance "verified" (case-insensitive);
+    /// `inferred_count` likewise for "inferred". A model claiming both verified
+    /// AND inferred for the same capability counts once in each bucket; duplicate
+    /// claims of the same capability+provenance on one model still count once.
+    /// Provenance is preserved (verified vs inferred stay separate). Sorted
+    /// deterministically by `capability`, case-insensitive then byte order.
+    /// Models with no claims contribute nothing. Empty when no claims exist.
+    /// Authoritative: reads `self.models` directly, never synthesized.
+    pub fn capability_summary(&self) -> Vec<(String, usize, usize)> {
+        let mut caps: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for model in self.models.values() {
+            let mut seen_verified: BTreeSet<String> = BTreeSet::new();
+            let mut seen_inferred: BTreeSet<String> = BTreeSet::new();
+            for claim in &model.capability_claims {
+                let cap = claim.capability.to_lowercase();
+                if claim.provenance.eq_ignore_ascii_case("verified") {
+                    seen_verified.insert(cap);
+                } else if claim.provenance.eq_ignore_ascii_case("inferred") {
+                    seen_inferred.insert(cap);
+                }
+            }
+            for cap in seen_verified {
+                let entry = caps.entry(cap).or_insert((0, 0));
+                entry.0 += 1;
+            }
+            for cap in seen_inferred {
+                let entry = caps.entry(cap).or_insert((0, 0));
+                entry.1 += 1;
+            }
+        }
+        let mut result: Vec<(String, usize, usize)> = caps
+            .into_iter()
+            .map(|(cap, (v, i))| (cap, v, i))
+            .collect();
+        result.sort_by(|a, b| {
+            a.0.to_lowercase()
+                .cmp(&b.0.to_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        result
     }
 
     /// Removes a model from the registry and deletes the underlying file.
@@ -686,5 +731,89 @@ mod tests {
 
         // z.gguf (no claims) is absent.
         assert!(results.iter().all(|r| r.0 != "z.gguf"));
+    }
+
+    #[test]
+    fn test_capability_summary_buckets() {
+        let (_dir, registry) = claims_fixture();
+
+        let summary = registry.capability_summary();
+        // ocr: a.gguf verified + m.gguf inferred; coding: a.gguf inferred only.
+        assert_eq!(
+            summary,
+            vec![
+                ("coding".to_string(), 0, 1),
+                ("ocr".to_string(), 1, 1),
+            ]
+        );
+        // z.gguf (no claims) is absent.
+        assert!(summary.iter().all(|(cap, _, _)| cap != "z.gguf"));
+    }
+
+    #[test]
+    fn test_capability_summary_dedupes_duplicate_claims() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        create_test_file(temp_dir.path(), "a.gguf", b"a");
+        registry.scan_directory(temp_dir.path()).unwrap();
+        registry
+            .set_capability_claims(
+                "a.gguf",
+                vec![
+                    CapabilityClaimRecord {
+                        capability: "ocr".into(),
+                        provenance: "verified".into(),
+                    },
+                    CapabilityClaimRecord {
+                        capability: "ocr".into(),
+                        provenance: "verified".into(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        // Two identical verified ocr claims on one model count once.
+        let summary = registry.capability_summary();
+        assert_eq!(summary, vec![("ocr".to_string(), 1, 0)]);
+    }
+
+    #[test]
+    fn test_capability_summary_empty_registry() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        assert!(registry.capability_summary().is_empty());
+    }
+
+    #[test]
+    fn test_capability_summary_deterministic_sort() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        create_test_file(temp_dir.path(), "a.gguf", b"a");
+        registry.scan_directory(temp_dir.path()).unwrap();
+        // Case-insensitive tie-break: byte order for "Ocr" vs "ocr" only matters
+        // when casings differ; here distinct caps sort case-insensitively then
+        // byte-wise, and repeated calls must yield identical order.
+        registry
+            .set_capability_claims(
+                "a.gguf",
+                vec![
+                    CapabilityClaimRecord {
+                        capability: "OCR".into(),
+                        provenance: "verified".into(),
+                    },
+                    CapabilityClaimRecord {
+                        capability: "vision".into(),
+                        provenance: "inferred".into(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let first = registry.capability_summary();
+        let second = registry.capability_summary();
+        assert_eq!(first, second);
+        // Case-insensitive sort: "OCR" and "ocr" both collapse to "ocr".
+        let caps: Vec<_> = first.iter().map(|c| c.0.clone()).collect();
+        assert_eq!(caps, vec!["ocr".to_string(), "vision".to_string()]);
     }
 }

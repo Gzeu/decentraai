@@ -1034,3 +1034,31 @@ foundations (GitHub-safe, no execution).
   preserved, case-insensitive, deterministic sort; no-claim models never
   returned). Tests across verified gating / no-match / case-insensitivity /
   sorting.
+
+## 35. Next-Gen Phase D/L — Extended Intent, Registry Summary, Digital Twin Overview
+
+Three parallel, additive capabilities closing the intent + Digital Twin loop
+(GitHub-safe, no execution).
+
+**Extended intent lexicon**
+- [x] `LEXICON` extended: Retrieval, Reranking, Reasoning, StructuredOutput,
+  Agents, TextToSpeech, Audio, Multimodal, DocumentUnderstanding, Video —
+  all mapping to existing `CapabilityKind` variants (no new kinds).
+- [x] `capability_label` (presentation-only delegate) and
+  `intent_capabilities_with_labels` (capability+label pairs). Tests for the
+  new mappings, dedup, and labels.
+
+**Registry capability summary**
+- [x] `ModelRegistry::capability_summary() -> Vec<(capability, verified_count,
+  inferred_count)>` — authoritative local overview (distinct models per
+  provenance bucket, deduped, deterministic sort). Tests for bucketing, dedup,
+  empty registry, sort.
+
+**Digital Twin overview**
+- [x] `GET /v1/capabilities` — operator/admin endpoint returning the local
+  on-disk capability summary (verified/inferred model counts).
+- [x] Dashboard Models view gains a "Capability overview" card rendering the
+  real local summary (no fabricated counts); Model card gains a
+  "CAN I RUN THIS? — on-disk variants (fabric)" block that calls `/v1/can_run`
+  and renders the real `variants` array (file, quantization, size, per-variant
+  fit) with per-worker blockers.

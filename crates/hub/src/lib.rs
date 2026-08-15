@@ -30,7 +30,10 @@ pub mod requirements;
 pub use capability::{CapabilityClaim, CapabilityKind, ModelCapabilities, Provenance};
 pub use catalog::{HubCatalog, HubLfs, HubModel, HubModelDetail, HubModelFile, PipelineTag};
 pub use download::download_model;
-pub use intent::{capabilities_for_intent, intent_requirements};
+pub use intent::{
+    capabilities_for_intent, capability_label, intent_capabilities_with_labels,
+    intent_requirements,
+};
 pub use requirements::{
     CapabilityMatch, CapabilityRequirement, EvidenceLevel, RequirementCheck, RequirementStatus,
     match_requirements, satisfies_any,

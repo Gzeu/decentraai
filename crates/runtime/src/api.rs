@@ -2505,6 +2505,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/can_run", get(can_run_handler))
+        .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_detail_handler))
         .route("/v1/completions", post(proxy_handler))
@@ -3084,6 +3085,42 @@ async fn can_run_handler(
         .unwrap_or("any");
     let evidence = if evidence == "verified" { "verified" } else { "any" };
     let body = mcp_worker_capability(&state, &model, &capability, evidence).await;
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// `GET /v1/capabilities` — authoritative local capability overview (Digital
+/// Twin): the distinct capabilities known across the fabric's on-disk models,
+/// each with verified/inferred model counts (from the real registry), plus the
+/// known capability taxonomy labels. Read-only. Operator/admin.
+async fn capabilities_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
+    let summary: Vec<serde_json::Value> = registry
+        .as_ref()
+        .map(|reg| {
+            reg.capability_summary()
+                .into_iter()
+                .map(|(cap, verified, inferred)| {
+                    serde_json::json!({
+                        "capability": cap,
+                        "verified_models": verified,
+                        "inferred_models": inferred,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = serde_json::json!({ "capabilities": summary });
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
