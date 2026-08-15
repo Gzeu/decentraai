@@ -439,33 +439,6 @@ impl RequestRouter {
     }
 }
 
-/// Handler for incoming inference requests
-///
-/// This can be used as a RequestHandler for the P2P node to process
-/// InferRequest messages.
-pub struct InferenceRequestHandler;
-
-#[async_trait::async_trait]
-impl decentraai_p2p::RequestHandler for InferenceRequestHandler {
-    fn handle(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Try to deserialize as an InferRequest
-        use decentraai_protocol::deserialize_message;
-
-        let _infer_request: InferRequest = deserialize_message(request, request.len())?;
-
-        // In a real implementation, this would:
-        // 1. Validate the request
-        // 2. Check if we can serve the requested model
-        // 3. Process the request (or queue it)
-        // 4. Return a response or error
-
-        // For now, return an error indicating this is not implemented
-        Err(anyhow::anyhow!(
-            "Inference request handling not implemented in P2P handler"
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -494,38 +494,6 @@ impl WorkerManager {
     }
 }
 
-/// Handler for incoming worker announcements
-///
-/// This can be used as a RequestHandler for the P2P node to process
-/// WorkerAnnouncement messages.
-pub struct WorkerAnnouncementHandler {
-    worker_manager: Arc<WorkerManager>,
-}
-
-impl WorkerAnnouncementHandler {
-    pub fn new(worker_manager: Arc<WorkerManager>) -> Self {
-        Self { worker_manager }
-    }
-}
-
-#[async_trait::async_trait]
-impl decentraai_p2p::RequestHandler for WorkerAnnouncementHandler {
-    fn handle(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Try to deserialize as a WorkerAnnouncement
-        match WorkerManager::deserialize_announcement(request) {
-            Ok(announcement) => {
-                self.worker_manager.process_announcement(announcement)?;
-                // Return empty response for announcements
-                Ok(Vec::new())
-            }
-            Err(_) => {
-                // Not a worker announcement, pass through
-                Err(anyhow::anyhow!("Not a worker announcement"))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
