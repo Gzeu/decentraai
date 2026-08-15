@@ -6288,6 +6288,64 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn mcp_execute_decision_requires_master_not_operator() {
+        // Phase M: a mutation (execute_decision runs real inference + reserves)
+        // must be admin-only. An operator token may read (decide) but must be
+        // denied the mutating execute_decision via the MCP surface; master is
+        // allowed.
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("db/tokens.json");
+        let operator_tok;
+        {
+            let mut store = decentraai_tokens::TokenStore::load(&registry_path).unwrap();
+            operator_tok = store
+                .create_with_role(
+                    "ops1",
+                    decentraai_tokens::Tier::GUEST,
+                    None,
+                    decentraai_tokens::Role::Operator,
+                )
+                .unwrap();
+        }
+        let (api, manager) =
+            start_stateful_api_with_store(dir.path(), "master".to_string()).await;
+        let client = reqwest::Client::new();
+        let mcp_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","prompt":"read","confirm":true}}}"#;
+
+        // Operator token -> denied (mutation requires master).
+        let op = client
+            .post(format!("http://{api}/mcp"))
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {operator_tok}"))
+            .body(mcp_body)
+            .send()
+            .await
+            .unwrap();
+        assert!(op.status().is_client_error(), "operator must not execute");
+
+        // Master token -> allowed (will return a 422 honest no-decision or a run).
+        let master = client
+            .post(format!("http://{api}/mcp"))
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer master")
+            .body(mcp_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), 200, "master may call execute_decision");
+        let j: serde_json::Value = master.json().await.unwrap();
+        // Either a result or an error is surfaced in the content; the boundary
+        // must NOT be an auth rejection for master.
+        assert!(
+            j["result"].is_object() || j["error"].is_object(),
+            "master call must yield a result or protocol error: {j}"
+        );
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn rate_limit_returns_429_and_audits() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
