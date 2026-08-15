@@ -82,6 +82,9 @@ pub struct PlannerConfig {
     pub w_headroom: f64,
     pub w_net: f64,
     pub w_kv: f64,
+    /// Weight for *cache locality*: steering a continuation back to the worker
+    /// that already holds the session's KV prefix, avoiding a cold prefill.
+    pub w_locality: f64,
 }
 
 impl Default for PlannerConfig {
@@ -94,6 +97,7 @@ impl Default for PlannerConfig {
             w_headroom: 0.15,
             w_net: 0.10,
             w_kv: 0.10,
+            w_locality: 0.15,
         }
     }
 }
@@ -112,6 +116,7 @@ pub struct CandidateScore {
     pub headroom: f32,
     pub net: f32,
     pub kv: f32,
+    pub locality: f32,
 }
 
 /// Observability of a planning decision: the chosen worker's component scores
@@ -209,11 +214,18 @@ impl ExecutionPlanner {
                 .any(|f| f.capabilities.prefill_decode_separation),
         );
 
-        // Score eligible workers: perf + load + network reach cost.
+        // Score eligible workers: perf + load + network reach cost (+ KV
+        // locality for continuations whose prefix is resident on a worker).
         let mut ranked: Vec<(CandidateScore, &WorkerFacts)> = eligible
             .iter()
             .map(|f| {
-                let cs = self.candidate_score(f, req, kv_hint.prefer_kv_headroom, &self.config);
+                let cs = self.candidate_score(
+                    f,
+                    req,
+                    kv_hint.prefer_kv_headroom,
+                    kv_hint.cache_locality_worker.as_deref(),
+                    &self.config,
+                );
                 (cs, *f)
             })
             .collect();
@@ -314,6 +326,7 @@ impl ExecutionPlanner {
         f: &WorkerFacts,
         req: &RequestFacts,
         prefer_kv_headroom: bool,
+        cache_locality_worker: Option<&str>,
         cfg: &PlannerConfig,
     ) -> CandidateScore {
         let tps_score = (f.tokens_per_second as f32 / 200.0).clamp(0.0, 1.0);
@@ -343,6 +356,14 @@ impl ExecutionPlanner {
         } else {
             0.0
         };
+        // KV locality (M20): for a continuation whose prefix is resident on a
+        // specific worker, steer back to that worker — a cold prefill on
+        // another worker would re-ingest the whole prefix. Only the prefix
+        // host scores here; every other worker gets 0.
+        let locality_score = match cache_locality_worker {
+            Some(host) if host == f.peer_id => 1.0,
+            _ => 0.0,
+        };
 
         let total = (cfg.w_tps * tps_score as f64
             + cfg.w_latency * (latency_score * priority_boost) as f64
@@ -350,7 +371,8 @@ impl ExecutionPlanner {
             + cfg.w_queue * (queue_score * priority_boost) as f64
             + cfg.w_headroom * headroom as f64
             + cfg.w_net * net_score as f64
-            + cfg.w_kv * kv_score as f64) as f32;
+            + cfg.w_kv * kv_score as f64
+            + cfg.w_locality * locality_score as f64) as f32;
 
         CandidateScore {
             peer_id: f.peer_id.clone(),
@@ -362,6 +384,7 @@ impl ExecutionPlanner {
             headroom,
             net: net_score,
             kv: kv_score,
+            locality: locality_score,
         }
     }
 
@@ -452,12 +475,46 @@ mod tests {
         let mut high = req();
         high.priority = 255;
 
-        let lo = planner.candidate_score(&fast, &low, false, &cfg);
-        let hi = planner.candidate_score(&fast, &high, false, &cfg);
+        let lo = planner.candidate_score(&fast, &low, false, None, &cfg);
+        let hi = planner.candidate_score(&fast, &high, false, None, &cfg);
         // At priority 0 the boost factor is exactly 1.0; at 255 it is 1.5, so
         // the latency*queue contribution (and thus the total) strictly grows.
         assert!(hi.total > lo.total, "high-priority must value the fast worker more");
         assert!((lo.latency - hi.latency).abs() < f32::EPSILON, "latency term unchanged");
+    }
+
+    #[test]
+    fn continuation_is_steered_to_prefix_host_by_locality_score() {
+        // M20 continuation affinity: when a session's KV prefix is resident on
+        // a specific worker, the planner must prefer it (avoiding a cold
+        // prefill), EVEN when that worker is slower than an alternative. This
+        // pins the locality term in the score — before it, the prefix host
+        // only won via the PeerId tiebreak.
+        let fast = worker_facts("fast", 180, 50, 10);
+        let mut host = worker_facts("host", 150, 80, 20);
+        host.kv = KVCacheState::Partial { used: 5, capacity: 4096 };
+
+        let mut continuation = req();
+        continuation.context.is_continuation = true;
+        continuation.context.prefix_resident_on = Some("host".into());
+
+        let p = ExecutionPlanner::default().plan(&continuation, &[fast, host]);
+        assert_eq!(
+            p.plan.workers(),
+            vec!["host"],
+            "continuation must go back to the prefix host"
+        );
+        // The locality term is the reason: only the prefix host gets it.
+        let chosen = p.rationale.chosen.as_ref().expect("chosen score present");
+        assert_eq!(chosen.locality, 1.0, "prefix host gets the locality term");
+        let runner_up_locality = p
+            .rationale
+            .ranked
+            .iter()
+            .find(|c| c.peer_id == "fast")
+            .map(|c| c.locality)
+            .unwrap();
+        assert_eq!(runner_up_locality, 0.0, "non-host gets no locality term");
     }
 
     #[test]
