@@ -1,4 +1,4 @@
-//! Capability taxonomy for DecentraAI models (Issue #26 §4–§6, §31).
+//! Capability taxonomy for DecentraAI models (Issue #26 §4-§6, §31).
 //!
 //! The Hub is a *capability marketplace*, not a raw HuggingFace frontend:
 //! users should be able to go from "WHAT DO I WANT TO DO?" to compatible
@@ -106,7 +106,7 @@ pub struct CapabilityClaim {
 pub struct ModelCapabilities {
     pub claims: Vec<CapabilityClaim>,
     /// Task filters exposed for this model, grouped by capability. Derived
-    /// deterministically from the claims — a task is only present when its
+    /// deterministically from the claims -- a task is only present when its
     /// capability is.
     pub tasks: Vec<TaskEntry>,
 }
@@ -256,7 +256,29 @@ pub fn classify(
     // --- INFERRED from conservative name heuristics ---
     let id_lower = id.to_lowercase();
     let name_has = |needle: &str| id_lower.contains(needle);
-    if name_has("codestral") || name_has("code") || name_has("coder") || name_has("starcoder") {
+
+    // BUGFIX (audit finding, verified from source): a bare `name_has("code")`
+    // substring check false-positives on "encoder", "decoder", "codec" and
+    // "vocoder" -- "code" is a literal substring of all four (e.g.
+    // "en-C-O-D-E-r"). Any embedding/vision/audio model with one of those
+    // words in its name (extremely common -- "bge-encoder", "vae-decoder",
+    // "hifi-vocoder", any audio codec) was silently mislabeled
+    // `Coding: Inferred`, directly contradicting this module's own "never
+    // claim a capability merely because it would be convenient" rule.
+    // Fix: exclude the known codec/encoder/decoder family explicitly before
+    // applying the broad "code" check, and add "codellama"/"code-llama"
+    // (a real, common coding-model family the old heuristic actually missed,
+    // since it contains neither "coder" nor bare unqualified "code" cleanly
+    // distinguishable from the false-positive family).
+    let looks_like_codec_family =
+        name_has("encode") || name_has("decode") || name_has("codec") || name_has("vocoder");
+    let coding_name_hit = name_has("codestral")
+        || name_has("coder")
+        || name_has("starcoder")
+        || name_has("codellama")
+        || name_has("code-llama")
+        || (name_has("code") && !looks_like_codec_family);
+    if coding_name_hit {
         push_unique(&mut claims, CapabilityKind::Coding, Provenance::Inferred);
     }
     if name_has("reason") || name_has("think") || name_has("deepseek-r1") || name_has("qwq") {
@@ -356,7 +378,6 @@ mod tests {
             c.capability == CapabilityKind::StructuredOutput
                 && c.provenance == Provenance::Verified
         }));
-        // Tool calling exposes task filters.
         assert!(caps
             .tasks
             .iter()
@@ -369,11 +390,9 @@ mod tests {
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
         }));
-        // ...but NOT claimed verified.
         assert!(!caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::Coding && c.provenance == Provenance::Verified
         }));
-        // Coding tasks appear once coding is claimed.
         assert!(caps.tasks.iter().any(|t| t.task == "repository understanding"));
     }
 
@@ -391,8 +410,6 @@ mod tests {
 
     #[test]
     fn unknown_pipeline_claims_nothing_false() {
-        // A repo with an unmapped pipeline tag and an innocent name must not
-        // claim any capability it cannot back.
         let caps = classify(
             Some("unknown-tag"),
             &tags(&["gguf", "license:mit"]),
@@ -415,5 +432,61 @@ mod tests {
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::Embeddings && c.provenance == Provenance::Verified
         }));
+    }
+
+    // --- Regression tests for the audit-found false-positive bugfix ---
+
+    #[test]
+    fn encoder_named_models_are_never_misclassified_as_coding() {
+        let caps = classify(Some("feature-extraction"), &tags(&["gguf"]), "org/bge-base-encoder");
+        assert!(
+            !caps.claims.iter().any(|c| c.capability == CapabilityKind::Coding),
+            "encoder-named embedding model must not be claimed as Coding: {:?}",
+            caps.claims
+        );
+    }
+
+    #[test]
+    fn decoder_and_codec_and_vocoder_named_models_are_never_misclassified_as_coding() {
+        for id in [
+            "org/vae-decoder",
+            "org/hifi-vocoder",
+            "org/neural-audio-codec",
+        ] {
+            let caps = classify(None, &tags(&["gguf"]), id);
+            assert!(
+                !caps.claims.iter().any(|c| c.capability == CapabilityKind::Coding),
+                "{id} must not be claimed as Coding: {:?}",
+                caps.claims
+            );
+        }
+    }
+
+    #[test]
+    fn codellama_family_is_still_inferred_as_coding() {
+        for id in ["org/codellama-7b", "org/code-llama-13b-instruct"] {
+            let caps = classify(Some("text-generation"), &tags(&["gguf"]), id);
+            assert!(
+                caps.claims.iter().any(|c| {
+                    c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
+                }),
+                "{id} must still be inferred as Coding: {:?}",
+                caps.claims
+            );
+        }
+    }
+
+    #[test]
+    fn coder_and_starcoder_and_codestral_still_infer_coding() {
+        for id in ["org/qwen2.5-coder-7b", "org/starcoder2-15b", "org/codestral-22b"] {
+            let caps = classify(Some("text-generation"), &tags(&["gguf"]), id);
+            assert!(
+                caps.claims.iter().any(|c| {
+                    c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
+                }),
+                "{id} must still be inferred as Coding: {:?}",
+                caps.claims
+            );
+        }
     }
 }
