@@ -328,7 +328,45 @@ fn validate_manifest(manifest: &Manifest) -> Result<usize> {
     if chunk_count == 0 {
         bail!("manifest has no chunks");
     }
+    // `model_id` and `file_name` arrive from a remote peer and are
+    // interpolated directly into staging/quarantine/models paths. A hostile
+    // peer must not be able to steer those writes outside their directories
+    // (path traversal / absolute-path write).
+    validate_artifact_component(&manifest.model_id)?;
+    validate_artifact_component(&manifest.file_name)?;
     Ok(chunk_count)
+}
+
+/// Rejects any name that cannot be used safely as a single path component.
+///
+/// A remote peer controls `model_id`/`file_name`, which are later joined into
+/// `staging/`, `quarantine/` and `models/` paths. We accept only a plain file
+/// name: no path separators, no `.`/`..`, no absolute/rooted path, no NUL
+/// byte, and no empty name. Using `Path::components()` keeps the check
+/// platform-aware (it also splits on Windows separators).
+fn validate_artifact_component(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("artifact name is empty");
+    }
+    if name.contains('\0') {
+        bail!("artifact name contains a NUL byte");
+    }
+    // Backslash is a separator on Windows; a name validated as safe on Linux
+    // could be re-processed on Windows. Model filenames never legitimately
+    // contain it, so reject it explicitly as a cross-platform guard.
+    if name.contains('\\') {
+        bail!("artifact name must be a plain file name, got {name:?}");
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(part)), None) => {
+            if part == ".." || part == "." {
+                bail!("artifact name must be a plain file name, got {name:?}");
+            }
+            Ok(())
+        }
+        _ => bail!("artifact name must be a plain file name, got {name:?}"),
+    }
 }
 
 /// Fetches one chunk from a peer without verifying it; verification is
@@ -459,4 +497,54 @@ fn save_bitmap(path: &Path, done: &[bool]) -> Result<()> {
     let bytes: Vec<u8> = done.iter().map(|d| u8::from(*d)).collect();
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_with(model_id: &str, file_name: &str) -> Manifest {
+        Manifest {
+            version: 1,
+            model_id: model_id.to_string(),
+            file_name: file_name.to_string(),
+            file_size: 0,
+            chunk_size: CHUNK_SIZE,
+            chunk_hashes: vec!["ab".to_string()],
+            merkle_root: "cd".to_string(),
+        }
+    }
+
+    /// A peer-controlled model_id/file_name must never escape the
+    /// staging/quarantine/models directories, even under platform-specific
+    /// path handling. This is the security invariant for `validate_manifest`.
+    #[test]
+    fn rejects_path_traversal_in_artifact_names() {
+        let malicious: &[(&str, &str)] = &[
+            ("../escape", "safe.bin"),
+            ("..", "safe.bin"),
+            ("/etc/passwd", "safe.bin"),
+            ("safe", "../escape.gguf"),
+            ("safe", "/tmp/evil"),
+            ("a/b", "safe"),
+            ("safe", "a\\b"),
+            ("safe", ""),
+        ];
+        for &(model_id, file_name) in malicious {
+            let e = validate_manifest(&manifest_with(model_id, file_name))
+                .expect_err(&format!("{model_id:?}/{file_name:?} must be rejected"));
+            assert!(!e.to_string().is_empty(), "error should carry a message");
+        }
+    }
+
+    #[test]
+    fn accepts_plain_artifact_names() {
+        // Real artifacts use the BLAKE3 file hash as model_id and the source
+        // basename as file_name — both are plain components.
+        let ok = manifest_with(
+            "9c4a5f3f9f1d9b7f5a8e2d0b1f6c7d8e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+            "model-7b-q4_k_m.gguf",
+        );
+        assert!(validate_manifest(&ok).is_ok());
+    }
 }
