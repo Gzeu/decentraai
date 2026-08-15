@@ -225,6 +225,7 @@ mod tests {
             engine: EngineKind::LlamaServer,
             tokens_per_second: tps,
             latency_ms: 40,
+            perf_measured: false,
             queue_depth: queue,
             load_percent: load as u8,
             available_ram_mb: 4096,

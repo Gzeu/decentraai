@@ -883,6 +883,11 @@ impl ComputeManager {
                     engine: decentraai_fabric::EngineKind::parse(&cap.engine),
                     tokens_per_second: a.tokens_per_second,
                     latency_ms: a.current_latency_ms,
+                    // Honest perf provenance (Phase N): any nonzero advertised
+                    // perf means a real measured completion fed the EWMA;
+                    // zero means never measured (estimated/unknown). Pure
+                    // provenance — the score formula is unchanged.
+                    perf_measured: a.tokens_per_second > 0 || a.current_latency_ms > 0,
                     queue_depth: a.queue_depth,
                     load_percent: a.load_percent,
                     available_ram_mb: a.available_ram_mb,
@@ -1874,6 +1879,84 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].available_models.len(), 1);
         assert_eq!(facts[0].available_models[0].file_name, "other-model.gguf");
+    }
+
+    #[tokio::test]
+    async fn fabric_facts_records_perf_measured_from_advertised_perf() {
+        // Phase N perf provenance: `fabric_facts` must set `perf_measured` to
+        // true when the advertisement carries nonzero advertised perf (a real
+        // completion fed the EWMA) and false when it is zero (never measured).
+        let local = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::new());
+
+        // Never-measured worker: all-zero perf -> estimated.
+        let fresh_peer = peer();
+        let fresh = build_advertisement(
+            fresh_peer,
+            "fresh",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(fresh).await;
+        let facts = manager.fabric_facts("abc").await;
+        let f = facts.iter().find(|f| f.peer_id == fresh_peer.to_string()).unwrap();
+        assert!(!f.perf_measured, "zero advertised perf must be ESTIMATED");
+        assert_eq!(f.tokens_per_second, 0);
+        assert_eq!(f.latency_ms, 0);
+
+        // Measured worker: nonzero advertised perf -> measured.
+        let busy_peer = peer();
+        let busy = build_advertisement(
+            busy_peer,
+            "busy",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf {
+                queue_depth: 2,
+                tokens_per_second: 180,
+                current_latency_ms: 50,
+            },
+        );
+        manager.process_advertisement(busy).await;
+        let facts = manager.fabric_facts("abc").await;
+        let f = facts.iter().find(|f| f.peer_id == busy_peer.to_string()).unwrap();
+        assert!(f.perf_measured, "nonzero advertised perf must be MEASURED");
+        assert_eq!(f.tokens_per_second, 180);
+        assert_eq!(f.latency_ms, 50);
+
+        // Latency-only measurement (tokens still zero) is also measured.
+        let lat_peer = peer();
+        let lat = build_advertisement(
+            lat_peer,
+            "lat",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf {
+                queue_depth: 0,
+                tokens_per_second: 0,
+                current_latency_ms: 90,
+            },
+        );
+        manager.process_advertisement(lat).await;
+        let facts = manager.fabric_facts("abc").await;
+        let f = facts.iter().find(|f| f.peer_id == lat_peer.to_string()).unwrap();
+        assert!(f.perf_measured, "latency-only measurement must count as measured");
     }
 
     #[tokio::test]

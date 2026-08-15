@@ -34,6 +34,12 @@ pub struct WorkerFacts {
     pub tokens_per_second: u32,
     /// Nominal single-token latency (ms).
     pub latency_ms: u32,
+    /// Whether `tokens_per_second`/`latency_ms` reflect REAL measured
+    /// completions (at least one verified completion fed the EWMA) or are
+    /// estimated/unknown (never measured, e.g. a nominal default or 0).
+    /// Purely additive provenance — it never affects scoring. The coordinator
+    /// sets it honestly from the advertisement's advertised perf.
+    pub perf_measured: bool,
     pub queue_depth: u32,
     pub load_percent: u8,
     pub available_ram_mb: u64,
@@ -131,6 +137,11 @@ pub struct CandidateScore {
     pub net: f32,
     pub kv: f32,
     pub locality: f32,
+    /// Perf provenance of the chosen worker: `true` = its
+    /// `tokens_per_second`/`latency_ms` reflect real measured completions,
+    /// `false` = estimated/unknown. Mirrors `WorkerFacts::perf_measured`.
+    /// Additive — it is NOT part of the score formula and never affects `total`.
+    pub perf_measured: bool,
 }
 
 /// Honest verdict for a capability requirement carried on a request. The fabric
@@ -430,6 +441,7 @@ impl ExecutionPlanner {
             net: net_score,
             kv: kv_score,
             locality: locality_score,
+            perf_measured: f.perf_measured,
         }
     }
 
@@ -559,6 +571,7 @@ mod tests {
             engine: EngineKind::LlamaServer,
             tokens_per_second: tps,
             latency_ms: latency,
+            perf_measured: false,
             queue_depth: 0,
             load_percent: load,
             available_ram_mb: 4096,
@@ -804,6 +817,42 @@ mod tests {
         assert_eq!(p.rationale.ranked.len(), 2);
         // ranked[0] is the chosen worker.
         assert_eq!(p.rationale.ranked[0].peer_id, "a");
+    }
+
+    #[test]
+    fn perf_provenance_is_recorded_without_changing_score() {
+        // The perf-provenance marker must flow from WorkerFacts into the
+        // CandidateScore/rationale for the CHOSEN worker, and must be purely
+        // additive: measured vs estimated candidates get identical `total`.
+        let planner = ExecutionPlanner::default();
+        let cfg = PlannerConfig::default();
+        // Identical nominal perf -> identical total, but the marker differs.
+        let mut m_a = worker_facts("a", 150, 60, 20);
+        m_a.perf_measured = true;
+        let mut e_a = worker_facts("a", 150, 60, 20);
+        e_a.perf_measured = false;
+        let cs_measured = planner.candidate_score(&m_a, &req(), false, None, &cfg);
+        let cs_estimated = planner.candidate_score(&e_a, &req(), false, None, &cfg);
+        assert!(cs_measured.perf_measured);
+        assert!(!cs_estimated.perf_measured);
+        assert_eq!(cs_measured.total, cs_estimated.total, "marker must not change the score");
+
+        // Through the plan, the chosen worker's rationale records the marker.
+        // The measured worker has strictly better perf, so it wins and is
+        // marked measured.
+        let mut measured = worker_facts("measured", 200, 30, 5);
+        measured.perf_measured = true;
+        let mut estimated = worker_facts("estimated", 150, 60, 20);
+        estimated.perf_measured = false;
+        let p = planner.plan(&req(), &[estimated.clone(), measured]);
+        let chosen = p.rationale.chosen.as_ref().expect("chosen score present");
+        assert!(chosen.perf_measured, "measured worker must win and be marked measured");
+        assert!(p.rationale.ranked[0].perf_measured);
+
+        // And the estimated-only case records the ESTIMATED marker.
+        let p = planner.plan(&req(), &[estimated]);
+        let chosen = p.rationale.chosen.as_ref().expect("chosen score present");
+        assert!(!chosen.perf_measured, "unmeasured worker is marked estimated");
     }
 
     #[test]

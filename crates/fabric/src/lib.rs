@@ -42,7 +42,7 @@ pub use advisory::{FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_
 pub use decision::{
     Adaptation, CandidateOutcome, ConstraintKind, ConstraintResult, ExecutionDecision,
     ExecutionEvent, ExecutionPhase, Observation, OrchestrationAction, WorkloadClass, adapt, classify,
-    evaluate, observe, orchestrate,
+    evaluate, observe, orchestrate, recovery_timeline,
 };
 pub use engine::{EngineCapabilities, EngineKind};
 pub use expert::{ExpertDecision, ExpertLayout, ExpertRegistry, ExpertRouter, ExpertShard};

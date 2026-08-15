@@ -751,6 +751,12 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           </tbody></table>
         </div>
         <div class="card" style="margin-top:14px">
+          <h2>Resources <span class="count">real state · /v1/resources</span></h2>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Node RAM/VRAM/CPU/DISK below; per-worker fabric rows from live advertisements. Provenance is explicit — UNKNOWN is never a fabricated zero, and RAM/VRAM are separate.</div>
+          <div class="mono" id="res-node" style="font-size:11.5px;margin-bottom:10px">collecting&hellip;</div>
+          <div id="res-fabric" class="empty">no fabric rows (compute not attached)</div>
+        </div>
+        <div class="card" style="margin-top:14px">
           <h2>Recent security events</h2>
           <table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead>
           <tbody id="events"><tr><td colspan="3" class="empty">no security events yet</td></tr></tbody></table>
@@ -1850,6 +1856,12 @@ function renderDecisions(x){
         return '<div class="mono" style="font-size:11.5px;margin-bottom:8px">'+badge+' required <b>'+esc(cr.capability||'')+'</b> · evidence '+esc(cr.evidence||'')+'</div>';
       })(d.capability_requirement) : '')+
       (d.reasoning ? '<div class="mono" style="font-size:11.5px;color:var(--muted);margin-bottom:8px">'+esc(d.reasoning)+'</div>' : '')+
+      (d.recovery ? (function(r){
+        var rc = r.recoveries || 0;
+        var b = rc > 0 ? '<span class="badge warn">self-healed ×'+rc+'</span>' : '<span class="badge ok">no recovery</span>';
+        var phases = (r.phases_seen||[]).map(p=>'<span class="mono" style="font-size:10px;color:var(--faint)">'+esc(p)+'</span>').join(' ');
+        return '<div class="mono" style="font-size:11.5px;margin-bottom:8px">'+b+' · '+esc(r.summary||'')+'<div style="margin-top:2px">'+phases+'</div></div>';
+      })(d.recovery) : '')+
       '<div>'+cands+'</div>'+
       '<ul class="trace" style="margin-top:10px">'+trace+'</ul>'+
     '</div>';
@@ -2470,6 +2482,41 @@ function renderDiag(s, c, n){
   $('set-discovery').textContent = 'mDNS / LAN (auto)';
   $('set-model').textContent = (s ? esc(s.model) : '—') + ' / ' + (s && s.node ? esc(s.node.engine) : '—');
 }
+// Resource view (Phase B): real node state + real fabric worker rows, each
+// tagged with provenance. UNKNOWN is never rendered as a fabricated zero.
+function renderResources(r){
+  if (!r) return;
+  const node = r.node || {};
+  const ram = node.ram || {};
+  const cpu = node.cpu || {};
+  const disk = node.disk || {};
+  let nodeHtml =
+    '<div><span class="badge ok">cpu</span> '+cpu.logical_cpus+' cores · '+(cpu.usage_percent||0).toFixed(1)+'% ['+esc(cpu.provenance||'')+']</div>'+
+    '<div><span class="badge ok">ram</span> '+fmtMB(ram.available_mb)+' free / '+fmtMB(ram.total_mb)+' total · headroom '+fmtMB(ram.headroom_mb)+' ['+esc(ram.provenance||'')+']</div>';
+  const vram = node.vram || {};
+  if (vram.present) {
+    nodeHtml += '<div><span class="badge ok">vram</span> '+esc(vram.name||'gpu')+' · '+fmtMB(vram.free_mb)+' free / '+fmtMB(vram.total_mb)+' ['+esc(vram.provenance||'')+']</div>';
+  } else {
+    nodeHtml += '<div><span class="badge warn">vram</span> no GPU surfaced ['+esc(vram.provenance||'UNKNOWN')+']</div>';
+  }
+  nodeHtml += '<div><span class="badge ok">disk</span> '+fmtMB(disk.free_mb)+' free ['+esc(disk.provenance||'')+']</div>';
+  $('res-node').innerHTML = nodeHtml;
+
+  const rows = (r.fabric||[]).map(w => {
+    const prow = (v, unit) => v ? '<span class="badge faint" title="provenance">'+esc(v)+'</span>' : unit;
+    const ramH = w.ram ? 'RAM '+fmtMB(w.ram.available_mb)+' free / '+fmtMB(w.ram.total_mb)+' · res '+fmtMB(w.ram.reserved_mb)+' '+prow(w.ram.provenance,'') : '';
+    const vramH = w.vram && w.vram.present
+      ? ' · VRAM '+fmtMB(w.vram.available_mb)+' / '+fmtMB(w.vram.total_mb)+' '+prow(w.vram.provenance,'')
+      : ' · <span class="badge warn">CPU-only</span>';
+    return '<div class="mono" style="font-size:11px;padding:4px 0;border-bottom:1px solid var(--border,#223)">'+
+      '<b>'+esc(w.node_name || short(w.peer_id,14))+'</b>'+
+      (w.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
+      ' · '+esc(w.engine||'—')+
+      '<div style="color:var(--muted)">cpu '+((w.cpu&&w.cpu.load_percent)||0)+'% · '+ramH+vramH+
+      ' · queue '+(w.queue?w.queue.depth:'—')+' · latency '+(w.latency?w.latency.ms+'ms @ '+(w.latency.tokens_per_second||0)+' t/s':'—')+'</div></div>';
+  }).join('');
+  $('res-fabric').innerHTML = rows || '<div class="empty">no fabric workers advertised</div>';
+}
 function renderSettings(s){
   const r = (s && s.resources) || {};
   $('set-cpu').textContent = (s && s.system && s.system.cpu_threads ? s.system.cpu_threads+' threads' : '—') + ' · reserve '+r.reserve_cpu_cores+' core(s)';
@@ -2673,6 +2720,7 @@ async function refresh(){
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
+  try { const rr = await (await fetch('/v1/resources', { headers })).json(); renderResources(rr); } catch (e) {}
   renderFabric(s, c, n, x);
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);

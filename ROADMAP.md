@@ -1121,3 +1121,34 @@ Deterministic historical intelligence from real measured execution history
   history statistics; honest 0-record response when no compute manager attached.
 - [x] Tests: deterministic aggregates (measured-only, retries, per-model,
   per-worker, empty history) + endpoint auth/JSON.
+
+## 39. Next-Gen Phase B/H/N — Resource Intelligence, Perf Provenance, Recovery Timeline
+
+Three product-level capabilities (GitHub-safe, no execution), all additive and
+reusing authoritative structures.
+
+**Phase B — Unified Resource Intelligence operator view**
+- [x] `GET /v1/resources` — unified operator view over CPU / RAM / VRAM / DISK /
+  KV / QUEUE / LATENCY, each with TOTAL/AVAILABLE/RESERVED/IN_USE/HEADROOM where
+  the dimension supports it and explicit provenance (MEASURED/ESTIMATED/RESERVED/
+  ACTUAL/UNKNOWN). RAM and VRAM strictly separate; UNKNOWN is never a fabricated
+  zero; every value comes from `SystemSnapshot`, `probe_gpu`, the compute
+  manager's real advertisements + reservation ledgers + session count, and the
+  node queue. VRAM reservations honestly omitted (no fabricated 0).
+- [x] Dashboard Diagnostics gains a Resources card rendering the real node +
+  per-worker state with provenance badges.
+
+**Phase N → planner — Perf provenance (MEASURED vs ESTIMATED)**
+- [x] `WorkerFacts.perf_measured` + `CandidateScore.perf_measured` — additive
+  provenance marker (real measured completions fed the EWMA vs estimated/0).
+  Never affects the score formula. Coordinator fills it honestly:
+  `tokens_per_second>0 || latency_ms>0`.
+
+**Phase H — Recovery timeline (self-healing visualization)**
+- [x] `recovery_timeline(&ExecutionDecision) -> Value` — pure projection of the
+  lifecycle trace: outcome, final phase, phases_seen, recoveries count,
+  last OrchestrationAction, order-preserving event timeline, human summary.
+  Reuses the existing event/phase/action vocabulary (no new recovery engine).
+- [x] `ExecutionDecision.last_orchestration` (serde-tagged) + `/v1/execution`
+  attaches a `recovery` timeline per decision; Dashboard decisions cards render
+  a "self-healed ×N / no recovery" badge + phase list.

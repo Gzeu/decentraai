@@ -174,6 +174,12 @@ pub struct ExecutionDecision {
     pub outcome: Option<String>,
     /// Every lifecycle event observed for this request (control-plane trace).
     pub trace: Vec<ExecutionEvent>,
+    /// The last orchestration action decided by the runtime loop, when one has
+    /// been recorded (recovery/adaptation observability). `None` until a
+    /// coordinator records a decision; additive and defaulted so existing
+    /// constructions keep compiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_orchestration: Option<OrchestrationAction>,
 }
 
 /// A typed, serializable lifecycle event (event-driven observability).
@@ -385,6 +391,7 @@ pub fn evaluate(
         reservation_id: None,
         outcome: None,
         trace,
+        last_orchestration: None,
     }
 }
 
@@ -499,7 +506,8 @@ pub struct Observation {
 }
 
 /// The orchestrator's safe next action for a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum OrchestrationAction {
     /// Keep executing on the current worker.
     Continue,
@@ -582,6 +590,119 @@ pub fn observe(decision: &mut ExecutionDecision, event: ExecutionEvent) {
     decision.trace.push(event);
 }
 
+// ---------------------------------------------------------------------------
+// Recovery timeline projection (Phase H — self-healing observability)
+// ---------------------------------------------------------------------------
+
+/// Stable snake_case name for an event variant, matching its serde `event` tag
+/// (`#[serde(tag="event", rename_all="snake_case")]`), so the projection and
+/// the wire format never diverge.
+fn event_name(e: &ExecutionEvent) -> &'static str {
+    match e {
+        ExecutionEvent::Discovered { .. } => "discovered",
+        ExecutionEvent::Classified { .. } => "classified",
+        ExecutionEvent::Planned { .. } => "planned",
+        ExecutionEvent::Reserved { .. } => "reserved",
+        ExecutionEvent::Executing { .. } => "executing",
+        ExecutionEvent::Observing { .. } => "observing",
+        ExecutionEvent::Adapting { .. } => "adapting",
+        ExecutionEvent::Replanning { .. } => "replanning",
+        ExecutionEvent::Recovering { .. } => "recovering",
+        ExecutionEvent::Replanned { .. } => "replanned",
+        ExecutionEvent::DeadlineElapsed { .. } => "deadline_elapsed",
+        ExecutionEvent::Completed { .. } => "completed",
+        ExecutionEvent::Released { .. } => "released",
+        ExecutionEvent::Failed { .. } => "failed",
+    }
+}
+
+/// The attempt number an event carries, if any (only retry/recovery events).
+fn event_attempt(e: &ExecutionEvent) -> Option<u32> {
+    match e {
+        ExecutionEvent::Recovering { attempt, .. } => Some(*attempt),
+        _ => None,
+    }
+}
+
+/// Whether an event represents the system reacting to a problem (a recovery /
+/// re-plan). Used for the `recoveries` count.
+fn is_recovery_event(e: &ExecutionEvent) -> bool {
+    matches!(
+        e,
+        ExecutionEvent::Recovering { .. }
+            | ExecutionEvent::Replanned { .. }
+            | ExecutionEvent::Replanning { .. }
+            | ExecutionEvent::Adapting { .. }
+    )
+}
+
+/// Projects a decision's lifecycle trace into a concise, operator-readable
+/// recovery timeline (for the dashboard / observability). Pure, deterministic,
+/// and derived only from real trace data — never invents a phase or event.
+///
+/// Returns a JSON object with:
+/// - `"outcome"`: the decision's terminal outcome, or `"in_flight"`.
+/// - `"phase"`: the final event's phase, as the stable snake_case name.
+/// - `"phases_seen"`: ordered distinct event names (order of first appearance).
+/// - `"recoveries"`: count of recovery/replan events.
+/// - `"adaptation"`: the last recorded orchestration action, if any.
+/// - `"timeline"`: per-event `{ event, phase, attempt }`, in order.
+/// - `"summary"`: a short deterministic human string.
+pub fn recovery_timeline(decision: &ExecutionDecision) -> serde_json::Value {
+    let outcome = decision
+        .outcome
+        .clone()
+        .unwrap_or_else(|| "in_flight".to_string());
+
+    let mut phases_seen: Vec<&str> = Vec::new();
+    let mut recoveries: u32 = 0;
+    let mut last_event: Option<&ExecutionEvent> = None;
+    let timeline: Vec<serde_json::Value> = decision
+        .trace
+        .iter()
+        .map(|e| {
+            let name = event_name(e);
+            if !phases_seen.contains(&name) {
+                phases_seen.push(name);
+            }
+            if is_recovery_event(e) {
+                recoveries += 1;
+            }
+            last_event = Some(e);
+            serde_json::json!({
+                "event": name,
+                "phase": name,
+                "attempt": event_attempt(e),
+            })
+        })
+        .collect();
+
+    let phase = last_event.map(event_name).unwrap_or("no_events");
+
+    let adaptation = match &decision.last_orchestration {
+        Some(action) => serde_json::to_value(action).ok(),
+        None => None,
+    };
+
+    let summary = if outcome == "failed" {
+        "aborted".to_string()
+    } else if recoveries == 0 {
+        "no recovery needed".to_string()
+    } else {
+        format!("recovered {recoveries} time(s)")
+    };
+
+    serde_json::json!({
+        "outcome": outcome,
+        "phase": phase,
+        "phases_seen": phases_seen,
+        "recoveries": recoveries,
+        "adaptation": adaptation,
+        "timeline": timeline,
+        "summary": summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +731,7 @@ mod tests {
             engine: EngineKind::LlamaServer,
             tokens_per_second: tps,
             latency_ms: latency,
+            perf_measured: false,
             queue_depth: 0,
             load_percent: load,
             available_ram_mb: 4096,
@@ -933,5 +1055,131 @@ mod tests {
             .trace
             .iter()
             .any(|e| matches!(e, ExecutionEvent::Recovering { attempt: 1, .. })));
+    }
+
+    // ---- Phase H: self-healing recovery timeline ----
+
+    #[test]
+    fn recovery_timeline_reports_recoveries_when_present() {
+        let g = worker("g", 150, 20, 10);
+        let mut d = evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(
+                ContextProfile {
+                    prompt_tokens: 10,
+                    max_output_tokens: 10,
+                    is_continuation: false,
+                    prefix_resident_on: None,
+                },
+                0,
+            ),
+            &[g],
+            false,
+            false,
+        );
+        observe(&mut d, ExecutionEvent::Recovering {
+            worker: Some("g".into()),
+            attempt: 1,
+        });
+        observe(&mut d, ExecutionEvent::Replanned {
+            retry_on: Some("g".into()),
+        });
+        observe(&mut d, ExecutionEvent::Completed { ok: true });
+        d.outcome = Some("succeeded".into());
+        d.last_orchestration = Some(OrchestrationAction::Recover { on: Some("g".into()) });
+
+        let tl = recovery_timeline(&d);
+        let recoveries = tl["recoveries"].as_u64().unwrap();
+        assert!(recoveries >= 2, "expected recovery events counted, got {recoveries}");
+        // The recovery event name shows up in both the phase list and timeline.
+        let phases = tl["phases_seen"].as_array().unwrap();
+        let names: Vec<&str> = phases
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(names.contains(&"recovering"));
+        assert!(names.contains(&"replanned"));
+        // Timeline preserves order and carries the snake_case event names.
+        let timeline = tl["timeline"].as_array().unwrap();
+        let tl_names: Vec<&str> = timeline
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(tl_names, names);
+        // The attempt is surfaced on the recovering entry.
+        let recovering_entry = timeline
+            .iter()
+            .find(|e| e["event"] == "recovering")
+            .unwrap();
+        assert_eq!(recovering_entry["attempt"].as_u64(), Some(1));
+        // The last orchestration action is carried through.
+        assert_eq!(tl["adaptation"]["action"], "recover");
+        assert_eq!(tl["outcome"], "succeeded");
+        // Non-failed + recoveries > 0 → the "recovered N time(s)" summary.
+        assert_eq!(tl["summary"], "recovered 2 time(s)");
+    }
+
+    #[test]
+    fn recovery_timeline_reports_no_recovery_when_absent() {
+        let g = worker("g", 150, 20, 10);
+        let mut d = evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(
+                ContextProfile {
+                    prompt_tokens: 10,
+                    max_output_tokens: 10,
+                    is_continuation: false,
+                    prefix_resident_on: None,
+                },
+                0,
+            ),
+            &[g],
+            false,
+            false,
+        );
+        d.outcome = Some("succeeded".into());
+        let tl = recovery_timeline(&d);
+        assert_eq!(tl["recoveries"].as_u64(), Some(0));
+        assert_eq!(tl["summary"], "no recovery needed");
+        assert_eq!(tl["outcome"], "succeeded");
+        // In-flight (no outcome) still projects without inventing a phase.
+        let no_outcome = ExecutionDecision {
+            outcome: None,
+            ..d.clone()
+        };
+        let inflight = recovery_timeline(&no_outcome);
+        assert_eq!(inflight["outcome"], "in_flight");
+    }
+
+    #[test]
+    fn recovery_timeline_is_aborted_on_failure() {
+        let g = worker("g", 150, 20, 10);
+        let mut d = evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(
+                ContextProfile {
+                    prompt_tokens: 10,
+                    max_output_tokens: 10,
+                    is_continuation: false,
+                    prefix_resident_on: None,
+                },
+                0,
+            ),
+            &[g],
+            false,
+            false,
+        );
+        observe(&mut d, ExecutionEvent::Failed {
+            cause: "definitive".into(),
+            retryable: false,
+        });
+        d.outcome = Some("failed".into());
+        let tl = recovery_timeline(&d);
+        assert_eq!(tl["summary"], "aborted");
+        assert_eq!(tl["phase"], "failed");
+        assert_eq!(tl["outcome"], "failed");
     }
 }

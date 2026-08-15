@@ -2591,6 +2591,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/stats", get(stats_handler))
+        .route("/v1/resources", get(resources_handler))
         .route("/v1/can_run", get(can_run_handler))
         .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/models", get(models_handler))
@@ -3197,9 +3198,192 @@ async fn execution_handler(
         // affinity, engine capability, expected mode, reservation/plan/outcome
         // correlation + lifecycle trace) for the control plane. Safe operational
         // metadata only — never chain-of-thought or request content.
-        body["decisions"] = serde_json::json!(compute.decisions());
+        // Phase H: each decision also carries a pure `recovery` timeline
+        // (recoveries, phase, adaptation, order-preserving event trace) so the
+        // self-healing loop is observable.
+        let decisions: Vec<serde_json::Value> = compute
+            .decisions()
+            .into_iter()
+            .map(|d| {
+                let recovery = decentraai_fabric::recovery_timeline(&d);
+                let mut v = serde_json::to_value(&d).unwrap_or_else(|_| serde_json::json!({}));
+                v["recovery"] = recovery;
+                v
+            })
+            .collect();
+        body["decisions"] = serde_json::json!(decisions);
         body["attached"] = serde_json::json!(true);
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// Convert raw bytes to whole MiB (`bytes / (1024*1024)`). Pure helper so the
+/// resource view never mixes byte and MiB magnitudes from different sources.
+fn mb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
+/// `GET /v1/resources` (Phase B — Resource Intelligence). A unified,
+/// read-only, operator-facing view of the fabric's resources across
+/// CPU / RAM / VRAM / DISK / KV / QUEUE / LATENCY. Every value is real,
+/// authoritative state — local node data from a live `SystemSnapshot` +
+/// GPU probe, and per-worker rows from the coordinator's actual
+/// `ComputeAdvertisement`s and reservation ledger. Nothing is invented:
+/// a value that is not available is tagged `provenance: "UNKNOWN"` and
+/// omitted (never a fabricated zero), and RAM and VRAM are always kept in
+/// separate objects because a model fitting in RAM does not imply VRAM fit.
+///
+/// Reserved VRAM on the fabric is intentionally *not* reported: the
+/// coordinator's public API exposes only per-worker RAM reservations
+/// (`ComputeManager::reserved_ram`); VRAM reservation totals are held
+/// internally and not surfaced, so we omit them rather than guess.
+async fn resources_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+
+    let system = decentraai_system_probe::SystemSnapshot::collect();
+    let gpu = decentraai_system_probe::probe_gpu();
+
+    let node_ram_total_mb = mb(system.total_memory_bytes);
+    let node_ram_available_mb = mb(system.available_memory_bytes);
+    let node_ram_in_use_mb = node_ram_total_mb.saturating_sub(node_ram_available_mb);
+
+    let node_vram = match &gpu {
+        decentraai_system_probe::GpuProbeStatus::Nvidia(snapshot) => {
+            serde_json::json!({
+                "present": true,
+                "name": snapshot.name,
+                "total_mb": snapshot.total_vram_mib,
+                "free_mb": snapshot.free_vram_mib,
+                "in_use_mb": snapshot.total_vram_mib.saturating_sub(snapshot.free_vram_mib),
+                "provenance": "MEASURED",
+            })
+        }
+        decentraai_system_probe::GpuProbeStatus::Unavailable(_) => {
+            // Honest: no GPU surfaced — never a fake 0.
+            serde_json::json!({ "present": false, "provenance": "UNKNOWN" })
+        }
+    };
+
+    let (serving, waiting) = state.queue.snapshot();
+
+    let mut fabric_rows: Vec<serde_json::Value> = Vec::new();
+    let mut kv_sessions_active: Option<usize> = None;
+    if let Some(compute) = &state.compute {
+        kv_sessions_active = Some(compute.session_count());
+        for adv in compute.workers().await {
+            let trusted = compute.is_trusted(&adv.peer_id).await;
+            let reserved_ram_mb = compute.reserved_ram(&adv.peer_id).await;
+            let ram_headroom = adv
+                .availability
+                .available_ram_mb
+                .saturating_sub(reserved_ram_mb);
+
+            let vram = match adv.availability.available_vram_mb {
+                Some(available_mb) => {
+                    let total_mb = adv
+                        .capability
+                        .gpu
+                        .as_ref()
+                        .map(|g| g.vram_mb)
+                        .unwrap_or(available_mb);
+                    serde_json::json!({
+                        "present": true,
+                        "total_mb": total_mb,
+                        "available_mb": available_mb,
+                        // Reserved VRAM is not surfaced by the coordinator's
+                        // public API, so it is honestly omitted (never a
+                        // fabricated 0).
+                        "provenance": "MEASURED",
+                    })
+                }
+                None => serde_json::json!({ "present": false, "provenance": "UNKNOWN" }),
+            };
+
+            let latency_provenance = if adv.availability.tokens_per_second > 0 {
+                "MEASURED"
+            } else {
+                "ESTIMATED"
+            };
+
+            fabric_rows.push(serde_json::json!({
+                "peer_id": adv.peer_id.to_string(),
+                "node_id": adv.node_id,
+                "node_name": adv.node_name,
+                "trusted": trusted,
+                "engine": adv.capability.engine,
+                "cpu": {
+                    "load_percent": adv.availability.load_percent,
+                    "provenance": "MEASURED",
+                },
+                "ram": {
+                    "total_mb": adv.capability.ram_mb,
+                    "available_mb": adv.availability.available_ram_mb,
+                    "reserved_mb": reserved_ram_mb,
+                    "headroom_mb": ram_headroom,
+                    "provenance": "MEASURED",
+                },
+                "vram": vram,
+                "queue": {
+                    "depth": adv.availability.queue_depth,
+                    "provenance": "MEASURED",
+                },
+                "latency": {
+                    "ms": adv.availability.current_latency_ms,
+                    "tokens_per_second": adv.availability.tokens_per_second,
+                    "provenance": latency_provenance,
+                },
+            }));
+        }
+    }
+
+    let body = serde_json::json!({
+        "node": {
+            "cpu": {
+                "logical_cpus": system.logical_cpus,
+                "usage_percent": system.cpu_usage_percent,
+                "provenance": "MEASURED",
+            },
+            "ram": {
+                "total_mb": node_ram_total_mb,
+                "available_mb": node_ram_available_mb,
+                // The local node tracks no reservation ledger entry; per-worker
+                // reservations live in the coordinator (see fabric rows). 0 is
+                // honest here, not a fabricated measurement.
+                "reserved_mb": 0,
+                "in_use_mb": node_ram_in_use_mb,
+                "headroom_mb": node_ram_available_mb,
+                "provenance": "MEASURED",
+            },
+            "vram": node_vram,
+            "disk": {
+                "free_mb": mb(system.total_disk_free_bytes),
+                "provenance": "MEASURED",
+            },
+        },
+        "fabric": fabric_rows,
+        "kv": match kv_sessions_active {
+            Some(n) => serde_json::json!({ "sessions_active": n, "provenance": "MEASURED" }),
+            // No coordinator attached: sessions are not tracked, so the value
+            // is honestly UNKNOWN rather than a fabricated 0.
+            None => serde_json::json!({ "sessions_active": null, "provenance": "UNKNOWN" }),
+        },
+        "queue": {
+            "serving": serving.is_some(),
+            "waiting": waiting.len(),
+            "provenance": "MEASURED",
+        },
+        "note": "Every value is real node/worker state with explicit provenance. UNKNOWN means a value is not available — it is never a fabricated zero. RAM and VRAM are reported separately; a model fitting in RAM does not imply VRAM fit. Reserved VRAM on the fabric is not reported because the coordinator's public API does not surface per-worker VRAM reservation totals.",
+    });
+
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -5730,6 +5914,69 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let j: serde_json::Value = resp.json().await.unwrap();
         assert!(j["records"].is_number(), "records field present");
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn mb_converts_bytes_to_mebibytes() {
+        assert_eq!(mb(0), 0);
+        assert_eq!(mb(1024 * 1024), 1);
+        assert_eq!(mb(5 * 1024 * 1024 + 123), 5);
+        assert_eq!(mb(123), 0, "sub-MiB rounds down to 0");
+    }
+
+    #[tokio::test]
+    async fn resources_endpoint_requires_operator_and_returns_honest_state() {
+        // /v1/resources is operator/admin-gated and returns 200 JSON with a
+        // master token, 401/403 without. It always reports real node state
+        // (never fabricates) and an empty-but-well-formed fabric when no
+        // compute manager is attached.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401/403.
+        let resp = client
+            .get(format!("http://{api}/v1/resources"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token -> 200 JSON with the unified resource shape.
+        let resp = client
+            .get(format!("http://{api}/v1/resources"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+
+        // node: RAM/CPU/disk always present; RAM and VRAM stay separate.
+        assert!(j["node"]["ram"]["total_mb"].is_number());
+        assert_eq!(j["node"]["ram"]["reserved_mb"], 0, "node tracks no reservation");
+        assert_eq!(j["node"]["ram"]["in_use_mb"], j["node"]["ram"]["total_mb"].as_u64().unwrap()
+            .saturating_sub(j["node"]["ram"]["available_mb"].as_u64().unwrap()));
+        assert_eq!(j["node"]["ram"]["provenance"], "MEASURED");
+        assert_eq!(j["node"]["cpu"]["provenance"], "MEASURED");
+        assert_eq!(j["node"]["disk"]["provenance"], "MEASURED");
+        // GPU is UNKNOWN (honest) when nvidia-smi is absent, never a fake 0.
+        let vram_present = j["node"]["vram"]["present"].as_bool().unwrap();
+        assert_eq!(
+            j["node"]["vram"]["provenance"],
+            if vram_present { "MEASURED" } else { "UNKNOWN" }
+        );
+
+        // Without a compute manager: fabric empty, kv honest UNKNOWN.
+        assert!(j["fabric"].is_array());
+        assert_eq!(j["fabric"].as_array().unwrap().len(), 0);
+        assert_eq!(j["kv"]["provenance"], "UNKNOWN");
+        assert!(j["kv"]["sessions_active"].is_null());
+        assert!(j["queue"]["serving"].is_boolean());
+        assert!(j["queue"]["waiting"].is_number());
+        assert!(j["note"].is_string());
 
         manager.lock().await.shutdown().await.unwrap();
     }
