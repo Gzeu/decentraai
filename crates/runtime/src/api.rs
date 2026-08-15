@@ -553,7 +553,29 @@ async fn admin_token_list_handler(State(state): State<ApiState>, headers: Header
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let body = serde_json::json!({"tokens": tokens.iter().map(|t| serde_json::json!({"name": &t.name, "tier": t.tier, "role": t.role.name(), "created_at": t.created_at, "revoked": t.revoked})).collect::<Vec<_>>()});
+    // Per-token live usage (requests + generated tokens) collected by
+    // note_token_usage during routed inference; absent for tokens that never
+    // served a request or when inference bypassed the coordinator.
+    let usage = state.token_usage.lock().unwrap().clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let body = serde_json::json!({"tokens": tokens.iter().map(|t| {
+        let u = usage.get(&t.name).copied().unwrap_or((0, 0, 0));
+        serde_json::json!({
+            "name": &t.name,
+            "tier": t.tier,
+            "role": t.role.name(),
+            "created_at": t.created_at,
+            "revoked": t.revoked,
+            "expires_at": t.expires_at,
+            "expired": t.expires_at.is_some_and(|ts| ts <= now),
+            "requests": u.0,
+            "tokens_generated": u.1,
+            "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+        })
+    }).collect::<Vec<_>>()});
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -592,19 +614,22 @@ async fn admin_token_create_handler(
         Some(r) => r,
         None => decentraai_tokens::Role::DEFAULT,
     };
+    // Optional unix-seconds expiry (Part 12/22 developer tokens): an expired
+    // token stops authenticating even though its record stays listed.
+    let expires_at = req.get("expires_at").and_then(|v| v.as_u64());
     let plaintext = match &state.token_store_path {
         Some(p) => {
             let mut s = match decentraai_tokens::TokenStore::load(p) {
                 Ok(s) => s,
                 Err(_) => return forbidden("load failed"),
             };
-            match s.create_with_role(&name, decentraai_tokens::Tier(tier), None, role) {
+            match s.create_with_role(&name, decentraai_tokens::Tier(tier), expires_at, role) {
                 Ok(t) => {
                     let a = state.info.repo_root.join("logs/audit.jsonl");
                     let _ = decentraai_audit::record(
                         a.parent().unwrap_or(&state.info.repo_root),
                         "token_created",
-                        serde_json::json!({"name": &name, "tier": tier, "role": role.name()}),
+                        serde_json::json!({"name": &name, "tier": tier, "role": role.name(), "expires_at": expires_at}),
                     );
                     Some(t)
                 }
@@ -613,7 +638,7 @@ async fn admin_token_create_handler(
         }
         None => return forbidden("no store"),
     };
-    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier, "role": role.name()});
+    let body = serde_json::json!({"token": plaintext, "name": name, "tier": tier, "role": role.name(), "expires_at": expires_at});
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -3726,6 +3751,25 @@ mod tests {
         assert_eq!(create_resp.status(), 200);
         let json: serde_json::Value = create_resp.json().await.unwrap();
         assert!(json["token"].as_str().unwrap().starts_with("dsk_"));
+
+        // A developer token with an expiry is accepted and listed with it.
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let dev_resp = reqwest::Client::new()
+            .post(format!("http://{api}/api/admin/token/create"))
+            .header("Authorization", "Bearer master_token")
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"name":"dev_token","tier":2,"expires_at":{exp}}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dev_resp.status(), 200);
+        let dev: serde_json::Value = dev_resp.json().await.unwrap();
+        assert_eq!(dev["expires_at"], exp);
+
         let list_resp = reqwest::Client::new()
             .get(format!("http://{api}/api/admin/token/list"))
             .header("Authorization", "Bearer master_token")
@@ -3733,6 +3777,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_resp.status(), 200);
+        let lj: serde_json::Value = list_resp.json().await.unwrap();
+        let dev_row = lj["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "dev_token")
+            .unwrap();
+        assert_eq!(dev_row["expires_at"], exp);
+        assert_eq!(dev_row["expired"], false);
+        assert_eq!(dev_row["requests"], 0, "usage starts at zero");
+        assert_eq!(dev_row["tokens_generated"], 0);
         manager.lock().await.shutdown().await.unwrap();
     }
 

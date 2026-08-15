@@ -352,6 +352,9 @@ enum TokenCommand {
         /// client (inference only) or operator (read-only operational views).
         #[arg(long, default_value = "client")]
         role: String,
+        /// Unix-seconds expiry; the token stops authenticating after this.
+        #[arg(long)]
+        expires_at: Option<u64>,
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
@@ -2686,14 +2689,20 @@ fn token_command(command: TokenCommand) -> Result<()> {
     let logs_dir = data_dir.join("logs");
 
     match command {
-        TokenCommand::Create { name, tier, role, .. } => {
+        TokenCommand::Create {
+            name,
+            tier,
+            role,
+            expires_at,
+            ..
+        } => {
             let tier = Tier::parse(tier)?;
             let role = decentraai_tokens::Role::parse(&role)?;
-            let plaintext = store.create_with_role(&name, tier, None, role)?;
+            let plaintext = store.create_with_role(&name, tier, expires_at, role)?;
             decentraai_audit::record_best_effort(
                 &logs_dir,
                 "token_created",
-                serde_json::json!({"name": name, "tier": tier.0, "role": role.name()}),
+                serde_json::json!({"name": name, "tier": tier.0, "role": role.name(), "expires_at": expires_at}),
             );
             println!(
                 "Subscription token for '{name}' (tier {} — {}, role {}):",
@@ -2704,6 +2713,9 @@ fn token_command(command: TokenCommand) -> Result<()> {
             println!("  {plaintext}");
             println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
             println!("Active at the next API request; no restart needed.");
+            if let Some(ts) = expires_at {
+                println!("Expires at unix time {ts} (then it stops authenticating).");
+            }
         }
         TokenCommand::List { json, .. } => {
             let records = store.list();
@@ -2713,9 +2725,18 @@ fn token_command(command: TokenCommand) -> Result<()> {
                 println!("Subscription tokens ({}):", records.len());
                 for record in records {
                     let status = if record.revoked { "revoked" } else { "active" };
+                    let expiry = record
+                        .expires_at
+                        .map(|ts| format!(", expires {ts}"))
+                        .unwrap_or_default();
                     println!(
-                        "  {} (tier {}, role {}, {}) — created {}",
-                        record.name, record.tier, record.role.name(), status, record.created_at
+                        "  {} (tier {}, role {}, {}{}) — created {}",
+                        record.name,
+                        record.tier,
+                        record.role.name(),
+                        status,
+                        expiry,
+                        record.created_at
                     );
                 }
                 if store.list().is_empty() {

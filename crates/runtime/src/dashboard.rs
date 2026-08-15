@@ -617,19 +617,38 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
         <div class="grid cols-2">
           <div class="card">
             <h2>Token admin <span class="count">master-gated</span></h2>
-            <div class="grid" style="grid-template-columns:1fr 110px 120px auto;gap:8px;align-items:end">
+            <div class="grid" style="grid-template-columns:1fr 100px 110px 120px 90px auto;gap:8px;align-items:end">
               <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Name</div><input id="tok-name" placeholder="alice"></div>
               <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Tier</div><select id="tok-tier"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select></div>
               <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Role</div><select id="tok-role"><option value="client">Client</option><option value="operator">Operator</option></select></div>
+              <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Expiry</div><input id="tok-expiry" type="number" min="0" placeholder="hours (0 = never)" value="0"></div>
               <button id="tok-create" class="primary">Create</button>
             </div>
             <div id="tok-result" style="margin-top:10px;font-size:12px"></div>
-            <table style="margin-top:12px"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Status</th><th></th></tr></thead>
-            <tbody id="tok-list"><tr><td colspan="5" class="empty">loading tokens&hellip;</td></tr></tbody></table>
+            <table style="margin-top:12px"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th class="num">Req</th><th class="num">Tokens</th><th>Status</th><th></th></tr></thead>
+            <tbody id="tok-list"><tr><td colspan="7" class="empty">loading tokens&hellip;</td></tr></tbody></table>
           </div>
           <div class="card">
             <h2>Security events <span class="count">audit log</span></h2>
             <div id="audit-list" class="empty">loading&hellip;</div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Developer access <span class="count">OpenAI-compatible /v1</span></h2>
+          <div class="grid cols-2">
+            <div>
+              <div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">API endpoint</div>
+              <code id="dev-endpoint" style="display:block;word-break:break-all"></code>
+              <button class="ghost" style="margin-top:6px" onclick="copyDev('dev-endpoint')">Copy endpoint</button>
+            </div>
+            <div>
+              <div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">API key (shown once at creation)</div>
+              <div id="dev-key" class="empty" style="min-height:20px">create a token above — the plaintext is shown once</div>
+              <button class="ghost" style="margin-top:6px" onclick="copyDev('dev-key')">Copy key</button>
+            </div>
+          </div>
+          <div style="margin-top:10px;font-size:12px;color:var(--muted)">
+            Base URL: <code id="dev-base-url" style="word-break:break-all"></code> · model ids = file names (see Models). Point Open WebUI, OpenClaw or any OpenAI SDK at this endpoint with a created token as the API key.
           </div>
         </div>
       </section>
@@ -1748,16 +1767,31 @@ function renderSecurity(){
     const html = evs.map(e => '<div class="mono" style="font-size:11.5px;margin-bottom:5px"><span style="color:var(--faint)">'+tstr(e.timestamp)+'</span> <b>'+esc(e.event||'')+'</b> <span style="color:var(--muted)">'+esc(JSON.stringify(e.details||{}))+'</span></div>').join('');
     $('audit-list').innerHTML = html || '<div class="empty">no security events yet</div>';
   }).catch(() => { $('audit-list').innerHTML = '<div class="empty">master token required</div>'; });
-  // tokens
+  // tokens (with expiry + live usage from the API)
   fetch('/api/admin/token/list', { headers }).then(r => r.json()).then(d => {
     const toks = (d && d.tokens || []);
-    const rows = toks.map(t =>
-      '<tr><td>'+esc(t.name)+'</td><td><span class="badge '+(t.tier===3?'ok':t.tier===2?'warn':'faint')+'">T'+t.tier+'</span></td><td>'+esc(t.role||'client')+'</td><td>'+(t.revoked ? '<span class="badge bad">revoked</span>' : '<span class="badge ok">active</span>')+'</td>'+
-      '<td>'+(isAdmin && !t.revoked ? '<button class="danger" data-n="'+t.name+'" onclick="revokeToken(event)">Revoke</button>' : '')+'</td></tr>'
-    ).join('');
-    $('tok-list').innerHTML = rows || '<tr><td colspan="5" class="empty">no tokens issued</td></tr>';
-  }).catch(() => { $('tok-list').innerHTML = '<tr><td colspan="5" class="empty">master token required</td></tr>'; });
+    const rows = toks.map(t => {
+      let status = t.revoked ? '<span class="badge bad">revoked</span>'
+        : t.expired ? '<span class="badge bad">expired</span>'
+        : '<span class="badge ok">active</span>';
+      if (!t.revoked && t.expires_at) status += ' <span class="badge faint">exp ' + new Date(t.expires_at*1000).toLocaleDateString() + '</span>';
+      return '<tr><td>'+esc(t.name)+'</td><td><span class="badge '+(t.tier===3?'ok':t.tier===2?'warn':'faint')+'">T'+t.tier+'</span></td><td>'+esc(t.role||'client')+'</td>'+
+      '<td class="num">'+(t.requests||0)+'</td><td class="num">'+(t.tokens_generated||0)+'</td><td>'+status+'</td>'+
+      '<td>'+(isAdmin && !t.revoked ? '<button class="danger" data-n="'+t.name+'" onclick="revokeToken(event)">Revoke</button>' : '')+'</td></tr>';
+    }).join('');
+    $('tok-list').innerHTML = rows || '<tr><td colspan="7" class="empty">no tokens issued</td></tr>';
+  }).catch(() => { $('tok-list').innerHTML = '<tr><td colspan="7" class="empty">master token required</td></tr>'; });
+  // Developer access: real endpoint this page is served from.
+  const ep = (location.protocol + '//' + location.host);
+  $('dev-endpoint').textContent = ep + '/v1';
+  $('dev-base-url').textContent = ep;
 }
+window.copyDev = id => {
+  const el = $(id);
+  const txt = el && (el.textContent || el.innerText || '').trim();
+  if (!txt || txt === 'create a token above — the plaintext is shown once') { toast('nothing to copy yet — create a token first', true); return; }
+  navigator.clipboard.writeText(txt).then(() => toast('copied: ' + short(txt, 24)));
+};
 window.revokeToken = async e => {
   const name = e.target.dataset.n;
   const r = await fetch('/api/admin/token/revoke', { method:'POST', headers, body: JSON.stringify({ name }) });
@@ -1766,11 +1800,15 @@ window.revokeToken = async e => {
 };
 $('tok-create').addEventListener('click', async () => {
   const name = $('tok-name').value.trim(), tier = +$('tok-tier').value, role = $('tok-role').value;
+  const hours = Math.max(0, +($('tok-expiry').value || 0));
   if (!name) { toast('token name required', true); return; }
-  const r = await fetch('/api/admin/token/create', { method:'POST', headers, body: JSON.stringify({ name, tier, role }) });
+  const body = { name, tier, role };
+  if (hours > 0) body.expires_at = Math.floor(Date.now()/1000) + hours*3600;
+  const r = await fetch('/api/admin/token/create', { method:'POST', headers, body: JSON.stringify(body) });
   const d = await r.json().catch(()=>({}));
   if (r.ok) {
     $('tok-result').innerHTML = '<div class="badge ok" style="margin-bottom:6px">created — copy now, shown once:</div><code style="display:block;word-break:break-all">'+esc(d.token)+'</code>';
+    $('dev-key').innerHTML = '<code style="word-break:break-all">'+esc(d.token)+'</code>';
     $('tok-name').value = ''; toast('token created');
   } else $('tok-result').innerHTML = '<span class="badge bad">' + esc((d.error&&d.error.message)||'create failed') + '</span>';
   renderSecurity();
