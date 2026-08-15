@@ -1089,3 +1089,20 @@ variant/verdict UI (GitHub-safe, no execution).
 - [x] `renderDecisions` confirmed already renders the `capability_requirement`
   badge (cap ✓/✗ + required capability + evidence) consistently on every
   decision card that carries one.
+
+## 37. Next-Gen Phase 8 — OTel GenAI Projection + Best-Variant
+
+**OpenTelemetry GenAI semantic conventions (Phase 8)**
+- [x] `/metrics` now also emits `gen_ai.*` metric families (request.count,
+  token.input/output, request.duration) with `gen_ai.request.model`,
+  `gen_ai.operation.name`, `gen_ai.provider.name` labels — ADDITIVE to the
+  DecentraAI-specific provenance; derived from real node state; never prompts
+  or outputs. `prometheus_escape` guards label values.
+- [x] Tests: metrics endpoint exposes the `gen_ai.*` families; escape helper
+  handles quotes/backslashes/newlines.
+
+**Best-variant selection (Phase D)**
+- [x] `/v1/can_run` / MCP `get_worker_capability` `model_info` now carries
+  `best_variant` — the first on-disk variant whose fit is CAN_RUN (deterministic
+  file-name order), else null (honest: no variant confirmed runnable). Directly
+  answers "which variant should I deploy on THIS fabric?".

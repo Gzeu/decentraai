@@ -951,6 +951,14 @@ async fn mcp_worker_capability(
         })
         .unwrap_or_default();
 
+    // Best on-disk variant to deploy on THIS fabric: the first variant whose
+    // fit is CAN_RUN (variants are in deterministic file-name order), else None
+    // (honest: no variant is confirmed runnable).
+    let best_variant = variants
+        .iter()
+        .find(|v| v["fit"]["verdict"] == "CAN_RUN")
+        .and_then(|v| v["file"].as_str().map(str::to_string));
+
     serde_json::json!({
         "model": model,
         "capability": capability,
@@ -959,6 +967,7 @@ async fn mcp_worker_capability(
             "model": model,
             "quantization": quantization,
             "available_workers": available_workers,
+            "best_variant": best_variant,
         },
         "fit": fit.to_json(),
         "worker_count": workers_json.len(),
@@ -2829,11 +2838,63 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     body.push_str("# TYPE decentraai_fabric_sessions_active gauge\n");
     body.push_str(&format!("decentraai_fabric_sessions_active {fabric_sessions_active}\n"));
 
+    // OpenTelemetry GenAI semantic-convention projection (Phase 8). These are
+    // ADDITIVE and derived from real node state — they never replace the
+    // DecentraAI-specific provenance/decision vocabulary. The `gen_ai.` prefix
+    // and label names follow the OTel GenAI conventions so external observability
+    // stacks can consume them without understanding DecentraAI internals.
+    // Safe metadata only: model id, operation, token/latency aggregates — never
+    // prompts or outputs.
+    let genai_model = state.info.model_name.clone();
+    let genai_provider = "decentraai";
+    body.push_str("# HELP gen_ai.server.request.count Number of inference requests served (OTel GenAI).\n");
+    body.push_str("# TYPE gen_ai.server.request.count counter\n");
+    body.push_str(&format!(
+        "gen_ai.server.request.count{{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\"}} {served}\n",
+        prometheus_escape(&genai_model),
+        genai_provider
+    ));
+    body.push_str("# HELP gen_ai.server.token.input Count of input tokens consumed (OTel GenAI).\n");
+    body.push_str("# TYPE gen_ai.server.token.input counter\n");
+    let total_input: u64 = recent.iter().map(|r| r.prompt_tokens).sum();
+    body.push_str(&format!(
+        "gen_ai.server.token.input{{gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\"}} {total_input}\n",
+        prometheus_escape(&genai_model),
+        genai_provider
+    ));
+    body.push_str("# HELP gen_ai.server.token.output Count of output tokens generated (OTel GenAI).\n");
+    body.push_str("# TYPE gen_ai.server.token.output counter\n");
+    body.push_str(&format!(
+        "gen_ai.server.token.output{{gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\"}} {tokens}\n",
+        prometheus_escape(&genai_model),
+        genai_provider
+    ));
+    body.push_str("# HELP gen_ai.server.request.duration Milliseconds per inference request (OTel GenAI).\n");
+    body.push_str("# TYPE gen_ai.server.request.duration gauge\n");
+    body.push_str(&format!(
+        "gen_ai.server.request.duration{{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\",quantile=\"p50\"}} {}\n",
+        prometheus_escape(&genai_model),
+        genai_provider,
+        stats.p50_ms
+    ));
+    body.push_str(&format!(
+        "gen_ai.server.request.duration{{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\",quantile=\"p95\"}} {}\n",
+        prometheus_escape(&genai_model),
+        genai_provider,
+        stats.p95_ms
+    ));
+
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
         .into_response()
+}
+
+/// Escape a label value for Prometheus exposition (backslash, double-quote,
+/// newline). Applies to any label we emit — currently the model name.
+fn prometheus_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// MCP (Model Context Protocol) read-only endpoint: `POST /mcp` speaking
@@ -5585,6 +5646,11 @@ mod tests {
             "decentraai_fabric_workers_total",
             "decentraai_fabric_trusted_workers_total",
             "decentraai_fabric_sessions_active",
+            "gen_ai.server.request.count",
+            "gen_ai.server.token.input",
+            "gen_ai.server.token.output",
+            "gen_ai.server.request.duration",
+            "gen_ai.provider.name",
             "# HELP",
             "# TYPE",
         ] {
@@ -5604,6 +5670,16 @@ mod tests {
             "model_loaded gauge must be 0 or 1: {body}"
         );
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn prometheus_escape_handles_label_special_chars() {
+        // A model name with a quote/backslash must not break the exposition.
+        assert_eq!(prometheus_escape("plain-model"), "plain-model");
+        assert_eq!(prometheus_escape("a\"b"), "a\\\"b");
+        assert_eq!(prometheus_escape("a\\b"), "a\\\\b");
+        assert_eq!(prometheus_escape("a\nb"), "a\\nb");
+        assert_eq!(prometheus_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
     #[tokio::test]
@@ -6889,6 +6965,8 @@ mod tests {
         assert_eq!(body["fit"]["verdict"], "UNKNOWN");
         assert!(body["workers"].as_array().unwrap().is_empty());
         assert_eq!(body["worker_count"], 0);
+        // No worker can run any variant -> honest best_variant null.
+        assert!(body["model_info"]["best_variant"].is_null());
     }
 
     #[tokio::test]
