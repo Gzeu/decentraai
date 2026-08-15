@@ -1267,6 +1267,36 @@ fn enforce_size_caps(outgoing: &[u8]) -> Option<Response> {
     None
 }
 
+/// Wraps an upstream SSE byte stream so a mid-stream failure never reaches the
+/// HTTP layer as a raw error.
+///
+/// A raw `Err` from `bytes_stream()` makes axum abort the connection without a
+/// proper SSE ending; the browser then reports the meaningless "TypeError:
+/// Error in input stream". Instead, convert the failure into a clean OpenAI
+/// error event followed by `[DONE]`, so callers see a useful message.
+fn sse_safe_stream<S, E>(
+    upstream: S,
+) -> impl futures::Stream<Item = Result<Bytes, E>>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    futures::stream::unfold(upstream, |mut upstream| async move {
+        match upstream.next().await {
+            Some(Ok(bytes)) => Some((Ok(bytes), upstream)),
+            Some(Err(e)) => {
+                let err_event = format!(
+                    "data: {{\"error\":{{\"message\":\"inference stream interrupted: {}\",\"type\":\"upstream_error\"}}}}\n\n",
+                    e
+                );
+                let done = Bytes::from(format!("{}\ndata: [DONE]\n\n", err_event.trim_end()));
+                Some((Ok(done), upstream))
+            }
+            None => None,
+        }
+    })
+}
+
 /// Proxies a streaming inference response to the caller chunk-by-chunk while
 /// recording the same best-effort metrics the non-streaming path does. The
 /// channel lets a drop of the client cut upstream early; the spawned task
@@ -1285,7 +1315,7 @@ fn stream_inference(
     let drain_buffer = Arc::clone(&buffer);
     let drain_path = path.clone();
     tokio::spawn(async move {
-        let mut chunks = upstream.bytes_stream();
+        let mut chunks = Box::pin(sse_safe_stream(upstream.bytes_stream()));
         while let Some(item) = chunks.next().await {
             match item {
                 Ok(bytes) => {
@@ -1294,6 +1324,9 @@ fn stream_inference(
                         return;
                     }
                 }
+                // sse_safe_stream never yields Err (it converts mid-stream
+                // failures into a clean SSE error event + [DONE]); keep the
+                // arm as a defensive fallback only.
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
                     return;
@@ -1813,6 +1846,18 @@ async fn route_remote_chat(
     )
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(stream);
+    // Inference on CPU is slow (a Mistral-7B response can take >30s per few
+    // tokens). The protocol default timeout is 30s — far too tight for a
+    // real chat turn. Derive the request deadline from the node config the
+    // same way the CLI does, so slow-but-healthy workers are not cut off
+    // mid-stream (which previously surfaced as "Error in input stream").
+    let mut request = request;
+    // Inference on CPU is slow (a Mistral-7B response can take >30s per few
+    // tokens). The protocol default timeout is 30s — far too tight for a
+    // real chat turn. Match the CLI's explicit 120s so slow-but-healthy
+    // workers are not cut off mid-stream (which previously surfaced as
+    // "Error in input stream").
+    request.timeout_ms = 120_000;
     let started = Instant::now();
 
     if stream {
@@ -2114,6 +2159,39 @@ mod tests {
         assert_eq!(info["attached"], false);
         assert_eq!(info["name"], "");
         assert!(info["served_models"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_safe_stream_converts_midstream_error_into_clean_event() {
+        // Regression: when the upstream (llama-server or remote worker) closed
+        // mid-stream, stream_inference forwarded the raw reqwest error into the
+        // response body; axum then aborted the connection and the browser
+        // reported "TypeError: Error in input stream". The safe stream must
+        // instead emit an OpenAI error event + [DONE] and never yield Err.
+        let err = std::io::Error::other("worker died");
+        let stream = futures::stream::iter(vec![
+            Ok(Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")),
+            Err(err),
+        ]);
+        let mut safe = Box::pin(sse_safe_stream(stream));
+        let mut chunks: Vec<String> = Vec::new();
+        let mut saw_error = false;
+        let mut saw_done = false;
+        while let Some(item) = safe.next().await {
+            let item = item.expect("sse_safe_stream must never yield Err");
+            let text = String::from_utf8_lossy(&item).to_string();
+            chunks.push(text.clone());
+            if text.contains("\"error\"") && text.contains("inference stream interrupted") {
+                saw_error = true;
+            }
+            if text.contains("[DONE]") {
+                saw_done = true;
+            }
+        }
+        assert!(saw_error, "expected a clean SSE error event, got: {chunks:?}");
+        assert!(saw_done, "expected [DONE] terminator, got: {chunks:?}");
+        // The first chunk (a real delta) must pass through unchanged.
+        assert!(chunks[0].contains("content\":\"hi\""));
     }
 
     #[cfg(unix)]

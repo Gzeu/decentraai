@@ -801,7 +801,7 @@ const saveHist = () => { try { localStorage.setItem(HIST_KEY, JSON.stringify(his
 hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : 'user', m.content || '(empty)'));
 const readSse = async (resp) => {
   const reader = resp.body.getReader(), dec = new TextDecoder();
-  let buffer = '', text = '', tokens = null;
+  let buffer = '', text = '', tokens = null, streamError = null;
   const msgNode = addMsg('node', '');
   const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
   try {
@@ -817,14 +817,16 @@ const readSse = async (resp) => {
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') continue;
         let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
+        if (ev.error && ev.error.message) { streamError = ev.error.message; continue; }
         const delta = ev.choices && ev.choices[0] && ev.choices[0].delta && ev.choices[0].delta.content;
         if (delta) { text += delta; bodyEl.textContent = text; }
         if (ev.usage) tokens = ev.usage.completion_tokens;
       }
       chatbox.scrollTop = chatbox.scrollHeight;
     }
-  } finally { reader.releaseLock(); }
-  return { text, tokens };
+  } catch (e) { streamError = 'stream interrupted: ' + e; }
+  finally { reader.releaseLock(); }
+  return { text, tokens, streamError };
 };
 const chatStatus = $('chat-status'), chatStopBtn = $('chat-stop'), chatRetryBtn = $('chat-retry'), chatSendBtn = $('chat-send');
 let currentController = null, lastUserPrompt = null;
@@ -861,7 +863,7 @@ const sendChat = async (prompt) => {
       }
     }
     let answer = '', tokens = null;
-    if (stream && r.ok && r.body) { const out = await readSse(r); answer = out.text; tokens = out.tokens; }
+    if (stream && r.ok && r.body) { const out = await readSse(r); answer = out.text; tokens = out.tokens; if (out.streamError) { addMsg('node', '(stream error: ' + out.streamError + ')'); } }
     else {
       const j = await r.json();
       answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
@@ -875,7 +877,12 @@ const sendChat = async (prompt) => {
     chatStatus.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' + (tokens != null ? ' · ' + tokens + ' tokens' : '');
   } catch (e) {
     if (controller.signal.aborted) chatStatus.textContent = 'stopped';
-    else { addMsg('node', 'request failed: ' + e); chatStatus.textContent = 'failed'; }
+    else {
+      const msg = (e && e.name === 'TypeError' && /input stream/i.test(String(e))) || /interrupted/i.test(String(e || ''))
+        ? 'stream interrupted — the worker closed the connection mid-answer'
+        : ('request failed: ' + e);
+      addMsg('node', msg); chatStatus.textContent = 'failed';
+    }
   } finally {
     if (currentController === controller) currentController = null;
     setStreamingUI(false);

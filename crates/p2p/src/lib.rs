@@ -406,7 +406,13 @@ impl P2PNode {
                 messages: request_response::Behaviour::with_codec(
                     codec,
                     [(MESSAGE_PROTOCOL, ProtocolSupport::Full)],
-                    request_response::Config::default(),
+                    // Default is 30s per request. A remote inference stream on
+                    // CPU can easily exceed that (Mistral-7B ~22s for 24
+                    // tokens); a tight protocol timeout cuts the stream
+                    // mid-answer and the browser reports "Error in input
+                    // stream". 300s keeps slow-but-healthy workers usable.
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(300)),
                 ),
             })
             .context("attaching network behaviour")?
