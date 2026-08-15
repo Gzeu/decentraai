@@ -90,8 +90,8 @@ pub mod worker;
 
 pub use compute::{
     ComputeAdvertisement, ComputeManager, ComputeMetricsReport, ContributionProfile,
-    ContributionRow, ExecutionAttribution, LivePerf, RuntimeMetrics, WorkerMetricRow,
-    build_advertisement, short_node_id,
+    ContributionRow, ExecutedPlan, ExecutionAttribution, LivePerf, RuntimeMetrics, WorkerMetricRow,
+    build_advertisement, execution_statistics, short_node_id,
 };
 pub use config::InferenceConfig;
 pub use error::DistributedError;

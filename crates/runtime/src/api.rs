@@ -2590,6 +2590,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/stats", get(stats_handler))
         .route("/v1/can_run", get(can_run_handler))
         .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/models", get(models_handler))
@@ -3199,6 +3200,31 @@ async fn execution_handler(
         body["decisions"] = serde_json::json!(compute.decisions());
         body["attached"] = serde_json::json!(true);
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// `GET /v1/stats` — deterministic historical execution statistics (Phase N,
+/// Historical Intelligence). Derived from real measured execution history
+/// (tokens, latency, outcomes per model/worker, retries). No ML, no synthetic
+/// benchmarks. Operator/admin. Read-only.
+async fn stats_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let body = match &state.compute {
+        Some(compute) => {
+            let history = compute.executions();
+            decentraai_distributed::execution_statistics(&history)
+        }
+        None => serde_json::json!({ "records": 0, "note": "no compute manager attached" }),
+    };
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -5680,6 +5706,32 @@ mod tests {
         assert_eq!(prometheus_escape("a\\b"), "a\\\\b");
         assert_eq!(prometheus_escape("a\nb"), "a\\nb");
         assert_eq!(prometheus_escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_returns_deterministic_history() {
+        // /v1/stats is operator/admin-gated; without a compute manager it
+        // returns a 0-record honest response (not an error, never invented).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401/403.
+        let resp = client.get(format!("http://{api}/v1/stats")).send().await.unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token -> 200 JSON with a records field.
+        let resp = client
+            .get(format!("http://{api}/v1/stats"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert!(j["records"].is_number(), "records field present");
+
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -1488,6 +1488,110 @@ pub struct ExecutedPlan {
     pub est_vram_mb: u64,
 }
 
+/// Deterministic historical statistics derived from real measured execution
+/// history (Phase N — Historical Intelligence). No ML, no synthetic benchmarks:
+/// every number comes from the `ExecutedPlan` records' measured fields
+/// (`tokens_used`, `processing_time_ms`, `outcome`, `ts`, `model_hash`,
+/// `selected_worker`, `attempt`). Missing measurements (`None`) are simply
+/// excluded from the aggregation they would feed — never treated as zero.
+///
+/// Returns a serde-friendly object. Pure; no I/O.
+pub fn execution_statistics(history: &[ExecutedPlan]) -> serde_json::Value {
+    let total = history.len();
+    let succeeded = history.iter().filter(|p| p.outcome == "succeeded").count();
+    let failed = history.iter().filter(|p| p.outcome == "failed").count();
+
+    // Measured throughput (tokens/sec) and latency (ms) — only from records
+    // that actually reported both usage and processing time.
+    let measured: Vec<(f64, f64)> = history
+        .iter()
+        .filter_map(|p| match (p.tokens_used, p.processing_time_ms) {
+            (Some(tokens), Some(ms)) if ms > 0 => Some((f64::from(tokens), f64::from(ms))),
+            _ => None,
+        })
+        .collect();
+    let measured_count = measured.len();
+    let total_tokens_measured: u64 = measured.iter().map(|(t, _)| *t as u64).sum();
+    let avg_tokens_per_sec = if measured_count > 0 {
+        measured.iter().map(|(t, ms)| t / (ms / 1000.0)).sum::<f64>() / measured_count as f64
+    } else {
+        0.0
+    };
+    let avg_latency_ms = if measured_count > 0 {
+        measured.iter().map(|(_, ms)| ms).sum::<f64>() / measured_count as f64
+    } else {
+        0.0
+    };
+
+    // Per-model outcomes (deterministic key order).
+    let mut per_model: Vec<(String, usize, usize, usize)> = Vec::new(); // (model, total, succ, fail)
+    for p in history {
+        if let Some(e) = per_model.iter_mut().find(|(m, _, _, _)| *m == p.model_hash) {
+            e.1 += 1;
+            if p.outcome == "succeeded" {
+                e.2 += 1;
+            } else if p.outcome == "failed" {
+                e.3 += 1;
+            }
+        } else {
+            let (s, f) = if p.outcome == "succeeded" {
+                (1, 0)
+            } else if p.outcome == "failed" {
+                (0, 1)
+            } else {
+                (0, 0)
+            };
+            per_model.push((p.model_hash.clone(), 1, s, f));
+        }
+    }
+    per_model.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Per-worker outcomes (deterministic key order).
+    let mut per_worker: Vec<(String, usize, usize, usize)> = Vec::new();
+    for p in history {
+        if let Some(e) = per_worker.iter_mut().find(|(w, _, _, _)| *w == p.selected_worker) {
+            e.1 += 1;
+            if p.outcome == "succeeded" {
+                e.2 += 1;
+            } else if p.outcome == "failed" {
+                e.3 += 1;
+            }
+        } else {
+            let (s, f) = if p.outcome == "succeeded" {
+                (1, 0)
+            } else if p.outcome == "failed" {
+                (0, 1)
+            } else {
+                (0, 0)
+            };
+            per_worker.push((p.selected_worker.clone(), 1, s, f));
+        }
+    }
+    per_worker.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Retry statistics: how many records were a retry (attempt > 0).
+    let retries = history.iter().filter(|p| p.attempt > 0).count();
+
+    serde_json::json!({
+        "records": total,
+        "outcomes": { "succeeded": succeeded, "failed": failed, "other": total.saturating_sub(succeeded + failed) },
+        "measured": {
+            "records": measured_count,
+            "total_tokens": total_tokens_measured,
+            "avg_tokens_per_sec": avg_tokens_per_sec,
+            "avg_latency_ms": avg_latency_ms,
+        },
+        "retries": retries,
+        "per_model": per_model.into_iter().map(|(m, t, s, f)| serde_json::json!({
+            "model": m, "total": t, "succeeded": s, "failed": f,
+        })).collect::<Vec<_>>(),
+        "per_worker": per_worker.into_iter().map(|(w, t, s, f)| serde_json::json!({
+            "worker": w, "total": t, "succeeded": s, "failed": f,
+        })).collect::<Vec<_>>(),
+        "note": "deterministic statistics from measured execution history; no synthetic data",
+    })
+}
+
 /// Measured usage a worker reports back for one request (Part 9/17). Kept
 /// as a single struct so `record_execution` stays under the argument budget
 /// and callers pass attribution in one place. All fields are honest: `None`
@@ -2718,5 +2822,67 @@ mod tests {
         // verified evidence — so the decision records satisfied at VERIFIED.
         assert!(view.satisfied, "verified claim -> satisfied");
         assert_eq!(view.evidence, "VERIFIED");
+    }
+
+    #[test]
+    fn execution_statistics_derives_deterministic_aggregates() {
+        // Build a small synthetic history with real measured fields: two
+        // succeeded records (with tokens+time), one failed, one retry.
+        let rec = |id: &str, model: &str, worker: &str, outcome: &str, tokens: Option<u32>, ms: Option<u32>, attempt: u32| ExecutedPlan {
+            request_id: id.to_string(),
+            plan_id: "p".into(),
+            model_hash: model.to_string(),
+            selected_worker: worker.to_string(),
+            score: 0.5,
+            stages: 1,
+            reservation_id: "r".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            network_rtt_ms: 10,
+            kv_headroom: "1/1".into(),
+            outcome: outcome.to_string(),
+            reasoning: "".into(),
+            ts: 1,
+            tokens_used: tokens,
+            processing_time_ms: ms,
+            attempt,
+            est_ram_mb: 100,
+            est_vram_mb: 0,
+        };
+
+        let history = vec![
+            rec("a", "m1", "w1", "succeeded", Some(100), Some(1000), 0),
+            rec("b", "m1", "w1", "succeeded", Some(200), Some(2000), 1), // retry
+            rec("c", "m2", "w2", "failed", None, None, 0),               // no measurement
+        ];
+
+        let s = execution_statistics(&history);
+        assert_eq!(s["records"], 3);
+        assert_eq!(s["outcomes"]["succeeded"], 2);
+        assert_eq!(s["outcomes"]["failed"], 1);
+        // Only the two measured records feed throughput/latency; the failed
+        // record with None measurements is excluded, never treated as 0.
+        assert_eq!(s["measured"]["records"], 2);
+        assert_eq!(s["measured"]["total_tokens"], 300);
+        assert!(s["measured"]["avg_tokens_per_sec"].as_f64().unwrap() > 0.0);
+        assert_eq!(s["measured"]["avg_latency_ms"], 1500.0);
+        assert_eq!(s["retries"], 1);
+        // Per-model: m1 (2 total) and m2 (1 total), deterministic order.
+        let per_model = s["per_model"].as_array().unwrap();
+        assert_eq!(per_model.len(), 2);
+        assert_eq!(per_model[0]["model"], "m1");
+        assert_eq!(per_model[0]["total"], 2);
+        assert_eq!(per_model[0]["succeeded"], 2);
+        assert_eq!(per_model[1]["model"], "m2");
+        // Per-worker: w1 (2) and w2 (1).
+        let per_worker = s["per_worker"].as_array().unwrap();
+        assert_eq!(per_worker.len(), 2);
+        assert_eq!(per_worker[0]["worker"], "w1");
+        assert_eq!(per_worker[0]["total"], 2);
+
+        // Empty history -> all zeros, no panic.
+        let e = execution_statistics(&[]);
+        assert_eq!(e["records"], 0);
+        assert_eq!(e["measured"]["records"], 0);
     }
 }

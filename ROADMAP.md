@@ -1106,3 +1106,18 @@ variant/verdict UI (GitHub-safe, no execution).
   `best_variant` — the first on-disk variant whose fit is CAN_RUN (deterministic
   file-name order), else null (honest: no variant confirmed runnable). Directly
   answers "which variant should I deploy on THIS fabric?".
+
+## 38. Next-Gen Phase N — Historical Execution Statistics
+
+Deterministic historical intelligence from real measured execution history
+(no ML, no synthetic benchmarks).
+
+- [x] `execution_statistics(&[ExecutedPlan])` — pure aggregate deriving records,
+  outcome counts, measured throughput/latency (only from records with real
+  `tokens_used` + `processing_time_ms`; `None` measurements excluded, never
+  treated as 0), retries, and per-model / per-worker outcomes (deterministic
+  order). Re-exported from `decentraai_distributed`.
+- [x] `GET /v1/stats` — operator/admin endpoint returning the deterministic
+  history statistics; honest 0-record response when no compute manager attached.
+- [x] Tests: deterministic aggregates (measured-only, retries, per-model,
+  per-worker, empty history) + endpoint auth/JSON.
