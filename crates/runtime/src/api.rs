@@ -782,6 +782,26 @@ fn hub_search_body(
     })
 }
 
+/// Live Hub capability search for the MCP `search_models_by_capability` tool.
+/// Performs the network lookup, then reuses the pure [`hub_search_body`]
+/// filter so the result is provenance-honest. On Hub failure it returns an
+/// explicit error object (never a fabricated empty 'no models').
+async fn mcp_capability_search(
+    query: &str,
+    limit: usize,
+    capability: decentraai_hub::CapabilityKind,
+) -> serde_json::Value {
+    let catalog = decentraai_hub::HubCatalog::new();
+    match catalog.search(query, limit).await {
+        Ok(models) => hub_search_body(query, &models, Some(capability)),
+        Err(e) => serde_json::json!({
+            "error": e.to_string(),
+            "matched": 0,
+            "models": [],
+        }),
+    }
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -1885,7 +1905,26 @@ async fn mcp_handler(
         return e.into_response();
     }
     let raw = String::from_utf8_lossy(&body);
-    let ctx = mcp_context(&state).await;
+    let mut ctx = mcp_context(&state).await;
+    // A `search_models_by_capability` call needs a live Hub lookup: precompute
+    // its result here (the MCP layer is I/O-free). Unknown/invalid capability
+    // values yield an empty honest result, never a fabricated positive.
+    if let Some((capability, query, limit)) = crate::mcp::capability_search_request(&raw) {
+        let cap = capability.parse::<decentraai_hub::CapabilityKind>().ok();
+        match cap {
+            Some(cap) => {
+                let q = query.unwrap_or_else(String::new);
+                ctx.capability_search = mcp_capability_search(&q, limit, cap).await;
+            }
+            None => {
+                ctx.capability_search = serde_json::json!({
+                    "error": format!("unknown capability: {capability}"),
+                    "matched": 0,
+                    "models": [],
+                });
+            }
+        }
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -1964,6 +2003,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         models,
         executions,
         peers,
+        capability_search: serde_json::json!({ "matched": 0, "models": [] }),
     }
 }
 

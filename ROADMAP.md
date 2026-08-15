@@ -799,3 +799,21 @@ intent planning, and the agent control plane's "which models can run this?"
   returns only models whose real metadata supports that capability (with
   `matched`/`total` counts), dropping models that cannot back the claim.
 - [x] Tests for every honesty rule + the API filter (pure, no hardware).
+
+## 24. Next-Gen Phase 7 — MCP Capability Search
+
+Extends the read-only MCP control plane so an external agent can ask "which
+models can do X?" without knowing model names. Reuses the existing auth and the
+pure capability matcher — MCP remains a thin translation layer (no new
+identity/registry/privilege, ADR-004/ADR-005).
+
+- [x] `search_models_by_capability` MCP tool — takes a snake_case capability
+  (e.g. `ocr`, `vision`, `coding`, `summarization`) plus optional `query`/
+  `limit`, returns only Hub models whose real metadata backs the claim.
+- [x] Honest by construction: unknown/invalid capabilities return an explicit
+  error or empty result, never a fabricated positive; Hub failures surface as
+  an error object rather than a false "no models".
+- [x] Architecture preserved: the async HTTP handler precomputes the Hub lookup
+  into `McpContext.capability_search`; the MCP module stays I/O-free and pure
+  (`capability_search_request` tells the handler whether a lookup is needed).
+- [x] Tests for the tool dispatch + request-arg extraction (pure, no network).

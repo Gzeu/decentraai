@@ -40,6 +40,10 @@ pub struct McpContext {
     pub executions: Value,
     /// Network peers + measured links.
     pub peers: Value,
+    /// Result of a Hub capability search (`search_models_by_capability`).
+    /// Precomputed by the HTTP layer, which performs the async Hub lookup;
+    /// the protocol layer only translates it (no I/O here).
+    pub capability_search: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -76,7 +80,63 @@ fn all_tools() -> Vec<ToolDef> {
             description: "Connected P2P peers and measured network links (RTT, bandwidth, locality).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
+        ToolDef {
+            name: "search_models_by_capability",
+            description: "Search the public Model Hub for models whose real metadata supports a requested capability (e.g. 'ocr', 'vision', 'coding', 'summarization'). Returns only models with actual evidence; a model that cannot back the claim is never included. The capability names use snake_case (see the on-node capability taxonomy).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capability": {
+                        "type": "string",
+                        "description": "Required capability in snake_case, e.g. ocr, vision, coding, summarization, embeddings, tool_calling.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional Hub search term to narrow the query (e.g. 'llama'). Empty searches the catalog by popularity.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to consider (1..=30). Default 8.",
+                    },
+                },
+                "required": ["capability"],
+                "additionalProperties": false,
+            }),
+        },
     ]
+}
+
+/// Extract the parameters of a `search_models_by_capability` call, if the
+/// incoming message is one. Pure — lets the HTTP layer decide whether it needs
+/// to precompute a Hub search into [`McpContext::capability_search`] before
+/// dispatching. Returns `(capability, query, limit)`.
+pub fn capability_search_request(raw: &str) -> Option<(String, Option<String>, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "search_models_by_capability" {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))?;
+    let capability = args.get("capability").and_then(|c| c.as_str())?.to_string();
+    if capability.is_empty() {
+        return None;
+    }
+    let query = args.get("query").and_then(|q| q.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    let limit = args
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(8)
+        .clamp(1, 30);
+    Some((capability, query, limit))
 }
 
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
@@ -156,6 +216,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "list_models" => &ctx.models,
         "list_executions" => &ctx.executions,
         "list_peers" => &ctx.peers,
+        "search_models_by_capability" => &ctx.capability_search,
         _ => return None,
     };
     Some(json!({
@@ -185,6 +246,7 @@ mod tests {
             models: json!([{ "file_name": "model.gguf" }]),
             executions: json!([{ "chosen_worker": "w1" }]),
             peers: json!([{ "peer_id": "p1" }]),
+            capability_search: json!({ "query": "", "matched": 1, "models": [{ "id": "org/vision" }] }),
         }
     }
 
@@ -215,6 +277,7 @@ mod tests {
         assert!(names.contains(&"list_workers"));
         assert!(names.contains(&"get_status"));
         assert!(names.contains(&"list_executions"));
+        assert!(names.contains(&"search_models_by_capability"));
         // Each tool declares a JSON schema.
         assert!(tools.iter().all(|t| t["inputSchema"].is_object()));
     }
@@ -224,6 +287,16 @@ mod tests {
         let r = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_workers","arguments":{}}}"#);
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("w1"), "must return the supplied snapshot");
+    }
+
+    #[test]
+    fn capability_search_returns_the_precomputed_hub_result() {
+        // The HTTP layer precomputes the Hub search into `capability_search`;
+        // the protocol layer returns it unchanged (no I/O here).
+        let r = call(r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_models_by_capability","arguments":{"capability":"vision"}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("org/vision"), "must return the supplied snapshot");
+        assert!(content.contains("\"matched\":1"));
     }
 
     #[test]
