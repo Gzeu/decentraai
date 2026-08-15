@@ -1235,3 +1235,15 @@ Turn the independent capabilities into ONE coherent read-only fabric decision.
 **Tests (focused)**
 - [x] `/v1/decision` auth + coherent structure (request/capabilities/decision/
   why/historical; decision null honestly when no workers).
+
+## 45. Next-Gen Phase 4 — `decide` Agent Workflow Tool
+
+The agent control plane gains ONE coherent workflow tool that encapsulates the
+full decision flow (reduces the need to chain many tools).
+
+- [x] MCP `decide { intent, evidence?, model? }` — precomputes
+  `unified_fabric_decision` (intent → capabilities → model options → per-variant
+  fabric fit → decision → why → historical). Read-only, no execution. Pure
+  `decision_request` extractor + dispatch.
+- [x] Tests: tool listed, arg parsing (evidence default + model optional),
+  precomputed snapshot returned unchanged.

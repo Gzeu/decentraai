@@ -64,6 +64,10 @@ pub struct McpContext {
     /// (nodes, models, capabilities, executions, network, kv). Precomputed by
     /// the HTTP layer; the protocol layer only translates.
     pub fabric_graph: Value,
+    /// Result of `decide`: ONE coherent fabric decision (Phase 1) — intent →
+    /// capabilities → model options → fabric fit → decision → why → historical.
+    /// Precomputed by the HTTP layer; the protocol layer only translates.
+    pub decision: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -211,6 +215,20 @@ fn all_tools() -> Vec<ToolDef> {
             name: "get_fabric_graph",
             description: "Project the current fabric graph (Digital Twin): real nodes (peer_id/node_id/node_name kept separate), models with their INFERRED quantization and persisted capability claims, the capabilities known across the fabric, recent executions with their recovery timeline, measured network links, and KV session count. Read-only projection of real fabric state — no fake nodes, no hardcoded names; empty arrays are honest. Future nodes appear automatically.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "decide",
+            description: "ONE coherent fabric decision (Digital Twin OS): turn an intent (e.g. 'OCR these images') into capabilities, the model options (per model + variant with CAN_RUN/CANNOT_RUN/UNKNOWN), the per-variant fabric fit, a chosen decision (first CAN_RUN, deterministic) with the reasons (why: capability/model/RAM/VRAM/trust/policy/engine), and the historical performance (measured; UNKNOWN when insufficient). Read-only projection — not a planner, no scoring, no execution. Optionally pass model= to narrow to one model file.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string", "description": "A natural-language intent, e.g. 'I need OCR and summarization'." },
+                    "evidence": { "type": "string", "enum": ["any", "verified"], "description": "'verified' requires VERIFIED claims; 'any' (default) includes inferred." },
+                    "model": { "type": "string", "description": "Optional: narrow to a specific model file." },
+                },
+                "required": ["intent"],
+                "additionalProperties": false,
+            }),
         },
     ]
 }
@@ -387,6 +405,36 @@ pub fn fabric_graph_request(raw: &str) -> Option<()> {
     Some(())
 }
 
+/// Extract the parameters of a `decide` call, if the incoming message is one.
+/// Pure — lets the HTTP layer precompute the unified decision into
+/// [`McpContext::decision`]. Returns `(intent, evidence, Option<model>)`.
+pub fn decision_request(raw: &str) -> Option<(String, String, Option<String>)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "decide" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let intent = args.get("intent").and_then(|c| c.as_str())?.to_string();
+    if intent.is_empty() {
+        return None;
+    }
+    let evidence = args
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "any".to_string());
+    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    let model = args.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    Some((intent, evidence, model))
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -538,6 +586,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "resolve_intent" => &ctx.intent_resolution,
         "resolve_intent_with_fit" => &ctx.intent_fit,
         "get_fabric_graph" => &ctx.fabric_graph,
+        "decide" => &ctx.decision,
         _ => return None,
     };
     Some(json!({
@@ -573,6 +622,7 @@ mod tests {
             intent_resolution: json!({}),
             intent_fit: json!({ "intent": "i", "capabilities": [] }),
             fabric_graph: json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": { "sessions_active": 0 } }),
+            decision: json!({ "request": "ocr", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
         }
     }
 
@@ -944,5 +994,48 @@ mod tests {
         assert!(content.contains("\"nodes\":[]"));
         assert!(content.contains("\"capabilities\":[]"));
         assert!(content.contains("\"sessions_active\":0"));
+    }
+
+    #[test]
+    fn tools_list_exposes_decide() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let d = tools.iter().find(|t| t["name"] == "decide").unwrap();
+        assert!(d["inputSchema"].is_object());
+        assert!(d["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|req| req == "intent"));
+        assert!(d["description"].as_str().unwrap().contains("coherent"));
+    }
+
+    #[test]
+    fn decision_request_parses_args_and_defaults_evidence() {
+        let (intent, ev, model) = decision_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"decide","arguments":{"intent":"OCR these images"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(intent, "OCR these images");
+        assert_eq!(ev, "any");
+        assert!(model.is_none());
+        // Explicit evidence + model honored; non-matching method -> None.
+        let (_, ev, model) = decision_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"decide","arguments":{"intent":"chat","evidence":"verified","model":"qwen.gguf"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, "verified");
+        assert_eq!(model.as_deref(), Some("qwen.gguf"));
+        assert!(decision_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+    }
+
+    #[test]
+    fn decide_returns_precomputed_decision() {
+        // The protocol layer returns the HTTP-precomputed unified decision.
+        let r = call(r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"decide","arguments":{"intent":"ocr"}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"request\":\"ocr\""));
+        assert!(content.contains("\"capabilities\":[]"));
+        assert!(content.contains("\"why\":[]"));
     }
 }

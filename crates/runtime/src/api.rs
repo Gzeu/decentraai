@@ -3208,6 +3208,10 @@ async fn mcp_handler(
     if crate::mcp::fabric_graph_request(&raw).is_some() {
         ctx.fabric_graph = mcp_fabric_graph(&state).await;
     }
+    // A `decide` call precomputes ONE coherent fabric decision (Phase 1).
+    if let Some((intent, evidence, model)) = crate::mcp::decision_request(&raw) {
+        ctx.decision = unified_fabric_decision(&state, &intent, &evidence, model.as_deref()).await;
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -3317,6 +3321,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         intent_resolution: serde_json::json!({}),
         intent_fit: serde_json::json!({}),
         fabric_graph: serde_json::json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": {} }),
+        decision: serde_json::json!({ "request": "", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
     }
 }
 
