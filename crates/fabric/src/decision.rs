@@ -159,6 +159,12 @@ pub struct ExecutionDecision {
     pub kv_affinity: String,
     pub engine_capability: EngineCapabilities,
     pub reasoning: String,
+    /// Optional required-capability verdict recorded from the planner (Phase L
+    /// foundation). `None` when no capability was requested; otherwise an
+    /// honest view (`satisfied=false`, `evidence="UNKNOWN"` unless a
+    /// coordinator supplies real `ModelCapabilities`). Surfaced so agents and
+    /// operators can see what capability an execution was asked to satisfy.
+    pub capability_requirement: Option<crate::planner::CapabilityRequirementView>,
     pub ts: u64,
     /// Reservation held for this request, filled in once the coordinator
     /// actually reserves a worker (correlates the decision with the outcome).
@@ -374,6 +380,7 @@ pub fn evaluate(
         },
         engine_capability,
         reasoning: plan_result.reasoning.clone(),
+        capability_requirement: plan_result.rationale.capability_requirement.clone(),
         ts: now_secs(),
         reservation_id: None,
         outcome: None,
@@ -702,6 +709,51 @@ mod tests {
         // The non-serving candidate records a ServesModel breach.
         let c = d.candidates.iter().find(|c| c.peer_id == "b").unwrap();
         assert!(c.constraints.breaches.contains(&ConstraintKind::ServesModel));
+    }
+
+    #[test]
+    fn evaluate_propagates_capability_requirement_from_planner() {
+        // A request carrying a required capability must surface that honest
+        // verdict on the ExecutionDecision, so agents/operators can see it via
+        // list_executions. The fabric has no ModelCapabilities, so the honest
+        // state is satisfied=false / evidence=UNKNOWN — never a false claim.
+        let g = worker("g", 150, 20, 10);
+        let mut r = req(
+            ContextProfile {
+                prompt_tokens: 10,
+                max_output_tokens: 10,
+                is_continuation: false,
+                prefix_resident_on: None,
+            },
+            0,
+        );
+        r.required_capability = Some("ocr".to_string());
+        let d = evaluate(
+            &ExecutionPlanner::default(),
+            "r-cap",
+            &r,
+            &[g],
+            true,
+            false,
+        );
+        let view = d.capability_requirement.expect("requirement must propagate");
+        assert_eq!(view.capability, "ocr");
+        assert!(!view.satisfied, "fabric never claims satisfaction without evidence");
+        assert_eq!(view.evidence, "UNKNOWN");
+        assert!(d.reasoning.contains("ocr"), "reasoning should mention the requirement");
+
+        // Without a requirement, the decision carries None.
+        let r2 = req(
+            ContextProfile {
+                prompt_tokens: 10,
+                max_output_tokens: 10,
+                is_continuation: false,
+                prefix_resident_on: None,
+            },
+            0,
+        );
+        let d2 = evaluate(&ExecutionPlanner::default(), "r-none", &r2, &[worker("g", 150, 20, 10)], true, false);
+        assert!(d2.capability_requirement.is_none());
     }
 
     #[test]

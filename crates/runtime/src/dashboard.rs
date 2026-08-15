@@ -1793,6 +1793,11 @@ function renderDecisions(x){
         '<span class="mono" style="margin-left:auto;font-size:11px;color:var(--faint)">'+tstr(d.ts)+'</span>'+
       '</div>'+
       '<div class="mono" style="font-size:11.5px;color:var(--muted);margin-bottom:8px">net '+d.network_cost_ms+'ms · kv '+esc(d.kv_affinity||'')+(d.reservation_id ? ' · res '+short(d.reservation_id,8) : '')+'</div>'+
+      (d.capability_requirement ? (function(cr){
+        var ok = cr.satisfied;
+        var badge = ok ? '<span class="badge ok">cap ✓</span>' : '<span class="badge warn">cap ✗</span>';
+        return '<div class="mono" style="font-size:11.5px;margin-bottom:8px">'+badge+' required <b>'+esc(cr.capability||'')+'</b> · evidence '+esc(cr.evidence||'')+'</div>';
+      })(d.capability_requirement) : '')+
       (d.reasoning ? '<div class="mono" style="font-size:11.5px;color:var(--muted);margin-bottom:8px">'+esc(d.reasoning)+'</div>' : '')+
       '<div>'+cands+'</div>'+
       '<ul class="trace" style="margin-top:10px">'+trace+'</ul>'+

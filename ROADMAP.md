@@ -858,3 +858,21 @@ execution decision observability), both honest by construction.
   (requirement `None` today — routing/protocol untouched).
 - [x] Tests: no requirement → None verdict; requirement → honest UNKNOWN;
   serde round-trip.
+
+## 27. Next-Gen Phase L — Capability Requirement Reaches the Execution Decision
+
+The planner plumbing (section 26) recorded the requirement in
+`PlannerRationale`, but it stopped there — `ExecutionDecision` (the record
+surfaced to agents via MCP/`/v1/compute#decisions` and the dashboard) did not
+carry it. This closes that gap so an agent/operator can see what capability an
+execution was asked to satisfy.
+
+- [x] `ExecutionDecision.capability_requirement: Option<CapabilityRequirementView>`
+  — populated in `evaluate()` from the planner rationale, so the decision
+  carries the same honest verdict (`satisfied=false`, `evidence="UNKNOWN"` when
+  the fabric has no `ModelCapabilities`).
+- [x] Dashboard "Autonomous decisions" cards now show a `cap ✓/✗` badge with
+  the required capability + evidence.
+- [x] Test: a request with a required capability surfaces the honest UNKNOWN
+  verdict on the decision and mentions it in reasoning; a request without one
+  carries `None`.
