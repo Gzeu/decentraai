@@ -821,6 +821,93 @@ fn refresh_registry_after_pull(
     Ok(count)
 }
 
+/// Project the Hub's capability taxonomy into registry persistence records.
+/// Each enum is converted to its snake_case string form via its `Serialize`
+/// impl (e.g. `CapabilityKind::Ocr` -> `"ocr"`, `Provenance::Verified` ->
+/// `"verified"`). This is a persistence *projection* of the authoritative hub
+/// data — no new capability system.
+fn capability_records_from_hub(
+    caps: &decentraai_hub::ModelCapabilities,
+) -> Vec<decentraai_registry::CapabilityClaimRecord> {
+    caps.claims
+        .iter()
+        .map(|c| decentraai_registry::CapabilityClaimRecord {
+            capability: serde_json::to_string(&c.capability)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            provenance: serde_json::to_string(&c.provenance)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+        })
+        .collect()
+}
+
+/// Compute `file`'s path relative to `base` by canonicalizing both and
+/// stripping the prefix. Returns `None` when the file lies outside `base` or
+/// either path cannot be canonicalized, so callers can skip best-effort.
+fn relative_path_of(base: &Path, file: &Path) -> Option<String> {
+    let base = std::fs::canonicalize(base).ok()?;
+    let file = std::fs::canonicalize(file).ok()?;
+    let rel = file.strip_prefix(&base).ok()?;
+    Some(rel.to_string_lossy().to_string())
+}
+
+/// Find a model's persisted capability claims in a registry by its file name.
+/// The registry `relative_path` is a path under models/ whose final component
+/// is the file name, so a suffix match disambiguates it. Empty means UNKNOWN.
+fn claims_for_file_name(
+    registry: &decentraai_registry::ModelRegistry,
+    file_name: &str,
+) -> Vec<decentraai_registry::CapabilityClaimRecord> {
+    registry
+        .models
+        .values()
+        .find(|r| r.relative_path.ends_with(file_name))
+        .map(|r| r.capability_claims.clone())
+        .unwrap_or_default()
+}
+
+/// Persist the Hub's authoritative capability claims for a freshly pulled
+/// model into the local registry. Best-effort by design: a Hub/registry/IO
+/// failure surfaces as an error the caller turns into a warning — capabilities
+/// are a projection, never a gate on the pull. Returns the number of claims
+/// persisted (0 when the Hub reports none).
+async fn persist_capability_claims_after_pull(
+    models_dir: &Path,
+    registry_path: &Path,
+    download_path: &Path,
+    repo: &str,
+) -> Result<usize> {
+    let catalog = decentraai_hub::HubCatalog::new();
+    let detail = catalog.model_detail(repo).await?;
+    let caps = detail.capabilities();
+    let claims = capability_records_from_hub(&caps);
+    if claims.is_empty() {
+        return Ok(0);
+    }
+    // Map the pulled file to its registry relative path under models_dir.
+    let Some(relative_path) = relative_path_of(models_dir, download_path) else {
+        anyhow::bail!(
+            "could not map pulled file {} to a path under {}",
+            download_path.display(),
+            models_dir.display()
+        );
+    };
+    let persisted = claims.len();
+    let mut registry = decentraai_registry::ModelRegistry::load(registry_path)?;
+    match registry.set_capability_claims(&relative_path, claims)? {
+        true => {
+            registry.save(registry_path)?;
+            Ok(persisted)
+        }
+        false => {
+            anyhow::bail!("pulled model not present in registry: {relative_path}");
+        }
+    }
+}
+
 /// Model Hub pull (Part 16/22): `POST /api/admin/hub/pull` with
 /// `{"reference":"hf:org/repo[:file]"}` downloads a verified GGUF into the
 /// node's models dir and refreshes the local registry, so the model becomes
@@ -881,6 +968,30 @@ async fn admin_hub_pull_handler(
             0
         }
     };
+    // Persist the Hub's authoritative capability claims for the pulled model
+    // into the local registry. Best-effort: a Hub/registry/IO failure only
+    // degrades to a warning — capability persistence must never break a pull.
+    let persisted = match persist_capability_claims_after_pull(
+        &models_dir,
+        &registry_path,
+        &download.path,
+        hf_ref.repo.as_str(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("persisting capability claims after pull failed: {e:#}");
+            0
+        }
+    };
+    if persisted > 0 {
+        tracing::info!(
+            claims = persisted,
+            file = %download.path.display(),
+            "persisted hub capability claims for pulled model"
+        );
+    }
     // Issue #26 §25: make the fabric see the new model without a restart.
     // Rebuild `available_models` from the refreshed registry and re-advertise
     // through the compute manager; the periodic broadcaster picks up the new
@@ -2564,6 +2675,12 @@ async fn fabric_model_list(
     let compute = state.compute.as_ref()?;
     let local_peer = compute.local_peer();
     let workers = compute.workers().await;
+    // Best-effort local registry: source of persisted capability claims for
+    // the local model entries (no Hub round-trip). A failure to load simply
+    // omits the field — the model list must never break on registry trouble.
+    let registry =
+        decentraai_registry::ModelRegistry::load(&state.info.repo_root.join("db/registry.json"))
+            .ok();
     // id (file name) → (owned_by, is_local)
     let mut seen: std::collections::BTreeMap<String, (String, bool)> =
         std::collections::BTreeMap::new();
@@ -2597,13 +2714,25 @@ async fn fabric_model_list(
     }
     let data: Vec<serde_json::Value> = seen
         .into_iter()
-        .map(|(id, (owned_by, _))| {
-            serde_json::json!({
+        .map(|(id, (owned_by, is_local))| {
+            let mut entry = serde_json::json!({
                 "id": id,
                 "object": "model",
                 "created": 0,
                 "owned_by": owned_by,
-            })
+            });
+            // Local models only: attach real persisted capability data when it
+            // exists. Absent means UNKNOWN — never force an empty list.
+            if is_local {
+                if let Some(reg) = &registry {
+                    let claims = claims_for_file_name(reg, &id);
+                    if !claims.is_empty() {
+                        entry["capability_claims"] =
+                            serde_json::to_value(claims).unwrap_or(serde_json::Value::Null);
+                    }
+                }
+            }
+            entry
         })
         .collect();
     Some(serde_json::json!({ "object": "list", "data": data }))
@@ -5292,6 +5421,128 @@ mod tests {
         assert_eq!(count, 1);
         let loaded = decentraai_registry::ModelRegistry::load(&registry_path).unwrap();
         assert!(loaded.models.contains_key("fresh-model.gguf"));
+    }
+
+    #[test]
+    fn capability_records_from_hub_maps_enums_to_snake_case() {
+        let caps = decentraai_hub::ModelCapabilities {
+            claims: vec![
+                decentraai_hub::CapabilityClaim {
+                    capability: decentraai_hub::CapabilityKind::Ocr,
+                    provenance: decentraai_hub::Provenance::Verified,
+                },
+                decentraai_hub::CapabilityClaim {
+                    capability: decentraai_hub::CapabilityKind::Coding,
+                    provenance: decentraai_hub::Provenance::Inferred,
+                },
+            ],
+            tasks: Vec::new(),
+        };
+        let records = capability_records_from_hub(&caps);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].capability, "ocr");
+        assert_eq!(records[0].provenance, "verified");
+        assert_eq!(records[1].capability, "coding");
+        assert_eq!(records[1].provenance, "inferred");
+    }
+
+    #[test]
+    fn relative_path_of_strips_prefix_and_rejects_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let file = models_dir.join("sub").join("model.gguf");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        // A file under models/ maps to its path relative to models/.
+        assert_eq!(
+            relative_path_of(&models_dir, &file).unwrap(),
+            "sub/model.gguf"
+        );
+        // A file outside models/ yields None, so best-effort callers skip.
+        let outside = dir.path().join("other.gguf");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(relative_path_of(&models_dir, &outside).is_none());
+    }
+
+    #[test]
+    fn claims_for_file_name_matches_by_suffix_and_omits_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        // Keyed by relative path (path under models/ ending with the file name).
+        registry.models.insert(
+            "org/codestral/codestral.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "org/codestral/codestral.gguf".to_string(),
+                canonical_path: "/models/org/codestral/codestral.gguf".to_string(),
+                size_bytes: 1,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: vec![decentraai_registry::CapabilityClaimRecord {
+                    capability: "coding".to_string(),
+                    provenance: "verified".to_string(),
+                }],
+            },
+        );
+        // A model whose file name matches an existing record returns its claims.
+        let claims = claims_for_file_name(&registry, "codestral.gguf");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].capability, "coding");
+        // An unknown file name yields UNKNOWN (empty), never fabricated claims.
+        assert!(claims_for_file_name(&registry, "nope.gguf").is_empty());
+        // Registry present but the model has no claims -> also UNKNOWN.
+        let mut bare = decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        bare.models.insert(
+            "org/codestral/codestral.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "org/codestral/codestral.gguf".to_string(),
+                canonical_path: "/models/org/codestral/codestral.gguf".to_string(),
+                size_bytes: 1,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: Vec::new(),
+            },
+        );
+        assert!(claims_for_file_name(&bare, "codestral.gguf").is_empty());
+    }
+
+    #[test]
+    fn fabric_model_claims_survive_pull_persist_round_trip() {
+        // End-to-end projection check: a registry fixture written the way the
+        // pull handler persists claims (relative path + snake_case strings)
+        // yields the same claims when read back for the model list.
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(models_dir).unwrap();
+        registry.models.insert(
+            "qwen/qwen.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "qwen/qwen.gguf".to_string(),
+                canonical_path: "x".to_string(),
+                size_bytes: 1,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: vec![
+                    decentraai_registry::CapabilityClaimRecord {
+                        capability: "ocr".to_string(),
+                        provenance: "verified".to_string(),
+                    },
+                    decentraai_registry::CapabilityClaimRecord {
+                        capability: "document_understanding".to_string(),
+                        provenance: "inferred".to_string(),
+                    },
+                ],
+            },
+        );
+        registry.save(&registry_path).unwrap();
+        let loaded = decentraai_registry::ModelRegistry::load(&registry_path).unwrap();
+        let claims = claims_for_file_name(&loaded, "qwen.gguf");
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].capability, "ocr");
+        assert_eq!(claims[1].provenance, "inferred");
     }
 
     #[tokio::test]

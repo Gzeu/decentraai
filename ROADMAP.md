@@ -876,3 +876,28 @@ execution was asked to satisfy.
 - [x] Test: a request with a required capability surfaces the honest UNKNOWN
   verdict on the decision and mentions it in reasoning; a request without one
   carries `None`.
+
+## 28. Next-Gen Phase L — Real Capability Data Persisted + Resolved
+
+The capability requirement plumbing was honest-but-UNKNOWN because the fabric
+had no real per-model capability data. This wires in the authoritative source:
+capabilities are classified from the Hub at pull time, persisted in the local
+registry, exposed on the fabric model list, and the fabric can resolve a real
+evidence-backed verdict from supplied claims.
+
+- [x] `CapabilityClaimRecord { capability, provenance }` on `ModelRecord`
+  (hub-agnostic projection of the hub taxonomy; `#[serde(default)]` keeps older
+  registries valid; survives rescans and save/load). `ModelRegistry::record` +
+  `set_capability_claims`.
+- [x] Pull-time persistence: `admin_hub_pull_handler` fetches `model_detail`,
+  classifies, and persists the claims for the pulled file (best-effort — a
+  failure to persist never breaks the pull).
+- [x] Fabric model list exposes `capability_claims` for local models (absent
+  when the registry has none = UNKNOWN; remote workers untouched).
+- [x] `resolve_capability_requirement` — pure, public fabric function that maps
+  supplied claims to an honest verdict (VERIFIED satisfies; INFERRED never
+  satisfies a verified requirement; MISSING otherwise). `capability_view`
+  still yields UNKNOWN when no claims are supplied (existing behavior unchanged).
+- [x] Tests: registry claims persistence/rescan/save-load; pull mapping helpers
+  (snake_case, relative path, suffix match); resolver honesty rules (verified /
+  inferred / missing / case-insensitive / pure).

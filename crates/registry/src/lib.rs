@@ -9,6 +9,18 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["gguf"];
 
 const REGISTRY_VERSION: u32 = 1;
 
+/// A persisted capability claim on a model, hub-agnostic so the registry stays
+/// a leaf crate (it does not depend on the hub). `capability` is the snake_case
+/// name from the shared capability taxonomy (e.g. "ocr", "coding"), `provenance`
+/// is "verified" or "inferred". This is a persistence *projection* of the
+/// authoritative hub `ModelCapabilities` — not a second capability system.
+/// Absent claims simply mean the model has no recorded capability data (UNKNOWN).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityClaimRecord {
+    pub capability: String,
+    pub provenance: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRecord {
     pub relative_path: String,
@@ -16,6 +28,10 @@ pub struct ModelRecord {
     pub size_bytes: u64,
     pub modification_time: u64,
     pub extension: String,
+    /// Persisted capability claims (projection of the hub taxonomy). Empty by
+    /// default (UNKNOWN); `#[serde(default)]` keeps older registries valid.
+    #[serde(default)]
+    pub capability_claims: Vec<CapabilityClaimRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +166,15 @@ impl ModelRegistry {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
+        // Preserve previously persisted capability claims on rescan so a
+        // periodic re-scan never wipes the capability data written at pull time
+        // (idempotent: existing claims are kept, absent means UNKNOWN).
+        let capability_claims = self
+            .models
+            .get(&relative_path)
+            .map(|r| r.capability_claims.clone())
+            .unwrap_or_default();
+
         let record = ModelRecord {
             relative_path: relative_path.clone(),
             canonical_path: canonical_path.to_string_lossy().to_string(),
@@ -160,6 +185,7 @@ impl ModelRegistry {
                 .unwrap_or_default()
                 .as_secs(),
             extension,
+            capability_claims,
         };
 
         // Idempotent: update existing record or add new one
@@ -171,6 +197,26 @@ impl ModelRegistry {
         let mut models: Vec<_> = self.models.values().collect();
         models.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         models
+    }
+
+    /// Returns a model record by its relative path.
+    pub fn record(&self, relative_path: &str) -> Option<&ModelRecord> {
+        self.models.get(relative_path)
+    }
+
+    /// Sets the persisted capability claims for a model identified by its
+    /// relative path (the projection of the hub taxonomy written at pull time).
+    /// Returns `Ok(false)` when no such model exists (nothing persisted).
+    pub fn set_capability_claims(
+        &mut self,
+        relative_path: &str,
+        claims: Vec<CapabilityClaimRecord>,
+    ) -> Result<bool> {
+        let Some(record) = self.models.get_mut(relative_path) else {
+            return Ok(false);
+        };
+        record.capability_claims = claims;
+        Ok(true)
     }
 
     /// Removes a model from the registry and deletes the underlying file.
@@ -275,6 +321,61 @@ mod tests {
         let count = registry.scan_directory(temp_dir.path()).unwrap();
         assert_eq!(count, 1);
         assert_eq!(registry.model_count(), 1);
+    }
+
+    #[test]
+    fn test_capability_claims_set_and_survive_rescan() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        create_test_file(temp_dir.path(), "model.gguf", b"GGUF magic");
+        registry.scan_directory(temp_dir.path()).unwrap();
+
+        // Set claims for the scanned model (projection written at pull time).
+        let rel = "model.gguf".to_string();
+        let claims = vec![
+            CapabilityClaimRecord {
+                capability: "ocr".into(),
+                provenance: "verified".into(),
+            },
+            CapabilityClaimRecord {
+                capability: "coding".into(),
+                provenance: "inferred".into(),
+            },
+        ];
+        assert!(registry.set_capability_claims(&rel, claims.clone()).unwrap());
+
+        // A rescan must NOT wipe the persisted claims (idempotent projection).
+        registry.scan_directory(temp_dir.path()).unwrap();
+        let record = registry.record(&rel).unwrap();
+        assert_eq!(record.capability_claims, claims);
+
+        // Setting claims for an unknown path is a no-op (returns false).
+        assert!(!registry.set_capability_claims("nope.gguf", vec![]).unwrap());
+    }
+
+    #[test]
+    fn test_capability_claims_persist_across_save_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        create_test_file(temp_dir.path(), "model.gguf", b"GGUF magic");
+        registry.scan_directory(temp_dir.path()).unwrap();
+        registry
+            .set_capability_claims(
+                "model.gguf",
+                vec![CapabilityClaimRecord {
+                    capability: "vision".into(),
+                    provenance: "verified".into(),
+                }],
+            )
+            .unwrap();
+        let path = temp_dir.path().join("registry.json");
+        registry.save(&path).unwrap();
+
+        let loaded = ModelRegistry::load(&path).unwrap();
+        let record = loaded.record("model.gguf").unwrap();
+        assert_eq!(record.capability_claims.len(), 1);
+        assert_eq!(record.capability_claims[0].capability, "vision");
+        assert_eq!(record.capability_claims[0].provenance, "verified");
     }
 
     #[test]

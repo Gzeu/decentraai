@@ -275,7 +275,7 @@ impl ExecutionPlanner {
                 chosen: None,
                 runner_up_delta: None,
                 ranked: Vec::new(),
-                capability_requirement: capability_view(req),
+                capability_requirement: capability_view(req, None),
             };
             return PlanResult {
                 plan: ExecutionPlan {
@@ -318,7 +318,7 @@ impl ExecutionPlanner {
                 None
             },
             ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
-            capability_requirement: capability_view(req),
+            capability_requirement: capability_view(req, None),
         };
         PlanResult {
             reasoning: append_capability_note(&stage.1, req),
@@ -448,18 +448,80 @@ impl ExecutionPlanner {
     }
 }
 
+/// Resolves a capability requirement against a caller-supplied set of real
+/// capability claims. Pure and I/O-free so a coordinator that holds the
+/// taxonomy (e.g. a projection of the hub taxonomy persisted in the local
+/// registry) can produce an honest, evidence-backed verdict instead of the
+/// fabric's always-UNKNOWN fallback.
+///
+/// `claims` is a generic, serde-free slice of `(capability_name, provenance)`
+/// where `capability_name` is the snake_case capability and `provenance` is
+/// either `"verified"` or `"inferred"`. The fabric deliberately does NOT depend
+/// on the registry or hub crates — it only consumes the resolved shapes.
+///
+/// Honesty semantics (the requirement is interpreted as needing VERIFIED
+/// evidence):
+/// - a matching claim with provenance `"verified"` → satisfied, `"VERIFIED"`;
+/// - else a matching claim with provenance `"inferred"` → NOT satisfied,
+///   `"INFERRED"` (an inferred claim never satisfies a verified requirement);
+/// - else → NOT satisfied, `"MISSING"`.
+///
+/// `label` is derived purely from the capability name (`'_'` → `' '`); it never
+/// invents a label not derivable from the name. Capability matching is
+/// case-insensitive on the snake_case names.
+pub fn resolve_capability_requirement(
+    required_capability: &str,
+    claims: &[(&str, &str)],
+) -> CapabilityRequirementView {
+    let eq = |name: &str| name.eq_ignore_ascii_case(required_capability);
+    let matching = claims.iter().filter(|(cap, _)| eq(cap)).collect::<Vec<_>>();
+
+    let (satisfied, evidence) = if matching
+        .iter()
+        .any(|(_, prov)| prov.eq_ignore_ascii_case("verified"))
+    {
+        (true, "VERIFIED")
+    } else if matching
+        .iter()
+        .any(|(_, prov)| prov.eq_ignore_ascii_case("inferred"))
+    {
+        (false, "INFERRED")
+    } else {
+        (false, "MISSING")
+    };
+
+    CapabilityRequirementView {
+        capability: required_capability.to_string(),
+        label: required_capability.replace('_', " "),
+        satisfied,
+        evidence: evidence.to_string(),
+    }
+}
+
 /// Builds the honest capability-requirement verdict for a request, or `None`
-/// when no capability was required. The fabric holds no capability data
-/// (engine-neutral), so a requested capability is ALWAYS recorded as NOT
-/// satisfied with `evidence = "UNKNOWN"` — a requirement is never claimed
-/// satisfied without real evidence. A coordinator with real `ModelCapabilities`
-/// may replace this verdict; the fabric does not.
-fn capability_view(req: &RequestFacts) -> Option<CapabilityRequirementView> {
-    req.required_capability.as_ref().map(|cap| CapabilityRequirementView {
-        capability: cap.clone(),
-        label: cap.clone(),
-        satisfied: false,
-        evidence: "UNKNOWN".to_string(),
+/// when no capability was required.
+///
+/// - When the request carries a requirement AND `claims` supplies real,
+///   non-empty claims → resolve an evidence-backed verdict via
+///   [`resolve_capability_requirement`].
+/// - When the request carries a requirement but no claims are supplied → the
+///   honest UNKNOWN fallback: NOT satisfied with `evidence = "UNKNOWN"`, since
+///   the fabric holds no capability data and never claims a requirement met
+///   without real evidence. A coordinator with real claims may resolve it.
+fn capability_view(
+    req: &RequestFacts,
+    claims: Option<&[(&str, &str)]>,
+) -> Option<CapabilityRequirementView> {
+    req.required_capability.as_ref().map(|cap| {
+        match claims.filter(|c| !c.is_empty()) {
+            Some(c) => resolve_capability_requirement(cap, c),
+            None => CapabilityRequirementView {
+                capability: cap.clone(),
+                label: cap.replace('_', " "),
+                satisfied: false,
+                evidence: "UNKNOWN".to_string(),
+            },
+        }
     })
 }
 
@@ -815,5 +877,68 @@ mod tests {
         let json = serde_json::to_string(view).unwrap();
         let back: CapabilityRequirementView = serde_json::from_str(&json).unwrap();
         assert_eq!(back, *view);
+    }
+
+    #[test]
+    fn resolve_requirement_with_no_claims_stays_unknown() {
+        // A requirement with empty/None claims keeps the honest UNKNOWN fallback.
+        let mut with_ocr = req();
+        with_ocr.required_capability = Some("ocr".to_string());
+        let view = capability_view(&with_ocr, Some(&[])).unwrap();
+        assert!(!view.satisfied);
+        assert_eq!(view.evidence, "UNKNOWN");
+    }
+
+    #[test]
+    fn resolve_requirement_with_matching_verified_claim_satisfies() {
+        // A matching claim with provenance "verified" → satisfied, VERIFIED.
+        let view = resolve_capability_requirement("ocr", &[("ocr", "verified")]);
+        assert!(view.satisfied);
+        assert_eq!(view.evidence, "VERIFIED");
+    }
+
+    #[test]
+    fn resolve_requirement_with_only_inferred_claim_is_not_satisfied() {
+        // An inferred claim never satisfies a verified requirement.
+        let view = resolve_capability_requirement("ocr", &[("ocr", "inferred")]);
+        assert!(!view.satisfied);
+        assert_eq!(view.evidence, "INFERRED");
+    }
+
+    #[test]
+    fn resolve_requirement_with_no_matching_capability_is_missing() {
+        // No matching capability at all → MISSING.
+        let view = resolve_capability_requirement("ocr", &[("asr", "verified"), ("tts", "inferred")]);
+        assert!(!view.satisfied);
+        assert_eq!(view.evidence, "MISSING");
+    }
+
+    #[test]
+    fn resolve_requirement_matches_capability_case_insensitively() {
+        // "OCR" must match a claim named "ocr".
+        let view = resolve_capability_requirement("OCR", &[("ocr", "verified")]);
+        assert!(view.satisfied);
+        assert_eq!(view.evidence, "VERIFIED");
+    }
+
+    #[test]
+    fn resolve_requirement_derives_label_from_name() {
+        // label derives purely from the name: '_' → ' '.
+        let view = resolve_capability_requirement("image_ocr", &[("image_ocr", "inferred")]);
+        assert_eq!(view.label, "image ocr");
+        assert_eq!(view.capability, "image_ocr");
+    }
+
+    #[test]
+    fn resolve_requirement_is_a_pure_free_function() {
+        // Call the free function directly with a synthetic claims slice; it
+        // needs no planner, no I/O, and only depends on its inputs.
+        let claims: &[(&str, &str)] = &[("ocr", "inferred"), ("asr", "verified")];
+        let view = resolve_capability_requirement("ocr", claims);
+        assert!(!view.satisfied);
+        assert_eq!(view.evidence, "INFERRED");
+        let verified = resolve_capability_requirement("asr", claims);
+        assert!(verified.satisfied);
+        assert_eq!(verified.evidence, "VERIFIED");
     }
 }
