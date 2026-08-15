@@ -1326,3 +1326,10 @@ The operator can now run a decided intent on the fabric from the dashboard.
   optional `session_id` → `InferRequest.with_session`, so a run links to an
   earlier one and the fabric router steers back to the worker holding the
   session's KV prefix (continuation / cache locality, reusing M20).
+
+## 52. Next-Gen — Phase M: mutation master-gating via MCP
+
+- [x] Policy fix: MCP `execute_decision` (a mutation — runs real inference +
+  reserves a worker) now requires the MASTER token, not just an operator role.
+  The MCP handler gates read-only tools at operator/admin, but a mutating tool
+  must be admin-only (an operator may decide; only admin may execute).

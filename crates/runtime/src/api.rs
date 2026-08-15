@@ -3549,6 +3549,15 @@ async fn mcp_handler(
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
+    // Phase M policy: `execute_decision` is a MUTATION (runs real inference and
+    // reserves a worker). It must require the MASTER token, not just an
+    // operator role — an operator may decide, but only admin may execute.
+    let raw0 = String::from_utf8_lossy(&body);
+    if crate::mcp::execution_request(&raw0).is_some() {
+        if let Err(e) = state.require_master(&headers) {
+            return e.into_response();
+        }
+    }
     let raw = String::from_utf8_lossy(&body);
     let mut ctx = mcp_context(&state).await;
     // A `search_models_by_capability` call needs a live Hub lookup: precompute
