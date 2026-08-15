@@ -363,7 +363,7 @@ mod tests {
             peers: json!([{ "peer_id": "p1" }]),
             capability_search: json!({ "query": "", "matched": 1, "models": [{ "id": "org/vision" }] }),
             local_capability_search: json!({ "matched": 1, "models": [{ "id": "local.gguf", "evidence": "verified" }] }),
-            worker_capability: json!({ "model": "m", "capability": "ocr", "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
+            worker_capability: json!({ "model": "m", "capability": "ocr", "fit": { "verdict": "CAN_RUN", "counts": { "can_run": 1 } }, "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
         }
     }
 

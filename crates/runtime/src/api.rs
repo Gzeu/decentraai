@@ -880,26 +880,28 @@ async fn mcp_worker_capability(
         })
         .unwrap_or_default();
 
-    let mut workers_json = Vec::new();
+    let mut results: Vec<WorkerCapResult> = Vec::new();
     if let Some(cm) = &state.compute {
         for adv in cm.workers().await {
             let trusted = cm.is_trusted(&adv.peer_id).await;
-            let r = worker_capability_verdict(
+            results.push(worker_capability_verdict(
                 &adv,
                 trusted,
                 model,
                 capability,
                 evidence,
                 &claims,
-            );
-            workers_json.push(r.to_json());
+            ));
         }
     }
+    let fit = aggregate_can_i_run(&results);
+    let workers_json: Vec<serde_json::Value> = results.iter().map(|r| r.to_json()).collect();
 
     serde_json::json!({
         "model": model,
         "capability": capability,
         "evidence": evidence,
+        "fit": fit.to_json(),
         "worker_count": workers_json.len(),
         "workers": workers_json,
     })
@@ -1396,6 +1398,144 @@ impl WorkerCapResult {
                 "reason": c.reason,
             })).collect::<Vec<_>>(),
         })
+    }
+}
+
+/// The unified fabric-wide "CAN I RUN THIS?" answer, aggregated from per-worker
+/// verdicts. Explainable: no opaque score — it derives from real per-worker
+/// checks and reuses the exact same capability/resource/trust vocabulary.
+#[derive(Debug, Clone)]
+struct FabricCapFit {
+    /// Overall: CAN_RUN if any worker can; CANNOT_RUN if workers exist but none
+    /// can and at least one hard-fails; else UNKNOWN (no workers / all unknown).
+    verdict: WorkerCapVerdict,
+    can_run_count: usize,
+    cannot_run_count: usize,
+    unknown_count: usize,
+    /// The chosen worker for "which worker should I use?" — the first CAN_RUN
+    /// result (deterministic input order), else None.
+    chosen_worker: Option<String>,
+    /// Human reasons behind the overall verdict (aggregated from workers).
+    reasons: Vec<String>,
+}
+
+impl FabricCapFit {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "verdict": match self.verdict {
+                WorkerCapVerdict::CanRun => "CAN_RUN",
+                WorkerCapVerdict::CannotRun => "CANNOT_RUN",
+                WorkerCapVerdict::Unknown => "UNKNOWN",
+            },
+            "counts": {
+                "can_run": self.can_run_count,
+                "cannot_run": self.cannot_run_count,
+                "unknown": self.unknown_count,
+            },
+            "chosen_worker": self.chosen_worker,
+            "reasons": self.reasons,
+        })
+    }
+}
+
+/// Pure aggregation of per-worker capability verdicts into a fabric-wide answer.
+///
+/// Rules (honest, no invented state):
+/// - zero workers → UNKNOWN ("no compatible worker"), never CANNOT_RUN without
+///   a real worker to blame.
+/// - any worker CAN_RUN → overall CAN_RUN; chosen_worker is the first CAN_RUN
+///   (deterministic given the caller's sorted worker order).
+/// - no CAN_RUN but at least one CANNOT_RUN → CANNOT_RUN.
+/// - only UNKNOWN workers → UNKNOWN.
+fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
+    if results.is_empty() {
+        return FabricCapFit {
+            verdict: WorkerCapVerdict::Unknown,
+            can_run_count: 0,
+            cannot_run_count: 0,
+            unknown_count: 0,
+            chosen_worker: None,
+            reasons: vec!["no compatible worker on the fabric".to_string()],
+        };
+    }
+
+    let can_run: Vec<&WorkerCapResult> = results
+        .iter()
+        .filter(|r| r.verdict == WorkerCapVerdict::CanRun)
+        .collect();
+    let cannot_run = results
+        .iter()
+        .filter(|r| r.verdict == WorkerCapVerdict::CannotRun)
+        .count();
+    let unknown = results
+        .iter()
+        .filter(|r| r.verdict == WorkerCapVerdict::Unknown)
+        .count();
+
+    let chosen_worker = can_run.first().map(|r| r.peer_id.clone());
+    let verdict = if !can_run.is_empty() {
+        WorkerCapVerdict::CanRun
+    } else if cannot_run > 0 {
+        WorkerCapVerdict::CannotRun
+    } else {
+        WorkerCapVerdict::Unknown
+    };
+
+    // Aggregate a small set of human reasons: the first CAN_RUN worker's
+    // capability + resource evidence (when present), or representative blockers.
+    let mut reasons = Vec::new();
+    match verdict {
+        WorkerCapVerdict::CanRun => {
+            if let Some(best) = can_run.first() {
+                reasons.push(format!(
+                    "{} (node {} / {}) can run it",
+                    best.peer_id, best.node_id, best.node_name
+                ));
+                let cap = best.checks.iter().find(|c| c.check == "capability");
+                if let Some(cap) = cap {
+                    reasons.push(format!(
+                        "capability {} — {} evidence",
+                        cap.state,
+                        if cap.pass { "satisfied" } else { "insufficient" }
+                    ));
+                }
+                reasons.push(format!(
+                    "RAM {} · VRAM {} ({} CAN_RUN workers)",
+                    if best.ram_sufficient { "sufficient" } else { "insufficient" },
+                    if best.vram_sufficient { "sufficient" } else { "insufficient" },
+                    can_run.len()
+                ));
+            }
+        }
+        WorkerCapVerdict::CannotRun => {
+            // Report the first few distinct blockers across CANNOT_RUN workers.
+            let mut seen = std::collections::BTreeSet::new();
+            for r in results.iter().filter(|r| r.verdict == WorkerCapVerdict::CannotRun) {
+                for c in &r.checks {
+                    if !c.pass {
+                        let key = format!("{}:{}", c.check, c.state);
+                        if seen.insert(key) {
+                            reasons.push(format!(
+                                "{} ({} / {}): {} — {}",
+                                r.node_name, r.node_id, r.peer_id, c.check, c.state
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        WorkerCapVerdict::Unknown => {
+            reasons.push("no worker can be confirmed to run it (evidence/telemetry unknown)".to_string());
+        }
+    }
+
+    FabricCapFit {
+        verdict,
+        can_run_count: can_run.len(),
+        cannot_run_count: cannot_run,
+        unknown_count: unknown,
+        chosen_worker,
+        reasons,
     }
 }
 
@@ -2234,6 +2374,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/can_run", get(can_run_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{id}", get(model_detail_handler))
         .route("/v1/completions", post(proxy_handler))
@@ -2774,6 +2915,36 @@ async fn execution_handler(
         body["decisions"] = serde_json::json!(compute.decisions());
         body["attached"] = serde_json::json!(true);
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// `GET /v1/can_run?model=...&capability=...&evidence=any|verified` — the
+/// unified fabric-wide "CAN I RUN THIS?" view. Reuses the exact same pure
+/// per-worker projection + aggregation as the MCP `get_worker_capability`
+/// tool, exposed as plain JSON for the dashboard / external clients. Read-only.
+async fn can_run_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let model = query.get("model").cloned().unwrap_or_default();
+    let capability = query.get("capability").cloned().unwrap_or_default();
+    if model.trim().is_empty() || capability.trim().is_empty() {
+        return forbidden("missing model and/or capability");
+    }
+    let evidence = query
+        .get("evidence")
+        .map(String::as_str)
+        .unwrap_or("any");
+    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let body = mcp_worker_capability(&state, &model, &capability, evidence).await;
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -5914,6 +6085,99 @@ mod tests {
         assert_eq!(j["worker"]["peer_id"], peer.to_string());
         assert_ne!(j["worker"]["node_id"], j["worker"]["peer_id"]);
         assert_eq!(j["verdict"], "CAN_RUN");
+    }
+
+    // ---- aggregate_can_i_run unified "CAN I RUN THIS?" tests ----
+
+    fn cap_result(peer_id: &str, node_id: &str, verdict: WorkerCapVerdict) -> WorkerCapResult {
+        WorkerCapResult {
+            peer_id: peer_id.to_string(),
+            node_id: node_id.to_string(),
+            node_name: node_id.to_string(),
+            verdict,
+            checks: Vec::new(),
+            model_availability: "served",
+            trusted: true,
+            ram_sufficient: true,
+            vram_sufficient: true,
+            est_ram_mb: 1024,
+            est_vram_mb: 0,
+            engine_compat: "compatible",
+        }
+    }
+
+    #[test]
+    fn aggregate_can_i_run_with_any_can_run_worker() {
+        // Two workers: one CAN_RUN, one CANNOT_RUN -> overall CAN_RUN, the
+        // CAN_RUN worker chosen.
+        let results = vec![
+            cap_result("p1", "dca-b", WorkerCapVerdict::CannotRun),
+            cap_result("p2", "dca-a", WorkerCapVerdict::CanRun),
+        ];
+        let fit = aggregate_can_i_run(&results);
+        assert_eq!(fit.verdict, WorkerCapVerdict::CanRun);
+        assert_eq!(fit.can_run_count, 1);
+        assert_eq!(fit.cannot_run_count, 1);
+        assert_eq!(fit.chosen_worker.as_deref(), Some("p2"));
+        assert!(!fit.reasons.is_empty());
+    }
+
+    #[test]
+    fn aggregate_can_i_run_none_can_run_is_cannot_run() {
+        let results = vec![
+            cap_result("p1", "dca-a", WorkerCapVerdict::CannotRun),
+            cap_result("p2", "dca-b", WorkerCapVerdict::CannotRun),
+        ];
+        let fit = aggregate_can_i_run(&results);
+        assert_eq!(fit.verdict, WorkerCapVerdict::CannotRun);
+        assert_eq!(fit.chosen_worker, None);
+    }
+
+    #[test]
+    fn aggregate_can_i_run_all_unknown_is_unknown() {
+        let results = vec![
+            cap_result("p1", "dca-a", WorkerCapVerdict::Unknown),
+            cap_result("p2", "dca-b", WorkerCapVerdict::Unknown),
+        ];
+        let fit = aggregate_can_i_run(&results);
+        assert_eq!(fit.verdict, WorkerCapVerdict::Unknown);
+    }
+
+    #[test]
+    fn aggregate_can_i_run_no_workers_is_unknown_not_invented() {
+        let fit = aggregate_can_i_run(&[]);
+        assert_eq!(fit.verdict, WorkerCapVerdict::Unknown);
+        assert!(fit.reasons.iter().any(|r| r.contains("no compatible worker")));
+        assert_eq!(fit.chosen_worker, None);
+    }
+
+    #[test]
+    fn aggregate_can_i_run_end_to_end_with_real_verdicts() {
+        // One good worker (verified OCR, sufficient resources) + one bad
+        // (insufficient RAM): the fabric-wide answer must be CAN_RUN choosing
+        // the good worker, with the aggregate projecting the real verdicts.
+        let claims = claims_verified_ocr();
+        let good = {
+            let peer = decentraai_p2p::PeerId::random();
+            let adv = cap_adv(&peer, "dca-good", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+            worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims)
+        };
+        let bad = {
+            let peer = decentraai_p2p::PeerId::random();
+            let adv = cap_adv(&peer, "dca-bad", "llama_server", 512, Some(8192), (8192, 2048), (true, false));
+            worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims)
+        };
+        assert_eq!(good.verdict, WorkerCapVerdict::CanRun);
+        assert_eq!(bad.verdict, WorkerCapVerdict::CannotRun);
+
+        let fit = aggregate_can_i_run(&[good.clone(), bad.clone()]);
+        assert_eq!(fit.verdict, WorkerCapVerdict::CanRun);
+        assert_eq!(fit.chosen_worker.as_deref(), Some(good.peer_id.as_str()));
+        // JSON projection carries the unified verdict + counts.
+        let j = fit.to_json();
+        assert_eq!(j["verdict"], "CAN_RUN");
+        assert_eq!(j["counts"]["can_run"], 1);
+        assert_eq!(j["counts"]["cannot_run"], 1);
     }
 
     #[tokio::test]

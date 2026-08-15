@@ -554,6 +554,20 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <!-- MODELS -->
       <section class="view" id="view-models">
         <div class="card">
+          <h2>CAN I RUN THIS? <span class="count">fabric-wide capability fit</span></h2>
+          <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="cir-model" class="mono" placeholder="model (e.g. qwen2.5-7b-instruct-q4_k_m.gguf)" style="min-width:240px;padding:4px 6px;font-size:12px">
+            <input id="cir-cap" class="mono" placeholder="capability (e.g. ocr)" style="width:140px;padding:4px 6px;font-size:12px">
+            <select id="cir-ev" class="mono" style="font-size:11px;padding:4px 4px">
+              <option value="any">evidence: any</option>
+              <option value="verified">evidence: verified</option>
+            </select>
+            <button class="btn small" onclick="canIRun()">check</button>
+            <span id="cir-note" class="mono" style="font-size:10.5px;color:var(--faint)"></span>
+          </div>
+          <div id="cir-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+        </div>
+        <div class="card" style="margin-top:14px">
           <h2>Served models <span class="count" id="models-count"></span></h2>
           <table><thead><tr><th>Model</th><th>Engine</th><th class="num">Context</th><th class="num">RAM</th><th class="num">VRAM</th><th>Active</th></tr></thead>
           <tbody id="models"><tr><td colspan="6" class="empty">no served models advertised</td></tr></tbody></table>
@@ -1805,8 +1819,44 @@ function renderDecisions(x){
   }).join('');
   $('decisions').innerHTML = cards;
 }
-function renderModels(s, c){
-  const served = (s && s.node && s.node.served_models || []);
+// CAN I RUN THIS? — fabric-wide capability fit via the real /v1/can_run
+// projection (same pure engine as the MCP get_worker_capability tool).
+async function canIRun(){
+  const model = ($('cir-model').value || '').trim();
+  const cap = ($('cir-cap').value || '').trim();
+  const ev = ($('cir-ev')||{}).value || 'any';
+  if (!model || !cap) { toast('enter a model and a capability', true); return; }
+  $('cir-note').textContent = 'checking…';
+  const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(model)+'&capability='+encodeURIComponent(cap)+'&evidence='+encodeURIComponent(ev), { headers });
+  $('cir-note').textContent = '';
+  if (!ok) { $('cir-result').innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
+  const fit = j.fit || {};
+  const badge = fit.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN RUN</span>'
+    : fit.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT RUN</span>'
+    : '<span class="badge warn">UNKNOWN</span>';
+  const counts = fit.counts || {};
+  const reasons = (fit.reasons || []).map(r => '<div class="mono" style="font-size:11px;margin-top:2px">• '+esc(r)+'</div>').join('');
+  const chosen = fit.chosen_worker ? '<div style="margin-top:6px">chosen worker: <code>'+esc(short(fit.chosen_worker, 16))+'</code></div>' : '';
+  let perWorker = '';
+  (j.workers || []).forEach(w => {
+    const wv = w.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN_RUN</span>' : w.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT_RUN</span>' : '<span class="badge warn">UNKNOWN</span>';
+    const id = (w.worker || {});
+    const checks = (w.checks || []).filter(c => !c.pass).map(c =>
+      '<li style="font-size:11px"><span class="warn">✗</span> '+esc(c.check)+' — '+esc(c.state)+'</li>').join('');
+    perWorker += '<div style="margin-top:8px;border-top:1px dashed var(--border);padding-top:6px">'+
+      '<code>'+esc(short(id.node_id||id.peer_id||'', 14))+'</code> · '+esc(id.node_name||'')+' · '+wv+' · '+
+      'model '+esc(w.model_availability||'')+' · '+(w.trusted?'<span class="badge ok">trusted</span>':'<span class="badge warn">untrusted</span>')+' · engine '+esc(w.engine||'')+
+      (checks?'<ul style="margin:4px 0 0 14px;padding:0">'+checks+'</ul>':'')+'</div>';
+  });
+  $('cir-result').innerHTML =
+    '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+badge+' <span class="mono">'+esc(cap)+' · '+esc(model)+'</span> '+
+    '<span class="mono" style="color:var(--faint)">'+counts.can_run+' can / '+counts.cannot_run+' cannot / '+counts.unknown+' unknown</span></div>'+
+    reasons + chosen +
+    (j.workers && j.workers.length ? '<div style="margin-top:8px"><b style="font-size:11px">per worker</b>'+perWorker+'</div>' : '')+
+    (!j.workers || !j.workers.length ? '<div class="mono" style="margin-top:6px">no workers on the fabric</div>' : '');
+}
+
+function renderModels(s, c){  const served = (s && s.node && s.node.served_models || []);
   const rows = served.map(m =>
     '<tr><td>'+esc(m.name||'')+'</td><td>'+esc((s && s.node && s.node.engine)||'')+'</td><td class="num">'+(m.context_tokens||'—')+'</td><td class="num">'+fmtMB(m.est_ram_mb)+'</td><td class="num">'+(m.est_vram_mb?fmtMB(m.est_vram_mb):'—')+'</td><td>'+(s.model===m.name?'<span class="badge ok">loaded</span>':'<span class="badge faint">-</span>')+'</td></tr>'
   ).join('');

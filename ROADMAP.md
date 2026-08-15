@@ -963,3 +963,24 @@ state, no execution/reservations/model start.
   insufficient RAM/VRAM → CANNOT_RUN, inferred+verified-evidence → CANNOT_RUN,
   missing claim → UNKNOWN, untrusted → CANNOT_RUN, missing telemetry → UNKNOWN,
   no workers → UNKNOWN, and identity separation.
+
+## 32. Next-Gen — Unified "CAN I RUN THIS?" Fabric Fit
+
+Combines capability fit + resource fit + worker fit + model availability into a
+single explainable fabric-wide answer — the foundation for the Fabric Digital
+Twin and the Intent → Capability → Model → Worker → Execution flow. Pure
+aggregation over the existing per-worker projection (no new scoring/estimator).
+
+- [x] `aggregate_can_i_run(&[WorkerCapResult])` — pure fabric-wide verdict
+  (CAN_RUN if any worker can; CANNOT_RUN if workers exist but none can; else
+  UNKNOWN, including no-workers). Chosen worker = first CAN_RUN; explainable
+  aggregated reasons from the real per-worker checks.
+- [x] `get_worker_capability` MCP tool now returns a `fit` block (verdict +
+  counts + chosen_worker + reasons) alongside the per-worker projections.
+- [x] `GET /v1/can_run?model=&capability=&evidence=` — the same unified view as
+  plain JSON (operator/admin), reusing `mcp_worker_capability`.
+- [x] Dashboard Models view gains a "CAN I RUN THIS?" card (model + capability +
+  evidence inputs) rendering the real verdict, counts, reasons and per-worker
+  blockers.
+- [x] Tests: aggregate over real verdicts (any-can-run, none-can-run, all
+  unknown, no-workers-not-invented, end-to-end good+bad worker).
