@@ -52,6 +52,10 @@ pub struct McpContext {
     /// for a required capability, with explainable reasons. Precomputed by the
     /// HTTP layer; the protocol layer only translates.
     pub worker_capability: Value,
+    /// Result of `resolve_intent`: a deterministic intent → capability →
+    /// local-model resolution. Precomputed by the HTTP layer via the pure
+    /// [`resolve_intent`] helper; empty until wired.
+    pub intent_resolution: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -155,6 +159,26 @@ fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "resolve_intent",
+            description: "Turn a natural-language intent (e.g. 'I need OCR and summarization') into the capability set it points at, then report which of THIS node's local models back each capability from persisted claims. Intent→capability is INFERRED from keywords; a capability with no matching local claim stays visible in 'unmatched' — the tool never claims a model can do something it has no claim for. Unknown intent resolves to empty capabilities.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "A natural-language intent, e.g. 'I need OCR and summarization'.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "enum": ["any", "verified"],
+                        "description": "'verified' keeps only local models with a VERIFIED claim; 'any' (default) also includes inferred ones.",
+                    },
+                },
+                "required": ["intent"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -252,6 +276,104 @@ pub fn worker_capability_request(raw: &str) -> Option<(String, String, String)> 
     Some((model, capability, evidence))
 }
 
+/// Extract the parameters of a `resolve_intent` call, if the incoming message
+/// is one. Pure — lets the HTTP layer precompute the resolution into
+/// [`McpContext::intent_resolution`]. Returns `(intent, evidence)` where
+/// evidence defaults to "any".
+pub fn intent_request(raw: &str) -> Option<(String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "resolve_intent" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let intent = args.get("intent").and_then(|c| c.as_str())?.to_string();
+    if intent.is_empty() {
+        return None;
+    }
+    let evidence = args
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "any".to_string());
+    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    Some((intent, evidence))
+}
+
+/// Pure, deterministic intent → capability → local-model resolution.
+///
+/// (1) Maps the intent to capabilities via
+/// `decentraai_hub::intent::capabilities_for_intent` (INFERRED keyword
+/// heuristic — never a model claim).
+/// (2) For each capability, scans `ctx.models.data[*].capability_claims` for a
+/// matching claim (`{capability, provenance}`). `evidence` "verified" keeps
+/// only VERIFIED claims; "any" also accepts INFERRED. A capability with no
+/// matching local claim goes into `unmatched`.
+///
+/// The HTTP layer precomputes this into [`McpContext::intent_resolution`]; the
+/// pure helper exists so the logic is testable without a running node. The
+/// `note` field keeps the result honest.
+pub fn resolve_intent(ctx: &McpContext, intent: &str, evidence: &str) -> Value {
+    let require_verified = evidence == "verified";
+
+    let capabilities = decentraai_hub::intent::capabilities_for_intent(intent);
+
+    let mut capabilities_json = Vec::new();
+    let mut matching_local_models = serde_json::Map::new();
+    let mut unmatched = Vec::new();
+
+    for capability in capabilities {
+        let cap_str = serde_json::to_string(&capability)
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+        capabilities_json.push(json!({
+            "capability": cap_str,
+            "label": capability.label(),
+            "evidence_required": if require_verified { "verified" } else { "any" },
+        }));
+
+        // Scan ctx.models.data[*].capability_claims for this capability.
+        let mut matched_models: Vec<Value> = Vec::new();
+        let mut has_match = false;
+        for m in ctx.models["data"].as_array().cloned().unwrap_or_default() {
+            let Some(claims) = m["capability_claims"].as_array() else {
+                continue; // no persisted claims -> UNKNOWN, not a match
+            };
+            if let Some(hit) = claims.iter().find(|c| {
+                let cap = c["capability"].as_str().unwrap_or("");
+                let prov = c["provenance"].as_str().unwrap_or("");
+                cap.eq_ignore_ascii_case(&cap_str)
+                    && (!require_verified || prov.eq_ignore_ascii_case("verified"))
+            }) {
+                has_match = true;
+                matched_models.push(json!({
+                    "id": m["id"],
+                    "evidence": hit["provenance"],
+                }));
+            }
+        }
+        if has_match {
+            matching_local_models.insert(cap_str.clone(), Value::Array(matched_models));
+        } else {
+            unmatched.push(cap_str);
+        }
+    }
+
+    json!({
+        "intent": intent,
+        "capabilities": capabilities_json,
+        "matching_local_models": matching_local_models,
+        "unmatched": unmatched,
+        "note": "intent-to-capability is INFERRED from keywords; a model's actual support is verified against persisted claims.",
+    })
+}
+
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
 /// Returns `None` for notifications (no `id`), which MCP clients do not await.
 pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
@@ -332,6 +454,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "search_models_by_capability" => &ctx.capability_search,
         "find_local_models_by_capability" => &ctx.local_capability_search,
         "get_worker_capability" => &ctx.worker_capability,
+        "resolve_intent" => &ctx.intent_resolution,
         _ => return None,
     };
     Some(json!({
@@ -364,6 +487,7 @@ mod tests {
             capability_search: json!({ "query": "", "matched": 1, "models": [{ "id": "org/vision" }] }),
             local_capability_search: json!({ "matched": 1, "models": [{ "id": "local.gguf", "evidence": "verified" }] }),
             worker_capability: json!({ "model": "m", "capability": "ocr", "fit": { "verdict": "CAN_RUN", "counts": { "can_run": 1 } }, "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
+            intent_resolution: json!({}),
         }
     }
 
@@ -498,5 +622,155 @@ mod tests {
     fn parse_error_is_reported() {
         let r = handle_message(&ctx(), "not json").unwrap();
         assert_eq!(r["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn intent_request_parses_args_and_defaults_evidence() {
+        let (intent, ev) = intent_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_intent","arguments":{"intent":"I need OCR and summarization"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(intent, "I need OCR and summarization");
+        assert_eq!(ev, "any");
+        // Explicit verified honored; non-matching method -> None.
+        let (_, ev) = intent_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_intent","arguments":{"intent":"chat","evidence":"verified"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, "verified");
+        assert!(intent_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+    }
+
+    #[test]
+    fn tools_list_exposes_resolve_intent() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let resolve = tools.iter().find(|t| t["name"] == "resolve_intent").unwrap();
+        assert!(resolve["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "intent"));
+    }
+
+    #[test]
+    fn resolve_intent_returns_matched_and_unmatched() {
+        let c = McpContext {
+            models: json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "local-vision.gguf",
+                        "capability_claims": [
+                            { "capability": "vision", "provenance": "verified" },
+                            { "capability": "ocr", "provenance": "verified" },
+                        ],
+                    },
+                    {
+                        "id": "plain-chat.gguf",
+                        "capability_claims": [
+                            { "capability": "chat", "provenance": "inferred" },
+                        ],
+                    },
+                ],
+            }),
+            ..ctx()
+        };
+        let out = resolve_intent(&c, "I need OCR and summarization", "any");
+        assert_eq!(out["intent"], "I need OCR and summarization");
+        let caps = out["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0]["capability"], "ocr");
+        assert_eq!(caps[0]["label"], "OCR");
+        assert_eq!(caps[0]["evidence_required"], "any");
+        assert_eq!(caps[1]["capability"], "summarization");
+        // OCR matched to local-vision.gguf (verified).
+        let matched = out["matching_local_models"]["ocr"].as_array().unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0]["id"], "local-vision.gguf");
+        assert_eq!(matched[0]["evidence"], "verified");
+        // Summarization has no local claim -> unmatched.
+        assert_eq!(out["unmatched"], json!(["summarization"]));
+        assert!(out["note"].as_str().unwrap().contains("INFERRED"));
+    }
+
+    #[test]
+    fn resolve_intent_matched_model_returned_under_its_capability() {
+        let c = McpContext {
+            models: json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "local-ocr.gguf",
+                        "capability_claims": [
+                            { "capability": "ocr", "provenance": "inferred" },
+                        ],
+                    },
+                ],
+            }),
+            ..ctx()
+        };
+        // evidence "any" includes inferred claims.
+        let out = resolve_intent(&c, "ocr", "any");
+        assert_eq!(out["matching_local_models"]["ocr"][0]["id"], "local-ocr.gguf");
+        assert_eq!(out["matching_local_models"]["ocr"][0]["evidence"], "inferred");
+        assert!(out["unmatched"].as_array().unwrap().is_empty());
+        // evidence "verified" excludes the inferred claim -> unmatched.
+        let out = resolve_intent(&c, "ocr", "verified");
+        assert!(out["matching_local_models"]["ocr"].is_null());
+        assert_eq!(out["unmatched"], json!(["ocr"]));
+    }
+
+    #[test]
+    fn resolve_intent_empty_intent_yields_empty_capabilities() {
+        let out = resolve_intent(&ctx(), "", "any");
+        assert!(out["capabilities"].as_array().unwrap().is_empty());
+        assert!(out["matching_local_models"].as_object().unwrap().is_empty());
+        assert!(out["unmatched"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_intent_capability_with_no_local_claim_is_unmatched() {
+        let c = McpContext {
+            models: json!({
+                "object": "list",
+                "data": [
+                    { "id": "local-ocr.gguf", "capability_claims": [{ "capability": "ocr", "provenance": "verified" }] },
+                ],
+            }),
+            ..ctx()
+        };
+        // "chat" maps to a capability but no local model claims it -> unmatched,
+        // while ocr stays matched. This is the honest UNKNOWN path.
+        let out = resolve_intent(&c, "chat and ocr", "any");
+        let unmatched: Vec<&str> = out["unmatched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(unmatched, vec!["chat"]);
+        assert_eq!(out["matching_local_models"]["ocr"][0]["id"], "local-ocr.gguf");
+    }
+
+    #[test]
+    fn resolve_intent_unknown_intent_is_empty_not_guessed() {
+        // An intent with no recognized keyword resolves to empty capabilities
+        // (honest UNKNOWN) — nothing is fabricated or marked unmatched.
+        let out = resolve_intent(&ctx(), "falafel please", "any");
+        assert!(out["capabilities"].as_array().unwrap().is_empty());
+        assert!(out["unmatched"].as_array().unwrap().is_empty());
+        assert!(out["matching_local_models"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_intent_call_returns_precomputed_snapshot() {
+        // The protocol layer returns the HTTP-precomputed snapshot unchanged.
+        let mut c = ctx();
+        c.intent_resolution = json!({ "intent": "ocr", "capabilities": [{ "capability": "ocr" }] });
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"resolve_intent","arguments":{"intent":"ocr"}}}"#)
+            .unwrap();
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("ocr"));
     }
 }

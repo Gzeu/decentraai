@@ -880,19 +880,26 @@ async fn mcp_worker_capability(
         })
         .unwrap_or_default();
 
-    let mut results: Vec<WorkerCapResult> = Vec::new();
+    // Fetch the worker set once and reuse it for the requested model and for
+    // every on-disk variant below (workers()/is_trusted are async I/O).
+    let mut workers: Vec<(decentraai_compute::ComputeAdvertisement, bool)> = Vec::new();
     if let Some(cm) = &state.compute {
         for adv in cm.workers().await {
             let trusted = cm.is_trusted(&adv.peer_id).await;
-            results.push(worker_capability_verdict(
-                &adv,
-                trusted,
-                model,
-                capability,
-                evidence,
-                &claims,
-            ));
+            workers.push((adv, trusted));
         }
+    }
+
+    let mut results: Vec<WorkerCapResult> = Vec::new();
+    for (adv, trusted) in &workers {
+        results.push(worker_capability_verdict(
+            adv,
+            *trusted,
+            model,
+            capability,
+            evidence,
+            &claims,
+        ));
     }
     let fit = aggregate_can_i_run(&results);
     let workers_json: Vec<serde_json::Value> = results.iter().map(|r| r.to_json()).collect();
@@ -907,6 +914,43 @@ async fn mcp_worker_capability(
         .filter(|r| r.model_availability != "unavailable")
         .count();
 
+    // On-disk GGUF variants of this model from the REAL local registry (never
+    // invented). Each variant is evaluated by the SAME per-worker pipeline as
+    // the requested model, so a variant with no matching worker honestly
+    // resolves to CANNOT_RUN/UNKNOWN via the existing aggregate.
+    let variants: Vec<serde_json::Value> = registry
+        .as_ref()
+        .map(|reg| {
+            registry_variants_for_model(reg, model)
+                .into_iter()
+                .map(|(file, size_bytes)| {
+                    let v_claims: Vec<(String, String)> = claims_for_file_name(reg, &file)
+                        .into_iter()
+                        .map(|c| (c.capability, c.provenance))
+                        .collect();
+                    let mut v_results: Vec<WorkerCapResult> = Vec::new();
+                    for (adv, trusted) in &workers {
+                        v_results.push(worker_capability_verdict(
+                            adv,
+                            *trusted,
+                            &file,
+                            capability,
+                            evidence,
+                            &v_claims,
+                        ));
+                    }
+                    let v_fit = aggregate_can_i_run(&v_results);
+                    serde_json::json!({
+                        "file": file,
+                        "quantization": variant_quantization_from_file_name(&file),
+                        "size_bytes": size_bytes,
+                        "fit": v_fit.to_json(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     serde_json::json!({
         "model": model,
         "capability": capability,
@@ -919,6 +963,7 @@ async fn mcp_worker_capability(
         "fit": fit.to_json(),
         "worker_count": workers_json.len(),
         "workers": workers_json,
+        "variants": variants,
     })
 }
 
@@ -987,6 +1032,37 @@ fn claims_for_file_name(
         .find(|r| r.relative_path.ends_with(file_name))
         .map(|r| r.capability_claims.clone())
         .unwrap_or_default()
+}
+
+/// Enumerate the real on-disk GGUF variants of `model` from the local registry,
+/// as `(relative_path, size_bytes)` pairs sorted deterministically by file name.
+///
+/// A registry record is a variant of `model` when its `relative_path`
+/// (case-insensitive) contains the model string, OR the model string contains
+/// the record's file name, OR the two suffix-match the way the per-worker model
+/// matcher does (`worker_capability_verdict`). This is the honest set of
+/// variants actually present on this fabric's disk — nothing is invented, and a
+/// model with no matching on-disk files yields an empty list. Purely a decision:
+/// no I/O, so tests drive it with synthetic registries.
+fn registry_variants_for_model(
+    reg: &decentraai_registry::ModelRegistry,
+    model: &str,
+) -> Vec<(String, u64)> {
+    let model_lower = model.to_lowercase();
+    let mut variants: Vec<(String, u64)> = reg
+        .models
+        .values()
+        .filter(|r| {
+            let f = r.relative_path.to_lowercase();
+            f.contains(&model_lower)
+                || model_lower.contains(&f)
+                || f.ends_with(&model_lower)
+                || model_lower.ends_with(&f)
+        })
+        .map(|r| (r.relative_path.clone(), r.size_bytes))
+        .collect();
+    variants.sort_by(|a, b| a.0.cmp(&b.0));
+    variants
 }
 
 /// Persist the Hub's authoritative capability claims for a freshly pulled
@@ -2727,6 +2803,12 @@ async fn mcp_handler(
     if let Some((model, capability, evidence)) = crate::mcp::worker_capability_request(&raw) {
         ctx.worker_capability = mcp_worker_capability(&state, &model, &capability, &evidence).await;
     }
+    // A `resolve_intent` call maps a natural-language intent to capabilities
+    // (pure, deterministic) and cross-references the fabric model list's
+    // persisted claims. Read-only; no execution.
+    if let Some((intent, evidence)) = crate::mcp::intent_request(&raw) {
+        ctx.intent_resolution = crate::mcp::resolve_intent(&ctx, &intent, &evidence);
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -2808,6 +2890,9 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         capability_search: serde_json::json!({ "matched": 0, "models": [] }),
         local_capability_search: serde_json::json!({ "matched": 0, "models": [] }),
         worker_capability: serde_json::json!({ "model": "", "worker_count": 0, "workers": [] }),
+        // Empty until the intent resolution is wired in the MCP handler; an
+        // honest no-op rather than a fabricated resolution.
+        intent_resolution: serde_json::json!({}),
     }
 }
 
@@ -6566,6 +6651,124 @@ mod tests {
             },
         );
         assert!(claims_for_file_name(&bare, "codestral.gguf").is_empty());
+    }
+
+    #[test]
+    fn registry_variants_for_model_matches_and_sorts_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        let mut record = |relative_path: &str, size: u64| {
+            registry.models.insert(
+                relative_path.to_string(),
+                decentraai_registry::ModelRecord {
+                    relative_path: relative_path.to_string(),
+                    canonical_path: format!("/models/{relative_path}"),
+                    size_bytes: size,
+                    modification_time: 0,
+                    extension: "gguf".to_string(),
+                    capability_claims: Vec::new(),
+                },
+            );
+        };
+        // Real variants of `qwen2.5-7b-instruct`.
+        record("qwen2.5-7b-instruct/qwen2.5-7b-instruct-q4_k_m.gguf", 100);
+        record("qwen2.5-7b-instruct/qwen2.5-7b-instruct-q8_0.gguf", 200);
+        record("qwen2.5-7b-instruct/qwen2.5-7b-instruct-fp16.gguf", 400);
+        // An unrelated model must NOT match.
+        record("codestral/codestral.gguf", 50);
+
+        let variants = registry_variants_for_model(&registry, "qwen2.5-7b-instruct");
+        // Only the three qwen variants, sorted by file name asc, with sizes.
+        let files: Vec<&str> = variants.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "qwen2.5-7b-instruct/qwen2.5-7b-instruct-fp16.gguf",
+                "qwen2.5-7b-instruct/qwen2.5-7b-instruct-q4_k_m.gguf",
+                "qwen2.5-7b-instruct/qwen2.5-7b-instruct-q8_0.gguf",
+            ]
+        );
+        assert_eq!(variants[0].1, 400);
+        assert_eq!(variants[1].1, 100);
+        assert_eq!(variants[2].1, 200);
+
+        // Model string contains the record's file name -> still matches.
+        let by_suffix = registry_variants_for_model(&registry, "q4_k_m.gguf");
+        assert_eq!(by_suffix.len(), 1);
+        assert_eq!(by_suffix[0].0, "qwen2.5-7b-instruct/qwen2.5-7b-instruct-q4_k_m.gguf");
+
+        // No records for an absent model -> empty, never invented.
+        assert!(registry_variants_for_model(&registry, "does-not-exist").is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_worker_capability_variants_enumerates_on_disk_files() {
+        // A registry on disk holds two real variants; the projection's
+        // `variants` array must enumerate exactly those two files with their
+        // size, inferred quantization and an honest per-variant fit (no workers
+        // -> UNKNOWN via the existing aggregate, never fabricated).
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(models_dir).unwrap();
+        registry.models.insert(
+            "qwen/qwen2.5-7b-instruct-q4_k_m.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "qwen/qwen2.5-7b-instruct-q4_k_m.gguf".to_string(),
+                canonical_path: "x".to_string(),
+                size_bytes: 1234,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: Vec::new(),
+            },
+        );
+        registry.models.insert(
+            "qwen/qwen2.5-7b-instruct-q8_0.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "qwen/qwen2.5-7b-instruct-q8_0.gguf".to_string(),
+                canonical_path: "y".to_string(),
+                size_bytes: 5678,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: Vec::new(),
+            },
+        );
+        registry.save(&registry_path).unwrap();
+
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+
+        let body = mcp_worker_capability(&state, "qwen2.5-7b-instruct", "ocr", "any").await;
+        let variants = body["variants"].as_array().expect("variants array present");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["file"], "qwen/qwen2.5-7b-instruct-q4_k_m.gguf");
+        assert_eq!(variants[0]["quantization"], "Q4");
+        assert_eq!(variants[0]["size_bytes"], 1234);
+        assert_eq!(variants[1]["file"], "qwen/qwen2.5-7b-instruct-q8_0.gguf");
+        assert_eq!(variants[1]["quantization"], "Q8");
+        assert_eq!(variants[1]["size_bytes"], 5678);
+        // No workers -> honest UNKNOWN fit (counts 0/0/0), not a pass.
+        for v in variants {
+            assert_eq!(v["fit"]["verdict"], "UNKNOWN");
+            assert_eq!(v["fit"]["counts"]["can_run"], 0);
+        }
+        // Existing top-level fields are preserved (additive).
+        assert_eq!(body["model"], "qwen2.5-7b-instruct");
+        assert_eq!(body["fit"]["verdict"], "UNKNOWN");
+        assert!(body["workers"].as_array().unwrap().is_empty());
+        assert_eq!(body["worker_count"], 0);
     }
 
     #[test]

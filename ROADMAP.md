@@ -1004,3 +1004,33 @@ deployable VARIANT. The unified fabric fit now carries honest variant metadata.
   confirmed already rendered.
 - [x] Tests: quantization classifier (10 cases incl. case-insensitivity and
   no-marker → None) + verdict carries inferred quantization (null path + Q4).
+
+## 34. Next-Gen Phase D/L — Variant Fit, Intent Resolver, Registry Capability Query
+
+Three parallel, additive capabilities completing the fabric-fit + intent
+foundations (GitHub-safe, no execution).
+
+**Per-variant fabric fit**
+- [x] `registry_variants_for_model` — enumerates the REAL on-disk GGUF variants
+  from the local registry (never invented), sorted deterministically.
+- [x] `/v1/can_run` + MCP `get_worker_capability` return a `variants` array:
+  per variant `file`, `quantization` (INFERRED), `size_bytes`, and a `fit`
+  block (same per-worker pipeline → aggregate). Existing fields unchanged.
+
+**Intent resolver (Phase L first step)**
+- [x] `crates/hub/src/intent.rs` — pure, deterministic intent→capability mapping
+  (keyword lexicon, INFERRED, dedup, no opaque scoring). `capabilities_for_intent`
+  and `intent_requirements`.
+- [x] MCP `resolve_intent` read-only tool + pure `resolve_intent(ctx, intent,
+  evidence)` that cross-references the fabric model list's persisted claims:
+  matched capabilities w/ models, unmatched capabilities, honest `note`. Wired
+  into the HTTP handler.
+- [x] Tests: hub intent mapping (all required cases), MCP arg parsing + matched/
+  unmatched/unknown behavior.
+
+**Registry capability query**
+- [x] `ModelRegistry::models_with_capability(capability, require_verified)` and
+  `models_with_any_claim` — pure, authoritative local queries (provenance
+  preserved, case-insensitive, deterministic sort; no-claim models never
+  returned). Tests across verified gating / no-match / case-insensitivity /
+  sorting.

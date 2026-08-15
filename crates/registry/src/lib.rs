@@ -219,6 +219,52 @@ impl ModelRegistry {
         Ok(true)
     }
 
+    /// Authoritative local capability query: every `(relative_path, capability,
+    /// provenance)` for each model whose `capability_claims` contains a claim
+    /// whose `capability` matches `capability` (case-insensitive). When
+    /// `require_verified` is true only claims with provenance exactly
+    /// "verified" (case-insensitive) qualify; when false, "verified" OR
+    /// "inferred" qualify. Provenance is preserved so callers can distinguish
+    /// verified from inferred. A model with no matching claim is never returned
+    /// (honest: UNKNOWN is absent). Sorted deterministically by `relative_path`
+    /// ascending.
+    pub fn models_with_capability(
+        &self,
+        capability: &str,
+        require_verified: bool,
+    ) -> Vec<(&str, &str, &str)> {
+        let want = capability.to_lowercase();
+        let mut results = Vec::new();
+        for model in self.models.values() {
+            for claim in &model.capability_claims {
+                if claim.capability.to_lowercase() != want {
+                    continue;
+                }
+                let is_verified = claim.provenance.eq_ignore_ascii_case("verified");
+                if require_verified && !is_verified {
+                    continue;
+                }
+                results.push((model.relative_path.as_str(), claim.capability.as_str(), claim.provenance.as_str()));
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(b.0));
+        results
+    }
+
+    /// Returns `(relative_path, claim_count)` for every model that has at least
+    /// one capability claim, sorted by `relative_path` ascending. Useful for a
+    /// "what capabilities are known locally" overview.
+    pub fn models_with_any_claim(&self) -> Vec<(&str, usize)> {
+        let mut results: Vec<(&str, usize)> = self
+            .models
+            .values()
+            .filter(|m| !m.capability_claims.is_empty())
+            .map(|m| (m.relative_path.as_str(), m.capability_claims.len()))
+            .collect();
+        results.sort_by(|a, b| a.0.cmp(b.0));
+        results
+    }
+
     /// Removes a model from the registry and deletes the underlying file.
     ///
     /// Security: the caller must supply a relative path — any attempt to
@@ -526,5 +572,119 @@ mod tests {
 
         let missing = registry.get_model("nonexistent.gguf");
         assert!(missing.is_none());
+    }
+
+    /// Builds a synthetic registry with three `.gguf` models and heterogeneous
+    /// claims: `a.gguf` has a verified "ocr" + inferred "coding"; `m.gguf` has
+    /// only an inferred "ocr"; `z.gguf` has no claims at all.
+    fn claims_fixture() -> (TempDir, ModelRegistry) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ModelRegistry::new(temp_dir.path().to_path_buf()).unwrap();
+        create_test_file(temp_dir.path(), "a.gguf", b"a");
+        create_test_file(temp_dir.path(), "m.gguf", b"m");
+        create_test_file(temp_dir.path(), "z.gguf", b"z");
+        registry.scan_directory(temp_dir.path()).unwrap();
+        registry
+            .set_capability_claims(
+                "a.gguf",
+                vec![
+                    CapabilityClaimRecord {
+                        capability: "ocr".into(),
+                        provenance: "verified".into(),
+                    },
+                    CapabilityClaimRecord {
+                        capability: "coding".into(),
+                        provenance: "inferred".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        registry
+            .set_capability_claims(
+                "m.gguf",
+                vec![CapabilityClaimRecord {
+                    capability: "ocr".into(),
+                    provenance: "inferred".into(),
+                }],
+            )
+            .unwrap();
+        (temp_dir, registry)
+    }
+
+    #[test]
+    fn test_models_with_capability_verified_gating() {
+        let (_dir, registry) = claims_fixture();
+
+        // require_verified=true: only a.gguf's verified "ocr" claim qualifies.
+        let results = registry.models_with_capability("ocr", true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("a.gguf", "ocr", "verified"));
+
+        // require_verified=false: verified AND inferred both qualify; sorted.
+        let results = registry.models_with_capability("ocr", false);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], ("a.gguf", "ocr", "verified"));
+        assert_eq!(results[1], ("m.gguf", "ocr", "inferred"));
+
+        // Provenance is preserved, never flattened.
+        let provenances: Vec<_> = results.iter().map(|r| r.2).collect();
+        assert!(provenances.contains(&"verified"));
+        assert!(provenances.contains(&"inferred"));
+    }
+
+    #[test]
+    fn test_models_with_capability_no_match_absent() {
+        let (_dir, registry) = claims_fixture();
+
+        // "vision" is claimed by no model -> empty regardless of gating.
+        assert!(registry.models_with_capability("vision", true).is_empty());
+        assert!(registry.models_with_capability("vision", false).is_empty());
+
+        // "coding" is only inferred on a.gguf -> empty when require_verified.
+        assert!(registry.models_with_capability("coding", true).is_empty());
+        let results = registry.models_with_capability("coding", false);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("a.gguf", "coding", "inferred"));
+
+        // z.gguf has no claims at all -> never returned.
+        assert!(registry
+            .models_with_capability("ocr", false)
+            .iter()
+            .all(|r| r.0 != "z.gguf"));
+    }
+
+    #[test]
+    fn test_models_with_capability_case_insensitive() {
+        let (_dir, registry) = claims_fixture();
+
+        // Query "OCR" matches the claim capability "ocr".
+        let results = registry.models_with_capability("OCR", false);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, "ocr");
+        assert_eq!(results[1].1, "ocr");
+    }
+
+    #[test]
+    fn test_models_with_capability_sorted_by_relative_path() {
+        let (_dir, registry) = claims_fixture();
+
+        // Multiple qualifying models are ordered by relative_path ascending.
+        let results = registry.models_with_capability("ocr", false);
+        let paths: Vec<_> = results.iter().map(|r| r.0).collect();
+        assert_eq!(paths, vec!["a.gguf", "m.gguf"]);
+    }
+
+    #[test]
+    fn test_models_with_any_claim() {
+        let (_dir, registry) = claims_fixture();
+
+        // Only models with claims appear, with correct counts, sorted.
+        let results = registry.models_with_any_claim();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], ("a.gguf", 2));
+        assert_eq!(results[1], ("m.gguf", 1));
+
+        // z.gguf (no claims) is absent.
+        assert!(results.iter().all(|r| r.0 != "z.gguf"));
     }
 }
