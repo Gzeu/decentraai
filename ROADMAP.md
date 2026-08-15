@@ -1333,3 +1333,11 @@ The operator can now run a decided intent on the fabric from the dashboard.
   reserves a worker) now requires the MASTER token, not just an operator role.
   The MCP handler gates read-only tools at operator/admin, but a mutating tool
   must be admin-only (an operator may decide; only admin may execute).
+
+## 53. Next-Gen — MEASURE + HISTORY feedback in execute
+
+- [x] `/v1/execute` success (non-streaming) now returns a `measure` block
+  (real tokens_used, latency_ms, derived tokens_per_sec, provenance MEASURED —
+  from the actual router response) and the `historical` stats updated after the
+  run (UNKNOWN when no compute manager). Completes the
+  execute → measure → history loop with real, not fabricated, numbers.

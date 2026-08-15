@@ -1564,15 +1564,34 @@ async fn run_execute_decision(
     let started = std::time::Instant::now();
     match distributed.route_request(request).await {
         Ok(resp) => {
+            let elapsed = started.elapsed();
             state.record_inference(
                 "/v1/execute",
-                started.elapsed(),
+                elapsed,
                 format!(
                     "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
                     resp.tokens_used
                 )
                 .as_bytes(),
             );
+            // MEASURE + HISTORY steps: real measured tokens/time/tps, plus the
+            // updated historical stats from the execution the router just
+            // recorded (UNKNOWN when no compute manager).
+            let measured = {
+                let secs = (elapsed.as_millis().max(1) as f64) / 1000.0;
+                let tps = (f64::from(resp.tokens_used) / secs).round();
+                serde_json::json!({
+                    "tokens_used": resp.tokens_used,
+                    "latency_ms": elapsed.as_millis() as u64,
+                    "tokens_per_sec": if resp.tokens_used > 0 { tps } else { 0.0 },
+                    "provenance": "MEASURED",
+                })
+            };
+            let historical = state
+                .compute
+                .as_ref()
+                .map(|cm| decentraai_distributed::execution_statistics(&cm.executions()))
+                .unwrap_or_else(|| serde_json::json!({ "records": 0 }));
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -1586,6 +1605,8 @@ async fn run_execute_decision(
                         "processing_time_ms": resp.processing_time_ms,
                         "worker": resp.worker_peer_id.to_string(),
                     },
+                    "measure": measured,
+                    "historical": historical,
                 })
                 .to_string(),
             )
