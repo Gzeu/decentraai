@@ -1062,3 +1062,30 @@ Three parallel, additive capabilities closing the intent + Digital Twin loop
   "CAN I RUN THIS? — on-disk variants (fabric)" block that calls `/v1/can_run`
   and renders the real `variants` array (file, quantization, size, per-variant
   fit) with per-worker blockers.
+
+## 36. Next-Gen Phase L/D — Intent→Fit Closed Loop, Variant Comparison, Verdict UI
+
+Three parallel additions closing the Intent Planner loop and completing the
+variant/verdict UI (GitHub-safe, no execution).
+
+**Intent → capability → fabric fit (Intent Planner loop closed)**
+- [x] `resolve_intent_with_fit` MCP tool + pure extractor `intent_fit_request`
+  and dispatch. HTTP layer precomputes it via `mcp_intent_with_fit`: resolves
+  the intent deterministically to capabilities, finds a real local model with a
+  persisted claim per capability, and evaluates it against the fabric through
+  the SAME per-worker verdict + aggregate pipeline. A capability with no local
+  model reports honest UNKNOWN with an explicit reason.
+- [x] Tests: composed flow (OCR → real model → UNKNOWN fit with no workers;
+  coding → no local model → UNKNOWN reason; unknown intent → empty), tool def +
+  extractor + dispatch.
+
+**Variant comparison (Phase D)**
+- [x] Dashboard Models view gains a "Variant comparison" card: input + capability
+  select + button that renders `/v1/can_run` `variants` side-by-side, sorted
+  deterministically (CAN_RUN → CANNOT_RUN → UNKNOWN, then by file). Empty →
+  honest empty message; error → error message.
+
+**Execution verdict UI**
+- [x] `renderDecisions` confirmed already renders the `capability_requirement`
+  badge (cap ✓/✗ + required capability + evidence) consistently on every
+  decision card that carries one.

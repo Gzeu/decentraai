@@ -567,6 +567,18 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           </div>
           <div id="cir-result" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
         </div>
+        <!-- Variant comparison: which on-disk variant of a model fits THIS
+             fabric best, side-by-side, from the real /v1/can_run variants
+             projection. Never invents variants/sizes/fits/node identities. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Variant comparison <span class="count">which on-disk variant fits THIS fabric best</span></h2>
+          <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="vc-model" class="mono" placeholder="model file (e.g. qwen2.5-7b-instruct-q4_k_m.gguf)" style="min-width:240px;padding:4px 6px;font-size:12px">
+            <select id="vc-cap" class="mono" style="font-size:11px;padding:4px 4px"></select>
+            <button class="btn small" onclick="variantCompare()">compare variants</button>
+          </div>
+          <div id="variant-compare" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+        </div>
         <div class="card" style="margin-top:14px">
           <h2>Capability overview <span class="count">local, on-disk</span></h2>
           <div id="cap-overview" style="margin-top:6px;font-size:12px;color:var(--muted)"><span class="muted">loading…</span></div>
@@ -2294,6 +2306,63 @@ async function loadVariantFit(){
       reasons + chosen +
       (v.workers && v.workers.length ? '<div style="margin-top:6px"><b style="font-size:11px">per worker</b>'+perWorker+'</div>' : '')+
       (!v.workers || !v.workers.length ? '<div class="mono" style="font-size:11px;color:var(--faint)">no workers on the fabric</div>' : '')+
+    '</div>';
+  }).join('');
+}
+// Variant comparison (Models view): answers "which on-disk variant should I
+// deploy on THIS fabric?" by listing every real on-disk variant of a model
+// with its per-variant fabric verdict, best-fit first. Everything rendered
+// comes from the real /v1/can_run projection — never fabricated.
+// Deterministic sort: verdict group (CAN_RUN, CANNOT_RUN, UNKNOWN), stable
+// within a group by file name.
+function sortVariantFits(variants){
+  var rank = { 'CAN_RUN': 0, 'CANNOT_RUN': 1, 'UNKNOWN': 2 };
+  return (variants || []).slice().sort(function(a, b){
+    var va = (a && a.fit && a.fit.verdict) || 'UNKNOWN';
+    var vb = (b && b.fit && b.fit.verdict) || 'UNKNOWN';
+    var ra = rank[va] !== undefined ? rank[va] : 2;
+    var rb = rank[vb] !== undefined ? rank[vb] : 2;
+    if (ra !== rb) return ra - rb;
+    return String(a && a.file || '').localeCompare(String(b && b.file || ''));
+  });
+}
+async function variantCompare(){
+  var modelInput = $('vc-model');
+  if (modelInput && !modelInput.value) {
+    var cir = $('cir-model');
+    if (cir && cir.value) modelInput.value = cir.value.trim();
+  }
+  var capSel = $('vc-cap');
+  if (capSel && capSel.options.length === 0) {
+    var known = ['ocr','vision','coding','summarization','translation','embeddings','tool_calling','structured_output','reasoning','speech_to_text','text_to_speech','image_generation','classification','multimodal'];
+    known.forEach(function(k){ var o = document.createElement('option'); o.value = k; o.textContent = k; capSel.appendChild(o); });
+  }
+  var model = (modelInput ? modelInput.value : '').trim();
+  var cap = (capSel || {}).value || '';
+  var con = $('variant-compare');
+  if (!model) { toast('enter a model file to compare', true); return; }
+  if (!con) return;
+  con.innerHTML = '<span class="mono" style="font-size:11px;color:var(--faint)">checking variants for '+esc(model)+'…</span>';
+  const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(model)+'&capability='+encodeURIComponent(cap)+'&evidence=any', { headers });
+  if (!ok) { con.innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
+  var variants = sortVariantFits(j && j.variants);
+  if (!variants.length) { con.innerHTML = '<span class="mono" style="font-size:11px;color:var(--muted)">no on-disk variants on this fabric for '+esc(model)+'</span>'; return; }
+  con.innerHTML = variants.map(function(v){
+    var q = v.quantization || '—';
+    var size = v.size_bytes ? fmtMB(v.size_bytes / 1048576) : '—';
+    var fit = (v.fit || {});
+    var badge = fit.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN_RUN</span>'
+      : fit.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT_RUN</span>'
+      : '<span class="badge warn">UNKNOWN</span>';
+    var counts = fit.counts || {};
+    var chosen = fit.chosen_worker ? ' · chosen worker: <code>'+esc(short(fit.chosen_worker, 16))+'</code>' : '';
+    return '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px">'+
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+        '<span class="mono" style="font-size:11.5px">'+esc(v.file||'')+'</span> '+badge+
+        ' <span class="mono" style="font-size:11px;color:var(--muted)">'+esc(q)+' · '+size+'</span>'+
+        ' <span class="mono" style="font-size:11px;color:var(--faint)">'+counts.can_run+' can / '+counts.cannot_run+' cannot / '+counts.unknown+' unknown</span>'+
+        chosen+
+      '</div>'+
     '</div>';
   }).join('');
 }

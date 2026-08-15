@@ -56,6 +56,10 @@ pub struct McpContext {
     /// local-model resolution. Precomputed by the HTTP layer via the pure
     /// [`resolve_intent`] helper; empty until wired.
     pub intent_resolution: Value,
+    /// Result of `resolve_intent_with_fit`: intent → capabilities → per-model
+    /// fabric fit (CAN I RUN THIS?). Precomputed by the HTTP layer; the
+    /// protocol layer only translates. Empty until wired.
+    pub intent_fit: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -179,6 +183,26 @@ fn all_tools() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "resolve_intent_with_fit",
+            description: "Turn a natural-language intent into the capability set it points at, then evaluate EACH capability against the fabric: which real local models back it and which fabric workers can actually RUN it (per-worker fit verdict, e.g. CAN_RUN / CANNOT_RUN / UNKNOWN). Intent→capability is INFERRED from keywords; every model/worker verdict is real, computed from live fabric state — the tool never claims a model can do something it has no claim for, nor that a worker can run what it cannot. Read-only; never triggers execution or reservations. Unknown intent resolves to empty capabilities.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "A natural-language intent, e.g. 'I need OCR and summarization'.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "enum": ["any", "verified"],
+                        "description": "'verified' keeps only models/workers with VERIFIED support; 'any' (default) also includes inferred ones.",
+                    },
+                },
+                "required": ["intent"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -290,6 +314,37 @@ pub fn intent_request(raw: &str) -> Option<(String, String)> {
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())?;
     if name != "resolve_intent" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let intent = args.get("intent").and_then(|c| c.as_str())?.to_string();
+    if intent.is_empty() {
+        return None;
+    }
+    let evidence = args
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "any".to_string());
+    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    Some((intent, evidence))
+}
+
+/// Extract the parameters of a `resolve_intent_with_fit` call, if the incoming
+/// message is one. Pure — lets the HTTP layer precompute the per-model fabric
+/// fit into [`McpContext::intent_fit`]. Returns `(intent, evidence)` where
+/// evidence defaults to "any". Identical to [`intent_request`] but matches the
+/// `resolve_intent_with_fit` tool name.
+pub fn intent_fit_request(raw: &str) -> Option<(String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "resolve_intent_with_fit" {
         return None;
     }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
@@ -455,6 +510,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "find_local_models_by_capability" => &ctx.local_capability_search,
         "get_worker_capability" => &ctx.worker_capability,
         "resolve_intent" => &ctx.intent_resolution,
+        "resolve_intent_with_fit" => &ctx.intent_fit,
         _ => return None,
     };
     Some(json!({
@@ -488,6 +544,7 @@ mod tests {
             local_capability_search: json!({ "matched": 1, "models": [{ "id": "local.gguf", "evidence": "verified" }] }),
             worker_capability: json!({ "model": "m", "capability": "ocr", "fit": { "verdict": "CAN_RUN", "counts": { "can_run": 1 } }, "workers": [{ "worker": { "node_id": "w1" }, "verdict": "CAN_RUN" }] }),
             intent_resolution: json!({}),
+            intent_fit: json!({ "intent": "i", "capabilities": [] }),
         }
     }
 
@@ -772,5 +829,60 @@ mod tests {
             .unwrap();
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("ocr"));
+    }
+
+    #[test]
+    fn tools_list_exposes_resolve_intent_with_fit() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let fit = tools.iter().find(|t| t["name"] == "resolve_intent_with_fit").unwrap();
+        assert!(fit["inputSchema"].is_object());
+        assert!(fit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|req| req == "intent"));
+        assert!(fit["inputSchema"]["additionalProperties"] == json!(false));
+        assert!(fit["description"]
+            .as_str()
+            .unwrap()
+            .contains("capabilities"));
+    }
+
+    #[test]
+    fn intent_fit_request_parses_args_and_defaults_evidence() {
+        let (intent, ev) = intent_fit_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_intent_with_fit","arguments":{"intent":"I need OCR and summarization"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(intent, "I need OCR and summarization");
+        assert_eq!(ev, "any");
+        // Explicit verified honored; non-matching method -> None.
+        let (_, ev) = intent_fit_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_intent_with_fit","arguments":{"intent":"chat","evidence":"verified"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ev, "verified");
+        assert!(intent_fit_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+        // A resolve_intent (no _with_fit) call is not matched by this extractor.
+        assert!(intent_fit_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_intent","arguments":{"intent":"chat"}}}"#).is_none());
+    }
+
+    #[test]
+    fn resolve_intent_with_fit_returns_precomputed_snapshot() {
+        // The protocol layer returns the HTTP-precomputed fabric-fit snapshot
+        // unchanged; it does not resolve intent itself.
+        let mut c = ctx();
+        c.intent_fit = json!({
+            "intent": "ocr and summarization",
+            "capabilities": [
+                { "capability": "ocr", "fit": { "verdict": "CAN_RUN" } },
+            ],
+        });
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"resolve_intent_with_fit","arguments":{"intent":"ocr and summarization"}}}"#)
+            .unwrap();
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("ocr and summarization"));
+        assert!(content.contains("\"verdict\":\"CAN_RUN\""));
     }
 }

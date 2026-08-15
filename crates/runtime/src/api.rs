@@ -967,6 +967,83 @@ async fn mcp_worker_capability(
     })
 }
 
+/// Composed intent → capability → fabric-fit resolution for the MCP
+/// `resolve_intent_with_fit` tool. Closes the Intent Planner loop: a
+/// natural-language intent maps (deterministically) to capabilities, and for
+/// each capability a real matching local model is found from the persisted
+/// registry claims, then evaluated against the fabric via the SAME per-worker
+/// verdict + aggregate pipeline. Read-only; never triggers execution.
+///
+/// Honest by construction: a capability with no matching local model reports
+/// fit = UNKNOWN ("no local model"); a capability that resolves to a model with
+/// no workers also reports UNKNOWN via the aggregate. Nothing is fabricated.
+async fn mcp_intent_with_fit(
+    state: &ApiState,
+    intent: &str,
+    evidence: &str,
+) -> serde_json::Value {
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
+    let require_verified = evidence == "verified";
+
+    let capabilities = decentraai_hub::intent::capabilities_for_intent(intent);
+
+    let mut capabilities_out = Vec::new();
+    for cap in capabilities {
+        let cap_str = serde_json::to_string(&cap)
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        // Find a real local model with a persisted claim for this capability.
+        let mut candidate: Option<(String, String)> = None; // (file, provenance)
+        if let Some(reg) = &registry {
+            if let Some(m) = reg.models_with_capability(&cap_str, require_verified).into_iter().next() {
+                candidate = Some((m.0.to_string(), m.2.to_string()));
+            }
+        }
+
+        let (fit_json, model_used) = match candidate {
+            Some((file, prov)) => {
+                let claims = vec![(cap_str.clone(), prov)];
+                let mut results = Vec::new();
+                if let Some(cm) = &state.compute {
+                    for adv in cm.workers().await {
+                        let trusted = cm.is_trusted(&adv.peer_id).await;
+                        results.push(worker_capability_verdict(
+                            &adv, trusted, &file, &cap_str, evidence, &claims,
+                        ));
+                    }
+                }
+                let fit = aggregate_can_i_run(&results);
+                (fit.to_json(), Some(file))
+            }
+            None => (
+                serde_json::json!({
+                    "verdict": "UNKNOWN",
+                    "counts": { "can_run": 0, "cannot_run": 0, "unknown": 0 },
+                    "chosen_worker": null,
+                    "reasons": ["no local model with a claim for this capability"],
+                }),
+                None,
+            ),
+        };
+
+        capabilities_out.push(serde_json::json!({
+            "capability": cap_str,
+            "label": cap.label(),
+            "evidence": if require_verified { "verified" } else { "any" },
+            "model": model_used,
+            "fit": fit_json,
+        }));
+    }
+
+    serde_json::json!({
+        "intent": intent,
+        "capabilities": capabilities_out,
+        "note": "intent-to-capability is INFERRED from keywords; fit reflects real local models + fabric state.",
+    })
+}
+
 /// Refresh the local registry after a model pull. Pure-ish (filesystem only,
 /// no network): scans the models dir and saves the registry atomically.
 fn refresh_registry_after_pull(
@@ -2810,6 +2887,11 @@ async fn mcp_handler(
     if let Some((intent, evidence)) = crate::mcp::intent_request(&raw) {
         ctx.intent_resolution = crate::mcp::resolve_intent(&ctx, &intent, &evidence);
     }
+    // A `resolve_intent_with_fit` call additionally evaluates each resolved
+    // capability against the fabric (real local models + worker fit).
+    if let Some((intent, evidence)) = crate::mcp::intent_fit_request(&raw) {
+        ctx.intent_fit = mcp_intent_with_fit(&state, &intent, &evidence).await;
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -2894,6 +2976,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         // Empty until the intent resolution is wired in the MCP handler; an
         // honest no-op rather than a fabricated resolution.
         intent_resolution: serde_json::json!({}),
+        intent_fit: serde_json::json!({}),
     }
 }
 
@@ -6806,6 +6889,70 @@ mod tests {
         assert_eq!(body["fit"]["verdict"], "UNKNOWN");
         assert!(body["workers"].as_array().unwrap().is_empty());
         assert_eq!(body["worker_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_intent_with_fit_resolves_capabilities_and_reports_honest_fit() {
+        // Composed intent -> capability -> fabric fit. A registry holds a model
+        // with a verified OCR claim; intent "I need OCR and coding" resolves to
+        // [Ocr, Coding]; OCR has a real local model (fit via the aggregate, no
+        // workers -> honest UNKNOWN), Coding has no local model -> UNKNOWN with
+        // an explicit reason.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let mut registry = decentraai_registry::ModelRegistry::new(models_dir).unwrap();
+        registry.models.insert(
+            "qwen.gguf".to_string(),
+            decentraai_registry::ModelRecord {
+                relative_path: "qwen.gguf".to_string(),
+                canonical_path: "x".to_string(),
+                size_bytes: 1,
+                modification_time: 0,
+                extension: "gguf".to_string(),
+                capability_claims: vec![decentraai_registry::CapabilityClaimRecord {
+                    capability: "ocr".to_string(),
+                    provenance: "verified".to_string(),
+                }],
+            },
+        );
+        registry.save(&registry_path).unwrap();
+
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+
+        let body = mcp_intent_with_fit(&state, "I need OCR and coding", "any").await;
+        let caps = body["capabilities"].as_array().expect("capabilities present");
+        assert!(!caps.is_empty(), "intent resolves to capabilities");
+
+        // Find the OCR and coding entries.
+        let ocr = caps.iter().find(|c| c["capability"] == "ocr").expect("ocr present");
+        let coding = caps.iter().find(|c| c["capability"] == "coding").expect("coding present");
+        // OCR uses the real local model; no workers -> honest UNKNOWN fit.
+        assert_eq!(ocr["model"], "qwen.gguf");
+        assert_eq!(ocr["fit"]["verdict"], "UNKNOWN");
+        // Coding has no local model -> UNKNOWN with an explicit reason.
+        assert!(coding["model"].is_null());
+        assert_eq!(coding["fit"]["verdict"], "UNKNOWN");
+        assert!(coding["fit"]["reasons"][0].as_str().unwrap().contains("no local model"));
+
+        // An intent with no recognized capability yields an empty list.
+        let body = mcp_intent_with_fit(&state, "zzz unknown words", "any").await;
+        assert!(body["capabilities"].as_array().unwrap().is_empty());
+
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     #[test]
