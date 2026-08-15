@@ -984,3 +984,23 @@ aggregation over the existing per-worker projection (no new scoring/estimator).
   blockers.
 - [x] Tests: aggregate over real verdicts (any-can-run, none-can-run, all
   unknown, no-workers-not-invented, end-to-end good+bad worker).
+
+## 33. Next-Gen Phase D — Variant-Aware CAN I RUN THIS?
+
+Model Hub 2.0 foundation: a repository is a MODEL, each GGUF file is a
+deployable VARIANT. The unified fabric fit now carries honest variant metadata.
+
+- [x] `variant_quantization_from_file_name` — pure, INFERRED-only quantization
+  classifier (Q8/Q6/Q5/Q4/Q3/Q2/FP16) from the GGUF file name; no marker →
+  `None` (UNKNOWN), never guessed or presented as VERIFIED.
+- [x] Per-worker `WorkerCapResult.quantization` (derived from the worker's
+  matched file name) surfaced in the `get_worker_capability` / `/v1/can_run`
+  per-worker JSON.
+- [x] `/v1/can_run` and the MCP tool now return a `model_info` block
+  (`quantization` + `available_workers` = real count holding the model).
+- [x] Dashboard Model card gains a "CAN I RUN THIS? (fabric)" button that calls
+  the LOCAL `/v1/can_run` (no Hub round-trip), sharing the `renderCanIRun`
+  helper with the Models view. The decisions `capability_requirement` badge
+  confirmed already rendered.
+- [x] Tests: quantization classifier (10 cases incl. case-insensitivity and
+  no-marker → None) + verdict carries inferred quantization (null path + Q4).

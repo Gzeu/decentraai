@@ -648,6 +648,13 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
               </div>
               <div id="md-fit" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
             </div>
+            <div style="margin-top:10px"><b style="font-size:12px">Can I run this? (fabric)</b>
+              <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <button class="btn small" onclick="hubCanIRunLocal()">CAN I RUN THIS? (fabric)</button>
+                <span class="mono" style="font-size:11px;color:var(--muted)">fabric-wide fit for the selected capability, from local claims (no Hub round-trip)</span>
+              </div>
+              <div id="md-cir" style="margin-top:6px;font-size:12px;color:var(--muted)"></div>
+            </div>
             <div style="margin-top:10px"><b style="font-size:12px">Variants</b>
               <table style="margin-top:6px"><thead><tr><th>File</th><th class="num">Size</th><th>SHA-256</th><th></th></tr></thead>
               <tbody id="md-variants"><tr><td colspan="4" class="empty">no variants reported</td></tr></tbody></table>
@@ -1830,7 +1837,14 @@ async function canIRun(){
   const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(model)+'&capability='+encodeURIComponent(cap)+'&evidence='+encodeURIComponent(ev), { headers });
   $('cir-note').textContent = '';
   if (!ok) { $('cir-result').innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
-  const fit = j.fit || {};
+  renderCanIRun(j, 'cir-result', model, cap);
+}
+// Shared renderer for the real /v1/can_run payload `j`. Renders the honest
+// verdict (badge + counts + chosen worker + reasons + per-worker blockers)
+// into whatever container id is passed. Used by both canIRun() and the
+// Model card's fabric fit button (hubCanIRunLocal).
+function renderCanIRun(j, containerId, model, cap){
+  const fit = (j && j.fit) || {};
   const badge = fit.verdict === 'CAN_RUN' ? '<span class="badge ok">CAN RUN</span>'
     : fit.verdict === 'CANNOT_RUN' ? '<span class="badge bad">CANNOT RUN</span>'
     : '<span class="badge warn">UNKNOWN</span>';
@@ -1848,7 +1862,9 @@ async function canIRun(){
       'model '+esc(w.model_availability||'')+' · '+(w.trusted?'<span class="badge ok">trusted</span>':'<span class="badge warn">untrusted</span>')+' · engine '+esc(w.engine||'')+
       (checks?'<ul style="margin:4px 0 0 14px;padding:0">'+checks+'</ul>':'')+'</div>';
   });
-  $('cir-result').innerHTML =
+  const con = $(containerId);
+  if (!con) return;
+  con.innerHTML =
     '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+badge+' <span class="mono">'+esc(cap)+' · '+esc(model)+'</span> '+
     '<span class="mono" style="color:var(--faint)">'+counts.can_run+' can / '+counts.cannot_run+' cannot / '+counts.unknown+' unknown</span></div>'+
     reasons + chosen +
@@ -2190,6 +2206,20 @@ async function hubCheckFit(){
     return '<div style="margin-top:3px"><span style="color:'+color+'">'+mark+'</span> <b class="mono">'+esc(c.capability)+'</b>: '+esc(c.reason||'')+'</div>';
   }).join('');
   $('md-fit').innerHTML = '<div>'+badge+' — requires <b class="mono">'+esc(fit.label||fit.capability)+'</b> (VERIFIED evidence)</div>'+checks;
+}
+// Fabric fit from LOCAL persisted claims (no Hub round-trip): asks the real
+// /v1/can_run endpoint with the selected capability against the model's repo
+// id. The backend matches by file-name suffix, so a repo id may not resolve
+// to a specific variant — we render whatever honest result it returns,
+// including "no workers on the fabric".
+async function hubCanIRunLocal(){
+  var cap = ($('md-fit-cap') || {}).value || '';
+  var model = hubFitCache || '';
+  if (!cap || !model) { toast('select a capability for the model card', true); return; }
+  $('md-cir').innerHTML = '<span class="mono" style="font-size:11px;color:var(--faint)">checking '+esc(cap)+'…</span>';
+  const { ok, status, j } = await apiFetch('/v1/can_run?model='+encodeURIComponent(model)+'&capability='+encodeURIComponent(cap)+'&evidence=any', { headers });
+  if (!ok) { $('md-cir').innerHTML = '<span class="badge warn">check failed (' + status + ')</span> ' + esc((j && j.error && j.error.message) || 'unknown'); return; }
+  renderCanIRun(j, 'md-cir', model, cap);
 }
 async function hubPullVariant(id, file){
   if (hubPulling[id+':'+file]) return;

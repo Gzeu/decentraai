@@ -897,10 +897,25 @@ async fn mcp_worker_capability(
     let fit = aggregate_can_i_run(&results);
     let workers_json: Vec<serde_json::Value> = results.iter().map(|r| r.to_json()).collect();
 
+    // Honest model metadata: quantization is INFERRED from the requested model
+    // string when it carries a recognized marker, else null (UNKNOWN);
+    // available_workers counts workers that actually hold the model (served or
+    // on-disk), derived from the real per-worker verdicts above.
+    let quantization = variant_quantization_from_file_name(model);
+    let available_workers = results
+        .iter()
+        .filter(|r| r.model_availability != "unavailable")
+        .count();
+
     serde_json::json!({
         "model": model,
         "capability": capability,
         "evidence": evidence,
+        "model_info": {
+            "model": model,
+            "quantization": quantization,
+            "available_workers": available_workers,
+        },
         "fit": fit.to_json(),
         "worker_count": workers_json.len(),
         "workers": workers_json,
@@ -1366,6 +1381,9 @@ struct WorkerCapResult {
     est_ram_mb: u64,
     est_vram_mb: u64,
     engine_compat: &'static str,
+    /// Quantization label INFERRED from the matched model file name (None =
+    /// unknown). Never VERIFIED.
+    quantization: Option<String>,
 }
 
 impl WorkerCapResult {
@@ -1383,6 +1401,7 @@ impl WorkerCapResult {
                 WorkerCapVerdict::Unknown => "UNKNOWN",
             },
             "model_availability": self.model_availability,
+            "quantization": self.quantization,
             "trusted": self.trusted,
             "engine": self.engine_compat,
             "resource_fit": {
@@ -1577,6 +1596,38 @@ fn worker_engine_compat(engine: &str, model_served: bool, model_on_disk: bool) -
 /// `model` is matched against the worker's served/available models by file
 /// name (suffix-safe). `claims` are the model's persisted capability claims
 /// (`(capability, provenance)`), `evidence` is "any" or "verified".
+/// Derive a variant's quantization label from a GGUF file name using ONLY
+/// conservative heuristics. The label is INFERRED from the file name — the file
+/// name is not authoritative metadata, so callers must never present it as
+/// VERIFIED. When no recognized quant marker is present, return `None`
+/// (UNKNOWN); never guess a quantization that isn't in the name.
+///
+/// Recognized markers (case-insensitive):
+/// - `q2_k` -> "Q2", `q3_k` -> "Q3", `q4_k_m`/`q4_0` -> "Q4"
+/// - `q5_1` -> "Q5", `q6_k` -> "Q6", `q8_0` -> "Q8"
+/// - `fp16`/`f16` -> "FP16"
+fn variant_quantization_from_file_name(file_name: &str) -> Option<String> {
+    let lower = file_name.to_lowercase();
+    if lower.contains("fp16") || lower.contains("f16") {
+        return Some("FP16".to_string());
+    }
+    // Longest markers first so e.g. `q4_k_m` is not swallowed by `q4`.
+    for (marker, label) in [
+        ("q8_0", "Q8"),
+        ("q6_k", "Q6"),
+        ("q5_1", "Q5"),
+        ("q4_k_m", "Q4"),
+        ("q4_0", "Q4"),
+        ("q3_k", "Q3"),
+        ("q2_k", "Q2"),
+    ] {
+        if lower.contains(marker) {
+            return Some(label.to_string());
+        }
+    }
+    None
+}
+
 fn worker_capability_verdict(
     adv: &decentraai_compute::ComputeAdvertisement,
     trusted: bool,
@@ -1609,6 +1660,8 @@ fn worker_capability_verdict(
     };
 
     let engine_compat = worker_engine_compat(&adv.capability.engine, served, on_disk);
+    let quantization = model_entry
+        .and_then(|m| variant_quantization_from_file_name(&m.file_name));
     let est_ram_mb = model_entry.map(|m| m.est_ram_mb).unwrap_or(0);
     let est_vram_mb = model_entry.map(|m| m.est_vram_mb).unwrap_or(0);
 
@@ -1789,6 +1842,7 @@ fn worker_capability_verdict(
         est_ram_mb,
         est_vram_mb,
         engine_compat,
+        quantization,
     }
 }
 
@@ -5983,6 +6037,62 @@ mod tests {
         assert_ne!(r.node_id, r.peer_id);
     }
 
+    // ---- variant quantization classifier (INFERRED, never VERIFIED) ----
+
+    #[test]
+    fn quantization_q4_k_m_is_q4() {
+        assert_eq!(variant_quantization_from_file_name("qwen2.5-7b-instruct-q4_k_m.gguf"), Some("Q4".to_string()));
+    }
+
+    #[test]
+    fn quantization_q8_0_is_q8() {
+        assert_eq!(variant_quantization_from_file_name("model-q8_0.gguf"), Some("Q8".to_string()));
+    }
+
+    #[test]
+    fn quantization_q6_k_is_q6() {
+        assert_eq!(variant_quantization_from_file_name("model-q6_k.gguf"), Some("Q6".to_string()));
+    }
+
+    #[test]
+    fn quantization_q5_1_is_q5() {
+        assert_eq!(variant_quantization_from_file_name("model-q5_1.gguf"), Some("Q5".to_string()));
+    }
+
+    #[test]
+    fn quantization_q3_k_is_q3() {
+        assert_eq!(variant_quantization_from_file_name("model-q3_k.gguf"), Some("Q3".to_string()));
+    }
+
+    #[test]
+    fn quantization_q2_k_is_q2() {
+        assert_eq!(variant_quantization_from_file_name("model-q2_k.gguf"), Some("Q2".to_string()));
+    }
+
+    #[test]
+    fn quantization_fp16_is_fp16() {
+        assert_eq!(variant_quantization_from_file_name("model-fp16.gguf"), Some("FP16".to_string()));
+        assert_eq!(variant_quantization_from_file_name("model-f16.gguf"), Some("FP16".to_string()));
+    }
+
+    #[test]
+    fn quantization_unknown_without_marker_is_none() {
+        assert_eq!(variant_quantization_from_file_name("model.gguf"), None);
+        assert_eq!(variant_quantization_from_file_name("qwen.gguf"), None);
+        assert_eq!(variant_quantization_from_file_name("no_quant_here.gguf"), None);
+    }
+
+    #[test]
+    fn quantization_is_case_insensitive() {
+        assert_eq!(variant_quantization_from_file_name("model-Q4_K_M.gguf"), Some("Q4".to_string()));
+        assert_eq!(variant_quantization_from_file_name("MODEL-Q8_0.gguf"), Some("Q8".to_string()));
+    }
+
+    #[test]
+    fn quantization_q4_0_is_q4() {
+        assert_eq!(variant_quantization_from_file_name("model-q4_0.gguf"), Some("Q4".to_string()));
+    }
+
     #[test]
     fn worker_cap_insufficient_ram_cannot_run() {
         let peer = decentraai_p2p::PeerId::random();
@@ -6103,6 +6213,7 @@ mod tests {
             est_ram_mb: 1024,
             est_vram_mb: 0,
             engine_compat: "compatible",
+            quantization: None,
         }
     }
 
@@ -6178,6 +6289,33 @@ mod tests {
         assert_eq!(j["verdict"], "CAN_RUN");
         assert_eq!(j["counts"]["can_run"], 1);
         assert_eq!(j["counts"]["cannot_run"], 1);
+    }
+
+    #[test]
+    fn worker_cap_verdict_carries_inferred_quantization_from_file_name() {
+        // A served file whose name carries a quant marker: the per-worker result
+        // must surface the INFERRED label in its JSON projection (and null when
+        // the name has no marker).
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        // cap_adv uses "qwen.gguf" (no marker) => quantization stays None.
+        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.quantization, None);
+        let j = r.to_json();
+        assert!(j["quantization"].is_null());
+    }
+
+    #[test]
+    fn worker_cap_verdict_quantization_from_marker_in_served_file_name() {
+        // A worker whose served model file name carries a quant marker: the
+        // per-worker result surfaces the INFERRED label in its JSON projection.
+        let peer = decentraai_p2p::PeerId::random();
+        let mut adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        adv.capability.served_models[0].file_name = "qwen2.5-7b-instruct-q4_k_m.gguf".to_string();
+        let r = worker_capability_verdict(&adv, true, "qwen2.5-7b-instruct-q4_k_m.gguf", "ocr", "any", &claims_verified_ocr());
+        assert_eq!(r.quantization.as_deref(), Some("Q4"));
+        let j = r.to_json();
+        assert_eq!(j["quantization"], "Q4");
     }
 
     #[tokio::test]
