@@ -1645,3 +1645,10 @@ new identity/token/trust/auth/discovery system.
   (`capacity`).
 - [x] Test: evidence-backed FULL/LIMITED/UNAVAILABLE from real availability.
   No planner-scoring change (no authoritative worker capacity model yet).
+
+## 81. Next-Gen — Capacity badge in the UI
+
+- [x] Fabric graph card shows each node's `capacity` badge (FULL ok / LIMITED
+  warn / UNAVAILABLE bad) from the real `capacity` field, plus a small
+  "capacity: FULL / LIMITED / UNAVAILABLE" legend when any node reports it.
+  Absent → nothing rendered. Real state only.

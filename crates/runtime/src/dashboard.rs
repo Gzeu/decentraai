@@ -2965,6 +2965,7 @@ function renderFabricGraph(f){
   $('fabric-g-models').textContent = models.length;
   $('fabric-g-caps').textContent = caps.length;
   $('fabric-g-execs').textContent = execs.length;
+  const capAny = nodes.some(n => n.capacity !== undefined);
   const nodeHtml = nodes.map(n => {
     // Version-consistency badges derive ONLY from the real version_status field:
     // CURRENT -> ok, OUTDATED -> warn, UNKNOWN -> faint, absent -> nothing.
@@ -2978,12 +2979,18 @@ function renderFabricGraph(f){
          : n.lifecycle === 'ONLINE' ? ' <span class="badge ok">online</span>'
          : ' <span class="badge faint">'+esc(n.lifecycle.toLowerCase())+'</span>')
       : '';
+    // Capacity badge from the REAL n.capacity field when present (evidence-backed,
+    // adaptive-contribution capacity). FULL ok, LIMITED warn, UNAVAILABLE bad,
+    // absent -> nothing. Never fabricated.
+    const capBadge = n.capacity === 'FULL' ? ' <span class="badge ok">FULL</span>'
+      : n.capacity === 'LIMITED' ? ' <span class="badge warn">LIMITED</span>'
+      : n.capacity === 'UNAVAILABLE' ? ' <span class="badge bad">UNAVAILABLE</span>' : '';
     return '<div class="mono" style="font-size:11px;padding:3px 0">'+
       '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
       (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
       (n.device_class ? ' <span class="badge faint">'+esc(n.device_class)+'</span>' : '')+
       (n.node_version ? ' <span class="badge faint">v'+esc(n.node_version)+'</span>' : '')+
-      vsBadge+lcBadge+
+      vsBadge+lcBadge+capBadge+
       ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
       '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>';
   }).join('');
@@ -2999,7 +3006,7 @@ function renderFabricGraph(f){
   $('fabric-graph').innerHTML =
     (coordLine ? '<div style="margin-bottom:6px">'+coordLine+'</div>' : '')+
     '<div class="grid cols-2">'+
-      '<div><h3 style="margin:8px 0 4px">Nodes</h3>'+(nodeHtml || '<div class="empty">no nodes</div>')+'</div>'+
+      '<div><h3 style="margin:8px 0 4px">Nodes</h3>'+((nodeHtml && capAny) ? '<div class="mono" style="font-size:10px;color:var(--muted)">capacity: FULL / LIMITED / UNAVAILABLE (adaptive contribution)</div>' : '')+(nodeHtml || '<div class="empty">no nodes</div>')+'</div>'+
       '<div><h3 style="margin:8px 0 4px">Capabilities</h3>'+(capHtml || '<div class="empty">no capabilities (UNKNOWN)</div>')+'</div>'+
     '</div>';
 }
