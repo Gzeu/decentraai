@@ -229,6 +229,10 @@ pub struct ApiState {
     /// endpoint, and the proxy reads this (not the immutable `info`) when
     /// applying sampling defaults. Read-only for clients.
     runtime_generation: Arc<tokio::sync::RwLock<GenerationSection>>,
+    /// Live Model Hub pull progress: `repo -> (bytes_downloaded, total_bytes)`.
+    /// Populated while a pull is in flight; removed on completion. Read by the
+    /// dashboard pull-status endpoint for a real progress bar.
+    hub_pulls: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
     /// Subscription registry (db/tokens.json) when tiers are in use.
     token_store_path: Option<PathBuf>,
     /// Consumer API key registry (db/consumer_keys.json) for the Compute
@@ -301,6 +305,7 @@ impl ApiState {
                 .build()
                 .unwrap_or_default(),
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
+            hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
             info,
             token_store_path,
             consumer_keys_path: None,
@@ -2437,9 +2442,27 @@ async fn admin_hub_pull_handler(
     if let Err(e) = std::fs::create_dir_all(&models_dir) {
         return forbidden(&format!("creating models dir: {e}"));
     }
-    let download = match decentraai_hub::download_model(&hf_ref, &models_dir).await {
+    // Register the pull so the dashboard can show real byte progress. The
+    // `total` is updated once the catalog reports the LFS size (the callback
+    // receives bytes downloaded; total stays 0 until we know the file size).
+    let repo_key = hf_ref.repo.clone();
+    {
+        let mut pulls = state.hub_pulls.lock().unwrap();
+        pulls.insert(repo_key.clone(), (0, 0));
+    }
+    let pulls = state.hub_pulls.clone();
+    let progress_key = repo_key.clone();
+    let progress = Box::new(move |bytes: u64| {
+        if let Ok(mut pulls) = pulls.lock() {
+            if let Some(e) = pulls.get_mut(&progress_key) {
+                e.0 = bytes;
+            }
+        }
+    });
+    let download = match decentraai_hub::download_model_with_progress(&hf_ref, &models_dir, Some(progress)).await {
         Ok(d) => d,
         Err(e) => {
+            state.hub_pulls.lock().unwrap().remove(&repo_key);
             let body = serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}});
             return (
                 StatusCode::BAD_GATEWAY,
@@ -2449,6 +2472,9 @@ async fn admin_hub_pull_handler(
                 .into_response();
         }
     };
+    // Pull completed: remove from the in-flight registry (dashboard stops
+    // polling; the final result below is authoritative).
+    state.hub_pulls.lock().unwrap().remove(&repo_key);
     // Refresh the local registry so the new model is immediately usable.
     let registry_path = state.info.repo_root.join("db/registry.json");
     if let Some(cm) = &state.compute {
@@ -2524,6 +2550,36 @@ async fn admin_hub_pull_handler(
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
+    )
+        .into_response()
+}
+
+/// Live Model Hub pull progress: `GET /api/admin/hub/pull/status` returns the
+/// in-flight pulls (repo -> bytes downloaded + total when known). Empty when
+/// no pull is running. Master-gated. The dashboard polls this while a pull is
+/// in flight to render a real byte progress bar.
+async fn admin_hub_pull_status_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let pulls = state.hub_pulls.lock().unwrap().clone();
+    let body: Vec<serde_json::Value> = pulls
+        .into_iter()
+        .map(|(repo, (bytes, total))| {
+            serde_json::json!({
+                "repo": repo,
+                "bytes_downloaded": bytes,
+                "total_bytes": if total > 0 { serde_json::json!(total) } else { serde_json::Value::Null },
+                "done": false,
+            })
+        })
+        .collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "pulls": body }).to_string(),
     )
         .into_response()
 }
@@ -4147,6 +4203,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/hub/model/{repo}", get(admin_hub_model_handler))
         .route("/api/admin/hub/compare", get(admin_hub_compare_handler))
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
+        .route("/api/admin/hub/pull/status", get(admin_hub_pull_status_handler))
         // Model removal (Issue #26): master-gated delete from registry + disk
         .route("/api/admin/models/remove", post(admin_models_remove_handler))
         .route("/api/admin/settings/generation", post(admin_settings_generation_handler))

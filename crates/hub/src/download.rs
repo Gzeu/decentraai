@@ -48,6 +48,17 @@ pub async fn download_model(
     reference: &HfRef,
     dest_dir: &Path,
 ) -> Result<DownloadedModel> {
+    download_model_with_progress(reference, dest_dir, None).await
+}
+
+/// Like [`download_model`] but reports download progress (bytes received) via
+/// `progress` when provided. The callback is invoked from the read loop; it
+/// must be cheap and non-blocking.
+pub async fn download_model_with_progress(
+    reference: &HfRef,
+    dest_dir: &Path,
+    progress: Option<Box<dyn Fn(u64) + Send + Sync>>,
+) -> Result<DownloadedModel> {
     let catalog = HubCatalog::new();
 
     let file = match &reference.file {
@@ -78,11 +89,11 @@ pub async fn download_model(
     match expected {
         Some(sha) => {
             tracing::info!(repo = %reference.repo, file = %file, "downloading verified model");
-            download_verified(&url, &dest_file, Some(&sha)).await
+            download_verified(&url, &dest_file, Some(&sha), progress).await
         }
         None => {
             tracing::warn!(repo = %reference.repo, file = %file, "no Hub SHA-256 available; downloading unverified");
-            download_verified(&url, &dest_file, None).await
+            download_verified(&url, &dest_file, None, progress).await
         }
     }
 }
@@ -96,6 +107,7 @@ pub async fn download_verified(
     url: &str,
     dest_file: &Path,
     expected_sha256: Option<&str>,
+    progress: Option<Box<dyn Fn(u64) + Send + Sync>>,
 ) -> Result<DownloadedModel> {
     let client = reqwest::Client::new();
     let mut req = client.get(url);
@@ -136,6 +148,9 @@ pub async fn download_verified(
             .await
             .with_context(|| format!("writing {}", part_path.display()))?;
         bytes += chunk.len() as u64;
+        if let Some(p) = &progress {
+            p(bytes);
+        }
     }
     file.flush()
         .await

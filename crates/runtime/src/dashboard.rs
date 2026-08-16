@@ -2883,10 +2883,27 @@ async function hubPull(id){
   if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
   const pullStarted = new Date().toLocaleTimeString();
   $('hub-status').innerHTML = '<span class="loading"><span class="spinner"></span> downloading '+esc(id)+'</span> <span class="muted">(started '+pullStarted+'; large models take a while; the node keeps serving)</span>';
+  // Live byte-progress: poll the pull-status endpoint while the download runs.
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch('/api/admin/hub/pull/status', { headers });
+      if (!r.ok) return;
+      const d = await r.json();
+      const p = (d.pulls||[]).find(x => x.repo === id || (x.repo||'').includes(id.split('/')[0]) || id.includes(x.repo||'---'));
+      if (!p) return; // pull finished (entry removed) -> stop polling
+      const bytes = p.bytes_downloaded || 0;
+      const mb = (bytes/1048576).toFixed(1);
+      const total = p.total_bytes ? ' / '+(p.total_bytes/1048576).toFixed(0)+' MiB' : '';
+      $('hub-status').innerHTML =
+        '<div class="loading"><span class="spinner"></span> downloading '+esc(id)+'</div>'+
+        '<div class="mono" style="margin-top:6px;font-size:11px;color:var(--muted)">'+mb+' MiB'+total+' downloaded</div>';
+    } catch (e) { /* transient; ignore */ }
+  }, 1500);
   const { ok, status, j } = await apiFetch('/api/admin/hub/pull', {
     method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ reference: 'hf:' + id }),
   });
+  clearInterval(poll);
   if (!ok) {
     $('hub-status').innerHTML = '<span class="badge warn">pull failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
   } else {
