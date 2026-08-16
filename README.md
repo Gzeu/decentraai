@@ -402,6 +402,14 @@ rail with a command palette (Ctrl+K):
   from config (CPU/RAM reserve, GPU policy), the generation defaults
   (sampling + system prompt) and the subscription tier policies
 
+**Settings is live-editable (master-gated).** From the dashboard you can
+change the **generation defaults** (temperature, top_p, top_k,
+repeat_penalty, system prompt) and the **resource admission limits** (CPU/RAM
+%, reserve cores/RAM/VRAM, GPU VRAM cap, temperature stop). Generation changes
+apply immediately to the next inference request; resource changes persist to
+`node.yaml` and apply on the next start (they gate startup admission). Both
+are audited and survive a restart.
+
 The page polls only the read-only status/control endpoints (`/status`,
 `/v1/peers`, `/v1/compute`, `/v1/network`, `/v1/execution`) — it never
 touches a proxied inference endpoint on its own, so watching the page
