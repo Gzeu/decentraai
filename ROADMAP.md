@@ -1488,3 +1488,10 @@ build version, so a coordinator/operator can see which fabric members are stale.
   reports its real build.
 - [x] `/v1/fabric` nodes carry `node_version` → visible next to each node's
   device_class, so you can tell desktop (old) vs laptop (new) at a glance.
+
+## 68. Next-Gen — Node version badge in the UI
+
+- [x] Fabric graph card now shows each node's `v<node_version>` badge next to
+  its `device_class`, so you can see at a glance which fabric members are stale
+  (e.g. desktop on an old build vs laptop on the new one). Empty/absent version
+  → nothing rendered (honest).

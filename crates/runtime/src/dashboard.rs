@@ -2939,6 +2939,7 @@ function renderFabricGraph(f){
       '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
       (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
       (n.device_class ? ' <span class="badge faint">'+esc(n.device_class)+'</span>' : '')+
+      (n.node_version ? ' <span class="badge faint">v'+esc(n.node_version)+'</span>' : '')+
       ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
       '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>'
   ).join('');
