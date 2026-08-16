@@ -2934,19 +2934,39 @@ function renderFabricGraph(f){
   $('fabric-g-models').textContent = models.length;
   $('fabric-g-caps').textContent = caps.length;
   $('fabric-g-execs').textContent = execs.length;
-  const nodeHtml = nodes.map(n =>
-    '<div class="mono" style="font-size:11px;padding:3px 0">'+
+  const nodeHtml = nodes.map(n => {
+    // Version-consistency badges derive ONLY from the real version_status field:
+    // CURRENT -> ok, OUTDATED -> warn, UNKNOWN -> faint, absent -> nothing.
+    const vsBadge = n.version_status === 'CURRENT' ? ' <span class="badge ok">current</span>'
+      : n.version_status === 'OUTDATED' ? ' <span class="badge warn">outdated</span>'
+      : n.version_status === 'UNKNOWN' ? ' <span class="badge faint">unknown</span>' : '';
+    // Lifecycle badge from the real lifecycle field when present; OUTDATED
+    // variants warn, ONLINE is healthy, the rest are faint. Absent -> nothing.
+    const lcBadge = n.lifecycle
+      ? (n.lifecycle.indexOf('OUTDATED') >= 0 ? ' <span class="badge warn">'+esc(n.lifecycle.toLowerCase())+'</span>'
+         : n.lifecycle === 'ONLINE' ? ' <span class="badge ok">online</span>'
+         : ' <span class="badge faint">'+esc(n.lifecycle.toLowerCase())+'</span>')
+      : '';
+    return '<div class="mono" style="font-size:11px;padding:3px 0">'+
       '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
       (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
       (n.device_class ? ' <span class="badge faint">'+esc(n.device_class)+'</span>' : '')+
       (n.node_version ? ' <span class="badge faint">v'+esc(n.node_version)+'</span>' : '')+
+      vsBadge+lcBadge+
       ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
-      '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>'
-  ).join('');
+      '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>';
+  }).join('');
   const capHtml = caps.slice(0, 8).map(c =>
     '<div class="mono" style="font-size:11px;padding:3px 0"><span class="badge accent">'+esc(c.capability)+'</span> '+c.models.length+' model(s) · '+c.nodes.length+' node(s)</div>'
   ).join('');
+  // Coordinator version + needs-update summary, real data only. Empty coordinator
+  // version renders nothing; only nodes with outdated === true are counted.
+  const coordV = (f.coordinator && f.coordinator.version) || '';
+  const outdatedCount = nodes.filter(n => n.outdated === true).length;
+  const coordLine = (coordV ? '<span class="badge accent">coordinator v'+esc(coordV)+'</span>' : '')+
+    (outdatedCount ? ' <span class="badge warn">'+outdatedCount+' node(s) need update</span>' : '');
   $('fabric-graph').innerHTML =
+    (coordLine ? '<div style="margin-bottom:6px">'+coordLine+'</div>' : '')+
     '<div class="grid cols-2">'+
       '<div><h3 style="margin:8px 0 4px">Nodes</h3>'+(nodeHtml || '<div class="empty">no nodes</div>')+'</div>'+
       '<div><h3 style="margin:8px 0 4px">Capabilities</h3>'+(capHtml || '<div class="empty">no capabilities (UNKNOWN)</div>')+'</div>'+

@@ -1513,3 +1513,10 @@ update.
   `node_version`). Mismatch is observable here (no new event system).
 - [x] Focused tests: version_status honesty; node_lifecycle only emits
   evidence-backed states.
+
+## 70. Next-Gen — Version-consistency UI
+
+- [x] Fabric graph card now shows per-node `version_status` (current/outdated/
+  unknown) and `lifecycle` badges from real backend fields, plus a coordinator
+  `v<version>` line and an honest "N node(s) need update" count (only nodes with
+  `outdated === true`; UNKNOWN nodes never counted).
