@@ -1715,3 +1715,43 @@ consumer API keys yet, no dashboard quota UI yet.
   insufficient/audit/policy-version), ComputeManager wiring (credited work earns
   quota, duplicates don't, failures don't, policy replaceable + versioned), and
   MCP `get_quota` exposure.
+
+## 84. Next-Gen — Consumer API keys (`dca_`) with quota authorization (Q2)
+
+Account-scoped consumer API keys for the [Compute Contribution & Quota
+roadmap](docs/roadmap/COMPUTE-CONTRIBUTION-AND-QUOTA.md) Q2: an access
+credential + quota ceiling that lets agents/applications consume fabric
+compute against the authoritative quota ledger. Reuses the existing `dsk_`
+auth architecture (hash-only storage, atomic persistence, revoke-by-id, roles)
+— no second authentication system, no invented economics.
+
+- [x] **ConsumerKeyStore** (`crates/tokens/src/consumer.rs`): `dca_` keys with
+  `owner_account`, `quota_ceiling`, `rate_limit_per_minute`, `scopes`.
+  Plaintext shown once; only BLAKE3 hash + short display prefix stored. Create/
+  revoke-by-id/list; corrupt registry starts fresh.
+- [x] **Account** — the consumer account is the existing `QuotaLedger`
+  `AccountId` (no parallel identity system). The ledger is `Arc`-shared between
+  `ComputeManager` (worker credits) and `ApiState` (consumer reserve/settle), so
+  provider contribution and consumer consumption are ONE authoritative balance.
+- [x] **Auth** — `Auth::Consumer` resolved in `classify` from the `dca_`
+  prefix; strictly an inference credential. `require_master` /
+  `require_operator_or_admin` reject it (a consumer key is never admin).
+- [x] **Quota authorization** — before routing, reserve
+  `min(account.available, quota_ceiling)`; settle against real measured
+  completion tokens on success; release on any other exit via a RAII guard
+  (no leak, no double-settle, no overdraw). Insufficient quota denies the
+  request (403) and is audited `consumer_quota_denied`.
+- [x] **Rate limit** — independent per-key sliding window
+  (`rate_limit_per_minute`), separate from tier/execute limits; audited
+  `consumer_rate_limited`.
+- [x] **Admin API** — `/api/admin/consumer-key/create|revoke|list`
+  (master-gated). List shows metadata + live usage + owner account balance;
+  never the secret.
+- [x] **CLI** — `decentraai consumer-key create|list|revoke`.
+- [x] **MCP** — `list_consumer_keys` read-only metadata tool (never the
+  secret); `get_quota` already covers the ledger.
+- [x] **Dashboard** — admin page Consumer API Keys card (create/list/revoke,
+  usage + account quota).
+- [x] Tests: create/auth/invalid/revoked/permission/ceiling/rate-limit/
+  reserve-settle/release-on-failure; secret never in metadata. Workspace tests,
+  clippy `-D warnings`, release build green.
