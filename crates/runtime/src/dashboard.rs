@@ -3887,5 +3887,17 @@ const populateChatModels = (s, c) => {
   }
   chatModel.value = '__auto__';
 };
+// The dashboard script is a <script type="module">: top-level function
+// declarations live in module scope, NOT on window. Inline onclick handlers
+// (onclick="hubSearch()") resolve names against window, so without this
+// explicit export every inline button would throw "hubSearch is not defined".
+// Expose exactly the functions the inline handlers reference.
+Object.assign(window, {
+  canIRun, continueSession, copyConsumerToken, decideNow, executeDecision,
+  hubCanIRunLocal, hubCheckFit, hubClearCompare, hubCloseCompare,
+  hubCloseDetail, hubCompareFit, hubCompareSelected, hubOpenDetail, hubPull,
+  hubPullVariant, hubSearch, loadVariantFit, openGenEdit, openResEdit,
+  previewDecision, removeModel, revokeConsumerKey, useModelOption, variantCompare,
+});
 refresh(); setInterval(refresh, 3000);
 "##;
