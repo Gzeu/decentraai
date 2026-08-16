@@ -80,6 +80,10 @@ pub struct McpContext {
     /// version). Precomputed by the HTTP layer from the live quota ledger;
     /// the protocol layer only translates. Read-only.
     pub quota: Value,
+    /// Result of `get_compensation`: reputation-based compensation credits
+    /// (M9-9) — lifetime earnings per worker, recent audited credits, and the
+    /// active reward policy. Read-only; synthetic bookkeeping, never money.
+    pub compensation: Value,
     /// Result of `list_consumer_keys`: consumer API key metadata (ids,
     /// prefixes, accounts, ceilings, rate limits, scopes, status, usage).
     /// Precomputed by the HTTP layer; the protocol layer only translates.
@@ -119,6 +123,11 @@ fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "get_quota",
             description: "Contribution-backed quota accounting: per-account earned/available/reserved/consumed quota (keyed by worker peer), totals, and the active contribution-to-quota policy version. Read-only; every figure is real measured work converted under the versioned policy. UNKNOWN measurements are never fabricated.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "get_compensation",
+            description: "Reputation-based compensation (M9-9): lifetime contribution credits per worker (earned only from verified work, reputation-scaled), the most recent audited credit events, and the active reward policy. Read-only; synthetic bookkeeping — never money, never the token registry.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
@@ -629,6 +638,22 @@ pub fn consumer_keys_request(raw: &str) -> bool {
         == Some("list_consumer_keys")
 }
 
+/// Whether the incoming message is a `get_compensation` tool call (M9-9).
+/// Pure — lets the HTTP layer precompute the compensation ledger snapshot into
+/// [`McpContext::compensation`].
+pub fn compensation_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_compensation")
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -786,6 +811,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "pull_model" => &ctx.execution,
         "list_sessions" => &ctx.sessions,
         "get_quota" => &ctx.quota,
+        "get_compensation" => &ctx.compensation,
         "list_consumer_keys" => &ctx.consumer_keys,
         _ => return None,
     };
@@ -826,6 +852,7 @@ mod tests {
             execution: json!({}),
             sessions: json!({ "sessions_active": 0, "sessions": [] }),
             quota: json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": 1 }),
+            compensation: json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
             consumer_keys: json!({ "keys": [] }),
         }
     }
@@ -1356,6 +1383,31 @@ mod tests {
         ));
         assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
         assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#));
+    }
+
+    #[test]
+    fn compensation_request_matches_only_the_tool() {
+        assert!(compensation_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_compensation","arguments":{}}}"#
+        ));
+        assert!(!compensation_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
+        assert!(!compensation_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#));
+    }
+
+    #[test]
+    fn get_compensation_returns_precomputed_snapshot() {
+        let r = call(r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"get_compensation","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"total_earned\":0"));
+        assert!(content.contains("\"recent_events\":[]"));
+        assert!(content.contains("\"policy\":null"));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_compensation() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "get_compensation"));
     }
 
     #[test]

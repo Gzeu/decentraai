@@ -134,6 +134,130 @@ pub fn total_attempts(profile: &ContributionProfile) -> u64 {
     profile.verified_requests.saturating_add(profile.failed_requests)
 }
 
+/// Lifetime compensation credits accumulated by one worker.
+///
+/// The invariant is simple: `earned` is monotonic — it never decreases, so a
+/// compensation ledger cannot "lose" credits when the reputation signal
+/// improves. Each credit is computed from the contribution profile **at the
+/// moment it was earned**, and the profile is frozen into the audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CompensationAccount {
+    /// Total credits ever earned (monotonic).
+    pub earned: u64,
+}
+
+/// One auditable compensation credit (provenance).
+///
+/// Unlike the quota ledger, the *profile at credit time* is frozen into the
+/// event so an operator can always explain a given credit: "at request X the
+/// worker had 1000 verified / 5 failed, which under this reward policy earned
+/// 970 credits".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompensationEvent {
+    /// The operation: always `credit` today (reserved for future ops).
+    pub op: String,
+    /// The account (worker peer id) affected.
+    pub account: String,
+    /// Credits involved.
+    pub amount: u64,
+    /// The idempotency key (execution/request id) this refers to.
+    pub ref_id: String,
+    /// The reward policy that governed the credit (frozen for explainability).
+    pub policy: RewardPolicy,
+    /// The worker's verified/failed counts when the credit was computed.
+    pub verified_requests: u64,
+    pub failed_requests: u64,
+}
+
+/// The deterministic reputation-compensation core (M9-9).
+///
+/// Wrap this behind a `Mutex` (never `await` under the lock). All operations
+/// are pure, idempotent by `ref_id`, and audited — mirroring `QuotaLedger`.
+#[derive(Debug, Default)]
+pub struct CompensationLedger {
+    /// Per-account balances.
+    accounts: std::collections::HashMap<String, CompensationAccount>,
+    /// Idempotency: set of `(op, ref_id)` tuples already applied.
+    applied: std::collections::HashSet<(String, String)>,
+    /// Append-only audit trail (provenance). Bounded to avoid unbounded growth.
+    events: std::collections::VecDeque<CompensationEvent>,
+    /// The active reward policy.
+    policy: RewardPolicy,
+}
+
+/// The max number of compensation events retained in memory (bounded provenance).
+const MAX_COMPENSATION_EVENTS: usize = 4096;
+
+impl CompensationLedger {
+    /// A fresh ledger with the given reward policy.
+    pub fn new(policy: RewardPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    /// The active reward policy (read-only).
+    pub fn policy(&self) -> RewardPolicy {
+        self.policy
+    }
+
+    /// Swaps the active reward policy **in place**, preserving all historical
+    /// balances and the audit trail. Future credits use the new policy;
+    /// already-recorded events keep the policy that produced them.
+    pub fn set_policy(&mut self, policy: RewardPolicy) {
+        self.policy = policy;
+    }
+
+    /// Current compensation balance of `account`, or `None` if no record.
+    pub fn account(&self, account: &str) -> Option<CompensationAccount> {
+        self.accounts.get(account).copied()
+    }
+
+    /// Snapshot of every account balance (read-only, deterministic order).
+    pub fn accounts(&self) -> std::collections::BTreeMap<String, CompensationAccount> {
+        self.accounts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// The audit trail so far (provenance). Read-only.
+    pub fn events(&self) -> &std::collections::VecDeque<CompensationEvent> {
+        &self.events
+    }
+
+    /// Credits reputation-adjusted compensation for one verified execution,
+    /// **exactly once** per `ref_id`.
+    ///
+    /// `profile` is the worker's contribution profile **at credit time** — the
+    /// same verified/failed counters `reward_tokens` consumes, so the reward
+    /// honestly reflects the reputation the worker had when it served the
+    /// request. Returns the credits credited (0 when the worker had no verified
+    /// work yet — you earn by *serving*, exactly as the module docs promise).
+    pub fn credit(&mut self, account: &str, ref_id: &str, profile: &ContributionProfile) -> u64 {
+        if !self.applied.insert(("credit".to_string(), ref_id.to_string())) {
+            return 0; // duplicate: already credited this ref_id exactly once.
+        }
+        let amount = reward_tokens(profile, &self.policy);
+        if amount == 0 {
+            return 0;
+        }
+        let acc = self.accounts.entry(account.to_string()).or_default();
+        acc.earned = acc.earned.saturating_add(amount);
+        if self.events.len() >= MAX_COMPENSATION_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(CompensationEvent {
+            op: "credit".to_string(),
+            account: account.to_string(),
+            amount,
+            ref_id: ref_id.to_string(),
+            policy: self.policy,
+            verified_requests: profile.verified_requests,
+            failed_requests: profile.failed_requests,
+        });
+        amount
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +352,74 @@ mod tests {
         assert!((p.reputation_multiplier(100, 0) - 1.0).abs() < 1e-9, "flawless -> 1.0");
         assert!((p.reputation_multiplier(0, 100) - 0.0).abs() < 1e-9, "all fail -> 0.0");
         assert!((p.reputation_multiplier(0, 0) - 1.0).abs() < 1e-9, "idle -> 1.0");
+    }
+
+    // ---- CompensationLedger ----
+
+    #[test]
+    fn ledger_credits_verified_work_and_is_idempotent() {
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let first = ledger.credit("peer-a", "req-1", &healthy());
+        assert!(first > 0, "verified work earns credits");
+        assert_eq!(ledger.account("peer-a").unwrap().earned, first);
+
+        // Re-crediting the same ref_id must be a no-op (idempotency).
+        let again = ledger.credit("peer-a", "req-1", &healthy());
+        assert_eq!(again, 0, "same ref_id is never double-credited");
+        assert_eq!(ledger.account("peer-a").unwrap().earned, first);
+    }
+
+    #[test]
+    fn ledger_failed_work_earns_nothing() {
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let failing = ContributionProfile {
+            verified_requests: 0,
+            failed_requests: 50,
+            ..healthy()
+        };
+        let amount = ledger.credit("peer-b", "req-fail", &failing);
+        assert_eq!(amount, 0, "a worker that only failed earns nothing");
+        assert!(ledger.account("peer-b").is_none(), "no record for zero earnings");
+    }
+
+    #[test]
+    fn ledger_accumulates_across_requests_and_orders_accounts() {
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let mut prof = healthy();
+        prof.verified_requests = 5;
+        let a1 = ledger.credit("peer-c", "r1", &prof);
+        prof.verified_requests = 10;
+        let a2 = ledger.credit("peer-c", "r2", &prof);
+        assert!(a2 > a1, "more verified work earns more on the next credit");
+        let total = ledger.account("peer-c").unwrap().earned;
+        assert_eq!(total, a1 + a2, "credits accumulate monotonically");
+
+        let accounts = ledger.accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts.get("peer-c").unwrap().earned, total);
+        assert_eq!(ledger.events().len(), 2, "one audited event per credit");
+        let ev = ledger.events().back().unwrap();
+        assert_eq!(ev.op, "credit");
+        assert_eq!(ev.ref_id, "r2");
+        assert_eq!(ev.verified_requests, 10);
+        assert_eq!(ev.failed_requests, 0);
+    }
+
+    #[test]
+    fn ledger_policy_swap_affects_only_future_credits() {
+        let mut ledger = CompensationLedger::new(RewardPolicy::default());
+        let p1 = ledger.credit("peer-d", "r1", &healthy());
+        let richer = RewardPolicy {
+            tokens_per_verified_request: 10,
+            ..Default::default()
+        };
+        ledger.set_policy(richer);
+        let p2 = ledger.credit("peer-d", "r2", &healthy());
+        assert!(p2 > p1, "a richer policy yields more credits going forward");
+        // Historical event keeps the old policy (explainability).
+        let first_event = ledger.events().front().unwrap();
+        assert_eq!(first_event.policy, RewardPolicy::default());
+        assert_eq!(ledger.policy(), richer);
+        assert_eq!(ledger.account("peer-d").unwrap().earned, p1 + p2);
     }
 }

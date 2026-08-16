@@ -345,6 +345,13 @@ pub struct ComputeManager {
     /// coordinator uses it to classify fabric peers as CURRENT / OUTDATED /
     /// UNKNOWN for the node-lifecycle view.
     node_version: String,
+    /// Reputation-based compensation ledger (M9-9): deterministic contribution
+    /// credits accumulated per worker from *verified* work, reputation-scaled
+    /// via the pure reward policy. Distinct from `quota` (spendable units) —
+    /// compensation is lifetime earnings bookkeeping, synthetic by design (see
+    /// `decentraai_compute::compensation` docs). `Arc`-shared so the runtime's
+    /// consumer path can read the SAME authoritative ledger.
+    compensation: std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>>,
 }
 
 impl ComputeManager {
@@ -385,6 +392,11 @@ impl ComputeManager {
             accepts_remote_inference: std::sync::atomic::AtomicBool::new(false),
             registry_path: std::sync::Mutex::new(None),
             node_version: env!("CARGO_PKG_VERSION").to_string(),
+            compensation: std::sync::Arc::new(std::sync::Mutex::new(
+                decentraai_compute::CompensationLedger::new(
+                    decentraai_compute::RewardPolicy::default(),
+                ),
+            )),
         }
     }
 
@@ -570,6 +582,7 @@ impl ComputeManager {
                 mc.total_processing_ms = mc.total_processing_ms.saturating_add(u64::from(ms));
             }
         }
+        let mut credited_profile: Option<decentraai_compute::ContributionProfile> = None;
         if let Some(tracker) = self.contribution.lock().unwrap().get_mut(peer) {
             if verified {
                 tracker.profile.verified_requests =
@@ -577,6 +590,9 @@ impl ComputeManager {
             } else {
                 tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
             }
+            // Freeze the profile at credit time for the compensation ledger, so
+            // the reputation signal that produced a reward is explainable.
+            credited_profile = Some(tracker.profile);
         }
         // Q3: convert the credited measured work into spendable quota for the
         // worker's account. Keyed by `request_id`, so the same execution is
@@ -587,6 +603,16 @@ impl ComputeManager {
             let worker_account = peer.to_string();
             let mut q = self.quota.lock().unwrap();
             q.credit(&worker_account, request_id, tokens_used, processing_time_ms);
+        }
+        // M9-9: reputation-based compensation credits. Awarded from the same
+        // verified completion, using the profile frozen above; the ledger is
+        // itself idempotent on `request_id`, so replay can never double-pay.
+        if verified {
+            if let Some(profile) = credited_profile {
+                let worker_account = peer.to_string();
+                let mut c = self.compensation.lock().unwrap();
+                c.credit(&worker_account, request_id, &profile);
+            }
         }
         true
     }
@@ -629,6 +655,45 @@ impl ComputeManager {
     /// one ledger (Q2: no second balance).
     pub fn quota_ledger(&self) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>> {
         self.quota.clone()
+    }
+
+    /// Snapshot of the compensation ledger's per-account balances (M9-9,
+    /// read-only). `BTreeMap` so iteration order is deterministic.
+    pub fn compensation_accounts(
+        &self,
+    ) -> std::collections::BTreeMap<String, decentraai_compute::CompensationAccount> {
+        self.compensation.lock().unwrap().accounts()
+    }
+
+    /// Balance of one account's compensation credits (M9-9, read-only).
+    pub fn compensation_account(&self, account: &str) -> Option<decentraai_compute::CompensationAccount> {
+        self.compensation.lock().unwrap().account(account)
+    }
+
+    /// The compensation ledger's audit trail (M9-9 provenance). Read-only.
+    pub fn compensation_events(
+        &self,
+    ) -> std::collections::VecDeque<decentraai_compute::CompensationEvent> {
+        self.compensation.lock().unwrap().events().clone()
+    }
+
+    /// Replaces the active reward policy (M9-9). The pure ledger keeps every
+    /// historical credit under the policy that produced it.
+    pub fn set_reward_policy(&self, policy: decentraai_compute::RewardPolicy) {
+        self.compensation.lock().unwrap().set_policy(policy);
+    }
+
+    /// The active reward policy (M9-9, read-only).
+    pub fn reward_policy(&self) -> decentraai_compute::RewardPolicy {
+        self.compensation.lock().unwrap().policy()
+    }
+
+    /// Shared handle to the authoritative compensation ledger (M9-9). The
+    /// runtime's consumer path can read the same earnings bookkeeping.
+    pub fn compensation_ledger(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>> {
+        self.compensation.clone()
     }
 
     /// Records a retryable routing failure for `peer` (P5), possibly tripping
@@ -1709,6 +1774,10 @@ pub struct ContributionRow {
     /// Reputation-dampened contribution credits (M9-9): zero for idle or
     /// complete-failure workers, scaled by quality and clean-service ratio.
     pub reward_tokens: u64,
+    /// Lifetime compensation credits actually accumulated in the ledger (M9-9):
+    /// real credited verified work, idempotently booked. Read directly from the
+    /// compensation ledger — the honest "what has this worker earned" number.
+    pub compensation_earned: u64,
 }
 
 /// Coordinator-side view of the whole mesh for observability (M16).
@@ -2069,6 +2138,13 @@ impl ComputeManager {
                 score: contribution_score(&profile),
                 suggested_tier: suggest_tier(&profile),
                 reward_tokens: reward_tokens(&profile, &RewardPolicy::default()),
+                compensation_earned: self
+                    .compensation
+                    .lock()
+                    .unwrap()
+                    .account(&adv.peer_id.to_string())
+                    .map(|a| a.earned)
+                    .unwrap_or(0),
             });
         }
         rows
@@ -3522,6 +3598,24 @@ mod tests {
         // Failed executions earn no quota.
         assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
         assert_eq!(manager.quota_account(&worker.to_string()).unwrap().earned, 3150);
+
+        // M9-9: verified executions also earn reputation-based compensation
+        // credits (distinct ledger from quota); failures and duplicates earn
+        // nothing and cannot double-pay.
+        let comp = manager.compensation_account(&worker.to_string()).unwrap();
+        assert!(comp.earned > 0, "verified work accumulates compensation credits");
+        let comp_before = comp.earned;
+        // Re-credit the same execution: both ledgers refuse (idempotency).
+        assert!(!manager.record_credited_contribution(&worker, "exec-1", true, Some(100), Some(2000)));
+        assert_eq!(manager.compensation_account(&worker.to_string()).unwrap().earned, comp_before);
+        // A failed execution after some verified work still earns nothing more.
+        assert!(manager.record_credited_contribution(&worker, "exec-4", false, None, None));
+        assert_eq!(manager.compensation_account(&worker.to_string()).unwrap().earned, comp_before);
+        // The audit trail records exactly the two verified credits.
+        let events = manager.compensation_events();
+        assert_eq!(events.len(), 2, "one compensation event per verified execution");
+        assert!(events.iter().all(|e| e.op == "credit"));
+        assert_eq!(manager.reward_policy(), decentraai_compute::RewardPolicy::default());
     }
 
     #[tokio::test]

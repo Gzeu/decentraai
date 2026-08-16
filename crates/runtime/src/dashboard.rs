@@ -653,8 +653,8 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Contributions <span class="count">M17 · real served work</span></h2>
-          <table><thead><tr><th>Worker</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Online</th><th class="num">Verified</th><th class="num">Failed</th><th class="num">Score</th><th>Tier</th><th class="num">Reward</th></tr></thead>
-          <tbody id="contributions"><tr><td colspan="9" class="empty">no contribution ledger yet</td></tr></tbody></table>
+          <table><thead><tr><th>Worker</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Online</th><th class="num">Verified</th><th class="num">Failed</th><th class="num">Score</th><th>Tier</th><th class="num">Reward</th><th class="num">Earned</th></tr></thead>
+          <tbody id="contributions"><tr><td colspan="10" class="empty">no contribution ledger yet</td></tr></tbody></table>
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Tier suggestions <span class="count">contribution → tier · master-gated</span></h2>
@@ -2030,9 +2030,9 @@ function renderWorkers(c){
   const crel = (c && c.contributions || []).map(r =>
     '<tr><td>'+esc(r.node_name || short(r.peer_id))+'</td><td class="num">'+r.cpu_cores+'</td><td class="num">'+fmtMB(r.ram_mb)+'</td><td class="num">'+fmtUptime(r.online_seconds)+'</td>'+
     '<td class="num">'+r.verified_requests+'</td><td class="num">'+r.failed_requests+'</td><td class="num">'+r.score.toFixed(2)+'</td>'+
-    '<td><span class="badge '+(r.suggested_tier===3?'ok':r.suggested_tier===2?'warn':'faint')+'">T'+r.suggested_tier+'</span></td><td class="num">'+r.reward_tokens+'</td></tr>'
+    '<td><span class="badge '+(r.suggested_tier===3?'ok':r.suggested_tier===2?'warn':'faint')+'">T'+r.suggested_tier+'</span></td><td class="num">'+r.reward_tokens+'</td><td class="num">'+r.compensation_earned+'</td></tr>'
   ).join('');
-  $('contributions').innerHTML = crel || '<tr><td colspan="9" class="empty">no contribution ledger yet</td></tr>';
+  $('contributions').innerHTML = crel || '<tr><td colspan="10" class="empty">no contribution ledger yet</td></tr>';
 }
 // Resource pressure (Part 17/22): honest aggregate of MEASURED load.
 // Local values come from the live SystemSnapshot in /status; worker values

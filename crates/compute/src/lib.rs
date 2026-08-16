@@ -55,7 +55,10 @@ pub(crate) mod testutil;
 pub use availability::{ComputeAdvertisement, ComputeAvailability, WorkerHealth};
 pub use capability::{ComputeCapability, GpuSpec, ServedModel};
 pub use contribution::{contribution_score, suggest_tier, ContributionProfile};
-pub use compensation::{reward_tokens, total_attempts, RewardPolicy};
+pub use compensation::{
+    reward_tokens, total_attempts, CompensationAccount, CompensationEvent, CompensationLedger,
+    RewardPolicy,
+};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};
 pub use loadbalance::{LoadShare, adaptive_load_shares};
 pub use quota::{

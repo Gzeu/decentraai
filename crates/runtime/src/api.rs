@@ -4834,9 +4834,55 @@ async fn mcp_handler(
             None => serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
         };
     }
-    // A `list_consumer_keys` call projects consumer API key metadata
-    // (read-only, never the plaintext secret): ids, prefixes, accounts,
-    // ceilings, rate limits, scopes, status, usage + owner account balance.
+    // A `get_compensation` call projects the reputation-based compensation
+    // ledger (M9-9, read-only, operator-level): lifetime earnings per worker
+    // from verified work, the most recent audited credits, and the active
+    // reward policy. Synthetic bookkeeping only — never money.
+    if crate::mcp::compensation_request(&raw) {
+        ctx.compensation = match &state.compute {
+            Some(cm) => {
+                let accounts: Vec<serde_json::Value> = cm
+                    .compensation_accounts()
+                    .into_iter()
+                    .map(|(account, acc)| {
+                        serde_json::json!({
+                            "account": account,
+                            "earned": acc.earned,
+                        })
+                    })
+                    .collect();
+                let events: Vec<serde_json::Value> = cm
+                    .compensation_events()
+                    .into_iter()
+                    .rev()
+                    .take(20)
+                    .map(|e| {
+                        serde_json::json!({
+                            "op": e.op,
+                            "account": e.account,
+                            "amount": e.amount,
+                            "ref_id": e.ref_id,
+                            "verified_requests": e.verified_requests,
+                            "failed_requests": e.failed_requests,
+                        })
+                    })
+                    .collect();
+                let policy = cm.reward_policy();
+                serde_json::json!({
+                    "accounts": accounts,
+                    "total_earned": accounts.iter().map(|a| a["earned"].as_u64().unwrap_or(0)).sum::<u64>(),
+                    "recent_events": events,
+                    "policy": {
+                        "tokens_per_verified_request": policy.tokens_per_verified_request,
+                        "quality_min": policy.quality_min,
+                        "quality_max": policy.quality_max,
+                        "reputation_power": policy.reputation_power,
+                    },
+                })
+            }
+            None => serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
+        };
+    }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
             Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
@@ -5066,6 +5112,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         sessions: serde_json::json!({ "sessions_active": 0, "sessions": [] }),
         quota: serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
         consumer_keys: serde_json::json!({ "keys": [] }),
+        compensation: serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
     }
 }
 
