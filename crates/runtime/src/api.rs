@@ -1131,6 +1131,54 @@ fn fabric_fit_for_model(
     results
 }
 
+/// Suggested share (%) of a request-level workload each CAN_RUN worker could
+/// absorb, based on real advertised capacity and load. Pure, INFERRED, and
+/// advisory only — it never changes scheduling. For each eligible worker the
+/// "weight" is `max(1, tps) * (100 - load) / 100` (throughput × idle headroom),
+/// normalized so the shares sum to ~100. `UNKNOWN`/no-eligible → empty.
+fn load_balance_for_workers(
+    workers: &[(decentraai_compute::ComputeAdvertisement, bool)],
+    can_run_peer_ids: &std::collections::HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let eligible: Vec<&(decentraai_compute::ComputeAdvertisement, bool)> = workers
+        .iter()
+        .filter(|(w, _)| can_run_peer_ids.contains(&w.peer_id.to_string()))
+        .collect();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    let total_weight: f64 = eligible
+        .iter()
+        .map(|(w, _)| {
+            let tps = w.availability.tokens_per_second.max(1) as f64;
+            let idle = (100.0 - f64::from(w.availability.load_percent)).max(1.0);
+            tps * (idle / 100.0)
+        })
+        .sum();
+    if total_weight <= 0.0 {
+        return Vec::new();
+    }
+    eligible
+        .iter()
+        .map(|(w, trusted)| {
+            let tps = w.availability.tokens_per_second.max(1) as f64;
+            let idle = (100.0 - f64::from(w.availability.load_percent)).max(1.0);
+            let weight = tps * (idle / 100.0);
+            let share = (weight / total_weight * 100.0).round() as u32;
+            serde_json::json!({
+                "peer_id": w.peer_id.to_string(),
+                "node_id": w.node_id,
+                "node_name": w.node_name,
+                "trusted": *trusted,
+                "device_class": device_class(&w.capability),
+                "tokens_per_second": w.availability.tokens_per_second,
+                "load_percent": w.availability.load_percent,
+                "suggested_share_pct": share,
+            })
+        })
+        .collect()
+}
+
 /// ONE coherent, explainable fabric decision (Phase 1 — Unified Decision).
 ///
 /// Combines intent → capabilities → model options → per-variant fabric fit →
@@ -1237,6 +1285,11 @@ async fn unified_fabric_decision(
                     .map(|c| format!("✓ {} — {}", c.check, c.state))
                     .collect::<Vec<_>>();
             }
+            let can_run_peer_ids: std::collections::HashSet<String> = results
+                .iter()
+                .filter(|r| r.verdict == WorkerCapVerdict::CanRun)
+                .map(|r| r.peer_id.clone())
+                .collect();
             model_options.push(serde_json::json!({
                 "model": model_file,
                 "quantization": variant_quantization_from_file_name(model_file),
@@ -1251,6 +1304,9 @@ async fn unified_fabric_decision(
                         "ram_sufficient": r.ram_sufficient, "vram_sufficient": r.vram_sufficient,
                     }))
                     .collect::<Vec<_>>(),
+                // Adaptive fan-out advisory: suggested request-level share ({%})
+                // per CAN_RUN worker (capacity x idle headroom), advisory only.
+                "load_balance": load_balance_for_workers(&workers, &can_run_peer_ids),
             }));
         }
 
@@ -7460,6 +7516,38 @@ mod tests {
         assert_eq!(device_class(&cap(false, 4 * 1024, 4)), "mobile"); // phone/Pi-class
         assert_eq!(device_class(&cap(false, 2 * 1024, 2)), "mobile");
         assert_eq!(device_class(&cap(false, 16 * 1024, 4)), "laptop"); // edge-ish but RAM-y
+    }
+
+    #[test]
+    fn load_balance_suggests_share_from_capacity_and_load() {
+        // Two CAN_RUN workers with different advertised tps + load: the faster
+        // / more idle one gets a larger suggested share; shares sum to ~100.
+        // Advisory only — never changes scheduling.
+        let p1 = decentraai_p2p::PeerId::random();
+        let p2 = decentraai_p2p::PeerId::random();
+        let mut w1 = cap_adv(&p1, "dca-fast", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut w2 = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        w1.availability.tokens_per_second = 100;
+        w1.availability.load_percent = 10; // idle 90 -> weight 90
+        w2.availability.tokens_per_second = 10;
+        w2.availability.load_percent = 50; // idle 50 -> weight 5
+
+        let can_run: std::collections::HashSet<String> =
+            [p1.to_string(), p2.to_string()].into();
+        let lb = load_balance_for_workers(&[(w1, true), (w2, true)], &can_run);
+        assert_eq!(lb.len(), 2);
+        // fast/idle share (90) >> slow/busy share (5); total ~100.
+        let fast = lb.iter().find(|x| x["node_id"] == "dca-fast").unwrap();
+        let slow = lb.iter().find(|x| x["node_id"] == "dca-slow").unwrap();
+        assert!(fast["suggested_share_pct"].as_u64().unwrap()
+            > slow["suggested_share_pct"].as_u64().unwrap());
+        let total: u64 = lb.iter().map(|x| x["suggested_share_pct"].as_u64().unwrap()).sum();
+        assert!((95..=105).contains(&total), "shares sum ~100: {total}");
+        assert!(fast["device_class"].is_string());
+
+        // No eligible -> empty (honest).
+        let w2b = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        assert!(load_balance_for_workers(&[(w2b, true)], &std::collections::HashSet::new()).is_empty());
     }
 
     #[test]

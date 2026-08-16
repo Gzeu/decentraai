@@ -1455,3 +1455,16 @@ Digital Twin.
   glance which fabric members are lightweight/mobile.
 - [x] Test: classification across server/desktop/laptop/mobile/edge from real
   capability inputs.
+
+## 65. Next-Gen — Adaptive fan-out / load-balance projection
+
+Second step toward "a fabric from ALL your devices": show how much each CAN_RUN
+worker could contribute (request-level load balancing), advisory only.
+
+- [x] `load_balance_for_workers(...)` — pure, INFERRED, advisory: per CAN_RUN
+  worker a `suggested_share_pct` from real advertised `tokens_per_second` ×
+  idle headroom (100-load), normalized to ~100%. Includes `device_class`.
+  Never changes scheduling; no eligible → empty.
+- [x] `unified_fabric_decision` model_options now carry a `load_balance` array.
+- [x] Test: faster/more-idle worker gets a larger share, shares sum ~100,
+  no-eligible → empty.
