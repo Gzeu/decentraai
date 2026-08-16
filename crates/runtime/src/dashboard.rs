@@ -1381,7 +1381,10 @@ window.revokeWorker = e => workerAct('revoke', e.target.dataset.p);
 // ---- sparklines ------------------------------------------------------------
 function spark(id, values, color){
   const svg = $(id); if (!svg) return;
-  const v = (values || []).slice(0, 24).reverse();
+  // Only finite numbers can be plotted; NaN/Inf/null from a remote or an
+  // unmeasured request would otherwise poison Math.max and emit invalid SVG
+  // points ("Expected number, NaN" console errors).
+  const v = (values || []).filter(x => Number.isFinite(x)).slice(0, 24).reverse();
   const w = 300, h = 70;
   if (!v.length) { svg.innerHTML = ''; return; }
   const max = Math.max(...v, 1);
