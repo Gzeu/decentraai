@@ -2085,8 +2085,18 @@ async function decideNow(){
           const execBtn = o.verdict === 'CAN_RUN'
             ? '<button class="btn small" style="font-size:10px;padding:1px 6px" onclick="useModelOption(\''+jsq(c.capability)+'\',\''+jsq(o.model)+'\')">execute</button>'
             : '<span class="badge faint" style="font-size:10px">—</span>';
+          // advisory fan-out shares (real backend data only; absent -> render nothing)
+          const lb = (o.load_balance || []);
+          const lbLine = lb.length
+            ? '<div class="mono" style="margin-top:4px;font-size:10px;color:var(--faint)">fan-out advisory:</div>'+
+              '<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+
+              lb.map(x =>
+                '<span class="badge ok">'+esc(short(x.node_id||x.peer_id||'', 12))+' '+
+                esc(x.node_name||'')+' ('+esc(String(x.suggested_share_pct))+'%)</span>').join(' ')+
+              '</div>'
+            : '';
           capBlock += '<div style="margin-top:6px;padding-left:4px"><span class="mono" style="font-size:11px">'+esc(o.model||'')+' · '+
-            esc(o.quantization || '—')+'</span> '+v+' '+execBtn+'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+wLine+'</div></div>';
+            esc(o.quantization || '—')+'</span> '+v+' '+execBtn+'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+wLine+'</div>'+lbLine+'</div>';
         });
       }
       capBlock += '</div>';
@@ -2928,6 +2938,7 @@ function renderFabricGraph(f){
     '<div class="mono" style="font-size:11px;padding:3px 0">'+
       '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
       (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
+      (n.device_class ? ' <span class="badge faint">'+esc(n.device_class)+'</span>' : '')+
       ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
       '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>'
   ).join('');

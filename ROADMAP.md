@@ -1468,3 +1468,11 @@ worker could contribute (request-level load balancing), advisory only.
 - [x] `unified_fabric_decision` model_options now carry a `load_balance` array.
 - [x] Test: faster/more-idle worker gets a larger share, shares sum ~100,
   no-eligible → empty.
+
+## 66. Next-Gen — Mobile-worker foundation in the UI
+
+- [x] Fabric graph card shows each node's `device_class` badge (mobile/desktop/
+  server/laptop/edge) when present.
+- [x] Decision card model options show the advisory `load_balance` fan-out
+  shares (per CAN_RUN worker: short id + name + share %) under a "fan-out
+  advisory:" note. Empty/absent → nothing rendered. Real state only.
