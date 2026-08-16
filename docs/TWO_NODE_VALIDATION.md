@@ -80,6 +80,10 @@ git pull --rebase
 
 # 2. Run the exact upgrade (builds current HEAD, swaps the binary, restarts
 #    the systemd user service, verifies accepts_remote_inference).
+#    IMPORTANT: this also enables remote inference in the node config
+#    (inference.allow_remote_inference + network.private_swarm), because the
+#    binary alone does NOT advertise accepts_remote_inference — the config
+#    flag does. Set ENABLE_REMOTE=0 to leave the config untouched.
 bash scripts/upgrade-node.sh
 
 # 3. Confirm the node now advertises remote inference:
@@ -89,8 +93,11 @@ curl -s -H "Authorization: Bearer $(cat ~/.decentraai/runtime/api.token)" \
 #   -> the Desktop's own row should show "accepts_remote_inference": true
 ```
 
-The script (`scripts/upgrade-node.sh`) is idempotent and only swaps the binary
-+ restarts; it never touches node data/config/identity.
+The script (`scripts/upgrade-node.sh`) is idempotent: it swaps the binary +
+restarts the service, and (unless `ENABLE_REMOTE=0`) flips
+`inference.allow_remote_inference` and `network.private_swarm` to `true` in the
+config (with a timestamped backup) so the node advertises remote inference. It
+never touches node data/identity.
 
 ### Prerequisites on the Desktop
 - The decentraai repository checked out (so it can `git pull` + `cargo build`).

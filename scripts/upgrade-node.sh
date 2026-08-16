@@ -63,6 +63,31 @@ echo "==> Installing the new binary"
 cp target/release/decentraai "$BIN"
 chmod +x "$BIN"
 
+# Enable remote inference in the node config (this is what actually makes the
+# node advertise accepts_remote_inference: true — the binary alone is not
+# enough). Requires both inference.allow_remote_inference and
+# network.private_swarm (config validation enforces private_swarm when remote
+# inference is on). Backs up the config first. Opt out with ENABLE_REMOTE=0.
+if [ "${ENABLE_REMOTE:-1}" = "1" ] && [ -f "$CONFIG_PATH" ]; then
+  echo "==> Enabling remote inference in $CONFIG_PATH"
+  cp "$CONFIG_PATH" "$CONFIG_PATH.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  # Flip allow_remote_inference: false -> true under the inference: block.
+  sed -i 's/^\([[:space:]]*allow_remote_inference:[[:space:]]*\)false/\1true/' "$CONFIG_PATH"
+  # Ensure network.private_swarm: true so config validation passes.
+  if ! grep -qE '^[[:space:]]*private_swarm:[[:space:]]*true' "$CONFIG_PATH"; then
+    if grep -qE '^[[:space:]]*private_swarm:' "$CONFIG_PATH"; then
+      sed -i 's/^\([[:space:]]*private_swarm:[[:space:]]*\)false/\1true/' "$CONFIG_PATH"
+    else
+      # Add under the network: block if it exists; else append (validation may
+      # still require a correct structure, so this is best-effort).
+      sed -i '/^[[:space:]]*network:/a\  private_swarm: true' "$CONFIG_PATH"
+    fi
+  fi
+  echo "  allow_remote_inference + private_swarm enabled"
+else
+  echo "==> Remote inference config left as-is (ENABLE_REMOTE=$ENABLE_REMOTE)"
+fi
+
 echo "==> Restarting the node service"
 systemctl --user start "$SERVICE"
 systemctl --user is-active "$SERVICE" >/dev/null
@@ -75,7 +100,7 @@ API_PORT="$(grep -E '^[[:space:]]*api_port:' "$CONFIG_PATH" 2>/dev/null | awk '{
 if [ -f "$TOKEN_FILE" ]; then
   TOKEN="$(cat "$TOKEN_FILE")"
   curl -s -m 5 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$API_PORT/v1/compute" \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); [print('  node', w.get('node_id'), 'accepts_remote_inference =', w.get('accepts_remote_inference')) for w in d.get('workers',[]) if w.get('node_id')==w.get('node_id')]" 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); [print('  node', w.get('node_id'), 'accepts_remote_inference =', w.get('accepts_remote_inference')) for w in d.get('workers',[])]" 2>/dev/null \
     || echo "  (could not read /v1/compute; check the dashboard manually)"
 fi
 
