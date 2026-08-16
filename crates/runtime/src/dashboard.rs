@@ -459,6 +459,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 
       <div class="card" style="margin-top:14px">
         <h2>Recent inference calls</h2>
+        <div id="recent-chart" class="empty" style="margin-bottom:8px">no throughput data yet</div>
         <table><thead><tr><th>Time</th><th>Endpoint</th><th class="num">Prompt tok</th><th class="num">Gen tok</th><th class="num">ms</th><th class="num">tok/s</th></tr></thead>
         <tbody id="recent"><tr><td colspan="6" class="empty">no inference calls yet</td></tr></tbody></table>
       </div>
@@ -2050,6 +2051,31 @@ function provenanceBadge(p){
   if (s === 'EXPERIMENTAL') return '<span class="badge accent pv">experimental</span>';
   return '<span class="badge faint pv">unknown</span>';
 }
+// Mini bar-chart of measured throughput (tok/s) across recent inference calls.
+// Real data from `/status` recent_requests; empty -> honest "no data yet".
+// Bars are coloured by relative speed (slow -> warn/bad, fast -> ok) so the
+// operator sees the throughput trend at a glance.
+function renderRecentChart(reqs){
+  const el = $('recent-chart');
+  if (!el) return;
+  if (!reqs || !reqs.length) { el.innerHTML = '<span class="empty">no throughput data yet</span>'; return; }
+  const vals = reqs.slice(0, 24).map(r => r.tokens_per_second || 0);
+  const max = Math.max.apply(null, vals.concat([1]));
+  const W = 600, H = 48, pad = 2;
+  const bw = Math.max(2, (W - pad*2) / vals.length - 2);
+  let bars = '';
+  vals.forEach((v, i) => {
+    const h = Math.max(2, (v / max) * (H - 8));
+    const ratio = v / (max || 1);
+    const color = ratio > 0.6 ? '#34d399' : ratio > 0.3 ? '#fbbf24' : '#f87171';
+    const x = pad + i * (bw + 2);
+    bars += '<rect x="'+x+'" y="'+(H-4-h)+'" width="'+bw+'" height="'+h+'" rx="1.5" fill="'+color+'" opacity="0.85"><title>'+v.toFixed(1)+' tok/s</title></rect>';
+  });
+  const line = 'M0 '+(H-4)+' L'+W+' '+(H-4);
+  el.innerHTML = '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:44px;display:block" preserveAspectRatio="none">'+
+    '<line x1="0" y1="'+(H-4)+'" x2="'+W+'" y2="'+(H-4)+'" stroke="var(--line-2)" stroke-width="1"/>'+bars+'</svg>'+
+    '<div style="font-size:10.5px;color:var(--faint);margin-top:2px">throughput (tok/s) — last '+vals.length+' call(s) · MEASURED</div>';
+}
 function renderDecisions(x){
   const ds = (x && x.decisions || []).slice(0, 10);
   if (!ds.length) { $('decisions').innerHTML = '<div class="empty">no autonomous decisions yet — run a routed request to see the M23 trace</div>'; return; }
@@ -3402,6 +3428,7 @@ async function refresh(){
     $('recent').innerHTML = (s.recent_requests||[]).map(r =>
       '<tr><td>'+tstr(r.timestamp)+'</td><td><code>'+esc(r.endpoint.replace('/v1/',''))+'</code></td><td class="num">'+r.prompt_tokens+'</td><td class="num">'+r.completion_tokens+'</td><td class="num">'+r.duration_ms+'</td><td class="num">'+r.tokens_per_second.toFixed(1)+'</td></tr>'
     ).join('') || '<tr><td colspan="6" class="empty">no inference calls yet</td></tr>';
+    renderRecentChart(s.recent_requests || []);
     $('ram').textContent = (s.system && s.system.ram_available_gib !== undefined) ? s.system.ram_available_gib.toFixed(1)+' / '+s.system.ram_total_gib.toFixed(1)+' GiB' : '—';
     $('cpu').textContent = (s.system && s.system.cpu_threads) ? s.system.cpu_threads+' threads' : '—';
     $('gpu').innerHTML = (s.system && s.system.gpu) ? esc(s.system.gpu.name)+' · '+s.system.gpu.temperature_c+'°C · '+s.system.gpu.free_vram_mib+' MiB free · '+s.system.gpu.utilization_percent+'%' : '<span class="badge faint">none detected</span>';
