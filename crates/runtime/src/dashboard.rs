@@ -50,7 +50,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
   --line:#182234; --line-2:#223048;
   --text:#e8eef6; --muted:#8fa0b3; --faint:#5a6b80;
   --accent:#22d3ee; --accent-2:#6366f1; --accent-soft:rgba(34,211,238,.1);
-  --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --remote:#a78bfa;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
   --radius:14px; --radius-sm:9px;
@@ -112,6 +112,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .grid.cols-4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);transition:border-color .15s ease}
 .card:hover{border-color:var(--line-2)}
+/* nested sub-panel inside a card: flat, no shadow, subtle border — avoids the
+   heavy cards-in-a-card look in multi-cell pressure/metric grids */
+.card.sub{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px 14px;box-shadow:none}
+.card.sub h3{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--faint);margin:0 0 8px}
 .card h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin-bottom:12px;display:flex;align-items:center;gap:8px}
 .card h2 .count{font-size:11px;color:var(--accent)}
 .metric{background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
@@ -119,6 +123,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .metric .value{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.02em;line-height:1.2;white-space:nowrap}
 .metric .sub{font-size:11.5px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
 .metric.ok .value{color:var(--ok)} .metric.warn .value{color:var(--warn)} .metric.bad .value{color:var(--bad)} .metric.accent .value{color:var(--accent)}
+/* metric value size variants — consistent alternative to inline font-size */
+.metric.lg .value{font-size:17px}
+.metric.sm .value{font-size:15px}
  table{width:100%;border-collapse:collapse;font-size:12.5px}
  tr:last-child td{border-bottom:0}
  td.num,th.num{text-align:right;font-family:var(--mono)}
@@ -128,7 +135,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .badge.bad{background:rgba(248,113,113,.12);color:var(--bad)}
 .badge.accent{background:var(--accent-soft);color:var(--accent)}
 .badge.faint{background:rgba(255,255,255,.05);color:var(--muted)}
-.badge.remote{background:rgba(139,92,246,.16);color:#c4b5fd}
+.badge.remote{background:rgba(139,92,246,.16);color:var(--remote)}
 .badge.local{background:rgba(52,211,153,.10);color:var(--ok)}
 /* provenance badges — compact, lowercase, letter-spaced; distinct from status */
 .badge.pv{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:1px 7px;border:1px solid transparent;font-weight:700}
@@ -170,8 +177,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 #chat-served{margin-left:auto;min-height:20px}
 .bar{height:5px;background:var(--bg-2);border-radius:99px;overflow:hidden;margin-top:5px}
 .bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .5s ease}
-.bar.warn>i{background:linear-gradient(90deg,#fbbf24,#f59e0b)}
-.bar.bad>i{background:linear-gradient(90deg,#f87171,#ef4444)}
+.bar.warn>i{background:linear-gradient(90deg,var(--warn),#f59e0b)}
+.bar.bad>i{background:linear-gradient(90deg,var(--bad),#ef4444)}
 .score-bars{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
 .score-bars .sb{font-size:10px;color:var(--faint)}
 .score-bars .sb b{font-family:var(--mono);color:var(--text);font-weight:600}
@@ -423,9 +430,9 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <div class="grid cols-3 secondary">
         <div class="card">
           <h2>Model</h2>
-          <div class="metric accent" style="margin-bottom:8px"><div class="label">Active model</div><div class="value" id="model-name" style="font-size:17px">&hellip;</div></div>
-          <div class="metric"><div class="label">File</div><div class="value" id="model-size" style="font-size:15px">&mdash;</div></div>
-          <div class="metric" style="margin-top:8px"><div class="label">Status</div><div class="value" id="model-status" style="font-size:15px">&mdash;</div></div>
+          <div class="metric accent lg" style="margin-bottom:8px"><div class="label">Active model</div><div class="value" id="model-name">&hellip;</div></div>
+          <div class="metric sm"><div class="label">File</div><div class="value" id="model-size">&mdash;</div></div>
+          <div class="metric sm" style="margin-top:8px"><div class="label">Status</div><div class="value" id="model-status">&mdash;</div></div>
           <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="also-models"></div>
         </div>
         <div class="card">
