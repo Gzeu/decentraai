@@ -1901,3 +1901,14 @@ boundary. Never splits a single generation/model (stays gated behind
   never serves; batch covers every request exactly once; KV continuation pinned;
   deterministic regardless of input order; provenance preserved. Workspace
   tests, clippy `-D warnings`, release build green.
+
+## 90. Next-Gen — Dashboard workload distribution
+
+Operator visibility into the adaptive fan-out: how a batch of independent
+requests would be spread across the fabric, from real adaptive-contribution
+factors. Advisory; real values only.
+
+- [x] Fabric graph card gains a "Workload distribution" bar: each eligible
+  node's adaptive share (normalized from its real `adaptive_contribution`),
+  sorted largest-first, with a percentage bar. Absent adaptive_contribution →
+  nothing rendered (never fabricated). Marked advisory.

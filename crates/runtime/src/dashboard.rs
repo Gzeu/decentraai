@@ -3048,7 +3048,33 @@ function renderFabricGraph(f){
     '<div class="grid cols-2">'+
       '<div><h3 style="margin:8px 0 4px">Nodes</h3>'+((nodeHtml && capAny) ? '<div class="mono" style="font-size:10px;color:var(--muted)">capacity: FULL / LIMITED / UNAVAILABLE (adaptive contribution)</div>' : '')+(nodeHtml || '<div class="empty">no nodes</div>')+'</div>'+
       '<div><h3 style="margin:8px 0 4px">Capabilities</h3>'+(capHtml || '<div class="empty">no capabilities (UNKNOWN)</div>')+'</div>'+
-    '</div>';
+    '</div>'+
+    renderWorkloadDist(nodes);
+}
+
+// Adaptive workload distribution (Next-Gen fan-out): normalize each node's
+// real adaptive_contribution factor into a deterministic share bar so the
+// operator sees how an independent-request batch would be spread. Real values
+// only — absent adaptive_contribution renders nothing (never fabricated).
+function renderWorkloadDist(nodes){
+  const withFactor = (nodes||[]).filter(n => n.adaptive_contribution != null && n.healthy !== false && n.trusted !== false);
+  if (!withFactor.length) return '';
+  const total = withFactor.reduce((s,n)=> s + n.adaptive_contribution, 0);
+  if (!(total > 0)) return '';
+  let row = '';
+  withFactor.slice().sort((a,b)=>(b.adaptive_contribution-a.adaptive_contribution)).forEach(n=>{
+    const share = (n.adaptive_contribution / total) * 100;
+    row += '<div class="mono" style="display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 0">'+
+      '<span style="flex:0 0 130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(n.node_name||short(n.peer_id,14))+'</span>'+
+      '<span style="flex:1;background:var(--line,#223);border-radius:3px;height:10px;position:relative">'+
+        '<span style="position:absolute;left:0;top:0;height:10px;width:'+share+'%;background:linear-gradient(90deg,#22d3ee,#6366f1);border-radius:3px"></span>'+
+      '</span>'+
+      '<span style="flex:0 0 44px;text-align:right">'+share.toFixed(0)+'%</span>'+
+      '</div>';
+  });
+  return '<h3 style="margin:8px 0 4px">Workload distribution <span class="count">adaptive shares · advisory</span></h3>'+
+    '<div style="font-size:10px;color:var(--muted);margin-bottom:4px">how a batch of independent requests would be spread (from real adaptive_contribution)</div>'+
+    row;
 }
 function renderSettings(s){
   const r = (s && s.resources) || {};
