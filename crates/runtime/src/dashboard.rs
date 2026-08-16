@@ -2079,8 +2079,14 @@ async function decideNow(){
                 '<span class="badge '+(w.trusted?'ok':'faint')+'">'+esc(short(w.node_id||w.peer_id||'', 12))+' · '+
                 esc(w.node_name||'')+' · '+(w.trusted?'trusted':'untrusted')+' · '+esc(w.engine||'')+'</span>').join(' ')
             : '<span class="badge faint">no runnable worker</span>';
+          // EXECUTE (T4): a real CAN_RUN option is a genuine candidate — offer a
+          // pre-fill button that loads the capability+model into the Execute
+          // inputs (never auto-runs). Non-runnable options get a muted dash.
+          const execBtn = o.verdict === 'CAN_RUN'
+            ? '<button class="btn small" style="font-size:10px;padding:1px 6px" onclick="useModelOption(\''+jsq(c.capability)+'\',\''+jsq(o.model)+'\')">execute</button>'
+            : '<span class="badge faint" style="font-size:10px">—</span>';
           capBlock += '<div style="margin-top:6px;padding-left:4px"><span class="mono" style="font-size:11px">'+esc(o.model||'')+' · '+
-            esc(o.quantization || '—')+'</span> '+v+'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+wLine+'</div></div>';
+            esc(o.quantization || '—')+'</span> '+v+' '+execBtn+'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+wLine+'</div></div>';
         });
       }
       capBlock += '</div>';
@@ -2107,6 +2113,27 @@ async function decideNow(){
     '<div class="mono" style="font-size:11px;color:var(--muted);margin-top:3px">'+histLine+'</div></div>';
 
   con.innerHTML = html;
+}
+
+// USE MODEL OPTION (T4): pre-populate the Decision card's execute inputs with a
+// REAL CAN_RUN model option (capability + model file) from the last decision.
+// Real state only: nothing runs here — it only fills the inputs and focuses the
+// prompt; execution always goes through the confirmed Execute button. Intent is
+// cleared so the backend gets `capability` (the exact option picked), never a
+// stale intent string.
+function useModelOption(cap, model){
+  const capEl = $('dec-cap');
+  if (capEl) capEl.value = cap || '';
+  const intentEl = $('dec-intent');
+  if (intentEl) intentEl.value = '';
+  const modelEl = $('dec-model');
+  if (modelEl) modelEl.value = model || '';
+  const prompt = $('dec-prompt');
+  if (prompt) {
+    if (!(prompt.value || '').trim()) prompt.value = 'run ' + (model || '');
+    prompt.focus();
+  }
+  toast('model ready: ' + short(model, 24) + ' — enter a prompt, then Execute (confirm)');
 }
 
 // EXECUTE (T3): run the decided intent on the fabric with explicit UI

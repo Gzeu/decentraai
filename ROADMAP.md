@@ -1424,3 +1424,11 @@ without executing.
   and `previewDecision()` send `capability` only when intent is absent (intent
   preferred when both filled). Real run still goes through the confirmed
   Execute path. Nothing fabricated.
+
+## 62. Next-Gen — "execute this" on CAN_RUN model options
+
+- [x] In the Decision card, each CAN_RUN model option gains an "execute"
+  button: `useModelOption(cap, model)` pre-populates `#dec-cap` (and clears
+  intent so the exact capability is sent) + `#dec-model`, prefills the prompt
+  only if empty, and toasts — execution still requires the confirmed Execute
+  path (no auto-run, no bypass). CANNOT_RUN/UNKNOWN options show a muted "—".
