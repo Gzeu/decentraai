@@ -55,6 +55,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
   --radius:14px; --radius-sm:9px;
   --shadow:0 14px 44px rgba(0,0,0,.45);
+  /* aliases used across the UI (kept in sync with the tokens above) */
+  --border:var(--line); --fg:var(--text);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -100,13 +102,14 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .dot.off{background:var(--faint)}
 .dot.accent{background:var(--accent);box-shadow:0 0 8px var(--accent)}
 .pulse{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .view{display:none;animation:fade .25s ease}
 .view.active{display:block}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .grid{display:grid;gap:14px}
 .grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
 .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.grid.cols-4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);transition:border-color .15s ease}
 .card:hover{border-color:var(--line-2)}
 .card h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin-bottom:12px;display:flex;align-items:center;gap:8px}
@@ -116,12 +119,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .metric .value{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.02em;line-height:1.2;white-space:nowrap}
 .metric .sub{font-size:11.5px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
 .metric.ok .value{color:var(--ok)} .metric.warn .value{color:var(--warn)} .metric.bad .value{color:var(--bad)} .metric.accent .value{color:var(--accent)}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--faint);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
-td{padding:7px 8px;border-bottom:1px solid rgba(28,38,52,.6);vertical-align:top}
-tr:last-child td{border-bottom:0}
-td.num,th.num{text-align:right;font-family:var(--mono)}
-.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;white-space:nowrap}
+ table{width:100%;border-collapse:collapse;font-size:12.5px}
+ tr:last-child td{border-bottom:0}
+ td.num,th.num{text-align:right;font-family:var(--mono)}
+ .badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;white-space:nowrap}
 .badge.ok{background:rgba(52,211,153,.12);color:var(--ok)}
 .badge.warn{background:rgba(251,191,36,.12);color:var(--warn)}
 .badge.bad{background:rgba(248,113,113,.12);color:var(--bad)}
@@ -373,7 +374,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <div class="topbar">
       <div><div class="crumb">DecentraAI · control plane</div><h1 id="page-title">Overview</h1></div>
       <div class="top-right">
-        <span class="live-pill"><span class="dot ok pulse" id="live-dot"></span><span id="live-text">model loaded</span></span>
+        <span class="live-pill"><span class="dot off" id="live-dot"></span><span id="live-text">connecting…</span></span>
         <button id="palette-open" title="Command palette (Ctrl+K)">⌘K</button>
       </div>
     </div>
@@ -424,7 +425,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <h2>Model</h2>
           <div class="metric accent" style="margin-bottom:8px"><div class="label">Active model</div><div class="value" id="model-name" style="font-size:17px">&hellip;</div></div>
           <div class="metric"><div class="label">File</div><div class="value" id="model-size" style="font-size:15px">&mdash;</div></div>
-          <div class="metric" style="margin-top:8px"><div class="label">Status</div><div class="value" id="model-status" style="font-size:15px">loading&hellip;</div></div>
+          <div class="metric" style="margin-top:8px"><div class="label">Status</div><div class="value" id="model-status" style="font-size:15px">&mdash;</div></div>
           <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="also-models"></div>
         </div>
         <div class="card">
@@ -452,7 +453,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
       <div class="card" style="margin-top:14px">
         <h2>Recent inference calls</h2>
         <table><thead><tr><th>Time</th><th>Endpoint</th><th class="num">Prompt tok</th><th class="num">Gen tok</th><th class="num">ms</th><th class="num">tok/s</th></tr></thead>
-        <tbody id="recent"><tr><td colspan="6" class="empty">loading&hellip;</td></tr></tbody></table>
+        <tbody id="recent"><tr><td colspan="6" class="empty">no inference calls yet</td></tr></tbody></table>
       </div>
 
       <div class="card" style="margin-top:14px">
@@ -625,7 +626,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <div class="grid cols-3">
             <div class="card sub">
               <h3 style="margin:0 0 6px">This node</h3>
-              <div id="pressure-local" class="empty">collecting…</div>
+              <div id="pressure-local" class="empty">no local pressure data yet</div>
             </div>
             <div class="card sub">
               <h3 style="margin:0 0 6px">Fabric aggregate</h3>
@@ -740,7 +741,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Capability overview <span class="count">local, on-disk</span></h2>
-          <div id="cap-overview" style="margin-top:6px;font-size:12px;color:var(--muted)"><span class="muted">loading…</span></div>
+          <div id="cap-overview" style="margin-top:6px;font-size:12px;color:var(--muted)"><span class="muted">&mdash;</span></div>
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Served models <span class="count" id="models-count"></span></h2>
@@ -912,7 +913,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         <div class="card" style="margin-top:14px">
           <h2>Resources <span class="count">real state · /v1/resources</span></h2>
           <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Node RAM/VRAM/CPU/DISK below; per-worker fabric rows from live advertisements. Provenance is explicit — UNKNOWN is never a fabricated zero, and RAM/VRAM are separate.</div>
-          <div class="mono" id="res-node" style="font-size:11.5px;margin-bottom:10px">collecting&hellip;</div>
+          <div class="mono" id="res-node" style="font-size:11.5px;margin-bottom:10px">no resource data yet</div>
           <div id="res-fabric" class="empty">no fabric rows (compute not attached)</div>
         </div>
         <div class="card" style="margin-top:14px">
@@ -1862,8 +1863,8 @@ function workerCard(w, localPeer){
       '<span><b>addr</b> '+esc((stageData.addresses[w.peer_id] || (isLocal ? stageData.localAddr : '')) || '—')+'</span>'+
       '<span><b>engine</b> '+esc(w.engine||'—')+'</span>'+
       '<span><b>last seen</b> '+(w.last_seen_secs != null ? fmtUptime(w.last_seen_secs)+' ago' : '—')+'</span>'+
-      '<span><b>queue</b> '+w.queue_depth+'</span><span><b>in-flight</b> '+w.in_flight+'</span>'+
-      '<span><b>tok/s</b> '+w.tokens_per_second+'</span><span><b>latency</b> '+w.current_latency_ms+'ms</span>'+
+      '<span><b>queue</b> '+(w.queue_depth!=null?w.queue_depth:'—')+'</span><span><b>in-flight</b> '+(w.in_flight!=null?w.in_flight:'—')+'</span>'+
+      '<span><b>tok/s</b> '+(w.tokens_per_second!=null?w.tokens_per_second:'—')+'</span><span><b>latency</b> '+(w.current_latency_ms!=null?w.current_latency_ms+'ms':'—')+'</span>'+
     '</div>'+
     '<div class="wc-res">'+
       '<div class="nc-bar"><span style="flex:none;width:52px">cpu</span><span class="track"><i class="'+(w.load_percent>80?'bad':w.load_percent>60?'warn':'')+'" style="width:'+Math.min(w.load_percent||0,100)+'%"></i></span><span style="flex:none;width:96px;text-align:right">'+w.load_percent+'% · '+(w.cpu_cores||'—')+' cores</span></div>'+
@@ -3001,12 +3002,15 @@ function renderObservability(s, c){
   spark('spark-latency', lat, '#22d3ee');
   spark('spark-tps', tps, '#6366f1');
   const lm = (s && s.latency_ms) || {};
-  $('obs-lat').textContent = 'p50 '+lm.p50+'ms · p95 '+lm.p95+'ms · p99 '+lm.p99+'ms · last '+((lat[0]||0))+'ms';
-  $('obs-tps').textContent = 'last '+(tps[0]||0).toFixed(1)+' tok/s';
+  const hasLat = (s && s.latency_ms && (lm.p50!=null || lm.p95!=null || lm.p99!=null));
+  $('obs-lat').textContent = hasLat
+    ? ('p50 '+lm.p50+'ms · p95 '+lm.p95+'ms · p99 '+lm.p99+'ms' + (lat[0]!=null ? ' · last '+lat[0]+'ms' : ''))
+    : (lat[0]!=null ? 'last '+lat[0]+'ms' : 'no latency data yet');
+  $('obs-tps').textContent = tps[0]!=null ? 'last '+tps[0].toFixed(1)+' tok/s' : 'no throughput yet';
   const t = (c && c.totals) || {};
-  $('obs-total-req').textContent = t.requests_completed || 0;
-  $('obs-total-tok').textContent = t.tokens_total || 0;
-  $('obs-total-fail').textContent = t.requests_failed || 0;
+  $('obs-total-req').textContent = t.requests_completed!=null ? t.requests_completed : '—';
+  $('obs-total-tok').textContent = t.tokens_total!=null ? t.tokens_total : '—';
+  $('obs-total-fail').textContent = t.requests_failed!=null ? t.requests_failed : '—';
   loadHistStats();
 }
 // Contribution-backed quota (Compute Contribution & Quota — Q3/Q4): real
@@ -3228,14 +3232,20 @@ function renderSettings(s){
   } else $('set-tiers').innerHTML = '<div class="empty">tiers disabled (admin-token-only)</div>';
 }
 function renderSecurity(){
-  // audit events
-  fetch('/api/admin/events', { headers }).then(r => r.json()).then(d => {
+  // audit events — a 401/403 (master-gated) is resolved (not rejected), so
+  // check status explicitly to show the honest "master token required" state
+  // instead of a misleading empty list.
+  fetch('/api/admin/events', { headers }).then(async r => {
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
     const evs = (d && d.events || []).slice(0, 30);
     const html = evs.map(e => '<div class="mono" style="font-size:11.5px;margin-bottom:5px"><span style="color:var(--faint)">'+tstr(e.timestamp)+'</span> <b>'+esc(e.event||'')+'</b> <span style="color:var(--muted)">'+esc(JSON.stringify(e.details||{}))+'</span></div>').join('');
     $('audit-list').innerHTML = html || '<div class="empty">no security events yet</div>';
-  }).catch(() => { $('audit-list').innerHTML = '<div class="empty">master token required</div>'; });
+  }).catch(() => { $('audit-list').innerHTML = '<div class="empty">master token required (admin endpoints are gated)</div>'; });
   // tokens (with expiry + live usage from the API)
-  fetch('/api/admin/token/list', { headers }).then(r => r.json()).then(d => {
+  fetch('/api/admin/token/list', { headers }).then(async r => {
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
     const toks = (d && d.tokens || []);
     const rows = toks.map(t => {
       let status = t.revoked ? '<span class="badge bad">revoked</span>'
@@ -3247,7 +3257,7 @@ function renderSecurity(){
       '<td>'+(isAdmin && !t.revoked ? '<button class="danger" data-n="'+t.name+'" onclick="revokeToken(event)">Revoke</button>' : '')+'</td></tr>';
     }).join('');
     $('tok-list').innerHTML = rows || '<tr><td colspan="7" class="empty">no tokens issued</td></tr>';
-  }).catch(() => { $('tok-list').innerHTML = '<tr><td colspan="7" class="empty">master token required</td></tr>'; });
+  }).catch(() => { $('tok-list').innerHTML = '<tr><td colspan="7" class="empty">master token required (admin endpoints are gated)</td></tr>'; });
   // Developer access: real endpoint this page is served from.
   const ep = (location.protocol + '//' + location.host);
   $('dev-endpoint').textContent = ep + '/v1';
@@ -3421,6 +3431,9 @@ async function refresh(){
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);
   loadCapOverview();
+  // Security view must load on page load / refresh too (not only after a token
+  // action); guarded by the API returning 401 -> "master token required".
+  renderSecurity();
 }
 setStageVisible(true);
 // Build the chat model selector once, from real data only:
