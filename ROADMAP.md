@@ -1558,3 +1558,12 @@ decisions, or orchestration.
 - [x] Platform-neutral worker path (libp2p TCP/Noise/mDNS; llama-server spawn is
       cross-platform; GPU probe degrades cleanly). Reuses the same signed
       advertisement + inbound signature verification as the full node.
+
+## 73. Next-Gen — Worker architecture documentation
+
+- [x] `docs/WORKER_ARCHITECTURE.md`: control plane vs worker plane, worker
+  dependency boundary, worker contract/advertisement (today vs future fields),
+  evidence-backed lifecycle, platform abstraction, mobile readiness & adaptive
+  contribution (explicitly CONTRACT/PLAN, not implemented), and the distributed
+  inference boundary (experimental). Honest: no fabricated mobile telemetry,
+  remote update, or distributed inference.
