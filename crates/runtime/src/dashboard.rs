@@ -2981,7 +2981,8 @@ function renderResources(r){
       (w.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
       ' · '+esc(w.engine||'—')+
       '<div style="color:var(--muted)">cpu '+((w.cpu&&w.cpu.load_percent)||0)+'% · '+ramH+vramH+
-      ' · queue '+(w.queue?w.queue.depth:'—')+' · latency '+(w.latency?w.latency.ms+'ms @ '+(w.latency.tokens_per_second||0)+' t/s':'—')+'</div></div>';
+      ' · queue '+(w.queue?w.queue.depth:'—')+' · latency '+(w.latency?w.latency.ms+'ms @ '+(w.latency.tokens_per_second||0)+' t/s':'—')+
+      ' · capacity '+esc(w.capacity||'—')+' · adaptive '+(w.adaptive_contribution!=null?w.adaptive_contribution.toFixed(2):'—')+'</div></div>';
   }).join('');
   $('res-fabric').innerHTML = rows || '<div class="empty">no fabric workers advertised</div>';
 }

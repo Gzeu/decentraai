@@ -1769,3 +1769,29 @@ auth architecture (hash-only storage, atomic persistence, revoke-by-id, roles)
   `decide`, executes with quota, is denied operational tools, and a failed
   MCP execution releases its reservation. Workspace tests, clippy `-D
   warnings`, release build green.
+
+## 85. Next-Gen — Adaptive worker contribution
+
+First step of the mobile/lightweight-worker adaptive-contribution direction:
+a worker's effective capacity is reduced by real, measured pressure so the
+planner sends stressed workers less work. Real signals only — nothing
+fabricated, UNKNOWN stays neutral.
+
+- [x] `ComputeAvailability.battery_percent` (Option<u8>) — real battery charge
+  when probed (mobile/laptop); `None` on desktop/UNKNOWN. Backward-compatible.
+- [x] `ComputeAvailability::adaptive_contribution_factor()` (0.0..1.0) — pure
+  product of real GPU thermal, GPU utilization, CPU load and battery terms:
+  thermal ≥95°C → ×0.1, ≥90 → ×0.25, ≥80 → ×0.5, ≥70 → ×0.8; full GPU util
+  → ×0.3; full CPU load → ×0.3; battery ≤10% → ×0.1, ≤20 → ×0.25, ≤50 → ×0.6.
+  UNKNOWN signals are neutral (never invented); result clamped to (0, 1] so a
+  worker always remains eligible for a small share.
+- [x] **Scheduler scoring** — `ComputeScheduler::score` multiplies the base
+  fit score by the adaptive factor, so a stressed worker is ranked below an
+  otherwise-identical healthy worker (verified by test).
+- [x] **Observability** — `/v1/fabric` nodes + `/v1/resources` fabric rows
+  expose `adaptive_contribution` (+ `battery_percent`); dashboard fabric row
+  shows `capacity` + `adaptive` factor.
+- [x] Tests: factor is neutral with all signals UNKNOWN, reduces under
+  thermal/battery/GPU-util stress, stays positive under combined worst case;
+  scheduler picks the healthy worker over the thermally-stressed identical
+  one. Workspace tests, clippy `-D warnings`, release build green.

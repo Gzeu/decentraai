@@ -564,6 +564,7 @@ mod tests {
                 status: decentraai_compute::WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,

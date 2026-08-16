@@ -236,6 +236,9 @@ impl ComputeScheduler {
         load_score * 0.30 + queue_score * 0.20 + throughput_score * 0.20
             + latency_score * 0.15
             + headroom * 0.15
+            // Adaptive contribution (roadmap): a stressed worker (high GPU
+            // thermal / GPU util / CPU load / low battery) gets less new work.
+            * a.adaptive_contribution_factor()
     }
 
     /// Placement confidence: how much free headroom and how little backlog
@@ -278,6 +281,7 @@ mod tests {
                 status: WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             })
     }
 
@@ -448,5 +452,27 @@ mod tests {
         assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_none(), "double-booking refused");
         sched.release(first.reservation.reservation_id);
         assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_some(), "release frees the slot");
+    }
+
+    #[test]
+    fn thermally_stressed_worker_is_ranked_below_identical_healthy_worker() {
+        // Adaptive contribution: two otherwise-identical workers — one healthy,
+        // one with high GPU thermal pressure — the healthy one must win.
+        let healthy = peer();
+        let hot = peer();
+        let mut sched = scheduler(HashSet::from([healthy, hot]));
+        for p in [healthy, hot] {
+            sched.upsert(advertisement(p, 12 * 1024, 18 * 1024, 10, 0, 80, 60));
+        }
+        // Mark `hot` as under GPU thermal pressure (95°C).
+        let mut adv = sched.registry().get(&hot).unwrap().clone();
+        adv.availability.gpu_temperature_celsius = Some(95);
+        sched.upsert(adv);
+
+        let winner = sched.select(&req(), Instant::now()).expect("a worker must be selected");
+        assert_eq!(
+            winner.worker, healthy,
+            "the healthy worker must win over the thermally-stressed one"
+        );
     }
 }

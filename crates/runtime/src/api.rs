@@ -4846,6 +4846,8 @@ fn fabric_graph_aggregate(
                     "utilization_percent": w.availability.gpu_utilization_percent,
                 },
                 "capacity": w.availability.capacity_state(),
+                "adaptive_contribution": w.availability.adaptive_contribution_factor(),
+                "battery_percent": w.availability.battery_percent,
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -5141,6 +5143,10 @@ async fn resources_handler(
                     "provenance": latency_provenance,
                 },
                 "capacity": adv.availability.capacity_state(),
+                // Adaptive-contribution load factor (0.0..1.0): how much work
+                // this worker should get given real thermal/GPU/CPU/battery
+                // pressure. ~1.0 healthy; lower = stressed. Real signals only.
+                "adaptive_contribution": adv.availability.adaptive_contribution_factor(),
             }));
         }
     }
@@ -6953,6 +6959,7 @@ mod tests {
                 status: decentraai_compute::WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,
@@ -8960,6 +8967,7 @@ mod tests {
                 status: decentraai_distributed::compute::WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             },
             announced_at_ms: 0,
             accepts_remote_inference: true,
@@ -10455,6 +10463,7 @@ mod tests {
                 status: decentraai_distributed::compute::WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             },
             announced_at_ms: 0,
             accepts_remote_inference: accepts_remote,

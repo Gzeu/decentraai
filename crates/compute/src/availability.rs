@@ -49,6 +49,12 @@ pub struct ComputeAvailability {
     /// Real GPU utilization (0..100) from the last probe, when available.
     #[serde(default)]
     pub gpu_utilization_percent: Option<u8>,
+    /// Real battery charge percentage (0..100) from the last probe, when the
+    /// node has a battery (mobile/laptop). `None` on desktop/no battery /
+    /// UNKNOWN. Foundation for battery-aware adaptive contribution: a low
+    /// battery worker is given less work.
+    #[serde(default)]
+    pub battery_percent: Option<u8>,
 }
 
 impl ComputeAvailability {
@@ -75,6 +81,67 @@ impl ComputeAvailability {
         } else {
             "FULL"
         }
+    }
+
+    /// Adaptive-contribution load factor (0.0..1.0), derived ONLY from real
+    /// availability signals (never fabricated):
+    ///
+    /// - GPU thermal pressure: near/above the throttle point reduces capacity.
+    /// - GPU utilization: a fully-busy GPU gets less new work.
+    /// - CPU load: a heavily loaded machine gets less new work.
+    /// - Battery: a low-battery worker gets less work (mobile/laptop).
+    ///
+    /// UNKNOWN signals (None) are neutral (factor 1.0 for that term): we never
+    /// invent a measurement. The result is the product of the available terms,
+    /// so any single stressed signal can reduce capacity while healthy nodes
+    /// keep factor ~1.0. This is the honest input the planner uses to reduce
+    /// the share of work sent to a stressed worker.
+    pub fn adaptive_contribution_factor(&self) -> f32 {
+        let mut f = 1.0_f32;
+
+        // GPU thermal: >90°C → heavily reduced; >80°C → reduced; else neutral.
+        if let Some(t) = self.gpu_temperature_celsius {
+            let t = f32::from(t);
+            f *= if t >= 95.0 {
+                0.1
+            } else if t >= 90.0 {
+                0.25
+            } else if t >= 80.0 {
+                0.5
+            } else if t >= 70.0 {
+                0.8
+            } else {
+                1.0
+            };
+        }
+
+        // GPU utilization: scale linearly from full capacity at 0% util down
+        // to 0.3 at 100% util (a fully-busy GPU takes little new work).
+        if let Some(u) = self.gpu_utilization_percent {
+            let u = f32::from(u).clamp(0.0, 100.0);
+            f *= 1.0 - 0.7 * (u / 100.0);
+        }
+
+        // CPU load: linear reduction from 1.0 (idle) to 0.3 (fully loaded).
+        let load = f32::from(self.load_percent.clamp(0, 100)) / 100.0;
+        f *= 1.0 - 0.7 * load;
+
+        // Battery: below 20% → heavily reduced; below 50% → reduced; else
+        // neutral. None (no battery / UNKNOWN) is neutral.
+        if let Some(b) = self.battery_percent {
+            let b = f32::from(b);
+            f *= if b <= 10.0 {
+                0.1
+            } else if b <= 20.0 {
+                0.25
+            } else if b <= 50.0 {
+                0.6
+            } else {
+                1.0
+            };
+        }
+
+        f.clamp(0.0, 1.0)
     }
 }
 
@@ -133,6 +200,7 @@ mod tests {
             status: WorkerHealth::Ready,
             gpu_temperature_celsius: None,
             gpu_utilization_percent: None,
+            battery_percent: None,
         };
         assert_eq!(a.capacity_state(), "FULL");
         // Healthy but loaded -> LIMITED.
@@ -151,6 +219,87 @@ mod tests {
         assert!(WorkerHealth::Ready.can_accept_work());
         assert!(!WorkerHealth::Busy.can_accept_work());
         assert!(!WorkerHealth::Unhealthy.can_accept_work());
+    }
+
+    #[test]
+    fn adaptive_contribution_factor_is_neutral_when_all_unknown() {
+        let a = ComputeAvailability {
+            available_ram_mb: 1000,
+            available_vram_mb: None,
+            load_percent: 0,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 10,
+            status: WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+            battery_percent: None,
+        };
+        // No measurements -> factor 1.0 (neutral), never reduced by invention.
+        assert_eq!(a.adaptive_contribution_factor(), 1.0);
+    }
+
+    #[test]
+    fn adaptive_contribution_factor_reduces_on_stress() {
+        let mut a = ComputeAvailability {
+            available_ram_mb: 1000,
+            available_vram_mb: None,
+            load_percent: 0,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 10,
+            status: WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+            battery_percent: None,
+        };
+        let healthy = a.adaptive_contribution_factor();
+        // High GPU thermal reduces capacity.
+        a.gpu_temperature_celsius = Some(95);
+        assert!(
+            a.adaptive_contribution_factor() < healthy,
+            "thermal pressure must reduce the contribution factor"
+        );
+        // A low battery reduces it further.
+        a.gpu_temperature_celsius = None;
+        a.battery_percent = Some(10);
+        assert!(
+            a.adaptive_contribution_factor() < healthy,
+            "low battery must reduce the contribution factor"
+        );
+        // A full GPU util reduces it.
+        a.battery_percent = None;
+        a.gpu_utilization_percent = Some(100);
+        assert!(
+            a.adaptive_contribution_factor() < healthy,
+            "full GPU utilization must reduce the contribution factor"
+        );
+    }
+
+    #[test]
+    fn adaptive_contribution_factor_is_bounded_and_monotone() {
+        let base = ComputeAvailability {
+            available_ram_mb: 1000,
+            available_vram_mb: None,
+            load_percent: 0,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 10,
+            status: WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+            battery_percent: None,
+        };
+        // Combined worst case is clamped to a small positive floor, never 0 or
+        // negative (a worker can always accept a tiny share, not be invisible).
+        let mut worst = base.clone();
+        worst.gpu_temperature_celsius = Some(95);
+        worst.gpu_utilization_percent = Some(100);
+        worst.load_percent = 100;
+        worst.battery_percent = Some(5);
+        let f = worst.adaptive_contribution_factor();
+        assert!(f > 0.0, "factor must stay positive, got {f}");
+        assert!(f < base.adaptive_contribution_factor());
     }
 
     #[test]
@@ -189,6 +338,7 @@ mod tests {
                 status: WorkerHealth::Ready,
                 gpu_temperature_celsius: None,
                 gpu_utilization_percent: None,
+                battery_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,

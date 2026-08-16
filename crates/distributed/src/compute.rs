@@ -237,6 +237,7 @@ pub fn build_advertisement(
             status: WorkerHealth::Ready,
             gpu_temperature_celsius: gpu_temp,
             gpu_utilization_percent: gpu_util,
+            battery_percent: None,
         },
         announced_at_ms,
         accepts_remote_inference: accepts_remote,
