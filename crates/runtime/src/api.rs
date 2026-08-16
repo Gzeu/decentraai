@@ -4140,11 +4140,24 @@ fn prometheus_escape(s: &str) -> String {
 /// JSON-RPC 2.0 over HTTP. Exposes the node's live fabric to external AI
 /// agents as read-only tools. Reuses the existing `dsk_` Bearer auth (same
 /// boundary as the operational /v1/* views it wraps) — no new token system.
+/// Consumer `dca_` keys (Q2) may call the inference-consumption tools
+/// (`decide`, `execute_decision`) with quota authorization; they are denied
+/// the operational/read views (which stay operator/admin).
 async fn mcp_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    // A consumer `dca_` key: allowed only the consumption path (decide +
+    // execute_decision), never the operational/read views (workers, network,
+    // executions, sessions, quota, consumer keys). No master/operator grant.
+    if matches!(auth, Auth::Consumer { .. }) {
+        return mcp_consumer_handler(&state, &auth, &body).await;
+    }
     // Operational control-plane data: operator/admin role required, matching
     // /v1/compute, /v1/network and /v1/execution which MCP wraps.
     if let Err(e) = state.require_operator_or_admin(&headers) {
@@ -4299,6 +4312,89 @@ async fn mcp_handler(
             })
         }).collect::<Vec<_>>() });
     }
+    let response = crate::mcp::handle_message(&ctx, &raw);
+    let json = response.unwrap_or_else(|| serde_json::json!({}));
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// MCP handler for a consumer `dca_` key (Q2/Q4): the external-agent
+/// consumption path. A consumer may only call the inference tools `decide`
+/// (read-only projection) and `execute_decision` (quota-bounded mutation). All
+/// other tools (workers, network, executions, sessions, quota, consumer keys)
+/// are denied — a consumer never sees the operational control plane and never
+/// gains admin/operator privileges.
+///
+/// For `execute_decision` the full consumption lifecycle is enforced against
+/// the authoritative quota ledger: per-key rate limit → reserve
+/// `min(account.available, ceiling)` → execute through the existing fabric →
+/// settle the real measured tokens → release any unused reservation. No
+/// duplicate accounting; the ledger remains the single source of truth.
+async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
+    let Auth::Consumer {
+        key_id,
+        account,
+        quota_ceiling,
+        rate_limit_per_minute,
+    } = auth
+    else {
+        return forbidden("not a consumer credential");
+    };
+    let raw = String::from_utf8_lossy(body);
+    let mut ctx = mcp_context(state).await;
+
+    // `decide`: read-only unified decision projection — allowed for consumers
+    // so an agent can pick what to run before executing.
+    if let Some((intent, evidence, model)) = crate::mcp::decision_request(&raw) {
+        ctx.decision = unified_fabric_decision(state, &intent, &evidence, model.as_deref()).await;
+    } else if crate::mcp::execution_request(&raw).is_some() {
+        // `execute_decision`: the mutating consumption step, quota-gated.
+        // The confirmation gate is enforced inside `run_execute_decision`.
+        let args: serde_json::Value =
+            serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
+        // Per-key rate limit (frequency), independent from quota.
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
+        // Quota reservation for this request (request_id from a monotonic
+        // timestamp + key — idempotent across a retry of the same key+instant).
+        let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
+        let Some(mut guard) =
+            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        else {
+            return forbidden("no spendable quota for this consumer account");
+        };
+        // Execute through the existing fabric (decide→reserve→execute).
+        let resp = run_execute_decision(state, &args).await;
+        // Settle the reservation against the real measured tokens the router
+        // returned; the unused reserved quota is released by the ledger.
+        let (parts, resp_body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(resp_body, 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+        let tokens_used = payload["executed"]["tokens_used"].as_u64().unwrap_or(0);
+        let ok = parts.status.is_success();
+        if ok {
+            guard.settle(tokens_used);
+            state.note_token_usage(auth, tokens_used);
+        }
+        // On failure the guard's Drop releases the reservation (no leak).
+        ctx.execution = serde_json::json!({
+            "status": parts.status.as_u16(),
+            "ok": ok,
+            "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
+            "body": payload,
+        });
+    } else {
+        // Any other tool is not in the consumer consumption scope.
+        return forbidden("consumer API keys may only call decide or execute_decision");
+    }
+
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -10862,5 +10958,126 @@ mod tests {
         assert!(ops.contains(&"settle"), "consumer settle is recorded");
         // All events carry the policy version that governed them.
         assert!(events.iter().all(|e| e.policy_version == 1));
+    }
+
+    // ---- Q2/Q4 MCP consumption flow --------------------------------------
+
+    /// Creates a consumer key via the admin API and returns its plaintext.
+    async fn make_consumer_key(api: SocketAddr, account: &str) -> String {
+        let client = reqwest::Client::new();
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": account, "quota_ceiling": 1000, "rate_limit_per_minute": 50,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        created["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn mcp_consumer_can_decide_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let plaintext = make_consumer_key(api, "consumer-account").await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        // A consumer can call `decide` (read-only inference planning).
+        assert_eq!(r.status(), 200, "consumer may decide via MCP");
+    }
+
+    #[tokio::test]
+    async fn mcp_consumer_execute_enforces_quota_and_releases_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let plaintext = make_consumer_key(api, "consumer-account").await;
+        let client = reqwest::Client::new();
+
+        // This test state has no distributed fabric router attached, so the
+        // execution cannot route. That is the failure case: the consumer's
+        // reservation must be RELEASED (not leaked, not settled) because no
+        // measured work completed.
+        let before = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
+        let before_available = before.available;
+
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"execute_decision","arguments":{"intent":"chat","prompt":"hi","confirm":true}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "consumer may call execute via MCP");
+        let j: serde_json::Value = r.json().await.unwrap();
+        let content = j["result"]["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
+        // Without a fabric router the execution cannot succeed (honest).
+        assert_eq!(parsed["ok"], false, "no fabric router -> execution fails honestly");
+
+        // The reservation was released on failure: no quota leaked as reserved
+        // and nothing was consumed (no measured work).
+        let after = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
+        assert_eq!(after.reserved, 0, "failed execution must release its reservation");
+        assert_eq!(after.consumed, 0, "failed execution settles nothing");
+        assert_eq!(after.available, before_available, "quota fully returned to the pool");
+    }
+
+    #[tokio::test]
+    async fn mcp_consumer_is_denied_operational_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let plaintext = make_consumer_key(api, "consumer-account").await;
+        let client = reqwest::Client::new();
+
+        // A consumer must NOT see the operational/read views (workers,
+        // network, executions, sessions, quota, consumer keys).
+        for tool in ["list_workers", "list_sessions", "get_quota", "list_consumer_keys", "list_executions"] {
+            let r = client
+                .post(format!("http://{api}/mcp"))
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .json(&serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "consumer must be denied {tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_invalid_consumer_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000")
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "unknown consumer key is unauthorized via MCP");
     }
 }

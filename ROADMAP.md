@@ -1756,7 +1756,16 @@ auth architecture (hash-only storage, atomic persistence, revoke-by-id, roles)
   earned/available/reserved/consumed, totals, active policy version, plus a
   "recent quota events" provenance trail (credit/reserve/settle/release with
   policy version), from `/v1/compute`. Real measured state only.
+- [x] **MCP consumption flow** — a consumer `dca_` key may call the inference
+  tools `decide` (read-only) and `execute_decision` (quota-bounded mutation)
+  through `/mcp`: per-key rate limit → reserve `min(account.available,
+  ceiling)` → execute through the existing fabric → settle the real measured
+  tokens → release unused reservation (RAII guard, incl. on failure). All
+  other tools (workers, network, executions, sessions, quota, consumer keys)
+  are denied to consumers; a consumer never gains admin/operator privileges.
 - [x] Tests: create/auth/invalid/revoked/permission/ceiling/rate-limit/
   reserve-settle/release-on-failure; secret never in metadata; quota
-  provenance exposed after a settled consumer request. Workspace tests, clippy
-  `-D warnings`, release build green.
+  provenance exposed after a settled consumer request; MCP consumer can
+  `decide`, executes with quota, is denied operational tools, and a failed
+  MCP execution releases its reservation. Workspace tests, clippy `-D
+  warnings`, release build green.
