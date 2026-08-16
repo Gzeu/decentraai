@@ -4469,11 +4469,31 @@ async fn compute_handler(
         let report = compute.metrics_report().await;
         let executions = compute.executions();
         let session_count = compute.session_count();
+        // Quota provenance (Q4): the bounded audit trail explaining each
+        // credit/reserve/settle/release + the policy version behind it, so an
+        // operator can answer "why did this account gain/consume N quota".
+        // Newest first; never contains prompts/outputs or secrets.
+        let quota_events: Vec<serde_json::Value> = compute
+            .quota_events()
+            .into_iter()
+            .rev()
+            .take(64)
+            .map(|e| {
+                serde_json::json!({
+                    "op": e.op,
+                    "account": e.account,
+                    "amount": e.amount,
+                    "ref_id": e.ref_id,
+                    "policy_version": e.policy_version,
+                })
+            })
+            .collect();
         body = serde_json::json!({
             "attached": true,
             "workers": report.workers,
             "contributions": report.contributions,
             "quota": report.quota,
+            "quota_events": quota_events,
             "local_peer": report.local_peer,
             "local_perf": report.local_perf,
             "totals": report.totals,
@@ -10800,5 +10820,47 @@ mod tests {
         assert_eq!(statuses[2], 429, "3rd request exceeds the 2/min limit");
         let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
         assert!(audit.contains("consumer_rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn consumer_quota_events_expose_provenance() {
+        // Q4 observability: after a settled consumer request, the quota
+        // provenance (credit/reserve/settle with policy version) is surfaced
+        // via the compute manager, explaining why the account's balance moved.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account", "quota_ceiling": 100, "rate_limit_per_minute": 10,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+
+        // A consumer chat request that settles measured usage.
+        client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({"model":"test","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+
+        // The shared ledger has provenance events (credit + reserve + settle).
+        let events = ledger.lock().unwrap().events().clone();
+        let ops: Vec<&str> = events.iter().map(|e| e.op.as_str()).collect();
+        assert!(ops.contains(&"credit"), "seed credit is recorded");
+        assert!(ops.contains(&"reserve"), "consumer reservation is recorded");
+        assert!(ops.contains(&"settle"), "consumer settle is recorded");
+        // All events carry the policy version that governed them.
+        assert!(events.iter().all(|e| e.policy_version == 1));
     }
 }

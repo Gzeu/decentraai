@@ -583,6 +583,18 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <table><thead><tr><th>Worker</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Online</th><th class="num">Verified</th><th class="num">Failed</th><th class="num">Score</th><th>Tier</th><th class="num">Reward</th></tr></thead>
           <tbody id="contributions"><tr><td colspan="9" class="empty">no contribution ledger yet</td></tr></tbody></table>
         </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Quota <span class="count">contribution-backed · policy v<span id="quota-policy-version">—</span></span></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px">
+            <div class="metric"><div class="label">Total earned</div><div class="value" id="quota-total-earned">—</div></div>
+            <div class="metric"><div class="label">Total consumed</div><div class="value" id="quota-total-consumed">—</div></div>
+            <div class="metric"><div class="label">Accounts</div><div class="value" id="quota-account-count">—</div></div>
+          </div>
+          <table><thead><tr><th>Account</th><th class="num">Earned</th><th class="num">Available</th><th class="num">Reserved</th><th class="num">Consumed</th></tr></thead>
+          <tbody id="quota-accounts"><tr><td colspan="5" class="empty">no quota ledger yet</td></tr></tbody></table>
+          <div style="margin-top:10px"><b style="font-size:12px">Recent quota events <span class="muted">provenance · policy v</span></b>
+          <div id="quota-events" class="muted" style="font-size:12px;margin-top:4px">—</div></div>
+        </div>
       </section>
 
       <!-- NETWORK -->
@@ -2867,6 +2879,27 @@ function renderObservability(s, c){
   $('obs-total-fail').textContent = t.requests_failed || 0;
   loadHistStats();
 }
+// Contribution-backed quota (Compute Contribution & Quota — Q3/Q4): real
+// measured-work balances per account, converted under the versioned policy.
+function renderQuota(c){
+  const q = (c && c.quota) || null;
+  $('quota-policy-version').textContent = (q && q.policy_version != null) ? q.policy_version : '—';
+  if (!q) { $('quota-total-earned').textContent = '—'; $('quota-total-consumed').textContent = '—'; $('quota-account-count').textContent = '—'; $('quota-accounts').innerHTML = '<tr><td colspan="5" class="empty">no quota ledger yet</td></tr>'; return; }
+  const accs = q.accounts || [];
+  $('quota-total-earned').textContent = q.total_earned || 0;
+  $('quota-total-consumed').textContent = q.total_consumed || 0;
+  $('quota-account-count').textContent = accs.length;
+  if (!accs.length) { $('quota-accounts').innerHTML = '<tr><td colspan="5" class="empty">no accounts with quota yet</td></tr>'; return; }
+  $('quota-accounts').innerHTML = accs.map(a =>
+    '<tr><td><code>'+esc(a.account)+'</code></td><td class="num">'+a.earned+'</td><td class="num">'+a.available+'</td><td class="num">'+a.reserved+'</td><td class="num">'+a.consumed+'</td></tr>'
+  ).join('');
+  // Quota provenance: explain each recent credit/reserve/settle/release.
+  const evs = (c && c.quota_events) || [];
+  $('quota-events').textContent = '';
+  $('quota-events').innerHTML = evs.length ? evs.map(e =>
+    '<code>'+esc(e.op)+'</code> '+esc(e.account)+' · '+e.amount+'u'+(e.policy_version!=null?' · v'+e.policy_version:'')+' <span class="muted">('+esc(e.ref_id)+')</span>').join('<br>')
+    : '<span class="muted">no quota accounting events yet</span>';
+}
 // Historical execution statistics (Phase N): deterministic aggregates from real
 // measured execution history via /v1/stats. Operator/admin-gated.
 async function loadHistStats(){
@@ -3210,7 +3243,7 @@ async function refresh(){
     renderRecovery(s, null, null);
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
-  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
+  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
   try { await renderSessions(); } catch (e) {}

@@ -1752,6 +1752,11 @@ auth architecture (hash-only storage, atomic persistence, revoke-by-id, roles)
   secret); `get_quota` already covers the ledger.
 - [x] **Dashboard** — admin page Consumer API Keys card (create/list/revoke,
   usage + account quota).
+- [x] **Main dashboard Quota card** (Q4 observability) — per-account
+  earned/available/reserved/consumed, totals, active policy version, plus a
+  "recent quota events" provenance trail (credit/reserve/settle/release with
+  policy version), from `/v1/compute`. Real measured state only.
 - [x] Tests: create/auth/invalid/revoked/permission/ceiling/rate-limit/
-  reserve-settle/release-on-failure; secret never in metadata. Workspace tests,
-  clippy `-D warnings`, release build green.
+  reserve-settle/release-on-failure; secret never in metadata; quota
+  provenance exposed after a settled consumer request. Workspace tests, clippy
+  `-D warnings`, release build green.
