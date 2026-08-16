@@ -290,9 +290,11 @@ pub struct ComputeManager {
     measured_contribution: std::sync::Mutex<MeasuredContribution>,
     /// Contribution-backed quota ledger (Compute Contribution & Quota — Q3):
     /// converts the *credited* measured work into spendable quota units under
-    /// a versioned, replaceable policy. Guarded by a std mutex; the pure
-    /// ledger does no I/O and never blocks on await.
-    quota: std::sync::Mutex<decentraai_compute::QuotaLedger>,
+    /// a versioned, replaceable policy. `Arc`-shared so the runtime's consumer
+    /// path (ApiState) reserves/settles against the SAME authoritative ledger
+    /// that worker contribution credits — no second balance. The pure ledger
+    /// does no I/O and never blocks on await.
+    quota: std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>>,
     /// Live, coordinator-side network graph (M19): measured RTT / bandwidth
     /// to each peer, fed by a periodic `InferPing` probe and read by the
     /// execution planner to weight reach cost.
@@ -365,9 +367,9 @@ impl ComputeManager {
             contribution: std::sync::Mutex::new(BTreeMap::new()),
             credited_executions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             measured_contribution: std::sync::Mutex::new(MeasuredContribution::default()),
-            quota: std::sync::Mutex::new(decentraai_compute::QuotaLedger::new(
+            quota: std::sync::Arc::new(std::sync::Mutex::new(decentraai_compute::QuotaLedger::new(
                 decentraai_compute::ContributionPolicy::default(),
-            )),
+            ))),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
@@ -617,6 +619,13 @@ impl ComputeManager {
     /// The quota ledger's audit trail (provenance). Read-only.
     pub fn quota_events(&self) -> std::collections::VecDeque<decentraai_compute::QuotaEvent> {
         self.quota.lock().unwrap().events().clone()
+    }
+
+    /// Shared handle to the authoritative quota ledger. The runtime's consumer
+    /// path holds a clone so worker credits and consumer reserve/settle are
+    /// one ledger (Q2: no second balance).
+    pub fn quota_ledger(&self) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>> {
+        self.quota.clone()
     }
 
     /// Records a retryable routing failure for `peer` (P5), possibly tripping

@@ -68,6 +68,13 @@ enum Command {
         #[command(subcommand)]
         command: TierCommand,
     },
+    /// Manage consumer API keys (`dca_…`) for the Compute Contribution &
+    /// Quota consumer path (Q2): an access credential + quota ceiling, never
+    /// an admin credential.
+    ConsumerKey {
+        #[command(subcommand)]
+        command: ConsumerKeyCommand,
+    },
     /// Run the full node as a background daemon — LAN/P2P discovery, model
     /// serving and the dashboard all at once, the way the desktop app / systemd
     /// service drives it. Detects and provisions a model automatically; the
@@ -375,6 +382,42 @@ enum TokenCommand {
     },
 }
 
+/// Consumer API key management (Q2): create/revoke/list `dca_…` keys for the
+/// Compute Contribution & Quota consumer path.
+#[derive(Debug, Subcommand)]
+enum ConsumerKeyCommand {
+    /// Issue a consumer API key for an account; shown once, stored only as a
+    /// hash. The key is an access credential + quota ceiling, never admin.
+    Create {
+        /// Owner account in the quota ledger (e.g. the worker/contributor name).
+        #[arg(long)]
+        account: String,
+        /// Per-request quota ceiling in quota units (> 0).
+        #[arg(long)]
+        quota_ceiling: u64,
+        /// Per-key rate limit (requests per minute, > 0).
+        #[arg(long)]
+        rate_limit_per_minute: u32,
+        /// Comma-separated permission scopes (e.g. "inference").
+        #[arg(long, default_value = "inference")]
+        scopes: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// List every consumer key's metadata (never the plaintext secret).
+    List {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Revoke a consumer key by key id; it stops authenticating immediately.
+    Revoke {
+        #[arg(long)]
+        key_id: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -436,6 +479,7 @@ async fn main() -> Result<()> {
         Command::Distributed(args) => distributed_command(args).await,
         Command::Trust { command } => trust_command(command),
         Command::Tier { command } => tier_command(command),
+        Command::ConsumerKey { command } => consumer_key_command(command),
         Command::Node(args) => node_start(args).await,
         Command::Open(args) => open_dashboard(args),
         Command::Invite(args) => invite(args),
@@ -1287,6 +1331,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
+        // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
+        // quota ledger with the compute manager, so worker credits and
+        // consumer reserve/settle are one ledger.
+        state.attach_consumer(
+            Some(data_dir.join("db/consumer_keys.json")),
+            Some(compute_manager.quota_ledger()),
+        );
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
             Err(e) => warn!(error = %e, "dashboard failed to bind"),
@@ -2758,6 +2809,90 @@ fn token_command(command: TokenCommand) -> Result<()> {
                 serde_json::json!({"name": name}),
             );
             println!("Token '{name}' revoked; it stops working at the next API request.");
+        }
+    }
+    Ok(())
+}
+
+/// Q2 — consumer API key management (`dca_…`): create/list/revoke keys for
+/// the Compute Contribution & Quota consumer path. Reuses the `dsk_`-style
+/// security model (hash-only storage, atomic persistence, revoke-by-id).
+fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
+    use decentraai_tokens::ConsumerKeyStore;
+    let config_path = match &command {
+        ConsumerKeyCommand::Create { config, .. }
+        | ConsumerKeyCommand::List { config }
+        | ConsumerKeyCommand::Revoke { config, .. } => config,
+    };
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let registry_path = data_dir.join("db/consumer_keys.json");
+    let mut store = ConsumerKeyStore::load(&registry_path)
+        .with_context(|| format!("loading consumer key registry from {}", registry_path.display()))?;
+    let logs_dir = data_dir.join("logs");
+
+    match command {
+        ConsumerKeyCommand::Create {
+            account,
+            quota_ceiling,
+            rate_limit_per_minute,
+            scopes,
+            ..
+        } => {
+            let scopes: Vec<String> = scopes
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let plaintext = store.create(&account, quota_ceiling, rate_limit_per_minute, scopes.clone())?;
+            decentraai_audit::record_best_effort(
+                &logs_dir,
+                "consumer_key_created",
+                serde_json::json!({
+                    "account": account,
+                    "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+                    "quota_ceiling": quota_ceiling,
+                    "rate_limit_per_minute": rate_limit_per_minute,
+                    "scopes": scopes,
+                }),
+            );
+            let key_id = store
+                .lookup(&plaintext)
+                .map(|r| r.key_id.clone())
+                .unwrap_or_default();
+            println!("Consumer API key for account '{account}' (quota ceiling {quota_ceiling} units/req, {rate_limit_per_minute} req/min):");
+            println!("  {plaintext}");
+            println!("  key_id: {key_id}");
+            println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
+            println!("Never share it; it is an inference credential, not an admin key.");
+        }
+        ConsumerKeyCommand::List { .. } => {
+            let records = store.list();
+            if records.is_empty() {
+                println!("No consumer API keys yet — create one with: decentraai consumer-key create --account <n> --quota-ceiling <u> --rate-limit-per-minute <n>");
+            } else {
+                println!("Consumer API keys ({}):", records.len());
+                for r in records {
+                    let status = if r.revoked { "revoked" } else { "active" };
+                    let scopes = r.scopes.join(",");
+                    println!(
+                        "  {} ({}): account={}, ceiling={}, rate={}/min, scopes=[{}], created {}",
+                        r.key_id, status, r.owner_account, r.quota_ceiling, r.rate_limit_per_minute, scopes, r.created_at
+                    );
+                }
+                println!("The plaintext secrets are never stored or shown here.");
+            }
+        }
+        ConsumerKeyCommand::Revoke { key_id, .. } => {
+            store.revoke(&key_id)?;
+            decentraai_audit::record_best_effort(
+                &logs_dir,
+                "consumer_key_revoked",
+                serde_json::json!({"key_id": key_id}),
+            );
+            println!("Consumer key '{key_id}' revoked; it stops authenticating at the next API request.");
         }
     }
     Ok(())

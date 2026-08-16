@@ -64,6 +64,56 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
 type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
 
+/// RAII guard for a consumer-quota reservation (Q2).
+///
+/// Reserving quota up front and settling/releasing through this guard makes
+/// consumer quota enforcement safe across the proxy's many return paths: if a
+/// handler returns without settling (early error, cancellation, transport
+/// failure), the guard's `Drop` releases the reservation so no quota leaks as
+/// reserved. On a measured success the caller calls [`settle`](Self::settle),
+/// which converts the reservation into consumed quota (releasing the unused
+/// remainder) and marks it settled so `Drop` does nothing.
+struct ConsumerQuotaGuard {
+    ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
+    reservation_id: Option<String>,
+    settled: bool,
+}
+
+impl ConsumerQuotaGuard {
+    fn new(ledger: Arc<StdMutex<decentraai_compute::QuotaLedger>>, reservation_id: String) -> Self {
+        Self {
+            ledger: Some(ledger),
+            reservation_id: Some(reservation_id),
+            settled: false,
+        }
+    }
+
+    /// Settles the reservation against real measured usage. Idempotent: a
+    /// second call is a no-op. Releases the unused remainder.
+    fn settle(&mut self, tokens_used: u64) {
+        if self.settled {
+            return;
+        }
+        if let (Some(ledger), Some(id)) = (&self.ledger, &self.reservation_id) {
+            let mut ledger = ledger.lock().unwrap();
+            let _ = ledger.settle(id, tokens_used);
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for ConsumerQuotaGuard {
+    fn drop(&mut self) {
+        // Release any still-held reservation so it cannot leak as reserved.
+        if !self.settled {
+            if let (Some(ledger), Some(id)) = (&self.ledger, &self.reservation_id) {
+                let mut ledger = ledger.lock().unwrap();
+                let _ = ledger.release(id);
+            }
+        }
+    }
+}
+
 /// One completed inference call, shown in the dashboard's recent list.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestStat {
@@ -108,6 +158,17 @@ enum Auth {
         tier: u8,
         role: decentraai_tokens::Role,
     },
+    /// A consumer API key (`dca_…`) resolved through the consumer key store
+    /// (Q2). Carries the quota ceiling + rate limit from the key record; the
+    /// key never grants admin/operator privileges (see `require_master` /
+    /// `require_operator_or_admin`). `account` is the owner account in the
+    /// authoritative quota ledger.
+    Consumer {
+        key_id: String,
+        account: String,
+        quota_ceiling: u64,
+        rate_limit_per_minute: u32,
+    },
 }
 
 impl Auth {
@@ -116,6 +177,7 @@ impl Auth {
             Self::Open => "open".to_string(),
             Self::Master => "master".to_string(),
             Self::Subscriber { name, .. } => name.clone(),
+            Self::Consumer { key_id, .. } => key_id.clone(),
         }
     }
 }
@@ -156,6 +218,20 @@ pub struct ApiState {
     info: DashboardInfo,
     /// Subscription registry (db/tokens.json) when tiers are in use.
     token_store_path: Option<PathBuf>,
+    /// Consumer API key registry (db/consumer_keys.json) for the Compute
+    /// Contribution & Quota consumer path (Q2). When set, `dca_…` keys are
+    /// accepted as an inference credential with a quota ceiling + rate limit.
+    consumer_keys_path: Option<PathBuf>,
+    /// The authoritative quota ledger, `Arc`-shared with the compute manager
+    /// (Q2: worker credits and consumer reserve/settle are one ledger). `None`
+    /// when running without compute; consumer quota enforcement is skipped.
+    quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
+    /// Per-consumer-key sliding-window rate limiting (Q2). Keyed by key_id;
+    /// independent from both tier rate limits and the execute mutation limit.
+    consumer_rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
+    /// Per-consumer-key usage counters (requests + generated tokens + last used),
+    /// for the admin/dashboard. Keyed by key_id.
+    consumer_usage: UsageCounters,
     /// Tier policies from the config; None = admin-token-only.
     tiers: Option<TiersSection>,
     /// Fair FIFO queue for inference requests (Q2).
@@ -213,6 +289,10 @@ impl ApiState {
                 .unwrap_or_default(),
             info,
             token_store_path,
+            consumer_keys_path: None,
+            quota_ledger: None,
+            consumer_rate_windows: Arc::new(StdMutex::new(HashMap::new())),
+            consumer_usage: Arc::new(StdMutex::new(HashMap::new())),
             tiers,
             queue,
             started_at: Instant::now(),
@@ -236,6 +316,20 @@ impl ApiState {
         self.distributed = Some(distributed);
     }
 
+    /// Enables the consumer API key path (Q2): points at the consumer key
+    /// registry and shares the authoritative quota ledger with the compute
+    /// manager, so consumer reserve/settle is one ledger with worker credits.
+    /// Call once at startup on paths that serve inference with a compute
+    /// manager attached.
+    pub fn attach_consumer(
+        &mut self,
+        consumer_keys_path: Option<std::path::PathBuf>,
+        quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
+    ) {
+        self.consumer_keys_path = consumer_keys_path;
+        self.quota_ledger = quota_ledger;
+    }
+
     fn presented_token(headers: &HeaderMap) -> Option<&str> {
         headers
             .get(header::AUTHORIZATION)
@@ -244,7 +338,8 @@ impl ApiState {
     }
 
     /// Classifies the caller: master token, issued subscription token
-    /// (resolved through the registry on every request), or open.
+    /// (resolved through the registry on every request), a consumer API key
+    /// (`dca_…`, resolved through the consumer key store — Q2), or open.
     fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
         let presented = Self::presented_token(headers);
         match &self.auth_token {
@@ -253,6 +348,41 @@ impl ApiState {
                 let presented = presented.ok_or(GateError::Unauthorized)?;
                 if presented == master.as_ref() {
                     return Ok(Auth::Master);
+                }
+                // Consumer API keys (dca_…): resolved through the consumer key
+                // store. Never admin; carries ceiling + rate limit.
+                if presented.starts_with(decentraai_tokens::KEY_PREFIX) {
+                    if !self.consumer_enabled() {
+                        return Err(GateError::Unauthorized);
+                    }
+                    let path = self.consumer_keys_path.as_ref().unwrap();
+                    let mut store = decentraai_tokens::ConsumerKeyStore::load(path)
+                        .map_err(|_| GateError::Unauthorized)?;
+                    // Copy the auth-relevant fields, then touch last-used
+                    // (mutable) so the borrow of `store` does not conflict.
+                    let record = {
+                        let rec = store.lookup(presented);
+                        rec.map(|r| {
+                            (
+                                r.key_id.clone(),
+                                r.owner_account.clone(),
+                                r.quota_ceiling,
+                                r.rate_limit_per_minute,
+                            )
+                        })
+                    };
+                    match record {
+                        Some((key_id, account, quota_ceiling, rate_limit_per_minute)) => {
+                            store.touch_used(&key_id);
+                            return Ok(Auth::Consumer {
+                                key_id,
+                                account,
+                                quota_ceiling,
+                                rate_limit_per_minute,
+                            });
+                        }
+                        None => return Err(GateError::Unauthorized),
+                    }
                 }
                 match &self.token_store_path {
                     Some(path) => {
@@ -284,6 +414,9 @@ impl ApiState {
             Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
                 "'{name}' is a subscription token; admin asks for the master token"
             ))),
+            Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
+                "'{key_id}' is a consumer API key; admin asks for the master token"
+            ))),
             Err(_) => Err(GateError::Unauthorized),
         }
     }
@@ -304,6 +437,9 @@ impl ApiState {
                     )))
                 }
             }
+            Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
+                "'{key_id}' is a consumer API key; operational views need an operator or admin token"
+            ))),
             Err(_) => Err(GateError::Unauthorized),
         }
     }
@@ -314,6 +450,9 @@ impl ApiState {
     /// multi-model routing when that lands.
     fn check_model_access(&self, auth: &Auth, body: &[u8]) -> Result<(), GateError> {
         let Auth::Subscriber { tier, name, .. } = auth else {
+            // Master, open, and consumer keys have no per-model tier gate here:
+            // a consumer key is bounded by its quota ceiling + rate limit, not
+            // by the subscription-tier model allowlist.
             return Ok(());
         };
         let Some(tiers) = &self.tiers else {
@@ -437,17 +576,99 @@ impl ApiState {
     }
 
     fn note_token_usage(&self, auth: &Auth, generated: u64) {
-        let Auth::Subscriber { name, .. } = auth else {
-            return;
-        };
-        let mut usage = self.token_usage.lock().unwrap();
-        let entry = usage.entry(name.clone()).or_default();
-        entry.0 += 1;
-        entry.1 += generated;
-        entry.2 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        match auth {
+            Auth::Subscriber { name, .. } => {
+                let mut usage = self.token_usage.lock().unwrap();
+                let entry = usage.entry(name.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += generated;
+                entry.2 = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+            }
+            Auth::Consumer { key_id, .. } => {
+                let mut usage = self.consumer_usage.lock().unwrap();
+                let entry = usage.entry(key_id.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += generated;
+                entry.2 = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+            }
+            _ => {}
+        }
+    }
+
+    /// Per-key rate limit for consumer API keys (Q2): a sliding window keyed
+    /// by key_id, capped at the key's own `rate_limit_per_minute`. Independent
+    /// from quota (frequency vs consumption) and from tier/execute limits.
+    fn check_consumer_rate_limit(&self, key_id: &str, limit_per_minute: u32) -> Result<(), GateError> {
+        let limit = limit_per_minute as usize;
+        let mut windows = self.consumer_rate_windows.lock().unwrap();
+        let window = windows.entry(key_id.to_string()).or_default();
+        let cutoff = Instant::now() - RATE_WINDOW;
+        while window.front().is_some_and(|t| *t < cutoff) {
+            window.pop_front();
+        }
+        if window.len() >= limit {
+            decentraai_audit::record_best_effort(
+                &self.info.repo_root.join("logs"),
+                "consumer_rate_limited",
+                serde_json::json!({ "key_id": key_id, "limit_per_minute": limit }),
+            );
+            return Err(GateError::RateLimited(limit));
+        }
+        window.push_back(Instant::now());
+        Ok(())
+    }
+
+    /// Whether consumer API keys are enabled (a registry path + shared ledger
+    /// are wired). Read-only.
+    fn consumer_enabled(&self) -> bool {
+        self.consumer_keys_path.is_some() && self.quota_ledger.is_some()
+    }
+
+    /// Reserves quota for a consumer request (Q2) against the authoritative
+    /// ledger, capped at `min(account.available, quota_ceiling)`. Returns a
+    /// RAII guard: on success the caller settles it with measured usage; on
+    /// any other exit the guard's `Drop` releases the reservation (no leak).
+    fn reserve_consumer_quota(
+        &self,
+        account: &str,
+        key_id: &str,
+        request_id: &str,
+        quota_ceiling: u64,
+    ) -> Option<ConsumerQuotaGuard> {
+        let ledger = self.quota_ledger.clone()?;
+        let reservation_id = format!("consumer:{key_id}:{request_id}");
+        {
+            let mut ledger = ledger.lock().unwrap();
+            let acc = ledger.account(&account.to_string());
+            let available = acc.map(|a| a.available).unwrap_or(0);
+            let amount = available.min(quota_ceiling);
+            if amount == 0 {
+                decentraai_audit::record_best_effort(
+                    &self.info.repo_root.join("logs"),
+                    "consumer_quota_denied",
+                    serde_json::json!({ "key_id": key_id, "account": account, "request_id": request_id }),
+                );
+                return None;
+            }
+            if ledger
+                .reserve(&account.to_string(), &reservation_id, amount)
+                .is_err()
+            {
+                decentraai_audit::record_best_effort(
+                    &self.info.repo_root.join("logs"),
+                    "consumer_quota_denied",
+                    serde_json::json!({ "key_id": key_id, "account": account, "request_id": request_id }),
+                );
+                return None;
+            }
+        }
+        Some(ConsumerQuotaGuard::new(ledger, reservation_id))
     }
 }
 
@@ -717,6 +938,188 @@ async fn admin_token_revoke_handler(
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({"success": success}).to_string(),
+    )
+        .into_response()
+}
+
+/// Q2 — Create a consumer API key (`dca_…`) for an account, master-gated.
+/// Shows the plaintext secret exactly once; only its hash + display prefix
+/// are stored. The key carries a per-request quota ceiling, a per-key rate
+/// limit, and optional scopes. The key never grants admin/operator privileges.
+async fn admin_consumer_key_create_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(path) = &state.consumer_keys_path else {
+        return forbidden("consumer keys are not enabled (no shared ledger)");
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let account = match req.get("account").and_then(|v| v.as_str()) {
+        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ => return forbidden("missing account"),
+    };
+    let quota_ceiling = req.get("quota_ceiling").and_then(|v| v.as_u64()).unwrap_or(0);
+    let rate_limit_per_minute = req
+        .get("rate_limit_per_minute")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let scopes = req
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if quota_ceiling == 0 {
+        return forbidden("quota_ceiling must be > 0");
+    }
+    if rate_limit_per_minute == 0 {
+        return forbidden("rate_limit_per_minute must be > 0");
+    }
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(path) {
+        Ok(s) => s,
+        Err(_) => return forbidden("consumer key store unreadable"),
+    };
+    let plaintext = match store.create(&account, quota_ceiling, rate_limit_per_minute, scopes.clone())
+    {
+        Ok(p) => p,
+        Err(e) => return forbidden(&e.to_string()),
+    };
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "consumer_key_created",
+        serde_json::json!({
+            "account": account,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "quota_ceiling": quota_ceiling,
+            "rate_limit_per_minute": rate_limit_per_minute,
+            "scopes": scopes,
+        }),
+    );
+    let key_id = store
+        .lookup(&plaintext)
+        .map(|r| r.key_id.clone())
+        .unwrap_or_default();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "token": plaintext,
+            "key_id": key_id,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "account": account,
+            "quota_ceiling": quota_ceiling,
+            "rate_limit_per_minute": rate_limit_per_minute,
+            "note": "shown once; only its hash and prefix are stored",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Q2 — Revoke a consumer API key by key id, master-gated.
+async fn admin_consumer_key_revoke_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(path) = &state.consumer_keys_path else {
+        return forbidden("consumer keys are not enabled");
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let key_id = match req.get("key_id").and_then(|v| v.as_str()) {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => return forbidden("missing key_id"),
+    };
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(path) {
+        Ok(s) => s,
+        Err(_) => return forbidden("consumer key store unreadable"),
+    };
+    if store.revoke(&key_id).is_err() {
+        return forbidden("no active consumer key with that id");
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "consumer_key_revoked",
+        serde_json::json!({"key_id": key_id}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"success": true, "key_id": key_id}).to_string(),
+    )
+        .into_response()
+}
+
+/// Q2 — List consumer API key metadata (never the plaintext secret),
+/// master-gated. Includes live usage counters from the running node.
+async fn admin_consumer_key_list_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let keys = match &state.consumer_keys_path {
+        Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
+            .map(|s| s.list())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let usage = state.consumer_usage.lock().unwrap().clone();
+    let ledger = state.quota_ledger.clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let body = serde_json::json!({"keys": keys.iter().map(|k| {
+        let u = usage.get(&k.key_id).copied().unwrap_or((0, 0, 0));
+        // Live account balance for the key's owner (authoritative ledger).
+        let (available, reserved, consumed) = ledger.as_ref().map(|l| {
+            let l = l.lock().unwrap();
+            let acc = l.account(&k.owner_account);
+            (
+                acc.map(|a| a.available).unwrap_or(0),
+                acc.map(|a| a.reserved).unwrap_or(0),
+                acc.map(|a| a.consumed).unwrap_or(0),
+            )
+        }).unwrap_or((0, 0, 0));
+        serde_json::json!({
+            "key_id": &k.key_id,
+            "prefix": &k.prefix,
+            "account": &k.owner_account,
+            "created_at": k.created_at,
+            "revoked": k.revoked,
+            "quota_ceiling": k.quota_ceiling,
+            "rate_limit_per_minute": k.rate_limit_per_minute,
+            "scopes": &k.scopes,
+            "requests": u.0,
+            "tokens_generated": u.1,
+            "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+            "account_quota": { "available": available, "reserved": reserved, "consumed": consumed },
+            "expired_or_revoked": k.revoked,
+            "age_secs": now.saturating_sub(k.created_at),
+        })
+    }).collect::<Vec<_>>()});
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
     )
         .into_response()
 }
@@ -3427,6 +3830,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
         .route("/api/admin/token/revoke", post(admin_token_revoke_handler))
+        // Q2 - Consumer API keys (master-gated; create/revoke/list metadata)
+        .route("/api/admin/consumer-key/create", post(admin_consumer_key_create_handler))
+        .route("/api/admin/consumer-key/revoke", post(admin_consumer_key_revoke_handler))
+        .route("/api/admin/consumer-key/list", get(admin_consumer_key_list_handler))
         // P3/M10 - Worker trust + audit events (master-gated control plane)
         .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
         .route("/api/admin/worker/revoke", post(admin_worker_revoke_handler))
@@ -5262,6 +5669,43 @@ async fn proxy_with_auth(
         }
     }
 
+    // Q2 consumer-quota authorization: reserve quota up front for a consumer
+    // key's inference request. The RAII guard settles on measured success and
+    // releases on any other exit (early error, cancellation, transport
+    // failure), so quota can never leak as reserved or be double-settled.
+    let mut consumer_quota = if let Auth::Consumer {
+        account,
+        key_id,
+        quota_ceiling,
+        rate_limit_per_minute,
+    } = &auth
+    {
+        if is_inference {
+            if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+                return e.into_response();
+            }
+            match state.reserve_consumer_quota(account, key_id, &uri.to_string(), *quota_ceiling) {
+                Some(guard) => Some(guard),
+                // A classified consumer key with no spendable quota is denied.
+                // (None also means "no ledger attached", but a consumer key can
+                // only authenticate when the ledger is wired — see classify.)
+                None => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "{\"error\":{\"message\":\"no spendable quota for this consumer account\",\"type\":\"insufficient_quota\"}}"
+                            .to_string(),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Fabric-aware chat routing (M18+): three ways a chat request can be
     // served — an explicit `worker_hint` (dashboard "Remote workers"
     // selection forces that specific node), `model: "__auto__"` (the
@@ -5470,8 +5914,14 @@ async fn proxy_with_auth(
                     .as_u64()
                     .unwrap_or(0);
                 state.note_token_usage(&auth, completion);
+                // Q2: settle the consumer reservation against real measured
+                // completion tokens; the unused reserved quota is released.
+                if let Some(guard) = consumer_quota.as_mut() {
+                    guard.settle(completion);
+                }
             } else if is_inference {
                 state.requests_failed.fetch_add(1, Ordering::SeqCst);
+                // Q2: no work completed; the guard releases the reservation.
             }
             let mut response = (status, bytes).into_response();
             if let Some(value) = content_type {
@@ -10010,5 +10460,304 @@ mod tests {
         let local = decentraai_p2p::PeerId::random();
         let workers = vec![test_adv(&local, "dca-local", false, &[])];
         assert_eq!(select_best_model(&workers, &local), None);
+    }
+
+    // ---- Q2 Consumer API keys --------------------------------------------
+
+    /// Builds an `ApiState` with the consumer path enabled: a consumer key
+    /// registry, a shared quota ledger (Arc), and a master token. The ledger is
+    /// pre-credited so the consumer account has spendable quota.
+    async fn start_consumer_state(
+        dir: &Path,
+        master: String,
+    ) -> (SocketAddr, Arc<StdMutex<decentraai_compute::QuotaLedger>>) {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        // Credit the consumer account so it can spend.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"consumer-account".to_string(), "seed", Some(1000), None);
+        }
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master),
+            manager.clone(),
+            test_info(dir, None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.join("db/consumer_keys.json")),
+            Some(ledger.clone()),
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        (api, ledger)
+    }
+
+    #[tokio::test]
+    async fn consumer_key_reserves_and_settles_against_shared_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // Admin creates a consumer key for the account.
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account",
+                "quota_ceiling": 100,
+                "rate_limit_per_minute": 10,
+                "scopes": ["inference"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+        assert!(plaintext.starts_with("dca_"), "consumer key uses dca_ namespace");
+
+        // A consumer-key chat request authenticates and executes.
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({"model":"test","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "consumer key must serve inference");
+
+        // The reservation was settled against measured usage (20 tokens).
+        let acc = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
+        assert_eq!(acc.consumed, 20, "measured 20 completion tokens debited");
+        assert_eq!(acc.reserved, 0, "no quota left reserved after settle");
+        assert_eq!(acc.available, 980, "1000 - 20 consumed");
+    }
+
+    #[tokio::test]
+    async fn invalid_consumer_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000")
+            .json(&serde_json::json!({"model":"test","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "unknown consumer key is unauthorized");
+    }
+
+    #[tokio::test]
+    async fn revoked_consumer_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account", "quota_ceiling": 100, "rate_limit_per_minute": 10,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+        let key_id = created["key_id"].as_str().unwrap().to_string();
+
+        // Revoke it.
+        let rev: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/revoke"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({"key_id": key_id}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rev["success"], true);
+
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({"model":"test","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "revoked key must not authenticate");
+    }
+
+    #[tokio::test]
+    async fn consumer_key_cannot_reach_admin_or_operational_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account", "quota_ceiling": 100, "rate_limit_per_minute": 10,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+
+        // Admin endpoints reject a consumer key.
+        let admin = client
+            .get(format!("http://{api}/api/admin/consumer-key/list"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), 403, "consumer key must never be admin");
+
+        // Operational read views reject a consumer key.
+        let ops = client
+            .get(format!("http://{api}/v1/compute"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(ops.status() == 403 || ops.status() == 401, "consumer key is not operator");
+    }
+
+    #[tokio::test]
+    async fn consumer_key_with_insufficient_quota_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // Drain the account's quota first (credit 1000, reserve+settle all).
+        {
+            let mut l = ledger.lock().unwrap();
+            // Spend it all via a reservation + settle.
+            let res = l.reserve(&"consumer-account".to_string(), "drain", 1000).unwrap();
+            let _ = l.settle(&res.reservation_id, 1000);
+        }
+
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account", "quota_ceiling": 100, "rate_limit_per_minute": 10,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({"model":"test","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        // No spendable quota -> the request is refused (403) with a clear body.
+        assert_eq!(resp.status(), 403, "no quota -> consumer request denied");
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        assert!(audit.contains("consumer_quota_denied"), "denial must be audited");
+    }
+
+    #[tokio::test]
+    async fn consumer_quota_guard_releases_on_failure() {
+        // The RAII guard must release the reservation when the request does
+        // not complete (e.g. backend error) so no quota leaks as reserved.
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"acct".to_string(), "seed", Some(100), None);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = tempfile::tempdir().unwrap();
+        let state = {
+            let mut state = ApiState::new(
+                "http://127.0.0.1:1".to_string(), // unreachable backend
+                Some("master".to_string()),
+                Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(3600)))),
+                test_info(dir.path(), None),
+                None,
+                None,
+                test_queue(),
+                None,
+                None,
+            );
+            state.attach_consumer(
+                Some(keys_dir.path().join("ck.json")),
+                Some(ledger.clone()),
+            );
+            state
+        };
+        let guard = state
+            .reserve_consumer_quota("acct", "key-1", "req-1", 50)
+            .expect("has quota");
+        // Simulate a failed request: drop the guard without settling.
+        drop(guard);
+        let acc = ledger.lock().unwrap().account(&"acct".to_string()).unwrap();
+        assert_eq!(acc.reserved, 0, "guard drop released the reservation");
+        assert_eq!(acc.available, 100, "quota returned to the pool");
+    }
+
+    #[tokio::test]
+    async fn consumer_rate_limit_is_independent_from_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "consumer-account", "quota_ceiling": 100, "rate_limit_per_minute": 2,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plaintext = created["token"].as_str().unwrap().to_string();
+
+        // 3 rapid requests against a 2/min limit: the 3rd is rate limited.
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let r = client
+                .post(format!("http://{api}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .json(&serde_json::json!({"model":"test","messages":[]}))
+                .send()
+                .await
+                .unwrap();
+            statuses.push(r.status());
+        }
+        assert_eq!(statuses[0], 200);
+        assert_eq!(statuses[1], 200);
+        assert_eq!(statuses[2], 429, "3rd request exceeds the 2/min limit");
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        assert!(audit.contains("consumer_rate_limited"));
     }
 }
