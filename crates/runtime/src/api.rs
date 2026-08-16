@@ -44,6 +44,8 @@ const DASHBOARD_EVENT_LIMIT: usize = 10;
 const RECENT_REQUEST_LIMIT: usize = 12;
 /// Sliding rate-limit window.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Phase M LIMITS: max mutations (execute) per minute per token name.
+const EXECUTE_RATE_LIMIT_PER_MINUTE: usize = 10;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Proxy-boundary cap on the JSON-encoded prompt text forwarded to
 /// llama-server (mirrors `BackendConfig::max_prompt_bytes` on the distributed
@@ -169,6 +171,10 @@ pub struct ApiState {
     recent_requests: Arc<StdMutex<VecDeque<RequestStat>>>,
     /// Per-token sliding-window timestamps (rate limiting).
     rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
+    /// Sliding-window timestamps for the MUTATING execute path (Phase M LIMITS).
+    /// Separate from `rate_windows` so mutation rate limiting never interacts
+    /// with tier inference limits. Keyed by the token name (or "master").
+    execute_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
     /// Per-token usage counters.
     token_usage: UsageCounters,
     /// Real distributed-compute coordinator state (M23/M24), wired into the
@@ -215,6 +221,7 @@ impl ApiState {
             requests_failed: Arc::new(AtomicU64::new(0)),
             recent_requests: Arc::new(StdMutex::new(VecDeque::new())),
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
+            execute_windows: Arc::new(StdMutex::new(HashMap::new())),
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
             compute,
             p2p,
@@ -362,6 +369,33 @@ impl ApiState {
                 serde_json::json!({"token": name, "tier": tier, "limit_per_minute": limit}),
             );
             return Err(GateError::RateLimited(limit));
+        }
+        window.push_back(Instant::now());
+        Ok(())
+    }
+
+    /// Phase M LIMITS for the MUTATING execute path: a fixed per-name sliding
+    /// window (default 10 mutations/minute) so a misbehaving/compromised master
+    /// token cannot hammer the fabric with executions. Separate from tier
+    /// inference limits; audited as `execute_rate_limited`. Read-only calls are
+    /// never limited here.
+    fn check_execute_rate_limit(&self, token_name: &str) -> Result<(), GateError> {
+        let mut windows = self.execute_windows.lock().unwrap();
+        let window = windows.entry(token_name.to_string()).or_default();
+        let cutoff = Instant::now() - RATE_WINDOW;
+        while window.front().is_some_and(|t| *t < cutoff) {
+            window.pop_front();
+        }
+        if window.len() >= EXECUTE_RATE_LIMIT_PER_MINUTE {
+            decentraai_audit::record_best_effort(
+                &self.info.repo_root.join("logs"),
+                "execute_rate_limited",
+                serde_json::json!({
+                    "token": token_name,
+                    "limit_per_minute": EXECUTE_RATE_LIMIT_PER_MINUTE,
+                }),
+            );
+            return Err(GateError::RateLimited(EXECUTE_RATE_LIMIT_PER_MINUTE));
         }
         window.push_back(Instant::now());
         Ok(())
@@ -1321,6 +1355,11 @@ async fn execute_decision_handler(
     body: Bytes,
 ) -> Response {
     if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    // Phase M LIMITS: mutations are rate-limited per token name (master here,
+    // since execute is master-gated) so the fabric cannot be hammered.
+    if let Err(e) = state.check_execute_rate_limit("master") {
         return e.into_response();
     }
     let req: serde_json::Value = match serde_json::from_slice(&body) {
@@ -6495,6 +6534,54 @@ mod tests {
         }
         let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
         assert!(audit.contains("rate_limited"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_mutations_are_rate_limited() {
+        // Phase M LIMITS: /v1/execute (master-gated mutation) is limited to
+        // EXECUTE_RATE_LIMIT_PER_MINUTE per name. Each call consumes a slot
+        // before body/decision handling (so even honest 422s count), and the
+        // (limit+1)-th call returns 429 + audits execute_rate_limited.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{api}/v1/execute");
+        let body = serde_json::json!({
+            "intent": "ocr",
+            "prompt": "read",
+            "max_tokens": 4,
+            "confirm": true,
+        })
+        .to_string();
+
+        for i in 0..EXECUTE_RATE_LIMIT_PER_MINUTE {
+            let resp = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .bearer_auth("master")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            // Each call passes the rate gate; without a fabric model it is a
+            // honest 422 (consuming a slot), never 429 until the limit is hit.
+            assert_ne!(resp.status(), 429, "call {i} must not be limited yet");
+        }
+        // The (limit+1)-th call is rate-limited.
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth("master")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429, "mutation must be rate limited");
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        assert!(audit.contains("execute_rate_limited"));
+
         manager.lock().await.shutdown().await.unwrap();
     }
 

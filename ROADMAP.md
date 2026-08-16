@@ -1432,3 +1432,12 @@ without executing.
   intent so the exact capability is sent) + `#dec-model`, prefills the prompt
   only if empty, and toasts — execution still requires the confirmed Execute
   path (no auto-run, no bypass). CANNOT_RUN/UNKNOWN options show a muted "—".
+
+## 63. Next-Gen — Phase M: LIMITS on mutations (execute rate limit)
+
+- [x] `/v1/execute` (master-gated mutation) is rate-limited per token name
+  (`master`) to `EXECUTE_RATE_LIMIT_PER_MINUTE = 10` via a separate sliding
+  window (never interacts with tier inference limits). A limited call returns
+  429 and audits `execute_rate_limited`. Read-only calls are never limited here.
+- [x] Test: limit+1 call → 429 + audit (each call consumes a slot before body/
+  decision handling, so honest 422s count).
