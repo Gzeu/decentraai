@@ -713,6 +713,7 @@ mod tests {
             available_memory_bytes: 16 * 1024 * 1024 * 1024,
             used_swap_bytes: 0,
             total_disk_free_bytes: 500 * 1024 * 1024 * 1024,
+            battery_percent: None,
         }
     }
 

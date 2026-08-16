@@ -8,6 +8,50 @@ use sysinfo::{Disks, System};
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
+/// Reads the real battery charge percentage (0..100) on Linux, when the node
+/// has a battery (mobile/laptop). Returns `None` on desktop / no battery /
+/// unreadable — honest UNKNOWN, never fabricated. Used by the worker to
+/// advertise `battery_percent` so the adaptive-contribution planner sends a
+/// low-battery worker less work.
+///
+/// Sources, in order: `/sys/class/power_supply/*/capacity` (the first battery
+/// with a valid percentage). A `capacity` of 0 or a path that is clearly a
+/// charger (e.g. `AC`, `ADP`, `Mains`) is not a battery and is skipped.
+pub fn probe_battery() -> Option<u8> {
+    probe_battery_at(std::path::Path::new("/sys/class/power_supply"))
+}
+
+/// Pure battery-probe over an explicit sysfs-like directory, so tests drive
+/// the real parsing/min-selection logic with synthetic entries. See
+/// [`probe_battery`].
+fn probe_battery_at(dir: &std::path::Path) -> Option<u8> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut batteries: Vec<u8> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        // Skip obvious AC/charger entries, not batteries.
+        if name.starts_with("ac")
+            || name.starts_with("adp")
+            || name.contains("mains")
+            || name.contains("charger")
+        {
+            continue;
+        }
+        let capacity_path = path.join("capacity");
+        let Ok(raw) = std::fs::read_to_string(&capacity_path) else {
+            continue;
+        };
+        let parsed: u8 = raw.trim().parse().ok()?;
+        if parsed <= 100 {
+            batteries.push(parsed);
+        }
+    }
+    // If there are multiple batteries, report the minimum (most conservative:
+    // the least charged cell bounds the device's usable life).
+    batteries.into_iter().min()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SystemSnapshot {
     pub logical_cpus: usize,
@@ -16,6 +60,9 @@ pub struct SystemSnapshot {
     pub available_memory_bytes: u64,
     pub used_swap_bytes: u64,
     pub total_disk_free_bytes: u64,
+    /// Real battery charge percentage (0..100), when the node has a battery.
+    /// `None` on desktop / no battery / unreadable (UNKNOWN).
+    pub battery_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +97,7 @@ impl SystemSnapshot {
             available_memory_bytes: system.available_memory(),
             used_swap_bytes: system.used_swap(),
             total_disk_free_bytes: disks.list().iter().map(|disk| disk.available_space()).sum(),
+            battery_percent: probe_battery(),
         }
     }
 
@@ -138,6 +186,7 @@ mod tests {
             available_memory_bytes: 4 * GIB,
             used_swap_bytes: 0,
             total_disk_free_bytes: 50 * GIB,
+            battery_percent: None,
         }
     }
 
@@ -219,6 +268,7 @@ mod tests {
             available_memory_bytes: 12 * GIB,
             used_swap_bytes: 0,
             total_disk_free_bytes: 200 * GIB,
+            battery_percent: None,
         };
         let budget = snapshot.derive_budget(&policy(), 100, 20);
         assert_eq!(budget.max_cpu_threads, 3);
@@ -236,8 +286,49 @@ mod tests {
             available_memory_bytes: 4 * GIB,
             used_swap_bytes: 0,
             total_disk_free_bytes: 25 * GIB,
+            battery_percent: None,
         };
         let budget = snapshot.derive_budget(&policy(), 100, 20);
         assert_eq!(budget.max_cache_bytes, 5 * GIB);
+    }
+
+    #[test]
+    fn battery_probe_reads_real_capacity_and_skips_chargers() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real battery reports capacity.
+        let bat = dir.path().join("BAT0");
+        std::fs::create_dir_all(&bat).unwrap();
+        std::fs::write(bat.join("capacity"), "42\n").unwrap();
+        // A charger must be skipped (not a battery).
+        let ac = dir.path().join("AC");
+        std::fs::create_dir_all(&ac).unwrap();
+        std::fs::write(ac.join("capacity"), "100\n").unwrap();
+
+        assert_eq!(probe_battery_at(dir.path()), Some(42));
+    }
+
+    #[test]
+    fn battery_probe_reports_conservative_min_across_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, cap) in [("BAT0", "80\n"), ("BAT1", "35\n")] {
+            let b = dir.path().join(name);
+            std::fs::create_dir_all(&b).unwrap();
+            std::fs::write(b.join("capacity"), cap).unwrap();
+        }
+        // Two cells: report the least charged (most conservative).
+        assert_eq!(probe_battery_at(dir.path()), Some(35));
+    }
+
+    #[test]
+    fn battery_probe_returns_none_without_a_battery() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory with only a charger -> no battery.
+        let ac = dir.path().join("ADP1");
+        std::fs::create_dir_all(&ac).unwrap();
+        std::fs::write(ac.join("capacity"), "100\n").unwrap();
+        assert_eq!(probe_battery_at(dir.path()), None);
+
+        // Missing directory -> None (honest UNKNOWN).
+        assert_eq!(probe_battery_at(&dir.path().join("does-not-exist")), None);
     }
 }

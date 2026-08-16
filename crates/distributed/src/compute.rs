@@ -237,7 +237,9 @@ pub fn build_advertisement(
             status: WorkerHealth::Ready,
             gpu_temperature_celsius: gpu_temp,
             gpu_utilization_percent: gpu_util,
-            battery_percent: None,
+            // Real battery charge from the probe (None on desktop / UNKNOWN) —
+            // the adaptive-contribution planner reduces work for a low battery.
+            battery_percent: snapshot.battery_percent,
         },
         announced_at_ms,
         accepts_remote_inference: accepts_remote,
@@ -2053,6 +2055,7 @@ mod tests {
             available_memory_bytes: 16 * 1024 * 1024 * 1024,
             used_swap_bytes: 0,
             total_disk_free_bytes: 200 * 1024 * 1024 * 1024,
+            battery_percent: None,
         }
     }
 

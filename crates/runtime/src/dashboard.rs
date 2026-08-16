@@ -3019,12 +3019,18 @@ function renderFabricGraph(f){
     const capBadge = n.capacity === 'FULL' ? ' <span class="badge ok">FULL</span>'
       : n.capacity === 'LIMITED' ? ' <span class="badge warn">LIMITED</span>'
       : n.capacity === 'UNAVAILABLE' ? ' <span class="badge bad">UNAVAILABLE</span>' : '';
+    // Real battery level (mobile/laptop) + adaptive-contribution factor when
+    // reported. Absent -> nothing rendered; never fabricated.
+    const batBadge = n.battery_percent != null
+      ? ' <span class="badge '+(n.battery_percent <= 20 ? 'warn' : 'faint')+'">bat '+n.battery_percent+'%</span>' : '';
+    const adaptBadge = n.adaptive_contribution != null && n.adaptive_contribution < 0.6
+      ? ' <span class="badge warn">adaptive '+(n.adaptive_contribution).toFixed(2)+'</span>' : '';
     return '<div class="mono" style="font-size:11px;padding:3px 0">'+
       '<b>'+esc(n.node_name || short(n.peer_id,14))+'</b>'+
       (n.trusted ? ' <span class="badge ok">trusted</span>' : ' <span class="badge warn">untrusted</span>')+
       (n.device_class ? ' <span class="badge faint">'+esc(n.device_class)+'</span>' : '')+
       (n.node_version ? ' <span class="badge faint">v'+esc(n.node_version)+'</span>' : '')+
-      vsBadge+lcBadge+capBadge+
+      vsBadge+lcBadge+capBadge+batBadge+adaptBadge+
       ' · <span class="badge faint">'+esc(n.engine||'—')+'</span>'+
       '<span style="color:var(--muted)"> · '+esc(n.node_id||'')+'</span></div>';
   }).join('');

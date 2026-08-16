@@ -42,6 +42,7 @@ fn snapshot() -> SystemSnapshot {
         available_memory_bytes: 12 * 1024 * 1024 * 1024,
         used_swap_bytes: 0,
         total_disk_free_bytes: 100 * 1024 * 1024 * 1024,
+        battery_percent: None,
     }
 }
 
@@ -704,6 +705,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         available_memory_bytes: 2 * 1024 * 1024 * 1024,
         used_swap_bytes: 0,
         total_disk_free_bytes: 100 * 1024 * 1024 * 1024,
+        battery_percent: None,
     };
 
     let mock = httpmock::prelude::MockServer::start_async().await;

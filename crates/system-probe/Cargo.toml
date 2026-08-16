@@ -9,3 +9,6 @@ license.workspace = true
 decentraai-config = { path = "../config" }
 sysinfo.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

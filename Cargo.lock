@@ -1216,6 +1216,7 @@ version = "1.0.0"
 dependencies = [
  "decentraai-config",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

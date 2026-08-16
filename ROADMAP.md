@@ -1779,6 +1779,11 @@ fabricated, UNKNOWN stays neutral.
 
 - [x] `ComputeAvailability.battery_percent` (Option<u8>) — real battery charge
   when probed (mobile/laptop); `None` on desktop/UNKNOWN. Backward-compatible.
+- [x] **Battery probe** (`system-probe::probe_battery`) — reads the real Linux
+  battery charge from `/sys/class/power_supply/*/capacity`, skipping
+  AC/charger entries and reporting the conservative min across cells. `None`
+  on desktop / no battery (honest UNKNOWN). Wired into `SystemSnapshot` and
+  `build_advertisement`, so a worker actually advertises `battery_percent`.
 - [x] `ComputeAvailability::adaptive_contribution_factor()` (0.0..1.0) — pure
   product of real GPU thermal, GPU utilization, CPU load and battery terms:
   thermal ≥95°C → ×0.1, ≥90 → ×0.25, ≥80 → ×0.5, ≥70 → ×0.8; full GPU util
@@ -1790,8 +1795,11 @@ fabricated, UNKNOWN stays neutral.
   otherwise-identical healthy worker (verified by test).
 - [x] **Observability** — `/v1/fabric` nodes + `/v1/resources` fabric rows
   expose `adaptive_contribution` (+ `battery_percent`); dashboard fabric row
-  shows `capacity` + `adaptive` factor.
+  shows `capacity` + `adaptive` factor, fabric graph node shows battery level
+  + adaptive badge.
 - [x] Tests: factor is neutral with all signals UNKNOWN, reduces under
   thermal/battery/GPU-util stress, stays positive under combined worst case;
   scheduler picks the healthy worker over the thermally-stressed identical
-  one. Workspace tests, clippy `-D warnings`, release build green.
+  one; battery probe reads real capacity, skips chargers, reports the
+  conservative min, and returns None without a battery. Workspace tests,
+  clippy `-D warnings`, release build green.
