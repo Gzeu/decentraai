@@ -654,6 +654,15 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <tbody id="contributions"><tr><td colspan="9" class="empty">no contribution ledger yet</td></tr></tbody></table>
         </div>
         <div class="card" style="margin-top:14px">
+          <h2>Tier suggestions <span class="count">contribution → tier · master-gated</span></h2>
+          <div id="tier-suggest" class="empty">loading…</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+            <button id="tier-apply" class="primary" disabled>Apply suggested tiers</button>
+            <span id="tier-status" class="mono" style="font-size:11px;color:var(--muted)"></span>
+          </div>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:6px">Pairs each active token to its same-named worker's measured-contribution tier (T1 guest / T2 contributor / T3 core). The same action as <code>decentraai tier apply --yes</code>.</p>
+        </div>
+        <div class="card" style="margin-top:14px">
           <h2>Quota <span class="count">contribution-backed · policy v<span id="quota-policy-version">—</span></span></h2>
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px">
             <div class="metric"><div class="label">Total earned</div><div class="value" id="quota-total-earned">—</div></div>
@@ -3605,6 +3614,47 @@ function copyConsumerToken(){
   const el = document.getElementById('ck-new-token');
   if (el && el.textContent) navigator.clipboard.writeText(el.textContent).then(() => toast('consumer key copied'));
 }
+// ---- Tier suggestions (contribution -> tier, master-gated) ----
+async function loadTierSuggest(){
+  const el = $('tier-suggest');
+  const btn = $('tier-apply');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/admin/contribution', { headers });
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
+    const changes = d.changes || [];
+    const rows = d.rows || [];
+    if (!changes.length) {
+      el.innerHTML = '<div class="empty">no tier changes to apply — tokens already match their contribution (or no contributing workers)</div>';
+      if (btn) btn.disabled = true;
+      return;
+    }
+    el.innerHTML = changes.map(c => {
+      const arrow = c.from < c.to ? ' ↑' : (c.from > c.to ? ' ↓' : ' =');
+      return '<div class="mono" style="font-size:12px;padding:2px 0"><code>'+esc(c.name)+'</code> T'+c.from+' → <span class="badge '+(c.to===3?'ok':c.to===2?'warn':'faint')+'">T'+c.to+'</span>'+' <span class="muted" style="font-size:10px">'+esc(arrow)+'</span></div>';
+    }).join('');
+    $('tier-suggest-count') && ($('tier-suggest-count').textContent = changes.length + ' change(s)');
+    if (btn) btn.disabled = false;
+  } catch (e) {
+    el.innerHTML = '<div class="empty">master token required (or no contribution data)</div>';
+    if (btn) btn.disabled = true;
+  }
+}
+async function applyTier(){
+  const btn = $('tier-apply');
+  if (btn) btn.disabled = true;
+  $('tier-status').textContent = 'applying…';
+  try {
+    const r = await fetch('/api/admin/tier/apply', { method:'POST', headers: Object.assign({}, headers, { 'Content-Type':'application/json' }), body: JSON.stringify({ confirm: true }) });
+    const d = await r.json();
+    if (!r.ok) { $('tier-status').innerHTML = '<span class="badge warn">' + esc((d.error&&d.error.message)||('failed '+r.status)) + '</span>'; if (btn) btn.disabled = false; return; }
+    $('tier-status').innerHTML = '<span class="badge ok">applied ' + (d.applied||0) + ' of ' + (d.total_changes||0) + ' tier change(s)</span>';
+    toast('tiers updated from contribution');
+    loadTierSuggest();
+    refresh();
+  } catch (e) { $('tier-status').innerHTML = '<span class="badge warn">apply failed</span>'; if (btn) btn.disabled = false; }
+}
 async function revokeConsumerKey(ev){
   const id = ev.target.dataset.id;
   const r = await fetch('/api/admin/consumer-key/revoke', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ key_id: id }) });
@@ -3616,6 +3666,7 @@ $('gen-save').addEventListener('click', saveGeneration);
 $('gen-cancel').addEventListener('click', closeGenEdit);
 $('res-save').addEventListener('click', saveResources);
 $('res-cancel').addEventListener('click', closeResEdit);
+$('tier-apply').addEventListener('click', applyTier);
 window.copyDev = id => {
   const el = $(id);
   const txt = el && (el.textContent || el.innerText || '').trim();
@@ -3775,6 +3826,7 @@ async function refresh(){
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
+  loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); renderRemoteExec(x, (c && c.local_peer) || stageData.localPeer); } catch (e) {}
   try { await renderSessions(); } catch (e) {}

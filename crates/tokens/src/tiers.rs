@@ -15,7 +15,7 @@
 use crate::{Tier, TokenRecord};
 
 /// A single tier change proposed for an active token.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TierChange {
     /// Token name (== worker node name).
     pub name: String,
@@ -26,7 +26,7 @@ pub struct TierChange {
 }
 
 /// One worker's suggested tier, paired to a token by name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SuggestedTier {
     pub name: String,
     /// 1 (guest), 2 (contributor), or 3 (core).

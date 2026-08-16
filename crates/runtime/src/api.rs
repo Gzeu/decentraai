@@ -4038,6 +4038,118 @@ fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> 
     decentraai_p2p::PeerId::from_str(peer).map_err(|_| "invalid peer_id".to_string())
 }
 
+/// Master-gated read-only view of the contribution report + suggested tiers.
+/// Reuses the live `ComputeManager::contribution_report` (the same data the
+/// CLI `decentraai tier suggest` prints) so the dashboard can show why each
+/// worker earned its suggested tier, then apply it.
+async fn admin_contribution_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "rows": [], "note": "no compute manager attached" }).to_string(),
+        )
+            .into_response();
+    };
+    let rows = compute.contribution_report().await;
+    // Pair each contribution row to its token suggestion (reuse the same
+    // planner the CLI uses).
+    let suggestions: Vec<decentraai_tokens::SuggestedTier> = rows
+        .iter()
+        .map(|r| decentraai_tokens::SuggestedTier {
+            name: r.node_name.clone(),
+            suggested: r.suggested_tier,
+        })
+        .collect();
+    let tokens: Vec<decentraai_tokens::TokenRecord> = match &state.token_store_path {
+        Some(p) => decentraai_tokens::TokenStore::load(p)
+            .map(|s| s.list())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let changes = decentraai_tokens::plan_tier_changes(&suggestions, &tokens);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "rows": rows,
+            "suggested": suggestions,
+            "changes": changes,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Master-gated mutation: apply the contribution-suggested tiers to the token
+/// registry (the same action as `decentraai tier apply --yes`). Only pairs an
+/// active token to its same-named worker's suggested tier; a token with no
+/// matching contribution is left unchanged. Audited as `tier_changed`.
+async fn admin_tier_apply_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    // Explicit confirmation for the mutation.
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return forbidden("tier apply requires \"confirm\": true (mutation)");
+    }
+    let Some(compute) = &state.compute else {
+        return forbidden("no compute manager attached");
+    };
+    let Some(store_path) = &state.token_store_path else {
+        return forbidden("no token registry (tiers disabled)");
+    };
+    let rows = compute.contribution_report().await;
+    let suggestions: Vec<decentraai_tokens::SuggestedTier> = rows
+        .iter()
+        .map(|r| decentraai_tokens::SuggestedTier {
+            name: r.node_name.clone(),
+            suggested: r.suggested_tier,
+        })
+        .collect();
+    let mut store = match decentraai_tokens::TokenStore::load(store_path) {
+        Ok(s) => s,
+        Err(_) => return forbidden("token registry unreadable"),
+    };
+    let tokens = store.list();
+    let changes = decentraai_tokens::plan_tier_changes(&suggestions, &tokens);
+    let mut applied = 0usize;
+    for c in &changes {
+        if store.set_tier(&c.name, decentraai_tokens::Tier(c.to)).is_ok() {
+            applied += 1;
+            let a = state.info.repo_root.join("logs/audit.jsonl");
+            let _ = decentraai_audit::record(
+                a.parent().unwrap_or(&state.info.repo_root),
+                "tier_changed",
+                serde_json::json!({ "name": c.name, "from": c.from, "to": c.to }),
+            );
+        }
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "success": true,
+            "applied": applied,
+            "total_changes": changes.len(),
+            "changes": changes,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// P3/M10 — Approve a worker: adds it to the coordinator's trust set so it
 /// becomes eligible to run workloads. Master-gated like the other admin
 /// endpoints. Guards gracefully (a clear OpenAI-style error, not a panic)
@@ -4208,6 +4320,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/models/remove", post(admin_models_remove_handler))
         .route("/api/admin/settings/generation", post(admin_settings_generation_handler))
         .route("/api/admin/settings/resources", post(admin_settings_resources_handler))
+        .route("/api/admin/contribution", get(admin_contribution_handler))
+        .route("/api/admin/tier/apply", post(admin_tier_apply_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
