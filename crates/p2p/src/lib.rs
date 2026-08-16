@@ -547,10 +547,14 @@ impl P2PNode {
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
         // Dial bootstrap peers so the DHT connects immediately instead of
-        // waiting for an idle routing query to discover them.
+        // waiting for an idle routing query to discover them. `info!` so the
+        // operator can see external-DHT connectivity (e.g. a public bootstrap)
+        // in the node log.
         for (peer, addr) in &bootstrap {
-            if let Err(e) = swarm.dial(addr.clone().with(Protocol::P2p(*peer))) {
-                debug!(%peer, error = %e, "bootstrap dial deferred");
+            let dial_addr = addr.clone().with(Protocol::P2p(*peer));
+            info!(peer = %peer, addr = %dial_addr, "dialing bootstrap peer");
+            if let Err(e) = swarm.dial(dial_addr) {
+                warn!(peer = %peer, addr = %addr, error = %e, "bootstrap dial failed (peer may be offline / on another subnet)");
             }
         }
 
