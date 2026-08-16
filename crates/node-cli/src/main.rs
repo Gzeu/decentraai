@@ -2621,14 +2621,19 @@ fn invite(args: InviteArgs) -> Result<()> {
             identity_path.display()
         )
     })?;
-    let peer_id = identity.peer_id().to_string();
-
     let addr = args.addr.trim();
     if addr.is_empty() {
         anyhow::bail!("--addr must be this node's reachable address (e.g. /ip4/192.168.1.5/tcp/4001)");
     }
-    // Build the fully-qualified multiaddr so the printed invite dials directly.
-    let multiaddr = format!("{addr}/p2p/{peer_id}");
+    // The reachable dial target uses the libp2p peer id (base58, e.g.
+    // 12D3KooW...), NOT the identity hex id — libp2p cannot parse the raw
+    // identity id in a multiaddr. Derive it the same way the swarm does.
+    use libp2p::PeerId as Libp2pPeerId;
+    use libp2p::identity::Keypair as Libp2pKeypair;
+    let libp2p_keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
+        .map_err(|e| anyhow::anyhow!("deriving libp2p keypair from node key: {e}"))?;
+    let libp2p_peer = Libp2pPeerId::from(libp2p_keypair.public());
+    let multiaddr = format!("{addr}/p2p/{libp2p_peer}");
 
     let mut store = TokenStore::load(&data_dir.join("db/tokens.json"))
         .with_context(|| "loading token registry".to_string())?;
@@ -4319,6 +4324,36 @@ mod tests {
             "bad token prefix"
         );
         assert!(parse_invite("   dsk_xyz").is_err(), "empty multiaddr");
+    }
+
+    #[test]
+    fn invite_peer_id_is_libp2p_not_identity_hex() {
+        // Regression: `decentraai invite` once printed the identity's raw hex
+        // id (64 chars) in the multiaddr, which libp2p cannot parse — the
+        // fresh node's reachability check failed with "invalid dial address /
+        // Invalid base string". The invite must derive the libp2p peer id
+        // (base58, 12D3KooW...) from the node key, exactly like the swarm.
+        use libp2p::identity::Keypair as Libp2pKeypair;
+        use libp2p::PeerId as Libp2pPeerId;
+        let identity = Identity::generate();
+        let keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
+            .expect("node key must derive an ed25519 libp2p keypair");
+        let peer_id = Libp2pPeerId::from(keypair.public());
+        let s = peer_id.to_string();
+        assert!(
+            s.starts_with("12D3KooW"),
+            "expected a base58 libp2p peer id, got: {s}"
+        );
+        assert!(
+            !s.chars().all(|c| c.is_ascii_hexdigit()),
+            "raw identity hex must never be used in an invite multiaddr"
+        );
+        // The fully-qualified multiaddr must parse as a libp2p dial target.
+        let multiaddr: libp2p::Multiaddr =
+            format!("/ip4/10.0.0.5/tcp/4001/p2p/{peer_id}")
+                .parse()
+                .expect("invite multiaddr must be a valid libp2p multiaddr");
+        assert!(multiaddr.to_string().contains("12D3KooW"));
     }
 
     #[test]
