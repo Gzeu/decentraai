@@ -78,6 +78,13 @@ pub struct ComputeAdvertisement {
     /// id client-side from the peer id.
     #[serde(default)]
     pub node_id: String,
+    /// DecentraAI build version this node runs (e.g. a git SHA / crate
+    /// version). Backward-compatible: older advertisements that predate the
+    /// field deserialize to empty (UNKNOWN), so a coordinator can still
+    /// show "unknown" rather than break. Lets operators see which fabric
+    /// members are on which version (e.g. after an update).
+    #[serde(default)]
+    pub node_version: String,
 }
 
 #[cfg(test)]
@@ -130,6 +137,7 @@ mod tests {
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,
             node_id: "dca-8f2a3c".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
         let json = serde_json::to_string(&adv).unwrap();

@@ -202,6 +202,7 @@ mod tests {
             peer_id: p,
             node_name: "rig".into(),
             node_id: "dca-rig01".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
             capability: ComputeCapability {
                 cpu_cores: 4,
                 ram_mb: 8 * 1024,

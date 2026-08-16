@@ -1476,3 +1476,15 @@ worker could contribute (request-level load balancing), advisory only.
 - [x] Decision card model options show the advisory `load_balance` fan-out
   shares (per CAN_RUN worker: short id + name + share %) under a "fan-out
   advisory:" note. Empty/absent → nothing rendered. Real state only.
+
+## 67. Next-Gen — Node version advertisement (update readiness)
+
+Helps the "update all nodes" workflow: each node now advertises its DecentraAI
+build version, so a coordinator/operator can see which fabric members are stale.
+
+- [x] `ComputeAdvertisement.node_version` (`#[serde(default)]`, backward-compat;
+  empty = UNKNOWN for older peers). Set from `CARGO_PKG_VERSION` in
+  `build_advertisement` (all production advertisements), so the local node
+  reports its real build.
+- [x] `/v1/fabric` nodes carry `node_version` → visible next to each node's
+  device_class, so you can tell desktop (old) vs laptop (new) at a glance.

@@ -222,6 +222,7 @@ pub fn build_advertisement(
         announced_at_ms,
         accepts_remote_inference: accepts_remote,
         node_id: short_node_id(&local_peer),
+        node_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 

@@ -533,6 +533,7 @@ mod tests {
             peer_id: create_test_peer_id(),
             node_name: "gpu-rig".into(),
             node_id: "dca-gpurig".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
             capability: decentraai_compute::ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 32 * 1024,

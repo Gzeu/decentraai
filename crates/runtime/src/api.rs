@@ -4192,6 +4192,7 @@ fn fabric_graph_aggregate(
                 "node_name": w.node_name,
                 "trusted": *trusted,
                 "device_class": device_class(&w.capability),
+                "node_version": w.node_version,
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -6253,6 +6254,7 @@ mod tests {
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,
             node_id: "dca-REMOTE".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         compute.process_advertisement(remote_adv).await;
 
@@ -8224,6 +8226,7 @@ mod tests {
             announced_at_ms: 0,
             accepts_remote_inference: true,
             node_id: node_id.to_string(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
@@ -9716,6 +9719,7 @@ mod tests {
             announced_at_ms: 0,
             accepts_remote_inference: accepts_remote,
             node_id: node_id.to_string(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
