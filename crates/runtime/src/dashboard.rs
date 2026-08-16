@@ -95,6 +95,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .topbar .crumb{color:var(--faint);font-size:12px}
 .top-right{display:flex;align-items:center;gap:10px}
 .live-pill{display:inline-flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:5px 12px;font-size:12px;color:var(--muted)}
+.node-pill{display:inline-flex;align-items:center;gap:6px;background:var(--accent-soft);border:1px solid rgba(34,211,238,.25);border-radius:999px;padding:5px 12px;font-size:12px;color:var(--accent)}
+.node-pill .mono{font-size:11px;font-weight:600}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
 .dot.warn{background:var(--warn);box-shadow:0 0 8px var(--warn)}
@@ -382,6 +384,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <div class="topbar">
       <div><div class="crumb">DecentraAI · control plane</div><h1 id="page-title">Overview</h1></div>
       <div class="top-right">
+        <span class="node-pill" id="node-pill" title="This node"><span class="mono" id="node-pill-name">node</span></span>
         <span class="live-pill"><span class="dot off" id="live-dot"></span><span id="live-text">connecting…</span></span>
         <button id="palette-open" title="Command palette (Ctrl+K)">⌘K</button>
       </div>
@@ -3451,7 +3454,7 @@ function renderSettings(s, c, n){
   const g = (s && s.generation) || {};
   if (g && g.temperature !== undefined) {
     $('set-generation').innerHTML = '<div class="mono" style="font-size:12px;color:var(--muted)">'+
-      'temperature <b>'+g.temperature+'</b> · top_p <b>'+g.top_p+'</b> · top_k <b>'+(g.top_k!=null?g.top_k:'off')+'</b> · repeat_penalty <b>'+g.repeat_penalty+'</b>'+
+      'temperature <b>'+Number(g.temperature||0).toFixed(2)+'</b> · top_p <b>'+Number(g.top_p||0).toFixed(2)+'</b> · top_k <b>'+(g.top_k!=null?g.top_k:'off')+'</b> · repeat_penalty <b>'+Number(g.repeat_penalty||0).toFixed(2)+'</b>'+
       (g.system_prompt ? '<div style="margin-top:6px">system prompt: <code>'+esc(g.system_prompt)+'</code></div>' : '')+'</div>'+
       '<button id="gen-edit" class="ghost" style="margin-top:6px" onclick="openGenEdit()">Edit live</button>';
     // populate the edit form from the real current values
@@ -3776,6 +3779,7 @@ async function refresh(){
     $('rail-dot').className = 'dot ' + (s.model_loaded ? 'ok pulse' : 'warn pulse');
     $('live-text').textContent = s.model_loaded ? 'model loaded' : 'model unloaded';
     $('rail-live').textContent = (s.node && s.node.name) || s.model || 'node';
+    const npi = $('node-pill-name'); if (npi) npi.textContent = (s.node && s.node.name) || short((s.p2p_peer_id||''), 10) || 'node';
     const others = (s.available_models||[]).filter(m => m.name !== s.model);
     $('also-models').textContent = others.length ? 'also indexed: '+others.map(m=>esc(m.name)+' ('+(m.size_bytes/1073741824).toFixed(2)+' GiB)').join(', ') : '';
     $('requests').textContent = s.requests_served;
