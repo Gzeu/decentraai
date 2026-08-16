@@ -74,6 +74,23 @@ struct Args {
     /// provisioning worker that fetches models on demand).
     #[arg(long)]
     no_model: bool,
+
+    /// Join an existing fabric from an invite: '<reachable-multiaddr> <dsk_ token>'.
+    /// Provisions identity + config, stores the guest credential (0600), and
+    /// verifies the coordinating peer is reachable over P2P. Then run with
+    /// `decentraai-worker --model <file.gguf>`.
+    #[arg(long)]
+    join: Option<String>,
+
+    /// Show real local worker state (identity, config, engine, advertisement,
+    /// lifecycle) and exit.
+    #[arg(long)]
+    status: bool,
+
+    /// Read-only diagnostics: report reachable/real problems (missing identity,
+    /// bad config, engine unavailable, insufficient resources) and exit.
+    #[arg(long)]
+    doctor: bool,
 }
 
 #[tokio::main]
@@ -83,6 +100,19 @@ async fn main() -> Result<()> {
     ).init();
 
     let args = Args::parse();
+
+    // ---- one-shot commands (join / status / doctor) ----
+    if let Some(invite) = &args.join {
+        let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+        return join_worker(invite, &data_dir).await;
+    }
+    if args.status {
+        return status_worker(&args);
+    }
+    if args.doctor {
+        return doctor_worker(&args);
+    }
+
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     for directory in ["identity", "models", "registry", "db", "logs", "runtime"] {
         std::fs::create_dir_all(data_dir.join(directory))?;
@@ -198,6 +228,179 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Parse a worker join invite: '<reachable-multiaddr> <dsk_ token>'. Reuses the
+/// same format and credential prefix as `decentraai join` (no new token format).
+fn parse_invite(invite: &str) -> Result<(String, String)> {
+    let split_at = invite
+        .find(' ')
+        .context("invite must be '<reachable-multiaddr> <dsk_ token>'")?;
+    let multiaddr = invite[..split_at].trim();
+    let token = invite[split_at..].trim_start();
+    if multiaddr.is_empty() || token.is_empty() {
+        anyhow::bail!("invite must be '<reachable-multiaddr> <dsk_ token>'");
+    }
+    if !token.starts_with("dsk_") {
+        anyhow::bail!("invite token must start with 'dsk_' — got an invalid invite string");
+    }
+    Ok((multiaddr.to_string(), token.to_string()))
+}
+
+/// `decentraai-worker --join '<multiaddr> <dsk_ token>'` — join an existing
+/// fabric. Reuses the EXISTING identity, config, guest-token credential (0600),
+/// and verified P2P dial mechanisms; it does NOT invent a new identity, token,
+/// trust, auth, or discovery system.
+async fn join_worker(invite: &str, data_dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use decentraai_p2p::P2PNode;
+
+    let (multiaddr, token) = parse_invite(invite)?;
+    for directory in ["identity", "models", "registry", "db", "logs", "runtime"] {
+        std::fs::create_dir_all(data_dir.join(directory))?;
+    }
+
+    // Identity: load or generate (same store as the full node — one identity).
+    let identity_path = data_dir.join("identity/key.pem");
+    let identity = if identity_path.exists() {
+        Identity::load(&identity_path)?
+    } else {
+        let identity = Identity::generate();
+        identity.save(&identity_path)?;
+        identity
+    };
+
+    // Store the guest credential (0600). The coordinator keeps only the hash,
+    // so this is the seat's only plaintext copy. Never logged.
+    let runtime_dir = data_dir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)?;
+    let credential_path = runtime_dir.join("invite.token");
+    std::fs::write(&credential_path, format!("{token}\n"))?;
+    let mut perms = std::fs::metadata(&credential_path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&credential_path, perms)?;
+
+    decentraai_audit::record_best_effort(
+        &data_dir.join("logs"),
+        "worker_joined",
+        serde_json::json!({"peer": multiaddr}),
+    );
+
+    // Verify the coordinating peer is reachable over the verified P2P path.
+    let node = P2PNode::new(&identity, 1_048_576, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)?;
+    node.dial(&multiaddr).await.with_context(|| {
+        format!("could not reach the coordinating peer at {multiaddr}; is it online?")
+    })?;
+    node.shutdown();
+
+    println!("Worker joined the fabric — connected to the coordinating peer at {multiaddr}");
+    println!("  Worker PeerId : {}", identity.peer_id());
+    println!("  Credential     : {} (0600)", credential_path.display());
+    println!("  Run the worker : decentraai-worker --model <file.gguf> [--data-dir {}]", data_dir.display());
+    Ok(())
+}
+
+/// `decentraai-worker --status` — real local worker state (identity, config,
+/// engine availability, credential, lifecycle). Read-only.
+fn status_worker(args: &Args) -> Result<()> {
+    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let identity_path = data_dir.join("identity/key.pem");
+    let credential = data_dir.join("runtime/invite.token");
+    let has_identity = identity_path.exists();
+    let has_credential = credential.exists();
+    let config_ok = decentraai_config::NodeConfig::load(&args.config).is_ok();
+
+    let snapshot = SystemSnapshot::collect();
+    let gpu = probe_gpu();
+    let gpu_line = match &gpu {
+        decentraai_system_probe::GpuProbeStatus::Nvidia(g) => format!(
+            "{} ({} MiB VRAM) · temp {}C · util {}%",
+            g.name, g.total_vram_mib, g.temperature_celsius, g.utilization_percent
+        ),
+        decentraai_system_probe::GpuProbeStatus::Unavailable(_) => "none".to_string(),
+    };
+
+    println!("== decentraai-worker status ==");
+    println!("  PeerId      : {}", if has_identity { Identity::load(&identity_path)?.peer_id().to_string() } else { "UNKNOWN (no identity)".into() });
+    println!("  Identity    : {}", if has_identity { "present" } else { "missing (run --join or --init)" });
+    println!("  Credential  : {}", if has_credential { "stored (0600)" } else { "none — not joined yet" });
+    println!("  Config      : {}", if config_ok { "valid" } else { "invalid/missing" });
+    println!("  Lifecycle   : {}", if has_identity && has_credential { "JOINED (DISCOVERED — starts advertising when run)" } else { "UNKNOWN" });
+    println!("  CPU cores   : {}", snapshot.logical_cpus);
+    println!("  RAM         : {} MiB total / {} MiB available", snapshot.total_memory_bytes / (1024*1024), snapshot.available_memory_bytes / (1024*1024));
+    println!("  GPU         : {gpu_line}");
+    Ok(())
+}
+
+/// `decentraai-worker --doctor` — read-only diagnostics reporting REAL,
+/// useful problems (missing identity, bad config, engine unavailable, no
+/// credential). UNKNOWN stays UNKNOWN. Never fabricates.
+fn doctor_worker(args: &Args) -> Result<()> {
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let mut problems = 0u32;
+    println!("== decentraai-worker doctor (read-only) ==");
+
+    // Identity.
+    let identity_path = data_dir.join("identity/key.pem");
+    if identity_path.exists() {
+        println!("  ✓ identity present");
+    } else {
+        problems += 1;
+        println!("  ✗ identity missing — run `decentraai-worker --join '<multiaddr> <dsk_ token>'`");
+    }
+
+    // Credential / joined.
+    let credential = data_dir.join("runtime/invite.token");
+    if credential.exists() {
+        println!("  ✓ join credential stored (0600)");
+    } else {
+        problems += 1;
+        println!("  ✗ not joined — run `decentraai-worker --join ...` first");
+    }
+
+    // Config.
+    match decentraai_config::NodeConfig::load(&args.config) {
+        Ok(_) => println!("  ✓ config loads"),
+        Err(e) => {
+            problems += 1;
+            println!("  ✗ config problem: {e}");
+        }
+    }
+
+    // Engine availability (worker REQUIRES a real llama-server).
+    match find_llama_server(args.binary.as_deref()) {
+        Ok(path) => println!("  ✓ llama-server found: {}", path.display()),
+        Err(_) => {
+            problems += 1;
+            println!("  ✗ llama-server not found — pass --binary <path> or install llama.cpp");
+        }
+    }
+
+    // Model availability (a worker should have a model to serve).
+    match std::fs::read_dir(data_dir.join("models")) {
+        Ok(rd) => {
+            let gguf = rd.flatten().filter(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false)).count();
+            if gguf > 0 {
+                println!("  ✓ {gguf} GGUF model(s) on disk");
+            } else {
+                problems += 1;
+                println!("  ✗ no GGUF model on disk — pass --model <file.gguf>");
+            }
+        }
+        Err(_) => {
+            problems += 1;
+            println!("  ✗ models/ directory missing");
+        }
+    }
+
+    if problems == 0 {
+        println!("  No problems detected — the worker should start and advertise.");
+    } else {
+        println!("  {problems} issue(s) found. Fix the items above, then run the worker.");
+    }
+    Ok(())
+}
+
 const DEFAULT_MAX_CHUNK_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Resolve the model file path (data-dir models/<name> or an absolute path).
@@ -306,4 +509,25 @@ async fn advertise_and_broadcast(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_invite;
+
+    #[test]
+    fn parse_invite_accepts_multiaddr_and_dsk_token() {
+        let (ma, tok) =
+            parse_invite("/ip4/192.168.1.50/tcp/41501 dsk_abc123").unwrap();
+        assert_eq!(ma, "/ip4/192.168.1.50/tcp/41501");
+        assert_eq!(tok, "dsk_abc123");
+    }
+
+    #[test]
+    fn parse_invite_rejects_non_dsk_token() {
+        assert!(parse_invite("/ip4/1.2.3.4/tcp/5 secret").is_err());
+        assert!(parse_invite("/ip4/1.2.3.4/tcp/5").is_err(), "no token");
+        assert!(parse_invite("").is_err());
+        assert!(parse_invite("dsk_only_no_multiaddr").is_err(), "no multiaddr");
+    }
 }

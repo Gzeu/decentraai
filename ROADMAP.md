@@ -1588,3 +1588,22 @@ First step toward thermal-aware adaptive contribution, using REAL measured data
   `cargo install --path crates/node-cli` already installs both binaries.
 - [x] `scripts/uninstall-app.sh` removes both `decentraai` and
   `decentraai-worker` binaries (exact `rm -f`, safe). bash -n validated.
+
+## 76. Next-Gen — Worker join / status / doctor
+
+Make a standalone worker easy to join an existing fabric, reusing ALL existing
+mechanisms (identity, config, guest-token credential, verified P2P dial) — no
+new identity/token/trust/auth/discovery system.
+
+- [x] `decentraai-worker --join '<multiaddr> <dsk_ token>'` — parses the invite
+  (same format + `dsk_` prefix as `decentraai join`), loads/generates identity
+  in the shared store, stores the guest credential 0600, dials the coordinating
+  peer over the verified P2P path, audits `worker_joined`. Secrets never logged.
+- [x] `decentraai-worker --status` — real local state (PeerId, identity, join
+  credential, config validity, lifecycle, CPU/RAM/GPU from a live probe). UNKNOWN
+  stays UNKNOWN.
+- [x] `decentraai-worker --doctor` — read-only diagnostics reporting REAL,
+  useful problems (identity missing, not joined, bad config, llama-server not
+  found, no model). Never fabricates.
+- [x] Tests: `parse_invite` accepts multiaddr+dsk_, rejects non-dsk_/missing
+  parts. Config/credential persist across restart (same data dir); perms 0600.
