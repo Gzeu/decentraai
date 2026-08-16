@@ -1002,7 +1002,32 @@ impl DistributedInference {
     /// The inference response from a worker, or an error if all workers fail
     pub async fn route_request(
         &self,
+        request: InferRequest,
+    ) -> Result<InferResponse, DistributedError> {
+        // P1 signing happens inside route_request_inner.
+        self.route_request_inner(request, None).await
+    }
+
+    /// Routes a request, preferring the given worker on the first attempt
+    /// (Next-Gen batch pinning). Honors a batch allocation by reserving the
+    /// exact worker when it is still eligible; if it is not (dropped, unhealthy,
+    /// full, untrusted, local node), falls back to normal planning. Retries
+    /// re-plan freely (the preferred worker may have failed), so pinning never
+    /// strands a request or violates capacity/trust/KV.
+    pub async fn route_request_on(
+        &self,
+        preferred: &libp2p::PeerId,
+        request: InferRequest,
+    ) -> Result<InferResponse, DistributedError> {
+        self.route_request_inner(request, Some(preferred)).await
+    }
+
+    /// Shared single-request routing. `preferred` (optional) is the batch
+    /// allocation's worker to pin on the first attempt; retries re-plan.
+    async fn route_request_inner(
+        &self,
         mut request: InferRequest,
+        preferred: Option<&libp2p::PeerId>,
     ) -> Result<InferResponse, DistributedError> {
         // P1: sign outbound requests so workers can authenticate them.
         self.sign_request(&mut request);
@@ -1030,10 +1055,45 @@ impl DistributedInference {
                     .await;
                 let mut last_error = None;
                 for attempt in 0u32..=self.config.max_retries {
-                    let Some((plan, placement)) = compute
-                        .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
-                        .await
-                    else {
+                    // Batch pinning: on the first attempt, prefer the allocated
+                    // worker (plan_and_reserve_on reserves it only if still
+                    // eligible, else falls back to normal planning). Retries
+                    // re-plan freely — the pinned worker may have failed.
+                    let planned = if attempt == 0 {
+                        match preferred {
+                            Some(p) => {
+                                compute
+                                    .plan_and_reserve_on(
+                                        p,
+                                        &req,
+                                        prompt_tokens,
+                                        request.session_id.as_deref(),
+                                        request.priority,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                compute
+                                    .plan_and_reserve(
+                                        &req,
+                                        prompt_tokens,
+                                        request.session_id.as_deref(),
+                                        request.priority,
+                                    )
+                                    .await
+                            }
+                        }
+                    } else {
+                        compute
+                            .plan_and_reserve(
+                                &req,
+                                prompt_tokens,
+                                request.session_id.as_deref(),
+                                request.priority,
+                            )
+                            .await
+                    };
+                    let Some((plan, placement)) = planned else {
                         break;
                     };
                     let task_placement = TaskPlacement {
@@ -1479,14 +1539,16 @@ impl DistributedInference {
     }
 
     /// Dispatches a batch of **independent** requests through the existing
-    /// single-request `route_request` path (which is authoritative for
-    /// capacity, reservation, retry, quota, KV affinity, recovery and audit).
+    /// single-request routing path, honoring the batch allocation's worker
+    /// preference (via [`route_request_on`]) so each request is pinned to its
+    /// allocated worker on the first attempt. The single-request path remains
+    /// authoritative for capacity, reservation, retry, quota, KV affinity,
+    /// recovery and audit; if the allocated worker is no longer eligible, the
+    /// request safely falls back to normal planning.
     ///
-    /// The batch allocation ([`plan_batch`]) is advisory for which worker each
-    /// request prefers; each request is then executed through the safe
-    /// per-request path. This is the **operational** boundary: it runs real
-    /// independent requests, collects per-request results with provenance, and
-    /// never invents capacity or splits a generation.
+    /// This is the **operational** boundary: it runs real independent requests,
+    /// collects per-request results with provenance, and never invents capacity
+    /// or splits a generation.
     ///
     /// Returns one outcome per input request (same order), with the request id,
     /// the chosen worker, and the result (or an honest error).
@@ -1494,9 +1556,27 @@ impl DistributedInference {
         &self,
         requests: Vec<(String, InferRequest)>,
     ) -> Vec<BatchRequestOutcome> {
+        // Compute the batch allocation over the live fabric (deterministic).
+        let alloc = self.plan_batch(&requests).await;
+        let assignments: std::collections::HashMap<String, String> = alloc
+            .as_ref()
+            .map(|a| {
+                a.assignments
+                    .iter()
+                    .map(|x| (x.request_id.clone(), x.worker.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut out = Vec::with_capacity(requests.len());
         for (request_id, request) in requests {
-            let result = self.route_request(request.clone()).await;
+            // Pin to the allocated worker if it is eligible (non-empty and
+            // eligible in the allocation); otherwise route normally.
+            let allocated = assignments.get(&request_id).filter(|w| !w.is_empty());
+            let preferred: Option<libp2p::PeerId> = allocated.and_then(|w| w.parse().ok());
+            let result = match preferred {
+                Some(p) => self.route_request_on(&p, request.clone()).await,
+                None => self.route_request(request.clone()).await,
+            };
             let worker = match &result {
                 Ok(r) => r.worker_peer_id.to_string(),
                 Err(_) => String::new(),

@@ -1234,6 +1234,61 @@ impl ComputeManager {
         }
     }
 
+    /// Plans and reserves a workload on an **explicitly preferred worker**
+    /// (Next-Gen batch pinning). This is the safe way to honor a batch
+    /// allocation: if `preferred` is still eligible — trusted, healthy, serves
+    /// the model, and has RAM/VRAM headroom — we reserve exactly that worker
+    /// (via the existing `reserve_worker`, which enforces trust/capacity/eligibility)
+    /// and build a single-stage plan targeting it. If the worker is no longer
+    /// eligible (dropped, unhealthy, full, untrusted, or is the local node),
+    /// we fall back to normal [`plan_and_reserve`](Self::plan_and_reserve), so
+    /// a request is never pinned to a worker that can't serve it.
+    ///
+    /// `None` = no eligible worker at all (the caller fails the request
+    /// honestly).
+    pub async fn plan_and_reserve_on(
+        &self,
+        preferred: &libp2p::PeerId,
+        req: &WorkloadRequirements,
+        prompt_tokens: u32,
+        session_id: Option<&str>,
+        priority: u8,
+    ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
+        // The coordinator never schedules a remote request onto itself.
+        if preferred == &self.local_peer {
+            return self.plan_and_reserve(req, prompt_tokens, session_id, priority).await;
+        }
+        // Reserve exactly this worker; `reserve_worker` validates trusted +
+        // healthy + serves + capacity. None => not eligible now → fall back.
+        let placement = self
+            .scheduler
+            .lock()
+            .await
+            .reserve_worker(preferred, req, Instant::now());
+        let Some(placement) = placement else {
+            return self.plan_and_reserve(req, prompt_tokens, session_id, priority).await;
+        };
+        // Build a single-stage plan targeting the preferred worker.
+        let facts = self.fabric_facts(&req.model_hash).await;
+        let worker_facts = facts.iter().find(|f| f.peer_id == preferred.to_string());
+        let plan = decentraai_fabric::ExecutionPlan {
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            model_hash: req.model_hash.clone(),
+            kind: decentraai_fabric::PlanKind::Single(decentraai_fabric::ExecutionStage {
+                stage_id: format!("s1-{preferred}"),
+                worker: preferred.to_string(),
+                model_hash: req.model_hash.clone(),
+                engine: worker_facts
+                    .map(|f| f.engine)
+                    .unwrap_or(decentraai_fabric::EngineKind::LlamaServer),
+                est_ram_mb: req.est_ram_mb,
+                est_vram_mb: req.est_vram_mb,
+            }),
+            fallback_orders: Vec::new(),
+        };
+        Some((plan, placement))
+    }
+
     /// DRY-RUN planning preview: builds the same `ExecutionPlan` the
     /// coordinator would use for `model_hash` (via `fabric_facts` + the fabric
     /// planner) WITHOUT reserving any worker or sending any request. Returns
@@ -2377,6 +2432,61 @@ mod tests {
             0,
             "release frees the booking"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_and_reserve_on_pins_to_the_preferred_worker() {
+        // Batch pinning: plan_and_reserve_on reserves the exact preferred worker
+        // when it is eligible (trusted + healthy + serves model + headroom).
+        let local = peer();
+        let a = peer();
+        let b = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([a, b]));
+        for (p, name) in [(a, "w-a"), (b, "w-b")] {
+            manager
+                .process_advertisement(build_advertisement(
+                    p, name, ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()],
+                    false, true, 0, LivePerf::default(),
+                ))
+                .await;
+            manager.record_rtt(&p, 2_000, 1_000);
+        }
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+
+        // Pin to `a` — it is eligible, so it is reserved.
+        let (plan, placement) = manager
+            .plan_and_reserve_on(&a, &req, 200, None, 0)
+            .await
+            .expect("preferred worker is eligible");
+        assert_eq!(placement.worker, a, "pins to the preferred worker");
+        assert_eq!(plan.stage_count(), 1);
+        assert_eq!(manager.in_flight(&a).await, 1);
+        manager.release(placement.reservation.reservation_id).await;
+    }
+
+    #[tokio::test]
+    async fn plan_and_reserve_on_falls_back_when_preferred_is_local_or_ineligible() {
+        // If the preferred worker is the local node (never scheduled via P2P)
+        // the coordinator must not pin to it; it falls back to normal planning.
+        let local = peer();
+        let remote = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([remote]));
+        manager
+            .process_advertisement(build_advertisement(
+                remote, "w", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()],
+                false, true, 0, LivePerf::default(),
+            ))
+            .await;
+        manager.record_rtt(&remote, 2_000, 1_000);
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+
+        // Preferred == local peer -> never pinned; falls back to the remote.
+        let (_, placement) = manager
+            .plan_and_reserve_on(&local, &req, 200, None, 0)
+            .await
+            .expect("falls back to an eligible worker");
+        assert_ne!(placement.worker, local, "never pins to the local node");
+        assert_eq!(placement.worker, remote);
     }
 
     #[tokio::test]

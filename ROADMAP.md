@@ -1896,6 +1896,18 @@ boundary. Never splits a single generation/model (stays gated behind
   the actually-chosen worker. This preserves all safety invariants without a
   larger runtime change; the allocation is authoritative for planning, and
   dispatch reuses the proven per-request path.
+- [x] **Exact worker pinning (wired)** — `ComputeManager::plan_and_reserve_on`
+  reserves the exact preferred worker when it is still eligible (trusted +
+  healthy + serves the model + headroom, via the existing `reserve_worker`),
+  building a single-stage plan targeting it; falls back to normal planning if
+  it is no longer eligible (dropped / unhealthy / full / untrusted / local
+  node). `DistributedInference::route_request_on` pins the first attempt to the
+  allocated worker; retries re-plan freely. `route_batch` now pins each
+  independent request to its allocated worker via `route_request_on` (falling
+  back when the worker is no longer eligible), so the batch allocation is
+  actually honored. Quota / KV affinity / capability / trust / idempotency /
+  retry / recovery / provenance are preserved by the shared single-request
+  path.
 - [x] Tests: 2 equal workers balance; faster worker gets more; LIMITED worker
   gets less than idle; unhealthy worker never assigned; incompatible worker
   never serves; batch covers every request exactly once; KV continuation pinned;
