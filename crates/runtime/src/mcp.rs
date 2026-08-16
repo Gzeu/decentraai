@@ -80,6 +80,11 @@ pub struct McpContext {
     /// version). Precomputed by the HTTP layer from the live quota ledger;
     /// the protocol layer only translates. Read-only.
     pub quota: Value,
+    /// Result of `list_consumer_keys`: consumer API key metadata (ids,
+    /// prefixes, accounts, ceilings, rate limits, scopes, status, usage).
+    /// Precomputed by the HTTP layer; the protocol layer only translates.
+    /// Read-only; never contains a plaintext secret.
+    pub consumer_keys: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -271,6 +276,11 @@ fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "list_sessions",
             description: "Coordinator-tracked KV/session residency (KV locality): which worker currently holds each session's KV prefix, the model, accounted tokens used, capacity, and KV headroom. Read-only; real accounted state (empty when no sessions/compute). Useful to know why a continuation would be steered to a specific worker.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_consumer_keys",
+            description: "Consumer API key metadata (Compute Contribution & Quota): per-key id, display prefix, owner account, quota ceiling, rate limit, scopes, status, and live usage + the owner account's quota balance. Read-only; NEVER exposes the plaintext secret.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
     ]
@@ -535,6 +545,22 @@ pub fn quota_request(raw: &str) -> bool {
         == Some("get_quota")
 }
 
+/// Whether the incoming message is a `list_consumer_keys` tool call. Pure —
+/// lets the HTTP layer precompute the consumer-key metadata snapshot into
+/// [`McpContext::consumer_keys`].
+pub fn consumer_keys_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("list_consumer_keys")
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -690,6 +716,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "execute_decision" => &ctx.execution,
         "list_sessions" => &ctx.sessions,
         "get_quota" => &ctx.quota,
+        "list_consumer_keys" => &ctx.consumer_keys,
         _ => return None,
     };
     Some(json!({
@@ -729,6 +756,7 @@ mod tests {
             execution: json!({}),
             sessions: json!({ "sessions_active": 0, "sessions": [] }),
             quota: json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": 1 }),
+            consumer_keys: json!({ "keys": [] }),
         }
     }
 
@@ -1242,5 +1270,30 @@ mod tests {
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"total_earned\":0"));
         assert!(content.contains("\"policy_version\":1"));
+    }
+
+    #[test]
+    fn tools_list_exposes_list_consumer_keys() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "list_consumer_keys"));
+    }
+
+    #[test]
+    fn consumer_keys_request_matches_only_the_tool() {
+        assert!(consumer_keys_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_consumer_keys","arguments":{}}}"#
+        ));
+        assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
+        assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#));
+    }
+
+    #[test]
+    fn list_consumer_keys_returns_precomputed_metadata() {
+        let r = call(r#"{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"list_consumer_keys","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        // Default empty projection; never leaks a secret.
+        assert!(content.contains("\"keys\":[]"));
+        assert!(!content.contains("dca_"), "metadata must not leak the secret prefix value");
     }
 }

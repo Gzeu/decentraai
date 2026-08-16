@@ -777,16 +777,21 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><t
 <h1>DecentraAI Admin</h1>
 <div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
 <div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<div class="card"><h2>Consumer API Keys</h2><form id="cf"><input name="account" placeholder="Owner account" required><input name="ceiling" type="number" min="1" placeholder="Quota ceiling" required><input name="rate" type="number" min="1" placeholder="req/min" required><button>Create</button></form><div id="cnew" style="display:none"><code id="ckey"></code><button onclick="navigator.clipboard.writeText(document.getElementById('ckey').textContent)">Copy</button><span>shown once</span></div><p id="cstatus"></p><table id="ctbl"><thead><tr><th>Key</th><th>Account</th><th>Ceiling</th><th>Rate</th><th>Used</th><th>Account quota (avail/cons)</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table></div>
 <div class="card"><h2>Audit events</h2><ul id="audit" style="list-style:none;padding-left:0"><li class="off">loading&hellip;</li></ul></div>
 <p id="api-url"></p></body><script>
 var f=document.getElementById('f'),status=document.getElementById('status'),tbl=document.querySelector('#tbl tbody'),tokenEl=document.getElementById('token'),newDiv=document.getElementById('new');
+var cf=document.getElementById('cf'),cstatus=document.getElementById('cstatus'),ctbl=document.querySelector('#ctbl tbody'),ckeyEl=document.getElementById('ckey'),cnewDiv=document.getElementById('cnew');
 var esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]});};
 f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value),role=f.role.value;status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t,role:role})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'};
-async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+esc(t.name)+'</td><td>'+t.tier+'</td><td>'+esc(t.role)+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();}
+cf.addEventListener('submit',async e=>{e.preventDefault();var acct=cf.account.value,ceil=parseInt(cf.ceiling.value),rate=parseInt(cf.rate.value);cstatus.textContent='Creating...';var r=await fetch('/api/admin/consumer-key/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({account:acct,quota_ceiling:ceil,rate_limit_per_minute:rate})});var d=await r.json();if(r.ok){ckeyEl.textContent=d.token;cnewDiv.style.display='block';cstatus.innerHTML='<span style="color:green">Saved! Copy now.</span>';cf.reset()}else cstatus.innerHTML='<span style="color:red">'+d.error.message+'</span>';loadConsumer();});
+async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+esc(t.name)+'</td><td>'+t.tier+'</td><td>'+esc(t.role)+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();loadConsumer();}
+async function loadConsumer(){var r=await fetch('/api/admin/consumer-key/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();ctbl.innerHTML='';if(!(d.keys||[]).length){ctbl.innerHTML='<tr><td colspan="8" class="off">no consumer API keys</td></tr>';return;}d.keys.forEach(k=>{var q=k.account_quota||{},row=document.createElement('tr');row.innerHTML='<td><code>'+esc(k.key_id)+'</code></td><td>'+esc(k.account)+'</td><td>'+k.quota_ceiling+'</td><td>'+k.rate_limit_per_minute+'</td><td>'+k.requests+' ('+k.tokens_generated+' tok)</td><td>'+q.available+'/'+q.consumed+'</td><td>'+(k.revoked?'revoked':'active')+'</td><td>'+(k.revoked?'':'<button data-id="'+esc(k.key_id)+'" onclick="revokeConsumer(event)">Revoke</button>')+'</td>';ctbl.appendChild(row)});}
 var auditEl=document.getElementById('audit');
 async function loadAudit(){var r=await fetch('/api/admin/events',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();var evs=d.events||[];auditEl.innerHTML=evs.length?'':('<li class="off">no security events yet</li>');evs.forEach(function(e){var li=document.createElement('li');var d2=new Date((e.timestamp||0)*1000).toLocaleString();li.innerHTML='<code>'+esc(e.event||'')+'</code> <span class="off">'+d2+'</span> <span class="small">'+esc(JSON.stringify(e.details||Object()))+'</span>';auditEl.appendChild(li);});}
 window.onload=load;
 function revoke(e){var n=e.target.dataset.n;fetch('/api/admin/token/revoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n})}).then(_=>load());}
+function revokeConsumer(e){var id=e.target.dataset.id;fetch('/api/admin/consumer-key/revoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({key_id:id})}).then(_=>loadConsumer());}
 document.getElementById('api-url').textContent='API: http://127.0.0.1:{}/v1';
 </script></html>"##;
 fn admin_html(port: u16) -> String {
@@ -4259,6 +4264,41 @@ async fn mcp_handler(
             None => serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
         };
     }
+    // A `list_consumer_keys` call projects consumer API key metadata
+    // (read-only, never the plaintext secret): ids, prefixes, accounts,
+    // ceilings, rate limits, scopes, status, usage + owner account balance.
+    if crate::mcp::consumer_keys_request(&raw) {
+        let keys = match &state.consumer_keys_path {
+            Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
+                .map(|s| s.list())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let usage = state.consumer_usage.lock().unwrap().clone();
+        let ledger = state.quota_ledger.clone();
+        ctx.consumer_keys = serde_json::json!({ "keys": keys.iter().map(|k| {
+            let u = usage.get(&k.key_id).copied().unwrap_or((0, 0, 0));
+            let (available, consumed) = ledger.as_ref().map(|l| {
+                let l = l.lock().unwrap();
+                let acc = l.account(&k.owner_account);
+                (acc.map(|a| a.available).unwrap_or(0), acc.map(|a| a.consumed).unwrap_or(0))
+            }).unwrap_or((0, 0));
+            serde_json::json!({
+                "key_id": &k.key_id,
+                "prefix": &k.prefix,
+                "account": &k.owner_account,
+                "created_at": k.created_at,
+                "revoked": k.revoked,
+                "quota_ceiling": k.quota_ceiling,
+                "rate_limit_per_minute": k.rate_limit_per_minute,
+                "scopes": &k.scopes,
+                "requests": u.0,
+                "tokens_generated": u.1,
+                "last_used_at": if u.2 > 0 { Some(u.2) } else { None },
+                "account_quota": { "available": available, "consumed": consumed },
+            })
+        }).collect::<Vec<_>>() });
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -4372,6 +4412,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         execution: serde_json::json!({}),
         sessions: serde_json::json!({ "sessions_active": 0, "sessions": [] }),
         quota: serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
+        consumer_keys: serde_json::json!({ "keys": [] }),
     }
 }
 
