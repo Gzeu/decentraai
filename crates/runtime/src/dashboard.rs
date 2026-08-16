@@ -48,7 +48,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 :root{
   --bg:#05070d; --bg-2:#0a0e16; --panel:#0d121c; --panel-2:#0a0f18;
   --line:#182234; --line-2:#223048;
-  --text:#e8eef6; --muted:#8fa0b3; --faint:#5a6b80;
+  --text:#e8eef6; --muted:#8fa0b3; --faint:#6f8198;
   --accent:#22d3ee; --accent-2:#6366f1; --accent-soft:rgba(34,211,238,.1);
   --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --remote:#a78bfa;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
