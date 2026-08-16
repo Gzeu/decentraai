@@ -3881,7 +3881,15 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
     let html = DASHBOARD_HTML
         .replace("/*__JS__*/", &dashboard_js(&state, &share))
         .replace("__API_PORT__", &state.info.api_port.to_string());
-    Html(html).into_response()
+    let mut response = Html(html).into_response();
+    // Never cache the dashboard: it is rebuilt on every request with the live
+    // node state and updated across node upgrades. Without this, a browser may
+    // keep serving a stale embedded UI after an upgrade.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// Public status snapshot: no secrets, safe without the token. Includes
