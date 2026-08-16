@@ -1864,3 +1864,40 @@ a batch of independent requests.
   thermally-stressed worker → smaller share (factor recorded); unhealthy worker
   excluded; empty/all-unhealthy → empty; deterministic regardless of input
   order. Workspace tests, clippy `-D warnings`, release build green.
+
+## 89. Next-Gen — Batch allocation in the real planner / execution path
+
+Makes the adaptive fan-out **operational** for batches of independent requests:
+a deterministic request → worker allocation from the pure `adaptive_load_shares`
+distribution, integrated into the fabric planner and the distributed execution
+boundary. Never splits a single generation/model (stays gated behind
+`supports_staging()`, parked).
+
+- [x] `decentraai_fabric::allocate_batch` (pure, deterministic): assigns a set
+  of independent requests to workers using `adaptive_load_shares` over the
+  fabric facts, honoring the same invariants as the single-request planner —
+  never an unhealthy/untrusted/incompatible worker; a **continuation** is
+  pinned to its KV-prefix worker; weighted-interleaved so shares spread evenly
+  (not one worker first); deterministic regardless of input order (request-id
+  asc + peer-id asc tie-breaks). `BatchAssignment`/`BatchAllocation` carry
+  provenance (request id, worker, share, kv_pinned, eligible).
+- [x] `DistributedInference::plan_batch` — operational planner boundary: builds
+  `RequestFacts` + `WorkerFacts` from the LIVE compute manager (real capacity,
+  load, KV residency) and returns the deterministic allocation for a
+  same-model batch. Empty/no-compute → honest empty/None.
+- [x] `DistributedInference::route_batch` — operational dispatch: each
+  independent request runs through the existing authoritative `route_request`
+  path (capacity, reservation, retry, quota, KV affinity, recovery, audit).
+  Returns `BatchRequestOutcome` (request id, chosen worker, result) preserving
+  per-request provenance. Never auto-retries a failed request (idempotency).
+- [x] **LOCAL-BLOCKED (honest boundary)**: pinning each request to its exact
+  allocated worker inside the single-request reserve/retry loop is NOT wired —
+  `route_batch` executes each request via the existing safe path and reports
+  the actually-chosen worker. This preserves all safety invariants without a
+  larger runtime change; the allocation is authoritative for planning, and
+  dispatch reuses the proven per-request path.
+- [x] Tests: 2 equal workers balance; faster worker gets more; LIMITED worker
+  gets less than idle; unhealthy worker never assigned; incompatible worker
+  never serves; batch covers every request exactly once; KV continuation pinned;
+  deterministic regardless of input order; provenance preserved. Workspace
+  tests, clippy `-D warnings`, release build green.

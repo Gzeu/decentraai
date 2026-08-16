@@ -261,6 +261,22 @@ mod error {
     }
 }
 
+/// The outcome of one request in a batch dispatch (Next-Gen adaptive fan-out).
+/// Preserves the request id + chosen worker provenance so the caller can trace
+/// each independent request end-to-end.
+#[derive(Debug)]
+pub struct BatchRequestOutcome {
+    /// The request id (caller-supplied provenance).
+    pub request_id: String,
+    /// The worker that actually served it (empty on failure — the request did
+    /// not complete; see `result` for the honest error).
+    pub worker: String,
+    /// The full result (Ok with measured usage / Err with the reason). Failed
+    /// requests earn no credit and are safe to retry by the caller with a new
+    /// request id (never auto-retried here to preserve idempotency).
+    pub result: Result<InferResponse, DistributedError>,
+}
+
 /// Main distributed inference coordinator
 ///
 /// Combines worker discovery, request routing, and fallback handling
@@ -1387,6 +1403,111 @@ impl DistributedInference {
         self.request_router
             .send_request_streamed(&self.p2p_node, request, placement, progress)
             .await
+    }
+
+    /// Produces a deterministic, adaptive batch allocation for a set of
+    /// **independent, same-model** requests (Next-Gen adaptive fan-out).
+    /// Reuses the pure [`decentraai_fabric::allocate_batch`] over the LIVE
+    /// fabric facts for the batch's model, so the allocation reflects real
+    /// capacity/load/KV residency at this instant.
+    ///
+    /// Each entry in `requests` is `(request_id, InferRequest)`. All requests
+    /// must target the same `model_hash` (a realistic independent-request
+    /// batch); a request with a different model is returned as a non-eligible
+    /// assignment so the caller fails it honestly. Returns `None` when no
+    /// compute manager is attached (no fabric to allocate over).
+    ///
+    /// This is the **planner boundary**: it says *which* worker each
+    /// independent request should go to. It never splits a single generation.
+    /// The actual dispatch reuses the existing single-request
+    /// `route_request` path (which is authoritative for capacity/reservation/
+    /// retry/quota/KV/recovery).
+    pub async fn plan_batch(
+        &self,
+        requests: &[(String, InferRequest)],
+    ) -> Option<decentraai_fabric::BatchAllocation> {
+        let compute = self.compute_manager.as_ref()?;
+        let Some((_, first)) = requests.first() else {
+            // Empty batch -> empty allocation (honest).
+            return Some(decentraai_fabric::BatchAllocation {
+                assignments: Vec::new(),
+                worker_shares: std::collections::BTreeMap::new(),
+            });
+        };
+        let model = first.model_hash.clone();
+        let facts = compute.fabric_facts(&model).await;
+
+        let mut allocs: Vec<(String, decentraai_fabric::RequestFacts)> = Vec::new();
+        for (request_id, req) in requests {
+            // Same-model check: a different model has no facts in this batch's
+            // set -> non-eligible (honest fail rather than misallocate).
+            let same_model = req.model_hash == model;
+            let is_continuation = same_model && req.session_id.is_some();
+            let prefix = if same_model {
+                req.session_id
+                    .as_deref()
+                    .and_then(|s| compute.session_residency(s))
+                    .map(|p| p.to_string())
+            } else {
+                None
+            };
+            allocs.push((
+                request_id.clone(),
+                decentraai_fabric::RequestFacts {
+                    model_hash: req.model_hash.clone(),
+                    est_ram_mb: 512,
+                    est_vram_mb: 0,
+                    context: decentraai_fabric::ContextProfile {
+                        prompt_tokens: prompt_token_estimate(&req.prompt),
+                        max_output_tokens: req.max_tokens,
+                        is_continuation,
+                        prefix_resident_on: prefix,
+                    },
+                    transfer_mib: 0,
+                    local_peer: Some(self.p2p_node.local_peer_id().to_string()),
+                    priority: req.priority,
+                    required_capability: None,
+                    capability_claims: Vec::new(),
+                },
+            ));
+        }
+        Some(decentraai_fabric::allocate_batch(
+            &allocs,
+            &facts,
+            &decentraai_fabric::PlannerConfig::default(),
+        ))
+    }
+
+    /// Dispatches a batch of **independent** requests through the existing
+    /// single-request `route_request` path (which is authoritative for
+    /// capacity, reservation, retry, quota, KV affinity, recovery and audit).
+    ///
+    /// The batch allocation ([`plan_batch`]) is advisory for which worker each
+    /// request prefers; each request is then executed through the safe
+    /// per-request path. This is the **operational** boundary: it runs real
+    /// independent requests, collects per-request results with provenance, and
+    /// never invents capacity or splits a generation.
+    ///
+    /// Returns one outcome per input request (same order), with the request id,
+    /// the chosen worker, and the result (or an honest error).
+    pub async fn route_batch(
+        &self,
+        requests: Vec<(String, InferRequest)>,
+    ) -> Vec<BatchRequestOutcome> {
+        let mut out = Vec::with_capacity(requests.len());
+        for (request_id, request) in requests {
+            let result = self.route_request(request.clone()).await;
+            let worker = match &result {
+                Ok(r) => r.worker_peer_id.to_string(),
+                Err(_) => String::new(),
+            };
+            out.push(BatchRequestOutcome {
+                request_id,
+                worker,
+                result,
+            });
+        }
+        out
     }
 
     /// Cancels an in-flight request on a worker by sending an `InferCancel`

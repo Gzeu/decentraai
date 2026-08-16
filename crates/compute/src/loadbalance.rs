@@ -102,6 +102,7 @@ pub fn adaptive_load_shares(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::WorkerHealth;
 
     fn avail(load: u8, tps: u32) -> ComputeAvailability {
         ComputeAvailability {
@@ -111,7 +112,7 @@ mod tests {
             queue_depth: 0,
             tokens_per_second: tps,
             current_latency_ms: 10,
-            status: crate::availability::WorkerHealth::Ready,
+            status: WorkerHealth::Ready,
             gpu_temperature_celsius: None,
             gpu_utilization_percent: None,
             battery_percent: None,

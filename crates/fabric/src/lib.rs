@@ -30,6 +30,7 @@
 //! behavior the runtime cannot actually provide.
 
 pub mod advisory;
+pub mod batch;
 pub mod decision;
 pub mod engine;
 pub mod expert;
@@ -39,6 +40,7 @@ pub mod plan;
 pub mod planner;
 
 pub use advisory::{FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision};
+pub use batch::{BatchAllocation, BatchAssignment, allocate_batch, set_kv_affinity};
 pub use decision::{
     Adaptation, CandidateOutcome, ConstraintKind, ConstraintResult, ExecutionDecision,
     ExecutionEvent, ExecutionPhase, Observation, OrchestrationAction, WorkloadClass, adapt, classify,
