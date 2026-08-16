@@ -1607,3 +1607,12 @@ new identity/token/trust/auth/discovery system.
   found, no model). Never fabricates.
 - [x] Tests: `parse_invite` accepts multiaddr+dsk_, rejects non-dsk_/missing
   parts. Config/credential persist across restart (same data dir); perms 0600.
+
+## 77. Next-Gen — Worker health / lifecycle in status
+
+- [x] `decentraai-worker --status` reports an evidence-backed worker-side
+  lifecycle: READY (identity + credential + valid config + engine + model) vs
+  DISCOVERED (joined, needs a model/engine) vs UNKNOWN (not joined). Engine +
+  model availability are probed; Trust and BUSY are clearly marked as
+  coordinator-side (the coordinator decides trust and observes busy/queued).
+  UPDATING/VERIFIED never emitted.

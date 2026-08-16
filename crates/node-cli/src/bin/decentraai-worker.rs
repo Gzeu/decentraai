@@ -325,7 +325,26 @@ fn status_worker(args: &Args) -> Result<()> {
     println!("  Identity    : {}", if has_identity { "present" } else { "missing (run --join or --init)" });
     println!("  Credential  : {}", if has_credential { "stored (0600)" } else { "none — not joined yet" });
     println!("  Config      : {}", if config_ok { "valid" } else { "invalid/missing" });
-    println!("  Lifecycle   : {}", if has_identity && has_credential { "JOINED (DISCOVERED — starts advertising when run)" } else { "UNKNOWN" });
+    // Evidence-backed worker-side lifecycle. Trust and BUSY are coordinator-side
+    // (the coordinator decides trust and observes busy/queued), so the worker can
+    // only honestly report DISCOVERED (joined, not yet runnable) vs READY (has
+    // identity + credential + a usable engine + a model to serve). UPDATING /
+    // VERIFIED are never emitted (no remote update mechanism).
+    let engine_ok = find_llama_server(args.binary.as_deref()).is_ok();
+    let model_ok = std::fs::read_dir(data_dir.join("models"))
+        .map(|rd| rd.flatten().any(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false)))
+        .unwrap_or(false);
+    let lifecycle = if has_identity && has_credential && config_ok && engine_ok && model_ok {
+        "READY (will advertise + serve when started)"
+    } else if has_identity && has_credential {
+        "DISCOVERED (joined; needs a model + engine to be READY)"
+    } else {
+        "UNKNOWN (not joined)"
+    };
+    println!("  Lifecycle   : {lifecycle}");
+    println!("  Engine      : {}", if engine_ok { "found" } else { "UNKNOWN — llama-server not found" });
+    println!("  Model       : {}", if model_ok { "on disk" } else { "none on disk (UNKNOWN)" });
+    println!("  Trust       : (coordinator-side — see the fabric dashboard /v1/fabric)");
     println!("  CPU cores   : {}", snapshot.logical_cpus);
     println!("  RAM         : {} MiB total / {} MiB available", snapshot.total_memory_bytes / (1024*1024), snapshot.available_memory_bytes / (1024*1024));
     println!("  GPU         : {gpu_line}");
