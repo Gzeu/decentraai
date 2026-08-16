@@ -279,6 +279,30 @@ fn all_tools() -> Vec<ToolDef> {
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
+            name: "serve_model",
+            description: "MUTATING (master-gated) — load a model file into the local engine so it can be served immediately. Body: {\"model\": \"file.gguf\"}. Refuses when the file is not on disk in the registry. Returns the resolved model + whether the engine reports it loaded. Useful to preload a model before routing work to this node.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "model": { "type": "string", "description": "A GGUF file name present in the local registry (e.g. 'qwen2.5-0.5b-instruct-q2_k.gguf')." },
+                },
+                "required": ["model"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "pull_model",
+            description: "MUTATING (master-gated) — pull a GGUF model from the HuggingFace Hub into the local registry (verified download, then indexed). Body: {\"reference\": \"hf:org/repo[:file.gguf]\"}. This is synchronous and can take a while for large models. Returns the pulled reference, bytes and sha256. Monitor progress via the dashboard or the pull-status endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reference": { "type": "string", "description": "HuggingFace reference, e.g. 'hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q2_k.gguf'." },
+                },
+                "required": ["reference"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "list_consumer_keys",
             description: "Consumer API key metadata (Compute Contribution & Quota): per-key id, display prefix, owner account, quota ceiling, rate limit, scopes, status, and live usage + the owner account's quota balance. Read-only; NEVER exposes the plaintext secret.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -515,6 +539,50 @@ pub fn execution_request(raw: &str) -> Option<serde_json::Value> {
     Some(args)
 }
 
+/// Whether the incoming message is a `serve_model` tool call. Pure — lets the
+/// HTTP layer gate it (master-only mutation) and run it.
+pub fn serve_model_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "serve_model" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?.clone();
+    let model = args.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    if model.trim().is_empty() {
+        return None;
+    }
+    Some(args)
+}
+
+/// Whether the incoming message is a `pull_model` tool call. Pure — lets the
+/// HTTP layer gate it (master-only mutation) and run it.
+pub fn pull_model_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "pull_model" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?.clone();
+    let reference = args.get("reference").and_then(|r| r.as_str()).unwrap_or("");
+    if reference.trim().is_empty() {
+        return None;
+    }
+    Some(args)
+}
+
 /// Whether the incoming message is a `list_sessions` tool call. Pure — lets the
 /// HTTP layer precompute the session snapshot into [`McpContext::sessions`].
 pub fn sessions_request(raw: &str) -> bool {
@@ -714,6 +782,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_fabric_graph" => &ctx.fabric_graph,
         "decide" => &ctx.decision,
         "execute_decision" => &ctx.execution,
+        "serve_model" => &ctx.execution,
+        "pull_model" => &ctx.execution,
         "list_sessions" => &ctx.sessions,
         "get_quota" => &ctx.quota,
         "list_consumer_keys" => &ctx.consumer_keys,

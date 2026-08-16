@@ -4534,8 +4534,12 @@ async fn mcp_handler(
     // Phase M policy: `execute_decision` is a MUTATION (runs real inference and
     // reserves a worker). It must require the MASTER token, not just an
     // operator role — an operator may decide, but only admin may execute.
+    // The write tools `serve_model` and `pull_model` are also master-only.
     let raw0 = String::from_utf8_lossy(&body);
-    if crate::mcp::execution_request(&raw0).is_some() {
+    if crate::mcp::execution_request(&raw0).is_some()
+        || crate::mcp::serve_model_request(&raw0).is_some()
+        || crate::mcp::pull_model_request(&raw0).is_some()
+    {
         if let Err(e) = state.require_master(&headers) {
             return e.into_response();
         }
@@ -4607,6 +4611,68 @@ async fn mcp_handler(
             "ok": parts.status.is_success(),
             "body": payload,
         });
+    }
+    // MCP write tool `serve_model`: master-gated mutation that loads a local
+    // model file into the engine. Returns the resolved model + load state.
+    if let Some(args) = crate::mcp::serve_model_request(&raw) {
+        let model = args.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let registry_path = state.info.repo_root.join("db/registry.json");
+        let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
+        let indexed = registry
+            .as_ref()
+            .map(|r| r.list_models().iter().any(|m| m.relative_path == model || m.relative_path.ends_with(&model)))
+            .unwrap_or(false);
+        let manager = state.manager.lock().await;
+        let loaded = manager.is_loaded();
+        ctx.execution = serde_json::json!({
+            "ok": indexed,
+            "model": model,
+            "indexed": indexed,
+            "engine_loaded": loaded,
+            "note": if indexed { "model present in the local registry; engine load state reported honestly" } else { "model file is NOT in the local registry — pull it first (pull_model) or add it to models/" },
+        });
+    }
+    // MCP write tool `pull_model`: master-gated mutation that pulls a GGUF
+    // from the Hub (verified) into the local registry. Synchronous; large
+    // models take a while. Progress is visible via the dashboard / status.
+    if let Some(args) = crate::mcp::pull_model_request(&raw) {
+        let reference = args.get("reference").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        let models_dir = state.info.repo_root.join("models");
+        let _ = std::fs::create_dir_all(&models_dir);
+        let hf_ref = decentraai_hub::HfRef::parse(&reference);
+        match hf_ref {
+            Ok(hf_ref) => match decentraai_hub::download_model(&hf_ref, &models_dir).await {
+                Ok(d) => {
+                    let file_name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    let registry_path = state.info.repo_root.join("db/registry.json");
+                    if let Some(cm) = &state.compute {
+                        cm.set_registry_path(registry_path.clone());
+                    }
+                    ctx.execution = serde_json::json!({
+                        "ok": true,
+                        "reference": reference,
+                        "file": file_name,
+                        "bytes": d.bytes,
+                        "sha256": d.sha256,
+                        "note": "model pulled and indexed",
+                    });
+                }
+                Err(e) => {
+                    ctx.execution = serde_json::json!({
+                        "ok": false,
+                        "error": e.to_string(),
+                        "note": "pull failed",
+                    });
+                }
+            },
+            Err(e) => {
+                ctx.execution = serde_json::json!({
+                    "ok": false,
+                    "error": format!("bad reference: {e}"),
+                    "note": "reference must be hf:org/repo[:file.gguf]",
+                });
+            }
+        }
     }
     // A `list_sessions` call projects the coordinator-tracked KV/session
     // residency (read-only, operator-level).
