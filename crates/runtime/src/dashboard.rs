@@ -107,7 +107,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .grid{display:grid;gap:14px}
 .grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
 .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
-.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);transition:border-color .15s ease}
+.card:hover{border-color:var(--line-2)}
 .card h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin-bottom:12px;display:flex;align-items:center;gap:8px}
 .card h2 .count{font-size:11px;color:var(--accent)}
 .metric{background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
@@ -128,6 +129,43 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .badge.faint{background:rgba(255,255,255,.05);color:var(--muted)}
 .badge.remote{background:rgba(139,92,246,.16);color:#c4b5fd}
 .badge.local{background:rgba(52,211,153,.10);color:var(--ok)}
+/* provenance badges — compact, lowercase, letter-spaced; distinct from status */
+.badge.pv{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:1px 7px;border:1px solid transparent;font-weight:700}
+.badge.pv.ok{color:var(--ok);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.06)}
+.badge.pv.warn{color:var(--warn);border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.06)}
+.badge.pv.accent{color:var(--accent);border-color:rgba(34,211,238,.3);background:var(--accent-soft)}
+.badge.pv.faint{color:var(--faint);border-color:var(--line);background:transparent}
+/* ---- table polish: hover, focusable rows, tighter density ---- */
+table{border-collapse:collapse;font-size:12.5px}
+tbody tr{transition:background .12s ease}
+tbody tr:hover{background:rgba(255,255,255,.028)}
+th{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--faint);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 8px;border-bottom:1px solid rgba(28,38,52,.6);vertical-align:top}
+/* consistent focus ring across every control (keyboard a11y) */
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.nav-item:focus-visible,.pal-item:focus-visible{
+  outline:2px solid rgba(34,211,238,.55);outline-offset:2px;border-radius:var(--radius-sm)
+}
+/* loading shimmer for empty/async regions */
+.loading{display:flex;align-items:center;gap:8px;color:var(--faint);font-size:12.5px}
+.loading .spinner{width:14px;height:14px;border-radius:50%;border:2px solid var(--line-2);border-top-color:var(--accent);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* P1 execution trace — horizontal phase timeline */
+.xt-steps{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:12px}
+.xt-step{display:flex;align-items:center;gap:7px;padding:7px 12px;border:1px solid var(--line);border-radius:10px;background:rgba(8,12,19,.55);font-size:10px;letter-spacing:.11em;color:var(--faint);text-transform:uppercase;font-weight:700}
+.xt-dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+.xt-step.done{border-color:rgba(52,211,153,.32);color:var(--ok)}
+.xt-step.done .xt-dot{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+.xt-step.cur{border-color:rgba(34,211,238,.4);background:var(--accent-soft);color:var(--accent)}
+.xt-step.cur .xt-dot{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 1.4s ease infinite}
+.xt-step.fail{border-color:rgba(248,113,113,.45);color:var(--bad)}
+.xt-step.fail .xt-dot{background:var(--bad);box-shadow:0 0 7px var(--bad)}
+.xt-step.off{opacity:.55}
+.xt-step .xt-v{font-size:9px;opacity:.85;letter-spacing:.06em}
+.xt-sep{color:var(--faint);font-size:11px;opacity:.45}
+.xt-meta{display:flex;gap:8px 20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--faint);padding-top:4px}
+.xt-meta b{color:var(--muted);font-weight:600;margin-right:3px}
+.xt-meta .badge{font-size:9.5px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #chat-served{margin-left:auto;min-height:20px}
 .bar{height:5px;background:var(--bg-2);border-radius:99px;overflow:hidden;margin-top:5px}
 .bar>i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .5s ease}
@@ -539,6 +577,16 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <h2>Execution (planner decisions) <span class="count" id="exec-count"></span></h2>
           <table><thead><tr><th>Req</th><th>Worker</th><th class="num">Score</th><th class="num">Stages</th><th>Cont</th><th class="num">RTT</th><th>KV</th><th>Usage</th><th>Outcome</th><th>Reasoning</th></tr></thead>
           <tbody id="execution"><tr><td colspan="10" class="empty">no executions yet</td></tr></tbody></table>
+        </div>
+        <!-- P1 EXECUTION TRACE: a visual, per-execution timeline of the phases
+             (request -> planner -> reserve -> worker -> engine -> result) so an
+             operator can read the lifecycle of a routed request at a glance.
+             Phases are derived from the REAL execution record (outcome,
+             is_continuation, selected_worker, score, stages, rtt, kv_headroom,
+             tokens) — never invented. The latest execution is highlighted. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Execution trace <span class="count">P1 · phase timeline</span></h2>
+          <div id="exec-trace"><div class="loading"><span class="spinner"></span>no executions yet — the trace appears once a request is routed</div></div>
         </div>
         <!-- REMOTE EXECUTION: real fabric-routed executions only. A row is
              shown when the planner selected a worker whose peer id differs from
@@ -1806,6 +1854,7 @@ function workerCard(w, localPeer){
       badge+
       (w.accepts_remote_inference ? '<span class="nc-tag" title="this node accepts inference routed from remote peers">remote-ok</span>' : '<span class="nc-tag" title="this node serves local requests only">local-only</span>')+
       (connected ? '<span class="badge ok">p2p connected</span>' : '<span class="badge faint">not connected</span>')+
+      (w.perf_measured !== undefined ? provenanceBadge(w.perf_measured ? 'MEASURED' : 'ESTIMATED') : '')+
     '</div>'+
     '<div class="wc-meta">'+
       '<span><b>peer</b> <code title="'+esc(w.peer_id)+'">'+short(w.peer_id, 14)+'</code></span>'+
@@ -1908,11 +1957,47 @@ function renderExecutions(x){
       ? e.tokens_used + ' tok · ' + e.processing_time_ms + 'ms' + (e.attempt ? ' · attempt ' + e.attempt : '')
       : '—';
     return '<tr><td><code>'+short(e.request_id, 8)+'</code></td><td><code>'+short(e.selected_worker, 10)+'</code></td><td class="num">'+e.score.toFixed(2)+'</td><td class="num">'+e.stages+'</td>'+
-    '<td>'+(e.is_continuation ? '<span class="badge accent">cont</span>' : '<span class="badge faint">cold</span>')+'</td><td class="num">'+e.network_rtt_ms+'ms</td>'+
-    '<td class="mono">'+esc(e.kv_headroom || '—')+'</td><td class="mono">'+esc(usage)+'</td><td>'+outcomeBadge(e.outcome)+'</td><td class="mono" style="font-size:11px">'+esc(e.reasoning || '')+'</td></tr>';
+    '<td>'+(e.is_continuation ? '<span class="badge accent">cont</span>' : '<span class="badge faint">cold</span>')+'</td><td class="num">'+e.network_rtt_ms+'ms '+provenanceBadge(e.network_rtt_ms>0?'MEASURED':'UNKNOWN')+'</td>'+
+    '<td class="mono">'+esc(e.kv_headroom || '—')+' '+provenanceBadge(e.kv_headroom?'MEASURED':'UNKNOWN')+'</td><td class="mono">'+esc(usage)+'</td><td>'+outcomeBadge(e.outcome)+'</td><td class="mono" style="font-size:11px">'+esc(e.reasoning || '')+'</td></tr>';
   }).join('');
   $('execution').innerHTML = rows || '<tr><td colspan="10" class="empty">no executions yet</td></tr>';
   $('exec-count').textContent = (x && x.executions || []).length;
+  renderExecTrace(x);
+}
+// P1 execution trace: a visual phase timeline for the most recent execution.
+// Each phase's state is derived from the REAL record (outcome determines the
+// terminal phase state; earlier phases are done for a completed run, current
+// for an in-flight one). KV continuation, measured RTT and measured usage are
+// flagged honestly via provenance badges.
+function renderExecTrace(x){
+  const ex = (x && x.executions || []) || [];
+  const el = $('exec-trace');
+  if (!el) return;
+  if (!ex.length) { el.innerHTML = '<div class="loading"><span class="spinner"></span>no executions yet — the trace appears once a request is routed</div>'; return; }
+  const e = ex[0];
+  const outcome = e.outcome || 'in flight';
+  const done = outcome === 'succeeded';
+  const failed = outcome === 'failed';
+  const running = !done && !failed;
+  const step = (label, state) => '<div class="xt-step '+state+'"><span class="xt-dot"></span><span class="xt-k">'+label+'</span>'+(state==='cur'||state==='done'||state==='fail'?'<span class="xt-v">'+(state==='cur'?'active':state==='done'?'done':'failed')+'</span>':'')+'</div>';
+  const steps = [
+    step('REQUEST', 'done'),
+    step('PLANNER', done||running ? (running?'cur':'done') : 'off'),
+    step('RESERVE', done||running ? (running?'cur':'done') : 'off'),
+    step('WORKER', running?'cur':(done?'done':'fail')),
+    step('ENGINE', running?'cur':(done?'done':'off')),
+    step('RESULT', failed?'fail':(done?'done':'off')),
+  ];
+  const meta =
+    '<div class="xt-meta">'+
+      '<span><b>req</b> <code>'+esc(e.request_id)+'</code></span>'+
+      '<span><b>worker</b> <code>'+esc(e.selected_worker || '—')+'</code></span>'+
+      '<span><b>score</b> '+e.score.toFixed(2)+'</span>'+
+      '<span><b>rtt</b> '+e.network_rtt_ms+'ms '+provenanceBadge(e.network_rtt_ms>0?'MEASURED':'UNKNOWN')+'</span>'+
+      '<span><b>kv</b> '+esc(e.kv_headroom || '—')+' '+provenanceBadge(e.kv_headroom?'MEASURED':'UNKNOWN')+'</span>'+
+      '<span><b>usage</b> '+(e.tokens_used!=null?e.tokens_used+' tok · '+e.processing_time_ms+'ms':'—')+'</span>'+
+    '</div>';
+  el.innerHTML = '<div class="xt-head"><span class="xt-arrow"></span></div><div class="xt-steps">'+steps.join('<span class="xt-sep">→</span>')+'</div>'+meta;
 }
 // Remote execution: honest fabric view. A request counts as remote only when
 // the planner picked a worker whose peer id differs from this node's own peer
@@ -1944,6 +2029,18 @@ function outcomeBadge(o){
 function workloadBadge(cls){
   const map = { streaming_chat:'Streaming', continuation:'Continuation', batch:'Batch', completion:'Completion' };
   return '<span class="badge accent">'+esc(map[cls] || cls || 'unknown')+'</span>';
+}
+// Honest provenance badge: color-codes real MEASURED / ESTIMATED / INFERRED /
+// UNKNOWN values. EXPERIMENTAL has no honest source in the API yet, so it is
+// never emitted here (never fabricated). `unknown` default renders faint.
+function provenanceBadge(p){
+  const s = String(p || '').toUpperCase();
+  if (s === 'MEASURED') return '<span class="badge ok pv">measured</span>';
+  if (s === 'ESTIMATED') return '<span class="badge warn pv">estimated</span>';
+  if (s === 'INFERRED') return '<span class="badge accent pv">inferred</span>';
+  if (s === 'VERIFIED') return '<span class="badge ok pv">verified</span>';
+  if (s === 'EXPERIMENTAL') return '<span class="badge accent pv">experimental</span>';
+  return '<span class="badge faint pv">unknown</span>';
 }
 function renderDecisions(x){
   const ds = (x && x.decisions || []).slice(0, 10);
@@ -2992,19 +3089,19 @@ function renderResources(r){
   const cpu = node.cpu || {};
   const disk = node.disk || {};
   let nodeHtml =
-    '<div><span class="badge ok">cpu</span> '+cpu.logical_cpus+' cores · '+(cpu.usage_percent||0).toFixed(1)+'% ['+esc(cpu.provenance||'')+']</div>'+
-    '<div><span class="badge ok">ram</span> '+fmtMB(ram.available_mb)+' free / '+fmtMB(ram.total_mb)+' total · headroom '+fmtMB(ram.headroom_mb)+' ['+esc(ram.provenance||'')+']</div>';
+    '<div><span class="badge ok">cpu</span> '+cpu.logical_cpus+' cores · '+(cpu.usage_percent||0).toFixed(1)+'% '+provenanceBadge(cpu.provenance)+'</div>'+
+    '<div><span class="badge ok">ram</span> '+fmtMB(ram.available_mb)+' free / '+fmtMB(ram.total_mb)+' total · headroom '+fmtMB(ram.headroom_mb)+' '+provenanceBadge(ram.provenance)+'</div>';
   const vram = node.vram || {};
   if (vram.present) {
-    nodeHtml += '<div><span class="badge ok">vram</span> '+esc(vram.name||'gpu')+' · '+fmtMB(vram.free_mb)+' free / '+fmtMB(vram.total_mb)+' ['+esc(vram.provenance||'')+']</div>';
+    nodeHtml += '<div><span class="badge ok">vram</span> '+esc(vram.name||'gpu')+' · '+fmtMB(vram.free_mb)+' free / '+fmtMB(vram.total_mb)+' '+provenanceBadge(vram.provenance)+'</div>';
   } else {
-    nodeHtml += '<div><span class="badge warn">vram</span> no GPU surfaced ['+esc(vram.provenance||'UNKNOWN')+']</div>';
+    nodeHtml += '<div><span class="badge warn">vram</span> no GPU surfaced '+provenanceBadge(vram.provenance)+'</div>';
   }
-  nodeHtml += '<div><span class="badge ok">disk</span> '+fmtMB(disk.free_mb)+' free ['+esc(disk.provenance||'')+']</div>';
+  nodeHtml += '<div><span class="badge ok">disk</span> '+fmtMB(disk.free_mb)+' free '+provenanceBadge(disk.provenance)+'</div>';
   $('res-node').innerHTML = nodeHtml;
 
   const rows = (r.fabric||[]).map(w => {
-    const prow = (v, unit) => v ? '<span class="badge faint" title="provenance">'+esc(v)+'</span>' : unit;
+    const prow = (v, unit) => v ? provenanceBadge(v) : unit;
     const ramH = w.ram ? 'RAM '+fmtMB(w.ram.available_mb)+' free / '+fmtMB(w.ram.total_mb)+' · res '+fmtMB(w.ram.reserved_mb)+' '+prow(w.ram.provenance,'') : '';
     const vramH = w.vram && w.vram.present
       ? ' · VRAM '+fmtMB(w.vram.available_mb)+' / '+fmtMB(w.vram.total_mb)+' '+prow(w.vram.provenance,'')
