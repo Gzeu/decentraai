@@ -203,6 +203,14 @@ pub struct DashboardInfo {
     pub generation: GenerationSection,
     /// Resource limits/guards from the config (Settings view).
     pub resources: ResourceSection,
+    /// Whether the node runs the Kademlia DHT (cross-subnet discovery).
+    pub dht_enabled: bool,
+    /// Whether the node runs relay + DCUtR (NAT traversal).
+    pub relay_enabled: bool,
+    /// Whether LAN mDNS discovery is enabled.
+    pub lan_discovery: bool,
+    /// Number of configured bootstrap peers (network.bootstrap_peers).
+    pub bootstrap_peer_count: usize,
 }
 
 /// Shared proxy state.
@@ -4634,6 +4642,11 @@ async fn network_handler(
         "addresses": [],
         "local_peer": null,
         "local_addresses": [],
+        "external_addresses": [],
+        "dht_enabled": state.info.dht_enabled,
+        "relay_enabled": state.info.relay_enabled,
+        "lan_discovery": state.info.lan_discovery,
+        "bootstrap_peers": state.info.bootstrap_peer_count,
     });
     if let Some(p2p) = &state.p2p {
         let snapshot = p2p.peers_snapshot().await;
@@ -4652,6 +4665,16 @@ async fn network_handler(
         body["local_addresses"] = serde_json::json!(
             snapshot
                 .local_addresses
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+        );
+        // Addresses observed for us by remote peers via identify (e.g. our
+        // public IP behind NAT). Empty on a pure-LAN node with no external
+        // peer yet. Real data only.
+        body["external_addresses"] = serde_json::json!(
+            snapshot
+                .external_addresses
                 .iter()
                 .map(|a| a.to_string())
                 .collect::<Vec<_>>()
@@ -6774,6 +6797,10 @@ mod tests {
                 max_upload_mbps: 20,
                 max_download_mbps: 80,
             },
+            dht_enabled: false,
+            relay_enabled: false,
+            lan_discovery: true,
+            bootstrap_peer_count: 0,
         }
     }
 

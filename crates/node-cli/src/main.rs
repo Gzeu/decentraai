@@ -1315,6 +1315,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             model_size_bytes,
             generation: config.inference.generation.clone(),
             resources: config.resources.clone(),
+            dht_enabled: config.network.dht_enabled,
+            relay_enabled: config.network.relay_enabled,
+            lan_discovery: config.network.lan_discovery,
+            bootstrap_peer_count: config.network.bootstrap_peers.len(),
         };
         let token_store_path = config
             .tiers
@@ -2261,6 +2265,10 @@ async fn serve_common(
         model_size_bytes,
         generation: config.inference.generation.clone(),
         resources: config.resources.clone(),
+        dht_enabled: config.network.dht_enabled,
+        relay_enabled: config.network.relay_enabled,
+        lan_discovery: config.network.lan_discovery,
+        bootstrap_peer_count: config.network.bootstrap_peers.len(),
     };
     let token_store_path = config.tiers.as_ref().map(|_| data_dir.join("db/tokens.json"));
     // Q2: one request at a time reaches the backend with the machine's

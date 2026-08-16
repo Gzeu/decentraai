@@ -679,6 +679,22 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
             <div id="connected" class="empty">no connected peers</div>
           </div>
         </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div class="card">
+            <h2>External addresses <span class="count">identify · NAT</span></h2>
+            <div id="external-addrs" class="empty">no external address yet — the node has not been observed by a remote peer</div>
+            <p class="mono" style="font-size:11px;color:var(--faint);margin-top:6px">Addresses remote peers observe for this node (via identify). When present, remote peers can dial this node directly across NAT.</p>
+          </div>
+          <div class="card">
+            <h2>Discovery <span class="count">cross-subnet</span></h2>
+            <table><tbody>
+              <tr><td>mDNS (LAN)</td><td class="num" id="net-mdns"><span class="badge ok">on</span></td></tr>
+              <tr><td>DHT (cross-subnet)</td><td class="num" id="net-dht"><span class="badge faint">unknown</span></td></tr>
+              <tr><td>Relay / DCUtR</td><td class="num" id="net-relay"><span class="badge faint">unknown</span></td></tr>
+              <tr><td>Bootstrap peers</td><td class="num" id="net-bootstrap">&mdash;</td></tr>
+            </tbody></table>
+          </div>
+        </div>
         <div class="card" style="margin-top:14px">
           <h2>Tracked peers (reputation)</h2>
           <table><thead><tr><th>Peer</th><th class="num">Verified chunks</th><th class="num">Failed</th><th class="num">Score</th><th>Status</th></tr></thead>
@@ -1999,6 +2015,23 @@ function renderNetwork(n){
   $('diag-p2p').innerHTML = conn.length + ' connected, ' + (n && n.links || []).length + ' measured link(s)' + ((n && n.addresses || []).length ? ' · ' + (n.addresses || []).length + ' address(es) known' : '');
   $('rec-connected').textContent = conn.length;
   $('rec-links').textContent = (n && n.links || []).length;
+  // External addresses observed for us by remote peers (identify / NAT).
+  const ext = (n && n.external_addresses || []);
+  $('external-addrs').innerHTML = ext.length
+    ? ext.map(a => '<div class="mono" style="font-size:11px;padding:2px 0"><span class="badge accent pv">external</span> <code>'+esc(a)+'</code></div>').join('')
+    : '<div class="empty">no external address yet — the node has not been observed by a remote peer</div>';
+  // Discovery posture: reflect what the node is configured to do. On a node
+  // with relay/DHT enabled the badge is accent (capable) but only turns ok
+  // when an external address is actually observed. We derive this from the
+  // real /status + config flags surfaced through the API, never invent it.
+  const dhtOn = (n && n.dht_enabled);
+  const relayOn = (n && n.relay_enabled);
+  const mdnsOn = (n && n.mdns_enabled !== false);
+  $('net-mdns').innerHTML = mdnsOn ? '<span class="badge ok">on</span>' : '<span class="badge faint">off</span>';
+  $('net-dht').innerHTML = dhtOn ? '<span class="badge accent">enabled</span>' : '<span class="badge faint">disabled</span>';
+  $('net-relay').innerHTML = relayOn ? '<span class="badge accent">enabled</span>' : '<span class="badge faint">disabled</span>';
+  const boot = (n && n.bootstrap_peers) || 0;
+  $('net-bootstrap').textContent = boot ? boot + ' configured' : 'none';
 }
 function renderPeers(p){
   const rows = (p || []).map(peer =>
