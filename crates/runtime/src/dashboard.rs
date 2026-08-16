@@ -622,6 +622,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
 
       <!-- WORKERS -->
       <section class="view" id="view-workers">
+        <div id="worker-gone" style="display:none;margin-bottom:12px;padding:10px 14px;border:1px solid rgba(248,113,113,.4);background:rgba(248,113,113,.06);border-radius:10px;font-size:12.5px;color:var(--text)"><b>Workers went away</b> <span id="worker-gone-list" style="color:var(--muted)"></span> — they will reconnect automatically (bootstrap re-dial).</div>
         <div class="card">
           <h2>Workers (compute registry) <span class="count" id="workers-count"></span></h2>
           <div id="workers" class="worker-cards"><div class="empty">no workers yet (compute not attached)</div></div>
@@ -1962,6 +1963,9 @@ function workerCard(w, localPeer){
       badge+
       (w.accepts_remote_inference ? '<span class="nc-tag" title="this node accepts inference routed from remote peers">remote-ok</span>' : '<span class="nc-tag" title="this node serves local requests only">local-only</span>')+
       (connected ? '<span class="badge ok">p2p connected</span>' : '<span class="badge faint">not connected</span>')+
+      (w.last_seen_secs > 90 ? '<span class="badge bad">offline '+fmtUptime(w.last_seen_secs)+'</span>'
+        : w.last_seen_secs > 30 ? '<span class="badge warn">stale '+fmtUptime(w.last_seen_secs)+'</span>'
+        : '')+
       (w.perf_measured !== undefined ? provenanceBadge(w.perf_measured ? 'MEASURED' : 'ESTIMATED') : '')+
     '</div>'+
     '<div class="wc-meta">'+
@@ -1986,6 +1990,24 @@ function workerCard(w, localPeer){
 function renderWorkers(c){
   const workers = (c && c.workers) || [];
   const localPeer = (c && c.local_peer) || 'local';
+  // Worker-gone alert: if a remote worker we saw before is no longer in the
+  // registry, surface it (it will reconnect via bootstrap re-dial). Only
+  // remote peers count (the local node is always present); the alert clears
+  // once the worker is back or after showing for a while.
+  const currentIds = new Set(workers.filter(w => w.peer_id !== localPeer).map(w => w.peer_id));
+  const prevIds = window.prevWorkerIds || new Set();
+  const gone = [...prevIds].filter(id => !currentIds.has(id));
+  if (gone.length) {
+    const names = gone.map(id => { const w = window.prevWorkersById && window.prevWorkersById[id]; return (w && (w.node_name || w.node_id)) || short(id, 10); });
+    $('worker-gone').style.display = 'block';
+    $('worker-gone-list').textContent = names.join(', ');
+    setTimeout(() => { const g = $('worker-gone'); if (g) g.style.display = 'none'; }, 15000);
+  } else {
+    const g = $('worker-gone'); if (g) g.style.display = 'none';
+  }
+  window.prevWorkerIds = currentIds;
+  window.prevWorkersById = {};
+  workers.forEach(w => { window.prevWorkersById[w.peer_id] = w; });
   $('workers').innerHTML = workers.map(w => workerCard(w, localPeer)).join('') || '<div class="empty">no workers yet (compute not attached)</div>';
   $('workers-count').textContent = workers.length + ' advertised';
   $('diag-workers').innerHTML = workers.length + ' worker(s)';
