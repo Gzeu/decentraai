@@ -3722,6 +3722,11 @@ async fn admin_settings_generation_handler(
         g.system_prompt = v.to_string();
     }
     let a = state.info.repo_root.join("logs/audit.jsonl");
+    // Persist to the node config (best-effort): the live override already
+    // applies immediately, but writing it to node.yaml makes it survive a
+    // restart. A write failure only warns — the live override stays valid for
+    // the current process.
+    let persisted = persist_generation_config(&state.info.repo_root, &g);
     let _ = decentraai_audit::record(
         a.parent().unwrap_or(&state.info.repo_root),
         "settings_generation_updated",
@@ -3730,6 +3735,7 @@ async fn admin_settings_generation_handler(
             "top_p": g.top_p,
             "top_k": g.top_k,
             "repeat_penalty": g.repeat_penalty,
+            "persisted": persisted,
         }),
     );
     (
@@ -3743,11 +3749,121 @@ async fn admin_settings_generation_handler(
                 "repeat_penalty": g.repeat_penalty,
                 "system_prompt": g.system_prompt,
             },
-            "note": "applied live; config file remains the startup source of truth",
+            "persisted": persisted,
+            "note": if persisted { "applied live and persisted to node.yaml" } else { "applied live only (could not persist config)" },
         })
         .to_string(),
     )
         .into_response()
+}
+
+/// Best-effort, text-based persistence of the runtime generation defaults into
+/// `<data_dir>/node.yaml` under the `generation:` block. Handles a missing
+/// file (returns false — live override only) and rewrites atomically
+/// (tmp + rename). Kept simple on purpose: the config crate's YAML round-trip
+/// would need `NodeConfig: Serialize`; editing the known keys directly is
+/// safer than reconstructing the whole file.
+fn persist_generation_config(repo_root: &std::path::Path, g: &GenerationSection) -> bool {
+    use std::io::Write;
+    let path = repo_root.join("node.yaml");
+    if !path.exists() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+    let temp = |line: &str, v: String| -> String {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("temperature:") {
+            format!("{}temperature: {}", &line[..line.len() - trimmed.len()], v)
+        } else if trimmed.starts_with("top_p:") {
+            format!("{}top_p: {}", &line[..line.len() - trimmed.len()], v)
+        } else if trimmed.starts_with("top_k:") {
+            format!("{}top_k: {}", &line[..line.len() - trimmed.len()], v)
+        } else if trimmed.starts_with("repeat_penalty:") {
+            format!("{}repeat_penalty: {}", &line[..line.len() - trimmed.len()], v)
+        } else if trimmed.starts_with("system_prompt:") {
+            format!(
+                "{}system_prompt: {}",
+                &line[..line.len() - trimmed.len()],
+                serde_json::to_string(&g.system_prompt).unwrap_or_else(|_| "\"\"".to_string())
+            )
+        } else {
+            line.to_string()
+        }
+    };
+    let in_gen = raw.lines().any(|l| l.trim() == "generation:");
+    if !in_gen {
+        return false;
+    }
+    let mut after_gen = false;
+    let mut out: Vec<String> = Vec::new();
+    let mut wrote = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed == "generation:" {
+            after_gen = true;
+            out.push(line.to_string());
+            continue;
+        }
+        // Once past `generation:` we only keep replacing until we hit a key at
+        // the same or lower indentation (i.e. a sibling key ends the block).
+        if after_gen {
+            let indent = line.len() - trimmed.len();
+            if indent <= 2 && !trimmed.is_empty() && !trimmed.starts_with('#') {
+                after_gen = false;
+            } else if indent > 2 {
+                let is_key = trimmed.starts_with("temperature:")
+                    || trimmed.starts_with("top_p:")
+                    || trimmed.starts_with("top_k:")
+                    || trimmed.starts_with("repeat_penalty:")
+                    || trimmed.starts_with("system_prompt:");
+                if is_key {
+                    out.push(match trimmed.split_once(':').map(|x| x.0.trim()) {
+                        Some("temperature") => {
+                            wrote = true;
+                            temp(line, format!("{}", g.temperature))
+                        }
+                        Some("top_p") => {
+                            wrote = true;
+                            temp(line, format!("{}", g.top_p))
+                        }
+                        Some("top_k") => {
+                            wrote = true;
+                            temp(line, g.top_k.map(|k| k.to_string()).unwrap_or_else(|| "null".into()))
+                        }
+                        Some("repeat_penalty") => {
+                            wrote = true;
+                            temp(line, format!("{}", g.repeat_penalty))
+                        }
+                        Some("system_prompt") => {
+                            wrote = true;
+                            temp(line, String::new()) // uses serde_json in temp()
+                        }
+                        _ => line.to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    // If none of the known keys existed, nothing to persist.
+    if !wrote {
+        return false;
+    }
+    let content = out.join("\n");
+    let tmp = path.with_extension("yaml.tmp");
+    let mut f = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to create config tmp file");
+            return false;
+        }
+    };
+    if f.write_all(content.as_bytes()).is_err() || f.sync_all().is_err() {
+        return false;
+    }
+    drop(f);
+    std::fs::rename(&tmp, &path).is_ok()
 }
 
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
