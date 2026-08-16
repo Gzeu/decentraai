@@ -1441,3 +1441,17 @@ without executing.
   429 and audits `execute_rate_limited`. Read-only calls are never limited here.
 - [x] Test: limit+1 call → 429 + audit (each call consumes a slot before body/
   decision handling, so honest 422s count).
+
+## 64. Next-Gen — Device-class projection (mobile/lightweight worker foundation)
+
+First step toward "a fabric from ALL your devices": classify each fabric node's
+device class from its REAL advertised capability (GPU/RAM/cores), exposed in the
+Digital Twin.
+
+- [x] `device_class(&ComputeCapability)` — pure INFERRED classification
+  (server/desktop/laptop/mobile/edge) from real hardware advertisement; never
+  fabricated, never changes scheduling.
+- [x] `/v1/fabric` nodes now carry `device_class`, so an operator can see at a
+  glance which fabric members are lightweight/mobile.
+- [x] Test: classification across server/desktop/laptop/mobile/edge from real
+  capability inputs.

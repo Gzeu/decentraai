@@ -4078,6 +4078,33 @@ async fn sessions_handler(
         .into_response()
 }
 
+/// Classify a node's device class from its REAL advertised capability
+/// (cpu_cores, ram_mb, GPU presence). This is an INFERRED classification for the
+/// Digital Twin / mobile-worker direction — it never changes scheduling or
+/// capability, and it never fabricates hardware. It lets an operator see at a
+/// glance which fabric members are lightweight/mobile.
+///
+/// Heuristics (conservative, INFERRED):
+/// - a discrete GPU with substantial RAM/cores -> "server"
+/// - a discrete GPU otherwise -> "desktop"
+/// - no GPU, high RAM & many cores -> "server" (headless/rack)
+/// - no GPU, moderate -> "laptop"
+/// - no GPU, low RAM / few cores -> "mobile" (phone/tablet/Raspberry Pi-class)
+/// - anything else -> "edge" (unknown/embedded)
+fn device_class(cap: &decentraai_compute::ComputeCapability) -> &'static str {
+    let has_gpu = cap.gpu.is_some();
+    let ram_gb = cap.ram_mb / 1024;
+    let cores = cap.cpu_cores;
+    match (has_gpu, ram_gb, cores) {
+        (true, r, _) if r >= 32 => "server",
+        (true, _, _) => "desktop",
+        (false, r, _) if r >= 32 && cores >= 16 => "server",
+        (false, r, _) if r >= 8 => "laptop",
+        (false, r, _) if r < 8 && cores < 8 => "mobile",
+        _ => "edge",
+    }
+}
+
 /// Pure projection of the conceptual fabric graph
 /// `NODE -> WORKER -> ENGINE -> MODEL -> CAPABILITY -> EXECUTION` from
 /// authoritative live state. It never fabricates: absent data yields empty
@@ -4108,6 +4135,7 @@ fn fabric_graph_aggregate(
                 "node_id": w.node_id,
                 "node_name": w.node_name,
                 "trusted": *trusted,
+                "device_class": device_class(&w.capability),
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -7401,6 +7429,37 @@ mod tests {
         assert!(body["network"].as_array().unwrap().is_empty());
         assert!(body["executions"].as_array().unwrap().is_empty());
         assert_eq!(body["kv"]["sessions_active"], 0);
+    }
+
+    #[test]
+    fn device_class_classifies_from_real_capability() {
+        // Device-class inference (Digital Twin / mobile workers): derived from
+        // real advertised capability (GPU/RAM/cores), never fabricated, and it
+        // does not change scheduling.
+        let cap = |gpu: bool, ram_mb: u64, cores: u16| decentraai_compute::ComputeCapability {
+            cpu_cores: cores,
+            ram_mb,
+            gpu: if gpu {
+                Some(decentraai_compute::GpuSpec {
+                    name: "gpu".into(),
+                    vram_mb: 8192,
+                    driver: "x".into(),
+                })
+            } else {
+                None
+            },
+            engine: "llama_server".into(),
+            served_models: vec![],
+            can_provision: false,
+            available_models: vec![],
+        };
+        assert_eq!(device_class(&cap(true, 64 * 1024, 32)), "server"); // big GPU box
+        assert_eq!(device_class(&cap(true, 16 * 1024, 8)), "desktop"); // gaming rig
+        assert_eq!(device_class(&cap(false, 64 * 1024, 24)), "server"); // headless
+        assert_eq!(device_class(&cap(false, 16 * 1024, 8)), "laptop");
+        assert_eq!(device_class(&cap(false, 4 * 1024, 4)), "mobile"); // phone/Pi-class
+        assert_eq!(device_class(&cap(false, 2 * 1024, 2)), "mobile");
+        assert_eq!(device_class(&cap(false, 16 * 1024, 4)), "laptop"); // edge-ish but RAM-y
     }
 
     #[test]
