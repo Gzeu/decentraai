@@ -1110,23 +1110,20 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
     }
 
-    let p2p_node = P2PNode::new(
+    let p2p_node = P2PNode::new_with_network(
         &identity,
         config.network.max_message_bytes as usize,
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
         Some(Arc::new(chained_handler)),
+        decentraai_p2p::NetworkConfig {
+            lan_discovery: config.network.lan_discovery,
+            dht_enabled: config.network.dht_enabled,
+            relay_enabled: config.network.relay_enabled,
+            bootstrap_peers: config.network.bootstrap_peers.clone(),
+            max_connections: config.network.max_connections,
+        },
     )?;
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
-
-    // Bootstrap peers: dial each explicitly-configured peer so the fabric is
-    // robust to DHCP IP churn (mDNS alone cannot rediscover a peer whose IP
-    // changed if the announcement is missed). Best-effort — a peer that is
-    // offline now is re-dialed on reconnect; never fails node startup.
-    for peer_addr in &config.network.bootstrap_peers {
-        if let Err(e) = p2p_node.dial(peer_addr).await {
-            tracing::warn!(peer = %peer_addr, error = %e, "bootstrap dial deferred (peer may be offline)");
-        }
-    }
 
     let mut distributed = DistributedInference::new(
         p2p_node,

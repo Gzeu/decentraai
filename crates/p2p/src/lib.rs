@@ -18,8 +18,10 @@ use decentraai_identity::Identity;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::{Multiaddr, mdns, noise, tcp, yamux};
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, dcutr, identify, kad, mdns, noise, ping, relay, tcp, yamux};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -33,6 +35,57 @@ use tracing::{debug, info, warn};
 pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
 /// Base backoff (ms) doubled on each reconnect attempt.
 pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
+
+/// Transport/discovery options for a node. Defaults to LAN-only (mDNS), which
+/// preserves the original single-subnet behaviour exactly. To reach peers
+/// across NAT / subnets, enable the DHT and optionally relay.
+#[derive(Debug, Clone)]
+pub struct NetworkConfig {
+    /// mDNS discovery on the local subnet. LAN-only discovery.
+    pub lan_discovery: bool,
+    /// Whether to run the Kademlia DHT for cross-subnet peer discovery.
+    pub dht_enabled: bool,
+    /// Whether to run the relay client, relay server and DCUtR hole-punching.
+    pub relay_enabled: bool,
+    /// Multiaddrs of DHT bootstrap peers (e.g. a well-known public relay /
+    /// rendezvous node), each ending in `/p2p/<PeerId>`.
+    pub bootstrap_peers: Vec<String>,
+    /// Upper bound on concurrent connections (reserved for connection limits;
+    /// currently informational).
+    pub max_connections: u16,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self::lan_only()
+    }
+}
+
+impl NetworkConfig {
+    /// The original single-subnet configuration: mDNS only, no DHT, no relay.
+    pub fn lan_only() -> Self {
+        Self {
+            lan_discovery: true,
+            dht_enabled: false,
+            relay_enabled: false,
+            bootstrap_peers: Vec::new(),
+            max_connections: 50,
+        }
+    }
+}
+
+/// Parses a bootstrap multiaddr like `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
+/// into a `(PeerId, Multiaddr)` pair where the returned address has the
+/// trailing `/p2p/<PeerId>` component stripped (so it can be handed to the
+/// DHT's `add_address` or re-append for dialing).
+fn parse_bootstrap_peer(s: &str) -> Result<(PeerId, Multiaddr)> {
+    let mut addr: Multiaddr = s.parse().with_context(|| format!("invalid multiaddr {s:?}"))?;
+    let peer_id = match addr.pop() {
+        Some(Protocol::P2p(peer)) => peer,
+        _ => bail!("bootstrap multiaddr must end with /p2p/<PeerId>: {s:?}"),
+    };
+    Ok((peer_id, addr))
+}
 
 /// Request/response protocol carrying serialized decentraai-protocol messages.
 pub const MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/decentraai/message/1");
@@ -295,6 +348,10 @@ pub struct PeersSnapshot {
     pub connected: Vec<PeerId>,
     pub addresses: HashMap<PeerId, Multiaddr>,
     pub local_addresses: Vec<Multiaddr>,
+    /// Addresses observed for us by remote peers via the identify protocol
+    /// (e.g. our public IP behind NAT). Advertised on the swarm so remote
+    /// peers can dial us directly.
+    pub external_addresses: Vec<Multiaddr>,
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
@@ -377,13 +434,34 @@ impl P2PNode {
         *guard = Some(std::sync::Arc::new(callback));
     }
 
-    /// Creates a node and spawns its swarm task. Must be called from within
-    /// a Tokio runtime: the mDNS behaviour registers with the reactor.
+    /// Creates a node and spawns its swarm task, LAN-only (mDNS discovery,
+    /// no DHT, no relay). Must be called from within a Tokio runtime: the
+    /// mDNS behaviour registers with the reactor.
     pub fn new(
         identity: &Identity,
         max_message_bytes: usize,
         max_chunk_message_bytes: usize,
         handler: Option<Arc<dyn RequestHandler>>,
+    ) -> Result<Self> {
+        Self::new_with_network(
+            identity,
+            max_message_bytes,
+            max_chunk_message_bytes,
+            handler,
+            NetworkConfig::lan_only(),
+        )
+    }
+
+    /// Creates a node and spawns its swarm task with explicit network
+    /// configuration (DHT, relay, bootstrap peers). This is the entry point
+    /// for NAT-traversal / cross-subnet deployments; [`P2PNode::new`]
+    /// delegates here with the default LAN-only config.
+    pub fn new_with_network(
+        identity: &Identity,
+        max_message_bytes: usize,
+        max_chunk_message_bytes: usize,
+        handler: Option<Arc<dyn RequestHandler>>,
+        network: NetworkConfig,
     ) -> Result<Self> {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
@@ -393,6 +471,16 @@ impl P2PNode {
         let codec = FrameCodec {
             max_frame_bytes: max_chunk_message_bytes.max(max_message_bytes),
         };
+        // Parse bootstrap peers up front (so a typo'd multiaddr is a loud
+        // warning, not a silent hole in discovery), and remember them to dial
+        // right after the swarm is built.
+        let mut bootstrap: Vec<(PeerId, Multiaddr)> = Vec::new();
+        for s in &network.bootstrap_peers {
+            match parse_bootstrap_peer(s) {
+                Ok((peer, addr)) => bootstrap.push((peer, addr)),
+                Err(e) => warn!(peer = %s, error = %e, "skipping invalid bootstrap peer"),
+            }
+        }
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -401,7 +489,14 @@ impl P2PNode {
                 yamux::Config::default,
             )
             .context("building TCP transport")?
-            .with_behaviour(|_| NodeBehaviour {
+            // Relay client transport: lets us dial and accept `/p2p-circuit`
+            // addresses through a relay server, which is how a node behind
+            // NAT reaches (and is reached by) peers outside its subnet.
+            // Always built so the transport is uniform; the behaviour itself
+            // is gated on `network.relay_enabled`.
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .context("building relay client transport")?
+            .with_behaviour(|keypair, relay_client| NodeBehaviour {
                 mdns: mdns_behaviour,
                 messages: request_response::Behaviour::with_codec(
                     codec,
@@ -414,10 +509,50 @@ impl P2PNode {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(300)),
                 ),
+                identify: identify::Behaviour::new(identify::Config::new(
+                    format!("decentraai/{}", env!("CARGO_PKG_VERSION")),
+                    keypair.public(),
+                )),
+                ping: ping::Behaviour::new(ping::Config::default()),
+                kad: Toggle::from(if network.dht_enabled {
+                    let mut k = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+                    // Advertise and serve K/V once we have a confirmed
+                    // external address (see kad behaviour docs); explicit
+                    // Server mode means we participate even on loopback.
+                    k.set_mode(Some(kad::Mode::Server));
+                    for (peer, addr) in &bootstrap {
+                        k.add_address(peer, addr.clone());
+                    }
+                    Some(k)
+                } else {
+                    None
+                }),
+                dcutr: Toggle::from(if network.relay_enabled {
+                    Some(dcutr::Behaviour::new(peer_id))
+                } else {
+                    None
+                }),
+                relay: Toggle::from(if network.relay_enabled {
+                    Some(relay_client)
+                } else {
+                    None
+                }),
+                relay_server: Toggle::from(if network.relay_enabled {
+                    Some(relay::Behaviour::new(peer_id, relay::Config::default()))
+                } else {
+                    None
+                }),
             })
             .context("attaching network behaviour")?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
+        // Dial bootstrap peers so the DHT connects immediately instead of
+        // waiting for an idle routing query to discover them.
+        for (peer, addr) in &bootstrap {
+            if let Err(e) = swarm.dial(addr.clone().with(Protocol::P2p(*peer))) {
+                debug!(%peer, error = %e, "bootstrap dial deferred");
+            }
+        }
 
         let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
         // A second sender used only by the reconnect tasks spawned on peer
@@ -446,6 +581,10 @@ impl P2PNode {
             let mut known_addresses: HashMap<PeerId, Multiaddr> = HashMap::new();
             // Our own listen addresses (the node's LAN identity).
             let mut local_addresses: Vec<Multiaddr> = Vec::new();
+            // Addresses observed for us by remote peers via identify (our
+            // public IP behind NAT). Advertised on the swarm so peers can
+            // dial us directly; surfaced for the control plane.
+            let mut external_addresses: Vec<Multiaddr> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -494,6 +633,7 @@ impl P2PNode {
                                     connected: connected.clone(),
                                     addresses: known_addresses.clone(),
                                     local_addresses: local_addresses.clone(),
+                                    external_addresses: external_addresses.clone(),
                                 });
                             }
                             Command::Shutdown => break,
@@ -704,6 +844,67 @@ impl P2PNode {
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
                                 request_response::Event::ResponseSent { .. },
                             )) => {}
+                            // Identify: learn the peer's addresses and, most
+                            // importantly, OUR address as observed by that
+                            // peer (the public IP behind NAT). Advertising it
+                            // on the swarm lets remote peers dial us directly,
+                            // and surfaces it for the control plane.
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
+                                identify::Event::Received { info, .. },
+                            )) => {
+                                if !info.observed_addr.is_empty() {
+                                    if !external_addresses.contains(&info.observed_addr) {
+                                        external_addresses.push(info.observed_addr.clone());
+                                    }
+                                    // Register with the swarm so it is
+                                    // announced and used for inbound dials.
+                                    swarm.add_external_address(info.observed_addr.clone());
+                                    info!(addr = %info.observed_addr, "identify learned our external address");
+                                }
+                                for addr in &info.listen_addrs {
+                                    swarm.add_peer_address(info.public_key.to_peer_id(), addr.clone());
+                                }
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(_)) => {}
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Ping(_)) => {}
+                            // Kademlia: learning a routable address for a peer
+                            // lets us dial it across subnets without mDNS.
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(
+                                kad::Event::RoutablePeer { peer, address },
+                            )) => {
+                                known_addresses.insert(peer, address.clone());
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(
+                                kad::Event::OutboundQueryProgressed { .. },
+                            )) => {}
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(_)) => {}
+                            // Relay client: once a reservation is accepted the
+                            // reserved relayed address is a way peers can
+                            // reach us across NAT.
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Relay(
+                                relay::client::Event::ReservationReqAccepted {
+                                    relay_peer_id, ..
+                                },
+                            )) => {
+                                info!(%relay_peer_id, "relay reservation accepted");
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Relay(_)) => {}
+                            // Relay server: log when peers reserve circuits or
+                            // circuits open/close through us.
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::RelayServer(
+                                relay::Event::ReservationReqAccepted { .. },
+                            )) => {}
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::RelayServer(
+                                relay::Event::CircuitClosed {
+                                    src_peer_id,
+                                    dst_peer_id,
+                                    error,
+                                },
+                            )) => {
+                                debug!(%src_peer_id, %dst_peer_id, error = ?error, "relay circuit closed");
+                            }
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::RelayServer(_)) => {}
+                            SwarmEvent::Behaviour(NodeBehaviourEvent::Dcutr(_)) => {}
                             _ => {}
                         }
                     }
@@ -798,6 +999,21 @@ impl P2PNode {
 struct NodeBehaviour {
     mdns: mdns::tokio::Behaviour,
     messages: request_response::Behaviour<FrameCodec>,
+    /// Identify: exchanges listen/observed addresses so peers learn each
+    /// other's external addresses across NAT.
+    identify: identify::Behaviour,
+    /// Ping: liveness/keepalive probe on every connection.
+    ping: ping::Behaviour,
+    /// Kademlia DHT: cross-subnet peer discovery and address routing.
+    /// `Toggle` off keeps the node LAN-only (config `network.dht_enabled`).
+    kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
+    /// Hole-punching over relayed connections (config `network.relay_enabled`).
+    dcutr: Toggle<dcutr::Behaviour>,
+    /// Relay client: dial and be dialed through a relay server across NAT.
+    /// Paired with the relay client transport built in `P2PNode::new`.
+    relay: Toggle<relay::client::Behaviour>,
+    /// Relay server: reserves circuits and relays traffic for other peers.
+    relay_server: Toggle<relay::Behaviour>,
 }
 
 #[derive(Debug, Clone)]
