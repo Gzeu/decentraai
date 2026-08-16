@@ -54,6 +54,7 @@ fi
 
 echo "==> Installing the decentraai CLI"
 cargo install --path crates/node-cli --force >/dev/null
+echo "  (standalone lightweight worker: decentraai-worker --name <n> --model <file.gguf>)"
 BIN="$HOME/.cargo/bin/decentraai"
 
 echo "==> Onboarding (detect hardware -> identity -> model -> validated config)"
@@ -91,6 +92,7 @@ cat <<EOF
   Stop        : systemctl --user stop $SERVICE
   Start       : systemctl --user start $SERVICE
   Restart     : systemctl --user restart $SERVICE
+  Worker      : decentraai-worker --name <worker-name> --model <model.gguf>  (join a fabric without the control plane)
   Uninstall   : bash scripts/uninstall-app.sh
 
 Open the launcher "DecentraAI" from the applications menu, or run:

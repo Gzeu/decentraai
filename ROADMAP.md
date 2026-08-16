@@ -1580,3 +1580,11 @@ First step toward thermal-aware adaptive contribution, using REAL measured data
   utilization_percent) — real measured values, or null (UNKNOWN).
 - [x] This is the honest foundation for the future mobile/thermal-pressure
   scheduler signals; nothing fabricated.
+
+## 75. Next-Gen — Productize the standalone worker
+
+- [x] `scripts/install-app.sh` documents the installed standalone worker
+  (`decentraai-worker --name <n> --model <file.gguf>`) in its messaging/summary;
+  `cargo install --path crates/node-cli` already installs both binaries.
+- [x] `scripts/uninstall-app.sh` removes both `decentraai` and
+  `decentraai-worker` binaries (exact `rm -f`, safe). bash -n validated.

@@ -31,6 +31,9 @@ rm -f "$DESKTOP"
 systemctl --user daemon-reload 2>/dev/null || true
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
+echo "==> Removing binaries"
+rm -f "$HOME/.cargo/bin/decentraai" "$HOME/.cargo/bin/decentraai-worker"
+
 if [ "$PURGE" -eq 1 ]; then
   echo "==> Purging node data ($DATA_DIR)"
   rm -rf "$DATA_DIR"
