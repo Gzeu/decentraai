@@ -41,6 +41,14 @@ pub struct ComputeAvailability {
     pub tokens_per_second: u32,
     pub current_latency_ms: u32,
     pub status: WorkerHealth,
+    /// Real GPU thermal pressure (Celsius) from the last probe, when a GPU is
+    /// present and reporting. `None` = no GPU / no measurement (UNKNOWN) —
+    /// never fabricated. Foundation for thermal-aware adaptive contribution.
+    #[serde(default)]
+    pub gpu_temperature_celsius: Option<u8>,
+    /// Real GPU utilization (0..100) from the last probe, when available.
+    #[serde(default)]
+    pub gpu_utilization_percent: Option<u8>,
 }
 
 impl ComputeAvailability {
@@ -133,6 +141,8 @@ mod tests {
                 tokens_per_second: 60,
                 current_latency_ms: 90,
                 status: WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,

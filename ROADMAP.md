@@ -1567,3 +1567,16 @@ decisions, or orchestration.
   contribution (explicitly CONTRACT/PLAN, not implemented), and the distributed
   inference boundary (experimental). Honest: no fabricated mobile telemetry,
   remote update, or distributed inference.
+
+## 74. Next-Gen — Real GPU thermal/utilization telemetry
+
+First step toward thermal-aware adaptive contribution, using REAL measured data
+(no fabricated telemetry).
+
+- [x] `ComputeAvailability.gpu_temperature_celsius` + `gpu_utilization_percent`
+  (`#[serde(default)]`, backward-compat): populated in `build_advertisement`
+  from the real nvidia-smi probe; `None` when no GPU / no measurement (UNKNOWN).
+- [x] `/v1/fabric` nodes carry a `gpu` block (temperature_celsius,
+  utilization_percent) — real measured values, or null (UNKNOWN).
+- [x] This is the honest foundation for the future mobile/thermal-pressure
+  scheduler signals; nothing fabricated.

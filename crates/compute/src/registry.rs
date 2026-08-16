@@ -227,6 +227,8 @@ mod tests {
                 tokens_per_second: 30,
                 current_latency_ms: 200,
                 status: WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,

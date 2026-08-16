@@ -276,6 +276,8 @@ mod tests {
                 tokens_per_second: tps,
                 current_latency_ms: lat,
                 status: WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
             })
     }
 

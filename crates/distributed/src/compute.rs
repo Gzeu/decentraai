@@ -184,7 +184,7 @@ pub fn build_advertisement(
     announced_at_ms: u64,
     perf: LivePerf,
 ) -> ComputeAdvertisement {
-    let (gpu_spec, free_vram_mib) = match &gpu {
+    let (gpu_spec, free_vram_mib, gpu_temp, gpu_util) = match &gpu {
         GpuProbeStatus::Nvidia(info) => (
             Some(GpuSpec {
                 name: info.name.clone(),
@@ -192,8 +192,10 @@ pub fn build_advertisement(
                 driver: "nvidia".into(),
             }),
             Some(info.free_vram_mib),
+            Some(info.temperature_celsius),
+            Some(info.utilization_percent),
         ),
-        GpuProbeStatus::Unavailable(_) => (None, None),
+        GpuProbeStatus::Unavailable(_) => (None, None, None, None),
     };
 
     let load_percent = (snapshot.cpu_usage_percent.clamp(0.0, 100.0)) as u8;
@@ -218,6 +220,8 @@ pub fn build_advertisement(
             tokens_per_second: perf.tokens_per_second,
             current_latency_ms: perf.current_latency_ms,
             status: WorkerHealth::Ready,
+            gpu_temperature_celsius: gpu_temp,
+            gpu_utilization_percent: gpu_util,
         },
         announced_at_ms,
         accepts_remote_inference: accepts_remote,

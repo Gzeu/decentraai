@@ -562,6 +562,8 @@ mod tests {
                 tokens_per_second: 60,
                 current_latency_ms: 90,
                 status: decentraai_compute::WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
             },
             announced_at_ms: 1_700_000_000_000,
             accepts_remote_inference: true,
