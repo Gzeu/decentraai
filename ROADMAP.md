@@ -102,10 +102,15 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
   inference / does not serve the model).
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
-  `<reachable-multiaddr>/p2p/<peer-id> <guest-token>` string; `decentraai join
-  "<invite>"` parses it, auto-provisions identity + config, stores the Tier-1
-  Guest token as the node's credential (`runtime/invite.token`, 0600) and
-  verifies the coordinating peer is reachable over the verified P2P path)
+  `<reachable-multiaddr>/p2p/<libp2p-peer-id> <guest-token>` string;
+  `decentraai join "<invite>"` parses it, auto-provisions identity + config,
+  stores the Tier-1 Guest token as the node's credential
+  (`runtime/invite.token`, 0600) and verifies the coordinating peer is
+  reachable over the verified P2P path). The invite uses the **libp2p peer id**
+  (base58 `12D3KooW…`) derived from the node key, never the raw identity hex —
+  a libp2p multiaddr cannot parse the hex id (fix `b644278`). Live-validated
+  end-to-end on the LAN fabric: fresh data dir → `join` → "connected to the
+  coordinating peer"; regression-pinned by `invite_peer_id_is_libp2p_not_identity_hex`.
 
 ## 8. Operations and scale (in progress)
 - [x] Q1: generation defaults (sampling + system prompt merged into
@@ -132,16 +137,21 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
 - [x] M9-6: P2P protocol extensions for WorkerAnnouncement and InferRequest
 - [x] M9-7: Inference request handler for workers (real llama-server adapter)
 - [x] M9-8: Real-time capacity updates from runtime
-- [x] M9-9: Reputation-based compensation for workers — pure reward policy
-  (`decentraai-compute::compensation::reward_tokens`, `RewardPolicy`): a
-  deterministic, synthetic **contribution-credits** ledger (not a payment
-  platform) = `verified_requests × rate`, scaled by contribution quality and a
-  reputation term (clean-service ratio `verified/(verified+failed)`). Zero
-  verified work or a complete-failure record earns 0. Wired into the
-  coordinator's `ContributionRow.reward_tokens`, surfaced on `/v1/compute` and
-  the `decentraai tier suggest` table. A worker whose verified-transfer
-  reputation is bad is already banned and never routed work, so its earnings
-  are zero regardless — the reputation axis rewards how *cleanly* served work
+- [x] M9-9: Reputation-based compensation for workers — **live ledger**
+  (`decentraai-compute::compensation`: `reward_tokens` pure policy +
+  `CompensationLedger`): a deterministic, synthetic **contribution-credits**
+  ledger (not a payment platform) = `verified_requests × rate`, scaled by
+  contribution quality and a reputation term (clean-service ratio
+  `verified/(verified+failed)`). Zero verified work or a complete-failure
+  record earns 0. The ledger is **wired into the live coordinator**:
+  `ComputeManager::record_credited_contribution` credits it (idempotent by
+  `ref_id`, exactly once per execution, profile frozen at credit time so each
+  credit is explainable) on every verified completion; failures and replays
+  earn nothing. Surfaced via the `get_compensation` MCP tool, the
+  `ContributionRow.compensation_earned` column in `/v1/compute`, and the
+  dashboard Workers view. A worker whose verified-transfer reputation is bad
+  is already banned and never routed work, so its earnings are zero
+  regardless — the reputation axis rewards how *cleanly* served work
   completed.
 
 ## 10. Zero-Touch Swarm Sharing (DONE)
@@ -659,7 +669,7 @@ honest model. Cross-worker non-empty KV-headroom steering has not been observed
 on the live link (the current worker advertises unknown capacity and there is
 no multi-worker contention) — the logic is unit/integration-proven.
 
-## 17. NOT DONE — M21: Distributed MoE / Expert Fabric (foundation only)
+## 17. WIRED — M21: Distributed MoE / Expert Fabric (abstraction + planner integration)
 
 `decentraai-fabric::expert` provides the honest abstraction: an
 `ExpertRegistry` (which workers hold which experts), the pure `ExpertRouter`
@@ -668,22 +678,31 @@ gate. Every expert-aware decision is gated behind an engine advertising
 `EngineCapabilities::expert_routing`. **No engine DecentraAI runs advertises
 it** — so the router returns exactly the whole-model result (the single
 correct answer for a monolithic model) and an `ExpertSplit` is never produced
-in production. A pinned test (`every_engine_decentraai_runs_is_gated...`)
-guards this so the split path can never be routed into without an engine that
-actually supports it. **Not marked done**: distributed MoE is not
-production-verified on real hardware; this is preparedness only.
+in production. The planner wiring is live and regression-tested:
+`ExecutionPlanner::build_stage` passes **all eligible candidates** to
+`ExpertRouter.route` (fix `ae42e0a`), so a split is sound and reachable the
+moment an engine advertises the capability; `expert_capable_worker_routes_to_expert_split`
+pins the wiring and `non_expert_engine_keeps_honest_whole_model_reasoning`
+guards the honest fallback. **Not marked done**: distributed MoE is not
+production-verified on real hardware (no capable engine yet); this is
+preparedness, but the routing path is reachable and tested, not dead.
 
-## 18. NOT DONE — M22: Multi-Engine Runtime Abstraction (foundation only)
+## 18. WIRED — M22: Multi-Engine Runtime Abstraction (contract + live classification)
 
 `decentraai-fabric::engine` defines `EngineKind` (llama-server / vLLM / SGLang /
 Ollama / generic OpenAI-compatible) and the `EngineCapabilities` contract
 (streaming, KV reporting, prefill/decode separation, expert routing, tensor
 parallel). DecentraAI never embeds an engine; it drives an external process's
 OpenAI-compatible HTTP API. Capabilities are conservative by default and
-narrowed by a live probe. **Only llama-server is actually spawned today**, and
-`prefill_decode_separation` stays `false` for it (that split is a parked idea,
-not a running feature). **Not production-verified** for any second engine;
-this is the abstraction layer only.
+narrowed by a live probe. The classification is wired into the live fabric:
+`ComputeManager::fabric_facts` parses each worker advertisement's engine string
+via `EngineKind::parse` and feeds `WorkerFacts.engine` + `advertised_capabilities()`
+to the execution planner, so scoring reflects the engine's real surface
+(regression-pinned by `engine_kind_capabilities_drive_worker_facts`). **Only
+llama-server is actually spawned today**, and `prefill_decode_separation` stays
+`false` for it (that split is a parked idea, not a running feature). **Not
+production-verified** for any second engine; this is the abstraction + live
+classification layer only.
 
 ## 19. PARTIAL — M23: Autonomous Execution Planner (foundation + live decision core)
 
@@ -1098,6 +1117,12 @@ variant/verdict UI (GitHub-safe, no execution).
   `gen_ai.operation.name`, `gen_ai.provider.name` labels — ADDITIVE to the
   DecentraAI-specific provenance; derived from real node state; never prompts
   or outputs. `prometheus_escape` guards label values.
+- [x] Remote fabric routes (`/v1/execute`, streamed + non-streamed remote
+  chat) record **real input-token estimates** via `prompt_token_estimate`
+  instead of hardcoded `prompt_tokens:0` — the remote worker never echoes
+  usage through the P2P stream, so `gen_ai.server.token.input` would read 0
+  forever for distributed execution without the local estimate (fix `267a65d`;
+  live-verified: non-streamed remote 54 prompt tokens, streamed 43).
 - [x] Tests: metrics endpoint exposes the `gen_ai.*` families; escape helper
   handles quotes/backslashes/newlines.
 

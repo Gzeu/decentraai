@@ -149,10 +149,14 @@ contribution**. Admin-only token issuance from a dashboard.
   `tier suggest` stays read-only.
 - **P5 — Invites & join**: admin generates an invite (bootstrap
   multiaddr + Tier-1 token); `decentraai join <invite>` bootstraps a
-  fresh node.
+  fresh node. Live-validated end-to-end on LAN (fix `b644278`: invite must
+  carry the libp2p peer id, not the identity hex).
 - **M9 / M18 — Distributed inference**: real P2P routing of inference between
   universal nodes (see the M18 foundation above). Reputation-based
-  compensation for workers (M9-9) is not yet implemented.
+  compensation for workers (M9-9) is wired as a live contribution-credits
+  ledger (fix `3b6fe90`): `CompensationLedger` credits verified work
+  idempotently per execution, exposed via `get_compensation` MCP + the
+  `compensation_earned` column; synthetic bookkeeping, never money.
 
 ### Execution Fabric — M18 + M19 + M20 (verified-DONE); M21–M24 NEXT
 
@@ -167,12 +171,23 @@ response → reservation release. Worker reuse, concurrent requests and
 bidirectional execution all proven; the loopback backend URL is never
 advertised as a remote endpoint.
 
-The crate also holds building blocks that are **parked as NEXT milestones
-(M21–M24), not claimed complete**: honest `ExpertRegistry`/`ExpertRouter`
-behind `expert_routing` (M21 — none advertise it; whole-model fallback is
-correct, never mocked), `EngineKind` + capability probe (M22 multi-engine), and
-an `ExecutionPlanner` (M23). Do NOT mark these as done until their behaviors are
-production-verified. M24 (resilience) has landed its remaining production gaps
+The crate also holds building blocks that were once **parked as NEXT
+milestones (M21–M23)**; they are now **wired into the live planner and
+regression-tested** (do not mark *done* — no engine DecentraAI runs
+advertises expert routing, so the split path is reachable but not
+production-verified):
+- **M21** `ExpertRegistry`/`ExpertRouter` behind `expert_routing`: wired in
+  `ExecutionPlanner::build_stage`, which passes **all eligible candidates** to
+  the router (fix `ae42e0a` — a single-candidate call could never produce a
+  split). No engine advertises the capability, so the honest whole-model
+  fallback is what runs; `expert_capable_worker_routes_to_expert_split` +
+  `non_expert_engine_keeps_honest_whole_model_reasoning` pin both sides.
+- **M22** `EngineKind` + capability probe: `ComputeManager::fabric_facts`
+  parses each advertisement's engine string and feeds `WorkerFacts.engine` +
+  `advertised_capabilities()` to the planner (`engine_kind_capabilities_drive_worker_facts`).
+- **M23** `ExecutionPlanner`: the live single-worker selector behind
+  `plan_and_reserve`; see ROADMAP §19 for the exact scope (not full autonomy).
+M24 (resilience) has landed its remaining production gaps
 (see below) and is now considered wired: the coordinator reaper
 `reap_unhealthy`, reservation TTLs, stale/offline worker eviction with audit,
 graceful + startup recovery, mDNS recovery, false-ready prevention, engine
