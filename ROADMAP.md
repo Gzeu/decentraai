@@ -1843,3 +1843,24 @@ fabricates a result.
   environment, so **no fabricated measurements are reported here**; the
   harness exists and produces real results when run on real hardware.
   LOCAL-BLOCKED on hardware + RPC binaries for an actual dataset.
+
+## 88. Next-Gen — Adaptive fan-out / load-balance real
+
+The roadmap's adaptive fan-out / load-balancing real: distribute **independent
+requests** across workers in proportion to each worker's real, currently-useful
+capacity — NOT by splitting a single model across devices (that stays gated
+behind `supports_staging()`, parked). A phone 30% / laptop 20% / desktop 50% for
+a batch of independent requests.
+
+- [x] `decentraai_compute::adaptive_load_shares` (pure, deterministic,
+  I/O-free): per-worker share `(0,1]` summing to 1.0, derived from throughput ×
+  idle headroom × adaptive contribution factor (thermal/battery/GPU-util
+  pressure). Unhealthy workers excluded; ties broken by peer id; shares sorted
+  share desc / peer id asc. Never splits a single generation — advisory only.
+- [x] `load_balance_for_workers` (runtime fabric decision) now uses the
+  authoritative pure distribution and exposes `adaptive_contribution` per
+  worker, so the dashboard/decision shows the real adaptive shares.
+- [x] Tests: equal workers → equal shares; faster worker → larger share;
+  thermally-stressed worker → smaller share (factor recorded); unhealthy worker
+  excluded; empty/all-unhealthy → empty; deterministic regardless of input
+  order. Workspace tests, clippy `-D warnings`, release build green.

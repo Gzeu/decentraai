@@ -1540,48 +1540,51 @@ fn fabric_fit_for_model(
 }
 
 /// Suggested share (%) of a request-level workload each CAN_RUN worker could
-/// absorb, based on real advertised capacity and load. Pure, INFERRED, and
-/// advisory only — it never changes scheduling. For each eligible worker the
-/// "weight" is `max(1, tps) * (100 - load) / 100` (throughput × idle headroom),
-/// normalized so the shares sum to ~100. `UNKNOWN`/no-eligible → empty.
+/// absorb, based on real advertised capacity — throughput × idle headroom ×
+/// adaptive contribution factor (thermal/battery/GPU-util pressure). Pure,
+/// INFERRED, and
+/// advisory only — it never changes scheduling. Uses the authoritative pure
+/// distribution [`decentraai_compute::adaptive_load_shares`]; normalized so
+/// the shares sum to ~100. `UNKNOWN`/no-eligible → empty.
 fn load_balance_for_workers(
     workers: &[(decentraai_compute::ComputeAdvertisement, bool)],
     can_run_peer_ids: &std::collections::HashSet<String>,
 ) -> Vec<serde_json::Value> {
-    let eligible: Vec<&(decentraai_compute::ComputeAdvertisement, bool)> = workers
+    let eligible: Vec<(String, String, decentraai_compute::ComputeAvailability)> = workers
         .iter()
         .filter(|(w, _)| can_run_peer_ids.contains(&w.peer_id.to_string()))
+        .map(|(w, _)| (w.peer_id.to_string(), w.node_id.clone(), w.availability.clone()))
         .collect();
     if eligible.is_empty() {
         return Vec::new();
     }
-    let total_weight: f64 = eligible
-        .iter()
-        .map(|(w, _)| {
-            let tps = w.availability.tokens_per_second.max(1) as f64;
-            let idle = (100.0 - f64::from(w.availability.load_percent)).max(1.0);
-            tps * (idle / 100.0)
-        })
-        .sum();
-    if total_weight <= 0.0 {
-        return Vec::new();
-    }
-    eligible
-        .iter()
-        .map(|(w, trusted)| {
-            let tps = w.availability.tokens_per_second.max(1) as f64;
-            let idle = (100.0 - f64::from(w.availability.load_percent)).max(1.0);
-            let weight = tps * (idle / 100.0);
-            let share = (weight / total_weight * 100.0).round() as u32;
+    let shares = decentraai_compute::adaptive_load_shares(&eligible);
+    shares
+        .into_iter()
+        .map(|s| {
+            let w = workers
+                .iter()
+                .find(|(w, _)| w.peer_id.to_string() == s.peer_id);
+            let (tps, load, trusted, node_name, device) = match w {
+                Some((w, trusted)) => (
+                    w.availability.tokens_per_second,
+                    w.availability.load_percent,
+                    *trusted,
+                    w.node_name.clone(),
+                    device_class(&w.capability),
+                ),
+                None => (0, 0, false, String::new(), ""),
+            };
             serde_json::json!({
-                "peer_id": w.peer_id.to_string(),
-                "node_id": w.node_id,
-                "node_name": w.node_name,
-                "trusted": *trusted,
-                "device_class": device_class(&w.capability),
-                "tokens_per_second": w.availability.tokens_per_second,
-                "load_percent": w.availability.load_percent,
-                "suggested_share_pct": share,
+                "peer_id": s.peer_id,
+                "node_id": s.node_id,
+                "node_name": node_name,
+                "trusted": trusted,
+                "device_class": device,
+                "tokens_per_second": tps,
+                "load_percent": load,
+                "adaptive_contribution": s.adaptive_factor,
+                "suggested_share_pct": (s.share * 100.0).round() as u32,
             })
         })
         .collect()
@@ -8261,6 +8264,36 @@ mod tests {
         // No eligible -> empty (honest).
         let w2b = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
         assert!(load_balance_for_workers(&[(w2b, true)], &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn load_balance_folds_in_adaptive_contribution() {
+        // Adaptive fan-out: two otherwise-identical workers — one healthy, one
+        // under GPU thermal pressure — the stressed one gets a smaller share,
+        // and the share record exposes its adaptive factor.
+        let p1 = decentraai_p2p::PeerId::random();
+        let p2 = decentraai_p2p::PeerId::random();
+        let mut w1 = cap_adv(&p1, "dca-h", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut w2 = cap_adv(&p2, "dca-hot", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        w1.availability.tokens_per_second = 100;
+        w1.availability.load_percent = 10;
+        w2.availability.tokens_per_second = 100;
+        w2.availability.load_percent = 10;
+        w2.availability.gpu_temperature_celsius = Some(95); // heavy thermal pressure
+
+        let can_run: std::collections::HashSet<String> = [p1.to_string(), p2.to_string()].into();
+        let lb = load_balance_for_workers(&[(w1, true), (w2, true)], &can_run);
+        assert_eq!(lb.len(), 2);
+        let healthy = lb.iter().find(|x| x["node_id"] == "dca-h").unwrap();
+        let hot = lb.iter().find(|x| x["node_id"] == "dca-hot").unwrap();
+        assert!(
+            healthy["suggested_share_pct"].as_u64().unwrap() > hot["suggested_share_pct"].as_u64().unwrap(),
+            "thermally-stressed worker gets a smaller share"
+        );
+        assert!(
+            hot["adaptive_contribution"].as_f64().unwrap() < 1.0,
+            "share record exposes the adaptive factor"
+        );
     }
 
     #[test]
