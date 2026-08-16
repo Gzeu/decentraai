@@ -144,6 +144,21 @@ struct ContributionTracker {
 
 pub use decentraai_compute::ContributionProfile;
 
+/// Real measured work that has earned contribution credit (compute-contribution
+/// roadmap). Distinct from advertised hardware: only successful, credited
+/// completions count. `None` fields mean UNKNOWN (not measured), never 0.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MeasuredContribution {
+    /// Number of distinct executions credited (deduped by request_id).
+    pub credited_executions: u64,
+    /// Total tokens processed/generated across credited executions (real).
+    pub total_tokens: u64,
+    /// Total processing wall-time (ms) across credited executions (real).
+    pub total_processing_ms: u64,
+    /// Successful (verified) credited completions.
+    pub verified_completions: u64,
+}
+
 impl ContributionTracker {
     /// Accrues online time and refreshes hardware from a fresh advertisement.
     fn observe(&mut self, adv: &ComputeAdvertisement) {
@@ -261,6 +276,18 @@ pub struct ComputeManager {
     /// Per-worker contribution ledger (M17): accrued online time and served
     /// request counts, feeding the tier-suggestion engine.
     contribution: std::sync::Mutex<BTreeMap<PeerId, ContributionTracker>>,
+    /// Dedup ledger for contribution credit: the bounded set of execution
+    /// request_ids already credited, so a duplicate completion event can never
+    /// double-count credit for the same execution. The transport ReplayGuard
+    /// protects request *intake*; this protects the *credit ledger* (the
+    /// roadmap's "duplicate execution credit" / "never charge the same
+    /// execution twice" invariant). Bounded to avoid unbounded growth.
+    credited_executions: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Real measured work that has actually earned credit (contribution
+    /// accounting): total credited tokens processed/generated and processing
+    /// wall-time, plus distinct credited executions. Derived only from real
+    /// successful completions, never from advertised hardware.
+    measured_contribution: std::sync::Mutex<MeasuredContribution>,
     /// Live, coordinator-side network graph (M19): measured RTT / bandwidth
     /// to each peer, fed by a periodic `InferPing` probe and read by the
     /// execution planner to weight reach cost.
@@ -331,6 +358,8 @@ impl ComputeManager {
             last_local_ad: std::sync::Mutex::new(None),
             metrics: std::sync::Arc::new(RuntimeMetrics::new()),
             contribution: std::sync::Mutex::new(BTreeMap::new()),
+            credited_executions: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            measured_contribution: std::sync::Mutex::new(MeasuredContribution::default()),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
@@ -486,6 +515,63 @@ impl ComputeManager {
                 tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
             }
         }
+    }
+
+    /// Records a credited, deduped measured-work contribution for one execution
+    /// (compute-contribution roadmap). Returns `false` if this `request_id` was
+    /// already credited (duplicate/replay at the credit layer), so the same
+    /// execution is never counted twice. `tokens_used` / `processing_time_ms`
+    /// are real measured values (Option = UNKNOWN, never fabricated).
+    ///
+    /// The transport ReplayGuard already protects request *intake*; this
+    /// protects the *credit ledger* from double-settlement.
+    pub fn record_credited_contribution(
+        &self,
+        peer: &PeerId,
+        request_id: &str,
+        verified: bool,
+        tokens_used: Option<u32>,
+        processing_time_ms: Option<u32>,
+    ) -> bool {
+        const MAX_CREDITED: usize = 4096;
+        // Dedup: if this execution was already credited, do NOT credit again.
+        {
+            let mut credited = self.credited_executions.lock().unwrap();
+            if credited.contains(&request_id.to_string()) {
+                return false;
+            }
+            credited.push_back(request_id.to_string());
+            while credited.len() > MAX_CREDITED {
+                credited.pop_front();
+            }
+        }
+        // Credit real measured work only on a verified completion.
+        if verified {
+            let mut mc = self.measured_contribution.lock().unwrap();
+            mc.credited_executions += 1;
+            mc.verified_completions += 1;
+            if let Some(t) = tokens_used {
+                mc.total_tokens = mc.total_tokens.saturating_add(u64::from(t));
+            }
+            if let Some(ms) = processing_time_ms {
+                mc.total_processing_ms = mc.total_processing_ms.saturating_add(u64::from(ms));
+            }
+        }
+        if let Some(tracker) = self.contribution.lock().unwrap().get_mut(peer) {
+            if verified {
+                tracker.profile.verified_requests =
+                    tracker.profile.verified_requests.saturating_add(1);
+            } else {
+                tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
+            }
+        }
+        true
+    }
+
+    /// Snapshot of the real measured contribution that has earned credit
+    /// (deduped). Read-only, for observability.
+    pub fn measured_contribution(&self) -> MeasuredContribution {
+        self.measured_contribution.lock().unwrap().clone()
     }
 
     /// Records a retryable routing failure for `peer` (P5), possibly tripping
@@ -3101,5 +3187,47 @@ mod tests {
         let e = execution_statistics(&[]);
         assert_eq!(e["records"], 0);
         assert_eq!(e["measured"]["records"], 0);
+    }
+
+    #[tokio::test]
+    async fn credited_contribution_dedups_by_request_id() {
+        // Compute-contribution roadmap: the credit ledger must never double-count
+        // the same execution. Recording the same request_id twice credits once.
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        // Register the worker so record_outcome's tracker exists.
+        manager
+            .process_advertisement(build_advertisement(
+                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![model()], false, true, 0, LivePerf::default(),
+            ))
+            .await;
+
+        // First credit: real measured tokens + processing time.
+        assert!(manager.record_credited_contribution(
+            &worker, "exec-1", true, Some(100), Some(2000),
+        ));
+        // Duplicate (replay/double-settlement): must NOT credit again.
+        assert!(!manager.record_credited_contribution(
+            &worker, "exec-1", true, Some(9999), Some(9999),
+        ));
+
+        // Another distinct execution credits once.
+        assert!(manager.record_credited_contribution(
+            &worker, "exec-2", true, Some(50), Some(1000),
+        ));
+
+        let mc = manager.measured_contribution();
+        assert_eq!(mc.credited_executions, 2, "two distinct executions credited");
+        assert_eq!(mc.verified_completions, 2);
+        assert_eq!(mc.total_tokens, 150, "duplicate tokens not counted");
+        assert_eq!(mc.total_processing_ms, 3000, "duplicate time not counted");
+
+        // A failed execution (tokens None) still dedups but contributes no work.
+        assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
+        let mc = manager.measured_contribution();
+        assert_eq!(mc.credited_executions, 2, "failed executions earn no measured credit");
     }
 }

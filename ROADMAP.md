@@ -1652,3 +1652,22 @@ new identity/token/trust/auth/discovery system.
   warn / UNAVAILABLE bad) from the real `capacity` field, plus a small
   "capacity: FULL / LIMITED / UNAVAILABLE" legend when any node reports it.
   Absent → nothing rendered. Real state only.
+
+## 82. Next-Gen — Contribution accounting foundation (deduped measured work)
+
+First GitHub-safe primitive of the Compute Contribution & Quota roadmap: a
+credit ledger that prevents double-counting, using REAL measured work (never
+advertised hardware). No economics/conversion invented.
+
+- [x] `MeasuredContribution { credited_executions, total_tokens,
+  total_processing_ms, verified_completions }` — real measured work that earned
+  credit; `None`/absent measurements stay UNKNOWN (never fabricated).
+- [x] `ComputeManager::record_credited_contribution(peer, request_id, verified,
+  tokens_used, processing_time_ms)` — DEDUPS by `request_id` (returns false on
+  duplicate/replay at the credit layer, so the same execution is never counted
+  twice); credits real tokens + processing time only on verified completions.
+  Reuses the existing peer identity + `ExecutedPlan` measured fields; no second
+  telemetry system.
+- [x] `measured_contribution()` snapshot + re-export.
+- [x] Test: duplicate request_id credits once (tokens/time not double-counted);
+  failed executions earn no measured credit.
