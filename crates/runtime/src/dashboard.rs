@@ -1058,7 +1058,23 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
               <tr><td>Remote inference</td><td class="num" id="set-remote">&mdash;</td></tr>
               <tr><td>Engine respawns</td><td class="num" id="set-respawns">&mdash;</td></tr>
             </tbody></table>
-            <div style="margin-top:10px"><h3 style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin:0 0 6px">Generation defaults</h3><div id="set-generation" class="empty">&mdash;</div></div>
+            <div style="margin-top:10px"><h3 style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin:0 0 6px">Generation defaults</h3><div id="set-generation" class="empty">&mdash;</div>
+              <div id="set-generation-edit" style="margin-top:8px;display:none">
+                <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-bottom:8px">
+                  <div><div class="label" style="font-size:10px;color:var(--faint)">temperature</div><input id="gen-temp" type="number" step="0.1" min="0" max="2"></div>
+                  <div><div class="label" style="font-size:10px;color:var(--faint)">top_p</div><input id="gen-topp" type="number" step="0.05" min="0" max="1"></div>
+                  <div><div class="label" style="font-size:10px;color:var(--faint)">top_k</div><input id="gen-topk" type="number" step="1" min="0" placeholder="0 = off"></div>
+                  <div><div class="label" style="font-size:10px;color:var(--faint)">repeat_penalty</div><input id="gen-rep" type="number" step="0.1" min="0" max="4"></div>
+                </div>
+                <div class="label" style="font-size:10px;color:var(--faint)">system prompt</div>
+                <textarea id="gen-sys" rows="2" style="width:100%;margin:4px 0 8px;font-size:12px"></textarea>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <button id="gen-save" class="primary">Save</button>
+                  <button id="gen-cancel" class="ghost">Cancel</button>
+                  <span id="gen-status" class="mono" style="font-size:11px;color:var(--muted)"></span>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="card">
             <h2>RESOURCES · admission guards</h2>
@@ -3368,8 +3384,15 @@ function renderSettings(s, c, n){
   const g = (s && s.generation) || {};
   if (g && g.temperature !== undefined) {
     $('set-generation').innerHTML = '<div class="mono" style="font-size:12px;color:var(--muted)">'+
-      'temperature <b>'+g.temperature+'</b> · top_p <b>'+g.top_p+'</b> · top_k <b>'+g.top_k+'</b> · repeat_penalty <b>'+g.repeat_penalty+'</b>'+
-      (g.system_prompt ? '<div style="margin-top:6px">system prompt: <code>'+esc(g.system_prompt)+'</code></div>' : '')+'</div>';
+      'temperature <b>'+g.temperature+'</b> · top_p <b>'+g.top_p+'</b> · top_k <b>'+(g.top_k!=null?g.top_k:'off')+'</b> · repeat_penalty <b>'+g.repeat_penalty+'</b>'+
+      (g.system_prompt ? '<div style="margin-top:6px">system prompt: <code>'+esc(g.system_prompt)+'</code></div>' : '')+'</div>'+
+      '<button id="gen-edit" class="ghost" style="margin-top:6px" onclick="openGenEdit()">Edit live</button>';
+    // populate the edit form from the real current values
+    $('gen-temp').value = g.temperature != null ? g.temperature : 0.7;
+    $('gen-topp').value = g.top_p != null ? g.top_p : 0.9;
+    $('gen-topk').value = g.top_k != null ? g.top_k : 0;
+    $('gen-rep').value = g.repeat_penalty != null ? g.repeat_penalty : 1.1;
+    $('gen-sys').value = g.system_prompt || '';
   } else $('set-generation').innerHTML = '<div class="empty">—</div>';
   const tiers = (s && s.tiers);
   if (tiers) {
@@ -3380,6 +3403,35 @@ function renderSettings(s, c, n){
     }).join('');
     $('set-tiers').innerHTML = t;
   } else $('set-tiers').innerHTML = '<div class="empty">tiers disabled (admin-token-only)</div>';
+}
+// ---- Settings: live generation-edit (master-gated) ----
+function openGenEdit(){
+  $('set-generation-edit').style.display = 'block';
+  const eb = $('gen-edit'); if (eb) eb.style.display = 'none';
+  $('gen-status').textContent = '';
+}
+function closeGenEdit(){
+  $('set-generation-edit').style.display = 'none';
+  const eb = $('gen-edit'); if (eb) eb.style.display = '';
+}
+async function saveGeneration(){
+  const body = {
+    temperature: parseFloat($('gen-temp').value),
+    top_p: parseFloat($('gen-topp').value),
+    top_k: parseInt($('gen-topk').value, 10) > 0 ? parseInt($('gen-topk').value, 10) : null,
+    repeat_penalty: parseFloat($('gen-rep').value),
+    system_prompt: $('gen-sys').value,
+  };
+  $('gen-status').textContent = 'saving…';
+  try {
+    const r = await fetch('/api/admin/settings/generation', { method:'POST', headers: Object.assign({}, headers, { 'Content-Type':'application/json' }), body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) { $('gen-status').innerHTML = '<span class="badge warn">' + esc((d.error&&d.error.message)||('failed '+r.status)) + '</span>'; return; }
+    $('gen-status').innerHTML = '<span class="badge ok">saved live</span> <span class="muted">(applies to next requests)</span>';
+    toast('generation defaults updated');
+    refresh();
+    closeGenEdit();
+  } catch (e) { $('gen-status').innerHTML = '<span class="badge warn">save failed</span>'; }
 }
 function renderSecurity(){
   // audit events — a 401/403 (master-gated) is resolved (not rejected), so
@@ -3457,6 +3509,8 @@ async function revokeConsumerKey(ev){
   if (r.ok) { toast('consumer key revoked'); loadConsumerKeys(); } else { toast((d.error&&d.error.message)||'revoke failed', true); }
 }
 $('ck-create').addEventListener('click', createConsumerKey);
+$('gen-save').addEventListener('click', saveGeneration);
+$('gen-cancel').addEventListener('click', closeGenEdit);
 window.copyDev = id => {
   const el = $(id);
   const txt = el && (el.textContent || el.innerText || '').trim();

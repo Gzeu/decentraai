@@ -224,6 +224,11 @@ pub struct ApiState {
     manager: Arc<Mutex<ServeManager>>,
     client: reqwest::Client,
     info: DashboardInfo,
+    /// Runtime-editable generation defaults. Seeded from the node config at
+    /// startup; an admin can update them live via the master-gated settings
+    /// endpoint, and the proxy reads this (not the immutable `info`) when
+    /// applying sampling defaults. Read-only for clients.
+    runtime_generation: Arc<tokio::sync::RwLock<GenerationSection>>,
     /// Subscription registry (db/tokens.json) when tiers are in use.
     token_store_path: Option<PathBuf>,
     /// Consumer API key registry (db/consumer_keys.json) for the Compute
@@ -295,6 +300,7 @@ impl ApiState {
                 .timeout(BACKEND_REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             info,
             token_store_path,
             consumer_keys_path: None,
@@ -3681,6 +3687,69 @@ async fn admin_models_remove_handler(
         .into_response()
 }
 
+/// Master-gated runtime settings: update generation defaults live (no restart).
+/// Body: `{ "temperature": f64, "top_p": f64, "top_k": u32|null,
+/// "repeat_penalty": f64, "system_prompt": string }` — each field is optional;
+/// omitted fields keep their current value. Persisting across restarts is not
+/// wired (config file is the source of truth at startup); this is a live
+/// override that applies to subsequent inference requests immediately.
+async fn admin_settings_generation_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let mut g = state.runtime_generation.write().await;
+    if let Some(v) = req.get("temperature").and_then(|v| v.as_f64()) {
+        g.temperature = v.clamp(0.0, 2.0) as f32;
+    }
+    if let Some(v) = req.get("top_p").and_then(|v| v.as_f64()) {
+        g.top_p = v.clamp(0.0, 1.0) as f32;
+    }
+    if let Some(v) = req.get("top_k") {
+        g.top_k = v.as_i64().map(|n| n as i32).filter(|k| *k > 0);
+    }
+    if let Some(v) = req.get("repeat_penalty").and_then(|v| v.as_f64()) {
+        g.repeat_penalty = v.clamp(0.0, 4.0) as f32;
+    }
+    if let Some(v) = req.get("system_prompt").and_then(|v| v.as_str()) {
+        g.system_prompt = v.to_string();
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "settings_generation_updated",
+        serde_json::json!({
+            "temperature": g.temperature,
+            "top_p": g.top_p,
+            "top_k": g.top_k,
+            "repeat_penalty": g.repeat_penalty,
+        }),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "success": true,
+            "generation": {
+                "temperature": g.temperature,
+                "top_p": g.top_p,
+                "top_k": g.top_k,
+                "repeat_penalty": g.repeat_penalty,
+                "system_prompt": g.system_prompt,
+            },
+            "note": "applied live; config file remains the startup source of truth",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
 /// admin endpoints. `peer_id` must be a valid base58 PeerId.
 fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
@@ -3862,6 +3931,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
         // Model removal (Issue #26): master-gated delete from registry + disk
         .route("/api/admin/models/remove", post(admin_models_remove_handler))
+        .route("/api/admin/settings/generation", post(admin_settings_generation_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
@@ -3903,6 +3973,8 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
 /// Public status snapshot: no secrets, safe without the token. Includes
 /// a fresh hardware probe so the operator sees RAM/GPU pressure live.
 async fn status_handler(State(state): State<ApiState>) -> Response {
+    // Runtime-editable generation defaults (live, master-updatable).
+    let gen_guard = state.runtime_generation.read().await;
     // Resolve the backend URL from the live manager (not the startup-frozen
     // one) so a M24 engine auto-restart — which re-allocates an ephemeral
     // port — is reflected here instead of a stale address.
@@ -3981,11 +4053,11 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "reserve_vram_mb": state.info.resources.reserve_vram_mb,
         },
         "generation": {
-            "temperature": state.info.generation.temperature,
-            "top_p": state.info.generation.top_p,
-            "top_k": state.info.generation.top_k,
-            "repeat_penalty": state.info.generation.repeat_penalty,
-            "system_prompt": state.info.generation.system_prompt,
+            "temperature": gen_guard.temperature,
+            "top_p": gen_guard.top_p,
+            "top_k": gen_guard.top_k,
+            "repeat_penalty": gen_guard.repeat_penalty,
+            "system_prompt": gen_guard.system_prompt,
         },
         "tiers": state.tiers.as_ref().map(|tiers| serde_json::json!({
             "tier1": {
@@ -5980,7 +6052,7 @@ async fn proxy_with_auth(
     // folded in), computed once up front so the proxy-boundary caps see the
     // exact prompt/max_tokens and it can be reused for the request below.
     let outgoing = if is_inference {
-        apply_generation_defaults(&state.info.generation, &body)
+        apply_generation_defaults(&*state.runtime_generation.read().await, &body)
     } else {
         body.to_vec()
     };
