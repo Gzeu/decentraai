@@ -288,6 +288,11 @@ pub struct ComputeManager {
     /// wall-time, plus distinct credited executions. Derived only from real
     /// successful completions, never from advertised hardware.
     measured_contribution: std::sync::Mutex<MeasuredContribution>,
+    /// Contribution-backed quota ledger (Compute Contribution & Quota — Q3):
+    /// converts the *credited* measured work into spendable quota units under
+    /// a versioned, replaceable policy. Guarded by a std mutex; the pure
+    /// ledger does no I/O and never blocks on await.
+    quota: std::sync::Mutex<decentraai_compute::QuotaLedger>,
     /// Live, coordinator-side network graph (M19): measured RTT / bandwidth
     /// to each peer, fed by a periodic `InferPing` probe and read by the
     /// execution planner to weight reach cost.
@@ -360,6 +365,9 @@ impl ComputeManager {
             contribution: std::sync::Mutex::new(BTreeMap::new()),
             credited_executions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             measured_contribution: std::sync::Mutex::new(MeasuredContribution::default()),
+            quota: std::sync::Mutex::new(decentraai_compute::QuotaLedger::new(
+                decentraai_compute::ContributionPolicy::default(),
+            )),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
@@ -565,6 +573,16 @@ impl ComputeManager {
                 tracker.profile.failed_requests = tracker.profile.failed_requests.saturating_add(1);
             }
         }
+        // Q3: convert the credited measured work into spendable quota for the
+        // worker's account. Keyed by `request_id`, so the same execution is
+        // credited exactly once here too (deduped above). The worker peer id is
+        // the account owner (existing identity primitive). Failed executions
+        // earn no quota — only verified completions are credited.
+        if verified {
+            let worker_account = peer.to_string();
+            let mut q = self.quota.lock().unwrap();
+            q.credit(&worker_account, request_id, tokens_used, processing_time_ms);
+        }
         true
     }
 
@@ -572,6 +590,33 @@ impl ComputeManager {
     /// (deduped). Read-only, for observability.
     pub fn measured_contribution(&self) -> MeasuredContribution {
         self.measured_contribution.lock().unwrap().clone()
+    }
+
+    /// Replaces the active contribution→quota conversion policy (Q3). The pure
+    /// ledger keeps every historical credit under the version that produced it.
+    pub fn set_contribution_policy(&self, policy: decentraai_compute::ContributionPolicy) {
+        self.quota.lock().unwrap().set_policy(policy);
+    }
+
+    /// The active contribution→quota policy (read-only).
+    pub fn contribution_policy(&self) -> decentraai_compute::ContributionPolicy {
+        self.quota.lock().unwrap().policy()
+    }
+
+    /// Snapshot of the quota ledger's per-account balances (read-only, for
+    /// observability). `BTreeMap` so iteration order is deterministic.
+    pub fn quota_accounts(&self) -> std::collections::BTreeMap<String, decentraai_compute::QuotaAccount> {
+        self.quota.lock().unwrap().accounts()
+    }
+
+    /// Balance of one account's quota (read-only).
+    pub fn quota_account(&self, account: &str) -> Option<decentraai_compute::QuotaAccount> {
+        self.quota.lock().unwrap().account(&account.to_string())
+    }
+
+    /// The quota ledger's audit trail (provenance). Read-only.
+    pub fn quota_events(&self) -> std::collections::VecDeque<decentraai_compute::QuotaEvent> {
+        self.quota.lock().unwrap().events().clone()
     }
 
     /// Records a retryable routing failure for `peer` (P5), possibly tripping
@@ -1604,9 +1649,35 @@ pub struct ContributionRow {
 pub struct ComputeMetricsReport {
     pub workers: Vec<WorkerMetricRow>,
     pub contributions: Vec<ContributionRow>,
+    pub quota: QuotaSummary,
     pub local_peer: String,
     pub local_perf: LivePerfSnapshot,
     pub totals: TotalsSnapshot,
+}
+
+/// Serializable quota summary (Compute Contribution & Quota — Q3): the
+/// per-worker quota balances plus the active policy version. Every figure is
+/// real measured work converted under the versioned policy — never fabricated.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuotaSummary {
+    /// One row per account that has any quota record (earned > 0 or reserved).
+    pub accounts: Vec<QuotaAccountRow>,
+    /// Total quota earned across all accounts.
+    pub total_earned: u64,
+    /// Total quota consumed across all accounts.
+    pub total_consumed: u64,
+    /// The active contribution→quota policy version.
+    pub policy_version: u32,
+}
+
+/// One account's quota balance in the summary.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuotaAccountRow {
+    pub account: String,
+    pub earned: u64,
+    pub available: u64,
+    pub reserved: u64,
+    pub consumed: u64,
 }
 
 /// Serializable snapshot of the local node's live perf.
@@ -1859,9 +1930,30 @@ impl ComputeManager {
         let contributions = self.contribution_report_locked(workers).await;
         let perf = self.metrics.snapshot();
         let (completed, failed, tokens) = self.metrics.totals();
+        let quota = {
+            let q = self.quota.lock().unwrap();
+            let accounts: Vec<QuotaAccountRow> = q
+                .accounts()
+                .into_iter()
+                .map(|(account, acc)| QuotaAccountRow {
+                    account,
+                    earned: acc.earned,
+                    available: acc.available,
+                    reserved: acc.reserved,
+                    consumed: acc.consumed,
+                })
+                .collect();
+            QuotaSummary {
+                total_earned: accounts.iter().map(|a| a.earned).sum(),
+                total_consumed: accounts.iter().map(|a| a.consumed).sum(),
+                policy_version: q.policy().version,
+                accounts,
+            }
+        };
         ComputeMetricsReport {
             workers: rows,
             contributions,
+            quota,
             local_peer: self.local_peer.to_string(),
             local_perf: LivePerfSnapshot {
                 queue_depth: perf.queue_depth,
@@ -3229,5 +3321,72 @@ mod tests {
         assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
         let mc = manager.measured_contribution();
         assert_eq!(mc.credited_executions, 2, "failed executions earn no measured credit");
+    }
+
+    #[tokio::test]
+    async fn credited_work_earns_quota_under_the_active_policy() {
+        // Compute Contribution & Quota — Q3: credited measured work is converted
+        // to spendable quota under the versioned policy, keyed by the worker
+        // peer account. Duplicate credit events cannot double-earn quota.
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        manager
+            .process_advertisement(build_advertisement(
+                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![model()], false, true, 0, LivePerf::default(),
+            ))
+            .await;
+
+        // First credited execution: 100 tokens + 2000ms -> 2100 units (v1 policy).
+        assert!(manager.record_credited_contribution(&worker, "exec-1", true, Some(100), Some(2000)));
+        // Duplicate must not re-credit quota.
+        assert!(!manager.record_credited_contribution(&worker, "exec-1", true, Some(9999), Some(9999)));
+        // A second distinct execution credits independently.
+        assert!(manager.record_credited_contribution(&worker, "exec-2", true, Some(50), Some(1000)));
+
+        let account = manager.quota_account(&worker.to_string()).unwrap();
+        assert_eq!(account.earned, 3150, "2100 + 1050 units");
+        assert_eq!(account.available, 3150);
+        assert_eq!(account.consumed, 0);
+
+        // Failed executions earn no quota.
+        assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
+        assert_eq!(manager.quota_account(&worker.to_string()).unwrap().earned, 3150);
+    }
+
+    #[tokio::test]
+    async fn quota_policy_is_versioned_and_replaceable() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        manager
+            .process_advertisement(build_advertisement(
+                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![model()], false, true, 0, LivePerf::default(),
+            ))
+            .await;
+
+        assert_eq!(manager.contribution_policy().version, 1);
+        // Credit under v1.
+        assert!(manager.record_credited_contribution(&worker, "exec-1", true, Some(100), Some(0)));
+
+        // Replace with a v7 policy: 2 units/token, 0 units/ms.
+        manager.set_contribution_policy(decentraai_compute::ContributionPolicy {
+            version: 7,
+            units_per_token: 2,
+            units_per_processing_ms: 0,
+        });
+        assert_eq!(manager.contribution_policy().version, 7);
+        assert!(manager.record_credited_contribution(&worker, "exec-2", true, Some(100), Some(9999)));
+
+        let account = manager.quota_account(&worker.to_string()).unwrap();
+        assert_eq!(account.earned, 300, "v1: 100 units + v7: 200 units");
+        // Audit trail retains the policy version that produced each credit.
+        let events = manager.quota_events();
+        assert_eq!(events[0].policy_version, 1);
+        assert_eq!(events[1].policy_version, 7);
     }
 }

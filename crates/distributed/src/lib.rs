@@ -1100,6 +1100,20 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // Compute Contribution & Quota — Q1: credit the real
+                    // measured work (exactly once, deduped by request_id) so
+                    // the worker earns quota for what it actually served. Only
+                    // a verified completion with measured usage is credited;
+                    // failures, timeouts and transport errors earn nothing.
+                    if let Ok(resp) = &result {
+                        compute.record_credited_contribution(
+                            &placement.worker,
+                            &request.request_id.to_string(),
+                            true,
+                            Some(resp.tokens_used),
+                            Some(resp.processing_time_ms),
+                        );
+                    }
                     // P5: feed the per-worker circuit breaker — a success
                     // resets the run; only a retryable failure counts toward
                     // tripping (rejections/cancellations are not the worker's
@@ -1319,6 +1333,20 @@ impl DistributedInference {
                     compute
                         .record_outcome(&placement.worker, result.is_ok())
                         .await;
+                    // Compute Contribution & Quota — Q1: credit the real
+                    // measured work for a streamed completion, exactly once by
+                    // request_id. Streaming is single-attempt, so no mid-stream
+                    // retry can double-credit; only a verified completion with
+                    // measured usage earns quota.
+                    if let Ok(resp) = &result {
+                        compute.record_credited_contribution(
+                            &placement.worker,
+                            &request.request_id.to_string(),
+                            true,
+                            Some(resp.tokens_used),
+                            Some(resp.processing_time_ms),
+                        );
+                    }
                     // P5: feed the per-worker circuit breaker (streaming path).
                     if result.is_ok() {
                         compute.record_breaker_success(&placement.worker);

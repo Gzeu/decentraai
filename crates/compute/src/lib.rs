@@ -42,6 +42,7 @@ pub mod capability;
 pub mod compensation;
 pub mod contribution;
 pub mod matcher;
+pub mod quota;
 pub mod registry;
 pub mod requirements;
 pub mod reservation;
@@ -55,6 +56,10 @@ pub use capability::{ComputeCapability, GpuSpec, ServedModel};
 pub use contribution::{contribution_score, suggest_tier, ContributionProfile};
 pub use compensation::{reward_tokens, total_attempts, RewardPolicy};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};
+pub use quota::{
+    AccountId, ContributionPolicy, QuotaAccount, QuotaError, QuotaEvent, QuotaLedger,
+    QuotaReservation,
+};
 pub use registry::ComputeRegistry;
 pub use requirements::WorkloadRequirements;
 pub use reservation::{Admission, AdmitReason, ReservationLedger, ResourceReservation};

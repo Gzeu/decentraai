@@ -3995,6 +3995,7 @@ async fn compute_handler(
             "attached": true,
             "workers": report.workers,
             "contributions": report.contributions,
+            "quota": report.quota,
             "local_peer": report.local_peer,
             "local_perf": report.local_perf,
             "totals": report.totals,

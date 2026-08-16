@@ -1671,3 +1671,43 @@ advertised hardware). No economics/conversion invented.
 - [x] `measured_contribution()` snapshot + re-export.
 - [x] Test: duplicate request_id credits once (tokens/time not double-counted);
   failed executions earn no measured credit.
+
+## 83. Next-Gen — Compute contribution & quota: live wiring + quota ledger
+
+Continues the [Compute Contribution & Quota roadmap](docs/roadmap/COMPUTE-CONTRIBUTION-AND-QUOTA.md)
+Q1 + Q3: wire the credited, deduped measured-work accounting into the live
+execution paths AND add a deterministic quota ledger that converts it into
+spendable quota. No economics invented (versioned placeholder policy), no
+consumer API keys yet, no dashboard quota UI yet.
+
+- [x] **Q1 live wiring** — `record_credited_contribution` is now called in the
+  authoritative `route_request` (non-streamed) and `route_request_streamed`
+  paths on every **verified completion with measured usage** (tokens +
+  processing time), keyed by `request_id`. Failures, timeouts, transport errors
+  and retries earn nothing; the same execution is credited exactly once (both
+  the credit layer and the quota layer dedup by `request_id`, and the streamed
+  path is single-attempt so no mid-stream retry can double-credit).
+- [x] **Q3 pure quota ledger** (`crates/compute/src/quota.rs`) — deterministic,
+  no I/O/no async, serde-serializable:
+  - `QuotaLedger::credit/reserve/settle/release` with explicit
+    `EARNED → AVAILABLE → RESERVED → CONSUMED` lifecycle; `release` returns
+    unused reservation to the pool.
+  - Idempotent by an explicit `ref_id` (existing execution/request/reservation
+    id): duplicate credit / reserve / settle / release are no-ops; double-settle
+    is refused; overdraw is refused (`InsufficientQuota`).
+  - `ContributionPolicy { version, units_per_token, units_per_processing_ms }`
+    — versioned, replaceable, inspectable; default is a documented placeholder
+    (1 token→1 unit, 1 ms→1 unit), NOT a fair market price. Historical credits
+    retain the policy version that produced them; `set_policy` swaps in place.
+  - UNKNOWN measurements (None) earn nothing — never fabricated; an unmeasured
+    execution creates no account record.
+  - Append-only, bounded audit trail (provenance) with `policy_version`.
+- [x] **ComputeManager integration** — `set_contribution_policy`,
+  `contribution_policy`, `quota_account`, `quota_accounts`, `quota_events`;
+  credited work earns quota keyed by the worker peer id (existing identity).
+- [x] **Observability** — `/v1/compute` surfaces `quota` (per-account
+  earned/available/reserved/consumed, totals, active policy version) alongside
+  workers/contributions. Real measured state only.
+- [x] Tests: quota ledger lifecycle (reserve/settle/release/partial/duplicate/
+  insufficient/audit/policy-version), ComputeManager wiring (credited work earns
+  quota, duplicates don't, failures don't, policy replaceable + versioned).
