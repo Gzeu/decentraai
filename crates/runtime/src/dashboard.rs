@@ -509,6 +509,15 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <table><thead><tr><th>Req</th><th>Worker</th><th class="num">Score</th><th class="num">Stages</th><th>Cont</th><th class="num">RTT</th><th>KV</th><th>Usage</th><th>Outcome</th><th>Reasoning</th></tr></thead>
           <tbody id="execution"><tr><td colspan="10" class="empty">no executions yet</td></tr></tbody></table>
         </div>
+        <!-- SESSIONS (KV locality): real coordinator-tracked KV/session
+             residency from /v1/sessions — which worker holds each
+             conversation's KV prefix (and why continuations are steered
+             there). Empty ledger and UNKNOWN headroom render honestly. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Sessions (KV locality) <span class="count" id="sessions-count"></span></h2>
+          <table><thead><tr><th>Session</th><th>Worker</th><th>Model</th><th class="num">KV tokens used</th><th>KV headroom</th></tr></thead>
+          <tbody id="sessions"><tr><td colspan="5" class="empty">no active sessions</td></tr></tbody></table>
+        </div>
       </section>
 
       <!-- WORKERS -->
@@ -1914,6 +1923,46 @@ function renderDecisions(x){
   }).join('');
   $('decisions').innerHTML = cards;
 }
+// ---- Sessions (KV locality) — real coordinator-tracked KV/session residency
+// from /v1/sessions. Only measured backend state is shown: an empty ledger
+// renders "no active sessions", a null kv_headroom renders UNKNOWN/faint.
+// Nothing here is fabricated — no invented sessions, workers, models or counts.
+async function renderSessions(){
+  const box = $('sessions');
+  if (!box) return;
+  const { ok, status, j } = await apiFetch('/v1/sessions', { headers });
+  const count = $('sessions-count');
+  if (!ok) {
+    if (count) count.textContent = '';
+    box.innerHTML = '<tr><td colspan="5"><span class="badge warn">sessions unavailable (' + status + ')</span> ' +
+      esc((j && j.error && j.error.message) || 'unknown error') + '</td></tr>';
+    return;
+  }
+  const active = (j && j.sessions_active) || 0;
+  if (count) count.textContent = active;
+  const sessions = (j && j.sessions) || [];
+  if (active === 0 || sessions.length === 0) {
+    box.innerHTML = '<tr><td colspan="5" class="empty">no active sessions</td></tr>';
+    return;
+  }
+  const rows = sessions.map(s => {
+    const cap = (s.capacity || 0) > 0 ? s.capacity : 0;
+    const used = (s.tokens_used !== undefined && s.tokens_used !== null) ? s.tokens_used : null;
+    const hk = (s.kv_headroom !== undefined && s.kv_headroom !== null) ? s.kv_headroom : null;
+    const usage = cap > 0 ? (used !== null ? used + ' / ' + cap : '&mdash; / ' + cap) : '&mdash;';
+    const head = hk === null || cap === 0
+      ? '<span class="badge faint">UNKNOWN</span>'
+      : hk < cap * 0.8
+        ? '<span class="badge ok">headroom ' + hk + '</span>'
+        : '<span class="badge warn">near capacity · ' + hk + '</span>';
+    return '<tr><td><code>' + short(s.session_id, 12) + '</code></td>' +
+      '<td><code>' + short(s.worker, 12) + '</code></td>' +
+      '<td class="mono" style="font-size:11px">' + esc(short(s.model_hash, 12)) + '</td>' +
+      '<td class="num">' + esc(usage) + '</td>' +
+      '<td>' + head + '</td></tr>';
+  }).join('');
+  box.innerHTML = rows;
+}
 // CAN I RUN THIS? — fabric-wide capability fit via the real /v1/can_run
 // projection (same pure engine as the MCP get_worker_capability tool).
 async function canIRun(){
@@ -3039,6 +3088,7 @@ async function refresh(){
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
+  try { await renderSessions(); } catch (e) {}
   try { const rr = await (await fetch('/v1/resources', { headers })).json(); renderResources(rr); } catch (e) {}
   try { const fg = await (await fetch('/v1/fabric', { headers })).json(); renderFabricGraph(fg); } catch (e) {}
   renderFabric(s, c, n, x);

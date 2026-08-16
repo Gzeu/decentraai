@@ -1379,3 +1379,11 @@ without executing.
 - [x] `GET /v1/sessions` (operator/admin): the session snapshot; honest empty
   when no compute manager.
 - [x] Test: auth + honest empty (never fabricated residency).
+
+## 57. Next-Gen — Dashboard Sessions card (KV locality)
+
+- [x] Execution view gains a "Sessions (KV locality)" card rendering the real
+  `/v1/sessions` snapshot: session/worker/model (short), tokens_used/capacity
+  (— when unknown), and a KV-headroom badge (ok / near-capacity warn / UNKNOWN
+  faint when null). Empty → "no active sessions"; wired into the 3s refresh.
+  Nothing fabricated.
