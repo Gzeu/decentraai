@@ -1951,3 +1951,26 @@ fabric. Live validation performed against the actual environment (see
   is otherwise covered by the loopback E2E two-node tests. Required to close:
   upgrade the Desktop binary + a model served by only one node / a forced
   remote route.
+
+## 92. Next-Gen — Desktop upgrade procedure + remote execution validation gate
+
+The live two-node finding is that the Desktop (`dca-NGE65Z`, 192.168.1.129)
+runs an older binary and conservatively advertises `accepts_remote_inference:
+false`. The Desktop's control plane (API on loopback by design, SSH closed) is
+not reachable from the laptop, so the upgrade must run on the Desktop by its
+operator.
+
+- [x] `scripts/upgrade-node.sh` — exact, idempotent in-place upgrade: build
+  current HEAD, stop the node service (ETXTBSY guard), swap the binary with a
+  timestamped backup, restart the systemd user service, and verify the node
+  now advertises `accepts_remote_inference: true`. Never touches data/config/
+  identity.
+- [x] `docs/TWO_NODE_VALIDATION.md` — documents the exact Desktop upgrade
+  steps + the post-upgrade trust + forced-remote route commands to prove
+  Laptop → Desktop remote execution.
+- [x] **LOCAL-BLOCKED — live remote execution validation**: cannot be
+  completed from this laptop because the Desktop's API/SSH are unreachable
+  (loopback API + no SSH). The upgrade + re-validation must run on the
+  Desktop. Two-node P2P connectivity IS verified live (this laptop dials the
+  Desktop's P2P port 38231; `/v1/network` shows it connected), which is the
+  precondition for remote execution.
