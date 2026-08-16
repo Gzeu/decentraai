@@ -1370,3 +1370,12 @@ without executing.
   with a "no request sent · no reservation held" note; no real-run confirm
   dialog (a preview is read-only). Errors render the real message + honest
   "no eligible worker" case. Nothing fabricated.
+
+## 56. Next-Gen — Sessions endpoint (KV locality observability)
+
+- [x] `SessionAccount::snapshot()` + `ComputeManager::sessions()` — expose every
+  coordinator-tracked KV/session (session_id → worker residency + model +
+  accounted tokens + capacity), real accounted state only.
+- [x] `GET /v1/sessions` (operator/admin): the session snapshot; honest empty
+  when no compute manager.
+- [x] Test: auth + honest empty (never fabricated residency).

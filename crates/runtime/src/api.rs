@@ -3295,6 +3295,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
         .route("/v1/resources", get(resources_handler))
@@ -3983,6 +3984,27 @@ async fn execution_handler(
         body["decisions"] = serde_json::json!(decisions);
         body["attached"] = serde_json::json!(true);
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// `GET /v1/sessions` — coordinator-tracked KV/session residency (M20): which
+/// worker holds each session's KV prefix, model, accounted tokens + capacity.
+/// Real accounted state only; empty when no compute manager. Operator/admin.
+async fn sessions_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let body = match &state.compute {
+        Some(cm) => cm.sessions(),
+        None => serde_json::json!({ "sessions_active": 0, "sessions": [] }),
+    };
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
@@ -6971,6 +6993,37 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let j: serde_json::Value = resp.json().await.unwrap();
         assert!(j["records"].is_number(), "records field present");
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_requires_operator_and_returns_honest_empty() {
+        // /v1/sessions is operator/admin-gated; without a compute manager it
+        // returns an honest empty session list (never fabricated residency).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("master".into()), None).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401/403.
+        let resp = client
+            .get(format!("http://{api}/v1/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token -> 200 JSON with sessions_active + sessions.
+        let resp = client
+            .get(format!("http://{api}/v1/sessions"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let j: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(j["sessions_active"], 0, "honest: no sessions");
+        assert!(j["sessions"].is_array());
 
         manager.lock().await.shutdown().await.unwrap();
     }

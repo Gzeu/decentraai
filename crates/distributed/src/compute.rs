@@ -630,6 +630,26 @@ impl ComputeManager {
         self.sessions.lock().unwrap().len()
     }
 
+    /// Snapshot of every coordinator-tracked KV/session (M20): session id →
+    /// worker residency + model + accounted tokens + capacity. Real state,
+    /// never fabricated; serde-friendly for the dashboard/API.
+    pub fn sessions(&self) -> serde_json::Value {
+        let snap = self.sessions.lock().unwrap().snapshot();
+        serde_json::json!({
+            "sessions_active": snap.len(),
+            "sessions": snap.into_iter().map(|(id, kv)| serde_json::json!({
+                "session_id": id,
+                "worker": kv.worker.to_string(),
+                "model_hash": kv.model_hash,
+                "tokens_used": kv.tokens_used,
+                "capacity": kv.capacity,
+                "kv_headroom": if kv.capacity > 0 {
+                    Some(kv.tokens_used.min(kv.capacity))
+                } else { None },
+            })).collect::<Vec<_>>(),
+        })
+    }
+
     /// Records an executed plan (M23): the real planner decision + placement +
     /// outcome, surfaced by the dashboard EXECUTION view. Bounded to the most
     /// recent 128 executions so the buffer cannot grow unbounded.
