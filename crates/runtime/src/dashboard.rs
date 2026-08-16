@@ -1085,6 +1085,24 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
               <tr><td>Disk free</td><td class="num" id="set-disk">&mdash;</td></tr>
               <tr><td>Swap used</td><td class="num" id="set-swap">&mdash;</td></tr>
             </tbody></table>
+            <button id="res-edit" class="ghost" style="margin-top:8px" onclick="openResEdit()">Edit limits</button>
+            <div id="set-resources-edit" style="margin-top:8px;display:none">
+              <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-bottom:8px">
+                <div><div class="label" style="font-size:10px;color:var(--faint)">CPU max %</div><input id="res-cpu" type="number" step="5" min="1" max="100"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">RAM max %</div><input id="res-rampct" type="number" step="5" min="1" max="100"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">Reserve CPU cores</div><input id="res-cpures" type="number" step="1" min="0"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">Reserve RAM (MiB)</div><input id="res-ramres" type="number" step="256" min="0"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">Reserve VRAM (MiB)</div><input id="res-vramres" type="number" step="256" min="0"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">GPU VRAM cap %</div><input id="res-vramcap" type="number" step="5" min="1" max="100"></div>
+                <div><div class="label" style="font-size:10px;color:var(--faint)">GPU temp stop °C</div><input id="res-gputemp" type="number" step="1" min="50" max="120"></div>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <button id="res-save" class="primary">Save</button>
+                <button id="res-cancel" class="ghost">Cancel</button>
+                <span id="res-status" class="mono" style="font-size:11px;color:var(--muted)"></span>
+              </div>
+              <p class="mono" style="font-size:10.5px;color:var(--faint);margin-top:6px">Resource limits gate engine startup/admission — saved to node.yaml and applied on the next start. GPU policy (enabled) is config-only.</p>
+            </div>
           </div>
         </div>
         <div class="grid cols-2" style="margin-top:14px">
@@ -3433,6 +3451,46 @@ async function saveGeneration(){
     closeGenEdit();
   } catch (e) { $('gen-status').innerHTML = '<span class="badge warn">save failed</span>'; }
 }
+// ---- Settings: resource limits (persisted for next start, master-gated) ----
+function openResEdit(){
+  // Pre-fill from the current real values (status resources + config display).
+  const r = (window.lastStatus && window.lastStatus.resources) || {};
+  $('res-cpu').value = r.cpu_max_percent != null ? r.cpu_max_percent : 50;
+  $('res-rampct').value = r.memory_max_percent != null ? r.memory_max_percent : 60;
+  $('res-cpures').value = r.reserve_cpu_cores != null ? r.reserve_cpu_cores : 1;
+  $('res-ramres').value = r.reserve_ram_mb != null ? r.reserve_ram_mb : 1024;
+  $('res-vramres').value = r.reserve_vram_mb != null ? r.reserve_vram_mb : 512;
+  $('res-vramcap').value = r.gpu_max_vram_percent != null ? r.gpu_max_vram_percent : 75;
+  $('res-gputemp').value = r.stop_gpu_temperature_celsius != null ? r.stop_gpu_temperature_celsius : 83;
+  $('set-resources-edit').style.display = 'block';
+  const eb = $('res-edit'); if (eb) eb.style.display = 'none';
+  $('res-status').textContent = '';
+}
+function closeResEdit(){
+  $('set-resources-edit').style.display = 'none';
+  const eb = $('res-edit'); if (eb) eb.style.display = '';
+}
+async function saveResources(){
+  const body = {
+    cpu_max_percent: parseInt($('res-cpu').value, 10),
+    memory_max_percent: parseInt($('res-rampct').value, 10),
+    reserve_cpu_cores: parseInt($('res-cpures').value, 10),
+    reserve_ram_mb: parseInt($('res-ramres').value, 10),
+    reserve_vram_mb: parseInt($('res-vramres').value, 10),
+    gpu_max_vram_percent: parseInt($('res-vramcap').value, 10),
+    stop_gpu_temperature_celsius: parseInt($('res-gputemp').value, 10),
+  };
+  $('res-status').textContent = 'saving…';
+  try {
+    const r = await fetch('/api/admin/settings/resources', { method:'POST', headers: Object.assign({}, headers, { 'Content-Type':'application/json' }), body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) { $('res-status').innerHTML = '<span class="badge warn">' + esc((d.error&&d.error.message)||('failed '+r.status)) + '</span>'; return; }
+    $('res-status').innerHTML = '<span class="badge ok">saved to node.yaml</span> <span class="muted">(applied on next start)</span>';
+    toast('resource limits saved');
+    refresh();
+    closeResEdit();
+  } catch (e) { $('res-status').innerHTML = '<span class="badge warn">save failed</span>'; }
+}
 function renderSecurity(){
   // audit events — a 401/403 (master-gated) is resolved (not rejected), so
   // check status explicitly to show the honest "master token required" state
@@ -3511,6 +3569,8 @@ async function revokeConsumerKey(ev){
 $('ck-create').addEventListener('click', createConsumerKey);
 $('gen-save').addEventListener('click', saveGeneration);
 $('gen-cancel').addEventListener('click', closeGenEdit);
+$('res-save').addEventListener('click', saveResources);
+$('res-cancel').addEventListener('click', closeResEdit);
 window.copyDev = id => {
   const el = $(id);
   const txt = el && (el.textContent || el.innerText || '').trim();
@@ -3611,6 +3671,7 @@ async function loadCapOverview(){
 async function refresh(){
   let s = null, c = null, n = null, x = null;
   try { s = await (await fetch('/status')).json(); } catch (e) {}
+  if (s) window.lastStatus = s;
   if (s) {
     $('model-name').textContent = s.model || '—';
     $('model-size').textContent = s.model_size_bytes > 0 ? (s.model_size_bytes/1073741824).toFixed(2)+' GiB' : '—';

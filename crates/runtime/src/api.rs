@@ -3866,6 +3866,108 @@ fn persist_generation_config(repo_root: &std::path::Path, g: &GenerationSection)
     std::fs::rename(&tmp, &path).is_ok()
 }
 
+/// Master-gated runtime settings: update resource admission limits in the node
+/// config (`node.yaml` under `resources:`). These are read at engine startup /
+/// admission, so the change is persisted for the NEXT start (live-apply is not
+/// possible without a restart — resource limits gate the pre-flight check).
+/// `gpu_enabled` is intentionally NOT editable here (changing the GPU policy
+/// live is a security-sensitive operation; keep it config-only).
+async fn admin_settings_resources_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let path = state.info.repo_root.join("node.yaml");
+    if !path.exists() {
+        return forbidden("node.yaml not found — cannot persist resource settings");
+    }
+    let persisted = persist_resource_config(&path, &req);
+    if !persisted {
+        return forbidden("could not persist resource settings (no matching keys / write failed)");
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "settings_resources_updated",
+        serde_json::json!({
+            "applied_keys": req,
+            "note": "persisted for next start (resource limits gate startup admission)",
+        }),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "success": true,
+            "persisted": true,
+            "note": "resource limits saved to node.yaml; applied on the next start",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Text-based, atomic persistence of resource limit keys under `resources:`
+/// in the node config. Edits the known numeric keys only; unknown keys are
+/// ignored. Returns false when no known key matched (nothing to write) or the
+/// file write failed.
+fn persist_resource_config(path: &std::path::Path, req: &serde_json::Value) -> bool {
+    use std::io::Write;
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let keys: [&str; 7] = [
+        "cpu_max_percent",
+        "memory_max_percent",
+        "reserve_cpu_cores",
+        "reserve_ram_mb",
+        "reserve_vram_mb",
+        "gpu_max_vram_percent",
+        "stop_gpu_temperature_celsius",
+    ];
+    let mut wrote = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        // Only rewrite lines inside the `resources:` block.
+        let mut replaced = None;
+        if trimmed.starts_with("resources:") {
+            // keep the header
+        } else if line.len() - trimmed.len() >= 2 {
+            for k in keys {
+                if let Some(rest) = trimmed.strip_prefix(k).and_then(|r| r.strip_prefix(':')) {
+                    if let Some(v) = req.get(k) {
+                        let indent = &line[..line.len() - trimmed.len()];
+                        replaced = Some(format!("{indent}{k}: {}", serde_json::to_string(v).unwrap_or_default().replace('"', "")));
+                        wrote = true;
+                    }
+                    let _ = rest;
+                    break;
+                }
+            }
+        }
+        out.push(replaced.unwrap_or_else(|| line.to_string()));
+    }
+    if !wrote {
+        return false;
+    }
+    let content = out.join("\n");
+    let tmp = path.with_extension("yaml.tmp");
+    let mut f = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if f.write_all(content.as_bytes()).is_err() || f.sync_all().is_err() {
+        return false;
+    }
+    drop(f);
+    std::fs::rename(&tmp, path).is_ok()
+}
+
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
 /// admin endpoints. `peer_id` must be a valid base58 PeerId.
 fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
@@ -4048,6 +4150,7 @@ pub fn build_router(state: ApiState) -> Router {
         // Model removal (Issue #26): master-gated delete from registry + disk
         .route("/api/admin/models/remove", post(admin_models_remove_handler))
         .route("/api/admin/settings/generation", post(admin_settings_generation_handler))
+        .route("/api/admin/settings/resources", post(admin_settings_resources_handler))
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
