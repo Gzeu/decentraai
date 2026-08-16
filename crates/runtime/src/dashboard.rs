@@ -3896,8 +3896,9 @@ Object.assign(window, {
   canIRun, continueSession, copyConsumerToken, decideNow, executeDecision,
   hubCanIRunLocal, hubCheckFit, hubClearCompare, hubCloseCompare,
   hubCloseDetail, hubCompareFit, hubCompareSelected, hubOpenDetail, hubPull,
-  hubPullVariant, hubSearch, loadVariantFit, openGenEdit, openResEdit,
-  previewDecision, removeModel, revokeConsumerKey, useModelOption, variantCompare,
+  hubPullVariant, hubSearch, hubToggleCompare, loadVariantFit, openGenEdit,
+  openResEdit, previewDecision, removeModel, revokeConsumerKey,
+  useModelOption, variantCompare,
 });
 refresh(); setInterval(refresh, 3000);
 "##;
