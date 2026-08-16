@@ -1616,3 +1616,12 @@ new identity/token/trust/auth/discovery system.
   model availability are probed; Trust and BUSY are clearly marked as
   coordinator-side (the coordinator decides trust and observes busy/queued).
   UPDATING/VERIFIED never emitted.
+
+## 78. Next-Gen — Dashboard "Add a lightweight worker" instructions
+
+- [x] Fabric graph card gains a static, instruction-only "Add a lightweight
+  worker" block: how to run `decentraai invite` on the coordinator, then
+  `decentraai-worker --join "<multiaddr> <dsk_ token>"` + `--model <file.gguf>`
+  on the new machine, then `decentraai trust add --peer <peer-id>`.
+  Instructions only — no new backend/mutation, and the real multiaddr/token are
+  never fabricated (they come from `decentraai invite` on demand).

@@ -492,6 +492,37 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           </div>
           <div id="fabric-graph" class="empty">fabric graph not loaded</div>
         </div>
+        <!-- ADD WORKER (instructions only): a static, honest walkthrough for
+             bringing a lightweight `decentraai-worker` into this fabric. No
+             backend/mutation — the real invite is obtained by running
+             `decentraai invite` on this coordinator. The placeholder
+             multiaddr/token below are NEVER fabricated here. -->
+        <div id="add-worker" class="card" style="margin-top:14px">
+          <h2>Add a lightweight worker <span class="count">instructions only</span></h2>
+          <p style="margin:4px 0 8px;color:var(--muted);font-size:13px">
+            Bring a new <code>decentraai-worker</code> into this fabric from any
+            machine. These are copy-paste steps on the <b>new machine</b>; nothing
+            here changes anything on this node.
+          </p>
+          <ol style="margin:0 0 8px;padding-left:18px;font-size:13px;line-height:1.5">
+            <li>On <b>this coordinator</b>, run <code>decentraai invite</code> to get a reachable
+                multiaddr + a guest (<code>dsk_</code>) token. Copy that invite.</li>
+            <li>On the <b>new machine</b>, join with the invite, then serve a GGUF model:</li>
+          </ol>
+          <pre class="mono" style="font-size:12px;margin:0 0 8px;padding:8px;background:rgba(0,0,0,.15);border-radius:6px;overflow-x:auto"># on the new machine
+decentraai-worker --join "&lt;multiaddr&gt; &lt;dsk_ token&gt;" --data-dir ~/.decentraai-worker
+decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre>
+          <p style="margin:0 0 8px;color:var(--muted);font-size:13px">
+            Replace <code>&lt;multiaddr&gt; &lt;dsk_ token&gt;</code> with the actual invite from
+            <code>decentraai invite</code> on this node — it is not shown here because it is
+            generated on demand and never stored in the dashboard.
+          </p>
+          <p style="margin:0;color:var(--muted);font-size:13px">
+            After it joins, trust it from this coordinator
+            (<code>decentraai trust add --peer &lt;peer-id&gt;</code>) and it will appear here
+            when advertising.
+          </p>
+        </div>
       </section>
 
       <!-- DECISIONS -->
