@@ -1625,3 +1625,11 @@ new identity/token/trust/auth/discovery system.
   on the new machine, then `decentraai trust add --peer <peer-id>`.
   Instructions only — no new backend/mutation, and the real multiaddr/token are
   never fabricated (they come from `decentraai invite` on demand).
+
+## 79. Next-Gen — Cross-platform worker packaging boundary
+
+- [x] `docs/WORKER_ARCHITECTURE.md` gains a practical packaging table: Linux
+  (systemd), Windows (console/scheduled task), ARM (container/CPU-only), and
+  Android/mobile marked FUTURE — not supported. The worker contract is identical
+  across platforms; only probes + engine adapters differ; no single update
+  mechanism assumed.

@@ -188,6 +188,19 @@ Because these are the only platform-touching pieces, a future Windows / ARM /
 Android port needs only its own probe + engine adapter — the core worker code
 does not change.
 
+### Practical packaging boundary (by platform)
+
+| Platform | Packaging | Notes |
+|---|---|---|
+| Linux | `cargo build --release --bin decentraai-worker`; systemd user unit optional | `scripts/install-app.sh` installs both binaries; llama-server from distro/built PATH |
+| Windows | build the same bin; run as a console service or scheduled task | llama-server.exe on PATH/`--binary`; process model is cross-platform |
+| ARM (e.g. Raspberry Pi) | same Rust bin; optional container | CPU-only probe path; no nvidia-smi (degrades to `gpu: None`) |
+| Android / mobile | FUTURE — not supported | needs its own NPU/thermal/battery probe + engine adapter; the worker contract is unchanged |
+
+The worker **contract** (advertisement fields, join flow, signed P2P) is
+identical across platforms; only probes and engine adapters differ. No single
+update mechanism is assumed (see `docs/deployment.md`).
+
 ---
 
 ## 6. Mobile readiness & adaptive contribution
