@@ -445,7 +445,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <tr><td>Serving now</td><td class="num" id="queue-serving"><span class="badge faint">idle</span></td></tr>
             <tr><td>Waiting</td><td class="num" id="queue-waiting"><span class="badge faint">nobody</span></td></tr>
           </tbody></table>
-          <div style="margin-top:12px;font-size:12px;color:var(--muted)">System: <span id="ram">&mdash;</span> RAM · <span id="cpu">&mdash;</span> · <span id="gpu">&mdash;</span></div>
+          <div style="margin-top:12px;font-size:12px;color:var(--muted)">System: <span id="ram">&mdash;</span> RAM · <span id="cpu">&mdash;</span> · <span id="gpu">&mdash;</span> <span id="sys-pv"></span></div>
         </div>
       </div>
 
@@ -3388,6 +3388,11 @@ async function refresh(){
     $('ram').textContent = (s.system && s.system.ram_available_gib !== undefined) ? s.system.ram_available_gib.toFixed(1)+' / '+s.system.ram_total_gib.toFixed(1)+' GiB' : '—';
     $('cpu').textContent = (s.system && s.system.cpu_threads) ? s.system.cpu_threads+' threads' : '—';
     $('gpu').innerHTML = (s.system && s.system.gpu) ? esc(s.system.gpu.name)+' · '+s.system.gpu.temperature_c+'°C · '+s.system.gpu.free_vram_mib+' MiB free · '+s.system.gpu.utilization_percent+'%' : '<span class="badge faint">none detected</span>';
+    // Live provenance on the system row: these come from a real system probe on
+    // this node, so they are MEASURED (never a fabricated estimate).
+    const sysPv = '<span style="color:var(--faint);font-size:10.5px"> '+provenanceBadge('MEASURED')+'</span>';
+    const sysRow = $('sys-pv');
+    if (sysRow) sysRow.innerHTML = sysPv;
     $('events').innerHTML = (s.recent_events||[]).map(e =>
       '<tr><td>'+tstr(e.timestamp)+'</td><td><code>'+esc(e.event)+'</code></td><td class="mono" style="font-size:11px">'+esc(JSON.stringify(e.details||{}))+'</td></tr>'
     ).join('') || '<tr><td colspan="3" class="empty">no security events yet</td></tr>';
