@@ -319,7 +319,7 @@ impl ExecutionPlanner {
         };
 
         let fallback_orders = self.fallback_orders(&ranked);
-        let stage = self.build_stage(best, req);
+        let stage = self.build_stage(best, &eligible, req);
         let plan = ExecutionPlan {
             plan_id: uuid::Uuid::new_v4().to_string(),
             model_hash: req.model_hash.clone(),
@@ -349,6 +349,7 @@ impl ExecutionPlanner {
     fn build_stage(
         &self,
         f: &WorkerFacts,
+        eligible: &[&WorkerFacts],
         req: &RequestFacts,
     ) -> (ExecutionStage, String) {
         let stage = ExecutionStage {
@@ -364,9 +365,16 @@ impl ExecutionPlanner {
             f.peer_id, f.tokens_per_second, f.latency_ms, f.queue_depth, f.load_percent,
         );
         if f.capabilities.expert_routing {
-            // Expert-aware decision.
+            // Expert-aware decision. Pass EVERY eligible worker as a candidate,
+            // not just the chosen one: a split can only be sound when the
+            // router sees all capable shards (a single candidate can never
+            // produce an ExpertSplit — it would always fall back whole-model).
+            let candidates: Vec<String> = eligible
+                .iter()
+                .map(|e| e.peer_id.clone())
+                .collect();
             if let crate::expert::ExpertDecision::ExpertSplit { workers, .. } =
-                ExpertRouter.route(&req.model_hash, &self.experts, vec![f.peer_id.clone()])
+                ExpertRouter.route(&req.model_hash, &self.experts, candidates)
             {
                 reasons.push_str(&format!("; expert split across {workers:?}"));
             }
@@ -1024,7 +1032,7 @@ mod tests {
         assert_eq!(view.capability, "image_ocr");
     }
 
-    #[test]
+#[test]
     fn resolve_requirement_is_a_pure_free_function() {
         // Call the free function directly with a synthetic claims slice; it
         // needs no planner, no I/O, and only depends on its inputs.
@@ -1035,5 +1043,90 @@ mod tests {
         let verified = resolve_capability_requirement("asr", claims);
         assert!(verified.satisfied);
         assert_eq!(verified.evidence, "VERIFIED");
+    }
+
+    #[test]
+    fn expert_capable_worker_routes_to_expert_split() {
+        // M21 wiring regression: when workers advertise expert_routing and the
+        // coordinator registry holds their shards, `plan()` must surface the
+        // ExpertSplit in the reasoning (proving ExpertRouter is actually
+        // invoked with ALL eligible candidates, not just the chosen worker).
+        use crate::expert::{ExpertRegistry, ExpertShard};
+        let mut experts = ExpertRegistry::new();
+        experts.record(
+            "m1",
+            "a",
+            ExpertShard {
+                experts: vec![0, 1],
+                routing_capable: true,
+                coverage: 1.0,
+            },
+        );
+        experts.record(
+            "m1",
+            "b",
+            ExpertShard {
+                experts: vec![2, 3],
+                routing_capable: true,
+                coverage: 1.0,
+            },
+        );
+        let mut a = worker_facts("a", 100, 50, 10);
+        a.capabilities.expert_routing = true;
+        a.engine = EngineKind::Vllm;
+        let mut b = worker_facts("b", 90, 60, 20);
+        b.capabilities.expert_routing = true;
+        b.engine = EngineKind::Vllm;
+        let planner = ExecutionPlanner {
+            experts,
+            ..Default::default()
+        };
+        let result = planner.plan(&req(), &[a, b]);
+        assert!(
+            result.reasoning.contains("expert split"),
+            "expert wiring must surface in the planner reasoning: {}",
+            result.reasoning
+        );
+    }
+
+    #[test]
+    fn non_expert_engine_keeps_honest_whole_model_reasoning() {
+        // M21 honest-fallback regression: LlamaServer (today's engine) never
+        // advertises expert_routing, so even with an empty registry the plan
+        // must NOT claim a split — whole-model fallback only.
+        let w = worker_facts("a", 100, 50, 10);
+        let planner = ExecutionPlanner::default();
+        let result = planner.plan(&req(), &[w]);
+        assert_eq!(result.plan.workers(), vec!["a"]);
+        assert!(
+            !result.reasoning.contains("expert split"),
+            "no engine advertises expert routing today: {}",
+            result.reasoning
+        );
+    }
+
+    #[test]
+    fn engine_kind_capabilities_drive_worker_facts() {
+        // M22 wiring regression: EngineKind::parse + advertised_capabilities
+        // must yield the engine's real capabilities (vLLM supports staging /
+        // KV reporting; LlamaServer does not), so the planner scores engines by
+        // their true surface.
+        let vllm_caps = EngineKind::Vllm.advertised_capabilities();
+        assert!(vllm_caps.supports_staging(), "vLLM advertises staged transfers");
+        assert!(vllm_caps.kv_report, "vLLM advertises KV reporting");
+        assert!(vllm_caps.tensor_parallel, "vLLM advertises tensor parallel");
+        assert!(!vllm_caps.expert_routing, "no engine advertises expert routing today");
+        let llama_caps = EngineKind::LlamaServer.advertised_capabilities();
+        assert!(!llama_caps.supports_staging());
+        assert!(llama_caps.kv_report, "llama-server exposes KV params");
+        assert!(!llama_caps.tensor_parallel);
+        // Ollama / RemoteOpenAI are conservative: no KV report, no staging.
+        let ollama_caps = EngineKind::Ollama.advertised_capabilities();
+        assert!(!ollama_caps.kv_report);
+        assert!(!ollama_caps.supports_staging());
+        // parse round-trip used by fabric_facts on the live coordinator.
+        assert_eq!(EngineKind::parse("vllm"), EngineKind::Vllm);
+        assert_eq!(EngineKind::parse("llama-server"), EngineKind::LlamaServer);
+        assert_eq!(EngineKind::parse("unknown-engine"), EngineKind::RemoteOpenAI);
     }
 }
