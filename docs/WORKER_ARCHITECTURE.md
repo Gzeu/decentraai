@@ -137,11 +137,12 @@ over P2P. `announced_at_ms` timestamps each beat.
 | CPU / RAM / GPU / VRAM | ✅ | |
 | engines / models / capabilities | ✅ | |
 | availability (load, queue, tps, latency) | ✅ | |
-| battery state | | 🔒 mobile plan |
-| thermal state | | 🔒 mobile plan |
+| GPU thermal / utilization | ✅ | |
+| battery state | ✅ (battery_percent, Linux probe) | charging/AC status |
+| thermal state | ✅ (GPU thermal) | CPU/SoC thermal (Android) |
 | foreground / background | | 🔒 mobile plan |
 | network quality | | 🔒 mobile plan |
-| user contribution limit | | 🔒 plan (adaptive contribution) |
+| user contribution limit | ✅ (adaptive contribution factor) | |
 
 The 🔒 rows are **plans**, not implemented; see §6.
 
@@ -195,43 +196,75 @@ does not change.
 | Linux | `cargo build --release --bin decentraai-worker`; systemd user unit optional | `scripts/install-app.sh` installs both binaries; llama-server from distro/built PATH |
 | Windows | build the same bin; run as a console service or scheduled task | llama-server.exe on PATH/`--binary`; process model is cross-platform |
 | ARM (e.g. Raspberry Pi) | same Rust bin; optional container | CPU-only probe path; no nvidia-smi (degrades to `gpu: None`) |
-| Android / mobile | FUTURE — not supported | needs its own NPU/thermal/battery probe + engine adapter; the worker contract is unchanged |
+| Android / mobile | FUTURE — not supported | needs its own NPU/SoC-thermal probe + engine adapter + battery probe via Android APIs; the worker contract is unchanged. The Linux battery probe is the prototype for the mobile battery path. |
 
 The worker **contract** (advertisement fields, join flow, signed P2P) is
 identical across platforms; only probes and engine adapters differ. No single
 update mechanism is assumed (see `docs/deployment.md`).
 
+### Android feasibility (honest assessment)
+
+Rust + libp2p (`decentraai-worker`) **can** target Android: the core worker
+(identity, signed advertisement, mDNS, P2P request/response, `--join`,
+`--status`, `--doctor`) is platform-neutral Rust that builds for `aarch64-linux-android`
+via the Android NDK toolchain. What is **not** done yet:
+
+| Piece | Status on Android |
+|---|---|
+| Core worker binary | feasible — cross-compiles with the NDK; libp2p TCP/Noise/mDNS works on Android |
+| llama-server engine | the biggest blocker — a working `llama-server` Android build + subprocess spawn + health probe (Android has no `fork`/exec model like Linux; needs the service/process model) |
+| Battery probe | feasible — `BatteryManager.getIntProperty(EXTRA_LEVEL)`; the Linux sysfs probe is the prototype |
+| CPU/SoC thermal probe | feasible — Android `ThermalManager` / `sys/class/thermal`; not implemented |
+| NPU accelerator | device-specific; llama.cpp Android often uses CPU/NPU via provider-specific backends — out of scope |
+| App foreground/background | feasible — Android `ActivityLifecycleCallbacks`; not implemented |
+
+**Verdict**: the **worker contract** is Android-portable today (that's the
+point of the platform abstraction), but a *real* Android worker is blocked on
+a maintained llama-server Android build and the Android process/service
+engine adapter. The battery/thermal/adaptive-contribution foundations landed
+here make the mobile worker direction concrete rather than aspirational, but
+**nothing runs on Android yet** — this is an honest feasibility note, not a
+supported platform.
+
 ---
 
 ## 6. Mobile readiness & adaptive contribution
 
-### Mobile advertisement extensions (CONTRACT / PLAN — not implemented)
-Future advertisement fields that a constrained/mobile device would add:
-- battery state (level, charging)
-- thermal pressure
+### Mobile advertisement extensions (implemented vs plan)
+Implemented (real, measured values only — nothing fabricated):
+- **GPU thermal / utilization** — `gpu_temperature_celsius` /
+  `gpu_utilization_percent`, probed from nvidia-smi when present.
+- **battery state** — `battery_percent`, probed on Linux from
+  `/sys/class/power_supply/*/capacity` (skips AC/charger; conservative min
+  across cells; `None` on desktop / no battery).
+- **adaptive contribution factor** — `adaptive_contribution_factor()` (0.0..1.0)
+  computed from real GPU thermal + GPU util + CPU load + battery; the fabric
+  scheduler multiplies its worker score by this so a stressed worker receives
+  less work. Exposed in `/v1/fabric` + `/v1/resources`.
+
+Still plan (🔒) — not implemented, would need their own probes:
 - foreground / background (app visibility)
-- network quality
-- CPU / GPU / NPU
-- available memory
-- user contribution limits
+- network quality (measured link health)
+- CPU / SoC thermal (Android)
 
-**These are plans only.** There is no fabricated mobile telemetry today — a
-worker advertises only real, measured values.
+**Honest rule holds**: there is no fabricated mobile telemetry — a worker
+advertises only real, measured values. `None` means UNKNOWN, never a guess.
 
-### How the scheduler would later adapt (direction, not implemented)
-When a device reports low battery / high thermal / busy / degraded network / or
-the user disables contribution, the scheduler should **reduce or stop**
-workload routed to it — driven entirely by what the worker honestly advertises.
+### How the scheduler adapts (implemented)
+When a device reports high GPU thermal / high GPU utilization / high CPU load /
+or a low battery, the `adaptive_contribution_factor` drops below 1.0 and the
+scheduler ranks that worker lower, **reducing** the workload routed to it —
+driven entirely by what the worker honestly advertises.
 
 ### Adaptive contribution direction
 - **Desktop → high**, **Laptop → medium**, **Phone → limited**.
 - The worker advertises its **honest** capacity; the coordinator does not assume
-  a fixed capacity.
-- Today the worker already advertises real `availability` (load, queue, tps,
-  latency). Future work adds **capacity / contribution limits** so the worker
-  can bound how much remote work it will take.
-
-This direction is documented here as a contract; it is not yet implemented.
+  a fixed capacity. The adaptive factor is the first concrete implementation of
+  "capacity / contribution limits" so a stressed device bounds how much remote
+  work it takes.
+- Remaining mobile work (battery charge/AC status granularity, CPU/SoC thermal,
+  network quality, foreground/background) is documented here as a contract; it
+  is not yet implemented.
 
 ---
 

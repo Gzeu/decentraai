@@ -1803,3 +1803,21 @@ fabricated, UNKNOWN stays neutral.
   one; battery probe reads real capacity, skips chargers, reports the
   conservative min, and returns None without a battery. Workspace tests,
   clippy `-D warnings`, release build green.
+
+## 86. Next-Gen — Mobile worker contract & Android feasibility (honest)
+
+Documentation + the concrete adaptive-contribution foundation for the
+mobile/lightweight-worker direction. No fabricated mobile telemetry; `None`
+stays UNKNOWN.
+
+- [x] `docs/WORKER_ARCHITECTURE.md` §5/§6 updated: the "Today vs Future"
+  table now marks GPU thermal, battery state and adaptive contribution as
+  **implemented** (real values), with foreground/background, network quality
+  and CPU/SoC thermal still 🔒 plan. The adaptive-contribution section
+  describes the real scheduler behavior (stressed worker ranked lower).
+- [x] **Android feasibility (honest)** — the worker contract is
+  Android-portable (Rust + libp2p cross-compiles via the NDK), but a real
+  Android worker is blocked on a maintained llama-server Android build + the
+  Android process/service engine adapter. Battery probe is the prototype for
+  the mobile battery path; SoC thermal/NPU/foreground are not implemented.
+  Documented as a feasibility note, not a supported platform.
