@@ -3823,6 +3823,35 @@ async fn mcp_handler(
             None => serde_json::json!({ "sessions_active": 0, "sessions": [] }),
         };
     }
+    // A `get_quota` call projects the contribution-backed quota ledger
+    // (read-only, operator-level): real measured-work balances + policy.
+    if crate::mcp::quota_request(&raw) {
+        ctx.quota = match &state.compute {
+            Some(cm) => {
+                let policy_version = cm.contribution_policy().version;
+                let accounts: Vec<serde_json::Value> = cm
+                    .quota_accounts()
+                    .into_iter()
+                    .map(|(account, acc)| {
+                        serde_json::json!({
+                            "account": account,
+                            "earned": acc.earned,
+                            "available": acc.available,
+                            "reserved": acc.reserved,
+                            "consumed": acc.consumed,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "accounts": accounts,
+                    "total_earned": accounts.iter().map(|a| a["earned"].as_u64().unwrap_or(0)).sum::<u64>(),
+                    "total_consumed": accounts.iter().map(|a| a["consumed"].as_u64().unwrap_or(0)).sum::<u64>(),
+                    "policy_version": policy_version,
+                })
+            }
+            None => serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
+        };
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -3935,6 +3964,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         decision: serde_json::json!({ "request": "", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
         execution: serde_json::json!({}),
         sessions: serde_json::json!({ "sessions_active": 0, "sessions": [] }),
+        quota: serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
     }
 }
 

@@ -75,6 +75,11 @@ pub struct McpContext {
     /// (which worker holds each session's KV prefix). Precomputed by the HTTP
     /// layer; the protocol layer only translates.
     pub sessions: Value,
+    /// Result of `get_quota`: contribution-backed quota accounting
+    /// (per-account earned/available/reserved/consumed, totals, policy
+    /// version). Precomputed by the HTTP layer from the live quota ledger;
+    /// the protocol layer only translates. Read-only.
+    pub quota: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -104,6 +109,11 @@ fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "list_executions",
             description: "Recent autonomous execution decisions: which worker ran what, the planner's reasoning (network/KV/capability), and the outcome.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "get_quota",
+            description: "Contribution-backed quota accounting: per-account earned/available/reserved/consumed quota (keyed by worker peer), totals, and the active contribution-to-quota policy version. Read-only; every figure is real measured work converted under the versioned policy. UNKNOWN measurements are never fabricated.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
@@ -510,6 +520,21 @@ pub fn sessions_request(raw: &str) -> bool {
         == Some("list_sessions")
 }
 
+/// Whether the incoming message is a `get_quota` tool call. Pure — lets the
+/// HTTP layer precompute the quota ledger snapshot into [`McpContext::quota`].
+pub fn quota_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_quota")
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -664,6 +689,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "decide" => &ctx.decision,
         "execute_decision" => &ctx.execution,
         "list_sessions" => &ctx.sessions,
+        "get_quota" => &ctx.quota,
         _ => return None,
     };
     Some(json!({
@@ -702,6 +728,7 @@ mod tests {
             decision: json!({ "request": "ocr", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
             execution: json!({}),
             sessions: json!({ "sessions_active": 0, "sessions": [] }),
+            quota: json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": 1 }),
         }
     }
 
@@ -1191,5 +1218,29 @@ mod tests {
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"sessions_active\":0"));
         assert!(content.contains("\"sessions\":[]"));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_quota() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "get_quota"));
+    }
+
+    #[test]
+    fn quota_request_matches_only_the_tool() {
+        assert!(quota_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#
+        ));
+        assert!(!quota_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
+        assert!(!quota_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#));
+    }
+
+    #[test]
+    fn get_quota_returns_precomputed_snapshot() {
+        let r = call(r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"total_earned\":0"));
+        assert!(content.contains("\"policy_version\":1"));
     }
 }

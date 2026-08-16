@@ -1708,6 +1708,10 @@ consumer API keys yet, no dashboard quota UI yet.
 - [x] **Observability** — `/v1/compute` surfaces `quota` (per-account
   earned/available/reserved/consumed, totals, active policy version) alongside
   workers/contributions. Real measured state only.
+- [x] **MCP `get_quota` tool** — read-only projection of the quota ledger for
+  external agents (per-account balances, totals, policy version). Same
+  master-gated boundary as the other MCP tools; no quota mutation surface.
 - [x] Tests: quota ledger lifecycle (reserve/settle/release/partial/duplicate/
   insufficient/audit/policy-version), ComputeManager wiring (credited work earns
-  quota, duplicates don't, failures don't, policy replaceable + versioned).
+  quota, duplicates don't, failures don't, policy replaceable + versioned), and
+  MCP `get_quota` exposure.
