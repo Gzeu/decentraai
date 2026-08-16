@@ -1305,6 +1305,36 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         // P1: sign outbound requests so workers can authenticate them.
         self.sign_request(&mut request);
+        self.route_request_streamed_inner(request, progress, None).await
+    }
+
+    /// Like [`route_request_streamed`](Self::route_request_streamed) but prefers
+    /// the given worker on the first attempt (Next-Gen batch pinning): it
+    /// reserves exactly `preferred` when still eligible (via
+    /// `plan_and_reserve_on`), otherwise falls back to normal planning. Uses
+    /// the streamed send path, which completes reliably over real LANs even
+    /// under high latency.
+    pub async fn route_request_streamed_on(
+        &self,
+        preferred: &libp2p::PeerId,
+        mut request: InferRequest,
+        progress: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
+        self.route_request_streamed_inner(request, progress, Some(preferred)).await
+    }
+
+    /// Shared streamed-routing logic. `preferred` (optional) pins the first
+    /// attempt to a batch-allocated worker; retries re-plan freely.
+    async fn route_request_streamed_inner(
+        &self,
+        mut request: InferRequest,
+        progress: tokio::sync::mpsc::UnboundedSender<String>,
+        preferred: Option<&libp2p::PeerId>,
+    ) -> Result<InferResponse, DistributedError> {
+        // P1: sign outbound requests so workers can authenticate them.
+        self.sign_request(&mut request);
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
@@ -1321,9 +1351,29 @@ impl DistributedInference {
                         request.stream,
                     )
                     .await;
-                if let Some((plan, placement)) = compute
-                    .plan_and_reserve(&req, prompt_tokens, request.session_id.as_deref(), request.priority)
-                    .await
+                if let Some((plan, placement)) = match preferred {
+                    Some(p) => {
+                        compute
+                            .plan_and_reserve_on(
+                                p,
+                                &req,
+                                prompt_tokens,
+                                request.session_id.as_deref(),
+                                request.priority,
+                            )
+                            .await
+                    }
+                    None => {
+                        compute
+                            .plan_and_reserve(
+                                &req,
+                                prompt_tokens,
+                                request.session_id.as_deref(),
+                                request.priority,
+                            )
+                            .await
+                    }
+                }
                 {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
@@ -1573,10 +1623,18 @@ impl DistributedInference {
             // eligible in the allocation); otherwise route normally.
             let allocated = assignments.get(&request_id).filter(|w| !w.is_empty());
             let preferred: Option<libp2p::PeerId> = allocated.and_then(|w| w.parse().ok());
+            // Use the streamed send path (drops progress): over a real LAN the
+            // streaming request/response completes reliably even under high
+            // latency, whereas the non-streamed send can time out waiting for a
+            // buffered final response. Matches the proven chat-remote path.
+            let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let mut req = request.clone();
+            req = req.with_streaming(true);
             let result = match preferred {
-                Some(p) => self.route_request_on(&p, request.clone()).await,
-                None => self.route_request(request.clone()).await,
+                Some(p) => self.route_request_streamed_on(&p, req, progress_tx).await,
+                None => self.route_request_streamed(req, progress_tx).await,
             };
+            let _ = progress_rx; // drained; output carried in the response
             let worker = match &result {
                 Ok(r) => r.worker_peer_id.to_string(),
                 Err(_) => String::new(),

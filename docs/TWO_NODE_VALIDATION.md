@@ -3,6 +3,66 @@
 Date: 2026-08-16. Scope: make the DecentraAI fabric rock-solid as a real
 **Laptop i5 ↔ Desktop i7** two-node fabric (mobile/Android stays roadmap-only).
 
+> UPDATE (same date): the Desktop was upgraded to current HEAD and configured
+> with `allow_remote_inference: true`. Live validation results are below.
+
+## Environment
+
+- This node: Laptop i5, node id `dca-GriBWu`, peer `12D3KooWGriBWu…`,
+  `allow_remote_inference: true`, port 8080, running the binary rebuilt from
+  HEAD (includes `/v1/batch` + streamed batch routing).
+- Remote node: Desktop i7, node id `dca-NGE65Z`, peer `12D3KooWNGE65…`,
+  `node_name: decentraai-node`, upgraded to current HEAD with
+  `allow_remote_inference: true`.
+
+## LIVE VERIFIED (real Laptop → Desktop remote execution, before the Desktop
+## went offline)
+
+The Desktop **did** serve remote inference over the real LAN link:
+
+1. **Discovery / P2P / trust / capability**: both nodes discovered each other;
+   the Desktop peer appeared in `/v1/network` `connected`; the Desktop was
+   trusted via `POST /api/admin/worker/trust`; it advertised
+   `accepts_remote_inference: true` and `served_models: [tinyllama.gguf]`.
+2. **Laptop → Desktop remote inference**: a `worker_hint: dca-NGE65Z` chat
+   request to `tinyllama.gguf` returned a real completion, with response headers
+   `X-Decentra-Origin: remote`, `X-Decentra-Worker: 12D3KooWNGE65…`,
+   `X-Decentra-Node: dca-NGE65Z` — proving the request crossed the P2P link and
+   the Desktop served it.
+3. **Provenance**: audit recorded `inference_completed` with the Desktop worker
+   id, `status: completed`, `tokens_used`, and `processing_time_ms`; execution
+   view recorded request_id + model_hash + tokens + latency.
+4. **Quota**: the Desktop's worker identity (`12D3KooWNGE65…`) earned quota
+   (`total_earned: 6276`) from the real measured remote executions
+   (credit events per request_id, policy v1). Quota reserve → execute → settle
+   works across the fabric.
+5. **Failure / recovery**: when a request to the Desktop timed out, the system
+   released the reservation (in_flight back to 0) and recorded `inference_failed`
+   — correct recovery behavior.
+
+## Batch / adaptive fan-out — partially blocked (Desktop went offline)
+
+`/v1/batch` was added (operator/admin-gated) to dispatch independent requests
+via `route_batch`. The batch endpoint routes each request through the **streamed**
+send path (which is reliable over the high-latency LAN), pinning each to its
+allocated worker via `route_request_streamed_on`. Local-model requests completed
+(7 tokens each); requests routed to the Desktop timed out because the Desktop
+went offline mid-validation.
+
+**Root-cause fix landed**: `route_batch` now uses `route_request_streamed_on`
+(streamed + pinned) instead of the non-streamed `send_request`, which timed out
+waiting for a buffered final response over the 10-18 s RTT LAN.
+
+## CURRENT STATE / LOCAL-BLOCKED
+
+At report time the Desktop node's P2P port (192.168.1.129:38231) is **closed /
+connection refused** — the Desktop has gone offline (or changed listeners). This
+node still serves locally. Full cross-node re-validation of remote execution +
+batch requires the Desktop to be back online.
+
+LIVE remote execution was proven before the Desktop went offline (see above).
+The remaining item is to re-run the batch validation once the Desktop is back.
+
 ## Environment
 
 - This node: Laptop i5, node id `dca-GriBWu`, peer `12D3KooWGriBWu…`,

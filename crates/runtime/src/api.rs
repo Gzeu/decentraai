@@ -3834,6 +3834,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/models/{id}", get(model_detail_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
+        .route("/v1/batch", post(batch_handler))
         // P3 - Admin dashboard endpoints
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
@@ -5798,6 +5799,98 @@ async fn proxy_handler(
         Err(e) => return e.into_response(),
     };
     proxy_with_auth(State(state), method, uri, headers, body, auth).await
+}
+
+/// `POST /v1/batch` — dispatch a set of **independent** requests across the
+/// fabric using the adaptive batch allocator (`route_batch`), returning
+/// per-request provenance (request_id, chosen worker, result, tokens).
+///
+/// Body: `{ "requests": [ { "id": "...", "model": "file.gguf",
+/// "prompt": "...", "max_tokens": N }, ... ] }`. Each request is pinned to
+/// its allocated worker on the first attempt (exact worker pinning), falling
+/// back to normal planning if that worker is no longer eligible.
+///
+/// This is the operational surface for the adaptive fan-out of independent
+/// requests across the Laptop + Desktop fabric. Operator/admin gated.
+async fn batch_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(distributed) = state.distributed.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\":{\"message\":\"fabric router unavailable\",\"type\":\"server_error\"}}".to_string(),
+        )
+            .into_response();
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let items = match req.get("requests").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return forbidden("missing or empty requests array"),
+    };
+    let sender = distributed.p2p_node().local_peer_id();
+    let mut requests: Vec<(String, decentraai_distributed::InferRequest)> = Vec::new();
+    for item in items {
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let model = item.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = item.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() || model.is_empty() || prompt.is_empty() {
+            return forbidden("each request needs id, model, prompt");
+        }
+        let Some(model_hash) = resolve_model_hash(&state, model).await else {
+            return forbidden(&format!("model '{model}' has no advertised hash on the fabric"));
+        };
+        let max_tokens = item
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64)
+            .min(4096) as u32;
+        let mut ir = decentraai_distributed::InferRequest::new(model_hash, prompt.to_string(), max_tokens)
+            .with_sender(sender)
+            .with_streaming(false);
+        ir.timeout_ms = 120_000;
+        if let Some(sid) = item.get("session_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            ir = ir.with_session(sid.to_string());
+        }
+        requests.push((id.to_string(), ir));
+    }
+    let outcomes = distributed.route_batch(requests).await;
+    let results: Vec<serde_json::Value> = outcomes
+        .into_iter()
+        .map(|o| {
+            let (ok, worker, tokens, ms, err) = match &o.result {
+                Ok(r) => (
+                    true,
+                    r.worker_peer_id.to_string(),
+                    r.tokens_used,
+                    r.processing_time_ms,
+                    String::new(),
+                ),
+                Err(e) => (false, o.worker.clone(), 0, 0, e.to_string()),
+            };
+            serde_json::json!({
+                "request_id": o.request_id,
+                "worker": worker,
+                "ok": ok,
+                "tokens_used": tokens,
+                "processing_time_ms": ms,
+                "error": if err.is_empty() { serde_json::Value::Null } else { serde_json::json!(err) },
+            })
+        })
+        .collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "requests": results }).to_string(),
+    )
+        .into_response()
 }
 
 /// The actual proxy logic. Auth is passed in so callers that already
