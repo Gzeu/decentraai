@@ -1924,3 +1924,30 @@ factors. Advisory; real values only.
   node's adaptive share (normalized from its real `adaptive_contribution`),
   sorted largest-first, with a percentage bar. Absent adaptive_contribution →
   nothing rendered (never fabricated). Marked advisory.
+
+## 91. Next-Gen — Live two-node fabric validation (Laptop i5 ↔ Desktop i7)
+
+Mobile/Android stays roadmap-only. Primary target: a rock-solid real two-node
+fabric. Live validation performed against the actual environment (see
+`docs/TWO_NODE_VALIDATION.md`).
+
+- [x] **Exact worker pinning wired** (`plan_and_reserve_on`, `route_request_on`,
+  `route_batch` pinning) — see §89; the LOCAL-BLOCKED gap is closed.
+- [x] **Live discovery verified** — this node restarted with the current binary;
+  both workers appear in `/v1/compute` and the Desktop peer is `connected` in
+  `/v1/network` (real LAN P2P connection, 192.168.1.132).
+- [x] **Live local inference verified** — `/v1/chat/completions` returns a real
+  completion.
+- [x] **Live version-mismatch scenario proven** — the Desktop node
+  (`dca-NGE65Z`) advertises `accepts_remote_inference: false` because it runs an
+  older binary (built 2026-08-15, predating the advertisement field); it
+  deserializes to the conservative default `false`. The coordinator honestly
+  rejects routing to it ("does not accept remote inference") rather than
+  sending work to a worker that did not opt in.
+- [x] **LOCAL-BLOCKED — live remote execution** (documented honestly): full
+  end-to-end remote execution across the two nodes was not completed this
+  session because the Desktop needs a current binary (manual/remote step) and
+  live requests were served locally (local models win). Distributed execution
+  is otherwise covered by the loopback E2E two-node tests. Required to close:
+  upgrade the Desktop binary + a model served by only one node / a forced
+  remote route.
