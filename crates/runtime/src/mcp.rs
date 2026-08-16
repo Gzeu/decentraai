@@ -71,6 +71,10 @@ pub struct McpContext {
     /// Result of `execute_decision`: a confirmed decide→reserve→execute run.
     /// MUTATING — requires explicit `confirm: true`; the HTTP layer enforces it.
     pub execution: Value,
+    /// Result of `list_sessions`: coordinator-tracked KV/session residency
+    /// (which worker holds each session's KV prefix). Precomputed by the HTTP
+    /// layer; the protocol layer only translates.
+    pub sessions: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -252,6 +256,11 @@ fn all_tools() -> Vec<ToolDef> {
                 "required": ["intent", "prompt", "confirm"],
                 "additionalProperties": false,
             }),
+        },
+        ToolDef {
+            name: "list_sessions",
+            description: "Coordinator-tracked KV/session residency (KV locality): which worker currently holds each session's KV prefix, the model, accounted tokens used, capacity, and KV headroom. Read-only; real accounted state (empty when no sessions/compute). Useful to know why a continuation would be steered to a specific worker.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
     ]
 }
@@ -483,6 +492,21 @@ pub fn execution_request(raw: &str) -> Option<serde_json::Value> {
     Some(args)
 }
 
+/// Whether the incoming message is a `list_sessions` tool call. Pure — lets the
+/// HTTP layer precompute the session snapshot into [`McpContext::sessions`].
+pub fn sessions_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("list_sessions")
+}
+
 /// Pure, deterministic intent → capability → local-model resolution.
 ///
 /// (1) Maps the intent to capabilities via
@@ -636,6 +660,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_fabric_graph" => &ctx.fabric_graph,
         "decide" => &ctx.decision,
         "execute_decision" => &ctx.execution,
+        "list_sessions" => &ctx.sessions,
         _ => return None,
     };
     Some(json!({
@@ -673,6 +698,7 @@ mod tests {
             fabric_graph: json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": { "sessions_active": 0 } }),
             decision: json!({ "request": "ocr", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
             execution: json!({}),
+            sessions: json!({ "sessions_active": 0, "sessions": [] }),
         }
     }
 
@@ -1127,5 +1153,29 @@ mod tests {
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"status\":422"));
         assert!(content.contains("no runnable decision"));
+    }
+
+    #[test]
+    fn tools_list_exposes_list_sessions() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "list_sessions"));
+    }
+
+    #[test]
+    fn sessions_request_matches_only_the_tool() {
+        assert!(sessions_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}"#
+        ));
+        assert!(!sessions_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
+        assert!(!sessions_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#));
+    }
+
+    #[test]
+    fn list_sessions_returns_precomputed_snapshot() {
+        let r = call(r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}"#);
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("\"sessions_active\":0"));
+        assert!(content.contains("\"sessions\":[]"));
     }
 }

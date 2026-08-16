@@ -1387,3 +1387,13 @@ without executing.
   (— when unknown), and a KV-headroom badge (ok / near-capacity warn / UNKNOWN
   faint when null). Empty → "no active sessions"; wired into the 3s refresh.
   Nothing fabricated.
+
+## 58. Next-Gen — MCP list_sessions tool
+
+- [x] `list_sessions` read-only MCP tool: exposes the coordinator-tracked
+  KV/session residency (worker + model + tokens + capacity + KV headroom) to
+  external agents, so they can see why a continuation would be steered to a
+  specific worker. Precomputed by the HTTP layer (same `sessions()` snapshot as
+  `/v1/sessions`); pure `sessions_request` extractor + dispatch.
+- [x] Tests: tool listed, extractor matches only the tool, precomputed snapshot
+  returned unchanged.

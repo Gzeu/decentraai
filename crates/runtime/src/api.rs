@@ -3699,6 +3699,14 @@ async fn mcp_handler(
             "body": payload,
         });
     }
+    // A `list_sessions` call projects the coordinator-tracked KV/session
+    // residency (read-only, operator-level).
+    if crate::mcp::sessions_request(&raw) {
+        ctx.sessions = match &state.compute {
+            Some(cm) => cm.sessions(),
+            None => serde_json::json!({ "sessions_active": 0, "sessions": [] }),
+        };
+    }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
     (
@@ -3810,6 +3818,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         fabric_graph: serde_json::json!({ "nodes": [], "models": [], "capabilities": [], "executions": [], "network": [], "kv": {} }),
         decision: serde_json::json!({ "request": "", "capabilities": [], "decision": null, "why": [], "historical": { "records": 0 } }),
         execution: serde_json::json!({}),
+        sessions: serde_json::json!({ "sessions_active": 0, "sessions": [] }),
     }
 }
 
