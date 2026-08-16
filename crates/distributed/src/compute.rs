@@ -2490,6 +2490,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_and_reserve_on_falls_back_when_preferred_does_not_serve_the_model() {
+        // Pinning must never reserve a worker that cannot serve the requested
+        // model: `reserve_worker` rejects it, so `plan_and_reserve_on` falls
+        // back to normal planning rather than pinning to an incompatible one.
+        let local = peer();
+        let incompatible = peer();
+        let compatible = peer();
+        let manager = ComputeManager::new(
+            local,
+            "c".into(),
+            HashSet::from([incompatible, compatible]),
+        );
+        // `incompatible` advertises a DIFFERENT model hash than the request.
+        let other_model = ServedModel {
+            model_hash: "xyz".into(),
+            ..model()
+        };
+        manager
+            .process_advertisement(build_advertisement(
+                incompatible, "w-incompat", ENGINE_LLAMA_SERVER, snapshot(), gpu(),
+                vec![other_model], false, true, 0, LivePerf::default(),
+            ))
+            .await;
+        manager
+            .process_advertisement(build_advertisement(
+                compatible, "w-compat", ENGINE_LLAMA_SERVER, snapshot(), gpu(),
+                vec![model()], false, true, 0, LivePerf::default(),
+            ))
+            .await;
+        manager.record_rtt(&incompatible, 2_000, 1_000);
+        manager.record_rtt(&compatible, 2_000, 1_000);
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+
+        let (_, placement) = manager
+            .plan_and_reserve_on(&incompatible, &req, 200, None, 0)
+            .await
+            .expect("falls back to an eligible worker");
+        assert_ne!(
+            placement.worker, incompatible,
+            "never pins to a worker that does not serve the requested model"
+        );
+        assert_eq!(placement.worker, compatible);
+    }
+
+    #[tokio::test]
     async fn plan_preview_plans_without_reserving() {
         // DRY-RUN: plan_preview builds the same plan the coordinator would use
         // but must NOT hold any reservation (in_flight stays 0).

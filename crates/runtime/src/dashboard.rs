@@ -540,6 +540,17 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <table><thead><tr><th>Req</th><th>Worker</th><th class="num">Score</th><th class="num">Stages</th><th>Cont</th><th class="num">RTT</th><th>KV</th><th>Usage</th><th>Outcome</th><th>Reasoning</th></tr></thead>
           <tbody id="execution"><tr><td colspan="10" class="empty">no executions yet</td></tr></tbody></table>
         </div>
+        <!-- REMOTE EXECUTION: real fabric-routed executions only. A row is
+             shown when the planner selected a worker whose peer id differs from
+             this node's own peer id; the worker field, status, tokens and time
+             are rendered verbatim, and anything the worker did not report shows
+             an honest "—". Never invented. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Remote execution <span class="count" id="remote-exec-count"></span></h2>
+          <table><thead><tr><th>Req</th><th>Remote worker</th><th>Status</th><th class="num">Tokens</th><th class="num">Time</th></tr></thead>
+          <tbody id="remote-exec"><tr><td colspan="5" class="empty">no remote executions yet</td></tr></tbody></table>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:6px">Only executions routed to a worker other than this node. Fields the worker did not report render as &mdash;.</p>
+        </div>
         <!-- SESSIONS (KV locality): real coordinator-tracked KV/session
              residency from /v1/sessions — which worker holds each
              conversation's KV prefix (and why continuations are steered
@@ -1902,6 +1913,28 @@ function renderExecutions(x){
   }).join('');
   $('execution').innerHTML = rows || '<tr><td colspan="10" class="empty">no executions yet</td></tr>';
   $('exec-count').textContent = (x && x.executions || []).length;
+}
+// Remote execution: honest fabric view. A request counts as remote only when
+// the planner picked a worker whose peer id differs from this node's own peer
+// id (`localPeer`, e.g. from /v1/compute's local_peer). Every displayed value
+// comes straight from the /v1/execution record; a field the worker did not
+// report (empty/missing) renders as "—", never a made-up number.
+function renderRemoteExec(x, localPeer){
+  const lp = localPeer || 'local';
+  const ex = (x && x.executions || [])
+    .filter(e => e.selected_worker && e.selected_worker !== lp)
+    .slice(0, 14);
+  const rows = ex.map(e => {
+    const status = (e.outcome !== undefined && e.outcome !== null && e.outcome !== '')
+      ? outcomeBadge(e.outcome) : '<span class="badge faint">—</span>';
+    const tokens = (e.tokens_used !== undefined && e.tokens_used !== null)
+      ? e.tokens_used : '—';
+    const time = (e.processing_time_ms !== undefined && e.processing_time_ms !== null)
+      ? e.processing_time_ms + 'ms' : '—';
+    return '<tr><td><code>'+short(e.request_id, 8)+'</code></td><td><code>'+short(e.selected_worker, 12)+'</code></td><td>'+status+'</td><td class="num">'+tokens+'</td><td class="num">'+time+'</td></tr>';
+  }).join('');
+  $('remote-exec').innerHTML = rows || '<tr><td colspan="5" class="empty">no remote executions yet</td></tr>';
+  $('remote-exec-count').textContent = ex.length;
 }
 function outcomeBadge(o){
   if (o === 'succeeded') return '<span class="badge ok">succeeded</span>';
@@ -3278,7 +3311,7 @@ async function refresh(){
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
-  try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); } catch (e) {}
+  try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); renderRemoteExec(x, (c && c.local_peer) || stageData.localPeer); } catch (e) {}
   try { await renderSessions(); } catch (e) {}
   try { const rr = await (await fetch('/v1/resources', { headers })).json(); renderResources(rr); } catch (e) {}
   try { const fg = await (await fetch('/v1/fabric', { headers })).json(); renderFabricGraph(fg); } catch (e) {}
