@@ -315,7 +315,9 @@ enum Command {
     },
     Dial {
         addr: Multiaddr,
-        reply: oneshot::Sender<Result<()>>,
+        /// Optional oneshot for a synchronous dial result; `None` for
+        /// best-effort periodic dials (the caller does not await the outcome).
+        reply: Option<oneshot::Sender<Result<()>>>,
     },
     Request {
         peer: PeerId,
@@ -562,6 +564,26 @@ impl P2PNode {
         // A second sender used only by the reconnect tasks spawned on peer
         // disconnects, so redial attempts don't block the event loop.
         let reconnect_sender = commands.clone();
+        // Periodic bootstrap re-dial: a peer that was offline when the node
+        // started (or that left the fabric and returned on a changed subnet)
+        // is re-dialed on an interval, so the fabric reconnects WITHOUT a node
+        // restart. Best-effort — dial failures are logged at debug and never
+        // affect the node. The swarm itself is moved into the main loop below;
+        // this task only enqueues Dial commands through the channel.
+        let bootstrap_repeat = bootstrap.clone();
+        let bootstrap_sender = commands.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                for (peer, addr) in &bootstrap_repeat {
+                    let dial_addr = addr.clone().with(Protocol::P2p(*peer));
+                    if bootstrap_sender.send(Command::Dial { addr: dial_addr, reply: None }).is_err() {
+                        debug!(%peer, "bootstrap re-dial enqueue failed (swarm stopped)");
+                    }
+                }
+            }
+        });
         // Shared on_infer callback storage for runtime registration
         let on_infer: SharedHandler<InferHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_infer_clone = on_infer.clone();
@@ -605,7 +627,9 @@ impl P2PNode {
                             }
                             Command::Dial { addr, reply } => {
                                 let res = swarm.dial(addr).map_err(Into::into);
-                                let _ = reply.send(res);
+                                if let Some(r) = reply {
+                                    let _ = r.send(res);
+                                }
                             }
                             Command::Request { peer, payload, reply } => {
                                 let id = swarm.behaviour_mut().messages.send_request(&peer, payload);
@@ -697,8 +721,7 @@ impl P2PNode {
                                 let sender = reconnect_sender.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(backoff).await;
-                                    let (reply, _) = oneshot::channel();
-                                    let _ = sender.send(Command::Dial { addr, reply });
+                                    let _ = sender.send(Command::Dial { addr, reply: None });
                                 });
                                 debug!(
                                     %peer_id,
@@ -947,7 +970,7 @@ impl P2PNode {
         self.commands
             .send(Command::Dial {
                 addr: addr.parse().context("invalid dial address")?,
-                reply,
+                reply: Some(reply),
             })
             .map_err(|_| anyhow::anyhow!("swarm task is not running"))?;
         rx.await.context("swarm task dropped the reply")?
