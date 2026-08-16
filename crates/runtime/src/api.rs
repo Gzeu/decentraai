@@ -5862,6 +5862,45 @@ async fn batch_handler(
         }
         requests.push((id.to_string(), ir));
     }
+    // DRY-RUN: show the deterministic adaptive batch allocation (which worker
+    // each independent request would be pinned to) WITHOUT executing anything.
+    // Honest preview from the live allocation; never sends a request or holds a
+    // reservation. Useful to understand the adaptive fan-out before running.
+    let dry_run = req.get("dry_run").and_then(|d| d.as_bool()).unwrap_or(false);
+    if dry_run {
+        let alloc = distributed.plan_batch(&requests).await;
+        let assignments: Vec<serde_json::Value> = alloc
+            .as_ref()
+            .map(|a| {
+                a.assignments
+                    .iter()
+                    .map(|x| {
+                        serde_json::json!({
+                            "request_id": x.request_id,
+                            "worker": x.worker,
+                            "eligible": x.eligible,
+                            "kv_pinned": x.kv_pinned,
+                            "share": x.share,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "dry_run": true,
+                "worker_shares": alloc
+                    .as_ref()
+                    .map(|a| a.worker_shares.clone())
+                    .unwrap_or_default(),
+                "requests": assignments,
+                "note": "allocation preview only — no request sent, no reservation held",
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
     let outcomes = distributed.route_batch(requests).await;
     let results: Vec<serde_json::Value> = outcomes
         .into_iter()

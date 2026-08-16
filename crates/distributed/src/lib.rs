@@ -1537,55 +1537,78 @@ impl DistributedInference {
         requests: &[(String, InferRequest)],
     ) -> Option<decentraai_fabric::BatchAllocation> {
         let compute = self.compute_manager.as_ref()?;
-        let Some((_, first)) = requests.first() else {
+        if requests.is_empty() {
             // Empty batch -> empty allocation (honest).
             return Some(decentraai_fabric::BatchAllocation {
                 assignments: Vec::new(),
                 worker_shares: std::collections::BTreeMap::new(),
             });
-        };
-        let model = first.model_hash.clone();
-        let facts = compute.fabric_facts(&model).await;
-
-        let mut allocs: Vec<(String, decentraai_fabric::RequestFacts)> = Vec::new();
-        for (request_id, req) in requests {
-            // Same-model check: a different model has no facts in this batch's
-            // set -> non-eligible (honest fail rather than misallocate).
-            let same_model = req.model_hash == model;
-            let is_continuation = same_model && req.session_id.is_some();
-            let prefix = if same_model {
-                req.session_id
-                    .as_deref()
-                    .and_then(|s| compute.session_residency(s))
-                    .map(|p| p.to_string())
-            } else {
-                None
-            };
-            allocs.push((
-                request_id.clone(),
-                decentraai_fabric::RequestFacts {
-                    model_hash: req.model_hash.clone(),
-                    est_ram_mb: 512,
-                    est_vram_mb: 0,
-                    context: decentraai_fabric::ContextProfile {
-                        prompt_tokens: prompt_token_estimate(&req.prompt),
-                        max_output_tokens: req.max_tokens,
-                        is_continuation,
-                        prefix_resident_on: prefix,
-                    },
-                    transfer_mib: 0,
-                    local_peer: Some(self.p2p_node.local_peer_id().to_string()),
-                    priority: req.priority,
-                    required_capability: None,
-                    capability_claims: Vec::new(),
-                },
-            ));
         }
-        Some(decentraai_fabric::allocate_batch(
-            &allocs,
-            &facts,
-            &decentraai_fabric::PlannerConfig::default(),
-        ))
+
+        // Build RequestFacts for every request, then allocate PER MODEL so a
+        // mixed-model batch is distributed correctly (each model's requests use
+        // the fabric facts for THAT model — a model served only by one node is
+        // never pinned to a worker that does not serve it). Deterministic: group
+        // by model hash, allocate each group with its own live facts, merge.
+        let mut by_model: std::collections::BTreeMap<String, Vec<(String, decentraai_fabric::RequestFacts)>> =
+            std::collections::BTreeMap::new();
+        for (request_id, req) in requests {
+            let is_continuation = req.session_id.is_some();
+            let prefix = req
+                .session_id
+                .as_deref()
+                .and_then(|s| compute.session_residency(s))
+                .map(|p| p.to_string());
+            by_model
+                .entry(req.model_hash.clone())
+                .or_default()
+                .push((
+                    request_id.clone(),
+                    decentraai_fabric::RequestFacts {
+                        model_hash: req.model_hash.clone(),
+                        est_ram_mb: 512,
+                        est_vram_mb: 0,
+                        context: decentraai_fabric::ContextProfile {
+                            prompt_tokens: prompt_token_estimate(&req.prompt),
+                            max_output_tokens: req.max_tokens,
+                            is_continuation,
+                            prefix_resident_on: prefix,
+                        },
+                        transfer_mib: 0,
+                        local_peer: Some(self.p2p_node.local_peer_id().to_string()),
+                        priority: req.priority,
+                        required_capability: None,
+                        capability_claims: Vec::new(),
+                    },
+                ));
+        }
+
+        let mut assignments = Vec::new();
+        let mut worker_shares: std::collections::BTreeMap<String, f64> =
+            std::collections::BTreeMap::new();
+        for (model, group) in by_model {
+            let facts = compute.fabric_facts(&model).await;
+            let alloc = decentraai_fabric::allocate_batch(
+                &group,
+                &facts,
+                &decentraai_fabric::PlannerConfig::default(),
+            );
+            assignments.extend(alloc.assignments);
+            for (peer, share) in alloc.worker_shares {
+                worker_shares.insert(peer, share);
+            }
+        }
+        // Preserve the caller's original request order.
+        let original: std::collections::HashMap<String, usize> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), i))
+            .collect();
+        assignments.sort_by_key(|a| original.get(&a.request_id).copied().unwrap_or(usize::MAX));
+        Some(decentraai_fabric::BatchAllocation {
+            assignments,
+            worker_shares,
+        })
     }
 
     /// Dispatches a batch of **independent** requests through the existing
