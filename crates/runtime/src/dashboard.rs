@@ -369,6 +369,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="diag"><span class="ic">✚</span><span>Diag</span></button>
     <button class="nav-item" data-view="security"><span class="ic">⚿</span><span>Security</span></button>
     <button class="nav-item" data-view="settings"><span class="ic">⚙</span><span>Settings</span></button>
+    <button class="nav-item" onclick="window.open('/admin','_blank')" title="Master-gated admin console (tokens, consumer keys, trust)"><span class="ic">🛡</span><span>Admin</span></button>
 
     <div class="rail-foot">
       <button id="adv-toggle" title="Show or hide the advanced fabric views">Show advanced</button>
@@ -776,6 +777,17 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <h2>Model Hub</h2>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <input id="hub-q" type="text" placeholder="search GGUF models on HuggingFace, e.g. Qwen" style="flex:1;min-width:220px;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg)">
+            <select id="hub-cap" style="padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg)">
+              <option value="">any capability</option>
+              <option value="chat">chat</option>
+              <option value="completion">completion</option>
+              <option value="coding">coding</option>
+              <option value="summarization">summarization</option>
+              <option value="vision">vision</option>
+              <option value="ocr">ocr</option>
+              <option value="embeddings">embeddings</option>
+              <option value="tool_calling">tool_calling</option>
+            </select>
             <button class="btn" id="hub-search-btn" onclick="hubSearch()">Search</button>
           </div>
            <div id="hub-status" style="margin-top:8px;font-size:12px;color:var(--muted)">search the Hub to discover models you can pull on this node</div>
@@ -982,37 +994,74 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
             <pre id="cfg-out" class="mono" style="margin-top:8px;padding:10px;background:rgba(0,0,0,.25);border-radius:8px;overflow:auto;font-size:11.5px;white-space:pre-wrap;word-break:break-all"></pre>
           </div>
         </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Consumer API keys <span class="count">dca_ · quota-bounded · master-gated</span></h2>
+          <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+            <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Account</div><input id="ck-account" placeholder="owner account" style="min-width:140px"></div>
+            <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Quota ceiling</div><input id="ck-ceiling" type="number" min="1" value="100" style="width:90px"></div>
+            <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Req/min</div><input id="ck-rate" type="number" min="1" value="10" style="width:80px"></div>
+            <button id="ck-create" class="primary">Create key</button>
+          </div>
+          <div id="ck-result" style="margin-top:10px;font-size:12px"></div>
+          <table style="margin-top:12px"><thead><tr><th>Key</th><th>Account</th><th class="num">Ceiling</th><th class="num">Rate</th><th class="num">Usage</th><th>Status</th><th></th></tr></thead>
+          <tbody id="ck-list"><tr><td colspan="7" class="empty">loading consumer keys&hellip;</td></tr></tbody></table>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:6px">Consumer keys are inference credentials with a per-key quota ceiling + rate limit. The plaintext is shown once; only its hash is stored. Never shown in list metadata.</p>
+        </div>
       </section>
 
       <!-- SETTINGS -->
       <section class="view" id="view-settings">
         <div class="grid cols-2">
           <div class="card">
-            <h2>Node</h2>
+            <h2>GENERAL · coordinator</h2>
             <table><tbody>
               <tr><td>Node name</td><td class="num" id="set-name">&mdash;</td></tr>
+              <tr><td>Node id / peer</td><td class="num" id="set-peer">&mdash;</td></tr>
+              <tr><td>Version</td><td class="num" id="set-version">&mdash;</td></tr>
+              <tr><td>Runtime</td><td class="num" id="set-runtime">&mdash;</td></tr>
               <tr><td>Dashboard port</td><td class="num" id="set-port">&mdash;</td></tr>
-              <tr><td>Discovery</td><td class="num" id="set-discovery">&mdash;</td></tr>
-              <tr><td>Trusted workers</td><td class="num" id="set-trust">&mdash;</td></tr>
-              <tr><td>Model / engine</td><td class="num" id="set-model">&mdash;</td></tr>
+              <tr><td>Uptime</td><td class="num" id="set-uptime">&mdash;</td></tr>
             </tbody></table>
           </div>
           <div class="card">
-            <h2>Resources (admission guards)</h2>
+            <h2>FABRIC · network &amp; discovery</h2>
             <table><tbody>
-              <tr><td>CPU</td><td class="num" id="set-cpu">&mdash;</td></tr>
-              <tr><td>RAM</td><td class="num" id="set-ram">&mdash;</td></tr>
-              <tr><td>GPU</td><td class="num" id="set-gpu">&mdash;</td></tr>
+              <tr><td>Discovery</td><td class="num" id="set-discovery">&mdash;</td></tr>
+              <tr><td>Trusted workers</td><td class="num" id="set-trust">&mdash;</td></tr>
+              <tr><td>Connected peers</td><td class="num" id="set-peers">&mdash;</td></tr>
+              <tr><td>Coordinator version</td><td class="num" id="set-coord-version">&mdash;</td></tr>
+              <tr><td>Model / engine</td><td class="num" id="set-model">&mdash;</td></tr>
             </tbody></table>
           </div>
         </div>
         <div class="grid cols-2" style="margin-top:14px">
           <div class="card">
-            <h2>Generation defaults</h2>
-            <div id="set-generation" class="empty">&mdash;</div>
+            <h2>INFERENCE · model &amp; remote</h2>
+            <table><tbody>
+              <tr><td>Backend</td><td class="num" id="set-backend">&mdash;</td></tr>
+              <tr><td>Remote inference</td><td class="num" id="set-remote">&mdash;</td></tr>
+              <tr><td>Engine respawns</td><td class="num" id="set-respawns">&mdash;</td></tr>
+            </tbody></table>
+            <div style="margin-top:10px"><h3 style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin:0 0 6px">Generation defaults</h3><div id="set-generation" class="empty">&mdash;</div></div>
           </div>
           <div class="card">
-            <h2>Tier policies</h2>
+            <h2>RESOURCES · admission guards</h2>
+            <table><tbody>
+              <tr><td>CPU</td><td class="num" id="set-cpu">&mdash;</td></tr>
+              <tr><td>RAM</td><td class="num" id="set-ram">&mdash;</td></tr>
+              <tr><td>GPU</td><td class="num" id="set-gpu">&mdash;</td></tr>
+              <tr><td>Disk free</td><td class="num" id="set-disk">&mdash;</td></tr>
+              <tr><td>Swap used</td><td class="num" id="set-swap">&mdash;</td></tr>
+            </tbody></table>
+          </div>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div class="card">
+            <h2>OBSERVABILITY · metrics</h2>
+            <div id="set-observability" class="empty">&mdash;</div>
+          </div>
+          <div class="card">
+            <h2>TIERS · policies</h2>
             <div id="set-tiers" class="empty">tiers disabled (admin-token-only)</div>
           </div>
         </div>
@@ -2740,8 +2789,10 @@ async function hubCompareFit(){
 async function hubSearch(){
   const q = ($('hub-q').value || '').trim();
   if (!q) { toast('type a model name to search', true); return; }
-  $('hub-status').innerHTML = 'searching HuggingFace for “'+esc(q)+'”…';
-  const { ok, status, j } = await apiFetch('/api/admin/hub/search?query='+encodeURIComponent(q)+'&limit=8', { headers });
+  const cap = ($('hub-cap') && $('hub-cap').value) || '';
+  $('hub-status').innerHTML = 'searching HuggingFace for “'+esc(q)+'”'+(cap?' (capability: '+esc(cap)+')':'')+'…';
+  const capParam = cap ? '&capability='+encodeURIComponent(cap) : '';
+  const { ok, status, j } = await apiFetch('/api/admin/hub/search?query='+encodeURIComponent(q)+'&limit=8'+capParam, { headers });
   if (!ok) {
     $('hub-status').innerHTML = '<span class="badge warn">search failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
     return;
@@ -2760,9 +2811,11 @@ async function hubSearch(){
 async function hubPull(id){
   if (hubPulling[id]) return;
   hubPulling[id] = true;
+  window.hubPullStart = Date.now();
   const btn = $('hub-pull-'+safeId(id));
   if (btn) { btn.disabled = true; btn.textContent = 'pulling…'; }
-  $('hub-status').innerHTML = 'downloading '+esc(id)+' — large models take a while; the node keeps serving';
+  const pullStarted = new Date().toLocaleTimeString();
+  $('hub-status').innerHTML = '<span class="loading"><span class="spinner"></span> downloading '+esc(id)+'</span> <span class="muted">(started '+pullStarted+'; large models take a while; the node keeps serving)</span>';
   const { ok, status, j } = await apiFetch('/api/admin/hub/pull', {
     method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ reference: 'hf:' + id }),
@@ -2770,11 +2823,13 @@ async function hubPull(id){
   if (!ok) {
     $('hub-status').innerHTML = '<span class="badge warn">pull failed (' + status + ')</span> ' + esc((j.error && j.error.message) || 'unknown error');
   } else {
-    $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.reference)+' — '+fmtMB(j.bytes / 1048576)+' · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh the page to see it in the registry';
+    const secs = ((Date.now() - (window.hubPullStart||Date.now())) / 1000).toFixed(0);
+    $('hub-status').innerHTML = '<span class="badge ok">pulled</span> '+esc(j.reference)+' — '+fmtMB(j.bytes / 1048576)+' in '+secs+'s · sha256 <code>'+esc(short(j.sha256, 16))+'</code> — refresh to see it in the registry';
     toast('model pulled: ' + short(j.reference, 24));
     refresh();
   }
   delete hubPulling[id];
+  window.hubPullStart = null;
   if (btn) { btn.disabled = false; btn.textContent = 'Pull'; }
 }
 function safeId(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
@@ -3243,11 +3298,40 @@ function renderWorkloadDist(nodes){
     '<div style="font-size:10px;color:var(--muted);margin-bottom:4px">how a batch of independent requests would be spread (from real adaptive_contribution)</div>'+
     row;
 }
-function renderSettings(s){
+function renderSettings(s, c, n){
   const r = (s && s.resources) || {};
+  const node = (s && s.node) || {};
+  // GENERAL · coordinator
+  $('set-name').textContent = node.name || (s && s.model) || '—';
+  $('set-peer').textContent = (c && c.local_peer) ? short(c.local_peer, 22) : '—';
+  $('set-version').textContent = (s && s.version) ? s.version : '1.0.0 (build)';
+  $('set-runtime').textContent = (node.engine || 'llama-server') + ' subprocess';
+  $('set-port').textContent = (s && s.api_port) || '—';
+  $('set-uptime').textContent = (s && s.uptime_secs != null) ? fmtUptime(s.uptime_secs) : '—';
+  // FABRIC · network & discovery
+  $('set-discovery').textContent = 'mDNS / LAN (auto)';
+  $('set-trust').textContent = (c && c.workers) ? (c.workers.filter(w => w.trusted).length + ' of ' + c.workers.length + ' trusted') : '—';
+  $('set-peers').textContent = (n && n.connected && n.connected.length) ? n.connected.length + ' connected' : '0 connected';
+  $('set-coord-version').textContent = (s && s.version) ? s.version : '—';
+  $('set-model').textContent = (s ? esc(s.model) : '—') + ' / ' + (node.engine || '—');
+  // INFERENCE
+  $('set-backend').textContent = (s && s.backend) ? esc(s.backend) : '—';
+  $('set-remote').innerHTML = (c && c.workers && c.workers.some(w => w.accepts_remote_inference))
+    ? '<span class="badge ok">enabled</span> remote opt-in present'
+    : '<span class="badge faint">local-only</span>';
+  $('set-respawns').textContent = (s && s.engine_respawns != null) ? s.engine_respawns : '—';
+  // RESOURCES
   $('set-cpu').textContent = (s && s.system && s.system.cpu_threads ? s.system.cpu_threads+' threads' : '—') + ' · reserve '+r.reserve_cpu_cores+' core(s)';
   $('set-ram').textContent = (s && s.system ? Math.round(s.system.ram_total_gib)+' GiB total' : '—') + ' · reserve '+(Math.round((r.reserve_ram_mb||0)/1024))+' GiB';
   $('set-gpu').textContent = (r.gpu_enabled || 'auto') + (r.gpu_max_vram_percent ? ' (vram cap '+r.gpu_max_vram_percent+'%)' : '') + (r.reserve_vram_mb ? ' · reserve '+Math.round((r.reserve_vram_mb||0)/1024)+' GiB' : '');
+  $('set-disk').textContent = (s && s.system && s.system.disk_free_gib != null) ? s.system.disk_free_gib.toFixed(1)+' GiB free' : '—';
+  $('set-swap').textContent = (s && s.system && s.system.used_swap_gib != null) ? s.system.used_swap_gib.toFixed(2)+' GiB used' : '—';
+  // OBSERVABILITY
+  $('set-observability').innerHTML =
+    '<div class="mono" style="font-size:12px;color:var(--muted)">'+
+    '<div>metrics: <a href="/metrics" target="_blank" style="color:var(--accent)">/metrics</a> <span class="badge faint pv">prometheus</span></div>'+
+    '<div style="margin-top:4px">served <b>'+((c&&c.totals&&c.totals.requests_completed)||0)+'</b> · failed <b>'+((c&&c.totals&&c.totals.requests_failed)||0)+'</b> · tokens <b>'+((c&&c.totals&&c.totals.tokens_total)||0)+'</b></div>'+
+    '</div>';
   const g = (s && s.generation) || {};
   if (g && g.temperature !== undefined) {
     $('set-generation').innerHTML = '<div class="mono" style="font-size:12px;color:var(--muted)">'+
@@ -3296,7 +3380,50 @@ function renderSecurity(){
   $('dev-endpoint').textContent = ep + '/v1';
   $('dev-base-url').textContent = ep;
   buildCfg();
+  loadConsumerKeys();
 }
+// Consumer API keys (dca_): master-gated create/list/revoke, quota-bounded.
+async function loadConsumerKeys(){
+  try {
+    const r = await fetch('/api/admin/consumer-key/list', { headers });
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
+    const keys = (d && d.keys || []);
+    $('ck-list').innerHTML = keys.map(k => {
+      const status = k.revoked ? '<span class="badge bad">revoked</span>' : '<span class="badge ok">active</span>';
+      const q = k.account_quota || {};
+      return '<tr><td><code>'+esc(k.key_id)+'</code></td><td>'+esc(k.account)+'</td><td class="num">'+k.quota_ceiling+'</td><td class="num">'+k.rate_limit_per_minute+'/min</td>'+
+        '<td class="num">'+k.requests+' req · '+k.tokens_generated+' tok</td><td>'+status+'</td>'+
+        '<td>'+(k.revoked ? '' : '<button class="danger" data-id="'+esc(k.key_id)+'" onclick="revokeConsumerKey(event)">Revoke</button>')+'</td></tr>';
+    }).join('') || '<tr><td colspan="7" class="empty">no consumer API keys</td></tr>';
+  } catch (e) {
+    $('ck-list').innerHTML = '<tr><td colspan="7" class="empty">master token required (admin endpoints are gated)</td></tr>';
+  }
+}
+async function createConsumerKey(){
+  const account = ($('ck-account').value || '').trim();
+  const ceiling = parseInt($('ck-ceiling').value, 10);
+  const rate = parseInt($('ck-rate').value, 10);
+  if (!account) { toast('enter an owner account', true); return; }
+  if (!(ceiling > 0)) { toast('quota ceiling must be > 0', true); return; }
+  if (!(rate > 0)) { toast('rate limit must be > 0', true); return; }
+  $('ck-result').innerHTML = '<span class="loading"><span class="spinner"></span> creating…</span>';
+  try {
+    const r = await fetch('/api/admin/consumer-key/create', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ account, quota_ceiling: ceiling, rate_limit_per_minute: rate }) });
+    const d = await r.json();
+    if (!r.ok) { $('ck-result').innerHTML = '<span class="badge warn">' + esc((d.error && d.error.message) || ('failed (' + r.status + ')')) + '</span>'; return; }
+    $('ck-result').innerHTML = '<span class="badge ok">created</span> <code>'+esc(d.token)+'</code> <span class="muted">(shown once)</span>';
+    toast('consumer key created for ' + short(account, 20));
+    loadConsumerKeys();
+  } catch (e) { $('ck-result').innerHTML = '<span class="badge warn">create failed</span>'; }
+}
+async function revokeConsumerKey(ev){
+  const id = ev.target.dataset.id;
+  const r = await fetch('/api/admin/consumer-key/revoke', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ key_id: id }) });
+  const d = await r.json().catch(()=>({}));
+  if (r.ok) { toast('consumer key revoked'); loadConsumerKeys(); } else { toast((d.error&&d.error.message)||'revoke failed', true); }
+}
+$('ck-create').addEventListener('click', createConsumerKey);
 window.copyDev = id => {
   const el = $(id);
   const txt = el && (el.textContent || el.innerText || '').trim();
@@ -3450,7 +3577,6 @@ async function refresh(){
     populateChatModels(s, c);
     renderModels(s, c);
     renderDiag(s, null, null);
-    renderSettings(s);
     renderObservability(s, null);
     renderRecovery(s, null, null);
   }
@@ -3464,6 +3590,7 @@ async function refresh(){
   renderFabric(s, c, n, x);
   if (s) renderDiag(s, c, n);
   if (s) renderRecovery(s, c, x);
+  if (s) renderSettings(s, c, n);
   loadCapOverview();
   // Security view must load on page load / refresh too (not only after a token
   // action); guarded by the API returning 401 -> "master token required".
