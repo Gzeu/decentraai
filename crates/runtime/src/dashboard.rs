@@ -599,6 +599,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
           <h2>Decision <span class="count">what should I run? · fabric-wide</span></h2>
           <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <input id="dec-intent" class="mono" placeholder="I need OCR and summarization" style="min-width:260px;padding:4px 6px;font-size:12px">
+            <input id="dec-cap" class="mono" placeholder="capability (optional — e.g. ocr; alternative to intent)" style="min-width:220px;padding:4px 6px;font-size:12px">
             <select id="dec-ev" class="mono" style="font-size:11px;padding:4px 4px">
               <option value="any">evidence: any</option>
               <option value="verified">evidence: verified</option>
@@ -2115,6 +2116,7 @@ async function decideNow(){
 // a genuine confirm() dialog, matching the backend's confirm:true requirement.
 async function executeDecision(){
   const intent = ($('dec-intent').value || '').trim();
+  const cap = ($('dec-cap').value || '').trim();
   const prompt = ($('dec-prompt').value || '').trim();
   const ev = ($('dec-ev')||{}).value || 'any';
   const maxRaw = $('dec-max').value || '256';
@@ -2122,16 +2124,17 @@ async function executeDecision(){
   const stream = !!($('dec-stream')||{}).checked;
   const model = ($('dec-model').value || '').trim();
   const sessionId = ($('dec-session').value || '').trim();
-  if (!intent) { toast('enter an intent to execute', true); return; }
+  if (!intent && !cap) { toast('enter an intent (or capability) to execute', true); return; }
   if (!prompt) { toast('enter a prompt to execute', true); return; }
   const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
   if (!confirm('Run this on the fabric? This reserves a worker and runs real inference.')) return;
-  const body = { intent, prompt, max_tokens: mt, stream, evidence: ev, confirm: true };
+  const body = { prompt, max_tokens: mt, stream, evidence: ev, confirm: true };
+  if (intent) body.intent = intent; else if (cap) body.capability = cap;
   if (model) body.model = model;
   if (sessionId) body.session_id = sessionId;
   const con = $('dec-exec');
   if (!con) return;
-  con.innerHTML = '<span class="badge ok">EXECUTING…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';
+  con.innerHTML = '<span class="badge ok">EXECUTING…</span> <span class="mono" style="color:var(--faint)">'+esc(intent || cap)+'</span>';
   const authHeaders = Object.assign({}, headers, { 'Content-Type': 'application/json' });
 
   if (stream) {
@@ -2210,21 +2213,23 @@ async function executeDecision(){
 // `would_execute`; never fabricates worker/plan/estimates.
 async function previewDecision(){
   const intent = ($('dec-intent').value || '').trim();
+  const cap = ($('dec-cap').value || '').trim();
   const prompt = ($('dec-prompt').value || '').trim();
   const ev = ($('dec-ev')||{}).value || 'any';
   const maxRaw = $('dec-max').value || '256';
   const maxTokens = parseInt(maxRaw, 10);
   const model = ($('dec-model').value || '').trim();
   const sessionId = ($('dec-session').value || '').trim();
-  if (!intent) { toast('enter an intent to preview', true); return; }
+  if (!intent && !cap) { toast('enter an intent (or capability) to preview', true); return; }
   if (!prompt) { toast('enter a prompt to preview', true); return; }
   const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
-  const body = { intent, prompt, max_tokens: mt, evidence: ev, dry_run: true, confirm: true };
+  const body = { prompt, max_tokens: mt, evidence: ev, dry_run: true, confirm: true };
+  if (intent) body.intent = intent; else if (cap) body.capability = cap;
   if (model) body.model = model;
   if (sessionId) body.session_id = sessionId;
   const pv = $('dec-preview');
   if (!pv) return;
-  pv.innerHTML = '<span class="badge ok">previewing…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';
+  pv.innerHTML = '<span class="badge ok">previewing…</span> <span class="mono" style="color:var(--faint)">'+esc(intent || cap)+'</span>';
   const authHeaders = Object.assign({}, headers, { 'Content-Type': 'application/json' });
   const { ok, status, j } = await apiFetch('/v1/execute', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) });
   if (!ok) {

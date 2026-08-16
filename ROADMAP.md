@@ -1417,3 +1417,10 @@ without executing.
 - [x] MCP tool schema documents intent OR capability; `execution_request`
   enforces "at least one". Tests: capability-only accepted, neither → rejected;
   endpoint capability-only proceeds past the intent gate and honestly 422s.
+
+## 61. Next-Gen — Dashboard capability-only execute
+
+- [x] Decision card gains a `capability` input (`#dec-cap`); `executeDecision()`
+  and `previewDecision()` send `capability` only when intent is absent (intent
+  preferred when both filled). Real run still goes through the confirmed
+  Execute path. Nothing fabricated.
