@@ -2005,6 +2005,9 @@ async fn execute_decision_stream(
     let state2 = state.clone();
     let started = std::time::Instant::now();
     let model2 = model.clone();
+    // Owned copy for the spawned task (the raw `prompt` borrows `req`, which
+    // does not live long enough for tokio::spawn).
+    let prompt_owned = prompt.to_string();
     tokio::spawn(async move {
         while let Some(chunk) = progress_rx.recv().await {
             if chunk.is_empty() {
@@ -2020,14 +2023,20 @@ async fn execute_decision_stream(
         }
         let final_event = match resp_task.await {
             Ok(Ok(resp)) => {
+                // Report the real prompt token estimate (the remote worker does
+                // not echo usage through the streamed path); token.input would
+                // otherwise read 0 in gen_ai.server.token.input metrics.
+                let prompt_tokens = decentraai_distributed::prompt_token_estimate(&prompt_owned);
                 let usage = format!(
-                    "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                    "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
+                    prompt_tokens,
                     resp.tokens_used
                 );
                 state2.record_inference("/v1/execute", started.elapsed(), usage.as_bytes());
                 format!(
-                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"model\":{},\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}\n\n",
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"model\":{},\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}\n\n",
                     serde_json::to_string(&model2).unwrap_or_else(|_| "\"\"".to_string()),
+                    prompt_tokens,
                     resp.tokens_used
                 )
             }
@@ -6862,6 +6871,9 @@ async fn route_remote_chat(
     let prompt = remote_chat_prompt(
         body["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]),
     );
+    // Owned copy: `prompt` is moved into InferRequest below, but the spawned
+    // streamed path also needs it for the input-token estimate.
+    let prompt_owned = prompt.clone();
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(1024).min(4096) as u32;
     let stream = body["stream"].as_bool().unwrap_or(false);
     let request = decentraai_distributed::InferRequest::new(
@@ -6915,13 +6927,20 @@ async fn route_remote_chat(
             }
             let final_event = match resp_task.await {
                 Ok(Ok(resp)) => {
+                    // Real input-token estimate for the streamed remote path —
+                    // the worker does not echo usage through SSE, so without
+                    // this gen_ai.server.token.input would read 0 forever.
+                    let prompt_tokens =
+                        decentraai_distributed::prompt_token_estimate(&prompt_owned);
                     let usage = format!(
-                        "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                        "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
+                        prompt_tokens,
                         resp.tokens_used
                     );
                     state2.record_inference(&path2, started2.elapsed(), usage.as_bytes());
                     format!(
-                        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}\n\n",
+                        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}\n\n",
+                        prompt_tokens,
                         resp.tokens_used
                     )
                 }
@@ -6952,8 +6971,11 @@ async fn route_remote_chat(
     // Non-streaming fabric route.
     match distributed.route_request(request).await {
         Ok(resp) => {
+            let prompt_tokens =
+                decentraai_distributed::prompt_token_estimate(&prompt_owned);
             let usage_json = format!(
-                "{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{}}}}}",
+                "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
+                prompt_tokens,
                 resp.tokens_used
             );
             state.record_inference(&path, started.elapsed(), usage_json.as_bytes());
