@@ -1147,4 +1147,43 @@ mod tests {
         );
         // The size gate passed (failure, if any, would be JSON parse, not size).
     }
+
+    #[test]
+    fn parse_bootstrap_peer_lan_and_public() {
+        // A LAN peer with trailing /p2p/<PeerId>.
+        let (peer, addr) = parse_bootstrap_peer(
+            "/ip4/192.168.1.129/tcp/41873/p2p/12D3KooWNGE65ZF4rCdLx7DVcna8zp4AcR3RiWgpdR49sixmvkRs",
+        )
+        .unwrap();
+        assert_eq!(
+            peer.to_string(),
+            "12D3KooWNGE65ZF4rCdLx7DVcna8zp4AcR3RiWgpdR49sixmvkRs"
+        );
+        // The address has the /p2p tail stripped (so it can be fed to DHT).
+        assert_eq!(addr.to_string(), "/ip4/192.168.1.129/tcp/41873");
+
+        // A public bootstrap address (e.g. an IPFS-style endpoint).
+        let (peer2, addr2) = parse_bootstrap_peer(
+            "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+        )
+        .unwrap();
+        assert_eq!(addr2.to_string(), "/ip4/104.131.131.82/tcp/4001");
+        assert_eq!(peer2.to_string(), "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ");
+    }
+
+    #[test]
+    fn parse_bootstrap_peer_rejects_bad_input() {
+        assert!(parse_bootstrap_peer("not-a-multiaddr").is_err());
+        assert!(parse_bootstrap_peer("/ip4/192.168.1.1/tcp/4001").is_err(), "missing /p2p PeerId");
+    }
+
+    #[test]
+    fn network_config_lan_only_defaults() {
+        let c = NetworkConfig::lan_only();
+        assert!(c.lan_discovery);
+        assert!(!c.dht_enabled);
+        assert!(!c.relay_enabled);
+        assert!(c.bootstrap_peers.is_empty());
+        assert_eq!(c.max_connections, 50);
+    }
 }

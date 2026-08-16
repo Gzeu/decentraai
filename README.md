@@ -171,6 +171,31 @@ idle-unloaded) so it stays selectable. This has been verified on real
 hardware (two Ubuntu machines on one LAN), including sequential, concurrent,
 worker-reuse and both directions — not mocks.
 
+### 0c. Cross-subnet and internet connectivity (relay / DHT / DCUtR)
+
+Since the transport gained NAT traversal, nodes can also reach each other
+outside a single LAN subnet:
+
+- **`bootstrap_peers`** — each node can dial a fixed list of peers (LAN or
+  public), so the fabric is robust to DHCP IP churn (mDNS alone can miss a
+  peer whose address changed). Configure under `network.bootstrap_peers` in
+  `node.yaml`.
+- **DHT (`dht_enabled: true`)** — Kademlia discovery for cross-subnet peers.
+- **Relay + DCUtR (`relay_enabled: true`)** — a node behind NAT can connect
+  through a relay server (`/p2p-circuit`) and hole-punch to a direct
+  connection where possible.
+- **Identify** — the node learns and registers its observed external address.
+
+To join nodes on different subnets / the internet, run one small **public
+relay + bootstrap node** (see `docs/PUBLIC_RELAY_NODE.md` — a VPS with port
+4001 open, `dht_enabled` + `relay_enabled`), then add its multiaddr to every
+member's `bootstrap_peers`. A VPN (Tailscale/WireGuard) is the simpler private
+option for cross-subnet-only setups.
+
+> Public IPFS/libp2p bootstrap nodes are **not** drop-in: their transport
+> (QUIC/WebTransport + IPFS-specific Noise) does not complete the DecentraAI
+> TCP+Noise+Yamux handshake. A self-hosted public node is the reliable path.
+
 ### 1. Index your local models
 
 ```bash
