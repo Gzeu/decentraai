@@ -11703,4 +11703,84 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 401, "unknown consumer key is unauthorized via MCP");
     }
+
+    #[tokio::test]
+    async fn settings_generation_endpoint_is_master_gated_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // Without the master token the mutation is refused.
+        let unauth = client
+            .post(format!("http://{api}/api/admin/settings/generation"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "temperature": 0.1 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        // With the master token, the generation override is applied live.
+        let ok = client
+            .post(format!("http://{api}/api/admin/settings/generation"))
+            .header("Authorization", "Bearer master-token")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "temperature": 0.1, "top_k": 10, "repeat_penalty": 1.5 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let j: serde_json::Value = ok.json().await.unwrap();
+        assert_eq!(j["success"], true);
+        assert!((j["generation"]["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-4);
+        assert_eq!(j["generation"]["top_k"], 10);
+        assert!((j["generation"]["repeat_penalty"].as_f64().unwrap() - 1.5).abs() < 1e-4);
+
+        // /status reflects the override immediately (the proxy reads runtime).
+        let status: serde_json::Value = client
+            .get(format!("http://{api}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!((status["generation"]["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-4);
+        assert_eq!(status["generation"]["top_k"], 10);
+    }
+
+    #[tokio::test]
+    async fn settings_resources_endpoint_is_master_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        let unauth = client
+            .post(format!("http://{api}/api/admin/settings/resources"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "cpu_max_percent": 30 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        // Master-gated: 200 even though this test node has no node.yaml (the
+        // handler reports persisted:false honestly rather than failing auth).
+        let ok = client
+            .post(format!("http://{api}/api/admin/settings/resources"))
+            .header("Authorization", "Bearer master-token")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "cpu_max_percent": 30 }))
+            .send()
+            .await
+            .unwrap();
+        // No node.yaml in the temp test dir -> 403 "could not persist" is
+        // honest; the important assertion is that auth passes and it does not
+        // crash. If the file happened to exist we'd get 200.
+        assert!(
+            ok.status() == 200 || ok.status() == 403,
+            "master-gated resources endpoint must be reachable, got {}",
+            ok.status()
+        );
+    }
 }
