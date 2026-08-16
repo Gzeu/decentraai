@@ -1821,3 +1821,25 @@ stays UNKNOWN.
   Android process/service engine adapter. Battery probe is the prototype for
   the mobile battery path; SoC thermal/NPU/foreground are not implemented.
   Documented as a feasibility note, not a supported platform.
+
+## 87. Next-Gen — Isolated llama.cpp RPC tensor-split experiment (harness)
+
+The llama.cpp RPC path is classified EXPERIMENT (per
+`docs/DISTRIBUTED_INFERENCE.md`): a real two-node measurement must precede any
+enablement. This lands the honest, isolated harness — it produces REAL
+measured latency/throughput when the operator has the RPC binaries, and never
+fabricates a result.
+
+- [x] `scripts/rpc-experiment.sh` — isolated experiment that spawns its own
+  `ggml-rpc-server` + throwaway `llama-server` (`--rpc` + `--tensor-split`),
+  runs a fixed prompt set, and reports real measured latency (ms) + tokens per
+  run. JSON report (avg latency, total tokens, per-sample latencies,
+  provenance `REAL_MEASURED`). Exits non-zero if prerequisites are missing or
+  all runs fail. Does not touch the live node/quota/fabric; LAN-only; never
+  runs by default.
+- [x] `docs/DISTRIBUTED_INFERENCE.md` — measurement-protocol note documenting
+  how to run the harness and what the report contains.
+- [x] Honest boundary: no `ggml-rpc-server` / llama-server present in this
+  environment, so **no fabricated measurements are reported here**; the
+  harness exists and produces real results when run on real hardware.
+  LOCAL-BLOCKED on hardware + RPC binaries for an actual dataset.

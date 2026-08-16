@@ -555,6 +555,27 @@ subprocess (never FFI); all distributed flags
   capability gate). Do NOT enable as a default; requires real two-node
   measurements first (ROADMAP gate).
 
+### Isolated experiment harness
+
+`scripts/rpc-experiment.sh` runs a **clean, isolated** two-node tensor-split
+measurement when the operator has the RPC binaries:
+
+```bash
+# Requires llama-server + ggml-rpc-server on PATH and a .gguf model.
+scripts/rpc-experiment.sh --model /path/model.gguf \
+  --rpc-host 127.0.0.1:50052 --layers 8 --report /tmp/rpc.json
+```
+
+- Spawns its **own** `ggml-rpc-server` and a throwaway `llama-server` with
+  `--rpc` + `--tensor-split`; runs a fixed prompt set and records the **real**
+  measured latency (ms) + tokens per run.
+- Writes a JSON report (avg latency, total tokens, per-sample latencies,
+  provenance = `REAL_MEASURED`) and exits non-zero if prerequisites are
+  missing or all runs fail — it never fabricates a result.
+- Does **not** touch the live DecentraAI node, its models, quota/accounting,
+  or the fabric. LAN-only, consistent with upstream's "fragile/insecure"
+  warning. It never runs by default; it only runs when explicitly invoked.
+
 ## GPU scheduling / KV-cache locality
 
 - SOURCE: repository evidence (M19 `NetworkGraph`, M20 `SessionAccount`,
