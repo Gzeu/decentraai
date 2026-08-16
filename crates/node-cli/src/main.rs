@@ -1118,6 +1118,16 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     )?;
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
 
+    // Bootstrap peers: dial each explicitly-configured peer so the fabric is
+    // robust to DHCP IP churn (mDNS alone cannot rediscover a peer whose IP
+    // changed if the announcement is missed). Best-effort — a peer that is
+    // offline now is re-dialed on reconnect; never fails node startup.
+    for peer_addr in &config.network.bootstrap_peers {
+        if let Err(e) = p2p_node.dial(peer_addr).await {
+            tracing::warn!(peer = %peer_addr, error = %e, "bootstrap dial deferred (peer may be offline)");
+        }
+    }
+
     let mut distributed = DistributedInference::new(
         p2p_node,
         InferenceConfig::default(),
