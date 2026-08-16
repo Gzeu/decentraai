@@ -515,8 +515,8 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
              there). Empty ledger and UNKNOWN headroom render honestly. -->
         <div class="card" style="margin-top:14px">
           <h2>Sessions (KV locality) <span class="count" id="sessions-count"></span></h2>
-          <table><thead><tr><th>Session</th><th>Worker</th><th>Model</th><th class="num">KV tokens used</th><th>KV headroom</th></tr></thead>
-          <tbody id="sessions"><tr><td colspan="5" class="empty">no active sessions</td></tr></tbody></table>
+          <table><thead><tr><th>Session</th><th>Worker</th><th>Model</th><th class="num">KV tokens used</th><th>KV headroom</th><th>Continue</th></tr></thead>
+          <tbody id="sessions"><tr><td colspan="6" class="empty">no active sessions</td></tr></tbody></table>
         </div>
       </section>
 
@@ -610,6 +610,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
               <label style="font-size:11px;color:var(--muted)">execute</label>
               <input id="dec-model" class="mono" placeholder="model (optional, file.gguf)" style="min-width:120px;padding:4px 6px;font-size:12px">
+              <input id="dec-session" class="mono" placeholder="session_id (optional — continue an earlier run)" style="min-width:200px;padding:4px 6px;font-size:12px">
               <input id="dec-max" class="mono" type="number" min="1" step="1" value="256" title="max_tokens" style="width:72px;padding:4px 6px;font-size:12px">
               <label style="font-size:11px;color:var(--muted)"><input id="dec-stream" type="checkbox" checked> stream</label>
               <button class="btn small warn" onclick="executeDecision()">Execute (confirm)</button>
@@ -1934,7 +1935,7 @@ async function renderSessions(){
   const count = $('sessions-count');
   if (!ok) {
     if (count) count.textContent = '';
-    box.innerHTML = '<tr><td colspan="5"><span class="badge warn">sessions unavailable (' + status + ')</span> ' +
+    box.innerHTML = '<tr><td colspan="6"><span class="badge warn">sessions unavailable (' + status + ')</span> ' +
       esc((j && j.error && j.error.message) || 'unknown error') + '</td></tr>';
     return;
   }
@@ -1942,7 +1943,7 @@ async function renderSessions(){
   if (count) count.textContent = active;
   const sessions = (j && j.sessions) || [];
   if (active === 0 || sessions.length === 0) {
-    box.innerHTML = '<tr><td colspan="5" class="empty">no active sessions</td></tr>';
+    box.innerHTML = '<tr><td colspan="6" class="empty">no active sessions</td></tr>';
     return;
   }
   const rows = sessions.map(s => {
@@ -1959,9 +1960,27 @@ async function renderSessions(){
       '<td><code>' + short(s.worker, 12) + '</code></td>' +
       '<td class="mono" style="font-size:11px">' + esc(short(s.model_hash, 12)) + '</td>' +
       '<td class="num">' + esc(usage) + '</td>' +
-      '<td>' + head + '</td></tr>';
+      '<td>' + head + '</td>' +
+      '<td><button class="btn small" onclick="continueSession(\'' + jsq(s.session_id) + '\')">continue</button></td></tr>';
   }).join('');
   box.innerHTML = rows;
+}
+// CONTINUE (KV locality): pre-populate the Decision card's execute inputs with
+// a real coordinator-tracked session_id so the operator can start a
+// continuation on the KV-prefix worker via the existing /v1/execute path.
+// Real state only: nothing runs here — it only loads the session id (and a
+// default intent/prompt when those are empty); execution happens solely
+// through the confirmed Execute button.
+function continueSession(sid){
+  const s = $('dec-session');
+  if (s) s.value = sid || '';
+  const intent = $('dec-intent');
+  if (intent && !(intent.value || '').trim()) intent.value = 'continue the conversation';
+  const prompt = $('dec-prompt');
+  if (prompt && !(prompt.value || '').trim()) prompt.value = 'continue this conversation…';
+  show('models');
+  toast('session loaded: ' + short(sid, 12) + ' — now Execute to continue with KV locality');
+  if (prompt) prompt.focus();
 }
 // CAN I RUN THIS? — fabric-wide capability fit via the real /v1/can_run
 // projection (same pure engine as the MCP get_worker_capability tool).
@@ -2102,12 +2121,14 @@ async function executeDecision(){
   const maxTokens = parseInt(maxRaw, 10);
   const stream = !!($('dec-stream')||{}).checked;
   const model = ($('dec-model').value || '').trim();
+  const sessionId = ($('dec-session').value || '').trim();
   if (!intent) { toast('enter an intent to execute', true); return; }
   if (!prompt) { toast('enter a prompt to execute', true); return; }
   const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
   if (!confirm('Run this on the fabric? This reserves a worker and runs real inference.')) return;
   const body = { intent, prompt, max_tokens: mt, stream, evidence: ev, confirm: true };
   if (model) body.model = model;
+  if (sessionId) body.session_id = sessionId;
   const con = $('dec-exec');
   if (!con) return;
   con.innerHTML = '<span class="badge ok">EXECUTING…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';
@@ -2194,11 +2215,13 @@ async function previewDecision(){
   const maxRaw = $('dec-max').value || '256';
   const maxTokens = parseInt(maxRaw, 10);
   const model = ($('dec-model').value || '').trim();
+  const sessionId = ($('dec-session').value || '').trim();
   if (!intent) { toast('enter an intent to preview', true); return; }
   if (!prompt) { toast('enter a prompt to preview', true); return; }
   const mt = (Number.isFinite(maxTokens) && maxTokens > 0) ? maxTokens : 256;
   const body = { intent, prompt, max_tokens: mt, evidence: ev, dry_run: true, confirm: true };
   if (model) body.model = model;
+  if (sessionId) body.session_id = sessionId;
   const pv = $('dec-preview');
   if (!pv) return;
   pv.innerHTML = '<span class="badge ok">previewing…</span> <span class="mono" style="color:var(--faint)">'+esc(intent)+'</span>';

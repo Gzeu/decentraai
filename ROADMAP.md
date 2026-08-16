@@ -1397,3 +1397,13 @@ without executing.
   `/v1/sessions`); pure `sessions_request` extractor + dispatch.
 - [x] Tests: tool listed, extractor matches only the tool, precomputed snapshot
   returned unchanged.
+
+## 59. Next-Gen — Continue-from-sessions (KV locality in the UI)
+
+- [x] Decision card gains a `session_id` input; `executeDecision()` and
+  `previewDecision()` send it ONLY when non-empty (continuation / KV locality
+  via the existing `/v1/execute` path).
+- [x] Sessions card rows gain a "continue" button: `continueSession(sid)`
+  pre-populates the session_id + intent/prompt defaults (never overwrites an
+  existing prompt), switches to the Models view, and toasts — the real run still
+  flows through the confirmed Execute path. No fabricated output.
