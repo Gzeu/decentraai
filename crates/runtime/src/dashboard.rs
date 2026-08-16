@@ -1017,6 +1017,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
             <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Account</div><input id="ck-account" placeholder="owner account" style="min-width:140px"></div>
             <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Quota ceiling</div><input id="ck-ceiling" type="number" min="1" value="100" style="width:90px"></div>
             <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Req/min</div><input id="ck-rate" type="number" min="1" value="10" style="width:80px"></div>
+            <div><div class="label" style="font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em">Scopes</div><input id="ck-scopes" placeholder="inference" value="inference" style="min-width:110px"></div>
             <button id="ck-create" class="primary">Create key</button>
           </div>
           <div id="ck-result" style="margin-top:10px;font-size:12px"></div>
@@ -3586,18 +3587,23 @@ async function createConsumerKey(){
   const account = ($('ck-account').value || '').trim();
   const ceiling = parseInt($('ck-ceiling').value, 10);
   const rate = parseInt($('ck-rate').value, 10);
+  const scopes = ($('ck-scopes') && $('ck-scopes').value || 'inference').split(',').map(s => s.trim()).filter(Boolean);
   if (!account) { toast('enter an owner account', true); return; }
   if (!(ceiling > 0)) { toast('quota ceiling must be > 0', true); return; }
   if (!(rate > 0)) { toast('rate limit must be > 0', true); return; }
   $('ck-result').innerHTML = '<span class="loading"><span class="spinner"></span> creating…</span>';
   try {
-    const r = await fetch('/api/admin/consumer-key/create', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ account, quota_ceiling: ceiling, rate_limit_per_minute: rate }) });
+    const r = await fetch('/api/admin/consumer-key/create', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ account, quota_ceiling: ceiling, rate_limit_per_minute: rate, scopes }) });
     const d = await r.json();
     if (!r.ok) { $('ck-result').innerHTML = '<span class="badge warn">' + esc((d.error && d.error.message) || ('failed (' + r.status + ')')) + '</span>'; return; }
-    $('ck-result').innerHTML = '<span class="badge ok">created</span> <code>'+esc(d.token)+'</code> <span class="muted">(shown once)</span>';
+    $('ck-result').innerHTML = '<span class="badge ok">created</span> <code id="ck-new-token">'+esc(d.token)+'</code> <button class="ghost" style="margin-left:6px" onclick="copyConsumerToken()">Copy</button> <span class="muted">(shown once)</span>';
     toast('consumer key created for ' + short(account, 20));
     loadConsumerKeys();
   } catch (e) { $('ck-result').innerHTML = '<span class="badge warn">create failed</span>'; }
+}
+function copyConsumerToken(){
+  const el = document.getElementById('ck-new-token');
+  if (el && el.textContent) navigator.clipboard.writeText(el.textContent).then(() => toast('consumer key copied'));
 }
 async function revokeConsumerKey(ev){
   const id = ev.target.dataset.id;
