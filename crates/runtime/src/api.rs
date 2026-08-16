@@ -1348,7 +1348,9 @@ async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
     let mut decisions: Vec<decentraai_fabric::ExecutionDecision> = Vec::new();
     let mut network = decentraai_fabric::NetworkGraph::new();
     let mut sessions_active = 0usize;
+    let mut coordinator_version = String::new();
     if let Some(compute) = &state.compute {
+        coordinator_version = compute.node_version().to_string();
         for adv in compute.workers().await {
             let trusted = compute.is_trusted(&adv.peer_id).await;
             workers.push((adv, trusted));
@@ -1363,6 +1365,7 @@ async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
         &decisions,
         &network,
         sessions_active,
+        &coordinator_version,
     )
 }
 
@@ -4161,6 +4164,48 @@ fn device_class(cap: &decentraai_compute::ComputeCapability) -> &'static str {
     }
 }
 
+/// Classify a fabric peer's version relative to the coordinator (node
+/// lifecycle). Pure and honest:
+///
+/// - `remote` empty/unknown → "UNKNOWN"
+/// - `remote == coordinator` → "CURRENT"
+/// - otherwise (a different, known version) → "OUTDATED"
+///
+/// A different version is reported as OUTDATED (the coordinator cannot prove it
+/// is newer; it can only know it differs). Never fabricated.
+fn version_status(coordinator: &str, remote: &str) -> &'static str {
+    if remote.trim().is_empty() {
+        return "UNKNOWN";
+    }
+    if coordinator == remote {
+        return "CURRENT";
+    }
+    "OUTDATED"
+}
+
+/// Derive a node's lifecycle phase from REAL evidence only (node lifecycle:
+/// DISCOVERED → TRUSTED → ONLINE → OUTDATED). Only states that the repository
+/// can actually support are emitted:
+///
+/// - UNKNOWN: node_version unavailable (cannot classify).
+/// - DISCOVERED: reachable (advertised) but not yet trusted.
+/// - TRUSTED: trusted by the coordinator but not healthy/ready.
+/// - ONLINE: trusted + healthy.
+/// - ONLINE_OUTDATED / DISCOVERED_OUTDATED: as above but on a different known
+///   version (needs update).
+///
+/// The UPDATING / VERIFIED phases are NOT emitted — there is no real remote
+/// update mechanism yet, so fabricating them would be dishonest.
+fn node_lifecycle(trusted: bool, healthy: bool, vs: &'static str) -> &'static str {
+    match vs {
+        "UNKNOWN" => "UNKNOWN",
+        _ if trusted && healthy && vs == "CURRENT" => "ONLINE",
+        _ if trusted && healthy => "ONLINE_OUTDATED",
+        _ if trusted => if vs == "CURRENT" { "TRUSTED" } else { "TRUSTED_OUTDATED" },
+        _ => if vs == "CURRENT" { "DISCOVERED" } else { "DISCOVERED_OUTDATED" },
+    }
+}
+
 /// Pure projection of the conceptual fabric graph
 /// `NODE -> WORKER -> ENGINE -> MODEL -> CAPABILITY -> EXECUTION` from
 /// authoritative live state. It never fabricates: absent data yields empty
@@ -4175,6 +4220,7 @@ fn fabric_graph_aggregate(
     decisions: &[decentraai_fabric::ExecutionDecision],
     network: &decentraai_fabric::NetworkGraph,
     sessions_active: usize,
+    coordinator_version: &str,
 ) -> serde_json::Value {
     // NODE -> WORKER: one node per real advertisement; identity fields stay
     // separate (peer_id / node_id / node_name) and trust comes from the
@@ -4193,6 +4239,13 @@ fn fabric_graph_aggregate(
                 "trusted": *trusted,
                 "device_class": device_class(&w.capability),
                 "node_version": w.node_version,
+                "version_status": version_status(coordinator_version, &w.node_version),
+                "outdated": version_status(coordinator_version, &w.node_version) == "OUTDATED",
+                "lifecycle": node_lifecycle(
+                    *trusted,
+                    w.availability.healthy(),
+                    version_status(coordinator_version, &w.node_version),
+                ),
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -4310,6 +4363,7 @@ fn fabric_graph_aggregate(
         .collect();
 
     serde_json::json!({
+        "coordinator": { "version": coordinator_version },
         "nodes": nodes,
         "models": models_json,
         "capabilities": caps_json,
@@ -4340,7 +4394,9 @@ async fn fabric_graph_handler(
     let mut decisions: Vec<decentraai_fabric::ExecutionDecision> = Vec::new();
     let mut network = decentraai_fabric::NetworkGraph::new();
     let mut sessions_active = 0usize;
+    let mut coordinator_version = String::new();
     if let Some(compute) = &state.compute {
+        coordinator_version = compute.node_version().to_string();
         for adv in compute.workers().await {
             let trusted = compute.is_trusted(&adv.peer_id).await;
             workers.push((adv, trusted));
@@ -4355,6 +4411,7 @@ async fn fabric_graph_handler(
         &decisions,
         &network,
         sessions_active,
+        &coordinator_version,
     );
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -7456,6 +7513,7 @@ mod tests {
             &[],
             &decentraai_fabric::NetworkGraph::new(),
             0,
+            "1.0.0",
         );
 
         // Nodes: one per real worker, identity fields kept separate and real.
@@ -7550,6 +7608,38 @@ mod tests {
         // No eligible -> empty (honest).
         let w2b = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
         assert!(load_balance_for_workers(&[(w2b, true)], &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn version_status_is_honest() {
+        // Node lifecycle: same version -> CURRENT; different known version ->
+        // OUTDATED; empty/unknown -> UNKNOWN. Never fabricates.
+        assert_eq!(version_status("1.0.0", "1.0.0"), "CURRENT");
+        assert_eq!(version_status("1.0.0", "1.1.0"), "OUTDATED");
+        assert_eq!(version_status("1.0.0", "0.9.0"), "OUTDATED");
+        assert_eq!(version_status("1.0.0", ""), "UNKNOWN");
+        assert_eq!(version_status("1.0.0", "   "), "UNKNOWN");
+        // A peer that does not report a version is never labeled CURRENT.
+        assert_ne!(version_status("1.0.0", ""), "CURRENT");
+    }
+
+    #[test]
+    fn node_lifecycle_only_emits_evidence_supported_states() {
+        // Node lifecycle: only real-evidence states are emitted. UPDATING /
+        // VERIFIED are NOT produced (no remote update mechanism exists yet).
+        assert_eq!(node_lifecycle(false, false, "UNKNOWN"), "UNKNOWN");
+        assert_eq!(node_lifecycle(false, true, "CURRENT"), "DISCOVERED");
+        assert_eq!(node_lifecycle(false, true, "OUTDATED"), "DISCOVERED_OUTDATED");
+        assert_eq!(node_lifecycle(true, false, "CURRENT"), "TRUSTED");
+        assert_eq!(node_lifecycle(true, false, "OUTDATED"), "TRUSTED_OUTDATED");
+        assert_eq!(node_lifecycle(true, true, "CURRENT"), "ONLINE");
+        assert_eq!(node_lifecycle(true, true, "OUTDATED"), "ONLINE_OUTDATED");
+        // The update-only phases must never be produced.
+        for (t, h, v) in [(false, false, "CURRENT"), (true, true, "OUTDATED")] {
+            let s = node_lifecycle(t, h, v);
+            assert_ne!(s, "UPDATING");
+            assert_ne!(s, "VERIFIED");
+        }
     }
 
     #[test]

@@ -300,6 +300,10 @@ pub struct ComputeManager {
     /// a real capability-requirement verdict. `None` = no registry wired yet
     /// (honest: claims resolution degrades to UNKNOWN).
     registry_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// This node's DecentraAI build version (from CARGO_PKG_VERSION). The
+    /// coordinator uses it to classify fabric peers as CURRENT / OUTDATED /
+    /// UNKNOWN for the node-lifecycle view.
+    node_version: String,
 }
 
 impl ComputeManager {
@@ -334,7 +338,13 @@ impl ComputeManager {
             )),
             accepts_remote_inference: std::sync::atomic::AtomicBool::new(false),
             registry_path: std::sync::Mutex::new(None),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    /// This node's DecentraAI build version.
+    pub fn node_version(&self) -> &str {
+        &self.node_version
     }
 
     /// Sets the node's Ed25519 signing key (P3) so `advertise_local` emits

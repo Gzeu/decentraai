@@ -1495,3 +1495,21 @@ build version, so a coordinator/operator can see which fabric members are stale.
   its `device_class`, so you can see at a glance which fabric members are stale
   (e.g. desktop on an old build vs laptop on the new one). Empty/absent version
   → nothing rendered (honest).
+
+## 69. Next-Gen — Node Lifecycle & version consistency
+
+Builds on node_version: the coordinator now classifies each fabric peer's
+version and lifecycle from real evidence, so operators can see which nodes need
+update.
+
+- [x] `ComputeManager.node_version()` — coordinator's own build version.
+- [x] `version_status(coordinator, remote)` — pure: CURRENT / OUTDATED /
+  UNKNOWN (a different known version is OUTDATED; empty is UNKNOWN; never
+  fabricates). `node_lifecycle(trusted, healthy, status)` — pure projection of
+  DISCOVERED → TRUSTED → ONLINE (+ *_OUTDATED) using only real evidence;
+  UPDATING/VERIFIED are NOT emitted (no real remote-update mechanism yet).
+- [x] `/v1/fabric` now returns a `coordinator.version` block, and each node
+  carries `version_status`, `outdated`, and `lifecycle` (plus the existing
+  `node_version`). Mismatch is observable here (no new event system).
+- [x] Focused tests: version_status honesty; node_lifecycle only emits
+  evidence-backed states.
