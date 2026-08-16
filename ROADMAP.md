@@ -1520,3 +1520,13 @@ update.
   unknown) and `lifecycle` badges from real backend fields, plus a coordinator
   `v<version>` line and an honest "N node(s) need update" count (only nodes with
   `outdated === true`; UNKNOWN nodes never counted).
+
+## 71. Next-Gen — Node Lifecycle & Upgrade documentation
+
+- [x] `docs/deployment.md` gains a "Node Lifecycle & Upgrade" section: the
+  evidence-backed lifecycle (DISCOVERED → TRUSTED → ONLINE → OUTDATED;
+  UPDATING/VERIFIED explicitly future, not produced), honest version semantics
+  (CURRENT/OUTDATED/UNKNOWN; never claims an update for UNKNOWN), a safe
+  out-of-band upgrade workflow (no remote shell, reuses trust; re-classified
+  after restart), and a platform-agnostic architecture note (Linux/Windows/ARM/
+  mobile each have their own packaging; the fabric only observes node_version).
