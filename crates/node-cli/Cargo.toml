@@ -9,6 +9,10 @@ license.workspace = true
 name = "decentraai"
 path = "src/main.rs"
 
+[[bin]]
+name = "decentraai-worker"
+path = "src/bin/decentraai-worker.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

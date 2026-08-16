@@ -1530,3 +1530,31 @@ update.
   out-of-band upgrade workflow (no remote shell, reuses trust; re-classified
   after restart), and a platform-agnostic architecture note (Linux/Windows/ARM/
   mobile each have their own packaging; the fabric only observes node_version).
+
+## 72. Next-Gen — Standalone lightweight worker (`decentraai-worker`)
+
+Separates the WORKER PLANE from the CONTROL PLANE: a worker joins the fabric,
+advertises capability/resources/engine/model, accepts authorized remote
+inference, executes on a local llama-server, and reports real measurements —
+WITHOUT running the planner, model hub, registry scan, dashboard, MCP, tokens,
+decisions, or orchestration.
+
+- [x] New `[[bin]] decentraai-worker` in `crates/node-cli` (`src/bin/decentraai-worker.rs`),
+      reusing 100% of the existing `decentraai-distributed` worker path
+      (`ComputeManager` worker-side methods + `DistributedInference::register_worker_backend`)
+      plus identity/config/system-probe/engine. NO duplicate identity, trust,
+      capability matcher, resource estimator, auth, or signed P2P protocol.
+- [x] Worker-only sequence: load identity → load config → spawn llama-server →
+      `ComputeManager` (advertise + serve) → `DistributedP2PHandler`/`P2PNode` →
+      `DistributedInference` (`register_as_worker` + `register_worker_backend`) →
+      immediate advertise + periodic broadcaster. Skips all coordinator-only
+      calls (no `set_signing_identity` for outbound, no router, no network probe,
+      no reaper, no contributions, no metrics server).
+- [x] Lifecycle (evidence-backed): DISCOVERED (signed ad + mDNS) → TRUSTED
+      (coordinator trusts peer id) → CONNECTED/READY (listening + advertising) →
+      BUSY (serving) → OFFLINE (heartbeat lapses). UPDATING/VERIFIED never
+      emitted (no remote update mechanism). CLI usage:
+      `decentraai-worker --name <n> --model <file.gguf> [--binary <llama-server>]`.
+- [x] Platform-neutral worker path (libp2p TCP/Noise/mDNS; llama-server spawn is
+      cross-platform; GPU probe degrades cleanly). Reuses the same signed
+      advertisement + inbound signature verification as the full node.
