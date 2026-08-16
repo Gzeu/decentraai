@@ -243,7 +243,8 @@ fn all_tools() -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "intent": { "type": "string", "description": "A natural-language intent, e.g. 'OCR these images'." },
+                    "intent": { "type": "string", "description": "A natural-language intent, e.g. 'OCR these images'. Either intent OR capability must be provided." },
+                    "capability": { "type": "string", "description": "Alternative to intent: run a specific capability (snake_case, e.g. 'ocr') directly, without intent parsing." },
                     "prompt": { "type": "string", "description": "The actual prompt to run." },
                     "max_tokens": { "type": "integer", "description": "Max tokens to generate (default 1024, cap 4096)." },
                     "stream": { "type": "boolean", "description": "Whether to stream (default false)." },
@@ -253,7 +254,7 @@ fn all_tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "description": "If true, preview what would be reserved/routed WITHOUT executing (no request, no reservation). Requires confirm:true too." },
                     "confirm": { "type": "boolean", "description": "MUST be true to execute (mutation safety)." },
                 },
-                "required": ["intent", "prompt", "confirm"],
+                "required": ["prompt", "confirm"],
                 "additionalProperties": false,
             }),
         },
@@ -484,7 +485,9 @@ pub fn execution_request(raw: &str) -> Option<serde_json::Value> {
         return None;
     }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?.clone();
-    if args.get("intent").and_then(|i| i.as_str()).unwrap_or("").is_empty()
+    let has_intent = args.get("intent").and_then(|i| i.as_str()).unwrap_or("").trim() != "";
+    let has_cap = args.get("capability").and_then(|c| c.as_str()).unwrap_or("").trim() != "";
+    if !(has_intent || has_cap)
         || args.get("prompt").and_then(|p| p.as_str()).unwrap_or("").is_empty()
     {
         return None;
@@ -1138,6 +1141,17 @@ mod tests {
         // Missing prompt -> None.
         assert!(execution_request(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","confirm":true}}}"#
+        )
+        .is_none());
+        // Capability-only is accepted (intent OR capability required).
+        let args = execution_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"capability":"ocr","prompt":"read","confirm":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(args["capability"], "ocr");
+        // Neither intent nor capability -> None.
+        assert!(execution_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"prompt":"read","confirm":true}}}"#
         )
         .is_none());
         assert!(execution_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());

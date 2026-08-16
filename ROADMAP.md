@@ -1407,3 +1407,13 @@ without executing.
   pre-populates the session_id + intent/prompt defaults (never overwrites an
   existing prompt), switches to the Models view, and toasts — the real run still
   flows through the confirmed Execute path. No fabricated output.
+
+## 60. Next-Gen — execute by capability directly (no intent parsing)
+
+- [x] `/v1/execute` and MCP `execute_decision` accept `capability` as an
+  alternative to `intent` (either one drives the unified decision; a snake_case
+  capability name is itself resolvable by the intent lexicon). `prompt` +
+  `confirm: true` still required. Honest 422 without a fabric model.
+- [x] MCP tool schema documents intent OR capability; `execution_request`
+  enforces "at least one". Tests: capability-only accepted, neither → rejected;
+  endpoint capability-only proceeds past the intent gate and honestly 422s.

@@ -1346,10 +1346,15 @@ async fn execute_decision_stream(
     if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
         return forbidden("mutating execution requires \"confirm\": true");
     }
-    let intent = req.get("intent").and_then(|i| i.as_str()).unwrap_or_default();
     let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
-    if intent.trim().is_empty() || prompt.trim().is_empty() {
-        return forbidden("missing intent and/or prompt");
+    if prompt.trim().is_empty() {
+        return forbidden("missing prompt");
+    }
+    // Intent OR a direct capability can drive the decision (capability alone
+    // lets an operator run a specific capability+model without intent parsing).
+    let intent = execute_decision_intent(req);
+    if intent.trim().is_empty() {
+        return forbidden("missing intent (or a capability to run)");
     }
     let max_tokens = req
         .get("max_tokens")
@@ -1361,7 +1366,7 @@ async fn execute_decision_stream(
     let explicit_model = req.get("model").and_then(|m| m.as_str());
 
     // decide → chosen model.
-    let decision = unified_fabric_decision(state, intent, evidence, explicit_model).await;
+    let decision = unified_fabric_decision(state, &intent, evidence, explicit_model).await;
     let Some(model) = decision["decision"]["model"].as_str().map(str::to_string) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1523,6 +1528,19 @@ async fn execute_decision_stream(
 /// `execute_decision` tool. Enforces the mutation-safety confirmation itself
 /// (so no caller can bypass it) and requires the node master token (checked by
 /// the HTTP layer; MCP runs behind the same master-gated boundary).
+/// Derive the intent string that drives the unified decision for an execute
+/// call: the explicit `intent` if present, else the `capability` (a snake_case
+/// capability name is itself resolvable by the intent lexicon), else empty.
+fn execute_decision_intent(req: &serde_json::Value) -> String {
+    if let Some(i) = req.get("intent").and_then(|i| i.as_str()).filter(|s| !s.trim().is_empty()) {
+        return i.trim().to_string();
+    }
+    if let Some(c) = req.get("capability").and_then(|c| c.as_str()).filter(|s| !s.trim().is_empty()) {
+        return c.trim().to_string();
+    }
+    String::new()
+}
+
 async fn run_execute_decision(
     state: &ApiState,
     req: &serde_json::Value,
@@ -1531,9 +1549,9 @@ async fn run_execute_decision(
     if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
         return forbidden("mutating execution requires \"confirm\": true");
     }
-    let intent = req.get("intent").and_then(|i| i.as_str()).unwrap_or_default();
+    let intent = execute_decision_intent(req);
     if intent.trim().is_empty() {
-        return forbidden("missing intent");
+        return forbidden("missing intent (or a capability to run)");
     }
     let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
     if prompt.trim().is_empty() {
@@ -1553,7 +1571,7 @@ async fn run_execute_decision(
     let explicit_model = req.get("model").and_then(|m| m.as_str());
 
     // decide: pick the first CAN_RUN model/worker from the unified projection.
-    let decision = unified_fabric_decision(state, intent, evidence, explicit_model).await;
+    let decision = unified_fabric_decision(state, &intent, evidence, explicit_model).await;
     let chosen_model = decision["decision"]["model"].as_str().map(str::to_string);
 
     // reserve+execute requires a real, advertised model hash.
@@ -7162,6 +7180,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dry.status(), 422, "dry-run with no fabric model is honest 422");
+
+        // Capability-only execute (no intent): accepted by the boundary and
+        // honestly 422 without a fabric model (NOT 'missing intent').
+        let cap_only = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth("master")
+            .body(serde_json::json!({
+                "capability": "ocr",
+                "prompt": "read the text",
+                "max_tokens": 64,
+                "confirm": true,
+            })
+            .to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            cap_only.status(),
+            422,
+            "capability-only execute proceeds past the intent gate and honestly 422s without a fabric model"
+        );
 
         manager.lock().await.shutdown().await.unwrap();
     }
