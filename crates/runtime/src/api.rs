@@ -4250,6 +4250,7 @@ fn fabric_graph_aggregate(
                     "temperature_celsius": w.availability.gpu_temperature_celsius,
                     "utilization_percent": w.availability.gpu_utilization_percent,
                 },
+                "capacity": w.availability.capacity_state(),
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -4544,6 +4545,7 @@ async fn resources_handler(
                     "tokens_per_second": adv.availability.tokens_per_second,
                     "provenance": latency_provenance,
                 },
+                "capacity": adv.availability.capacity_state(),
             }));
         }
     }

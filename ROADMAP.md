@@ -1633,3 +1633,15 @@ new identity/token/trust/auth/discovery system.
   Android/mobile marked FUTURE — not supported. The worker contract is identical
   across platforms; only probes + engine adapters differ; no single update
   mechanism assumed.
+
+## 80. Next-Gen — Adaptive-contribution capacity state (FULL/LIMITED/UNAVAILABLE)
+
+- [x] `ComputeAvailability::capacity_state()` — pure, evidence-backed
+  classification from real health/load/queue: FULL (healthy + headroom),
+  LIMITED (healthy but load>=80 or queue>=6), UNAVAILABLE (unhealthy). Never
+  fabricated. Foundation for adaptive contribution (desktop high / laptop
+  medium / phone limited).
+- [x] Exposed in `/v1/fabric` nodes (`capacity`) and `/v1/resources` fabric rows
+  (`capacity`).
+- [x] Test: evidence-backed FULL/LIMITED/UNAVAILABLE from real availability.
+  No planner-scoring change (no authoritative worker capacity model yet).

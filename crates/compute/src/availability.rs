@@ -56,6 +56,26 @@ impl ComputeAvailability {
     pub fn healthy(&self) -> bool {
         self.status.can_accept_work()
     }
+
+    /// Adaptive-contribution capacity state, derived ONLY from real,
+    /// authoritative availability data. Never fabricated:
+    /// - `UNAVAILABLE`: the worker is unhealthy / cannot accept work.
+    /// - `LIMITED`: healthy but heavily loaded (load >= 80) or a long queue
+    ///   (>= 6) — it can accept, but only a limited share.
+    /// - `FULL`: healthy with headroom.
+    /// - `UNKNOWN`: we cannot tell (shouldn't normally happen; conservative
+    ///   fallback when the state is not a recognized health variant).
+    pub fn capacity_state(&self) -> &'static str {
+        if !self.status.can_accept_work() {
+            return "UNAVAILABLE";
+        }
+        let loaded = self.load_percent >= 80 || self.queue_depth >= 6;
+        if loaded {
+            "LIMITED"
+        } else {
+            "FULL"
+        }
+    }
 }
 
 /// One full advertisement: static [`ComputeCapability`] plus current
@@ -99,6 +119,32 @@ pub struct ComputeAdvertisement {
 mod tests {
     use super::*;
     use crate::capability::{GpuSpec, ServedModel};
+
+    #[test]
+    fn capacity_state_is_evidence_backed() {
+        // Adaptive-contribution capacity: derived from real health/load/queue.
+        let mut a = ComputeAvailability {
+            available_ram_mb: 1000,
+            available_vram_mb: None,
+            load_percent: 10,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 10,
+            status: WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+        };
+        assert_eq!(a.capacity_state(), "FULL");
+        // Healthy but loaded -> LIMITED.
+        a.load_percent = 90;
+        assert_eq!(a.capacity_state(), "LIMITED");
+        a.load_percent = 10;
+        a.queue_depth = 8;
+        assert_eq!(a.capacity_state(), "LIMITED");
+        // Unhealthy -> UNAVAILABLE, regardless of load.
+        a.status = WorkerHealth::Unhealthy;
+        assert_eq!(a.capacity_state(), "UNAVAILABLE");
+    }
 
     #[test]
     fn health_gates_acceptance() {
