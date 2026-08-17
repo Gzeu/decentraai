@@ -438,6 +438,55 @@ enum AgentCommand {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
+    /// Show the full record of one local agent (by agent_id): role,
+    /// description, state, semantic capabilities with provenance, allowed
+    /// models, tools, policies and memory scopes. Read-only.
+    Show {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The agent_id to inspect (e.g. `<short-id>:generalist`).
+        #[arg(long)]
+        agent: String,
+    },
+    /// List the steps of a named workflow template (a local, pure fabric
+    /// primitive — no network, no engine). Supports `research_report`.
+    /// Read-only.
+    Workflow {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The template id to inspect.
+        #[arg(long, default_value = "research_report")]
+        template: String,
+    },
+    /// Show a reputation profile for one local agent, built from synthetic
+    /// sample data (this demonstrates the P6 reputation model locally — the
+    /// numbers are NOT real measurements). Read-only.
+    Reputation {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The agent_id the profile belongs to.
+        #[arg(long)]
+        agent: String,
+        /// Minimum sample count before a factor counts as meaningful.
+        #[arg(long, default_value = "1")]
+        min_samples: u64,
+    },
+    /// Inspect the talent tree (P8 capability graph): list every capability,
+    /// which ones are unlockable given what you have and a memory budget, and
+    /// the cheapest path to a target. Read-only, local.
+    TalentTree {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Comma-separated capability names you already hold (snake_case).
+        #[arg(long)]
+        have: String,
+        /// Memory budget (MiB) for the unlockable-capability filter.
+        #[arg(long, default_value = "2048")]
+        budget_mb: u64,
+        /// A target capability to resolve the cheapest unlock path to.
+        #[arg(long)]
+        target: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -2974,9 +3023,29 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
 
 /// `decentraai agent` subcommands (Collective Intelligence P1).
 fn agent_command(command: AgentCommand) -> Result<()> {
-    let config_path = match &command {
-        AgentCommand::List { config } => config,
-    };
+    match command {
+        AgentCommand::List { config } => agent_list(&config),
+        AgentCommand::Show { config, agent } => agent_show(&config, &agent),
+        AgentCommand::Workflow { template, .. } => agent_workflow(&template),
+        AgentCommand::Reputation {
+            agent,
+            min_samples,
+            ..
+        } => agent_reputation(&agent, min_samples),
+        AgentCommand::TalentTree {
+            have,
+            budget_mb,
+            target,
+            ..
+        } => agent_talent_tree(&have, budget_mb, target.as_deref()),
+    }
+}
+
+/// Loads the config + identity and returns this node's default local agents
+/// (shared by `agent list` and `agent show` so the two never disagree).
+fn load_local_agents(
+    config_path: &Path,
+) -> Result<Vec<decentraai_agents::AgentRecord>> {
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     let data_dir = expand_tilde(&config.node.data_dir);
@@ -2994,51 +3063,316 @@ fn agent_command(command: AgentCommand) -> Result<()> {
             .context("libp2p keypair from identity")?;
     let libp2p_peer = libp2p::PeerId::from(libp2p_keypair.public());
     let short_id = decentraai_distributed::short_node_id(&libp2p_peer);
-    let agents = default_local_agents(
+    Ok(default_local_agents(
         &short_id,
         &config.node.name,
         "",
         config.inference.allow_remote_inference,
-    );
+    ))
+}
 
-    match command {
-        AgentCommand::List { .. } => {
-            if agents.is_empty() {
-                println!("No logical agents advertised by this node.");
-                return Ok(());
+/// Finds an agent by id within a default agent set, if present.
+fn find_agent_by_id<'a>(
+    agents: &'a [decentraai_agents::AgentRecord],
+    agent_id: &str,
+) -> Option<&'a decentraai_agents::AgentRecord> {
+    agents.iter().find(|a| a.agent_id == agent_id)
+}
+
+fn agent_list(config_path: &Path) -> Result<()> {
+    let agents = load_local_agents(config_path)?;
+    if agents.is_empty() {
+        println!("No logical agents advertised by this node.");
+        return Ok(());
+    }
+    for agent in &agents {
+        let caps: Vec<String> = agent
+            .semantic_capabilities
+            .iter()
+            .map(|c| format!("{}:{:?}", c.capability.label(), c.provenance))
+            .collect();
+        let models = if agent.allowed_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            format!("{} model(s)", agent.allowed_models.len())
+        };
+        let tools = if agent.tools.is_empty() {
+            "(none)".to_string()
+        } else {
+            format!("{} tool(s)", agent.tools.len())
+        };
+        println!(
+            "{}  role={}  state={:?}\n  capabilities: {}\n  models: {}   tools: {}\n",
+            agent.agent_id,
+            agent.role,
+            agent.state,
+            if caps.is_empty() { "(none)".to_string() } else { caps.join(", ") },
+            models,
+            tools,
+        );
+    }
+    println!(
+        "Total: {} logical agent(s) on node {}",
+        agents.len(),
+        agent_node_name(config_path).unwrap_or_else(|_| "?".to_string()),
+    );
+    Ok(())
+}
+
+/// The node name from config, best-effort (only used for display).
+fn agent_node_name(config_path: &Path) -> Result<String> {
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    Ok(config.node.name)
+}
+
+fn agent_show(config_path: &Path, agent_id: &str) -> Result<()> {
+    let agents = load_local_agents(config_path)?;
+    let agent = find_agent_by_id(&agents, agent_id).ok_or_else(|| {
+        let ids: Vec<&str> = agents.iter().map(|a| a.agent_id.as_str()).collect();
+        anyhow::anyhow!(
+            "no local agent with id '{agent_id}'. Local agents: {}",
+            if ids.is_empty() {
+                "(none)".to_string()
+            } else {
+                ids.join(", ")
             }
-            for agent in &agents {
-                let caps: Vec<String> = agent
-                    .semantic_capabilities
-                    .iter()
-                    .map(|c| format!("{}:{:?}", c.capability.label(), c.provenance))
-                    .collect();
-                let models = if agent.allowed_models.is_empty() {
-                    "(none)".to_string()
+        )
+    })?;
+
+    println!("Agent: {} ({})", agent.name, agent.agent_id);
+    println!("  role        : {}", agent.role);
+    println!("  description : {}", agent.description);
+    println!("  state       : {:?}", agent.state);
+
+    println!("  capabilities:");
+    if agent.semantic_capabilities.is_empty() {
+        println!("    (none)");
+    }
+    for c in &agent.semantic_capabilities {
+        println!(
+            "    - {}  [provenance: {:?}]",
+            c.capability.label(),
+            c.provenance
+        );
+    }
+
+    println!("  allowed models:");
+    if agent.allowed_models.is_empty() {
+        println!("    (none)");
+    }
+    for m in &agent.allowed_models {
+        println!("    - {m}");
+    }
+
+    println!("  tools:");
+    if agent.tools.is_empty() {
+        println!("    (none)");
+    }
+    for t in &agent.tools {
+        println!("    - {} (kind: {})", t.name, t.kind);
+    }
+
+    println!("  policies:");
+    println!("    sandbox            : {:?}", agent.policies.sandbox);
+    println!(
+        "    max_concurrent_tasks: {}",
+        agent.policies.max_concurrent_tasks
+    );
+    println!("    allow_remote       : {}", agent.policies.allow_remote);
+
+    println!("  memory scopes:");
+    if agent.memory_scopes.is_empty() {
+        println!("    (none)");
+    }
+    for s in &agent.memory_scopes {
+        println!("    - {s}");
+    }
+    Ok(())
+}
+
+/// The known workflow templates this CLI can inspect.
+fn workflow_templates() -> Vec<(&'static str, decentraai_agents::WorkflowTemplate)> {
+    vec![(
+        "research_report",
+        decentraai_agents::research_report_template(),
+    )]
+}
+
+fn agent_workflow(template: &str) -> Result<()> {
+    let templates = workflow_templates();
+    let Some((_, t)) = templates.iter().find(|(id, _)| *id == template) else {
+        let available: Vec<&str> = templates.iter().map(|(id, _)| *id).collect();
+        anyhow::bail!(
+            "unknown workflow template '{template}'. Available templates: {}",
+            available.join(", ")
+        );
+    };
+    println!("Template: {} ({})", t.name, t.template_id);
+    println!("  {}", t.description.trim());
+    println!(
+        "Synthesis: {}",
+        if t.synthesis { "enabled" } else { "disabled" }
+    );
+    for step in &t.steps {
+        let deps = if step.depends_on.is_empty() {
+            "(none)".to_string()
+        } else {
+            step.depends_on.join(", ")
+        };
+        println!(
+            "  step {}: capability={} evidence={:?} depends_on=[{}]",
+            step.step_id,
+            step.capability.label(),
+            step.evidence,
+            deps
+        );
+    }
+    Ok(())
+}
+
+/// Builds an in-memory reputation store seeded with deterministic synthetic
+/// samples for one (agent, capability) — a local demonstration of the P6
+/// reputation model. These are NOT real measurements.
+fn sample_reputation_store(
+    agent: &str,
+    capability: &str,
+    samples: u64,
+) -> decentraai_agents::ReputationStore {
+    use decentraai_agents::{ReputationFactor, ReputationStore, ReputationUpdate};
+    let factors: &[(ReputationFactor, f32)] = &[
+        (ReputationFactor::Reliability, 0.9),
+        (ReputationFactor::Quality, 0.8),
+        (ReputationFactor::Latency, 0.6),
+        (ReputationFactor::Uptime, 0.95),
+        (ReputationFactor::Safety, 1.0),
+    ];
+    let mut store = ReputationStore::new();
+    let mut at = 1_000_000u64;
+    for (factor, value) in factors {
+        for _ in 0..samples {
+            store.observe(ReputationUpdate::new(
+                agent,
+                capability,
+                *factor,
+                *value,
+                at,
+            ));
+            at += 1;
+        }
+    }
+    store
+}
+
+/// Aggregate score over the meaningful factors, honoring `min_samples`.
+/// Mirrors `AgentReputation::score` but lets the CLI respect a custom floor.
+fn aggregate_score(
+    rep: &decentraai_agents::AgentReputation,
+    min_samples: u64,
+) -> f32 {
+    use decentraai_agents::default_weights;
+    let weights = default_weights();
+    let mut weighted_sum = 0.0f64;
+    let mut weight_total = 0.0f64;
+    for (factor, score) in &rep.factors {
+        if !score.is_meaningful(min_samples) {
+            continue;
+        }
+        let w = weights.get(factor).copied().unwrap_or(0.0) as f64;
+        weighted_sum += w * score.value as f64;
+        weight_total += w;
+    }
+    if weight_total == 0.0 {
+        return 0.0;
+    }
+    (weighted_sum / weight_total).clamp(0.0, 1.0) as f32
+}
+
+fn agent_reputation(agent: &str, min_samples: u64) -> Result<()> {
+    // The generalist agent's primary claimed capability; synthetic sample data.
+    let capability = "chat";
+    let store = sample_reputation_store(agent, capability, 3);
+    let rep = store
+        .get(agent, capability)
+        .ok_or_else(|| anyhow::anyhow!("no reputation generated for agent '{agent}'"))?;
+
+    println!("Reputation profile for agent '{agent}' (capability '{capability}')");
+    println!(
+        "  NOTE: built from synthetic sample data for demonstration — these are\n\
+         \x20       NOT real measurements."
+    );
+    println!(
+        "  aggregate score (min_samples={min_samples}): {:.3}",
+        aggregate_score(rep, min_samples)
+    );
+    println!("  per-factor:");
+    for reason in rep.reasons() {
+        println!("    - {reason}");
+    }
+    Ok(())
+}
+
+/// Parses a comma-separated list of capability names, skipping (and warning
+/// on) names that do not map to a known [`CapabilityKind`].
+fn parse_have_capabilities(have: &str) -> Vec<decentraai_hub::capability::CapabilityKind> {
+    use std::str::FromStr;
+    let mut out = Vec::new();
+    for part in have.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match decentraai_hub::capability::CapabilityKind::from_str(part) {
+            Ok(kind) => out.push(kind),
+            Err(()) => warn!(capability = %part, "skipping unknown capability in --have"),
+        }
+    }
+    out
+}
+
+fn agent_talent_tree(have: &str, budget_mb: u64, target: Option<&str>) -> Result<()> {
+    use std::str::FromStr;
+    let tree = decentraai_agents::seed_talent_tree();
+    let have_kinds = parse_have_capabilities(have);
+
+    println!("Talent tree (P8 capability graph):");
+    println!("  all capabilities ({}):", tree.capabilities().len());
+    for kind in &tree.capabilities() {
+        let node = tree.get(*kind).expect("capability present");
+        let marker = if node.experimental { " (experimental)" } else { "" };
+        println!("    - {}{marker}", kind.label());
+    }
+
+    println!(
+        "  unlockable with [{}] and budget {budget_mb} MiB:",
+        have_kinds
+            .iter()
+            .map(|k| k.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let available = tree.available_capabilities(&have_kinds, budget_mb);
+    if available.is_empty() {
+        println!("    (none)");
+    }
+    for kind in &available {
+        println!("    - {}", kind.label());
+    }
+
+    if let Some(target) = target {
+        match decentraai_hub::capability::CapabilityKind::from_str(target) {
+            Ok(kind) => {
+                let path = tree.resolve_path(kind, &have_kinds);
+                if path.is_empty() {
+                    println!(
+                        "  resolve_path to '{target}': not reachable (already held, or a prerequisite chain is missing)"
+                    );
                 } else {
-                    format!("{} model(s)", agent.allowed_models.len())
-                };
-                let tools = if agent.tools.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    format!("{} tool(s)", agent.tools.len())
-                };
-                println!(
-                    "{}  role={}  state={:?}\n  capabilities: {}\n  models: {}   tools: {}\n",
-                    agent.agent_id,
-                    agent.role,
-                    agent.state,
-                    if caps.is_empty() { "(none)".to_string() } else { caps.join(", ") },
-                    models,
-                    tools,
-                );
+                    let steps: Vec<&str> = path.iter().map(|k| k.label()).collect();
+                    println!("  resolve_path to '{target}': {}", steps.join(" -> "));
+                }
             }
-            println!(
-                "Total: {} logical agent(s) on node {} (PeerId {})",
-                agents.len(),
-                config.node.name,
-                identity.peer_id(),
-            );
+            Err(()) => anyhow::bail!("unknown target capability '{target}'"),
         }
     }
     Ok(())
@@ -4588,5 +4922,131 @@ mod tests {
         assert_eq!(store.lookup(&plaintext).unwrap().tier, 1);
         let on_disk = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();
         assert!(!on_disk.contains(&plaintext), "plaintext must never be persisted");
+    }
+
+    // ---- `decentraai agent` inspection subcommands (Show/Workflow/Reputation/TalentTree) ----
+
+    #[test]
+    fn agent_show_resolves_an_agent_by_id_from_the_default_set() {
+        let agents = default_local_agents("dca-test", "TestNode", "", false);
+        let generalist = find_agent_by_id(&agents, "dca-test:generalist")
+            .expect("generalist agent must be present in the default set");
+        assert_eq!(generalist.role, decentraai_agents::ROLE_GENERALIST);
+        assert_eq!(generalist.name, "TestNode Generalist");
+        // A missing id resolves to None (caller turns that into an error).
+        assert!(find_agent_by_id(&agents, "dca-test:nope").is_none());
+    }
+
+    #[test]
+    fn agent_workflow_returns_the_research_report_template_steps() {
+        let (id, template) = workflow_templates()
+            .into_iter()
+            .find(|(id, _)| *id == "research_report")
+            .expect("research_report template is registered");
+        assert_eq!(id, "research_report");
+        assert!(template.synthesis, "research_report synthesizes");
+        let ids: Vec<&str> = template.steps.iter().map(|s| s.step_id.as_str()).collect();
+        assert_eq!(ids, vec!["research", "finance", "documents"]);
+        // finance and documents both depend on research.
+        let finance = template.steps.iter().find(|s| s.step_id == "finance").unwrap();
+        assert_eq!(finance.depends_on, vec!["research".to_string()]);
+        assert_eq!(template.validate(), Ok(()));
+    }
+
+    #[test]
+    fn agent_reputation_produces_a_meaningful_score() {
+        let agent = "dca-test:generalist";
+        let store = sample_reputation_store(agent, "chat", 3);
+        let rep = store.get(agent, "chat").expect("reputation seeded");
+        // Every factor has 3 samples, so at min_samples = 3 all are meaningful.
+        assert!(rep.is_meaningful(3));
+        assert_eq!(rep.reasons().len(), 5);
+        let score = aggregate_score(rep, 3);
+        assert!(
+            score > 0.0,
+            "aggregate of positive factors must be positive, got {score}"
+        );
+        assert!(score <= 1.0);
+        // At a higher floor than any sample count, nothing is meaningful -> 0.
+        assert_eq!(aggregate_score(rep, 4), 0.0);
+    }
+
+    #[test]
+    fn agent_talent_tree_availability_filter_works() {
+        let tree = decentraai_agents::seed_talent_tree();
+        let have = parse_have_capabilities("embeddings,coding,not_a_cap");
+        assert_eq!(
+            have,
+            vec![
+                decentraai_hub::capability::CapabilityKind::Embeddings,
+                decentraai_hub::capability::CapabilityKind::Coding,
+            ],
+            "unknown capabilities are skipped with a warning"
+        );
+        // With Embeddings + Coding held, the one-hop frontier under a 2048 MiB
+        // budget is the leaves plus Retrieval and Summarization. FunctionCalling
+        // needs ToolCalling (not held), so it stays locked.
+        let available = tree.available_capabilities(&have, 2048);
+        for kind in [
+            decentraai_hub::capability::CapabilityKind::Embeddings,
+            decentraai_hub::capability::CapabilityKind::Coding,
+            decentraai_hub::capability::CapabilityKind::Retrieval,
+            decentraai_hub::capability::CapabilityKind::Summarization,
+        ] {
+            assert!(available.contains(&kind), "missing {kind:?} in {available:?}");
+        }
+        assert!(!available.contains(
+            &decentraai_hub::capability::CapabilityKind::FunctionCalling
+        ));
+        // DocumentUnderstanding (4096 MiB) is out of budget.
+        assert!(!available.contains(
+            &decentraai_hub::capability::CapabilityKind::DocumentUnderstanding
+        ));
+        // Target resolution: reach Retrieval starting from Embeddings. The path
+        // may pick up other unlocked leaves first, but must end at Retrieval.
+        let path = tree.resolve_path(
+            decentraai_hub::capability::CapabilityKind::Retrieval,
+            &[decentraai_hub::capability::CapabilityKind::Embeddings],
+        );
+        assert_eq!(
+            path.last(),
+            Some(&decentraai_hub::capability::CapabilityKind::Retrieval)
+        );
+
+        // CLI parsing: the new inspection subcommands accept their args.
+        let cli =
+            Cli::try_parse_from(["decentraai", "agent", "show", "--agent", "x:generalist"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::Show { .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["decentraai", "agent", "workflow"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::Workflow { .. }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["decentraai", "agent", "reputation", "--agent", "x:generalist"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::Reputation { .. }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["decentraai", "agent", "talent-tree", "--have", "embeddings"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::TalentTree { .. }
+            }
+        ));
     }
 }

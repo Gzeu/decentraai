@@ -46,6 +46,9 @@ pub struct StageExecutor {
 pub struct AgentOrchestrator {
     messenger: Arc<AgentMessenger>,
     agents: Arc<AgentManager>,
+    /// This node's peer id, stamped on Delegates so remote runtimes know
+    /// where to reply.
+    local_peer: PeerId,
     reputation: Arc<Mutex<ReputationStore>>,
     /// Max time to wait for a delegated stage's Reply.
     delegate_timeout: Duration,
@@ -59,10 +62,10 @@ impl AgentOrchestrator {
         agents: Arc<AgentManager>,
         local_peer: PeerId,
     ) -> Self {
-        let _ = local_peer;
         Self {
             messenger,
             agents,
+            local_peer,
             reputation: Arc::new(Mutex::new(ReputationStore::new())),
             delegate_timeout: Duration::from_secs(60),
         }
@@ -156,6 +159,8 @@ impl AgentOrchestrator {
         )
         .with_task(&task_id)
         .with_payload(payload)
+        // Stamp our peer so the remote runtime replies to us.
+        .with_from_peer(self.local_peer.to_string())
         .with_created_at_ms(now_ms());
 
         // Send (re-dialing until the connection settles — a dialed link needs

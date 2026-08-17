@@ -2164,3 +2164,50 @@ Continues §93/§94. The remaining pure fabric milestones landed (commit
 - The remote "agent runtime" in the E2E is a test stub that answers
   `Delegate`; a production agent runtime (executing real tasks on the remote
   side) is the next step, built on this orchestrator.
+
+## 96. Collective Intelligence — production agent runtime + memory + observability + CLI (DONE)
+
+Continues §93–§95. Commit `e28f5b3`. The fabric's runtime halves + product
+surfaces.
+
+### Production agent runtime (DONE, `crates/distributed/src/agent_runtime.rs`)
+- [x] `AgentRuntime`: the remote-side executor. Drains an agent's inbox, runs
+  each `AgentMessage::Delegate` through an injected `AgentExecutor` (a
+  `for<'a,'b> Fn(&AgentTask, &Value) -> Result<Value>` seam to a real engine),
+  replies to the delegating peer with `AgentMessage::Reply` (error-shaped on
+  failure so the orchestrator marks the stage failed instead of hanging).
+  `run_forever` drain loop; honest `ExecutedMessage` outcomes.
+- [x] `AgentMessage.from_peer` (additive, backward-compatible): the
+  orchestrator stamps its peer on Delegates so the remote runtime knows where
+  to reply.
+- [x] The orchestrator E2E now uses a real `AgentRuntime` (not a test stub) on
+  the remote node.
+
+### Collective memory persistence (DONE, `crates/distributed/src/agent_memory.rs`)
+- [x] `MemoryStore`: SQLite-backed persistent store enforcing the pure P5
+  policies — `register_scope`/`write`/`read`/`search`/`unregister_scope`/
+  `list_scopes` with access control (owner/trust/remote-opt-in), expiry
+  pruning, `max_entries` (newest kept), JSON policy round-trip, and real
+  cross-reopen persistence (proved by test).
+
+### Collective-graph observability (DONE, dashboard)
+- [x] The AGENTS view now renders a Collective Graph: aggregate metrics
+  (total/local/remote agents, capability claims, tools, models, per-role
+  breakdown) and a capability-coverage table (agents per capability +
+  verified-provenance badge) — all from the real `/v1/agents` payload, no
+  mock data, inside the advanced container.
+
+### CLI (DONE, `decentraai agent`)
+- [x] `decentraai agent show --agent <id>` — full local record.
+- [x] `decentraai agent workflow [--template research_report]` — template steps.
+- [x] `decentraai agent reputation --agent <id>` — synthetic-sample reputation
+  profile (honestly labeled) demonstrating the P6 model.
+- [x] `decentraai agent talent-tree --have <caps> --budget_mb N [--target X]` —
+  P8 capability-graph availability/resolve-path.
+
+### Honesty notes
+- The `AgentRuntime`'s executor is injected; a production *inference*
+  executor (calling the local llama-server / routing a request) is the next
+  integration step — the runtime never pretends to execute without one.
+- CLI `reputation` uses deterministic synthetic samples, clearly labeled —
+  never presented as real measurements.

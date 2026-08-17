@@ -8543,6 +8543,62 @@ mod tests {
         manager.lock().await.shutdown().await.unwrap();
     }
 
+    // Collective graph (P16) aggregate cards are present in the dashboard HTML,
+    // live inside the advanced container (so the normal user never sees raw
+    // distributed-compute internals by default), and are driven by real
+    // /v1/agents payload state, never mock numbers.
+    #[test]
+    fn dashboard_collective_graph_aggregates_are_present_and_advanced() {
+        let adv_open = DASHBOARD_HTML
+            .find("<div id=\"advanced\"")
+            .expect("advanced container present");
+        // Aggregate metric element ids the JS fills from /v1/agents.
+        for needle in [
+            "id=\"cg-total-agents\"",
+            "id=\"cg-local-agents\"",
+            "id=\"cg-remote-peers\"",
+            "id=\"cg-capability-claims\"",
+            "id=\"cg-total-tools\"",
+            "id=\"cg-total-models\"",
+            "id=\"cg-roles\"",
+            "id=\"cg-coverage\"",
+        ] {
+            let idx = DASHBOARD_HTML
+                .find(needle)
+                .unwrap_or_else(|| panic!("collective graph element {needle} must be present"));
+            assert!(idx > adv_open, "{needle} must be inside the advanced container");
+        }
+        // The JS renders the collective graph and capability coverage from the
+        // real /v1/agents payload.
+        assert!(JS_TEMPLATE.contains("function renderCollectiveGraph(a)"));
+        assert!(JS_TEMPLATE.contains("renderCollectiveGraph(a)"));
+        assert!(JS_TEMPLATE.contains("cg-capability-claims"));
+        assert!(JS_TEMPLATE.contains("cg-coverage"));
+        assert!(JS_TEMPLATE.contains("semantic_capabilities"));
+    }
+
+    // The /v1/agents handler must keep returning a well-formed payload when the
+    // agent manager is not attached (the dashboard shows its empty state).
+    #[tokio::test]
+    async fn agents_handler_returns_empty_payload_when_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/v1/agents"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], false);
+        assert_eq!(body["agents"].as_array().unwrap().len(), 0);
+        assert_eq!(body["local_count"], 0);
+        assert_eq!(body["remote_peer_count"], 0);
+        assert_eq!(body["total_count"], 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn status_and_peers_feed_the_dashboard() {

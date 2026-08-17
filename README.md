@@ -680,6 +680,13 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
   via `AgentMessage::Delegate` over the messenger → per-hop verify → collect.
   E2E-verified: a coordinator delegates a real workflow to a remote agent on
   another node and completes it.
+- **Production agent runtime** (`crates/distributed/src/agent_runtime.rs`):
+  the remote-side executor — drains an agent's inbox, runs each `Delegate`
+  through an injected `AgentExecutor` (seam to a real engine) and replies.
+  Plus a SQLite-backed `MemoryStore` (persistent, access-enforcing collective
+  memory), a Collective-Graph dashboard view (agents/models/tools/capability
+  coverage), and an extended `decentraai agent` CLI
+  (`show` / `workflow` / `reputation` / `talent-tree`).
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted

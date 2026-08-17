@@ -69,6 +69,10 @@ pub struct AgentMessage {
     /// `agent_id` of the recipient; empty means "any capable agent" and is
     /// resolved by the transport (see [`validate_message`]).
     pub to_agent: String,
+    /// Hosting peer id of the sender (libp2p PeerId string), set by the
+    /// transport so the recipient knows where to reply. Not user-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_peer: Option<String>,
     /// What kind of exchange this is.
     pub kind: MessageKind,
     /// Linked [`crate::AgentTask`] id, when the message belongs to a task.
@@ -97,6 +101,7 @@ impl AgentMessage {
             message_id: message_id.into(),
             from_agent: from.into(),
             to_agent: to.into(),
+            from_peer: None,
             kind,
             task_id: None,
             payload: None,
@@ -105,6 +110,12 @@ impl AgentMessage {
             nonce: 0,
             created_at_ms: 0,
         }
+    }
+
+    /// Sets the sender's hosting peer id (used by the recipient to reply).
+    pub fn with_from_peer(mut self, from_peer: impl Into<String>) -> Self {
+        self.from_peer = Some(from_peer.into());
+        self
     }
 
     /// Links the message to an [`crate::AgentTask`] by id.

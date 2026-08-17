@@ -1051,6 +1051,7 @@ dependencies = [
  "futures",
  "httpmock",
  "libp2p",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

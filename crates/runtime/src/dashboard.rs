@@ -700,6 +700,25 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           </div>
           <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Agents are logical execution contexts on nodes — not extra processes. Capability claims carry provenance (VERIFIED / INFERRED); an agent is never assumed capable of something it has not claimed with the required evidence.</p>
         </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Collective graph <span class="count">P16 · entities</span></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px">
+            <div class="metric"><div class="label">Total agents</div><div class="value" id="cg-total-agents">—</div></div>
+            <div class="metric"><div class="label">Local agents</div><div class="value" id="cg-local-agents">—</div></div>
+            <div class="metric"><div class="label">Remote peers</div><div class="value" id="cg-remote-peers">—</div></div>
+            <div class="metric"><div class="label">Capability claims</div><div class="value" id="cg-capability-claims">—</div></div>
+            <div class="metric"><div class="label">Tools</div><div class="value" id="cg-total-tools">—</div></div>
+            <div class="metric"><div class="label">Models</div><div class="value" id="cg-total-models">—</div></div>
+          </div>
+          <div style="margin-top:10px"><b style="font-size:12px">Roles <span class="muted">aggregated across the collective</span></b>
+            <div id="cg-roles" class="muted" style="font-size:12px;margin-top:6px">—</div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Capability coverage <span class="count">provenance-aware</span></h2>
+          <table><thead><tr><th>Capability</th><th class="num">Agents</th><th class="num">Verified</th><th>Coverage</th></tr></thead>
+          <tbody id="cg-coverage"><tr><td colspan="4" class="empty">no capability claims yet — agents have not advertised semantic capabilities</td></tr></tbody></table>
+        </div>
       </section>
 
       <!-- NETWORK -->
@@ -2034,18 +2053,67 @@ function renderAgents(a){
   $('agents-local-count').textContent = (a && a.local_count) != null ? a.local_count : '—';
   $('agents-remote-peers').textContent = (a && a.remote_peer_count) != null ? a.remote_peer_count : '—';
   $('agents-total-count').textContent = (a && a.total_count) != null ? a.total_count : '—';
+  renderCollectiveGraph(a);
+}
+// Collective graph (P16): aggregate metrics, role breakdown and a
+// provenance-aware capability coverage table — all derived from the real
+// /v1/agents payload, never mock data.
+function renderCollectiveGraph(a){
+  const agents = (a && a.agents) || [];
+  const capClaims = agents.reduce((n, ag) => n + ((ag.semantic_capabilities || []).length), 0);
+  const totalTools = agents.reduce((n, ag) => n + ((ag.tools || []).length), 0);
+  const totalModels = agents.reduce((n, ag) => n + ((ag.allowed_models || []).length), 0);
+  $('cg-total-agents').textContent = agents.length;
+  $('cg-local-agents').textContent = (a && a.local_count) != null ? a.local_count : '—';
+  $('cg-remote-peers').textContent = (a && a.remote_peer_count) != null ? a.remote_peer_count : '—';
+  $('cg-capability-claims').textContent = capClaims;
+  $('cg-total-tools').textContent = totalTools;
+  $('cg-total-models').textContent = totalModels;
+  // Per-role breakdown across the collective.
+  const byRole = {};
+  agents.forEach(ag => { const r = ag.role || 'unknown'; byRole[r] = (byRole[r] || 0) + 1; });
+  const roles = Object.keys(byRole);
+  $('cg-roles').innerHTML = roles.length
+    ? roles.map(r => '<span class="nc-model" title="'+esc(r)+'">'+esc(r)+' <b>×'+byRole[r]+'</b></span>').join(' ')
+    : '—';
+  // Capability coverage: how many agents claim each capability and how many
+  // of those claims are verified (provenance-aware).
+  const cov = {};
+  agents.forEach(ag => (ag.semantic_capabilities || []).forEach(c => {
+    const name = c.capability || 'unknown';
+    if (!cov[name]) cov[name] = { agents: 0, verified: 0 };
+    cov[name].agents++;
+    if (c.provenance === 'verified') cov[name].verified++;
+  }));
+  const names = Object.keys(cov);
+  $('cg-coverage').innerHTML = names.length
+    ? names.map(name => {
+        const c = cov[name];
+        const pct = Math.round((c.agents / Math.max(1, agents.length)) * 100);
+        return '<tr>'+
+          '<td>'+esc(name)+'</td>'+
+          '<td class="num">'+c.agents+'</td>'+
+          '<td class="num">'+(c.verified ? '<span class="badge pv ok">'+c.verified+' verified</span>' : '<span class="muted">—</span>')+'</td>'+
+          '<td><div style="min-width:64px;height:6px;border-radius:999px;background:rgba(255,255,255,.06)"><div style="width:'+pct+'%;height:100%;border-radius:999px;background:var(--accent)"></div></div> <span class="muted" style="font-size:10.5px">'+pct+'%</span></td>'+
+        '</tr>';
+      }).join('')
+    : '<tr><td colspan="4" class="empty">no capability claims yet — agents have not advertised semantic capabilities</td></tr>';
 }
 function agentCard(a){
   const isLocal = !a.remote;
   const caps = (a.semantic_capabilities || []).map(c =>
     '<span class="nc-model" title="'+(c.provenance||'')+' provenance">' + esc(c.capability||'') + (c.provenance === 'verified' ? ' ✓' : c.provenance === 'inferred' ? ' ~' : '') + '</span>'
   ).join('');
-  const models = (a.allowed_models || []).slice(0, 4).map(m =>
+  const allModels = a.allowed_models || [];
+  const models = allModels.slice(0, 4).map(m =>
     '<span class="nc-model" title="'+esc(m)+'">'+short(m, 12)+'</span>'
   ).join('');
-  const tools = (a.tools || []).slice(0, 4).map(t =>
+  const allTools = a.tools || [];
+  const tools = allTools.slice(0, 4).map(t =>
     '<span class="nc-model" title="'+esc(t.kind||'')+'">'+esc(t.name||'')+'</span>'
   ).join('');
+  const modelBadge = allModels.length ? '<span class="badge faint">'+allModels.length+'</span>' : '';
+  const toolBadge = allTools.length ? '<span class="badge faint">'+allTools.length+'</span>' : '';
   const state = a.state || 'registered';
   const stateBadge = state === 'ready' ? '<span class="badge ok">ready</span>'
     : state === 'busy' ? '<span class="badge accent">busy</span>'
@@ -2073,8 +2141,8 @@ function agentCard(a){
       '<span><b>capabilities</b> '+(caps || '<span class="badge faint">none claimed</span>')+'</span>'+
     '</div>'+
     '<div class="wc-meta">'+
-      '<span><b>models</b> '+(models || '<span class="badge faint">none</span>')+'</span>'+
-      '<span><b>tools</b> '+(tools || '<span class="badge faint">none</span>')+'</span>'+
+      '<span><b>models</b> '+(models || '<span class="badge faint">none</span>')+' '+modelBadge+'</span>'+
+      '<span><b>tools</b> '+(tools || '<span class="badge faint">none</span>')+' '+toolBadge+'</span>'+
     '</div>'+
     (a.description ? '<div class="wc-meta"><span style="color:var(--muted)">'+esc(a.description)+'</span></div>' : '')+
   '</div>';

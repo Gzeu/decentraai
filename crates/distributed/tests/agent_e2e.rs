@@ -396,8 +396,8 @@ async fn two_nodes_exchange_agent_messages_over_the_transport() {
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
     use decentraai_agents::{
-        AgentAdvertisement, AgentMessage, AgentRecord, AgentTask, AgentState, DelegationVerdict,
-        MessageKind, ROLE_SPECIALIST, TaskVerification,
+        AgentAdvertisement, AgentRecord, AgentTask, AgentState, DelegationVerdict, ROLE_SPECIALIST,
+        TaskVerification,
     };
     use decentraai_distributed::agent_messenger::AgentMessenger;
     use decentraai_distributed::agent_orchestrator::AgentOrchestrator;
@@ -435,29 +435,16 @@ async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
     // send() rides the connected peer.
     messenger_b.set_transport(node_b.clone());
 
-    // B's agent runtime: drain the inbox and reply to every Delegate.
-    let runtime_b = messenger_b.clone();
-    let rt_peer_a = peer_a;
-    let _runtime_task = tokio::spawn(async move {
-        loop {
-            if let Some(msg) = runtime_b.pop("b:ocr") {
-                if msg.kind == MessageKind::Delegate {
-                    let task_id = msg.task_id.unwrap_or_else(|| "t".into());
-                    let reply = AgentMessage::new(
-                        format!("reply-{task_id}"),
-                        "b:ocr",
-                        "orchestrator",
-                        MessageKind::Reply,
-                    )
-                    .with_task(&task_id)
-                    .with_payload(serde_json::json!({ "ocr_text": "parsed text" }))
-                    .with_created_at_ms(1_700_000_000_000);
-                    let _ = runtime_b.send(rt_peer_a, reply).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    // B's agent runtime: a production AgentRuntime that executes Delegates
+    // and replies to the delegating peer (via the message's from_peer).
+    let mut agent_runtime = decentraai_distributed::agent_runtime::AgentRuntime::new(
+        "b:ocr",
+        messenger_b.clone(),
+    );
+    agent_runtime.with_executor(|_task, _inputs| {
+        Ok(serde_json::json!({ "ocr_text": "parsed text" }))
     });
+    let _runtime_task = tokio::spawn(async move { agent_runtime.run_forever().await });
 
     // Node A: orchestrator with a messenger riding the SAME node that dials
     // B, so both the outgoing Delegate and the inbound Reply flow through the
