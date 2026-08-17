@@ -1,0 +1,32 @@
+name: Dashboard build verification
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build runtime and node CLI
+        run: cargo build --workspace
+
+      - name: Verify DecentraAI branding is compiled into source
+        shell: bash
+        run: |
+          grep -q 'DecentraAI — Command Deck' crates/runtime/src/dashboard.rs
+          grep -q 'aria-label="DecentraAI logo"' crates/runtime/src/dashboard.rs
+          test -f docs/brand/decentraai-logo.svg
+          echo 'DecentraAI dashboard branding source verified.'
