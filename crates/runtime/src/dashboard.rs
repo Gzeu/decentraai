@@ -43,7 +43,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DecentraAI dashboard</title>
+<title>DecentraAI — Command Deck</title>
 <style>
 :root{
   --bg:#05070d; --bg-2:#0a0e16; --panel:#0d121c; --panel-2:#0a0f18;
@@ -78,7 +78,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 /* ---------- sidebar ---------- */
 .rail{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:rgba(8,12,20,.82);border-right:1px solid var(--line);padding:18px 12px;gap:4px;backdrop-filter:blur(12px)}
 .brand{display:flex;align-items:center;gap:10px;padding:4px 8px 16px}
-.brand-mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:grid;place-items:center;font-weight:800;color:#04121a;font-size:15px;box-shadow:0 0 18px rgba(34,211,238,.35)}
+.brand-mark{width:32px;height:32px;flex:0 0 32px;border-radius:9px;display:grid;place-items:center;background:rgba(34,211,238,.06);border:1px solid rgba(34,211,238,.28);box-shadow:0 0 18px rgba(34,211,238,.18);overflow:hidden}.brand-mark svg{width:27px;height:27px;display:block}.brand-mark .logo-core{fill:var(--accent)}.brand-mark .logo-node{fill:#e8eef6}.brand-mark .logo-link{stroke:var(--accent);stroke-width:1.6;fill:none;opacity:.95}
 .brand-name{font-weight:700;letter-spacing:.02em}
 .brand-sub{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.14em}
 .rail-label{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.12em;padding:14px 10px 4px}
@@ -349,7 +349,16 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 <div class="layout">
   <!-- ======================= RAIL ======================= -->
   <aside class="rail">
-    <div class="brand"><div class="brand-mark">◆</div><div><div class="brand-name">DecentraAI</div><div class="brand-sub">command deck</div></div></div>
+    <div class="brand"><div class="brand-mark" aria-label="DecentraAI logo">
+  <svg viewBox="0 0 64 64" role="img" aria-hidden="true">
+    <path class="logo-link" d="M18 10h17c12 0 21 10 21 22s-9 22-21 22H18"/>
+    <path class="logo-link" d="M18 10v44"/>
+    <path class="logo-link" d="M28 22L42 17M28 22l14 25M28 22l13 10M28 42l13-10M28 42l14 5"/>
+    <circle class="logo-node" cx="28" cy="22" r="3.8"/><circle class="logo-node" cx="28" cy="42" r="3.8"/>
+    <circle class="logo-node" cx="42" cy="17" r="3.8"/><circle class="logo-node" cx="41" cy="32" r="4.3"/><circle class="logo-node" cx="42" cy="47" r="3.8"/>
+    <circle class="logo-core" cx="41" cy="32" r="2.1"/>
+  </svg>
+</div><div><div class="brand-name">DecentraAI</div><div class="brand-sub">execution fabric</div></div></div>
 
     <div class="rail-label">Navigate</div>
     <button class="nav-item" data-view="overview"><span class="ic">◉</span><span>Overview</span></button>
