@@ -2249,3 +2249,22 @@ Commit `1c4f9bb`. Pivot on local GGUF models.
 
 Switch between models by editing `node.model` (e.g. Llama-3.2-1B for speed,
 Mistral-7B for quality) and restarting the node — no re-detection needed.
+
+## 99. Collective workflows live over the fabric (DONE)
+
+Commit `1d3a9a5`. The P9 `research_report_template` now runs end-to-end over
+the live fabric, not just as a pure unit.
+
+- [x] `AgentOrchestrator::orchestrate_plan(&DelegationPlan)` — execute an
+  already-instantiated plan (e.g. from `WorkflowTemplate::instantiate`) by
+  delegating each stage to a chosen executor, verifying per hop. Shared
+  `run_plan` loop behind both `orchestrate` (plan+run) and `orchestrate_plan`.
+- [x] `select_executor` fix: a stage with NO capability requirements (e.g. a
+  synthesis stage) is eligible on any agent — the orchestrator never invents
+  an executor, but also does not block unconstrained stages on a capability
+  match (this is why the synthesis stage of a workflow whose master task
+  declares no capabilities previously failed as "no capable agent").
+- [x] E2E: the research-report workflow (Research → Finance → Documents →
+  Synthesis) is instantiated from the P9 template and executed on a real
+  remote node's `AgentRuntime` — all four stages delegate, per-hop
+  verification passes, and a final output is produced.

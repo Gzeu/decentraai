@@ -100,28 +100,31 @@ impl AgentOrchestrator {
     ///
     /// Ranking (deterministic): agents that satisfy the stage's capability,
     /// local first, then by reputation score desc (unknown reputation = 0, a
-    /// tie never penalises a capable agent), then by agent_id asc.
+    /// tie never penalises a capable agent), then by agent_id asc. A stage
+    /// with NO capability requirements (e.g. a synthesis stage) is eligible on
+    /// any agent — the orchestrator never invents an executor, but it also
+    /// does not block unconstrained stages on a capability match.
     pub fn select_executor(&self, stage: &DelegationStage) -> Option<StageExecutor> {
-        let cap = stage
+        let reputation = self.reputation.lock().unwrap();
+        let cap_label = stage
             .task
             .required_capabilities
             .first()
-            .map(|r| r.capability)
-            .or(stage.task.required_capabilities.first().map(|r| r.capability));
-        let cap = cap?;
-        let reputation = self.reputation.lock().unwrap();
+            .map(|r| r.capability.label().to_string())
+            .unwrap_or_default();
         let mut candidates: Vec<(bool /*local*/, f32 /*score*/, String, PeerId)> = self
             .agents
             .view()
             .into_iter()
             .filter(|v| {
-                match_agent_semantic(&v.record, &stage.task.required_capabilities).is_satisfied()
+                stage.task.required_capabilities.is_empty()
+                    || match_agent_semantic(&v.record, &stage.task.required_capabilities)
+                        .is_satisfied()
             })
             .map(|v| {
                 let local = !v.remote;
-                let cap_name = cap.label().to_string();
                 let score = reputation
-                    .get(&v.record.agent_id, &cap_name)
+                    .get(&v.record.agent_id, &cap_label)
                     .map(|r| r.score())
                     .unwrap_or(0.0);
                 (local, score, v.record.agent_id.clone(), v.peer_id)
@@ -197,8 +200,7 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Executes a plan across the fabric by delegating each stage to its
-    /// chosen executor (async). Builds assignments deterministically.
+    /// Plans a master task and executes it across the fabric (async).
     pub async fn orchestrate(&self, master_task: &AgentTask) -> WorkflowOutcome {
         let plan = match self.plan(master_task) {
             Ok(p) => p,
@@ -216,6 +218,19 @@ impl AgentOrchestrator {
                 );
             }
         };
+        self.run_plan(&plan).await
+    }
+
+    /// Executes an already-instantiated plan (e.g. one built from a
+    /// `WorkflowTemplate::instantiate`) across the fabric by delegating each
+    /// stage to its chosen executor and verifying per hop.
+    pub async fn orchestrate_plan(&self, plan: &DelegationPlan) -> WorkflowOutcome {
+        self.run_plan(plan).await
+    }
+
+    /// The shared execution loop: delegate stages in topological order,
+    /// verify per hop, collect outputs. Honest Partial on any failure.
+    async fn run_plan(&self, plan: &DelegationPlan) -> WorkflowOutcome {
         let plan_id = plan.plan_id.clone();
         let task_id = plan.master_task_id.clone();
 
@@ -312,7 +327,7 @@ impl AgentOrchestrator {
             stages: results,
             final_output,
         };
-        WorkflowOutcome::new(plan_id, task_id, plan, result)
+        WorkflowOutcome::new(plan_id, task_id, plan.clone(), result)
     }
 
     /// Returns the flattened known agents (for dashboards/tests).

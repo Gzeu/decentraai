@@ -526,3 +526,137 @@ async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
     drop(node_a);
     drop(node_b);
 }
+/// P9 collective workflow end-to-end: the `research_report_template`
+/// (Research → Finance → Documents → Synthesis, Critic-verified) instantiated
+/// into a plan and executed by delegating every stage to a remote agent,
+/// verifying per hop. Proves the full template → plan → delegate → verify →
+/// collect path on real nodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_runs_research_report_workflow_on_remote_agent() {
+    use decentraai_agents::{
+        AgentAdvertisement, AgentRecord, AgentState, DelegationVerdict, ROLE_GENERALIST,
+        research_report_template,
+    };
+    use decentraai_distributed::agent_messenger::AgentMessenger;
+    use decentraai_distributed::agent_orchestrator::AgentOrchestrator;
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
+
+    let identity_a = Identity::generate();
+    let identity_b = Identity::generate();
+    let peer_a = libp2p_peer_id(&identity_a);
+    let peer_b = libp2p_peer_id(&identity_b);
+
+    // Node B: messenger + a production AgentRuntime answering every Delegate
+    // with a per-stage object (honestly distinguishable by task id).
+    let messenger_b = Arc::new(AgentMessenger::new(
+        P2PNode::new(
+            &identity_b,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap(),
+    ));
+    let mut handler_b = DistributedP2PHandler::new();
+    handler_b.set_messenger(messenger_b.clone());
+    let chained_b = ChainedHandler::new().add_handler(Arc::new(handler_b));
+    let node_b = P2PNode::new(
+        &identity_b,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained_b)),
+    )
+    .unwrap();
+    let node_b_addr = node_b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    messenger_b.set_transport(node_b.clone());
+
+    let mut agent_runtime = decentraai_distributed::agent_runtime::AgentRuntime::new(
+        "b:generalist",
+        messenger_b.clone(),
+    );
+    agent_runtime.with_executor(|task, _inputs| {
+        let stage = task.task_id.clone();
+        async move { Ok(serde_json::json!({ "stage": stage, "ok": true })) }
+    });
+    let _runtime_task = tokio::spawn(async move { agent_runtime.run_forever().await });
+
+    // Node A: orchestrator.
+    let messenger_a = Arc::new(AgentMessenger::new(
+        P2PNode::new(
+            &identity_a,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap(),
+    ));
+    let mut handler_a = DistributedP2PHandler::new();
+    handler_a.set_messenger(messenger_a.clone());
+    let chained_a = ChainedHandler::new().add_handler(Arc::new(handler_a));
+    let node_a = P2PNode::new(
+        &identity_a,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained_a)),
+    )
+    .unwrap();
+    node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    node_a.dial(&node_b_addr.to_string()).await.unwrap();
+    messenger_a.set_transport(node_a.clone());
+
+    // The remote agent advertises the capabilities the research_report
+    // template requires (reasoning, document understanding, chat).
+    let mut generalist = AgentRecord::new("b:generalist", "Generalist", ROLE_GENERALIST)
+        .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
+        .with_capability(CapabilityKind::DocumentUnderstanding, Provenance::Inferred)
+        .with_capability(CapabilityKind::Chat, Provenance::Inferred);
+    generalist.set_state(AgentState::Ready);
+    let agent_manager = decentraai_distributed::agents::AgentManager::new(peer_a, "coord".into());
+    agent_manager.process_advertisement(AgentAdvertisement::new(
+        peer_b,
+        "node-b",
+        vec![generalist],
+    ));
+    let agent_manager = Arc::new(agent_manager);
+
+    let mut orchestrator = AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
+    orchestrator.with_delegate_timeout(Duration::from_secs(15));
+
+    // Instantiate the research-report workflow from the P9 template.
+    let master_task = decentraai_agents::AgentTask::new("report-master");
+    let plan = research_report_template()
+        .instantiate(&master_task, "plan-report", 1_700_000_000_000)
+        .expect("template instantiates into a valid plan");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let outcome = orchestrator.orchestrate_plan(&plan).await;
+
+    assert_eq!(
+        outcome.verdict,
+        DelegationVerdict::Completed,
+        "workflow must complete: {:?}",
+        outcome.result.stages
+    );
+    // The template has research + finance + documents + synthesis.
+    assert_eq!(
+        outcome.result.stages.len(),
+        4,
+        "research + finance + documents + synthesis"
+    );
+    let synth = outcome
+        .result
+        .stages
+        .iter()
+        .find(|s| s.stage_id == "synthesis")
+        .expect("synthesis stage present");
+    assert!(synth.verified, "synthesis output verified");
+    assert!(
+        outcome.result.final_output.is_some(),
+        "workflow produces a final output"
+    );
+
+    drop(messenger_a);
+    drop(messenger_b);
+    drop(node_a);
+    drop(node_b);
+}
