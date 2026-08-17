@@ -7,10 +7,13 @@
 ## Active / next (in order)
 
 - [ ] **Two-node LAN validation** (Collective Intelligence live on 2 nodes)
-  - [ ] Desktop: `git pull --rebase && bash scripts/upgrade-node.sh` (build nou;
-        Desktop-ul e pe IP nou `192.168.1.138:41627`, verifica `bootstrap_peers`).
-  - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
+  - [x] Desktop: `git pull --rebase && bash scripts/upgrade-node.sh` (DONE
+        2026-08-18, HEAD `f7dbe10`, `accepts_remote_inference: true`).
+  - [ ] Laptop: **binarul e vechi** (agent ads respinse: `missing field
+        protocol_version`) — ruleaza `git pull --rebase && bash
+        scripts/upgrade-node.sh` pe i5, apoi `bash scripts/validate-lan.sh`
         (orchestrator pe un nod, executa pe celalalt prin `route_request`).
+        Referinta: `docs/NODE_UPGRADE.md`.
 - [ ] **Collective memory written from workflows** — when a workflow completes,
   write its verified results into the SQLite `MemoryStore` scopes (ownership +
   access per the pure P5 model), so the fabric accumulates real knowledge.
