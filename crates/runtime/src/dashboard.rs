@@ -371,7 +371,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="diag"><span class="ic">✚</span><span>Diag</span></button>
     <button class="nav-item" data-view="security"><span class="ic">⚿</span><span>Security</span></button>
     <button class="nav-item" data-view="settings"><span class="ic">⚙</span><span>Settings</span></button>
-    <button class="nav-item" onclick="window.open('/admin','_blank')" title="Master-gated admin console (tokens, consumer keys, trust)"><span class="ic">🛡</span><span>Admin</span></button>
+    <button class="nav-item" onclick="location.href='/admin'" title="Master-gated admin console (tokens, consumer keys, trust)"><span class="ic">🛡</span><span>Admin</span></button>
 
     <div class="rail-foot">
       <button id="adv-toggle" title="Show or hide the advanced fabric views">Show advanced</button>
