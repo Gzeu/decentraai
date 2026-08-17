@@ -2324,3 +2324,19 @@ with Llama-3.2-1B returns `verdict: completed`, all four stages verified, and
 a real generated final report text.
 
 933 workspace tests green; clippy clean.
+
+## 102. Two-node LAN validation tooling (READY — pending Desktop upgrade)
+
+Commit `pending`. The Desktop node (dca-NGE65Z) runs an older binary, so it is
+not yet visible as a remote worker/agent (old builds omit agent
+advertisements and `accepts_remote_inference`). Trust is already set on this
+laptop.
+
+- [x] `scripts/validate-lan.sh` — from the coordinating laptop: checks the
+  API, requires at least one remote worker, reports trusted/remote_ok per
+  remote worker, picks a model served only by the remote node (so routing is
+  forced remote), routes a real chat request to it, and reports the reply —
+  proving two-node remote inference end-to-end. Exits non-zero on any failure.
+- [ ] **Blocked on Desktop**: run `git pull && bash scripts/upgrade-node.sh`
+  on the Desktop so it advertises agents + `accepts_remote_inference`, then
+  `bash scripts/validate-lan.sh` on this laptop.
