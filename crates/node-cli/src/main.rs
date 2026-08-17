@@ -1283,26 +1283,45 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     distributed.set_signing_identity(identity.signing_key_bytes());
 
     // ---- Collective Intelligence: make this node a live agent host ----
-    // A production AgentRuntime with an inference executor answers delegated
-    // LLM tasks through the fabric; a SQLite MemoryStore persists collective
-    // memory. Both are best-effort and never disturb the existing flow.
+    // A production AgentRuntime per local agent answers delegated LLM tasks
+    // through the fabric (inference executor); a SQLite MemoryStore persists
+    // collective memory. Both are best-effort and never disturb the flow.
     if is_worker && !model_hash.is_empty() {
         let inference_executor =
             decentraai_distributed::agent_runtime::InferenceAgentExecutor::new(
                 Arc::new(distributed.clone()),
                 model_hash.clone(),
             );
-        let mut agent_runtime =
-            decentraai_distributed::agent_runtime::AgentRuntime::new("orchestrator", agent_messenger.clone());
-        agent_runtime.with_executor(move |task, inputs| {
+        // One runtime per local logical agent (the orchestrator selects these
+        // as executors for delegated stages).
+        let local_agents = agent_manager.local_agents();
+        for agent in &local_agents {
+            let mut agent_runtime = decentraai_distributed::agent_runtime::AgentRuntime::new(
+                agent.agent_id.clone(),
+                agent_messenger.clone(),
+            );
             let ex = inference_executor.clone();
-            async move { ex.execute(&task, &inputs).await }
-        });
-        tokio::spawn(async move { agent_runtime.run_forever().await });
-        info!("node is a live agent host (inference executor wired)");
+            agent_runtime.with_executor(move |task, inputs| {
+                let ex = ex.clone();
+                async move { ex.execute(&task, &inputs).await }
+            });
+            tokio::spawn(async move { agent_runtime.run_forever().await });
+        }
+        info!(
+            agents = local_agents.len(),
+            "node is a live agent host (inference executor wired)"
+        );
     } else {
         info!("node agent host: no servable model — agent runtime idle");
     }
+    // The coordinator-side orchestrator runs collective workflows by delegating
+    // stages to the local/remote agents. Shared with the API so a user can
+    // trigger a workflow from the dashboard/CLI.
+    let agent_orchestrator = Arc::new(decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
+        agent_messenger.clone(),
+        agent_manager.clone(),
+        local_peer_id,
+    ));
     // Persistent collective memory (best-effort; the node keeps working if it
     // cannot open or create the store).
     let agent_memory_path = data_dir.join("db/agent_memory.sqlite");
@@ -1520,6 +1539,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         state.attach_distributed(distributed.clone().into());
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());
+        // P3.5/P9: the API can trigger collective workflows by delegating to
+        // the node's local agents.
+        state.attach_orchestrator(agent_orchestrator.clone());
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.

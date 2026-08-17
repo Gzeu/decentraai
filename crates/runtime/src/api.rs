@@ -285,6 +285,10 @@ pub struct ApiState {
     /// agents, wired into the AGENTS dashboard view. `None` when the node
     /// does not run an agent manager.
     agents: Option<Arc<decentraai_distributed::agents::AgentManager>>,
+    /// The coordinator-side orchestrator that runs collective workflows by
+    /// delegating stages to local/remote agents (P3.5/P9). `None` when the
+    /// node is not an agent host.
+    orchestrator: Option<Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>>,
 }
 
 impl ApiState {
@@ -330,6 +334,7 @@ impl ApiState {
             p2p,
             distributed: None,
             agents: None,
+            orchestrator: None,
         }
     }
 
@@ -347,6 +352,15 @@ impl ApiState {
         agents: Arc<decentraai_distributed::agents::AgentManager>,
     ) {
         self.agents = Some(agents);
+    }
+
+    /// Attaches the collective-workflow orchestrator (P3.5/P9) so the API can
+    /// trigger a workflow that delegates stages to local/remote agents.
+    pub fn attach_orchestrator(
+        &mut self,
+        orchestrator: Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>,
+    ) {
+        self.orchestrator = Some(orchestrator);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4369,6 +4383,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/peers", get(peers_handler))
         .route("/v1/compute", get(compute_handler))
         .route("/v1/agents", get(agents_handler))
+        .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5329,6 +5344,88 @@ async fn agents_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
             "total_count": agents.total_count(),
         });
     }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// Runs a collective workflow by delegating stages to the node's agents
+/// (P9). Body: `{ "prompt": string, "template": "research_report" (default) }`.
+/// Returns the workflow outcome (verdict + per-stage results + final output).
+async fn agents_orchestrate_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_agents::{AgentTask, research_report_template};
+
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(orchestrator) = &state.orchestrator else {
+        let body = serde_json::json!({ "error": "orchestrator not attached (node is not an agent host)" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+
+    let prompt = body
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let template = body
+        .get("template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("research_report");
+
+    // Master task: the workflow template supplies the capability DAG; the
+    // user prompt is the seed injected into every stage.
+    let master_task = AgentTask::new("workflow-master");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let plan = match template {
+        "research_report" => match research_report_template()
+            .instantiate(&master_task, "workflow-run", now_ms)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let body = serde_json::json!({ "error": format!("template instantiation failed: {e}") });
+                return (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&body).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        },
+        other => {
+            let body = serde_json::json!({
+                "error": format!("unknown workflow template '{other}' (supported: research_report)")
+            });
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response();
+        }
+    };
+
+    let seed = serde_json::json!({ "prompt": prompt });
+    let outcome = orchestrator.orchestrate_plan(&plan, Some(&seed)).await;
+
+    let body = serde_json::json!({
+        "verdict": serde_json::to_value(&outcome.verdict).unwrap_or_default(),
+        "stages": serde_json::to_value(&outcome.result.stages).unwrap_or_default(),
+        "final_output": outcome.result.final_output,
+        "completed_stages": outcome.completed_stages,
+        "failed_stages": outcome.failed_stages,
+    });
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),

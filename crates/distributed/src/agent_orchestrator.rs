@@ -27,6 +27,7 @@ use decentraai_agents::{
     WorkflowOutcome, match_agent_semantic,
 };
 use libp2p::PeerId;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -218,19 +219,31 @@ impl AgentOrchestrator {
                 );
             }
         };
-        self.run_plan(&plan).await
+        self.run_plan(&plan, None).await
     }
 
     /// Executes an already-instantiated plan (e.g. one built from a
     /// `WorkflowTemplate::instantiate`) across the fabric by delegating each
     /// stage to its chosen executor and verifying per hop.
-    pub async fn orchestrate_plan(&self, plan: &DelegationPlan) -> WorkflowOutcome {
-        self.run_plan(plan).await
+    ///
+    /// `seed` is merged into every stage's inputs (its fields win only when a
+    /// dependency did not already produce them) so the original user prompt
+    /// stays available to each stage.
+    pub async fn orchestrate_plan(
+        &self,
+        plan: &DelegationPlan,
+        seed: Option<&serde_json::Value>,
+    ) -> WorkflowOutcome {
+        self.run_plan(plan, seed).await
     }
 
     /// The shared execution loop: delegate stages in topological order,
     /// verify per hop, collect outputs. Honest Partial on any failure.
-    async fn run_plan(&self, plan: &DelegationPlan) -> WorkflowOutcome {
+    async fn run_plan(
+        &self,
+        plan: &DelegationPlan,
+        seed: Option<&serde_json::Value>,
+    ) -> WorkflowOutcome {
         let plan_id = plan.plan_id.clone();
         let task_id = plan.master_task_id.clone();
 
@@ -262,6 +275,13 @@ impl AgentOrchestrator {
                     inputs.insert(dep.clone(), out.clone());
                 } else {
                     missing = true;
+                }
+            }
+            // Merge the seed (e.g. the original user prompt) into the inputs,
+            // only where a dependency did not already supply that field.
+            if let Some(Value::Object(seed_map)) = seed {
+                for (k, v) in seed_map {
+                    inputs.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
             if missing {

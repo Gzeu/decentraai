@@ -2268,3 +2268,28 @@ the live fabric, not just as a pure unit.
   Synthesis) is instantiated from the P9 template and executed on a real
   remote node's `AgentRuntime` — all four stages delegate, per-hop
   verification passes, and a final output is produced.
+
+## 100. Collective workflows in the API + dashboard (DONE)
+
+Commit `b7c2a18`. A user can now trigger a real collective workflow from the
+dashboard/API on a single node, executing through the node's local agents.
+
+- [x] `AgentOrchestrator` is shared into `ApiState` and wired in `decentraai
+  node`; a runtime is spawned **per local agent** (the orchestrator selects
+  these as executors), each answering delegated stages through the inference
+  executor.
+- [x] `POST /v1/agents/orchestrate` — body `{ prompt, template? }`; instantiates
+  the named `WorkflowTemplate` (research_report), runs it via
+  `orchestrate_plan` with the prompt as the seed, returns verdict + per-stage
+  results + final output.
+- [x] `orchestrate_plan(plan, seed)` / `run_plan` now merge a `seed` (e.g. the
+  user prompt) into every stage's inputs, so the original prompt stays
+  available to each stage (executor reads `inputs.prompt`).
+- [x] Dashboard AGENTS view: a "Collective workflow" runner — prompt input +
+  template select + Run button, rendering per-stage verdicts and the final
+  output. Real state only.
+
+### Honesty notes
+- On a single node the workflow runs through the node's own agents; with
+  remote peers trusted, the same orchestrator delegates to them (LAN
+  validation is the next live step).

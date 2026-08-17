@@ -719,6 +719,22 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <table><thead><tr><th>Capability</th><th class="num">Agents</th><th class="num">Verified</th><th>Coverage</th></tr></thead>
           <tbody id="cg-coverage"><tr><td colspan="4" class="empty">no capability claims yet — agents have not advertised semantic capabilities</td></tr></tbody></table>
         </div>
+        <!-- COLLECTIVE WORKFLOW RUNNER (P9): trigger a workflow that delegates
+             stages to the node's agents and see the outcome. Real state only. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Collective workflow <span class="count">P9 · delegate → verify</span></h2>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <textarea id="wf-prompt" rows="2" placeholder="e.g. Analyze this company and build a report." style="resize:vertical"></textarea>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <select id="wf-template">
+                <option value="research_report">research_report (Research → Finance → Documents → Synthesis)</option>
+              </select>
+              <button id="wf-run" class="primary" onclick="runCollectiveWorkflow()">Run workflow</button>
+              <span id="wf-status" class="mono" style="font-size:11px;color:var(--muted)"></span>
+            </div>
+          </div>
+          <div id="wf-result" class="muted" style="font-size:12px;margin-top:10px">Run a workflow to see its stages and final output.</div>
+        </div>
       </section>
 
       <!-- NETWORK -->
@@ -2054,6 +2070,40 @@ function renderAgents(a){
   $('agents-remote-peers').textContent = (a && a.remote_peer_count) != null ? a.remote_peer_count : '—';
   $('agents-total-count').textContent = (a && a.total_count) != null ? a.total_count : '—';
   renderCollectiveGraph(a);
+}
+// P9 collective workflow runner: POST /v1/agents/orchestrate with the prompt
+// + template, show the per-stage verdicts and the final output. Real state.
+function runCollectiveWorkflow(){
+  const prompt = $('wf-prompt').value.trim();
+  const template = $('wf-template').value;
+  const status = $('wf-status'), result = $('wf-result');
+  if (!prompt) { status.textContent = 'enter a prompt first'; return; }
+  status.textContent = 'running…';
+  result.innerHTML = '<span class="badge accent">running</span> delegating stages…';
+  fetch('/v1/agents/orchestrate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, template }),
+  }).then(r => r.json().then(j => ({ ok: r.ok, j }))).then(({ ok, j }) => {
+    status.textContent = ok ? 'done' : 'error';
+    if (!ok) { result.innerHTML = '<div class="badge bad">error</div> ' + esc((j && j.error) || 'request failed'); return; }
+    const v = j.verdict || {};
+    const badge = v === 'completed' ? '<span class="badge ok">completed</span>'
+      : v === 'partial' ? '<span class="badge warn">partial</span>'
+      : '<span class="badge bad">' + esc(v) + '</span>';
+    const stages = (j.stages || []).map(s =>
+      '<tr><td><code>'+esc(s.stage_id)+'</code></td><td><code>'+esc(s.agent_id)+'</code></td>'+
+      '<td>'+(s.verified ? '<span class="badge ok">verified</span>' : s.error ? '<span class="badge bad">failed</span>' : '<span class="badge faint">—</span>')+'</td>'+
+      '<td class="mono" style="font-size:11px">'+esc(JSON.stringify(s.output || (s.error || ''))).slice(0,160)+'</td></tr>'
+    ).join('');
+    const out = (j.final_output && j.final_output.prompt !== undefined)
+      ? esc(JSON.stringify(j.final_output)).slice(0, 800)
+      : esc(JSON.stringify(j.final_output || null)).slice(0, 800);
+    result.innerHTML = '<div style="margin-bottom:8px">'+badge+' <span class="muted">'+esc(prompt).slice(0,80)+'</span></div>'+
+      '<table><thead><tr><th>Stage</th><th>Agent</th><th>Verdict</th><th>Output</th></tr></thead><tbody>'+
+      (stages || '<tr><td colspan="4" class="empty">no stages executed</td></tr>')+'</tbody></table>'+
+      '<div style="margin-top:10px"><b style="font-size:12px">Final output</b><div class="mono" style="font-size:11px;color:var(--muted);word-break:break-word;margin-top:4px">'+out+'</div></div>';
+  }).catch(e => { status.textContent = 'error'; result.innerHTML = '<div class="badge bad">network error</div> ' + esc(String(e)); });
 }
 // Collective graph (P16): aggregate metrics, role breakdown and a
 // provenance-aware capability coverage table — all derived from the real
@@ -4043,7 +4093,7 @@ Object.assign(window, {
   hubCloseDetail, hubCompareFit, hubCompareSelected, hubOpenDetail, hubPull,
   hubPullVariant, hubSearch, hubToggleCompare, loadVariantFit, openGenEdit,
   openResEdit, previewDecision, removeModel, revokeConsumerKey,
-  useModelOption, variantCompare,
+  runCollectiveWorkflow, useModelOption, variantCompare,
 });
 refresh(); setInterval(refresh, 3000);
 "##;

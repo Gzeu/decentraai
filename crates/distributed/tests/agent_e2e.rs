@@ -629,7 +629,7 @@ async fn orchestrator_runs_research_report_workflow_on_remote_agent() {
         .expect("template instantiates into a valid plan");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let outcome = orchestrator.orchestrate_plan(&plan).await;
+    let outcome = orchestrator.orchestrate_plan(&plan, None).await;
 
     assert_eq!(
         outcome.verdict,
