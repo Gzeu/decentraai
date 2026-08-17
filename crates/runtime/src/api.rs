@@ -791,23 +791,70 @@ fn registry_models(data_dir: &Path) -> Vec<serde_json::Value> {
 }
 
 // P3 - Admin dashboard handlers
-const ADMIN_HTML: &str = r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>DecentraAI Admin</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;background:#0f141b;color:#e6edf3}.card{border:1px solid #2a3442;border-radius:10px;padding:14px}</style></head><body>
-<h1>DecentraAI Admin</h1>
-<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button>Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button></div><p id="status"></p></div>
-<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Action</th></tr></thead><tbody></tbody></table></div>
-<div class="card"><h2>Consumer API Keys</h2><form id="cf"><input name="account" placeholder="Owner account" required><input name="ceiling" type="number" min="1" placeholder="Quota ceiling" required><input name="rate" type="number" min="1" placeholder="req/min" required><button>Create</button></form><div id="cnew" style="display:none"><code id="ckey"></code><button onclick="navigator.clipboard.writeText(document.getElementById('ckey').textContent)">Copy</button><span>shown once</span></div><p id="cstatus"></p><table id="ctbl"><thead><tr><th>Key</th><th>Account</th><th>Ceiling</th><th>Rate</th><th>Used</th><th>Account quota (avail/cons)</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table></div>
-<div class="card"><h2>Audit events</h2><ul id="audit" style="list-style:none;padding-left:0"><li class="off">loading&hellip;</li></ul></div>
-<p id="api-url"></p></body><script>
+const ADMIN_HTML: &str = r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI · Admin</title>
+<style>
+:root{--bg:#05070d;--bg-2:#0a0e16;--panel:#0d121c;--panel-2:#0a0f18;--line:#182234;--line-2:#223048;--text:#e8eef6;--muted:#8fa0b3;--faint:#6f8198;--accent:#22d3ee;--accent-2:#6366f1;--accent-soft:rgba(34,211,238,.1);--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;--radius:14px;--radius-sm:9px;--shadow:0 14px 44px rgba(0,0,0,.45)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.55 var(--sans);background:var(--bg);color:var(--text);padding:26px;max-width:1100px;margin:0 auto}
+.page-head{display:flex;align-items:center;gap:12px;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+.brand-mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:grid;place-items:center;font-weight:800;color:#04121a;box-shadow:0 0 18px rgba(34,211,238,.35)}
+.page-head h1{font-size:19px;font-weight:700;letter-spacing:-.01em}
+.crumb{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.14em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow);margin-bottom:14px;min-width:0}
+.card h2{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+form{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+input,select{background:var(--bg);border:1px solid var(--line);border-radius:var(--radius-sm);color:var(--text);padding:7px 10px;font:inherit;font-size:12.5px;min-width:130px;flex:1}
+input:focus,select:focus{border-color:var(--accent);outline:none}
+button{background:var(--accent-soft);border:1px solid var(--line-2);color:var(--text);border-radius:var(--radius-sm);padding:7px 14px;font:inherit;font-size:12.5px;cursor:pointer;transition:border-color .15s,background .15s}
+button:hover{border-color:var(--accent);background:var(--accent-soft)}
+button.primary{background:var(--accent);color:#04121a;font-weight:700;border-color:transparent}
+button.primary:hover{filter:brightness(1.1)}
+button.danger{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3);color:var(--bad)}
+button.danger:hover{border-color:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--faint);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 8px;border-bottom:1px solid rgba(28,38,52,.6);vertical-align:top}
+tbody tr:hover{background:rgba(255,255,255,.028)}
+code,.mono{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;white-space:nowrap}
+.badge.ok{background:rgba(52,211,153,.12);color:var(--ok)}
+.badge.warn{background:rgba(251,191,36,.12);color:var(--warn)}
+.badge.bad{background:rgba(248,113,113,.12);color:var(--bad)}
+.badge.faint{background:rgba(111,129,152,.12);color:var(--faint)}
+.off{color:var(--faint);font-size:12.5px}
+.small{font-size:11px;color:var(--faint)}
+#new,#cnew{margin-top:8px;padding:10px 12px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.3);border-radius:var(--radius-sm);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#new code,#cnew code{word-break:break-all;color:var(--ok)}
+#status,#cstatus{font-size:12px;margin-top:6px}
+#status[data-ok],#cstatus[data-ok]{color:var(--ok)}
+#status:not([data-ok]),#cstatus:not([data-ok]){color:var(--bad)}
+#audit{list-style:none;padding-left:0}
+#audit li{padding:8px 0;border-bottom:1px solid rgba(28,38,52,.6);font-size:12px;color:var(--muted);line-height:1.5}
+#audit li code{color:var(--accent)}
+.api-url{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:20px;padding-top:12px;border-top:1px solid var(--line)}
+</style></head><body>
+<div class="page-head"><div class="brand-mark">◈</div><div><div class="crumb">DecentraAI · control plane</div><h1>Admin</h1></div></div>
+<div class="grid">
+<div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button class="primary" type="submit">Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button><span class="small">shown once</span></div><p id="status"></p></div>
+<div class="card"><h2>Consumer API Keys</h2><form id="cf"><input name="account" placeholder="Owner account" required><input name="ceiling" type="number" min="1" placeholder="Quota ceiling" required><input name="rate" type="number" min="1" placeholder="req/min" required><button class="primary" type="submit">Create</button></form><div id="cnew" style="display:none"><code id="ckey"></code><button onclick="navigator.clipboard.writeText(document.getElementById('ckey').textContent)">Copy</button><span class="small">shown once</span></div><p id="cstatus"></p></div>
+</div>
+<div class="card"><h2>Tokens</h2><table id="tbl"><thead><tr><th>Name</th><th>Tier</th><th>Role</th><th>Action</th></tr></thead><tbody><tr><td colspan="4" class="off">loading&hellip;</td></tr></tbody></table></div>
+<div class="card"><h2>Consumer API Key Registry</h2><table id="ctbl"><thead><tr><th>Key</th><th>Account</th><th>Ceiling</th><th>Rate</th><th>Used</th><th>Account quota</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+<div class="card"><h2>Audit Events</h2><ul id="audit"><li class="off">loading&hellip;</li></ul></div>
+<p id="api-url" class="api-url"></p><script>
 var f=document.getElementById('f'),status=document.getElementById('status'),tbl=document.querySelector('#tbl tbody'),tokenEl=document.getElementById('token'),newDiv=document.getElementById('new');
 var cf=document.getElementById('cf'),cstatus=document.getElementById('cstatus'),ctbl=document.querySelector('#ctbl tbody'),ckeyEl=document.getElementById('ckey'),cnewDiv=document.getElementById('cnew');
 var esc=function(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]});};
-f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value),role=f.role.value;status.textContent='Creating...';var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t,role:role})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='block';status.innerHTML='<span style="color:green">Saved! Copy now.</span>';f.reset()}else status.innerHTML='<span style="color:red">'+d.error.message+'</span>'});
-cf.addEventListener('submit',async e=>{e.preventDefault();var acct=cf.account.value,ceil=parseInt(cf.ceiling.value),rate=parseInt(cf.rate.value);cstatus.textContent='Creating...';var r=await fetch('/api/admin/consumer-key/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({account:acct,quota_ceiling:ceil,rate_limit_per_minute:rate})});var d=await r.json();if(r.ok){ckeyEl.textContent=d.token;cnewDiv.style.display='block';cstatus.innerHTML='<span style="color:green">Saved! Copy now.</span>';cf.reset()}else cstatus.innerHTML='<span style="color:red">'+d.error.message+'</span>';loadConsumer();});
-async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML='';d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td>'+esc(t.name)+'</td><td>'+t.tier+'</td><td>'+esc(t.role)+'</td><td><button data-n="'+t.name+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();loadConsumer();}
-async function loadConsumer(){var r=await fetch('/api/admin/consumer-key/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();ctbl.innerHTML='';if(!(d.keys||[]).length){ctbl.innerHTML='<tr><td colspan="8" class="off">no consumer API keys</td></tr>';return;}d.keys.forEach(k=>{var q=k.account_quota||{},row=document.createElement('tr');row.innerHTML='<td><code>'+esc(k.key_id)+'</code></td><td>'+esc(k.account)+'</td><td>'+k.quota_ceiling+'</td><td>'+k.rate_limit_per_minute+'</td><td>'+k.requests+' ('+k.tokens_generated+' tok)</td><td>'+q.available+'/'+q.consumed+'</td><td>'+(k.revoked?'revoked':'active')+'</td><td>'+(k.revoked?'':'<button data-id="'+esc(k.key_id)+'" onclick="revokeConsumer(event)">Revoke</button>')+'</td>';ctbl.appendChild(row)});}
+function tierBadge(t){return '<span class="badge '+(t==3?'ok':t==2?'warn':'faint')+'">T'+t+'</span>';}
+function setStatus(el,s,ok){el.textContent=s;el.dataset.ok=ok?'1':'';}
+f.addEventListener('submit',async e=>{e.preventDefault();var n=f.name.value,t=parseInt(f.t.value),role=f.role.value;setStatus(status,'Creating...',true);var r=await fetch('/api/admin/token/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({name:n,tier:t,role:role})});var d=await r.json();if(r.ok){tokenEl.textContent=d.token;newDiv.style.display='flex';setStatus(status,'Saved! Copy now.',true);f.reset()}else setStatus(status,d.error&&d.error.message||'error',false);});
+cf.addEventListener('submit',async e=>{e.preventDefault();var acct=cf.account.value,ceil=parseInt(cf.ceiling.value),rate=parseInt(cf.rate.value);setStatus(cstatus,'Creating...',true);var r=await fetch('/api/admin/consumer-key/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')},body:JSON.stringify({account:acct,quota_ceiling:ceil,rate_limit_per_minute:rate})});var d=await r.json();if(r.ok){ckeyEl.textContent=d.token;cnewDiv.style.display='flex';setStatus(cstatus,'Saved! Copy now.',true);cf.reset()}else setStatus(cstatus,d.error&&d.error.message||'error',false);loadConsumer();});
+async function load(){var r=await fetch('/api/admin/token/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();tbl.innerHTML=d.tokens.length?'':('<tr><td colspan="4" class="off">no tokens yet</td></tr>');d.tokens.forEach(t=>{var row=document.createElement('tr');row.innerHTML='<td class="mono">'+esc(t.name)+'</td><td>'+tierBadge(t.tier)+'</td><td>'+esc(t.role||'—')+'</td><td><button class="danger" data-n="'+esc(t.name)+'" onclick="revoke(event)">Revoke</button></td>';tbl.appendChild(row)});loadAudit();loadConsumer();}
+async function loadConsumer(){var r=await fetch('/api/admin/consumer-key/list',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();ctbl.innerHTML='';if(!(d.keys||[]).length){ctbl.innerHTML='<tr><td colspan="8" class="off">no consumer API keys</td></tr>';return;}d.keys.forEach(k=>{var q=k.account_quota||{},row=document.createElement('tr');row.innerHTML='<td><code>'+esc(k.key_id)+'</code></td><td>'+esc(k.account)+'</td><td>'+k.quota_ceiling+'</td><td>'+k.rate_limit_per_minute+'</td><td>'+k.requests+' ('+k.tokens_generated+' tok)</td><td>'+q.available+'/'+q.consumed+'</td><td>'+(k.revoked?'<span class="badge bad">revoked</span>':'<span class="badge ok">active</span>')+'</td><td>'+(k.revoked?'':'<button class="danger" data-id="'+esc(k.key_id)+'" onclick="revokeConsumer(event)">Revoke</button>')+'</td>';ctbl.appendChild(row)});}
 var auditEl=document.getElementById('audit');
-async function loadAudit(){var r=await fetch('/api/admin/events',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();var evs=d.events||[];auditEl.innerHTML=evs.length?'':('<li class="off">no security events yet</li>');evs.forEach(function(e){var li=document.createElement('li');var d2=new Date((e.timestamp||0)*1000).toLocaleString();li.innerHTML='<code>'+esc(e.event||'')+'</code> <span class="off">'+d2+'</span> <span class="small">'+esc(JSON.stringify(e.details||Object()))+'</span>';auditEl.appendChild(li);});}
+async function loadAudit(){var r=await fetch('/api/admin/events',{headers:{'Authorization':'Bearer '+(localStorage.getItem('admin-token')||'')}});var d=await r.json();var evs=d.events||[];auditEl.innerHTML=evs.length?'':('<li class="off">no security events yet</li>');evs.forEach(function(e){var li=document.createElement('li');var d2=new Date((e.timestamp||0)*1000).toLocaleString();li.innerHTML='<code>'+esc(e.event||'')+'</code> <span class="small">'+d2+'</span> <span class="small">'+esc(JSON.stringify(e.details||Object()))+'</span>';auditEl.appendChild(li);});}
 (async function(){
   // Fetch the master token from /v1/token (same as the dashboard) and cache
   // it so every /api/admin/* call below authenticates. If it is missing, the
@@ -9525,7 +9572,7 @@ mod tests {
             .unwrap();
         assert_eq!(denied.status(), 200);
         let html = denied.text().await.unwrap();
-        assert!(html.contains("DecentraAI Admin"));
+        assert!(html.contains("DecentraAI · Admin"));
         assert!(html.contains("Create Token"));
         // The API surface under /admin must still be master-gated.
         let denied_api = reqwest::Client::new()
@@ -10889,7 +10936,7 @@ mod tests {
             .await
             .unwrap();
         assert!(html.contains("operator"), "admin page must offer the operator role");
-        assert!(html.contains("Audit events"), "admin page must show audit events");
+        assert!(html.contains("Audit Events"), "admin page must show audit events");
         assert!(html.contains("/api/admin/events"), "audit list must fetch the gated events endpoint");
         manager.lock().await.shutdown().await.unwrap();
     }
