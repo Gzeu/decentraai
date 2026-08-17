@@ -237,21 +237,83 @@ planner scoring that M20's KV placement will combine with.
 Q4: `decentraai setup` — detect hardware → identity → auto-select model →
 write validated config → READY. Idempotent; verified end-to-end on Ubuntu.
 
-### Collective Intelligence — P0+P1 agent substrate (DONE, `crates/agents`)
+### Collective Intelligence — P0–P11 fabric + orchestrator + workflows (DONE)
 
 Direction (agreed 2026-08-17, see `docs/COLLECTIVE_INTELLIGENCE.md`): DecentraAI
 evolves from a distributed inference fabric into a collective-intelligence
 infrastructure. **An agent is a logical execution context on a node — not a new
-process.** P0+P1 landed: `AgentRecord`/`AgentRegistry`/`AgentTask`/
-`ToolDescriptor`/`AgentAdvertisement` (pure crate, no I/O), the **unified
-capability matcher** (one compositional verdict: hub provenance-aware semantic
-gate + agent model allowlist + compute physical gate — the two capability
-languages are now cross-wired), `SignedAgentAdvertisement` (anti-spoof),
-`AgentManager` in `decentraai-distributed`, `/v1/agents` + dashboard AGENTS
-view, `decentraai agent list`, and E2E two-node signed advertisement exchange.
-Next milestones (in order): P2 agent messaging → P3 delegation DAG → P4
-verification/consensus → P5 collective memory → P6 agent reputation →
-P7 policy+sandbox.
+process.** The full fabric is implemented in `crates/agents` (pure, no I/O)
+plus the runtime half in `decentraai-distributed`:
+
+- **P0 — agent substrate**: `AgentRecord`/`AgentRegistry`/`AgentTask`/
+  `ToolDescriptor`/`AgentAdvertisement`; the **unified capability matcher**
+  (one compositional verdict: hub provenance-aware semantic gate + agent model
+  allowlist + compute physical gate — the two capability languages are
+  cross-wired). `SignedAgentAdvertisement` (anti-spoof), `AgentManager`,
+  `/v1/agents` + dashboard AGENTS view.
+- **P1 — signed discovery**: `SignedAgentAdvertisement` in protocol; agents
+  advertised over the P2P heartbeat; E2E two-node signed advertisement
+  exchange.
+- **P2 — messaging**: `AgentMessage` (ask/delegate/reply/verify/ping) +
+  bounded `AgentInbox`; `AgentMessenger` bridges to the libp2p request/response
+  channel with **self-delivery** (a single-node workflow must not depend on
+  libp2p self-dial).
+- **P3 — delegation DAG**: `DelegationPlan`/`DelegationPlanner`/`execute_plan`;
+  per-hop verification on the JSON *value* (not its serialization). An
+  unroutable capability rejects the plan — never invents an executor.
+- **P4 — verification/consensus**: `VerificationReport`/`CheckKind`, honest
+  structural `check_output_schema`, `ConsensusPolicy`/`evaluate_consensus`,
+  `DisagreementResolution`, bounded immutable `VerificationLedger`.
+- **P5 — collective memory**: `MemoryLevel`/`MemoryAccess`/`MemoryPolicy`/
+  `MemoryEntry`/`MemoryScope`, `can_read`/`can_write` (ownership + access +
+  trust + provenance), `enforce_retention`, `MemoryRegistry`; SQLite
+  `MemoryStore` in distributed (persistent, access-enforcing).
+- **P6 — reputation**: per-(agent, capability) `AgentReputation` with factors
+  (reliability/quality/latency/uptime/safety/provenance), EMA `ReputationStore`,
+  deterministic `best_for_capability`, `safety_penalty` (policy/crypto only —
+  network errors never touch safety; unknown reputation = 0, not a penalty).
+- **P7 — policy**: `PolicyEngine` — explicit Allow/Deny for tools/models/peers/
+  budgets/egress + the Controlled-Exploration boundary (Normal/Exploration/
+  Experimental). **Agent Power ≠ Permission.**
+- **P8 — talent tree**: dynamic capability graph (`TalentNode`/`TalentTree`/
+  `can_unlock`/`resolve_path`/`available_capabilities`), no fixed levels.
+- **P9 — collective workflows**: `WorkflowTemplate`/`WorkflowStep`/
+  `run_workflow`/`WorkflowOutcome`; `research_report_template`
+  (Research → Finance → Documents → Synthesis).
+- **P10 — self-optimization**: `SelfOptimizer` (weighted observations →
+  Increase/Decrease/Rebalance under hard/soft constraints).
+- **P11 — economy**: `CapabilityOffer`/`BookingRequest`/`negotiate`/
+  `EconomyLedger` — non-monetary, modular.
+
+**Runtime half (`decentraai-distributed`)**:
+- `AgentOrchestrator`: binds the pure fabric to the live P2P channel —
+  plan (`DelegationPlanner`) → reputation-ranked executor selection (local
+  first; a stage with no capability requirements is eligible on any agent) →
+  delegate via `AgentMessage::Delegate` → per-hop verify → collect.
+  `orchestrate_plan(plan, seed)` runs an instantiated workflow with the user
+  prompt injected into every stage.
+- `AgentRuntime`: remote-side executor — drains an agent's inbox, runs each
+  `Delegate` through an injected async `AgentExecutor` and replies.
+  `InferenceAgentExecutor` runs delegated LLM tasks either against the node's
+  **live local backend over HTTP** (single-node; distributed `route_request`
+  cannot self-route) or via `route_request` (multi-node).
+- **Node daemon is a live agent host**: `decentraai node` wires the messenger,
+  spawns a production `AgentRuntime` per local agent with the inference
+  executor, opens the SQLite `MemoryStore`, and shares the orchestrator into
+  the API.
+- **`POST /v1/agents/orchestrate`** (`{ prompt, template? }`) runs a collective
+  workflow on the node's own agents; the dashboard AGENTS view has a
+  Collective-workflow runner.
+
+**Verified live**: `research_report` on a real node with Llama-3.2-1B returns
+`verdict: completed`, all four stages verified, real generated report text.
+`node.model` selects the served GGUF model explicitly (hard error on a typo).
+
+Next (documented): two-node LAN validation — Desktop must
+`git pull && bash scripts/upgrade-node.sh` (old builds omit agent
+advertisements + `accepts_remote_inference`), then `bash scripts/validate-lan.sh`
+on the coordinating laptop. Collective memory written from workflows and
+reputation fed from real results are also open follow-ups.
 
 Productization (installable app): `decentraai node` is the one-process
 background daemon (auto-provision identity/config, LAN/P2P discovery +

@@ -18,13 +18,18 @@ The execution-fabric foundation (M18) has been verified on **real hardware /
 LAN** — two physical Ubuntu machines (Desktop ↔ Laptop), each running the
 single universal `decentraai node`:
 
-- **Collective Intelligence (P0+P1)**: nodes host **logical agents** (execution
-  contexts on the node — not extra processes) with signed capability claims,
-  advertise them over the P2P channel, and answer unified semantic+physical
-  capability questions with one compositional matcher verdict. The dashboard
-  AGENTS view shows the collective agent layer (local + remote). See
-  `docs/COLLECTIVE_INTELLIGENCE.md` for the architecture and the next
-  milestones (P2 messaging → P3 delegation → P4 verification).
+- **Collective Intelligence (P0–P11, live)**: nodes host **logical agents**
+  (execution contexts on the node — not extra processes) with signed
+  capability claims, advertised over the P2P channel, and answered with one
+  compositional capability-matcher verdict. The full fabric is implemented:
+  messaging, delegation DAGs, verification/consensus, collective memory,
+  reputation, policy, talent tree, collective workflows, self-optimization
+  and a non-monetary economy. **Verified live on a real node**: `research_report`
+  (Research → Finance → Documents → Synthesis) runs end-to-end via
+  `POST /v1/agents/orchestrate` with a real local model, returning
+  `verdict: completed` and generated report text. The dashboard AGENTS view
+  (in Mesh) shows the collective graph + a workflow runner. See
+  `docs/COLLECTIVE_INTELLIGENCE.md`.
 
 - **Universal node**: every installation is a symmetric coordinator + worker;
   one process does onboarding, P2P discovery, worker advertisement, model
