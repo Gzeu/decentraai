@@ -26,6 +26,8 @@ pub struct DistributedP2PHandler {
     tracker: Option<Arc<crate::tracker::RequestTracker>>,
     /// Optional compute manager to process ComputeAdvertisement frames
     compute_manager: Option<Arc<crate::compute::ComputeManager>>,
+    /// Optional agent manager to process (signed) agent advertisements
+    agents: Option<Arc<crate::agents::AgentManager>>,
 }
 
 impl DistributedP2PHandler {
@@ -36,6 +38,7 @@ impl DistributedP2PHandler {
             infer_handler: None,
             tracker: None,
             compute_manager: None,
+            agents: None,
         }
     }
 
@@ -46,6 +49,7 @@ impl DistributedP2PHandler {
             infer_handler: None,
             tracker: None,
             compute_manager: None,
+            agents: None,
         }
     }
 
@@ -58,6 +62,7 @@ impl DistributedP2PHandler {
             infer_handler: Some(Arc::new(infer_handler)),
             tracker: None,
             compute_manager: None,
+            agents: None,
         }
     }
 
@@ -71,6 +76,7 @@ impl DistributedP2PHandler {
             infer_handler: Some(Arc::new(infer_handler)),
             tracker: None,
             compute_manager: None,
+            agents: None,
         }
     }
 
@@ -84,6 +90,12 @@ impl DistributedP2PHandler {
     pub fn set_compute_manager(&mut self, compute_manager: Arc<crate::compute::ComputeManager>) {
         self.compute_manager = Some(compute_manager);
     }
+
+    /// Attach an AgentManager so (signed) agent advertisements are recorded
+    /// into the collective agent view (P1).
+    pub fn set_agent_manager(&mut self, agents: Arc<crate::agents::AgentManager>) {
+        self.agents = Some(agents);
+    }
 }
 
 impl Default for DistributedP2PHandler {
@@ -95,9 +107,32 @@ impl Default for DistributedP2PHandler {
 impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
         use decentraai_protocol::{
-            InferMessage, SignedComputeAdvertisement, deserialize_message, serialize_message,
-            verify_signed_compute_advertisement,
+            InferMessage, SignedAgentAdvertisement, SignedComputeAdvertisement,
+            deserialize_message, serialize_message, verify_signed_compute_advertisement,
         };
+
+        // P1 (Collective Intelligence): a signed agent advertisement is
+        // verified before the agent view is updated. The signer's public key
+        // must map to the advertisement's own peer_id (anti-spoof).
+        if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(
+            request,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+        ) {
+            match crate::agents::verify_agent_advertisement_signed(&signed) {
+                Ok(adv) => {
+                    if let Some(agents) = &self.agents {
+                        let agents = agents.clone();
+                        tokio::spawn(async move {
+                            agents.process_advertisement(adv);
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rejected signed agent advertisement");
+                }
+            }
+            return Ok(Vec::new()); // No response for advertisements
+        }
 
         // P3: a signed compute advertisement is verified before being trusted.
         // The signer's public key must map to the advertisement's own peer_id

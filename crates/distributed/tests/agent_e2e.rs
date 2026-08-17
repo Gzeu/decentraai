@@ -1,0 +1,314 @@
+//! Two-node agent-advertisement E2E (Collective Intelligence P1): a real
+//! worker node advertises its logical agents (identity + semantic capability
+//! claims + tools + policies) over the wire, signed with its Ed25519
+//! identity; the coordinator receives it into its agent manager and can then
+//! answer a unified semantic+physical match against the remote agent.
+//!
+//! This exercises the FULL wire path: P2P broadcast → generic RequestHandler
+//! chain → SignedAgentAdvertisement deserialize → signature verify → agent
+//! manager upsert. It does NOT touch inference — the agent layer is the
+//! subject under test.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use decentraai_agents::{
+    AgentRecord, AgentRequirement, AgentState, ROLE_GENERALIST, ROLE_SPECIALIST, TOOL_KIND_HTTP,
+    ToolDescriptor,
+};
+use decentraai_compute::CapabilityMatcher;
+use decentraai_distributed::agents::AgentManager;
+use decentraai_distributed::DistributedP2PHandler;
+use decentraai_hub::capability::{CapabilityKind, Provenance};
+use decentraai_identity::Identity;
+use decentraai_p2p::{
+    ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode,
+};
+use libp2p::PeerId;
+use libp2p::identity::Keypair;
+
+fn libp2p_peer_id(identity: &Identity) -> PeerId {
+    let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes()).unwrap();
+    PeerId::from(keypair.public())
+}
+
+fn ocr_agent(short_id: &str) -> AgentRecord {
+    AgentRecord::new(format!("{short_id}:ocr"), "OCR", ROLE_SPECIALIST)
+        .described("extracts and understands text from documents")
+        .with_capability(CapabilityKind::Ocr, Provenance::Verified)
+        .with_capability(CapabilityKind::DocumentUnderstanding, Provenance::Verified)
+        .with_tool(ToolDescriptor::new("ocr.api", TOOL_KIND_HTTP).described("OCR API endpoint"))
+}
+
+fn generalist_agent(short_id: &str, model_hash: &str) -> AgentRecord {
+    let mut rec = AgentRecord::new(format!("{short_id}:generalist"), "Generalist", ROLE_GENERALIST)
+        .described("chat, reasoning and text generation on this node")
+        .with_capability(CapabilityKind::Chat, Provenance::Inferred)
+        .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
+        .with_model(model_hash);
+    rec.set_state(AgentState::Ready);
+    rec
+}
+
+/// Builds a node with its own agent manager and a signed broadcast path.
+async fn build_node(
+    identity: &Identity,
+    short_id: &str,
+    model_hash: &str,
+) -> (Arc<AgentManager>, P2PNode, libp2p::Multiaddr) {
+    let peer = libp2p_peer_id(identity);
+    let mut manager = AgentManager::new(peer, format!("node-{short_id}"));
+    manager.set_signing_key(identity.signing_key_bytes());
+    manager.set_local_agents(vec![generalist_agent(short_id, model_hash), ocr_agent(short_id)]);
+    let manager = Arc::new(manager);
+
+    let mut handler = DistributedP2PHandler::new();
+    handler.set_agent_manager(manager.clone());
+    let chained = ChainedHandler::new().add_handler(Arc::new(handler));
+    let node = P2PNode::new(
+        identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained)),
+    )
+    .unwrap();
+    let addr = node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    (manager, node, addr)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_node_exchange_signed_agent_advertisements() {
+    let coordinator_identity = Identity::generate();
+    let worker_identity = Identity::generate();
+    let coordinator_peer = libp2p_peer_id(&coordinator_identity);
+
+    let (coordinator_agents, coordinator_node, _coordinator_addr) =
+        build_node(&coordinator_identity, "coord", "model-a").await;
+    let (worker_agents, worker_node, worker_addr) =
+        build_node(&worker_identity, "worker", "model-b").await;
+
+    // The coordinator dials the worker (mDNS is not exercised in a loopback
+    // test; a real node discovers peers via mDNS and dials them).
+    coordinator_node.dial(&worker_addr.to_string()).await.unwrap();
+
+    // The worker broadcasts its signed agent advertisement. Re-announce until
+    // the dialed connection settles and the coordinator's agent manager sees
+    // it (broadcast only reaches connected peers).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let wire = worker_agents.advertisement_wire_bytes().unwrap();
+        worker_node.announce(wire);
+        if coordinator_agents.remote_peer_count() > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the agent advertisement to propagate"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let view = coordinator_agents.view();
+    let remote: Vec<_> = view.iter().filter(|v| v.remote).collect();
+    assert!(
+        remote.len() >= 2,
+        "coordinator must see the worker's two logical agents, got {}: {:?}",
+        remote.len(),
+        remote.iter().map(|v| v.record.agent_id.as_str()).collect::<Vec<_>>()
+    );
+
+    // The worker's agents arrive with their full capability shape.
+    let ocr = remote
+        .iter()
+        .find(|v| v.record.role == ROLE_SPECIALIST)
+        .expect("worker's OCR specialist agent must be visible");
+    assert!(ocr.record.has_capability(CapabilityKind::Ocr));
+    assert!(ocr.record.has_tool("ocr.api"));
+    assert_eq!(ocr.node_name, "node-worker");
+
+    // The coordinator's own agents stay local (never marked remote).
+    let local = view.iter().filter(|v| !v.remote).collect::<Vec<_>>();
+    assert_eq!(local.len(), 2, "coordinator advertises its own two agents");
+
+    // The worker can also see the coordinator's agents (bidirectional). The
+    // coordinator broadcasts its own advertisement the same way.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let wire = coordinator_agents.advertisement_wire_bytes().unwrap();
+        coordinator_node.announce(wire);
+        if worker_agents
+            .view()
+            .iter()
+            .any(|v| v.remote && v.record.role == ROLE_GENERALIST)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the coordinator's agent advertisement to propagate"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Cleanup: drop the nodes so the swarm tasks end.
+    drop(coordinator_node);
+    drop(worker_node);
+    let _ = coordinator_peer;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_agent_advertisement_is_rejected() {
+    // A forged advertisement (signed by a different identity) must be
+    // dropped by the receiver — the anti-spoof invariant of the protocol.
+    let victim_identity = Identity::generate();
+    let attacker_identity = Identity::generate();
+    let victim_peer = libp2p_peer_id(&victim_identity);
+
+    let victim_manager = Arc::new(AgentManager::new(victim_peer, "victim".into()));
+    let mut handler = DistributedP2PHandler::new();
+    handler.set_agent_manager(victim_manager.clone());
+    let chained = ChainedHandler::new().add_handler(Arc::new(handler));
+    let victim_node = P2PNode::new(
+        &victim_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained)),
+    )
+    .unwrap();
+    let victim_addr = victim_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    // The attacker builds a fake "victim" advertisement signed with its OWN
+    // key — the receiver must reject it because the signer key does not map
+    // to the embedded peer id.
+    let fake_adv = decentraai_agents::AgentAdvertisement::new(
+        victim_peer,
+        "victim",
+        vec![generalist_agent("v", "model-x")],
+    );
+    let fake_bytes = serde_json::to_vec(&fake_adv).unwrap();
+    let signed = decentraai_protocol::sign_agent_advertisement(
+        &attacker_identity.signing_key_bytes(),
+        &fake_bytes,
+    );
+    let wire = serde_json::to_vec(&signed).unwrap();
+
+    let attacker_node = P2PNode::new(
+        &attacker_identity,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    attacker_node.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    attacker_node.dial(&victim_addr.to_string()).await.unwrap();
+    attacker_node.announce(wire);
+
+    // The victim must NOT record any remote agents from the forged frame.
+    wait_for(Duration::from_secs(3)).await;
+    assert_eq!(
+        victim_manager.remote_peer_count(),
+        0,
+        "forged agent advertisement must be rejected at the signature gate"
+    );
+
+    drop(attacker_node);
+    drop(victim_node);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_matcher_answers_semantic_match_against_remote_agent() {
+    // A coordinator with an OCR requirement can match it against a remote
+    // agent's semantic claims — the seam that P3 delegation will use.
+    let worker_identity = Identity::generate();
+    let worker_peer = libp2p_peer_id(&worker_identity);
+    let worker_agent = ocr_agent("w").with_model("model-x");
+
+    let mut wl = decentraai_compute::WorkloadRequirements::new("model-x".into(), 256, 0);
+    wl.required_capability = Some("ocr".into());
+    let requirement = AgentRequirement::new(
+        vec![decentraai_hub::requirements::CapabilityRequirement {
+            capability: CapabilityKind::Ocr,
+            evidence: decentraai_hub::requirements::EvidenceLevel::Verified,
+        }],
+        Some(wl.clone()),
+    );
+
+    // The hosting node advertises capacity for the required model.
+    let adv = decentraai_compute::ComputeAdvertisement {
+        peer_id: worker_peer,
+        node_name: "worker".into(),
+        capability: decentraai_compute::ComputeCapability {
+            cpu_cores: 8,
+            ram_mb: 16 * 1024,
+            gpu: None,
+            engine: "llama_server".into(),
+            served_models: vec![decentraai_compute::ServedModel {
+                model_hash: "model-x".into(),
+                file_name: "m.gguf".into(),
+                size_mb: 512,
+                est_ram_mb: 256,
+                est_vram_mb: 0,
+                context_tokens: 0,
+            }],
+            can_provision: false,
+            available_models: vec![],
+        },
+        availability: decentraai_compute::ComputeAvailability {
+            available_ram_mb: 8 * 1024,
+            available_vram_mb: None,
+            load_percent: 10,
+            queue_depth: 0,
+            tokens_per_second: 50,
+            current_latency_ms: 40,
+            status: decentraai_compute::WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+            battery_percent: None,
+        },
+        announced_at_ms: 1_700_000_000_000,
+        accepts_remote_inference: true,
+        node_id: "dca-w".into(),
+        node_version: "1.0.0".into(),
+    };
+
+    let ledger = decentraai_compute::ReservationLedger::new(Duration::from_secs(60), 4);
+    let outcome = decentraai_agents::match_agent(
+        &worker_agent,
+        &adv,
+        &requirement,
+        &CapabilityMatcher::default(),
+        &ledger,
+        true,
+        None,
+    );
+    assert_eq!(outcome, decentraai_agents::AgentMatchOutcome::Eligible);
+
+    // Negative control: a generalist without OCR must be rejected on the
+    // semantic gate, even though the physical node can run the model.
+    let generalist = generalist_agent("w", "model-x");
+    let outcome = decentraai_agents::match_agent(
+        &generalist,
+        &adv,
+        &requirement,
+        &CapabilityMatcher::default(),
+        &ledger,
+        true,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            decentraai_agents::AgentMatchOutcome::Rejected(
+                decentraai_agents::AgentMatchReason::SemanticMissing { .. }
+            )
+        ),
+        "generalist without OCR must fail the semantic gate: {outcome:?}"
+    );
+}
+
+/// Polls `cond` until it is true or the deadline passes, then asserts it.
+/// Sleeps for a fixed time (for negative assertions we must let the wire
+/// path a chance to run before asserting nothing happened).
+async fn wait_for(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}

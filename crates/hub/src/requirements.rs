@@ -19,10 +19,10 @@
 //! create a second capability system.
 
 use crate::capability::{CapabilityKind, ModelCapabilities, Provenance};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The minimum evidence required to consider a capability satisfied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceLevel {
     /// A VERIFIED claim is required; an INFERRED claim is not enough.
@@ -32,7 +32,7 @@ pub enum EvidenceLevel {
 }
 
 /// One capability a tool/workload requires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityRequirement {
     pub capability: CapabilityKind,
     /// How strong the evidence must be.
@@ -40,7 +40,7 @@ pub struct CapabilityRequirement {
 }
 
 /// The verdict for a single required capability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequirementStatus {
     /// Satisfied with the strongest available provenance for this capability.
@@ -55,7 +55,7 @@ pub enum RequirementStatus {
 }
 
 /// A single requirement check with its reason.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequirementCheck {
     pub capability: CapabilityKind,
     pub requirement: EvidenceLevel,
@@ -65,7 +65,7 @@ pub struct RequirementCheck {
 }
 
 /// The full matching result: satisfied iff every required capability is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMatch {
     pub satisfied: bool,
     pub checks: Vec<RequirementCheck>,

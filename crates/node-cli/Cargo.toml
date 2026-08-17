@@ -17,6 +17,7 @@ path = "src/bin/decentraai-worker.rs"
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+decentraai-agents = { path = "../agents" }
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }

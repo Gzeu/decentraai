@@ -361,6 +361,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="execution"><span class="ic">⇄</span><span>Execution</span></button>
 
     <div class="rail-label">Mesh</div>
+    <button class="nav-item" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
@@ -676,6 +677,28 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <tbody id="quota-accounts"><tr><td colspan="5" class="empty">no quota ledger yet</td></tr></tbody></table>
           <div style="margin-top:10px"><b style="font-size:12px">Recent quota events <span class="muted">provenance · policy v</span></b>
           <div id="quota-events" class="muted" style="font-size:12px;margin-top:4px">—</div></div>
+        </div>
+      </section>
+
+      <!-- AGENTS (Collective Intelligence P1): logical execution contexts
+           hosted by nodes — identity + capabilities + policies, advertised
+           with signed capability claims. Local agents run on this node;
+           remote agents were discovered through signed agent advertisements.
+           Everything rendered here comes from real runtime state (the
+           agent manager), never mock data. -->
+      <section class="view" id="view-agents">
+        <div class="card">
+          <h2>Collective agents <span class="count" id="agents-count"></span></h2>
+          <div id="agents" class="worker-cards"><div class="empty">no agents yet (agent manager not attached)</div></div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Agent fabric summary <span class="count">P1</span></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+            <div class="metric"><div class="label">Local agents</div><div class="value" id="agents-local-count">—</div></div>
+            <div class="metric"><div class="label">Remote peers advertising</div><div class="value" id="agents-remote-peers">—</div></div>
+            <div class="metric"><div class="label">Total agents known</div><div class="value" id="agents-total-count">—</div></div>
+          </div>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Agents are logical execution contexts on nodes — not extra processes. Capability claims carry provenance (VERIFIED / INFERRED); an agent is never assumed capable of something it has not claimed with the required evidence.</p>
         </div>
       </section>
 
@@ -1180,8 +1203,8 @@ const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'a
 const isAdmin = !!token;
 
 // ---- navigation ------------------------------------------------------------
-const VIEWS = ['overview','chat','fabric','decisions','execution','workers','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const VIEWS = ['overview','chat','fabric','decisions','execution','agents','workers','network','models','observability','recovery','diag','security','settings'];
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   current = view;
@@ -2001,6 +2024,59 @@ function workerCard(w, localPeer){
     (models ? '<div class="wc-models">'+models+'</div>' : '')+
     '<div class="wc-trust">'+trustChain(steps, curIdx)+'</div>'+
     (action ? '<div class="wc-actions">'+action+'</div>' : '')+
+  '</div>';
+}
+function renderAgents(a){
+  const agents = (a && a.agents) || [];
+  const localPeer = (a && a.local_peer) || 'local';
+  $('agents').innerHTML = agents.map(agentCard).join('') || '<div class="empty">no agents yet (agent manager not attached)</div>';
+  $('agents-count').textContent = agents.length + (agents.length === 1 ? ' known' : ' known');
+  $('agents-local-count').textContent = (a && a.local_count) != null ? a.local_count : '—';
+  $('agents-remote-peers').textContent = (a && a.remote_peer_count) != null ? a.remote_peer_count : '—';
+  $('agents-total-count').textContent = (a && a.total_count) != null ? a.total_count : '—';
+}
+function agentCard(a){
+  const isLocal = !a.remote;
+  const caps = (a.semantic_capabilities || []).map(c =>
+    '<span class="nc-model" title="'+(c.provenance||'')+' provenance">' + esc(c.capability||'') + (c.provenance === 'verified' ? ' ✓' : c.provenance === 'inferred' ? ' ~' : '') + '</span>'
+  ).join('');
+  const models = (a.allowed_models || []).slice(0, 4).map(m =>
+    '<span class="nc-model" title="'+esc(m)+'">'+short(m, 12)+'</span>'
+  ).join('');
+  const tools = (a.tools || []).slice(0, 4).map(t =>
+    '<span class="nc-model" title="'+esc(t.kind||'')+'">'+esc(t.name||'')+'</span>'
+  ).join('');
+  const state = a.state || 'registered';
+  const stateBadge = state === 'ready' ? '<span class="badge ok">ready</span>'
+    : state === 'busy' ? '<span class="badge accent">busy</span>'
+    : state === 'suspended' ? '<span class="badge warn">suspended</span>'
+    : state === 'retired' ? '<span class="badge faint">retired</span>'
+    : '<span class="badge faint">registered</span>';
+  const sandbox = (a.policies && a.policies.sandbox) || 'normal';
+  return '<div class="worker-card '+(isLocal?'local':'')+'">'+
+    '<div class="wc-head">'+
+      '<span class="wc-name">'+esc(a.name || a.agent_id || short(a.peer_id, 14))+'</span>'+
+      (isLocal ? '<span class="nc-tag local-tag">local</span>' : '<span class="nc-tag remote-tag">remote</span>')+
+      stateBadge+
+      '<span class="nc-tag">'+esc(a.role || '—')+'</span>'+
+      (sandbox !== 'normal' ? '<span class="nc-tag warn">sandbox:'+esc(sandbox)+'</span>' : '')+
+      (a.policies && a.policies.allow_remote ? '<span class="nc-tag" title="this agent accepts work delegated by remote peers">remote-ok</span>' : '')+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>agent</b> <code>'+esc(a.agent_id || '—')+'</code></span>'+
+      '<span><b>host</b> '+(isLocal ? 'this node' : esc(a.node_name || short(a.peer_id, 14)))+'</span>'+
+      '<span><b>peer</b> <code title="'+esc(a.peer_id||'')+'">'+short(a.peer_id, 14)+'</code></span>'+
+      (a.memory_scopes && a.memory_scopes.length ? '<span><b>memory</b> '+a.memory_scopes.length+' scope(s)</span>' : '')+
+      (a.policies && a.policies.max_concurrent_tasks ? '<span><b>budget</b> '+a.policies.max_concurrent_tasks+' task(s)</span>' : '')+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>capabilities</b> '+(caps || '<span class="badge faint">none claimed</span>')+'</span>'+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>models</b> '+(models || '<span class="badge faint">none</span>')+'</span>'+
+      '<span><b>tools</b> '+(tools || '<span class="badge faint">none</span>')+'</span>'+
+    '</div>'+
+    (a.description ? '<div class="wc-meta"><span style="color:var(--muted)">'+esc(a.description)+'</span></div>' : '')+
   '</div>';
 }
 function renderWorkers(c){
@@ -3832,6 +3908,7 @@ async function refresh(){
     renderRecovery(s, null, null);
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
+  try { const ag = await (await fetch('/v1/agents', { headers })).json(); renderAgents(ag); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}

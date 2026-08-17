@@ -281,6 +281,10 @@ pub struct ApiState {
     /// advertises the requested model, instead of only serving locally.
     /// `None` = plain local-only proxy (unchanged behaviour).
     distributed: Option<Arc<decentraai_distributed::DistributedInference>>,
+    /// Collective-intelligence agent view (P1): local + remote logical
+    /// agents, wired into the AGENTS dashboard view. `None` when the node
+    /// does not run an agent manager.
+    agents: Option<Arc<decentraai_distributed::agents::AgentManager>>,
 }
 
 impl ApiState {
@@ -325,6 +329,7 @@ impl ApiState {
             compute,
             p2p,
             distributed: None,
+            agents: None,
         }
     }
 
@@ -333,6 +338,15 @@ impl ApiState {
     /// the node daemon path, where a `DistributedInference` already exists.
     pub fn attach_distributed(&mut self, distributed: Arc<decentraai_distributed::DistributedInference>) {
         self.distributed = Some(distributed);
+    }
+
+    /// Attaches the collective-intelligence agent manager (P1) so the
+    /// dashboard AGENTS view renders local + remote logical agents.
+    pub fn attach_agents(
+        &mut self,
+        agents: Arc<decentraai_distributed::agents::AgentManager>,
+    ) {
+        self.agents = Some(agents);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4354,6 +4368,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/token", get(token_handler))
         .route("/v1/peers", get(peers_handler))
         .route("/v1/compute", get(compute_handler))
+        .route("/v1/agents", get(agents_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5261,6 +5276,57 @@ async fn compute_handler(
             "totals": report.totals,
             "sessions": session_count,
             "executions": executions,
+        });
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// AGENTS real state (Collective Intelligence P1): the node's local logical
+/// agents plus every remote agent discovered through signed agent
+/// advertisements. Empty structure when no agent manager is attached.
+async fn agents_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let mut body = serde_json::json!({
+        "attached": false,
+        "agents": [],
+        "local_count": 0,
+        "remote_peer_count": 0,
+        "total_count": 0,
+    });
+    if let Some(agents) = &state.agents {
+        let view = agents.view();
+        let rows: Vec<serde_json::Value> = view
+            .into_iter()
+            .map(|v| {
+                serde_json::json!({
+                    "peer_id": v.peer_id.to_string(),
+                    "node_name": v.node_name,
+                    "remote": v.remote,
+                    "agent_id": v.record.agent_id,
+                    "name": v.record.name,
+                    "role": v.record.role,
+                    "description": v.record.description,
+                    "state": serde_json::to_value(v.record.state).unwrap_or_default(),
+                    "semantic_capabilities": v.record.semantic_capabilities,
+                    "allowed_models": v.record.allowed_models,
+                    "tools": v.record.tools,
+                    "memory_scopes": v.record.memory_scopes,
+                    "policies": serde_json::to_value(&v.record.policies).unwrap_or_default(),
+                })
+            })
+            .collect();
+        body = serde_json::json!({
+            "attached": true,
+            "agents": rows,
+            "local_count": agents.local_count(),
+            "remote_peer_count": agents.remote_peer_count(),
+            "total_count": agents.total_count(),
         });
     }
     (

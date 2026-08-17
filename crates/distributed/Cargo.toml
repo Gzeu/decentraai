@@ -22,11 +22,13 @@ uuid.workspace = true
 chrono.workspace = true
 
 # Internal dependencies
+decentraai-agents = { path = "../agents" }
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-discovery = { path = "../discovery" }
 decentraai-fabric = { path = "../fabric" }
+decentraai-hub = { path = "../hub" }
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }

@@ -18,6 +18,14 @@ The execution-fabric foundation (M18) has been verified on **real hardware /
 LAN** — two physical Ubuntu machines (Desktop ↔ Laptop), each running the
 single universal `decentraai node`:
 
+- **Collective Intelligence (P0+P1)**: nodes host **logical agents** (execution
+  contexts on the node — not extra processes) with signed capability claims,
+  advertise them over the P2P channel, and answer unified semantic+physical
+  capability questions with one compositional matcher verdict. The dashboard
+  AGENTS view shows the collective agent layer (local + remote). See
+  `docs/COLLECTIVE_INTELLIGENCE.md` for the architecture and the next
+  milestones (P2 messaging → P3 delegation → P4 verification).
+
 - **Universal node**: every installation is a symmetric coordinator + worker;
   one process does onboarding, P2P discovery, worker advertisement, model
   serving and distributed inference. No separate `decentraai distributed`
@@ -618,8 +626,9 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
  decentraai token list                           # show issued tokens
  decentraai token revoke --name <n>              # revoke (effective next request)
  decentraai invite --addr <host:...>             # new-seat invite + guest token (P5)
-decentraai join "<addr /p2p/<peer-id> dsk_...>" # join from an invite (P5)
-decentraai serve start --backend http://H:P    # Q3: local auth/tiers/queue + remote model
+ decentraai join "<addr /p2p/<peer-id> dsk_...>" # join from an invite (P5)
+ decentraai serve start --backend http://H:P    # Q3: local auth/tiers/queue + remote model
+ decentraai agent list --config <path>          # show this node's logical agents (P1)
 ```
 
 ## Architecture highlights
@@ -643,6 +652,15 @@ decentraai serve start --backend http://H:P    # Q3: local auth/tiers/queue + re
   into `route_request` via `plan_and_reserve`; `reserve_worker` keeps capacity
   authority in the scheduler. A coordinator reaper evicts dead workers with
   audit (M24).
+- **Collective intelligence** (`crates/agents`, P0+P1): logical agents as
+  *execution contexts on nodes* (not extra processes) — `AgentRecord`
+  (identity + semantic capability claims + models + tools + policies),
+  `AgentRegistry`, a **unified capability matcher** (one compositional verdict:
+  hub provenance-aware semantic gate + agent model allowlist + compute
+  physical gate), and `SignedAgentAdvertisement` over the P2P channel
+  (anti-spoof signature verification). Nodes advertise their agents on the
+  heartbeat; the dashboard AGENTS view shows local + remote agents; see
+  `docs/COLLECTIVE_INTELLIGENCE.md`.
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted
@@ -661,8 +679,11 @@ decentraai serve start --backend http://H:P    # Q3: local auth/tiers/queue + re
 ## Layout
 
 - `crates/audit` — append-only security audit log
+- `crates/agents` — collective-intelligence agent model: logical agents, unified semantic+execution capability matcher, agent tasks, registry, advertisements
 - `crates/config` — typed YAML configuration with validation (incl. tiers)
-- `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, fallback handling
+- `crates/distributed` — P2P distributed inference: worker discovery, request routing, queue management, fallback handling, agent manager
+- `crates/fabric` — execution planner: single / sequential / fan-out plans, network/KV/expert-aware scoring
+- `crates/hub` — HuggingFace catalog + verified download + semantic capability taxonomy/intent
 - `crates/identity` — Ed25519 keypairs and PeerId derivation
 - `crates/manifest` — GGUF manifests: chunk hashes, Merkle root, atomic writes
 - `crates/protocol` — swarm message schemas (incl. catalog) and canonical signing

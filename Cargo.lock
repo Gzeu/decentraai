@@ -931,6 +931,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-agents"
+version = "1.0.0"
+dependencies = [
+ "decentraai-compute",
+ "decentraai-hub",
+ "libp2p",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "decentraai-audit"
 version = "1.0.0"
 dependencies = [
@@ -950,6 +962,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "decentraai-agents",
  "decentraai-audit",
  "decentraai-compute",
  "decentraai-config",
@@ -1022,11 +1035,13 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "decentraai-agents",
  "decentraai-audit",
  "decentraai-compute",
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-fabric",
+ "decentraai-hub",
  "decentraai-identity",
  "decentraai-inference-adapter",
  "decentraai-p2p",

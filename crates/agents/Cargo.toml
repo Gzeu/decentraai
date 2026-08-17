@@ -1,0 +1,21 @@
+[package]
+name = "decentraai-agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Collective-intelligence agent model: logical agents, unified semantic+execution capabilities, agent tasks, local registry and wire advertisements"
+
+[dependencies]
+libp2p.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+# Internal dependencies (both are leaves in the dependency graph)
+decentraai-compute = { path = "../compute" }
+decentraai-hub = { path = "../hub" }
+
+[dev-dependencies]
+serde_json.workspace = true

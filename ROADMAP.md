@@ -1999,3 +1999,55 @@ operator.
   Desktop. Two-node P2P connectivity IS verified live (this laptop dials the
   Desktop's P2P port 38231; `/v1/network` shows it connected), which is the
   precondition for remote execution.
+
+## 93. Collective Intelligence — P0+P1 agent substrate (DONE)
+
+Direction (agreed with George, `docs/COLLECTIVE_INTELLIGENCE.md`): DecentraAI
+evolves from a distributed inference fabric into a collective-intelligence
+infrastructure in which many specialized agents collaborate as one distributed
+system. **An agent is a logical execution context on a node — not a new
+process.** This milestone lays the P0+P1 foundation: the agent model, the
+unified capability matcher, and the signed wire advertisement.
+
+### P0 — agent model (done, commit: `decentraai-agents` crate)
+- [x] `crates/agents` (pure, no I/O): `AgentRecord` (identity/capabilities/
+  role/policies/memory_scopes/lifecycle), `AgentRegistry` (deterministic
+  local registry), `AgentCapability` (unified semantic+execution view),
+  `ToolDescriptor` (extensible tool kinds: mcp/builtin/http/custom),
+  `AgentTask` (generic task contract with schemas + verification — the shape
+  P3 delegation will route), `AgentAdvertisement` (wire shape).
+- [x] **Unified capability language**: `CapabilityKind`/`Provenance`/
+  `CapabilityClaim`/`CapabilityRequirement` + hub requirement types now derive
+  `Deserialize` (additive), making the semantic taxonomy wire-compatible.
+- [x] **Unified matcher** (`AgentMatcher::match_agent`): ONE compositional
+  verdict — hub provenance-aware semantic gate + agent model allowlist gate +
+  compute physical gate (trust/health/RAM/VRAM/reservations) — replacing the
+  two unrelated matchers a caller previously had to reconcile by hand.
+
+### P1 — signed discovery (done)
+- [x] `SignedAgentAdvertisement` in `decentraai-protocol` (opaque bytes +
+  Ed25519 signature, anti-spoof: signer key must map to the claiming peer).
+- [x] `AgentManager` in `decentraai-distributed`: local agent registry +
+  remote advertisement registry + stale eviction + signed wire bytes +
+  flattened dashboard view.
+- [x] `DistributedP2PHandler` branch: verifies signed agent advertisements
+  before updating the agent view (rejected forgery is dropped, never trusted).
+- [x] Node wiring (`decentraai node` + `distributed`): registers the node's
+  default logical agents (generalist + model-tied executor, honest INFERRED
+  provenance), broadcasts them on the advertisement heartbeat, prunes stale
+  remote views.
+- [x] CLI `decentraai agent list` — read-only view of the node's advertised
+  agents.
+- [x] Dashboard AGENTS view (`/v1/agents` + nav) — local + remote logical
+  agents with capability chips (provenance marks), tools, models, policies,
+  sandbox mode; real state only.
+- [x] E2E: two real libp2p nodes exchange signed agent advertisements
+  bidirectionally; a forged advertisement is rejected at the signature gate;
+  the unified matcher answers a semantic match against a remote agent.
+
+### Honesty notes
+- Default agents claim LLM capabilities as INFERRED (the node cannot back
+  VERIFIED claims without Hub metadata — never claimed stronger than real).
+- Agent tasks are defined and tested but NOT routed yet (P3 = delegation).
+- Remote agents are visible in the dashboard but cannot receive work yet
+  (P2/P3 = messaging + delegation).

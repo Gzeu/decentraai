@@ -75,6 +75,14 @@ enum Command {
         #[command(subcommand)]
         command: ConsumerKeyCommand,
     },
+    /// Inspect this node's logical agents (Collective Intelligence P1).
+    /// Agents are logical execution contexts hosted by the node — not extra
+    /// processes — and are advertised to the fabric with signed capability
+    /// claims.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Run the full node as a background daemon — LAN/P2P discovery, model
     /// serving and the dashboard all at once, the way the desktop app / systemd
     /// service drives it. Detects and provisions a model automatically; the
@@ -384,6 +392,9 @@ enum TokenCommand {
 
 /// Consumer API key management (Q2): create/revoke/list `dca_…` keys for the
 /// Compute Contribution & Quota consumer path.
+/// Manage consumer API keys (`dca_…`) for the Compute Contribution &
+/// Quota consumer path (Q2): an access credential + quota ceiling, never
+/// an admin credential.
 #[derive(Debug, Subcommand)]
 enum ConsumerKeyCommand {
     /// Issue a consumer API key for an account; shown once, stored only as a
@@ -413,6 +424,17 @@ enum ConsumerKeyCommand {
     Revoke {
         #[arg(long)]
         key_id: String,
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
+
+/// `decentraai agent` subcommands (Collective Intelligence P1).
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// List the logical agents this node advertises (the defaults derived
+    /// from its model + config). Read-only, never mutates state.
+    List {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
@@ -480,6 +502,7 @@ async fn main() -> Result<()> {
         Command::Trust { command } => trust_command(command),
         Command::Tier { command } => tier_command(command),
         Command::ConsumerKey { command } => consumer_key_command(command),
+        Command::Agent { command } => agent_command(command),
         Command::Node(args) => node_start(args).await,
         Command::Open(args) => open_dashboard(args),
         Command::Invite(args) => invite(args),
@@ -1090,12 +1113,38 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         .set_allow_provisioning(config.sharing.provision_models_on_demand)
         .await;
 
+    // ---- Collective Intelligence P1: this node's logical agents ----
+    // Agents are logical execution contexts hosted by the node (NOT extra
+    // processes): identity + capabilities + policies, advertised to the
+    // fabric with signed capability claims. The default agent set mirrors
+    // what the node can honestly claim — see `default_local_agents`.
+    let mut agent_manager = Arc::new(decentraai_distributed::agents::AgentManager::new(
+        local_peer_id,
+        node_name.clone(),
+    ));
+    // P1 signing: peers reject forged agent advertisements (anti-spoof).
+    if let Some(am) = Arc::get_mut(&mut agent_manager) {
+        am.set_signing_key(identity.signing_key_bytes());
+    }
+    let short_id = decentraai_distributed::short_node_id(&local_peer_id);
+    agent_manager.set_local_agents(default_local_agents(
+        &short_id,
+        &node_name,
+        &model_hash,
+        config.inference.allow_remote_inference,
+    ));
+    info!(
+        agents = agent_manager.local_count(),
+        "node advertises logical agents",
+    );
+
     let tracker = Arc::new(decentraai_distributed::RequestTracker::new());
 
     let mut distributed_handler =
         decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     distributed_handler.set_tracker(tracker.clone());
     distributed_handler.set_compute_manager(compute_manager.clone());
+    distributed_handler.set_agent_manager(agent_manager.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 
     // Serve manifests/chunks off the registry if one exists (model sharing).
@@ -1274,6 +1323,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         )
         .await?;
     }
+    // P1: keep the fabric's agent view fresh (agent advertisements change
+    // rarely, but the periodic refresh also expires stale remote views).
+    spawn_agent_broadcaster(agent_manager.clone(), distributed.p2p_node().clone());
 
     // M19: RTT probing to known workers for network-aware planning.
     spawn_network_probe(compute_manager.clone(), distributed.p2p_node().clone()).await;
@@ -1342,6 +1394,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
+        // P1: the AGENTS dashboard view reads the node's agent manager.
+        state.attach_agents(agent_manager.clone());
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.
@@ -2918,6 +2972,122 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
     Ok(())
 }
 
+/// `decentraai agent` subcommands (Collective Intelligence P1).
+fn agent_command(command: AgentCommand) -> Result<()> {
+    let config_path = match &command {
+        AgentCommand::List { config } => config,
+    };
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+
+    let identity_path = data_dir.join("identity/key.pem");
+    let identity = if identity_path.exists() {
+        Identity::load(&identity_path)?
+    } else {
+        Identity::generate()
+    };
+    // The libp2p peer id is derived from the identity signing key, exactly as
+    // the node daemon does, so the short id matches what the node advertises.
+    let libp2p_keypair =
+        libp2p::identity::Keypair::ed25519_from_bytes(identity.signing_key_bytes())
+            .context("libp2p keypair from identity")?;
+    let libp2p_peer = libp2p::PeerId::from(libp2p_keypair.public());
+    let short_id = decentraai_distributed::short_node_id(&libp2p_peer);
+    let agents = default_local_agents(
+        &short_id,
+        &config.node.name,
+        "",
+        config.inference.allow_remote_inference,
+    );
+
+    match command {
+        AgentCommand::List { .. } => {
+            if agents.is_empty() {
+                println!("No logical agents advertised by this node.");
+                return Ok(());
+            }
+            for agent in &agents {
+                let caps: Vec<String> = agent
+                    .semantic_capabilities
+                    .iter()
+                    .map(|c| format!("{}:{:?}", c.capability.label(), c.provenance))
+                    .collect();
+                let models = if agent.allowed_models.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    format!("{} model(s)", agent.allowed_models.len())
+                };
+                let tools = if agent.tools.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    format!("{} tool(s)", agent.tools.len())
+                };
+                println!(
+                    "{}  role={}  state={:?}\n  capabilities: {}\n  models: {}   tools: {}\n",
+                    agent.agent_id,
+                    agent.role,
+                    agent.state,
+                    if caps.is_empty() { "(none)".to_string() } else { caps.join(", ") },
+                    models,
+                    tools,
+                );
+            }
+            println!(
+                "Total: {} logical agent(s) on node {} (PeerId {})",
+                agents.len(),
+                config.node.name,
+                identity.peer_id(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The logical agents a node advertises by default (P1). Built from the
+/// node's identity short id and the model it serves — this is the node's
+/// own "generalist" agent plus, when a model is present, a model-tied
+/// executor. Provenance stays honest: without Hub metadata the LLM claims
+/// are INFERRED, never VERIFIED (a claim the node cannot back is not
+/// claimed as verified).
+///
+/// This is the shared builder used by both the running node and the
+/// `agent list` CLI so the two never disagree about what is advertised.
+fn default_local_agents(
+    short_id: &str,
+    node_name: &str,
+    model_hash: &str,
+    allow_remote: bool,
+) -> Vec<decentraai_agents::AgentRecord> {
+    use decentraai_agents::{
+        AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST,
+    };
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
+
+    let mut agents = Vec::new();
+    let mut generalist = AgentRecord::new(
+        format!("{short_id}:generalist"),
+        format!("{node_name} Generalist"),
+        ROLE_GENERALIST,
+    )
+    .described("chat, reasoning and text generation on this node")
+    .with_capability(CapabilityKind::Chat, Provenance::Inferred)
+    .with_capability(CapabilityKind::TextGeneration, Provenance::Inferred)
+    .with_capability(CapabilityKind::Reasoning, Provenance::Inferred);
+    if !model_hash.is_empty() {
+        generalist = generalist.with_model(model_hash);
+    }
+    if allow_remote {
+        generalist = generalist.with_policies(AgentPolicies {
+            allow_remote: true,
+            ..AgentPolicies::default()
+        });
+    }
+    generalist.set_state(AgentState::Ready);
+    agents.push(generalist);
+    agents
+}
+
 /// Reads the persisted contribution report and prints each worker's computed
 /// `decentraai tier` — subscription tiers driven by measured contribution
 /// (M17 suggest / P4 apply). Reads the report a coordinator wrote while
@@ -3290,6 +3460,22 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
         cm.set_signing_key(identity.signing_key_bytes());
     }
+    // P1 (Collective Intelligence): this node's logical agents, advertised
+    // with signed capability claims (same anti-spoof discipline as compute).
+    let mut agent_manager = Arc::new(decentraai_distributed::agents::AgentManager::new(
+        local_peer_id,
+        args.name.clone(),
+    ));
+    if let Some(am) = Arc::get_mut(&mut agent_manager) {
+        am.set_signing_key(identity.signing_key_bytes());
+    }
+    let short_id = decentraai_distributed::short_node_id(&local_peer_id);
+    agent_manager.set_local_agents(default_local_agents(
+        &short_id,
+        &args.name,
+        model_hash.as_deref().unwrap_or(""),
+        config.inference.allow_remote_inference,
+    ));
 // M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
     if let Some(engine) = config.inference.engine.as_deref() {
@@ -3326,6 +3512,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         decentraai_distributed::DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     distributed_handler.set_tracker(tracker.clone());
     distributed_handler.set_compute_manager(compute_manager.clone());
+    distributed_handler.set_agent_manager(agent_manager.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 
     // Add registry handler if registry exists
@@ -3433,6 +3620,9 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
 
         info!(peer_id = %local_peer_id, model = %model_name, "registered as distributed worker");
     }
+    // P1: keep the fabric's agent view fresh (agent advertisements change
+    // rarely, but the periodic beat enforces staleness of remote views).
+    spawn_agent_broadcaster(agent_manager.clone(), distributed.p2p_node().clone());
 
     // M19: periodically measure RTT to each known remote worker so the
     // execution planner weights reach cost, not just nominal performance.
@@ -3696,6 +3886,35 @@ async fn spawn_compute_broadcaster(
         }
     });
     Ok(())
+}
+
+/// P1 (Collective Intelligence): periodically broadcast this node's logical
+/// agents and prune stale remote agent views. Agent advertisements change
+/// rarely, but the periodic beat keeps the fabric's agent view fresh and
+/// enforces staleness — mirroring the compute advertisement heartbeat.
+fn spawn_agent_broadcaster(
+    agent_manager: Arc<decentraai_distributed::agents::AgentManager>,
+    p2p_node: decentraai_p2p::P2PNode,
+) {
+    use decentraai_compute::DEFAULT_ADVERTISEMENT_INTERVAL_MS;
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(DEFAULT_ADVERTISEMENT_INTERVAL_MS));
+        loop {
+            interval.tick().await;
+            match agent_manager.advertisement_wire_bytes() {
+                Ok(bytes) => p2p_node.announce(bytes),
+                Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
+            }
+            // Expire remote agent views that have not refreshed (pure
+            // bookkeeping — never touches trust or reputation).
+            let stale = std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
+            let evicted = agent_manager.prune_stale(stale);
+            if evicted > 0 {
+                tracing::debug!(evicted, "pruned stale remote agent views");
+            }
+        }
+    });
 }
 
 /// Parses `http://host:port/...` into `(host, port)`. Returns `None` on an

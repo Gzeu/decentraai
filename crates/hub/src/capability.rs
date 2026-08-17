@@ -15,10 +15,14 @@
 //! The taxonomy is pure: no I/O, no async. The Hub search / model detail
 //! paths serialize it for the admin API.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A capability category a model may genuinely have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+///
+/// Wire-compatible: derives `Deserialize` so capability claims can travel
+/// inside agent advertisements and be parsed by other nodes (the collective
+/// fabric uses this taxonomy as the *semantic* half of its capability model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityKind {    Chat,
     TextGeneration,
@@ -120,7 +124,7 @@ impl std::str::FromStr for CapabilityKind {
 }
 
 /// How a capability claim was obtained. Never hidden from the user (§31).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     /// Stated explicitly by the source metadata (e.g. Hub pipeline tag).
@@ -130,7 +134,7 @@ pub enum Provenance {
 }
 
 /// One capability claim with its provenance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityClaim {
     pub capability: CapabilityKind,
     pub provenance: Provenance,
@@ -138,7 +142,7 @@ pub struct CapabilityClaim {
 
 /// The full capability view of a model: claims plus the task-level filters
 /// that are supported by the claimed capabilities (§5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub claims: Vec<CapabilityClaim>,
     /// Task filters exposed for this model, grouped by capability. Derived
@@ -147,7 +151,7 @@ pub struct ModelCapabilities {
     pub tasks: Vec<TaskEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEntry {
     pub capability: CapabilityKind,
     pub task: String,

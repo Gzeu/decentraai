@@ -237,6 +237,22 @@ planner scoring that M20's KV placement will combine with.
 Q4: `decentraai setup` — detect hardware → identity → auto-select model →
 write validated config → READY. Idempotent; verified end-to-end on Ubuntu.
 
+### Collective Intelligence — P0+P1 agent substrate (DONE, `crates/agents`)
+
+Direction (agreed 2026-08-17, see `docs/COLLECTIVE_INTELLIGENCE.md`): DecentraAI
+evolves from a distributed inference fabric into a collective-intelligence
+infrastructure. **An agent is a logical execution context on a node — not a new
+process.** P0+P1 landed: `AgentRecord`/`AgentRegistry`/`AgentTask`/
+`ToolDescriptor`/`AgentAdvertisement` (pure crate, no I/O), the **unified
+capability matcher** (one compositional verdict: hub provenance-aware semantic
+gate + agent model allowlist + compute physical gate — the two capability
+languages are now cross-wired), `SignedAgentAdvertisement` (anti-spoof),
+`AgentManager` in `decentraai-distributed`, `/v1/agents` + dashboard AGENTS
+view, `decentraai agent list`, and E2E two-node signed advertisement exchange.
+Next milestones (in order): P2 agent messaging → P3 delegation DAG → P4
+verification/consensus → P5 collective memory → P6 agent reputation →
+P7 policy+sandbox.
+
 Productization (installable app): `decentraai node` is the one-process
 background daemon (auto-provision identity/config, LAN/P2P discovery +
 verified auto-share, auto-select + serve model, dashboard/API bound

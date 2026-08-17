@@ -333,6 +333,75 @@ pub fn verify_signed_compute_advertisement(
     decentraai_identity::verify_signature(&key, &signed.advertisement, &sig)
 }
 
+/// Serialized agent advertisement plus its sender's signature (Collective
+/// Intelligence P1).
+///
+/// Mirrors [`SignedComputeAdvertisement`] exactly: the `advertisement` is the
+/// canonical serialized `decentraai_agents::AgentAdvertisement`; `signature`
+/// is Ed25519 over those bytes. The receiver verifies the signature and that
+/// the embedded advertisement's `peer_id` matches the signing public key, so
+/// a forged agent advertisement is rejected. The payload stays opaque
+/// (`Vec<u8>`) so this crate never needs to depend on `decentraai-agents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignedAgentAdvertisement {
+    pub protocol_version: u16,
+    /// Canonical bytes of the agent advertisement.
+    pub advertisement: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_public_key: Option<[u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none", with = "b64_opt")]
+    pub signature: Option<Vec<u8>>,
+}
+
+impl Default for SignedAgentAdvertisement {
+    fn default() -> Self {
+        Self {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            advertisement: Vec::new(),
+            sender_public_key: None,
+            signature: None,
+        }
+    }
+}
+
+/// Signs serialized agent-advertisement bytes with the node identity.
+pub fn sign_agent_advertisement(
+    signing_key_bytes: &[u8; 32],
+    advertisement_bytes: &[u8],
+) -> SignedAgentAdvertisement {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
+    let signature = signing_key.sign(advertisement_bytes).to_bytes().to_vec();
+    SignedAgentAdvertisement {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        advertisement: advertisement_bytes.to_vec(),
+        sender_public_key: Some(signing_key.verifying_key().to_bytes()),
+        signature: Some(signature),
+    }
+}
+
+/// Verifies a signed agent advertisement (same rules as the compute one).
+pub fn verify_signed_agent_advertisement(
+    signed: &SignedAgentAdvertisement,
+    expected_peer: &PeerId,
+) -> Result<()> {
+    let (Some(sig), Some(pk_bytes)) = (signed.signature.as_deref(), signed.sender_public_key)
+    else {
+        anyhow::bail!("unsigned agent advertisement");
+    };
+    let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk_bytes)
+        .context("invalid sender public key")?;
+    let signer = PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey));
+    if &signer != expected_peer {
+        anyhow::bail!(
+            "agent advertisement signer {signer} does not match the claiming peer {expected_peer}"
+        );
+    }
+    let key = VerifyingKey::from_bytes(&pk_bytes).context("invalid ed25519 public key")?;
+    let sig = Signature::from_slice(sig).context("invalid signature")?;
+    decentraai_identity::verify_signature(&key, &signed.advertisement, &sig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +776,46 @@ mod tests {
         // Tamper with the serialized payload after signing.
         signed.advertisement = serde_json::to_vec(&["vram_999"]).unwrap();
         assert!(verify_signed_compute_advertisement(&signed, &peer).is_err());
+    }
+
+    // ---- Collective Intelligence P1: signed agent advertisements ----
+
+    #[test]
+    fn signed_agent_advertisement_roundtrip_verifies_for_the_claiming_peer() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        // Canonical advertisement bytes (opaque payload from the caller —
+        // this crate never parses the agent shape).
+        let adv_bytes = serde_json::to_vec(&["agent:generalist", "agent:ocr"]).unwrap();
+        let signed = sign_agent_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        assert!(signed.signature.is_some());
+        assert!(verify_signed_agent_advertisement(&signed, &peer).is_ok());
+    }
+
+    #[test]
+    fn signed_agent_advertisement_rejects_a_spoofed_claiming_peer() {
+        let identity = Identity::generate();
+        let other = Identity::generate();
+        let adv_bytes = serde_json::to_vec(&["agent:generalist"]).unwrap();
+        let signed = sign_agent_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        // Anti-spoof: the signer key must map to the claiming peer.
+        assert!(verify_signed_agent_advertisement(&signed, &peer_of(&other)).is_err());
+    }
+
+    #[test]
+    fn signed_agent_advertisement_rejects_tampered_payload() {
+        let identity = Identity::generate();
+        let peer = peer_of(&identity);
+        let adv_bytes = serde_json::to_vec(&["agent:generalist"]).unwrap();
+        let mut signed = sign_agent_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        signed.advertisement = serde_json::to_vec(&["agent:impostor"]).unwrap();
+        assert!(verify_signed_agent_advertisement(&signed, &peer).is_err());
+    }
+
+    #[test]
+    fn signed_agent_advertisement_rejects_unsigned_message() {
+        let peer = peer_of(&Identity::generate());
+        let signed = SignedAgentAdvertisement::default();
+        assert!(verify_signed_agent_advertisement(&signed, &peer).is_err());
     }
 }
