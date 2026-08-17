@@ -312,3 +312,83 @@ async fn unified_matcher_answers_semantic_match_against_remote_agent() {
 async fn wait_for(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_exchange_agent_messages_over_the_transport() {
+    use decentraai_agents::{AgentMessage, MessageKind};
+    use decentraai_distributed::agent_messenger::AgentMessenger;
+
+    let identity_a = Identity::generate();
+    let identity_b = Identity::generate();
+    let peer_b = libp2p_peer_id(&identity_b);
+
+    // Node B: messenger + handler that drains inbound frames into its inbox.
+    // The node stays alive so A can dial and deliver to it.
+    let (messenger_b, node_b, node_b_addr) = {
+        let mut handler = DistributedP2PHandler::new();
+        let messenger_b = Arc::new(AgentMessenger::new(
+            P2PNode::new(
+                &identity_b,
+                DEFAULT_MAX_MESSAGE_BYTES,
+                DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+                None,
+            )
+            .unwrap(),
+        ));
+        handler.set_messenger(messenger_b.clone());
+        let chained = ChainedHandler::new().add_handler(Arc::new(handler));
+        let node_b = P2PNode::new(
+            &identity_b,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            Some(Arc::new(chained)),
+        )
+        .unwrap();
+        let addr = node_b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+        (messenger_b, node_b, addr)
+    };
+
+    // Node A: messenger sends a message to B.
+    let node_a = P2PNode::new(
+        &identity_a,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
+    node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    node_a.dial(&node_b_addr.to_string()).await.unwrap();
+    let messenger_a = AgentMessenger::new(node_a.clone());
+
+    // Re-send until the transport delivers (request only reaches connected
+    // peers; the dialed connection needs a beat to settle).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let message = AgentMessage::new("msg-1", "a:research", "b:ocr", MessageKind::Delegate)
+        .with_nonce(7)
+        .with_created_at_ms(1_700_000_000_000)
+        .with_task("t-42");
+    loop {
+        // Best-effort send: failures before the connection settles are retried.
+        let _ = messenger_a.send(peer_b, message.clone()).await;
+        if messenger_b.has_pending("b:ocr") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the agent message to be delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let received = messenger_b.pop("b:ocr").expect("inbox must hold the message");
+    assert_eq!(received.message_id, message.message_id);
+    assert_eq!(received.kind, MessageKind::Delegate);
+    assert_eq!(received.task_id.as_deref(), Some("t-42"));
+    assert_eq!(received.from_agent, "a:research");
+    assert_eq!(received.nonce, 7);
+
+    drop(messenger_a);
+    drop(messenger_b);
+    drop(node_a);
+    drop(node_b);
+}

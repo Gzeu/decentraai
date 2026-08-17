@@ -2051,3 +2051,64 @@ unified capability matcher, and the signed wire advertisement.
 - Agent tasks are defined and tested but NOT routed yet (P3 = delegation).
 - Remote agents are visible in the dashboard but cannot receive work yet
   (P2/P3 = messaging + delegation).
+
+## 94. Collective Intelligence — P2–P7 agent fabric (DONE)
+
+Continues §93. The pure agent-fabric milestones landed in one coherent push
+(commit `b2a4701`), each as a module in `crates/agents` (pure, no I/O) with
+unit tests + E2E where a wire path exists.
+
+### P2 — agent messaging (DONE)
+- [x] `message.rs`: `AgentMessage` (ask/delegate/reply/verify/ping; opaque
+  JSON payload; nonce; created_at), `AgentInbox` (bounded per-recipient FIFO,
+  overflow dropped never grown), `validate_message`.
+- [x] `AgentMessenger` in `decentraai-distributed`: sends `AgentMessage` over
+  the existing libp2p request/response channel (Noise-authenticated), lands
+  inbound frames in the right recipient's inbox.
+- [x] `DistributedP2PHandler` branch delivers inbound messages to the inbox.
+- [x] E2E: two real nodes exchange a `Delegate` message over the transport.
+
+### P3 — delegation DAG (DONE)
+- [x] `delegation.rs`: `DelegationPlan` (DAG of `DelegationStage`s with
+  depends-on edges + per-stage verification), `DelegationPlanner::plan_task`
+  (one stage per required capability, deterministic first-capable-agent
+  routing, then a synthesis stage), `execute_plan` (topological execution
+  with an injected executor, per-hop schema verification on the VALUE, honest
+  Partial verdicts).
+- [x] Honesty: an unroutable capability rejects the plan (never invents an
+  executor); per-hop verification runs when the stage demands it.
+
+### P4 — result verification / consensus (DONE)
+- [x] `verification.rs`: `VerificationReport`/`VerificationCheck`/`CheckKind`,
+  `check_output_schema` (honest JSON structural check), `ConsensusPolicy` +
+  `evaluate_consensus`, `DisagreementResolution` + `resolve_disagreement`,
+  `VerificationLedger` (bounded, immutable per task_id).
+
+### P5 — collective memory (DONE)
+- [x] `memory.rs`: `MemoryLevel`/`MemoryAccess`/`MemoryPolicy`/`MemoryEntry`/
+  `MemoryScope`, `can_read`/`can_write` (ownership + access + trust +
+  provenance), `enforce_retention`, `MemoryRegistry` (bounded scopes with
+  expiry pruning + access enforcement). Runtime SQLite persistence is a later
+  concern; the model the runtime will enforce is settled here.
+
+### P6 — agent reputation (DONE)
+- [x] `reputation.rs`: per-(agent, capability) `AgentReputation` with factors
+  (reliability/quality/latency/uptime/safety/provenance), EMA `ReputationStore`
+  `observe`, deterministic `best_for_capability`, `safety_penalty` (only
+  policy/crypto violations — network errors never touch safety), unknown
+  reputation = 0.0 NOT a penalty.
+
+### P7 — policy engine (DONE)
+- [x] `policy.rs`: `Permission`/`PolicyDecision`/`PolicyEngine` — explicit
+  Allow/Deny with reasons for tools, models, peers, resource budgets,
+  network egress; Controlled-Exploration boundary (Normal/Exploration/
+  Experimental → `ExplorationLimit`). **Agent Power ≠ Permission** enforced.
+
+### Honesty notes
+- Per-hop verification checks the JSON *value* (not its serialization, which
+  would always parse), catching a stage that promised an object and returned
+  a string.
+- `check_output_schema` is deliberately shallow (structural, not a full
+  JSON-Schema validator) and never claims more validation than it does.
+- Messaging is wired end-to-end (E2E-verified) but not yet driven by the
+  product UI; P3/P9 orchestration will use it.

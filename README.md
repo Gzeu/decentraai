@@ -661,6 +661,16 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
   (anti-spoof signature verification). Nodes advertise their agents on the
   heartbeat; the dashboard AGENTS view shows local + remote agents; see
   `docs/COLLECTIVE_INTELLIGENCE.md`.
+- **Agent fabric** (`crates/agents`, P2–P7): `AgentMessage` + bounded
+  `AgentInbox` (P2, with an `AgentMessenger` bridging to the P2P transport,
+  E2E-verified); `DelegationPlan`/`DelegationPlanner`/`execute_plan` — a DAG
+  of capability-bound stages with per-hop verification (P3);
+  `VerificationReport`/consensus/disagreement-resolution (P4); multi-level
+  `MemoryScope`/`MemoryRegistry` with ownership+access+retention policies
+  (P5); per-(agent, capability) `AgentReputation` with a safety factor that
+  only policy/crypto violations touch (P6); `PolicyEngine` — explicit
+  Allow/Deny for tools/models/peers/budgets/egress with a Controlled-
+  Exploration boundary (P7).
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted

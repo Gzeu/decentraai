@@ -11,11 +11,9 @@ description = "Collective-intelligence agent model: logical agents, unified sema
 [dependencies]
 libp2p.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 # Internal dependencies (both are leaves in the dependency graph)
 decentraai-compute = { path = "../compute" }
 decentraai-hub = { path = "../hub" }
-
-[dev-dependencies]
-serde_json.workspace = true

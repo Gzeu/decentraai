@@ -28,6 +28,9 @@ pub struct DistributedP2PHandler {
     compute_manager: Option<Arc<crate::compute::ComputeManager>>,
     /// Optional agent manager to process (signed) agent advertisements
     agents: Option<Arc<crate::agents::AgentManager>>,
+    /// Optional messenger that delivers inbound agent messages to their
+    /// recipient's inbox (P2).
+    messenger: Option<Arc<crate::agent_messenger::AgentMessenger>>,
 }
 
 impl DistributedP2PHandler {
@@ -39,6 +42,7 @@ impl DistributedP2PHandler {
             tracker: None,
             compute_manager: None,
             agents: None,
+            messenger: None,
         }
     }
 
@@ -50,6 +54,7 @@ impl DistributedP2PHandler {
             tracker: None,
             compute_manager: None,
             agents: None,
+            messenger: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl DistributedP2PHandler {
             tracker: None,
             compute_manager: None,
             agents: None,
+            messenger: None,
         }
     }
 
@@ -77,6 +83,7 @@ impl DistributedP2PHandler {
             tracker: None,
             compute_manager: None,
             agents: None,
+            messenger: None,
         }
     }
 
@@ -96,6 +103,12 @@ impl DistributedP2PHandler {
     pub fn set_agent_manager(&mut self, agents: Arc<crate::agents::AgentManager>) {
         self.agents = Some(agents);
     }
+
+    /// Attach an AgentMessenger so inbound agent messages land in the right
+    /// recipient's inbox (P2).
+    pub fn set_messenger(&mut self, messenger: Arc<crate::agent_messenger::AgentMessenger>) {
+        self.messenger = Some(messenger);
+    }
 }
 
 impl Default for DistributedP2PHandler {
@@ -111,11 +124,23 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
             deserialize_message, serialize_message, verify_signed_compute_advertisement,
         };
 
+        // P2 (Collective Intelligence): an agent message is delivered into
+        // the recipient's inbox. The sender is authenticated by the Noise
+        // transport; the message's nonce guards replay at the app layer.
+        if let Ok(msg) = crate::agent_messenger::parse_agent_message(request) {
+            if let Some(messenger) = &self.messenger {
+                let delivered = messenger.push_inbound(msg);
+                if !delivered {
+                    tracing::warn!("agent inbox full — dropping inbound message");
+                }
+            }
+            return Ok(Vec::new()); // transport ack
+        }
+
         // P1 (Collective Intelligence): a signed agent advertisement is
         // verified before the agent view is updated. The signer's public key
         // must map to the advertisement's own peer_id (anti-spoof).
-        if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(
-            request,
+        if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(request,
             decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
         ) {
             match crate::agents::verify_agent_advertisement_signed(&signed) {
