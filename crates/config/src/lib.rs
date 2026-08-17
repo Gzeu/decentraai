@@ -39,6 +39,12 @@ pub struct NodeSection {
     pub name: String,
     pub mode: NodeMode,
     pub data_dir: String,
+    /// Explicit GGUF model file name to serve (e.g.
+    /// `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`). When set, the node serves this
+    /// model instead of auto-detecting the first one in the models dir; a
+    /// missing file is a hard error at startup. Optional (absent = auto-detect).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

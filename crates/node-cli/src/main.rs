@@ -731,6 +731,34 @@ fn auto_detect_model(dir: &std::path::Path) -> Result<String> {
     Ok(found.into_iter().next().unwrap_or_default())
 }
 
+/// Resolves which model file to serve: an explicit `node.model` name wins
+/// (and must exist on disk — a wrong name is a hard error, not a silent
+/// fallback to auto-detect, so the operator notices the typo); otherwise the
+/// first `.gguf` in the models dir is auto-detected.
+fn resolve_model_name(
+    models_dir: &std::path::Path,
+    explicit: Option<&str>,
+) -> Result<String> {
+    match explicit {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Ok(String::new());
+            }
+            let path = models_dir.join(trimmed);
+            if !path.is_file() {
+                anyhow::bail!(
+                    "node.model '{}' not found in {} — check the model file name",
+                    trimmed,
+                    models_dir.display()
+                );
+            }
+            Ok(trimmed.to_string())
+        }
+        None => auto_detect_model(models_dir),
+    }
+}
+
 /// Builds a valid `NodeConfig` YAML from detected state. The schema mirrors
 /// `configs/node.example.yaml`; fields a fresh user should not tune are set
 /// to safe defaults. Must round-trip through `NodeConfig::load`.
@@ -924,7 +952,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // the model over P2P) and a coordinator (routes/streams to other workers);
     // if absent it is a coordinator-only discovery node.
     let models_dir = data_dir.join("models");
-    let model_name = auto_detect_model(&models_dir).unwrap_or_default();
+    // An explicit `node.model` wins over auto-detection (and errors on a
+    // typo); otherwise the first .gguf in the models dir is chosen.
+    let model_name = resolve_model_name(&models_dir, config.node.model.as_deref())
+        .unwrap_or_default();
     let detected_model = if model_name.is_empty() {
         None
     } else {
@@ -5092,5 +5123,47 @@ mod tests {
                 command: AgentCommand::TalentTree { .. }
             }
         ));
+    }
+
+    // ---- node.model resolution (pivot on local GGUF models) ----
+
+    #[test]
+    fn explicit_model_wins_over_auto_detect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.gguf"), b"a").unwrap();
+        std::fs::write(dir.path().join("B.gguf"), b"b").unwrap();
+        // Explicit name is served even though "A.gguf" would auto-detect first.
+        assert_eq!(
+            resolve_model_name(dir.path(), Some("B.gguf")).unwrap(),
+            "B.gguf"
+        );
+    }
+
+    #[test]
+    fn explicit_missing_model_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_model_name(dir.path(), Some("Nope.gguf")).unwrap_err();
+        assert!(err.to_string().contains("Nope.gguf"));
+    }
+
+    #[test]
+    fn explicit_blank_model_falls_back_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_model_name(dir.path(), Some("   ")).unwrap(), "");
+    }
+
+    #[test]
+    fn no_explicit_model_auto_detects_first_sorted_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("B.gguf"), b"b").unwrap();
+        std::fs::write(dir.path().join("A.gguf"), b"a").unwrap();
+        std::fs::write(dir.path().join("junk.txt"), b"j").unwrap();
+        assert_eq!(resolve_model_name(dir.path(), None).unwrap(), "A.gguf");
+    }
+
+    #[test]
+    fn empty_dir_yields_no_model() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_model_name(dir.path(), None).unwrap(), "");
     }
 }

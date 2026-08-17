@@ -2234,3 +2234,18 @@ Continues §96. Commit `2e2c8e3`.
 - The agent runtime answers `Delegate` for the node's own agent via the
   orchestrator's message protocol; full remote-orchestration on LAN between
   two live `decentraai node` hosts is the next live validation.
+
+## 98. Node — explicit model selection (`node.model`) (DONE)
+
+Commit `1c4f9bb`. Pivot on local GGUF models.
+
+- [x] `NodeSection.model: Option<String>` (additive, `deny_unknown_fields`-safe;
+  absent = auto-detect as before).
+- [x] `resolve_model_name`: an explicit `node.model` wins over auto-detection
+  and a missing file is a HARD startup error (the operator notices a typo, not
+  a silent fallback); blank = no model; None = first sorted `.gguf`.
+- [x] `decentraai node` serves the resolved model through llama-server.
+- [x] Docs + example config.
+
+Switch between models by editing `node.model` (e.g. Llama-3.2-1B for speed,
+Mistral-7B for quality) and restarting the node — no re-detection needed.
