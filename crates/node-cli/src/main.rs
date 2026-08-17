@@ -1194,6 +1194,18 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     distributed_handler.set_tracker(tracker.clone());
     distributed_handler.set_compute_manager(compute_manager.clone());
     distributed_handler.set_agent_manager(agent_manager.clone());
+    // Agent messenger: routes inbound agent messages to the right recipient's
+    // inbox. Starts on a placeholder node; re-pointed at the real P2P node
+    // below (the messenger/handler/node construction is circular).
+    let agent_messenger = Arc::new(
+        decentraai_distributed::agent_messenger::AgentMessenger::new(P2PNode::new(
+            &identity,
+            config.network.max_message_bytes as usize,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )?),
+    );
+    distributed_handler.set_messenger(agent_messenger.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 
     // Serve manifests/chunks off the registry if one exists (model sharing).
@@ -1222,6 +1234,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         },
     )?;
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    // Re-point the agent messenger at the real, handler-bearing P2P node so
+    // both outbound Delegates and inbound Replies ride the connected peer.
+    agent_messenger.set_transport(p2p_node.clone());
 
     let mut distributed = DistributedInference::new(
         p2p_node,
@@ -1235,6 +1250,35 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // P1: sign outbound routed requests with the node identity so workers can
     // authenticate them and reject spoofed/unsigned traffic.
     distributed.set_signing_identity(identity.signing_key_bytes());
+
+    // ---- Collective Intelligence: make this node a live agent host ----
+    // A production AgentRuntime with an inference executor answers delegated
+    // LLM tasks through the fabric; a SQLite MemoryStore persists collective
+    // memory. Both are best-effort and never disturb the existing flow.
+    if is_worker && !model_hash.is_empty() {
+        let inference_executor =
+            decentraai_distributed::agent_runtime::InferenceAgentExecutor::new(
+                Arc::new(distributed.clone()),
+                model_hash.clone(),
+            );
+        let mut agent_runtime =
+            decentraai_distributed::agent_runtime::AgentRuntime::new("orchestrator", agent_messenger.clone());
+        agent_runtime.with_executor(move |task, inputs| {
+            let ex = inference_executor.clone();
+            async move { ex.execute(&task, &inputs).await }
+        });
+        tokio::spawn(async move { agent_runtime.run_forever().await });
+        info!("node is a live agent host (inference executor wired)");
+    } else {
+        info!("node agent host: no servable model — agent runtime idle");
+    }
+    // Persistent collective memory (best-effort; the node keeps working if it
+    // cannot open or create the store).
+    let agent_memory_path = data_dir.join("db/agent_memory.sqlite");
+    match decentraai_distributed::agent_memory::MemoryStore::open(&agent_memory_path) {
+        Ok(_store) => info!(path = %agent_memory_path.display(), "collective memory store ready"),
+        Err(e) => tracing::warn!(error = %e, "failed to open collective memory store"),
+    }
 
     // The dashboard owns the llama-server lifecycle; the worker advertises in
     // sync with its LIVE health (see spawn_compute_broadcaster). Create the

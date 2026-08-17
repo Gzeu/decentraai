@@ -441,7 +441,7 @@ async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
         "b:ocr",
         messenger_b.clone(),
     );
-    agent_runtime.with_executor(|_task, _inputs| {
+    agent_runtime.with_executor(|_task, _inputs| async move {
         Ok(serde_json::json!({ "ocr_text": "parsed text" }))
     });
     let _runtime_task = tokio::spawn(async move { agent_runtime.run_forever().await });

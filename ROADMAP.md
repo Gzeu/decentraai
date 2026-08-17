@@ -2211,3 +2211,26 @@ surfaces.
   integration step — the runtime never pretends to execute without one.
 - CLI `reputation` uses deterministic synthetic samples, clearly labeled —
   never presented as real measurements.
+
+## 97. Collective Intelligence — production inference executor + node agent host (DONE)
+
+Continues §96. Commit `2e2c8e3`.
+
+- [x] `AgentExecutor` is now **async** (takes `AgentTask` + `Value` by value,
+  returns a boxed future) so a real inference backend can be awaited.
+- [x] `InferenceAgentExecutor` (in `agent_runtime.rs`): an executor that runs
+  a delegated LLM task through the fabric's real path
+  (`DistributedInference::route_request`). Input is a prompt string or
+  `{ "prompt", "model_hash?" }`; model resolution is task-workload > input >
+  default; output is `{ text, model_hash, tokens }`. Pure
+  `infer_request_from` maps input→request (unit-tested, no network).
+- [x] **Node daemon is now a live agent host**: `decentraai node` wires the
+  agent messenger (placeholder → `set_transport` on the real P2P node), spawns
+  a production `AgentRuntime` with the `InferenceAgentExecutor` (when a model
+  is served) so it can execute delegated LLM tasks, and opens the SQLite
+  `MemoryStore` — all best-effort, never disturbing the existing flow.
+
+### Honesty notes
+- The agent runtime answers `Delegate` for the node's own agent via the
+  orchestrator's message protocol; full remote-orchestration on LAN between
+  two live `decentraai node` hosts is the next live validation.

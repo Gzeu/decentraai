@@ -682,11 +682,14 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
   another node and completes it.
 - **Production agent runtime** (`crates/distributed/src/agent_runtime.rs`):
   the remote-side executor — drains an agent's inbox, runs each `Delegate`
-  through an injected `AgentExecutor` (seam to a real engine) and replies.
-  Plus a SQLite-backed `MemoryStore` (persistent, access-enforcing collective
+  through an injected `AgentExecutor` (async, so a real engine can be
+  awaited) and replies. Includes `InferenceAgentExecutor`, which runs a
+  delegated LLM task through the fabric's real `route_request` path, plus a
+  SQLite-backed `MemoryStore` (persistent, access-enforcing collective
   memory), a Collective-Graph dashboard view (agents/models/tools/capability
   coverage), and an extended `decentraai agent` CLI
-  (`show` / `workflow` / `reputation` / `talent-tree`).
+  (`show` / `workflow` / `reputation` / `talent-tree`). `decentraai node` now
+  wires this as a live agent host.
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted
