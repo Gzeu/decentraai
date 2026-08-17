@@ -834,8 +834,10 @@ code,.mono{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
 #audit li{padding:8px 0;border-bottom:1px solid rgba(28,38,52,.6);font-size:12px;color:var(--muted);line-height:1.5}
 #audit li code{color:var(--accent)}
 .api-url{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:20px;padding-top:12px;border-top:1px solid var(--line)}
+.back{margin-left:auto;text-decoration:none;color:var(--muted);font-size:12.5px;padding:7px 14px;border:1px solid var(--line-2);border-radius:var(--radius-sm);background:var(--accent-soft);transition:border-color .15s,color .15s}
+.back:hover{border-color:var(--accent);color:var(--accent)}
 </style></head><body>
-<div class="page-head"><div class="brand-mark">◈</div><div><div class="crumb">DecentraAI · control plane</div><h1>Admin</h1></div></div>
+<div class="page-head"><div class="brand-mark">◈</div><div><div class="crumb">DecentraAI · control plane</div><h1>Admin</h1></div><a class="back" href="/">← Dashboard</a></div>
 <div class="grid">
 <div class="card"><h2>Create Token</h2><form id="f"><input name="name" placeholder="Token name" required><select name="t"><option value="1">Guest</option><option value="2">Contributor</option><option value="3">Core</option></select><select name="role"><option value="client">Client</option><option value="operator">Operator</option></select><button class="primary" type="submit">Create</button></form><div id="new" style="display:none"><code id="token"></code><button onclick="navigator.clipboard.writeText(document.getElementById('token').textContent)">Copy</button><span class="small">shown once</span></div><p id="status"></p></div>
 <div class="card"><h2>Consumer API Keys</h2><form id="cf"><input name="account" placeholder="Owner account" required><input name="ceiling" type="number" min="1" placeholder="Quota ceiling" required><input name="rate" type="number" min="1" placeholder="req/min" required><button class="primary" type="submit">Create</button></form><div id="cnew" style="display:none"><code id="ckey"></code><button onclick="navigator.clipboard.writeText(document.getElementById('ckey').textContent)">Copy</button><span class="small">shown once</span></div><p id="cstatus"></p></div>
