@@ -24,7 +24,12 @@ use std::sync::{Arc, Mutex};
 /// Sends agent messages and holds the inbound inbox.
 #[derive(Clone)]
 pub struct AgentMessenger {
-    p2p: P2PNode,
+    /// The P2P transport. Interior-mutable because construction is circular
+    /// (the handler needs the messenger, the messenger needs the node): the
+    /// messenger starts on a placeholder node and is re-pointed at the real,
+    /// handler-bearing node via [`AgentMessenger::set_transport`] after it
+    /// exists.
+    p2p: Arc<Mutex<P2PNode>>,
     inbox: Arc<Mutex<AgentInbox>>,
 }
 
@@ -32,9 +37,14 @@ impl AgentMessenger {
     /// Wraps the node's P2P transport with a per-recipient bounded inbox.
     pub fn new(p2p: P2PNode) -> Self {
         Self {
-            p2p,
+            p2p: Arc::new(Mutex::new(p2p)),
             inbox: Arc::new(Mutex::new(AgentInbox::new(64))),
         }
+    }
+
+    /// Points the messenger at the transport that carries its handler.
+    pub fn set_transport(&self, p2p: P2PNode) {
+        *self.p2p.lock().unwrap() = p2p;
     }
 
     /// Delivers a message to a peer over the transport. Returns `Ok(())`
@@ -45,7 +55,8 @@ impl AgentMessenger {
         decentraai_agents::validate_message(&message)
             .context("refusing to send an invalid agent message")?;
         let bytes = serialize_message(&message)?;
-        self.p2p.request(peer, bytes).await.context("agent message transport")?;
+        let p2p = self.p2p.lock().unwrap().clone();
+        p2p.request(peer, bytes).await.context("agent message transport")?;
         Ok(())
     }
 

@@ -76,6 +76,7 @@ fn describe_admit_reason(reason: AdmitReason) -> String {
 }
 
 pub mod agent_messenger;
+pub mod agent_orchestrator;
 pub mod agents;
 pub mod breaker;
 pub mod compute;

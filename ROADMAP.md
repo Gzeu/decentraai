@@ -2112,3 +2112,55 @@ unit tests + E2E where a wire path exists.
   JSON-Schema validator) and never claims more validation than it does.
 - Messaging is wired end-to-end (E2E-verified) but not yet driven by the
   product UI; P3/P9 orchestration will use it.
+
+## 95. Collective Intelligence — P8–P11 + live orchestrator (DONE)
+
+Continues §93/§94. The remaining pure fabric milestones landed (commit
+`b1d5a0f`) plus the live orchestrator that binds them together.
+
+### P8 — talent tree (DONE, `crates/agents/src/talent_tree.rs`)
+- [x] Dynamic capability graph: `TalentNode` (capability + prerequisites +
+  resource estimate + provenance + confidence + experimental), `TalentTree`
+  (`can_unlock`, `resolve_path`, `available_capabilities`, `reachable`),
+  `seed_talent_tree()`. No fixed levels, no hardcoded end; new capabilities
+  are added at the graph level without code changes. Composite nodes are
+  mapped to the closest existing `CapabilityKind` (documented honestly).
+
+### P9 — collective workflows (DONE, `crates/agents/src/workflow.rs`)
+- [x] `WorkflowTemplate`/`WorkflowStep`/`run_workflow`/`WorkflowOutcome`:
+  named reusable DAG templates instantiated into concrete `DelegationPlan`s
+  and executed with the delegation executor.
+- [x] `research_report_template()`: the architecture-doc example
+  (Research → Financial → Documents → Synthesis, with a Critic verification).
+
+### P10 — self-optimization (DONE, `crates/agents/src/selfopt.rs`)
+- [x] `SelfOptimizer`: weighted observations per `OptimizationDimension` →
+  Increase/Decrease/Rebalance suggestions scored under hard-ceiling
+  (Reliability/Security/Privacy) and soft-target (Quality/Cost/Latency)
+  constraints; `suggest_compute`. Pure policy loop — the runtime applies it.
+
+### P11 — agent economy (DONE, `crates/agents/src/economy.rs`)
+- [x] `CapabilityOffer` (quality/reliability/price-per-unit/SLA/concurrency),
+  `BookingRequest`/`negotiate` (explicit Booked/Rejected verdicts),
+  `EconomyLedger` (bounded, cheapest-first selection). Non-monetary
+  (synthetic credits), modular — later wired to Quota/Compensation.
+
+### P3.5 — live orchestrator (DONE, `crates/distributed/src/agent_orchestrator.rs`)
+- [x] `AgentOrchestrator` binds the pure fabric to the live P2P channel:
+  **plan** (`DelegationPlanner`) → **select** (reputation-ranked executor from
+  the local+remote agent view, local first) → **delegate** (sends
+  `AgentMessage::Delegate` over the messenger, awaits the `Reply` with a
+  re-dialing send + reply timeout) → **verify** (per-hop value check) →
+  **collect** (topological, honest Partial on any failure).
+- [x] `AgentMessenger::set_transport` (interior-mutable P2P) resolves the
+  circular messenger/handler/node construction.
+- [x] E2E: a real coordinator delegates a 2-stage workflow to a remote agent
+  on another node over the transport, receives the replies, verifies the
+  object output and completes — the first real agent-to-agent delegated work.
+
+### Honesty notes
+- Orchestrator selection ranks by reputation but a tie never penalises a
+  capable agent (unknown reputation = 0.0, not a penalty).
+- The remote "agent runtime" in the E2E is a test stub that answers
+  `Delegate`; a production agent runtime (executing real tasks on the remote
+  side) is the next step, built on this orchestrator.

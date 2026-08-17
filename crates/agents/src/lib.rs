@@ -40,15 +40,19 @@ pub mod advertisement;
 pub mod agent;
 pub mod capability;
 pub mod delegation;
+pub mod economy;
 pub mod matcher;
 pub mod memory;
 pub mod message;
 pub mod policy;
 pub mod registry;
 pub mod reputation;
+pub mod selfopt;
+pub mod talent_tree;
 pub mod task;
 pub mod tool;
 pub mod verification;
+pub mod workflow;
 
 pub use advertisement::AgentAdvertisement;
 pub use agent::{
@@ -60,6 +64,10 @@ pub use capability::{AgentCapability, model_capabilities_from_claims};
 pub use delegation::{
     DelegationError, DelegationPlan, DelegationPlanner, DelegationResult, DelegationStage,
     DelegationVerdict, StageAssignment, StageResult, execute_plan,
+};
+pub use economy::{
+    BookingRequest, BookingVerdict, CapabilityOffer, EconomyError, EconomyLedger, MAX_OFFERS,
+    OfferStatus, negotiate,
 };
 pub use matcher::{
     AgentMatchOutcome, AgentMatchReason, AgentRequirement, match_agent, match_agent_semantic,
@@ -79,6 +87,11 @@ pub use reputation::{
     AgentReputation, DEFAULT_MIN_SAMPLES, FactorScore, ReputationFactor, ReputationStore,
     ReputationUpdate, default_weights, safety_penalty,
 };
+pub use selfopt::{
+    Constraint, ConstraintKind, Direction, OptimizationDimension, OptimizationObservation,
+    OptimizationSuggestion, RiskLevel, SelfOptimizer,
+};
+pub use talent_tree::{TalentError, TalentNode, TalentTree, seed_talent_tree};
 pub use task::{AgentTask, AgentWorkloadRequirement, TaskVerification};
 pub use tool::{
     ToolDescriptor, TOOL_KIND_BUILTIN, TOOL_KIND_CUSTOM, TOOL_KIND_HTTP, TOOL_KIND_MCP,
@@ -87,6 +100,10 @@ pub use verification::{
     CheckKind, ConsensusPolicy, ConsensusResult, DisagreementResolution, VerificationCheck,
     VerificationError, VerificationLedger, VerificationReport, VerificationVerdict,
     check_output_schema, clamped_confidence, evaluate_consensus, resolve_disagreement,
+};
+pub use workflow::{
+    WorkflowError, WorkflowOutcome, WorkflowStep, WorkflowTemplate, research_report_template,
+    run_workflow,
 };
 
 /// Current protocol version carried by agent advertisements.

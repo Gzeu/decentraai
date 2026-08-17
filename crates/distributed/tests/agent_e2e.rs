@@ -392,3 +392,150 @@ async fn two_nodes_exchange_agent_messages_over_the_transport() {
     drop(node_a);
     drop(node_b);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
+    use decentraai_agents::{
+        AgentAdvertisement, AgentMessage, AgentRecord, AgentTask, AgentState, DelegationVerdict,
+        MessageKind, ROLE_SPECIALIST, TaskVerification,
+    };
+    use decentraai_distributed::agent_messenger::AgentMessenger;
+    use decentraai_distributed::agent_orchestrator::AgentOrchestrator;
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
+    use decentraai_hub::requirements::EvidenceLevel;
+
+    let identity_a = Identity::generate();
+    let identity_b = Identity::generate();
+    let peer_a = libp2p_peer_id(&identity_a);
+    let peer_b = libp2p_peer_id(&identity_b);
+
+    // Node B: a messenger with a minimal "agent runtime" that answers any
+    // Delegate with a Reply (task → {"ocr_text": "…"} object).
+    let messenger_b = Arc::new(AgentMessenger::new(
+        P2PNode::new(
+            &identity_b,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap(),
+    ));
+    let mut handler_b = DistributedP2PHandler::new();
+    handler_b.set_messenger(messenger_b.clone());
+    let chained_b = ChainedHandler::new().add_handler(Arc::new(handler_b));
+    let node_b = P2PNode::new(
+        &identity_b,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained_b)),
+    )
+    .unwrap();
+    let node_b_addr = node_b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    // Re-point the messenger's transport to the handler-bearing node so its
+    // send() rides the connected peer.
+    messenger_b.set_transport(node_b.clone());
+
+    // B's agent runtime: drain the inbox and reply to every Delegate.
+    let runtime_b = messenger_b.clone();
+    let rt_peer_a = peer_a;
+    let _runtime_task = tokio::spawn(async move {
+        loop {
+            if let Some(msg) = runtime_b.pop("b:ocr") {
+                if msg.kind == MessageKind::Delegate {
+                    let task_id = msg.task_id.unwrap_or_else(|| "t".into());
+                    let reply = AgentMessage::new(
+                        format!("reply-{task_id}"),
+                        "b:ocr",
+                        "orchestrator",
+                        MessageKind::Reply,
+                    )
+                    .with_task(&task_id)
+                    .with_payload(serde_json::json!({ "ocr_text": "parsed text" }))
+                    .with_created_at_ms(1_700_000_000_000);
+                    let _ = runtime_b.send(rt_peer_a, reply).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    // Node A: orchestrator with a messenger riding the SAME node that dials
+    // B, so both the outgoing Delegate and the inbound Reply flow through the
+    // connected peer's handler.
+    let messenger_a = Arc::new(AgentMessenger::new(
+        P2PNode::new(
+            &identity_a,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap(),
+    ));
+    let mut handler_a = DistributedP2PHandler::new();
+    handler_a.set_messenger(messenger_a.clone());
+    let chained_a = ChainedHandler::new().add_handler(Arc::new(handler_a));
+    let node_a = P2PNode::new(
+        &identity_a,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        Some(Arc::new(chained_a)),
+    )
+    .unwrap();
+    node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    node_a.dial(&node_b_addr.to_string()).await.unwrap();
+    messenger_a.set_transport(node_a.clone());
+
+    // The coordinator's agent manager knows B advertises an OCR agent.
+    let agent_manager = decentraai_distributed::agents::AgentManager::new(peer_a, "coord".into());
+    let mut ocr = AgentRecord::new("b:ocr", "OCR", ROLE_SPECIALIST)
+        .with_capability(CapabilityKind::Ocr, Provenance::Verified)
+        .with_model("m");
+    ocr.set_state(AgentState::Ready);
+    agent_manager.process_advertisement(AgentAdvertisement::new(
+        peer_b,
+        "node-b",
+        vec![ocr],
+    ));
+    let agent_manager = Arc::new(agent_manager);
+
+    let mut orchestrator = AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
+    orchestrator.with_delegate_timeout(Duration::from_secs(10));
+
+    // A master task that needs OCR and an object output, self-check verified.
+    let mut task = AgentTask::new("t-master")
+        .require_capability(CapabilityKind::Ocr, EvidenceLevel::Verified)
+        .verified_by(TaskVerification::SelfCheck);
+    task.output_schema = Some(r#"{"type":"object"}"#.into());
+
+    // Let the dialed connection settle, then orchestrate.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let outcome = orchestrator.orchestrate(&task).await;
+
+    assert_eq!(
+        outcome.verdict,
+        DelegationVerdict::Completed,
+        "orchestration must complete: {:?}",
+        outcome.result.stages
+    );
+    // Synthesis received the OCR output and returned an object.
+    assert!(
+        outcome.result.final_output.is_some(),
+        "final output must be produced"
+    );
+    let synth_stage = outcome
+        .result
+        .stages
+        .iter()
+        .find(|s| s.stage_id == "synthesis")
+        .expect("synthesis stage present");
+    assert!(synth_stage.verified, "synthesis output verified");
+    assert!(
+        synth_stage.output.is_some(),
+        "synthesis output present after remote delegation"
+    );
+
+    drop(messenger_a);
+    drop(messenger_b);
+    drop(node_a);
+    drop(node_b);
+}

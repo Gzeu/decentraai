@@ -661,7 +661,7 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
   (anti-spoof signature verification). Nodes advertise their agents on the
   heartbeat; the dashboard AGENTS view shows local + remote agents; see
   `docs/COLLECTIVE_INTELLIGENCE.md`.
-- **Agent fabric** (`crates/agents`, P2–P7): `AgentMessage` + bounded
+- **Agent fabric** (`crates/agents`, P2–P11): `AgentMessage` + bounded
   `AgentInbox` (P2, with an `AgentMessenger` bridging to the P2P transport,
   E2E-verified); `DelegationPlan`/`DelegationPlanner`/`execute_plan` — a DAG
   of capability-bound stages with per-hop verification (P3);
@@ -670,7 +670,16 @@ decentraai token create --name <n> --tier 1..3  # issue a subscription token
   (P5); per-(agent, capability) `AgentReputation` with a safety factor that
   only policy/crypto violations touch (P6); `PolicyEngine` — explicit
   Allow/Deny for tools/models/peers/budgets/egress with a Controlled-
-  Exploration boundary (P7).
+  Exploration boundary (P7); a dynamic **talent tree** capability graph (P8);
+  named **collective workflows** as reusable DAG templates (P9); a
+  `SelfOptimizer` policy loop (P10); and a non-monetary agent-economy offer/
+  negotiate ledger (P11).
+- **Live orchestrator** (`crates/distributed/src/agent_orchestrator.rs`): an
+  `AgentOrchestrator` binds the pure fabric to the live P2P channel —
+  plan (DelegationPlanner) → reputation-ranked executor selection → delegate
+  via `AgentMessage::Delegate` over the messenger → per-hop verify → collect.
+  E2E-verified: a coordinator delegates a real workflow to a remote agent on
+  another node and completes it.
 - **Transfer** (`crates/p2p/transfer.rs`): per-chunk verification, `.part` staging +
   `.done` resume bitmap, full-file hash + Merkle gate, atomic rename; single-peer
   (`download`) or ranked multi-provider waves (`download_multi`); corrupted
