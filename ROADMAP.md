@@ -2293,3 +2293,34 @@ dashboard/API on a single node, executing through the node's local agents.
 - On a single node the workflow runs through the node's own agents; with
   remote peers trusted, the same orchestrator delegates to them (LAN
   validation is the next live step).
+
+## 101. Collective workflow verified LIVE on a real node (DONE)
+
+Commit `e0a9d3c`. The research-report workflow now runs end-to-end on a real
+`decentraai node` with a real local model, generating actual text.
+
+Three production bugs fixed in cascade, each with the root cause:
+
+- **libp2p refuses self-dial**: a single-node orchestrator delegating to its
+  own agent over P2P never got a reply. `AgentMessenger::send` now detects
+  self-delivery (`p2p.local_peer_id() == peer`) and pushes straight into the
+  local inbox instead of round-tripping over libp2p (single-node workflows
+  must not depend on a P2P loopback).
+- **missing capability**: the local generalist agent did not advertise
+  `DocumentUnderstanding`, so the workflow's `documents` stage was
+  unroutable. `default_local_agents` now also claims (INFERRED) Document
+  Understanding, Summarization, Classification, StructuredOutput — honest for
+  a generalist LLM.
+- **stale backend URL**: the single-node inference executor captured a static
+  backend URL, but llama-server respawns on a new port (M24), so the captured
+  port went stale. `InferenceAgentExecutor` now takes the node's LIVE engine
+  URL cache (`live_engine_url`) and re-reads it per call, and executes
+  delegated tasks directly against the local backend over HTTP (distributed
+  `route_request` cannot self-route), falling back to `route_request` when no
+  local backend is configured.
+
+Verified live: `POST /v1/agents/orchestrate` (research_report) on this node
+with Llama-3.2-1B returns `verdict: completed`, all four stages verified, and
+a real generated final report text.
+
+933 workspace tests green; clippy clean.

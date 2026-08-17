@@ -1287,11 +1287,18 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // through the fabric (inference executor); a SQLite MemoryStore persists
     // collective memory. Both are best-effort and never disturb the flow.
     if is_worker && !model_hash.is_empty() {
-        let inference_executor =
+        let mut inference_executor =
             decentraai_distributed::agent_runtime::InferenceAgentExecutor::new(
                 Arc::new(distributed.clone()),
                 model_hash.clone(),
             );
+        // Single-node path: execute delegated tasks directly on this node's
+        // live local llama-server backend over HTTP (distributed
+        // route_request cannot self-route over libp2p). The live URL cache is
+        // re-read per call, so an engine respawn (new port) is always hit.
+        if !backend_url.is_empty() {
+            inference_executor.with_live_backend(live_engine_url.clone());
+        }
         // One runtime per local logical agent (the orchestrator selects these
         // as executors for delegated stages).
         let local_agents = agent_manager.local_agents();
@@ -3504,7 +3511,13 @@ fn default_local_agents(
     .described("chat, reasoning and text generation on this node")
     .with_capability(CapabilityKind::Chat, Provenance::Inferred)
     .with_capability(CapabilityKind::TextGeneration, Provenance::Inferred)
-    .with_capability(CapabilityKind::Reasoning, Provenance::Inferred);
+    .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
+    // A generalist LLM can perform these with an appropriate prompt; all are
+    // INFERRED (the node cannot back VERIFIED claims without Hub metadata).
+    .with_capability(CapabilityKind::DocumentUnderstanding, Provenance::Inferred)
+    .with_capability(CapabilityKind::Summarization, Provenance::Inferred)
+    .with_capability(CapabilityKind::Classification, Provenance::Inferred)
+    .with_capability(CapabilityKind::StructuredOutput, Provenance::Inferred);
     if !model_hash.is_empty() {
         generalist = generalist.with_model(model_hash);
     }

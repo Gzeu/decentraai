@@ -181,8 +181,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// An [`AgentRuntime`] executor that runs a delegated LLM task through the
-/// fabric's real inference path (`DistributedInference::route_request`).
+/// An [`AgentRuntime`] executor that runs a delegated LLM task.
+///
+/// When a local OpenAI-compatible backend (this node's llama-server) is
+/// configured, the task is executed directly against it over HTTP — this is
+/// the single-node path (the distributed `route_request` cannot self-route
+/// over libp2p, which refuses self-dial). Without a local backend it falls
+/// back to `DistributedInference::route_request` (the multi-node path).
 ///
 /// The delegate's JSON input may carry `prompt` (string) and an optional
 /// `model_hash`; when the task names a model (via its required workload) or
@@ -192,6 +197,11 @@ fn now_ms() -> u64 {
 pub struct InferenceAgentExecutor {
     distributed: Arc<DistributedInference>,
     default_model_hash: String,
+    client: reqwest::Client,
+    /// Live local backend URL, re-read on every call so an engine respawn
+    /// (new port) is always targeted. `None` = no local backend → fall back
+    /// to the distributed routing path.
+    local_backend: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 impl InferenceAgentExecutor {
@@ -200,26 +210,99 @@ impl InferenceAgentExecutor {
         Self {
             distributed,
             default_model_hash,
+            client: reqwest::Client::new(),
+            local_backend: None,
         }
     }
 
-    /// Runs the task through the fabric planner → reservation → worker path.
+    /// Points the executor at the node's live local backend URL (the single
+    /// authoritative engine-address cache, updated on respawn), so single-node
+    /// tasks execute locally over HTTP instead of the distributed
+    /// self-routing path.
+    pub fn with_live_backend(&mut self, url: Arc<std::sync::Mutex<Option<String>>>) -> &mut Self {
+        self.local_backend = Some(url);
+        self
+    }
+
+    /// Runs the task, preferring the live local backend when configured.
     pub async fn execute(
         &self,
         task: &AgentTask,
         inputs: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let request = infer_request_from(task, inputs, &self.default_model_hash)?;
-        let response = self
-            .distributed
-            .route_request(request)
-            .await
-            .context("routing delegated inference")?;
+        let model_hash = request.model_hash.clone();
+        let live_url = self
+            .local_backend
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .and_then(|g| g.clone());
+        let (text, tokens): (String, serde_json::Value) = match live_url {
+            Some(url) => {
+                let text = self.call_local_backend(&url, &request).await?;
+                // Token count is unknown on the raw local path.
+                (text, serde_json::Value::Null)
+            }
+            None => {
+                let response = self
+                    .distributed
+                    .route_request(request)
+                    .await
+                    .context("routing delegated inference")?;
+                (
+                    response.output,
+                    serde_json::json!(response.tokens_used),
+                )
+            }
+        };
         Ok(serde_json::json!({
-            "text": response.output,
-            "model_hash": task.required_workload.as_ref().map(|w| w.model_hash.clone()).unwrap_or_else(|| self.default_model_hash.clone()),
-            "tokens": response.tokens_used,
+            "text": text,
+            "model_hash": model_hash,
+            "tokens": tokens,
         }))
+    }
+
+    /// Executes against a local OpenAI-compatible backend over HTTP and
+    /// returns the generated text. Uses the request's model hash as the model
+    /// id (llama-server serves by file name; the coordinator resolves it).
+    async fn call_local_backend(
+        &self,
+        url: &str,
+        request: &decentraai_protocol::InferRequest,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "model": request.model_hash,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "max_tokens": request.max_tokens,
+        });
+        let endpoint = format!("{url}/v1/chat/completions");
+        let resp = self
+            .client
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context("calling local backend")?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .context("parsing local backend response")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "local backend returned {status}: {}",
+                payload.get("error").map(|e| e.to_string()).unwrap_or_default()
+            );
+        }
+        payload
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("local backend response had no text content"))
     }
 }
 

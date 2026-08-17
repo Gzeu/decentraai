@@ -51,11 +51,20 @@ impl AgentMessenger {
     /// once the receiving node has *accepted* the frame (transport-level
     /// acknowledgement — not agent-level processing; agents drain their
     /// inbox asynchronously).
+    ///
+    /// Self-delivery: when the target is this node's own peer, the message is
+    /// pushed straight into the local inbox instead of round-tripping over
+    /// libp2p — libp2p refuses self-dial, and a single-node workflow must not
+    /// depend on a P2P loopback connection.
     pub async fn send(&self, peer: PeerId, message: AgentMessage) -> Result<()> {
         decentraai_agents::validate_message(&message)
             .context("refusing to send an invalid agent message")?;
         let bytes = serialize_message(&message)?;
         let p2p = self.p2p.lock().unwrap().clone();
+        if p2p.local_peer_id() == peer {
+            self.push_inbound(message);
+            return Ok(());
+        }
         p2p.request(peer, bytes).await.context("agent message transport")?;
         Ok(())
     }
@@ -162,5 +171,28 @@ mod tests {
         assert_eq!(back.message_id, "m-1");
         assert_eq!(back.kind, MessageKind::Ask);
         assert!(parse_agent_message(b"not a message").is_err());
+    }
+
+    #[tokio::test]
+    async fn send_to_self_delivers_into_local_inbox() {
+        // A single-node workflow must not depend on libp2p self-dial: sending
+        // to this node's own peer pushes into the local inbox directly.
+        use decentraai_agents::MessageKind;
+        let messenger = AgentMessenger::new(P2PNode::new(
+            &Identity::generate(),
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+            decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap());
+        let own = messenger.p2p.lock().unwrap().local_peer_id();
+        let msg = AgentMessage::new("m", "a:1", "b:1", MessageKind::Delegate)
+            .with_from_peer(own.to_string())
+            .with_created_at_ms(1_700_000_000_000);
+        messenger.send(own, msg.clone()).await.unwrap();
+        // The message lands in the local inbox, not over the network.
+        assert_eq!(messenger.pending("b:1"), 1);
+        let popped = messenger.pop("b:1").unwrap();
+        assert_eq!(popped.message_id, "m");
     }
 }
