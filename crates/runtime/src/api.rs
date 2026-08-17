@@ -8319,7 +8319,7 @@ mod tests {
                 "path {path} must serve the dashboard"
             );
             let body = response.text().await.unwrap();
-            assert!(body.contains("DecentraAI dashboard"));
+            assert!(body.contains("DecentraAI — Command Deck"));
             assert!(body.contains("Tokens generated"));
             assert!(body.contains("Queue"));
             assert!(body.contains("Recent inference calls"));
