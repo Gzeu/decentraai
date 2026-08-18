@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::agent_memory::MemoryStore;
 use crate::agent_messenger::AgentMessenger;
 use crate::agents::{AgentManager, AgentView};
 
@@ -51,6 +52,10 @@ pub struct AgentOrchestrator {
     /// where to reply.
     local_peer: PeerId,
     reputation: Arc<Mutex<ReputationStore>>,
+    /// Optional persistent collective-memory store. When attached, verified
+    /// workflow outcomes are written into it (scope `workflow_results`),
+    /// so completed work becomes collective knowledge the node can reuse.
+    memory_store: Option<Arc<MemoryStore>>,
     /// Max time to wait for a delegated stage's Reply.
     delegate_timeout: Duration,
 }
@@ -68,6 +73,7 @@ impl AgentOrchestrator {
             agents,
             local_peer,
             reputation: Arc::new(Mutex::new(ReputationStore::new())),
+            memory_store: None,
             delegate_timeout: Duration::from_secs(60),
         }
     }
@@ -75,6 +81,13 @@ impl AgentOrchestrator {
     /// Attaches a shared reputation store so selection ranks real history.
     pub fn with_reputation_store(&mut self, store: Arc<Mutex<ReputationStore>>) -> &mut Self {
         self.reputation = store;
+        self
+    }
+
+    /// Attaches the persistent collective-memory store so verified workflow
+    /// outcomes are written into it (scope `workflow_results`).
+    pub fn with_memory_store(&mut self, store: Arc<MemoryStore>) -> &mut Self {
+        self.memory_store = Some(store);
         self
     }
 
@@ -376,6 +389,14 @@ impl AgentOrchestrator {
             stages: results,
             final_output,
         };
+        // Collective memory: a completed workflow's verified results become
+        // collective knowledge (scope `workflow_results`). Best-effort — a
+        // memory write must never fail the execution path.
+        if matches!(verdict, DelegationVerdict::Completed) {
+            if let Some(store) = &self.memory_store {
+                write_workflow_to_memory(store, &plan_id, &task_id, &result);
+            }
+        }
         WorkflowOutcome::new(plan_id, task_id, plan.clone(), result)
     }
 
@@ -505,4 +526,198 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Writes a completed workflow's verified stage outputs into a collective
+/// memory store (scope `workflow_results`). Idempotent by entry id;
+/// best-effort by design — a memory failure must never fail the execution.
+///
+/// The verdict gate lives here (not at the call site) so the invariant
+/// "only completed workflows become memory" is testable in isolation.
+fn write_workflow_to_memory(
+    store: &MemoryStore,
+    plan_id: &str,
+    task_id: &str,
+    result: &decentraai_agents::DelegationResult,
+) {
+    if !matches!(result.verdict, DelegationVerdict::Completed) {
+        return;
+    }
+    // The scope is registered once; concurrent orchestrations may race, so an
+    // existing scope is treated as already registered.
+    let scope = decentraai_agents::MemoryScope::new(
+        "workflow_results",
+        "orchestrator",
+        decentraai_agents::MemoryLevel::Team,
+    );
+    if store.register_scope(&scope).is_err() {
+        // Duplicate scope is fine — it already exists.
+    }
+    let now = now_ms();
+    let task_short = task_id.chars().take(12).collect::<String>();
+    // One entry per verified stage, plus a summary entry with the final
+    // output. Content is a compact JSON of the verified output value.
+    for sr in result
+        .stages
+        .iter()
+        .filter(|s| s.verified && s.error.is_none())
+    {
+        let content = serde_json::json!({
+            "stage_id": sr.stage_id,
+            "output": sr.output.clone().unwrap_or(Value::Null),
+        })
+        .to_string();
+        let entry = decentraai_agents::MemoryEntry::new(
+            format!("wf:{plan_id}:{task_short}:{}", sr.stage_id),
+            "workflow_results".to_string(),
+            "orchestrator".to_string(),
+            "local".to_string(),
+            content,
+        )
+        .tagged("workflow")
+        .tagged("verified")
+        .created_at(now);
+        let _ = store.write("workflow_results", &entry, "orchestrator", true, true, true);
+    }
+    // Summary entry with the verdict + final output.
+    let summary = serde_json::json!({
+        "task_id": task_id,
+        "verdict": "completed",
+        "final_output": result.final_output.clone().unwrap_or(Value::Null),
+        "completed_stages": result.stages.iter().filter(|s| s.verified).count(),
+    })
+    .to_string();
+    let summary_entry = decentraai_agents::MemoryEntry::new(
+        format!("wf:{plan_id}:{task_short}:summary"),
+        "workflow_results".to_string(),
+        "orchestrator".to_string(),
+        "local".to_string(),
+        summary,
+    )
+    .tagged("workflow")
+    .tagged("summary")
+    .created_at(now);
+    let _ = store.write(
+        "workflow_results",
+        &summary_entry,
+        "orchestrator",
+        true,
+        true,
+        true,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_memory::MemoryStore;
+    use decentraai_agents::{DelegationResult, StageResult};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn temp_store(name: &str) -> Arc<MemoryStore> {
+        let path = std::env::temp_dir().join(format!(
+            "decentraai-mem-test-{}-{}.sqlite",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&path);
+        Arc::new(MemoryStore::open(&path).unwrap())
+    }
+
+    fn verified_stage(stage_id: &str) -> StageResult {
+        StageResult {
+            stage_id: stage_id.into(),
+            agent_id: "a:1".into(),
+            output: Some(json!({"result": stage_id})),
+            verified: true,
+            checks: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn completed_workflow_writes_memory_entries() {
+        let store = temp_store("completed");
+        let result = DelegationResult {
+            plan_id: "p1".into(),
+            task_id: "t1".into(),
+            verdict: DelegationVerdict::Completed,
+            stages: vec![verified_stage("research"), verified_stage("synthesis")],
+            final_output: Some(json!({"text": "done"})),
+        };
+        write_workflow_to_memory(&store, "p1", "t1", &result);
+
+        let scopes = store.list_scopes().unwrap();
+        assert!(
+            scopes.iter().any(|s| s.name == "workflow_results"),
+            "workflow_results scope must be registered"
+        );
+        let entries = store
+            .read("workflow_results", "orchestrator", true)
+            .unwrap();
+        // 2 verified stages + 1 summary entry.
+        assert_eq!(
+            entries.len(),
+            3,
+            "expected 3 memory entries, got {}",
+            entries.len()
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.tags.contains(&"summary".to_string())),
+            "a summary entry must exist"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.tags.contains(&"verified".to_string())),
+            "verified stage entries must exist"
+        );
+    }
+
+    #[test]
+    fn partial_workflow_is_not_written_to_memory() {
+        let store = temp_store("partial");
+        let result = DelegationResult {
+            plan_id: "p2".into(),
+            task_id: "t2".into(),
+            verdict: DelegationVerdict::Partial {
+                failed_stages: vec!["synthesis".into()],
+            },
+            stages: vec![verified_stage("research")],
+            final_output: None,
+        };
+        write_workflow_to_memory(&store, "p2", "t2", &result);
+
+        let scopes = store.list_scopes().unwrap();
+        assert!(
+            !scopes.iter().any(|s| s.name == "workflow_results"),
+            "partial workflow must not create the memory scope"
+        );
+    }
+
+    #[test]
+    fn workflow_memory_write_is_idempotent() {
+        let store = temp_store("idempotent");
+        let result = DelegationResult {
+            plan_id: "p3".into(),
+            task_id: "t3".into(),
+            verdict: DelegationVerdict::Completed,
+            stages: vec![verified_stage("research")],
+            final_output: Some(json!({"text": "done"})),
+        };
+        write_workflow_to_memory(&store, "p3", "t3", &result);
+        write_workflow_to_memory(&store, "p3", "t3", &result);
+
+        let entries = store
+            .read("workflow_results", "orchestrator", true)
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "idempotent write must not duplicate entries"
+        );
+    }
 }

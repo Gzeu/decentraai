@@ -1485,16 +1485,6 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // The coordinator-side orchestrator runs collective workflows by delegating
     // stages to the local/remote agents. Shared with the API so a user can
     // trigger a workflow from the dashboard/CLI.
-    let mut agent_orchestrator = decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
-        agent_messenger.clone(),
-        agent_manager.clone(),
-        local_peer_id,
-    );
-    // Larger models (e.g. 7B on CPU) generate slower than the 60s default; a
-    // per-stage reply can take minutes. Keep the timeout generous so a real
-    // collective workflow completes instead of timing out mid-stage.
-    agent_orchestrator.with_delegate_timeout(Duration::from_secs(600));
-    let agent_orchestrator = Arc::new(agent_orchestrator);
     // Persistent collective memory (best-effort; the node keeps working if it
     // cannot open or create the store). Held and shared with the API so the
     // dashboard can show it and workflows can write verified results to it.
@@ -1510,6 +1500,21 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 None
             }
         };
+    let mut agent_orchestrator = decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
+        agent_messenger.clone(),
+        agent_manager.clone(),
+        local_peer_id,
+    );
+    // Verified workflow outcomes are written into collective memory
+    // (scope `workflow_results`) so completed work becomes reusable knowledge.
+    if let Some(store) = &agent_memory_store {
+        agent_orchestrator.with_memory_store(store.clone());
+    }
+    // Larger models (e.g. 7B on CPU) generate slower than the 60s default; a
+    // per-stage reply can take minutes. Keep the timeout generous so a real
+    // collective workflow completes instead of timing out mid-stage.
+    agent_orchestrator.with_delegate_timeout(Duration::from_secs(600));
+    let agent_orchestrator = Arc::new(agent_orchestrator);
 
     // The dashboard owns the llama-server lifecycle; the worker advertises in
     // sync with its LIVE health (see spawn_compute_broadcaster). Create the
