@@ -66,20 +66,27 @@ node's API from the other; only the P2P port is open between them.
 
 ## What to do on the Desktop (i7) so it shows up as a remote worker
 
+> Hardware note (verified 2026-08-18): the **Laptop (i5) has 30 GiB RAM** and
+> holds both the tiny model (Llama-3.2-1B) and Mistral-7B on disk; the
+> **Desktop (i7) has 8 GiB RAM and only the tiny model** — do NOT point
+> `node.model` at Mistral on the Desktop (it cannot host it comfortably).
+> Both nodes serving the same tiny model is fine: remote routing is forced by
+> trust + `route_request_on`/a remote-only placement, not by a distinct model.
+
 ```bash
 cd ~/decentraai
 git pull --rebase
 bash scripts/upgrade-node.sh     # rebuild, set allow_remote_inference, restart
-# ensure it serves a model the Laptop does NOT have (forces remote routing):
-#   node.model: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"   (in ~/.decentraai/node.yaml)
+# ensure ~/.decentraai/node.yaml has:
 #   inference.allow_remote_inference: true
+#   node.model: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"  (the tiny model it can host)
 systemctl --user restart decentraai-node
 ```
 
 After the restart the Desktop should re-advertise as a **worker** and the
 Laptop's `/v1/compute` should list it as a trusted, `remote_ok` remote worker.
 Then verify two-node remote inference from the Laptop:
-`bash scripts/validate-lan.sh`.
+`bash scripts/validate-lan.sh` (forced-remote routing).
 
 ## Version-mismatch failure mode (do not re-diagnose)
 
