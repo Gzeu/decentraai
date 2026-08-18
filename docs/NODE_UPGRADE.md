@@ -43,36 +43,43 @@ node's API from the other; only the P2P port is open between them.
 - Usage: `bash scripts/upgrade-remote-node.sh [user@host]` (`REMOTE_PORT=…` to
   override the port).
 
-## Current state (2026-08-18)
+## Current state (2026-08-18, verified live from the Laptop)
 
-- **Desktop i7: UP TO DATE.** Repo at `f7dbe10` (= `origin/main`), binary
-  rebuilt from HEAD via `upgrade-node.sh`. Advertises
-  `accepts_remote_inference: true`. `/v1/agents` → 1 agent (`generalis`),
-  `/v1/compute` → 1 worker (itself).
-- **Laptop i5: BINARY OUTDATED.** P2P-connected (peer visible in
-  `/v1/network` `connected`, score 46) but its installed binary predates
-  `protocol_version` on agent advertisements — the Desktop logs show:
+> Corrected by Pylon (source of truth), 2026-08-18. An earlier version of this
+> doc claimed the Laptop binary was outdated; that was wrong — the Laptop is on
+> a current binary and *processes* agent advertisements correctly.
+
+- **Laptop i5: UP TO DATE (binary + repo).** The installed binary is current
+  (built 2026-08-18), runs the orchestrator/AgentRuntime/workflow endpoints and
+  the AGENTS dashboard view. `/v1/agents` on the Laptop shows the Desktop as a
+  **remote agent** (`dca-NGE65Z:generalist`, `remote: true`), which proves the
+  Laptop deserializes and verifies agent advertisements correctly.
+- **Desktop i7: agent-visible, but its compute worker does not yet appear on
+  the Laptop.** The Desktop is connected and advertises a `generalist` agent
+  (build is new), yet `/v1/compute` on the Laptop lists only the local worker
+  (`dca-GriBWu`). The Laptop's log shows recurring
   `WARN rejected signed agent advertisement error=missing field protocol_version`
-  and `WARN request ignored: no handler configured`. The laptop therefore does
-  NOT appear as a worker/agent/node in the fabric even though it is connected.
-  The repo on the laptop may already be at HEAD; the **binary** is what is old.
+  for a peer that sends a signed agent advertisement whose inner payload lacks
+  `protocol_version` — to be traced to which peer/version (the local binary
+  already carries `protocol_version`). The Desktop's **compute worker** must
+  become visible before two-node remote inference can be validated.
 
-## What to do after a pull on the laptop (i5)
+## What to do on the Desktop (i7) so it shows up as a remote worker
 
 ```bash
 cd ~/decentraai
 git pull --rebase
-bash scripts/upgrade-node.sh     # rebuilds the binary, restarts the service
+bash scripts/upgrade-node.sh     # rebuild, set allow_remote_inference, restart
+# ensure it serves a model the Laptop does NOT have (forces remote routing):
+#   node.model: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"   (in ~/.decentraai/node.yaml)
+#   inference.allow_remote_inference: true
+systemctl --user restart decentraai-node
 ```
 
-After the restart the laptop re-advertises with the current protocol and is
-re-classified CURRENT in the fabric. Verify from the Desktop:
-
-```bash
-TOKEN=$(cat ~/.decentraai/runtime/api.token)
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/fabric
-# expect 2 nodes; the laptop row should show version 1.0.0, lifecycle ONLINE
-```
+After the restart the Desktop should re-advertise as a **worker** and the
+Laptop's `/v1/compute` should list it as a trusted, `remote_ok` remote worker.
+Then verify two-node remote inference from the Laptop:
+`bash scripts/validate-lan.sh`.
 
 ## Version-mismatch failure mode (do not re-diagnose)
 
