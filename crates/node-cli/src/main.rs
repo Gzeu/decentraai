@@ -459,6 +459,37 @@ enum AgentCommand {
         #[arg(long)]
         agent: String,
     },
+    /// Add a custom logical agent to this node and persist it (db/agents.json)
+    /// so it survives restarts. The agent advertises itself on the fabric
+    /// with its declared capabilities after the node restarts/reloads.
+    Add {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Agent id suffix (e.g. `writer` → `<short-id>:writer`).
+        #[arg(long)]
+        id: String,
+        /// Display name.
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Role label (e.g. `generalist`, `researcher`, `writer`).
+        #[arg(long, default_value = "generalist")]
+        role: String,
+        /// Short description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Comma-separated capabilities (snake_case, e.g. `writing,summarization`).
+        #[arg(long, default_value = "")]
+        capabilities: String,
+    },
+    /// Remove a logical agent from this node and persist the change
+    /// (db/agents.json). Cannot remove the last agent.
+    Remove {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The full agent_id (e.g. `<short-id>:writer`).
+        #[arg(long)]
+        agent: String,
+    },
     /// List the steps of a named workflow template (a local, pure fabric
     /// primitive — no network, no engine). Supports `research_report`.
     /// Read-only.
@@ -1343,15 +1374,32 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // drive the agent's capabilities. Loaded once; empty until the operator
     // registers datasets/skills via `decentraai agent skill`.
     let skills_registry = load_skill_registry(&data_dir.join("db/skills.json"));
-    agent_manager.set_local_agents(default_local_agents(
-        &short_id,
-        &node_name,
-        &model_hash,
-        config.inference.allow_remote_inference,
-        &model_name,
-        &skills_registry,
-        config.inference.embeddings_backend_url.is_some(),
-    ));
+    // Persistent agent records (db/agents.json): operator-editable, survives
+    // restarts. Missing/corrupt file falls back to the deterministic default
+    // set, which is then persisted so the file appears and stays stable.
+    let agents_path = data_dir.join("db/agents.json");
+    let local_agents: Vec<decentraai_agents::AgentRecord> = match load_agent_records(&agents_path) {
+        Some(records) if !records.is_empty() => {
+            info!(count = records.len(), "loaded persistent agent records");
+            records
+        }
+        _ => {
+            let defaults = default_local_agents(
+                &short_id,
+                &node_name,
+                &model_hash,
+                config.inference.allow_remote_inference,
+                &model_name,
+                &skills_registry,
+                config.inference.embeddings_backend_url.is_some(),
+            );
+            if let Err(e) = save_agent_records(&agents_path, &defaults) {
+                tracing::warn!(error = %e, "failed to persist default agent records");
+            }
+            defaults
+        }
+    };
+    agent_manager.set_local_agents(local_agents);
     info!(
         agents = agent_manager.local_count(),
         "node advertises logical agents",
@@ -3364,6 +3412,15 @@ async fn agent_command(command: AgentCommand) -> Result<()> {
     match command {
         AgentCommand::List { config } => agent_list(&config),
         AgentCommand::Show { config, agent } => agent_show(&config, &agent),
+        AgentCommand::Add {
+            config,
+            id,
+            name,
+            role,
+            description,
+            capabilities,
+        } => agent_add(&config, &id, &name, &role, &description, &capabilities),
+        AgentCommand::Remove { config, agent } => agent_remove(&config, &agent),
         AgentCommand::Workflow { template, .. } => agent_workflow(&template),
         AgentCommand::WorkflowRun {
             config,
@@ -3689,11 +3746,151 @@ fn agent_list(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Adds a custom logical agent to the node's persistent records
+/// (db/agents.json). Loads the current records (or the defaults), appends the
+/// new agent with the given capabilities, writes back atomically, and shows
+/// the resulting record. A running node picks the change up on next restart.
+fn agent_add(
+    config_path: &Path,
+    id: &str,
+    name: &str,
+    role: &str,
+    description: &str,
+    capabilities: &str,
+) -> Result<()> {
+    if id.trim().is_empty() {
+        anyhow::bail!("--id must not be empty");
+    }
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let agents_path = data_dir.join("db/agents.json");
+    let short_id = node_short_id(config_path)?;
+    let agent_id = format!("{short_id}:{}", id.trim());
+
+    // Load current records (persisted or defaults). The default set needs the
+    // skill registry + a model hash; reuse the exact helpers the daemon uses.
+    let models_dir = data_dir.join("models");
+    let mut records = match load_agent_records(&agents_path) {
+        Some(r) if !r.is_empty() => r,
+        _ => {
+            let skills = load_skill_registry(&data_dir.join("db/skills.json"));
+            let model_name =
+                resolve_model_name(&models_dir, config.node.model.as_deref()).unwrap_or_default();
+            let model_hash = if model_name.is_empty() {
+                String::new()
+            } else {
+                blake3::hash(
+                    std::fs::read(models_dir.join(&model_name))
+                        .ok()
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+                .to_hex()
+                .to_string()
+            };
+            default_local_agents(
+                &short_id,
+                &config.node.name,
+                &model_hash,
+                config.inference.allow_remote_inference,
+                &model_name,
+                &skills,
+                config.inference.embeddings_backend_url.is_some(),
+            )
+        }
+    };
+    if records.iter().any(|a| a.agent_id == agent_id) {
+        anyhow::bail!("agent '{agent_id}' already exists");
+    }
+
+    // Build the new record: name defaults to the id suffix, capabilities are
+    // parsed from the comma-separated snake_case list (unknown names are a
+    // hard error — no silent typos).
+    let display_name = if name.is_empty() {
+        id.to_string()
+    } else {
+        name.to_string()
+    };
+    let mut record = decentraai_agents::AgentRecord::new(&agent_id, &display_name, role);
+    record.description = description.to_string();
+    for part in capabilities.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        use std::str::FromStr;
+        let kind = decentraai_hub::capability::CapabilityKind::from_str(part).map_err(|_| {
+            anyhow::anyhow!("unknown capability '{part}' (see --capabilities help)")
+        })?;
+        record = record.with_capability(kind, decentraai_hub::capability::Provenance::Verified);
+    }
+    records.push(record.clone());
+    save_agent_records(&agents_path, &records)?;
+    println!("added agent {agent_id}");
+    println!(
+        "  role={}  capabilities={}",
+        record.role,
+        record
+            .semantic_capabilities
+            .iter()
+            .map(|c| c.capability.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("persisted to {}", agents_path.display());
+    println!("restart the node to advertise it on the fabric");
+    Ok(())
+}
+
+/// Removes a logical agent from the node's persistent records (db/agents.json)
+/// and writes back atomically. Refuses to remove the last remaining agent.
+fn agent_remove(config_path: &Path, agent_id: &str) -> Result<()> {
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let agents_path = data_dir.join("db/agents.json");
+    let mut records = match load_agent_records(&agents_path) {
+        Some(r) if !r.is_empty() => r,
+        _ => anyhow::bail!("no persisted agent records — nothing to remove"),
+    };
+    if records.len() <= 1 {
+        anyhow::bail!("cannot remove the last agent");
+    }
+    let before = records.len();
+    records.retain(|a| a.agent_id != agent_id);
+    if records.len() == before {
+        anyhow::bail!("agent '{agent_id}' not found");
+    }
+    save_agent_records(&agents_path, &records)?;
+    println!(
+        "removed agent {agent_id}; {} agent(s) remain",
+        records.len()
+    );
+    println!("persisted to {}", agents_path.display());
+    Ok(())
+}
+
 /// The node name from config, best-effort (only used for display).
 fn agent_node_name(config_path: &Path) -> Result<String> {
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     Ok(config.node.name)
+}
+
+/// The node's short id (derived from its identity, exactly as the daemon
+/// derives it), used to build stable agent ids like `<short-id>:role`.
+fn node_short_id(config_path: &Path) -> Result<String> {
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let identity =
+        Identity::load(&data_dir.join("identity/key.pem")).context("loading node identity")?;
+    let libp2p_keypair =
+        libp2p::identity::Keypair::ed25519_from_bytes(identity.signing_key_bytes())
+            .context("libp2p keypair from identity")?;
+    let libp2p_peer = libp2p::PeerId::from(libp2p_keypair.public());
+    Ok(decentraai_distributed::short_node_id(&libp2p_peer))
 }
 
 fn agent_show(config_path: &Path, agent_id: &str) -> Result<()> {
@@ -4014,6 +4211,35 @@ fn load_skill_registry(path: &std::path::Path) -> decentraai_agents::SkillRegist
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => decentraai_agents::SkillRegistry::new(),
     }
+}
+
+/// Loads the persistent agent records (`db/agents.json`) if present. The
+/// operator can edit this file to add/rename/remove the node's logical
+/// agents; an empty or missing file yields `None` and the caller falls back
+/// to the deterministic defaults.
+fn load_agent_records(path: &std::path::Path) -> Option<Vec<decentraai_agents::AgentRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str(&json).ok(),
+        Err(_) => None,
+    }
+}
+
+/// Persists the node's logical agent records atomically (tmp + rename) so
+/// operator edits survive restarts. Best-effort; never fails the boot path.
+fn save_agent_records(
+    path: &std::path::Path,
+    records: &[decentraai_agents::AgentRecord],
+) -> Result<()> {
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(records)?;
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(json.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Persists the dataset/skill registry atomically (tmp + rename).
