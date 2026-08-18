@@ -1413,16 +1413,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     distributed_handler.set_compute_manager(compute_manager.clone());
     distributed_handler.set_agent_manager(agent_manager.clone());
     // Agent messenger: routes inbound agent messages to the right recipient's
-    // inbox. Starts on a placeholder node; re-pointed at the real P2P node
-    // below (the messenger/handler/node construction is circular).
-    let agent_messenger = Arc::new(
-        decentraai_distributed::agent_messenger::AgentMessenger::new(P2PNode::new(
-            &identity,
-            config.network.max_message_bytes as usize,
-            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
-            None,
-        )?),
-    );
+    // inbox. Starts WITHOUT a transport (a placeholder P2PNode would spawn a
+    // live swarm whose handler-less node answers none of the peers' probes);
+    // re-pointed at the real P2P node below (circular wiring).
+    let agent_messenger =
+        Arc::new(decentraai_distributed::agent_messenger::AgentMessenger::uninitialized());
     distributed_handler.set_messenger(agent_messenger.clone());
     let mut chained_handler = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
 

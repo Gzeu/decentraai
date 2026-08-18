@@ -26,25 +26,43 @@ use std::sync::{Arc, Mutex};
 pub struct AgentMessenger {
     /// The P2P transport. Interior-mutable because construction is circular
     /// (the handler needs the messenger, the messenger needs the node): the
-    /// messenger starts on a placeholder node and is re-pointed at the real,
+    /// messenger is created without a transport and re-pointed at the real,
     /// handler-bearing node via [`AgentMessenger::set_transport`] after it
-    /// exists.
-    p2p: Arc<Mutex<P2PNode>>,
+    /// exists. Starting with `None` (instead of a handler-less placeholder
+    /// node) matters: a placeholder P2PNode still spawns a live swarm with
+    /// mDNS discovery, which would dial peers and answer none of their
+    /// request/response probes (e.g. the M19 `InferPing` every 5s) — a
+    /// stream of "request ignored: no handler configured" warnings and a
+    /// phantom connection per peer.
+    p2p: Arc<Mutex<Option<P2PNode>>>,
     inbox: Arc<Mutex<AgentInbox>>,
 }
 
 impl AgentMessenger {
     /// Wraps the node's P2P transport with a per-recipient bounded inbox.
+    /// Prefer [`AgentMessenger::uninitialized`] when the real transport does
+    /// not exist yet (node construction is circular); `new` is for callers
+    /// that already hold a transport.
     pub fn new(p2p: P2PNode) -> Self {
         Self {
-            p2p: Arc::new(Mutex::new(p2p)),
+            p2p: Arc::new(Mutex::new(Some(p2p))),
+            inbox: Arc::new(Mutex::new(AgentInbox::new(64))),
+        }
+    }
+
+    /// Creates a messenger with no transport yet. [`AgentMessenger::send`]
+    /// fails until [`AgentMessenger::set_transport`] is called; this is the
+    /// correct constructor for the circular node/handler/messenger wiring.
+    pub fn uninitialized() -> Self {
+        Self {
+            p2p: Arc::new(Mutex::new(None)),
             inbox: Arc::new(Mutex::new(AgentInbox::new(64))),
         }
     }
 
     /// Points the messenger at the transport that carries its handler.
     pub fn set_transport(&self, p2p: P2PNode) {
-        *self.p2p.lock().unwrap() = p2p;
+        *self.p2p.lock().unwrap() = Some(p2p);
     }
 
     /// Delivers a message to a peer over the transport. Returns `Ok(())`
@@ -60,7 +78,12 @@ impl AgentMessenger {
         decentraai_agents::validate_message(&message)
             .context("refusing to send an invalid agent message")?;
         let bytes = serialize_message(&message)?;
-        let p2p = self.p2p.lock().unwrap().clone();
+        let p2p = self
+            .p2p
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("agent messenger has no transport yet"))?;
         if p2p.local_peer_id() == peer {
             self.push_inbound(message);
             return Ok(());
@@ -189,7 +212,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let own = messenger.p2p.lock().unwrap().local_peer_id();
+        let own = messenger.p2p.lock().unwrap().as_ref().unwrap().local_peer_id();
         let msg = AgentMessage::new("m", "a:1", "b:1", MessageKind::Delegate)
             .with_from_peer(own.to_string())
             .with_created_at_ms(1_700_000_000_000);
