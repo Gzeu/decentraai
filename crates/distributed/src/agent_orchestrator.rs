@@ -23,8 +23,8 @@
 use anyhow::{Context, Result, bail};
 use decentraai_agents::{
     AgentMessage, AgentTask, DelegationPlan, DelegationPlanner, DelegationStage, DelegationVerdict,
-    MessageKind, ReputationStore, StageResult, TaskVerification, WorkflowOutcome,
-    match_agent_semantic,
+    MessageKind, ReputationFactor, ReputationStore, ReputationUpdate, StageResult,
+    TaskVerification, WorkflowOutcome, match_agent_semantic,
 };
 use libp2p::PeerId;
 use serde_json::Value;
@@ -305,8 +305,16 @@ impl AgentOrchestrator {
                 continue;
             }
             let input_value = serde_json::Value::Object(inputs);
+            let t0 = Instant::now();
+            let capability = stage
+                .task
+                .required_capabilities
+                .first()
+                .map(|r| r.capability.label().to_string())
+                .unwrap_or_default();
             match self.delegate_stage(&executor, stage, &input_value).await {
                 Ok(output) => {
+                    let latency_ms = t0.elapsed().as_millis() as u64;
                     let mut checks = Vec::new();
                     let mut verified = true;
                     if stage.verification != TaskVerification::None {
@@ -319,6 +327,10 @@ impl AgentOrchestrator {
                     } else {
                         failed.push(stage.stage_id.clone());
                     }
+                    // Reputation from real execution: a verified delegated
+                    // stage is a success signal; latency feeds the Latency
+                    // factor (normalised so faster is better).
+                    self.record_execution(&executor.agent_id, &capability, true, latency_ms);
                     results.push(StageResult {
                         stage_id: stage.stage_id.clone(),
                         agent_id: executor.agent_id.clone(),
@@ -333,6 +345,9 @@ impl AgentOrchestrator {
                     });
                 }
                 Err(e) => {
+                    let latency_ms = t0.elapsed().as_millis() as u64;
+                    // A failed delegated stage is a reliability signal.
+                    self.record_execution(&executor.agent_id, &capability, false, latency_ms);
                     failed.push(stage.stage_id.clone());
                     results.push(StageResult {
                         stage_id: stage.stage_id.clone(),
@@ -367,6 +382,66 @@ impl AgentOrchestrator {
     /// Returns the flattened known agents (for dashboards/tests).
     pub fn known_agents(&self) -> Vec<AgentView> {
         self.agents.view()
+    }
+
+    /// Records a real execution outcome into the reputation store
+    /// (per agent, per capability). Reliability/Quality reflect success;
+    /// Latency is normalised so faster is better (1.0 at ~0ms, decaying to
+    /// ~0.5 at 30s, floor 0.2 — a slow-but-working agent is not punished to
+    /// zero).
+    fn record_execution(&self, agent_id: &str, capability: &str, success: bool, latency_ms: u64) {
+        let now = now_ms();
+        let cap = if capability.is_empty() {
+            "_"
+        } else {
+            capability
+        };
+        let reliability = if success { 1.0 } else { 0.0 };
+        let quality = if success { 1.0 } else { 0.0 };
+        let latency_score = {
+            let raw = 1.0 - (latency_ms as f64 / 30_000.0);
+            raw.clamp(0.2, 1.0) as f32
+        };
+        let mut store = self.reputation.lock().unwrap();
+        store.observe(ReputationUpdate::new(
+            agent_id,
+            cap,
+            ReputationFactor::Reliability,
+            reliability,
+            now,
+        ));
+        store.observe(ReputationUpdate::new(
+            agent_id,
+            cap,
+            ReputationFactor::Quality,
+            quality,
+            now,
+        ));
+        store.observe(ReputationUpdate::new(
+            agent_id,
+            cap,
+            ReputationFactor::Latency,
+            latency_score,
+            now,
+        ));
+    }
+
+    /// A serializable snapshot of the reputation store (per agent, per
+    /// capability), for the dashboard. Real, measured history only.
+    pub fn reputation_snapshot(&self) -> Vec<serde_json::Value> {
+        let store = self.reputation.lock().unwrap();
+        store
+            .all()
+            .into_iter()
+            .map(|rep| {
+                serde_json::json!({
+                    "agent_id": rep.agent_id,
+                    "capability": rep.capability,
+                    "score": rep.score(),
+                    "reasons": rep.reasons(),
+                })
+            })
+            .collect()
     }
 }
 

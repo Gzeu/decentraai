@@ -373,6 +373,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
     <button class="nav-item" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
     <button class="nav-item" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
+    <button class="nav-item" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
@@ -789,6 +790,17 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         <div class="card">
           <h2>Collective memory <span class="count" id="memory-count"></span></h2>
           <div id="memory" class="worker-cards"><div class="empty">loading…</div></div>
+        </div>
+      </section>
+
+      <!-- REPUTATION (P6): real measured per-(agent, capability) history fed
+           by verified executions. From /v1/reputation — never synthetic. -->
+      <section class="view" id="view-reputation">
+        <div class="card">
+          <h2>Agent reputation <span class="count" id="reputation-count"></span></h2>
+          <table><thead><tr><th>Agent</th><th>Capability</th><th class="num">Score</th><th>Factors</th></tr></thead>
+          <tbody id="reputation"><tr><td colspan="4" class="empty">loading…</td></tr></tbody></table>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Measured from real verified executions (Reliability / Quality / Latency). Empty until workflows run.</p>
         </div>
       </section>
 
@@ -1293,8 +1305,8 @@ const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'a
 const isAdmin = !!token;
 
 // ---- navigation ------------------------------------------------------------
-const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','workers','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','workers','network','models','observability','recovery','diag','security','settings'];
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   current = view;
@@ -2183,6 +2195,22 @@ function runCollectiveWorkflow(){
       '<div style="margin-top:10px"><b style="font-size:12px">Final output</b><div class="mono" style="font-size:11px;color:var(--muted);word-break:break-word;margin-top:4px">'+out+'</div></div>';
   }).catch(e => { status.textContent = 'error'; result.innerHTML = '<div class="badge bad">network error</div> ' + esc(String(e)); });
 }
+// ---- Reputation (P6) ----
+// Renders /v1/reputation: real measured per-(agent, capability) history fed
+// by verified executions. Never synthetic.
+function renderReputation(d){
+  if (!d) return;
+  const reps = d.reputations || [];
+  $('reputation-count').textContent = reps.length;
+  const rows = reps.map(r => {
+    const score = (r.score != null) ? r.score.toFixed(2) : '—';
+    const reasons = (r.reasons || []).map(x => '<div class="mono" style="font-size:10px;color:var(--faint)">'+esc(x)+'</div>').join('');
+    return '<tr><td><code>'+esc(r.agent_id)+'</code></td><td>'+esc(r.capability)+'</td>'+
+      '<td class="num">'+score+'</td><td>'+reasons+'</td></tr>';
+  }).join('');
+  $('reputation').innerHTML = rows || '<tr><td colspan="4" class="empty">no reputation yet — run a verified workflow to build measured history</td></tr>';
+}
+
 // ---- Memory (P5) ----
 // Renders /v1/memory: collective memory scopes + entries written by verified
 // workflows into the persistent MemoryStore. Real state only.
@@ -4213,6 +4241,7 @@ async function refresh(){
   try { const ag = await (await fetch('/v1/agents', { headers })).json(); renderAgents(ag); } catch (e) {}
   try { const sk = await (await fetch('/v1/skills', { headers })).json(); renderSkills(sk); } catch (e) {}
   try { const mem = await (await fetch('/v1/memory', { headers })).json(); renderMemory(mem); } catch (e) {}
+  try { const rep = await (await fetch('/v1/reputation', { headers })).json(); renderReputation(rep); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}

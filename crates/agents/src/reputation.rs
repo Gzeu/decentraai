@@ -351,6 +351,12 @@ impl ReputationStore {
             .get(&(agent_id.to_string(), capability.to_string()))
     }
 
+    /// All reputations across every (agent, capability), sorted by
+    /// (agent_id, capability) — deterministic, for dashboards/export.
+    pub fn all(&self) -> Vec<AgentReputation> {
+        self.reputations.values().cloned().collect()
+    }
+
     /// All reputations of one agent, sorted by capability (deterministic).
     pub fn for_agent(&self, agent_id: &str) -> Vec<AgentReputation> {
         let mut reps: Vec<AgentReputation> = self

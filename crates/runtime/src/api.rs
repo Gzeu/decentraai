@@ -4559,6 +4559,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/rag/index", post(rag_index_handler))
         .route("/v1/rag/query", post(rag_query_handler))
         .route("/v1/memory", get(memory_handler))
+        .route("/v1/reputation", get(reputation_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -6100,6 +6101,29 @@ async fn memory_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
         }));
     }
     let body = serde_json::json!({ "attached": true, "scopes": scope_rows });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// Agent reputation (P6): real measured per-(agent, capability) history from
+/// the orchestrator's reputation store (fed by verified executions).
+async fn reputation_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(orchestrator) = &state.orchestrator else {
+        let body = serde_json::json!({ "attached": false, "reputations": [] });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let body =
+        serde_json::json!({ "attached": true, "reputations": orchestrator.reputation_snapshot() });
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_default(),

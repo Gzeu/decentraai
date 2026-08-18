@@ -2467,3 +2467,14 @@ routed to a node that can actually perform semantic retrieval.
 
 Verified live: the agent advertises `retrieval` alongside its other
 capabilities (chat, coding, tool_calling, document_understanding, ...).
+
+## 110. Reputation from real results + UI (DONE)
+
+Commit `pending`. The orchestrator now feeds the `ReputationStore` from real
+verified executions: each delegated stage records Reliability/Quality
+(success) and Latency (normalised, faster-is-better, never punished to zero)
+per (agent, capability). A `reputation_snapshot()` exposes the measured
+history; `POST /v1/reputation` + a dashboard Reputation view render it.
+
+This is real, measured history — not the synthetic samples the CLI demo used.
+Empty until workflows run.
