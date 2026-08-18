@@ -487,6 +487,17 @@ enum AgentCommand {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Show the dataset/skill layer: how a dataset + a skill applied to a
+    /// model unlock capabilities that feed the Talent Tree (P8 dataset layer).
+    /// Read-only, demonstrates the mechanism with the local model.
+    Skill {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The served model file name to demonstrate skills against (defaults
+        /// to the node's current model).
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -3142,6 +3153,7 @@ fn agent_command(command: AgentCommand) -> Result<()> {
             target,
             ..
         } => agent_talent_tree(&have, budget_mb, target.as_deref()),
+        AgentCommand::Skill { config, model } => agent_skill(&config, model.as_deref()),
     }
 }
 
@@ -3482,7 +3494,125 @@ fn agent_talent_tree(have: &str, budget_mb: u64, target: Option<&str>) -> Result
     Ok(())
 }
 
-/// The logical agents a node advertises by default (P1). Built from the
+/// Shows the dataset/skill layer (P8 dataset): how a dataset + a skill
+/// applied to a model unlock capabilities that feed the Talent Tree.
+/// Demonstrates the mechanism with a seeded code-finetune dataset/skill and
+/// the local model's inferred base capabilities.
+fn agent_skill(config_path: &std::path::Path, model_override: Option<&str>) -> Result<()> {
+    use decentraai_agents::{
+        DatasetDescriptor, DatasetKind, SkillDescriptor, SkillRegistry, build_agent_capabilities,
+    };
+    use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
+
+    // Seed a dataset + a skill (demonstration data, clearly labelled).
+    let mut registry = SkillRegistry::new();
+    let dataset = DatasetDescriptor::new(
+        "code_finetune_2024",
+        "Code fine-tune 2024",
+        vec![CapabilityKind::Coding, CapabilityKind::ToolCalling],
+        DatasetKind::FineTune,
+    )
+    .from("hf:example/code-finetune")
+    .sized(10 * 1024 * 1024 * 1024, 0.9)
+    .with_provenance(Provenance::Verified)
+    .with_license("MIT");
+    registry.add_dataset(dataset.clone())?;
+    registry.add_skill(
+        SkillDescriptor::new(
+            "code-agent",
+            "Code agent",
+            "code_finetune_2024",
+            Some(CapabilityKind::Coding),
+            vec![CapabilityKind::ToolCalling],
+        )
+        .with_prerequisites(vec![CapabilityKind::Reasoning])
+        .with_resource(1024),
+    )?;
+
+    // Resolve the served model (override or default local agents' model).
+    let model_name = match model_override {
+        Some(m) => m.to_string(),
+        None => load_local_agents(config_path)?
+            .into_iter()
+            .find_map(|a| a.allowed_models.first().cloned())
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
+
+    // Infer the model's base capabilities from its file name (honest,
+    // INFERRED): "coder" → Coding; otherwise a general chat model.
+    let lower = model_name.to_ascii_lowercase();
+    let mut base = vec![
+        CapabilityClaim {
+            capability: CapabilityKind::Chat,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::TextGeneration,
+            provenance: Provenance::Inferred,
+        },
+    ];
+    if lower.contains("coder") {
+        base.push(CapabilityClaim {
+            capability: CapabilityKind::Coding,
+            provenance: Provenance::Inferred,
+        });
+        base.push(CapabilityClaim {
+            capability: CapabilityKind::Reasoning,
+            provenance: Provenance::Inferred,
+        });
+    }
+
+    println!("Dataset/skill layer (P8 dataset -> capabilities -> talents):");
+    println!("  datasets:");
+    for d in registry.datasets() {
+        println!(
+            "    - {} [{}] develops: {} (provenance {:?}, {:.1} GiB)",
+            d.id,
+            d.name,
+            d.develops
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+            d.provenance,
+            d.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
+    println!("  skills:");
+    for s in registry.skills() {
+        println!(
+            "    - {} [{}] dataset={} requires_model={:?} develops: {}",
+            s.id,
+            s.name,
+            s.dataset_id,
+            s.requires_model.map(|k| k.label()),
+            s.develops
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+
+    println!("  model: {model_name}");
+    let build = build_agent_capabilities(base.clone(), &registry);
+    println!("  base capabilities: {}", base.iter().map(|c| c.capability.label()).collect::<Vec<_>>().join(", "));
+    if build.unlocked.is_empty() {
+        println!("  skills unlocked: (none — model does not satisfy skill prerequisites)");
+    } else {
+        println!(
+            "  skills unlocked: {}",
+            build
+                .unlocked
+                .iter()
+                .map(|c| c.capability.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("  (demonstration data — register real datasets/skills to drive agent evolution)");
+    Ok(())
+}
 /// node's identity short id and the model it serves — this is the node's
 /// own "generalist" agent plus, when a model is present, a model-tied
 /// executor. Provenance stays honest: without Hub metadata the LLM claims

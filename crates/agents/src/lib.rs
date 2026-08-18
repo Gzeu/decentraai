@@ -39,6 +39,7 @@
 pub mod advertisement;
 pub mod agent;
 pub mod capability;
+pub mod dataset;
 pub mod delegation;
 pub mod economy;
 pub mod matcher;
@@ -61,6 +62,10 @@ pub use agent::{
     ROLE_ROUTER, ROLE_SPECIALIST, ROLE_TOOL, ROLE_VERIFIER, SandboxMode,
 };
 pub use capability::{AgentCapability, model_capabilities_from_claims};
+pub use dataset::{
+    CapabilityBuild, DatasetDescriptor, DatasetError, DatasetKind, SkillDescriptor, SkillRegistry,
+    build_agent_capabilities,
+};
 pub use delegation::{
     DelegationError, DelegationPlan, DelegationPlanner, DelegationResult, DelegationStage,
     DelegationVerdict, StageAssignment, StageResult, execute_plan,

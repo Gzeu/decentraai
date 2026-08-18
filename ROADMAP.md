@@ -2364,3 +2364,27 @@ end-to-end on real hardware (Laptop i5 ↔ Desktop i7).
 - [x] E2E isolation: test P2P nodes disable mDNS (parallel loopback tests no
   longer discover each other); the forged-ad test asserts the specific peer is
   rejected (deterministic under parallel runs).
+
+## 104. Local GGUF model set + dataset/skill layer (P8 dataset)
+
+Commit `pending`. Two parts:
+
+### Model set (downloaded, verified SHA-256) on the Laptop (~30 GiB RAM)
+- `Llama-3.2-1B-Instruct` (tiny, existing), `Mistral-7B` (general, existing)
+- `qwen2.5-3b-instruct-q4_k_m` (small/rapid, 2.1 GiB)
+- `qwen2.5-coder-7b-instruct-q4_k_m` (coding, 4.7 GiB)
+- `nomic-embed-text-v1.5.Q4_K_M` (embeddings/RAG, 84 MiB)
+- Registry updated to 5 models (`decentraai registry list`). The Desktop keeps
+  the tiny model (8 GiB RAM).
+
+### Dataset/skill layer (`crates/agents/src/dataset.rs`, P8 dataset)
+The mechanism that lets the Talent Tree evolve — the chain
+`Hardware → Models → Tools → Datasets → Capabilities → Talents → Agent Power`:
+- `DatasetDescriptor` (develops capabilities, source, kind, quality,
+  provenance, license), `SkillDescriptor` (binds a dataset to a model with a
+  base capability + prerequisites, unlocking capabilities), `SkillRegistry`,
+  and `build_agent_capabilities` (model base caps + applicable skills →
+  unlocked caps, feeding `TalentTree::available_capabilities`).
+- `decentraai agent skill` demonstrates the chain with a seeded
+  code-finetune dataset + code-agent skill: a coding model unlocks
+  `tool calling`. Honest provenance — a dataset claims only what it develops.
