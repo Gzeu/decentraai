@@ -232,7 +232,7 @@ pub enum DatasetError {
 }
 
 /// Deterministic registries of datasets and skills.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillRegistry {
     datasets: BTreeMap<String, DatasetDescriptor>,
     skills: BTreeMap<String, SkillDescriptor>,

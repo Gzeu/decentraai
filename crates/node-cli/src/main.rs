@@ -487,16 +487,67 @@ enum AgentCommand {
         #[arg(long)]
         target: Option<String>,
     },
-    /// Show the dataset/skill layer: how a dataset + a skill applied to a
-    /// model unlock capabilities that feed the Talent Tree (P8 dataset layer).
-    /// Read-only, demonstrates the mechanism with the local model.
+    /// Manage the dataset/skill layer (P8): show the demonstration, list the
+    /// persistent registry, or register a real dataset + skill that drives the
+    /// agent's capabilities.
     Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+/// `decentraai agent skill` subcommands.
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Show the P8 demonstration (Qwen-Coder + code-finetune + code-agent →
+    /// tool calling). Read-only, from the real demo registry.
+    Demo {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
-        /// The served model file name to demonstrate skills against (defaults
-        /// to the node's current model).
+        /// The served model file name to demonstrate against (defaults to the
+        /// node's current model).
         #[arg(long)]
         model: Option<String>,
+    },
+    /// List the persistent dataset/skill registry (db/skills.json).
+    List {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Register a real dataset + a skill that unlocks capabilities (evidence).
+    /// The dataset's provenance is a claim; it only feeds the agent when the
+    /// node restarts and applies the persistent registry.
+    Add {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Dataset id (e.g. "code_finetune_2024").
+        #[arg(long)]
+        dataset_id: String,
+        /// Dataset name.
+        #[arg(long)]
+        name: String,
+        /// Source reference (e.g. hf:org/repo@rev).
+        #[arg(long)]
+        source: String,
+        /// Dataset kind (training|fine_tune|knowledge_base|benchmarks).
+        #[arg(long, default_value = "fine_tune")]
+        kind: String,
+        /// Capabilities the dataset develops (comma-separated snake_case).
+        #[arg(long)]
+        develops: String,
+        /// Provenance of the claims (verified|inferred).
+        #[arg(long, default_value = "inferred")]
+        provenance: String,
+        /// Skill id.
+        #[arg(long)]
+        skill_id: String,
+        /// Model base capability the skill requires (snake_case).
+        #[arg(long)]
+        requires_model: String,
+        /// Capabilities the skill unlocks (comma-separated; must be ⊆ dataset
+        /// develops).
+        #[arg(long)]
+        unlock: String,
     },
 }
 
@@ -1214,12 +1265,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         am.set_signing_key(identity.signing_key_bytes());
     }
     let short_id = decentraai_distributed::short_node_id(&local_peer_id);
+    // Persistent dataset/skill registry (db/skills.json) — real skills that
+    // drive the agent's capabilities. Loaded once; empty until the operator
+    // registers datasets/skills via `decentraai agent skill`.
+    let skills_registry = load_skill_registry(&data_dir.join("db/skills.json"));
     agent_manager.set_local_agents(default_local_agents(
         &short_id,
         &node_name,
         &model_hash,
         config.inference.allow_remote_inference,
         &model_name,
+        &skills_registry,
     ));
     info!(
         agents = agent_manager.local_count(),
@@ -1566,7 +1622,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // the node's local agents.
         state.attach_orchestrator(agent_orchestrator.clone());
         // P8: expose the dataset/skill registry to the dashboard (read-only).
-        state.attach_skills(Arc::new(decentraai_agents::demo_skill_registry()));
+        // The persistent registry drives the agent; the demo is shown only as a
+        // labelled demonstration (the handler adds it).
+        state.attach_skills(Arc::new(skills_registry.clone()));
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.
@@ -3191,7 +3249,33 @@ fn agent_command(command: AgentCommand) -> Result<()> {
             target,
             ..
         } => agent_talent_tree(&have, budget_mb, target.as_deref()),
-        AgentCommand::Skill { config, model } => agent_skill(&config, model.as_deref()),
+        AgentCommand::Skill { command } => match command {
+            SkillCommand::Demo { config, model } => agent_skill(&config, model.as_deref()),
+            SkillCommand::List { config } => skill_list(&config),
+            SkillCommand::Add {
+                config,
+                dataset_id,
+                name,
+                source,
+                kind,
+                develops,
+                provenance,
+                skill_id,
+                requires_model,
+                unlock,
+            } => skill_add(
+                &config,
+                &dataset_id,
+                &name,
+                &source,
+                &kind,
+                &develops,
+                &provenance,
+                &skill_id,
+                &requires_model,
+                &unlock,
+            ),
+        },
     }
 }
 
@@ -3221,6 +3305,7 @@ fn load_local_agents(config_path: &Path) -> Result<Vec<decentraai_agents::AgentR
         "",
         config.inference.allow_remote_inference,
         &config.node.name,
+        &decentraai_agents::SkillRegistry::new(),
     ))
 }
 
@@ -3532,6 +3617,32 @@ fn agent_talent_tree(have: &str, budget_mb: u64, target: Option<&str>) -> Result
     Ok(())
 }
 
+/// Loads the persistent dataset/skill registry from disk (best-effort: a
+/// missing/corrupt file yields an empty registry so the node still runs).
+fn load_skill_registry(path: &std::path::Path) -> decentraai_agents::SkillRegistry {
+    match std::fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+        Err(_) => decentraai_agents::SkillRegistry::new(),
+    }
+}
+
+/// Persists the dataset/skill registry atomically (tmp + rename).
+fn save_skill_registry(
+    path: &std::path::Path,
+    registry: &decentraai_agents::SkillRegistry,
+) -> Result<()> {
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(registry)?;
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(json.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Shows the dataset/skill layer (P8 dataset): how a dataset + a skill
 /// applied to a model unlock capabilities that feed the Talent Tree.
 /// Demonstrates the mechanism with a seeded code-finetune dataset/skill and
@@ -3634,6 +3745,135 @@ fn agent_skill(config_path: &std::path::Path, model_override: Option<&str>) -> R
     println!("  (demonstration data — register real datasets/skills to drive agent evolution)");
     Ok(())
 }
+
+/// Lists the persistent dataset/skill registry (db/skills.json).
+fn skill_list(config_path: &Path) -> Result<()> {
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let path = data_dir.join("db/skills.json");
+    let registry = load_skill_registry(&path);
+    println!("Dataset/skill registry ({}):", path.display());
+    if registry.datasets().is_empty() && registry.skills().is_empty() {
+        println!("  (empty — register a dataset+skill with `decentraai agent skill add`)");
+        return Ok(());
+    }
+    for d in registry.datasets() {
+        println!(
+            "  dataset: {} [{}] develops: {} · provenance {:?} · source {}",
+            d.id,
+            d.name,
+            d.develops
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+            d.provenance,
+            d.source,
+        );
+    }
+    for s in registry.skills() {
+        println!(
+            "  skill:   {} [{}] dataset={} requires_model={:?} unlocks: {}",
+            s.id,
+            s.name,
+            s.dataset_id,
+            s.requires_model.map(|k| k.label()),
+            s.develops
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Registers a real dataset + a skill into the persistent registry. The skill
+/// must only unlock capabilities its dataset develops (integrity invariant).
+/// The node applies the persistent registry to its agent on restart.
+#[allow(clippy::too_many_arguments)] // clap CLI flags, not a domain signature
+fn skill_add(
+    config_path: &Path,
+    dataset_id: &str,
+    name: &str,
+    source: &str,
+    kind: &str,
+    develops: &str,
+    provenance: &str,
+    skill_id: &str,
+    requires_model: &str,
+    unlock: &str,
+) -> Result<()> {
+    use decentraai_agents::{DatasetDescriptor, DatasetKind, SkillDescriptor};
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
+    use std::str::FromStr;
+
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let path = data_dir.join("db/skills.json");
+    let mut registry = load_skill_registry(&path);
+
+    // Parse capability lists (comma-separated snake_case).
+    let parse_caps = |s: &str| -> Result<Vec<CapabilityKind>> {
+        s.split(',')
+            .map(|c| {
+                CapabilityKind::from_str(c.trim())
+                    .map_err(|_| anyhow::anyhow!("unknown capability '{c}'"))
+            })
+            .collect()
+    };
+    let develops_kinds = parse_caps(develops)?;
+    let unlock_kinds = parse_caps(unlock)?;
+    let requires = if requires_model.trim().is_empty() {
+        None
+    } else {
+        Some(
+            CapabilityKind::from_str(requires_model.trim())
+                .map_err(|_| anyhow::anyhow!("unknown requires_model '{requires_model}'"))?,
+        )
+    };
+    let prov = match provenance.trim().to_ascii_lowercase().as_str() {
+        "verified" => Provenance::Verified,
+        "inferred" => Provenance::Inferred,
+        other => anyhow::bail!("unknown provenance '{other}' (use verified|inferred)"),
+    };
+    let kind_enum = match kind.trim().to_ascii_lowercase().as_str() {
+        "training" => DatasetKind::Training,
+        "fine_tune" => DatasetKind::FineTune,
+        "knowledge_base" => DatasetKind::KnowledgeBase,
+        "benchmarks" => DatasetKind::Benchmarks,
+        other => anyhow::bail!("unknown dataset kind '{other}'"),
+    };
+
+    registry
+        .add_dataset(
+            DatasetDescriptor::new(dataset_id, name, develops_kinds, kind_enum)
+                .from(source)
+                .with_provenance(prov),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    registry
+        .add_skill(SkillDescriptor::new(
+            skill_id,
+            format!("{name} skill"),
+            dataset_id,
+            requires,
+            unlock_kinds,
+        ))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    save_skill_registry(&path, &registry)?;
+    println!(
+        "Registered dataset '{dataset_id}' + skill '{skill_id}' in {}",
+        path.display()
+    );
+    println!(
+        "Restart the node (systemctl --user restart decentraai-node) for the agent to apply these capabilities."
+    );
+    Ok(())
+}
 /// node's identity short id and the model it serves — this is the node's
 /// own "generalist" agent plus, when a model is present, a model-tied
 /// executor. Provenance stays honest: without Hub metadata the LLM claims
@@ -3648,24 +3888,26 @@ fn default_local_agents(
     model_hash: &str,
     allow_remote: bool,
     model_name: &str,
+    skills: &decentraai_agents::SkillRegistry,
 ) -> Vec<decentraai_agents::AgentRecord> {
-    use decentraai_agents::{AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST};
+    use decentraai_agents::{
+        AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST, build_agent_capabilities,
+    };
 
     let mut agents = Vec::new();
-    // Base capabilities are derived from the actual served model (runtime
-    // wiring). All are INFERRED (from the model name) — the node cannot back
-    // VERIFIED claims without real evaluation evidence. Skills from the
-    // dataset/skill registry are NOT applied here until real (non-demo)
-    // datasets exist; applying demo skills would lend their provenance to
-    // synthetic claims (see docs/DATASET_AUDIT.md).
+    // Base capabilities are derived from the actually-served model (runtime
+    // wiring); all INFERRED. Then real skills from the persistent registry are
+    // applied: a skill only unlocks capabilities its dataset develops (with
+    // the dataset's provenance). The demo registry is never applied here.
     let base = model_base_capabilities(model_name);
+    let build = build_agent_capabilities(base, skills);
     let mut generalist = AgentRecord::new(
         format!("{short_id}:generalist"),
         format!("{node_name} Generalist"),
         ROLE_GENERALIST,
     )
     .described("chat, reasoning and text generation on this node");
-    for c in &base {
+    for c in build.all() {
         generalist = generalist.with_capability(c.capability, c.provenance);
     }
     if !model_hash.is_empty() {
@@ -4100,6 +4342,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         model_hash.as_deref().unwrap_or(""),
         config.inference.allow_remote_inference,
         model_name.as_deref().unwrap_or(""),
+        &decentraai_agents::SkillRegistry::new(),
     ));
     // M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
@@ -5247,7 +5490,14 @@ mod tests {
 
     #[test]
     fn agent_show_resolves_an_agent_by_id_from_the_default_set() {
-        let agents = default_local_agents("dca-test", "TestNode", "", false, "");
+        let agents = default_local_agents(
+            "dca-test",
+            "TestNode",
+            "",
+            false,
+            "",
+            &decentraai_agents::SkillRegistry::new(),
+        );
         let generalist = find_agent_by_id(&agents, "dca-test:generalist")
             .expect("generalist agent must be present in the default set");
         assert_eq!(generalist.role, decentraai_agents::ROLE_GENERALIST);
@@ -5449,6 +5699,7 @@ mod tests {
             "hash123",
             false,
             "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+            &decentraai_agents::SkillRegistry::new(),
         );
         let g = agents
             .iter()
@@ -5463,6 +5714,7 @@ mod tests {
             "",
             false,
             "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+            &decentraai_agents::SkillRegistry::new(),
         );
         let gg = gens
             .iter()

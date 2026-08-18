@@ -5771,7 +5771,8 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
             provenance: Provenance::Inferred,
         },
     ];
-    let demo_build = build_agent_capabilities(demo_base.clone(), registry);
+    let demo_build =
+        build_agent_capabilities(demo_base.clone(), &decentraai_agents::demo_skill_registry());
     let demo_unlocked: Vec<String> = demo_build
         .unlocked
         .iter()
