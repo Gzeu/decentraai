@@ -43,7 +43,7 @@ node's API from the other; only the P2P port is open between them.
 - Usage: `bash scripts/upgrade-remote-node.sh [user@host]` (`REMOTE_PORT=…` to
   override the port).
 
-## Current state (2026-08-18, verified live from the Laptop)
+## Current state (2026-08-18, verified live)
 
 > Corrected by Pylon (source of truth), 2026-08-18. An earlier version of this
 > doc claimed the Laptop binary was outdated; that was wrong — the Laptop is on
@@ -54,15 +54,21 @@ node's API from the other; only the P2P port is open between them.
   the AGENTS dashboard view. `/v1/agents` on the Laptop shows the Desktop as a
   **remote agent** (`dca-NGE65Z:generalist`, `remote: true`), which proves the
   Laptop deserializes and verifies agent advertisements correctly.
-- **Desktop i7: agent-visible, but its compute worker does not yet appear on
-  the Laptop.** The Desktop is connected and advertises a `generalist` agent
-  (build is new), yet `/v1/compute` on the Laptop lists only the local worker
-  (`dca-GriBWu`). The Laptop's log shows recurring
-  `WARN rejected signed agent advertisement error=missing field protocol_version`
-  for a peer that sends a signed agent advertisement whose inner payload lacks
-  `protocol_version` — to be traced to which peer/version (the local binary
-  already carries `protocol_version`). The Desktop's **compute worker** must
-  become visible before two-node remote inference can be validated.
+- **Desktop i7: UP TO DATE at `095465c` (binary rebuilt via `upgrade-node.sh`
+  with the `80829be` p2p fix).** Verified live from the Desktop after the
+  rebuild:
+  - `/v1/compute` → **2 workers**: `dca-NGE65Z` + `dca-GriBWu`, both
+    `accepts_remote_inference: true`.
+  - `/v1/agents` → **2 agents**: `dca-NGE65Z:generalist` (local) +
+    `dca-GriBWu:generalist` (`remote: true`).
+  - `/v1/fabric` → **2 nodes**: Laptop `ONLINE`, `trusted: true`, v1.0.0.
+  - `/v1/network` → connected to `12D3KooWGriBWu…`, link LAN 1000 Mbps,
+    `rtt_ms: 830`.
+  The root cause of the missing worker was the p2p advertisement bug fixed in
+  `80829be` (SignedComputeAdvertisement was swallowed in the agent branch),
+  NOT a stale binary on either side. Open item: run `scripts/validate-lan.sh`
+  from the Laptop to prove remote execution end-to-end (the Desktop cannot
+  reach the Laptop's loopback API).
 
 ## What to do on the Desktop (i7) so it shows up as a remote worker
 

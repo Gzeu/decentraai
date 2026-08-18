@@ -10,12 +10,15 @@
   - [x] Desktop: `git pull --rebase && bash scripts/upgrade-node.sh` (DONE
         2026-08-18; Desktop-ul e vizibil ca agent remote pe Laptop —
         `dca-NGE65Z:generalist` in `/v1/agents`).
-  - [ ] **Desktop compute worker nu apare pe Laptop** — Desktop-ul e agent-visible
-        dar `/v1/compute` pe Laptop listeaza doar worker-ul local. De rezolvat
-        (Desktop: `node.model` la un model diferit de Llama — ex. Mistral — ca
-        sa forteze rutarea remote; verifica `allow_remote_inference: true`;
-        reporneste node-ul), apoi `bash scripts/validate-lan.sh` pe Laptop.
-        Referinta: `docs/NODE_UPGRADE.md` (corectat de Pylon).
+  - [x] **Vizibilitate reciproca verificata live de pe Desktop** (DONE
+        2026-08-18, dupa rebuild cu fix-ul p2p `80829be`): `/v1/compute` = 2
+        workers (ambele `remote=True`), `/v1/agents` = 2 (unul remote),
+        `/v1/fabric` = 2 noduri (Laptop `ONLINE`, `trusted: true`), link LAN
+        1000 Mbps. Cauza reala era bug-ul p2p (SignedComputeAdvertisement
+        inghitit in agent branch), NU un binar vechi.
+  - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
+        end-to-end (orchestrator pe un nod, executa pe celalalt prin
+        `route_request`). Referinta: `docs/NODE_UPGRADE.md`.
 - [ ] **Collective memory written from workflows** — when a workflow completes,
   write its verified results into the SQLite `MemoryStore` scopes (ownership +
   access per the pure P5 model), so the fabric accumulates real knowledge.
