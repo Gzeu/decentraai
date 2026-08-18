@@ -1769,6 +1769,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(compute_manager.clone()),
             Some(distributed.p2p_node().clone()),
         );
+        state.set_dashboard(config.node.dashboard);
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
@@ -2729,7 +2730,7 @@ async fn serve_common(
         usize::from(config.inference.queue_max_requests),
         Duration::from_secs(u64::from(config.inference.request_timeout_seconds)),
     );
-    let state = ApiState::new(
+    let mut state = ApiState::new(
         backend_url.clone(),
         token.clone(),
         manager.clone(),
@@ -2740,6 +2741,7 @@ async fn serve_common(
         None,
         None,
     );
+    state.set_dashboard(config.node.dashboard);
     let api_addr = serve_api(state, &bind_address, api_port).await?;
 
     decentraai_audit::record_best_effort(

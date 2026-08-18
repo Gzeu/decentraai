@@ -2,6 +2,9 @@ node:
   name: "decentraai-node"
   mode: "balanced"
   data_dir: "~/.decentraai"
+  # `v1` preserves the existing dashboard at `/`; preview the visual refresh
+  # any time at `/ui2`, then set this to `v2` when ready.
+  dashboard: "v1"
   # Optional: serve a specific GGUF model instead of auto-detecting the first
   # one in the models dir. Missing file = hard error at startup.
   # model: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"

@@ -39,12 +39,28 @@ pub struct NodeSection {
     pub name: String,
     pub mode: NodeMode,
     pub data_dir: String,
+    /// Embedded dashboard to expose at `/`. `v1` remains the safe default;
+    /// `v2` is an opt-in visual refresh available at `/ui2` either way.
+    #[serde(default)]
+    pub dashboard: DashboardVersion,
     /// Explicit GGUF model file name to serve (e.g.
     /// `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`). When set, the node serves this
     /// model instead of auto-detecting the first one in the models dir; a
     /// missing file is a hard error at startup. Optional (absent = auto-detect).
     #[serde(default)]
     pub model: Option<String>,
+}
+
+/// Which embedded dashboard is served at the root path.
+///
+/// Keeping this an enum makes invalid values a config-load failure instead of
+/// silently selecting a UI the operator did not intend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DashboardVersion {
+    #[default]
+    V1,
+    V2,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +472,32 @@ mod tests {
         assert_eq!(generation.top_p, 0.9);
         assert_eq!(generation.repeat_penalty, 1.1);
         assert!(!generation.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn dashboard_version_accepts_v1_and_v2_and_rejects_other_values() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+
+        let v1 = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(v1.node.dashboard, DashboardVersion::V1);
+
+        std::fs::write(
+            file.path(),
+            raw.replace("dashboard: \"v1\"", "dashboard: \"v2\""),
+        )
+        .unwrap();
+        let v2 = NodeConfig::load(file.path()).unwrap();
+        assert_eq!(v2.node.dashboard, DashboardVersion::V2);
+
+        std::fs::write(
+            file.path(),
+            raw.replace("dashboard: \"v1\"", "dashboard: \"neon\""),
+        )
+        .unwrap();
+        assert!(NodeConfig::load(file.path()).is_err());
     }
 
     #[test]

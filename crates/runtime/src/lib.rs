@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod dashboard;
+pub mod dashboard_v2;
 pub mod mcp;
 pub mod queue;
 

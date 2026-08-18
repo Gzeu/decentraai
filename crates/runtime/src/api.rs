@@ -21,7 +21,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use decentraai_config::{GenerationSection, ResourceSection, TiersSection};
+use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::Serialize;
@@ -36,6 +36,7 @@ use tokio::sync::Mutex;
 
 use crate::ServeManager;
 use crate::dashboard::{DASHBOARD_HTML, JS_TEMPLATE};
+use crate::dashboard_v2::{DASHBOARD_V2_HTML, JS_V2_TEMPLATE};
 use crate::queue::InferenceQueue;
 
 /// Maximum audit events shown on the dashboard.
@@ -224,6 +225,9 @@ pub struct ApiState {
     manager: Arc<Mutex<ServeManager>>,
     client: reqwest::Client,
     info: DashboardInfo,
+    /// Root dashboard choice from `node.dashboard`. `/ui2` always remains a
+    /// preview route, so an operator can switch back without losing access.
+    dashboard: DashboardVersion,
     /// Runtime-editable generation defaults. Seeded from the node config at
     /// startup; an admin can update them live via the master-gated settings
     /// endpoint, and the proxy reads this (not the immutable `info`) when
@@ -327,6 +331,7 @@ impl ApiState {
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
             info,
+            dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
             quota_ledger: None,
@@ -353,6 +358,11 @@ impl ApiState {
             memory: None,
             talent_tree: None,
         }
+    }
+
+    /// Selects which embedded dashboard is served at `/`.
+    pub fn set_dashboard(&mut self, dashboard: DashboardVersion) {
+        self.dashboard = dashboard;
     }
 
     /// Attaches the fabric inference coordinator so the proxy can route chat
@@ -4552,7 +4562,8 @@ async fn openapi_handler() -> Response {
 /// (also the fallback), and the small JSON views that feed it.
 pub fn build_router(state: ApiState) -> Router {
     Router::new()
-        .route("/", get(dashboard_handler))
+        .route("/", get(root_dashboard_handler))
+        .route("/ui2", get(dashboard_v2_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
@@ -4635,6 +4646,39 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
+}
+
+/// Pure root-route choice. Keeping it separate preserves the v1 handler and
+/// makes the config switch straightforward to test without an HTTP server.
+fn root_uses_v2(dashboard: DashboardVersion) -> bool {
+    dashboard == DashboardVersion::V2
+}
+
+async fn root_dashboard_handler(State(state): State<ApiState>) -> Response {
+    if root_uses_v2(state.dashboard) {
+        dashboard_v2_response(&state)
+    } else {
+        dashboard_handler(State(state)).await
+    }
+}
+
+/// The v2 preview page. Unlike `/`, this route deliberately ignores
+/// `node.dashboard`, allowing a risk-free browser review at any time.
+async fn dashboard_v2_handler(State(state): State<ApiState>) -> Response {
+    dashboard_v2_response(&state)
+}
+
+fn dashboard_v2_response(state: &ApiState) -> Response {
+    let share = share_guide_html(state);
+    let html = DASHBOARD_V2_HTML
+        .replace("/*__JS__*/", &dashboard_v2_js(state, &share))
+        .replace("__API_PORT__", &state.info.api_port.to_string());
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// Binds the API on `host:port` (port 0 means ephemeral) and serves it
@@ -8105,6 +8149,12 @@ fn dashboard_js(state: &ApiState, share: &str) -> String {
         .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
 }
 
+fn dashboard_v2_js(state: &ApiState, share: &str) -> String {
+    JS_V2_TEMPLATE
+        .replace("__SHARE__", &share.replace('"', "\\\""))
+        .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
+}
+
 /// Real node + engine info derived from the local compute advertisement when a
 /// compute manager is attached. Falls back to empty markers otherwise — never
 /// mock data.
@@ -9274,6 +9324,87 @@ mod tests {
             }
         }
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ui2_is_always_available_and_root_honors_dashboard_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        // Rendering either embedded page does not need a live engine. Keeping
+        // this handler-level test free of a subprocess makes the route contract
+        // deterministic on restricted CI runners too.
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(60))));
+        let mut state = ApiState::new(
+            String::new(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.set_dashboard(DashboardVersion::V2);
+
+        for response in [
+            root_dashboard_handler(State(state.clone())).await,
+            dashboard_v2_handler(State(state.clone())).await,
+        ] {
+            let body = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("DecentraAI · Node"), "handler must serve v2");
+            assert!(body.contains("Chat with this node"));
+        }
+    }
+
+    #[test]
+    fn dashboard_choice_is_a_pure_v1_v2_decision() {
+        assert!(!root_uses_v2(DashboardVersion::V1));
+        assert!(root_uses_v2(DashboardVersion::V2));
+    }
+
+    #[test]
+    fn share_guide_rendering_escapes_the_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(60))));
+        let mut info = test_info(dir.path(), None);
+        info.repo_root = PathBuf::from("/tmp/models<&\"");
+        let state = ApiState::new(
+            String::new(),
+            None,
+            manager,
+            info,
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let guide = share_guide_html(&state);
+        assert!(guide.contains("/tmp/models&lt;&amp;&quot;"));
+        assert!(!guide.contains("/tmp/models<&\""));
+    }
+
+    #[test]
+    fn v2_dashboard_js_only_polls_status_and_peers() {
+        // The streaming chat API is user-initiated; the recurring refresh must
+        // only observe these two node-owned JSON views and never hit the
+        // llama-server backend or its idle-clock-affecting proxy paths.
+        assert!(JS_V2_TEMPLATE.contains("setInterval(refresh, 5000)"));
+        assert!(JS_V2_TEMPLATE.contains("fetch('/status')"));
+        assert!(JS_V2_TEMPLATE.contains("fetch('/v1/peers'"));
+        for forbidden in ["/health", "/props", "/v1/completions"] {
+            assert!(
+                !JS_V2_TEMPLATE.contains(forbidden),
+                "v2 page must not reference proxied backend endpoint {forbidden}"
+            );
+        }
     }
 
     #[cfg(unix)]

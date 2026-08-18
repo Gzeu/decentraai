@@ -63,6 +63,8 @@
 
 ## Product / polish
 
+- [x] Dashboard v2 visual refresh — preview at `/ui2`; `node.dashboard: v1|v2`
+      keeps v1 the default until the operator opts in.
 - [x] Dashboard: reputation + talent tree views — DONE 2026-08-18: Talents
   (commit `8d2c5eb`), Reputation + Memory views live in Mesh.
 - [ ] `decentraai agent` — add `memory` and `economy` inspection subcommands.
