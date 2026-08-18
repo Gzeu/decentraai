@@ -1389,13 +1389,16 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // The coordinator-side orchestrator runs collective workflows by delegating
     // stages to the local/remote agents. Shared with the API so a user can
     // trigger a workflow from the dashboard/CLI.
-    let agent_orchestrator = Arc::new(
-        decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
-            agent_messenger.clone(),
-            agent_manager.clone(),
-            local_peer_id,
-        ),
+    let mut agent_orchestrator = decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
+        agent_messenger.clone(),
+        agent_manager.clone(),
+        local_peer_id,
     );
+    // Larger models (e.g. 7B on CPU) generate slower than the 60s default; a
+    // per-stage reply can take minutes. Keep the timeout generous so a real
+    // collective workflow completes instead of timing out mid-stage.
+    agent_orchestrator.with_delegate_timeout(Duration::from_secs(600));
+    let agent_orchestrator = Arc::new(agent_orchestrator);
     // Persistent collective memory (best-effort; the node keeps working if it
     // cannot open or create the store). Held and shared with the API so the
     // dashboard can show it and workflows can write verified results to it.
