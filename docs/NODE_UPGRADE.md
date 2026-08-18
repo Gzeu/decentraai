@@ -70,6 +70,20 @@ node's API from the other; only the P2P port is open between them.
   from the Laptop to prove remote execution end-to-end (the Desktop cannot
   reach the Laptop's loopback API).
 
+## Two-node remote inference — VERIFIED both directions (2026-08-18)
+
+- **Laptop → Desktop** (verified by Devin on the Laptop): `curl
+  /v1/chat/completions` with `model=tinyllama.gguf` (served only on the
+  Desktop) returned a real remote reply; M19 RTT probe measured
+  `links rtt_ms=180, locality=Lan`.
+- **Desktop → Laptop** (verified by Pylon on the Desktop, HEAD `d42dfd9`):
+  `bash scripts/validate-lan.sh` found the remote worker `dca-GriBWu`
+  (trusted, remote_ok, model `qwen2.5-coder-7b-instruct-q4_k_m.gguf`), routed
+  a real request to it; `/v1/execution` confirms the planner chose the Laptop
+  peer (network_cost 849ms, score 0.496) and rejected the local candidate
+  (breach `trusted`). The model replied `LOCAL` (it did not interpret the
+  prompt), but the remote routing is proven by the execution view.
+
 ## What to do on the Desktop (i7) so it shows up as a remote worker
 
 > Hardware note (verified 2026-08-18): the **Laptop (i5) has 30 GiB RAM** and

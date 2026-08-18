@@ -16,9 +16,13 @@
         `/v1/fabric` = 2 noduri (Laptop `ONLINE`, `trusted: true`), link LAN
         1000 Mbps. Cauza reala era bug-ul p2p (SignedComputeAdvertisement
         inghitit in agent branch), NU un binar vechi.
-  - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
-        end-to-end (orchestrator pe un nod, executa pe celalalt prin
-        `route_request`). Referinta: `docs/NODE_UPGRADE.md`.
+  - [x] **`validate-lan.sh` rulat de pe Desktop** (DONE 2026-08-18, HEAD
+        `d42dfd9`): remote worker `dca-GriBWu` (trusted, remote_ok, model
+        `qwen2.5-coder-7b-instruct-q4_k_m.gguf`), request real rutat remote —
+        `/v1/execution` confirma decizia (peer laptop ales, network_cost 849ms,
+        score 0.496; candidat local respins breach `trusted`). Remote execution
+        end-to-end VERIFICAT din ambele directii (Laptop→Desktop in commit-ul
+        Devin, Desktop→Laptop aici). Referinta: `docs/NODE_UPGRADE.md`.
   - [x] **Remote execution verificata live de pe Laptop** (DONE 2026-08-18,
         dupa update-ul Desktop): `curl /v1/chat/completions` cu
         `model=tinyllama.gguf` (model existent DOAR pe Desktop) a returnat
