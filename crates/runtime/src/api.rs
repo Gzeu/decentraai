@@ -9136,6 +9136,19 @@ mod tests {
         assert!(JS_TEMPLATE.contains("unlocked"));
     }
 
+    #[test]
+    fn dashboard_chat_has_node_selector_and_metrics() {
+        // The chat now lets the operator pin a node and see live metrics.
+        assert!(DASHBOARD_HTML.contains("id=\"chat-node\""));
+        assert!(DASHBOARD_HTML.contains("id=\"chat-metrics\""));
+        assert!(JS_TEMPLATE.contains("populateChatNodes"));
+        assert!(JS_TEMPLATE.contains("chatNodeFilter"));
+        assert!(JS_TEMPLATE.contains("pinnedNode"));
+        assert!(JS_TEMPLATE.contains("chat-metrics"));
+        assert!(JS_TEMPLATE.contains("tok/s"));
+        assert!(JS_TEMPLATE.contains("worker_hint"));
+    }
+
     // The /v1/agents handler must keep returning a well-formed payload when the
     // agent manager is not attached (the dashboard shows its empty state).
     #[tokio::test]

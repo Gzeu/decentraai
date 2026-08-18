@@ -509,11 +509,13 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <button id="chat-retry" disabled>Retry</button>
           </div>
           <div class="chat-controls" style="margin-top:8px">
+            <select id="chat-node" title="Node to serve chat (fabric)" style="min-width:150px"></select>
             <select id="chat-model" title="Model for chat" style="min-width:180px"></select>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"><input id="chat-stream" type="checkbox" checked> stream</label>
             <span class="chat-status" id="chat-status">ready</span>
             <span id="chat-served"></span>
           </div>
+          <div class="chat-metrics" id="chat-metrics" style="margin-top:8px;display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)"></div>
         </div>
       </div>
     </section>
@@ -1349,7 +1351,7 @@ const activeModel = "__MODEL__";
 const HIST_KEY = 'decentraai.chat.history';
 let hist = [];
 try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
-const chatbox = $('chat-history'), chatModel = $('chat-model'), chatInput = $('chat-input');
+const chatbox = $('chat-history'), chatModel = $('chat-model'), chatNode = $('chat-node'), chatInput = $('chat-input');
 // `__auto__` = fabric-wide best-model picker; `remote:<node>:<file>` = an
 // explicit remote worker's model (sendChat turns it into worker_hint).
 const currentModel = () => {
@@ -1357,6 +1359,14 @@ const currentModel = () => {
   if (v === '__auto__') return 'auto';
   if (v.startsWith('remote:')) { const i = v.indexOf(':', 7); return v.slice(i + 1); }
   return v || activeModel;
+};
+// The node the user pinned for chat (__auto__ = fabric best, local = this node,
+// otherwise a remote worker's node id/name). Drives worker_hint and the model
+// filter.
+const pinnedNode = () => {
+  const v = chatNode ? chatNode.value : '__auto__';
+  if (v === '__auto__' || v === 'local') return '';
+  return v;
 };
 const addMsg = (role, text) => {
   const div = document.createElement('div');
@@ -1412,20 +1422,23 @@ const sendChat = async (prompt) => {
   const t0 = performance.now();
   try {
     const sel = chatModel.value || '';
-    let workerHint = '';
-    if (sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
+    let workerHint = pinnedNode();
+    // Backward-compatible: an explicit remote:<node>:<file> model also pins a node.
+    if (!workerHint && sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
     const body = JSON.stringify({ model: currentModel(), messages: hist, stream, ...(workerHint ? { worker_hint: workerHint } : {}) });
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
     const servedEl = $('chat-served');
+    let servedOrigin = '', servedNode = '';
     if (servedEl) {
       const origin = r.headers.get('x-decentra-origin') || '';
       const worker = r.headers.get('x-decentra-worker') || '';
       const node = r.headers.get('x-decentra-node') || '';
+      servedOrigin = origin; servedNode = node || worker;
       if (origin === 'remote') {
-        servedEl.textContent = 'served by ' + (node || worker || 'remote worker') + ' · remote';
+        servedEl.textContent = 'served by ' + servedNode + ' · remote';
         servedEl.className = 'badge remote';
       } else if (origin === 'local') {
-        servedEl.textContent = 'served locally' + (node ? ' · ' + node : '');
+        servedEl.textContent = 'served locally' + (servedNode ? ' · ' + servedNode : '');
         servedEl.className = 'badge local';
       } else {
         servedEl.textContent = '';
@@ -1444,6 +1457,18 @@ const sendChat = async (prompt) => {
     saveHist();
     const dt = Math.round(performance.now() - t0);
     chatStatus.textContent = (r.ok ? 'done' : 'error') + ' in ' + dt + ' ms' + (tokens != null ? ' · ' + tokens + ' tokens' : '');
+    // Live metrics card: latency, tokens, throughput, served node, model.
+    const m = $('chat-metrics');
+    if (m) {
+      const tokps = tokens != null && dt > 0 ? (tokens / (dt / 1000)).toFixed(1) : '—';
+      const nodeLabel = servedOrigin === 'remote' ? (servedNode || 'remote worker') : (servedOrigin === 'local' ? 'local' : '—');
+      m.innerHTML =
+        '<span><b>latency</b> ' + dt + ' ms</span>' +
+        '<span><b>tokens</b> ' + (tokens != null ? tokens : '—') + '</span>' +
+        '<span><b>tok/s</b> ' + tokps + '</span>' +
+        '<span><b>served by</b> ' + esc(nodeLabel) + '</span>' +
+        '<span><b>model</b> <code>' + esc(currentModel()) + '</code></span>';
+    }
   } catch (e) {
     if (controller.signal.aborted) chatStatus.textContent = 'stopped';
     else {
@@ -4143,13 +4168,7 @@ async function refresh(){
     $('events').innerHTML = (s.recent_events||[]).map(e =>
       '<tr><td>'+tstr(e.timestamp)+'</td><td><code>'+esc(e.event)+'</code></td><td class="mono" style="font-size:11px">'+esc(JSON.stringify(e.details||{}))+'</td></tr>'
     ).join('') || '<tr><td colspan="3" class="empty">no security events yet</td></tr>';
-    // populate chat model selector once
-    if (chatModel.options.length === 0) {
-      const names = new Set([activeModel]);
-      (s.available_models||[]).forEach(m => { if (m && m.name) names.add(m.name); });
-      names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; chatModel.appendChild(opt); });
-      chatModel.value = activeModel;
-    }
+    populateChatNodes(c);
     populateChatModels(s, c);
     renderModels(s, c);
     renderDiag(s, null, null);
@@ -4181,29 +4200,54 @@ setStageVisible(true);
 //   Local models           — this node's /status available_models
 //   Remote workers         — every model advertised by other workers, even
 //                            when a local copy exists, labelled with its node
-const populateChatModels = (s, c) => {
-  if (!c || !c.workers || chatModel.querySelector('optgroup[label="Remote workers"]')) return;
+const populateChatNodes = (c) => {
+  if (!chatNode || !c || !c.workers || chatNode.options.length > 0) return;
+  const add = (v, label) => { const o = document.createElement('option'); o.value = v; o.textContent = label; chatNode.appendChild(o); };
+  add('__auto__', 'Auto (best node)');
+  add('local', 'Local (this node)');
+  const seen = new Set();
+  (c.workers || []).forEach(w => {
+    if (w && w.peer_id === c.local_peer) return;
+    const n = w.node_id || w.node_name || w.peer_id;
+    if (!seen.has(n)) { seen.add(n); add(n, n); }
+  });
+  chatNode.value = '__auto__';
+  chatNode.addEventListener('change', () => populateChatModels(window.__chatStatus, window.__chatCompute, true));
+};
+// The node filter currently selected in the chat-node dropdown.
+const chatNodeFilter = () => chatNode ? (chatNode.value || '__auto__') : '__auto__';
+const populateChatModels = (s, c, force) => {
+  window.__chatStatus = s; window.__chatCompute = c;
+  if (!chatModel) return;
+  if (!force && chatModel.options.length > 0) return; // keep the user's selection
   chatModel.innerHTML = '';
+  const filter = chatNodeFilter();
   const auto = document.createElement('option');
   auto.value = '__auto__';
   auto.textContent = 'Auto (best available)';
   chatModel.appendChild(auto);
-  const names = new Set([activeModel]);
-  ((s && s.available_models) || []).forEach(m => { if (m && m.name) names.add(m.name); });
-  if (names.size) {
-    const og = document.createElement('optgroup'); og.label = 'Local models';
-    names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; og.appendChild(opt); });
-    chatModel.appendChild(og);
+  // Local models only when the filter is auto or local.
+  if (filter === '__auto__' || filter === 'local') {
+    const names = new Set([activeModel]);
+    ((s && s.available_models) || []).forEach(m => { if (m && m.name) names.add(m.name); });
+    if (names.size) {
+      const og = document.createElement('optgroup'); og.label = 'Local models';
+      names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; og.appendChild(opt); });
+      chatModel.appendChild(og);
+    }
   }
+  // Remote models: all when filter is auto, or only the pinned node's.
   const remote = [];
-  (c.workers || []).forEach(w => {
+  (c && c.workers || []).forEach(w => {
     if (w && w.peer_id === c.local_peer) return;
+    const n = w.node_id || w.node_name || w.peer_id;
+    if (filter !== '__auto__' && filter !== n) return;
     (w.served_models || []).forEach(m => {
-      if (m && m.file_name) remote.push({ file: m.file_name, node: w.node_id || w.node_name || w.peer_id });
+      if (m && m.file_name) remote.push({ file: m.file_name, node: n });
     });
   });
   if (remote.length) {
-    const og = document.createElement('optgroup'); og.label = 'Remote workers';
+    const og = document.createElement('optgroup'); og.label = 'Remote workers' + (filter === '__auto__' ? '' : ' · ' + filter);
     remote.forEach(r => {
       const opt = document.createElement('option');
       opt.value = 'remote:' + r.node + ':' + r.file;
