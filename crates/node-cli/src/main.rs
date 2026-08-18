@@ -1219,6 +1219,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         &node_name,
         &model_hash,
         config.inference.allow_remote_inference,
+        &model_name,
     ));
     info!(
         agents = agent_manager.local_count(),
@@ -3219,6 +3220,7 @@ fn load_local_agents(config_path: &Path) -> Result<Vec<decentraai_agents::AgentR
         &config.node.name,
         "",
         config.inference.allow_remote_inference,
+        &config.node.name,
     ))
 }
 
@@ -3645,26 +3647,27 @@ fn default_local_agents(
     node_name: &str,
     model_hash: &str,
     allow_remote: bool,
+    model_name: &str,
 ) -> Vec<decentraai_agents::AgentRecord> {
     use decentraai_agents::{AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST};
-    use decentraai_hub::capability::{CapabilityKind, Provenance};
 
     let mut agents = Vec::new();
+    // Base capabilities are derived from the actual served model (runtime
+    // wiring). All are INFERRED (from the model name) — the node cannot back
+    // VERIFIED claims without real evaluation evidence. Skills from the
+    // dataset/skill registry are NOT applied here until real (non-demo)
+    // datasets exist; applying demo skills would lend their provenance to
+    // synthetic claims (see docs/DATASET_AUDIT.md).
+    let base = model_base_capabilities(model_name);
     let mut generalist = AgentRecord::new(
         format!("{short_id}:generalist"),
         format!("{node_name} Generalist"),
         ROLE_GENERALIST,
     )
-    .described("chat, reasoning and text generation on this node")
-    .with_capability(CapabilityKind::Chat, Provenance::Inferred)
-    .with_capability(CapabilityKind::TextGeneration, Provenance::Inferred)
-    .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
-    // A generalist LLM can perform these with an appropriate prompt; all are
-    // INFERRED (the node cannot back VERIFIED claims without Hub metadata).
-    .with_capability(CapabilityKind::DocumentUnderstanding, Provenance::Inferred)
-    .with_capability(CapabilityKind::Summarization, Provenance::Inferred)
-    .with_capability(CapabilityKind::Classification, Provenance::Inferred)
-    .with_capability(CapabilityKind::StructuredOutput, Provenance::Inferred);
+    .described("chat, reasoning and text generation on this node");
+    for c in &base {
+        generalist = generalist.with_capability(c.capability, c.provenance);
+    }
     if !model_hash.is_empty() {
         generalist = generalist.with_model(model_hash);
     }
@@ -3677,6 +3680,36 @@ fn default_local_agents(
     generalist.set_state(AgentState::Ready);
     agents.push(generalist);
     agents
+}
+
+/// Honest base capabilities of a served model, derived from its file name
+/// (all INFERRED — a name cannot back a VERIFIED claim). "coder" models claim
+/// Coding (plus the general chat/reasoning set); anything else claims the
+/// general set only.
+fn model_base_capabilities(model_name: &str) -> Vec<decentraai_hub::capability::CapabilityClaim> {
+    use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
+    let lower = model_name.to_ascii_lowercase();
+    let mut caps = vec![
+        CapabilityClaim {
+            capability: CapabilityKind::Chat,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::TextGeneration,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::Reasoning,
+            provenance: Provenance::Inferred,
+        },
+    ];
+    if lower.contains("coder") {
+        caps.push(CapabilityClaim {
+            capability: CapabilityKind::Coding,
+            provenance: Provenance::Inferred,
+        });
+    }
+    caps
 }
 
 /// Reads the persisted contribution report and prints each worker's computed
@@ -4066,6 +4099,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         &args.name,
         model_hash.as_deref().unwrap_or(""),
         config.inference.allow_remote_inference,
+        model_name.as_deref().unwrap_or(""),
     ));
     // M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
@@ -4844,6 +4878,7 @@ async fn wait_for_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
 
     #[test]
     fn parses_engine_health_addresses() {
@@ -5212,7 +5247,7 @@ mod tests {
 
     #[test]
     fn agent_show_resolves_an_agent_by_id_from_the_default_set() {
-        let agents = default_local_agents("dca-test", "TestNode", "", false);
+        let agents = default_local_agents("dca-test", "TestNode", "", false, "");
         let generalist = find_agent_by_id(&agents, "dca-test:generalist")
             .expect("generalist agent must be present in the default set");
         assert_eq!(generalist.role, decentraai_agents::ROLE_GENERALIST);
@@ -5383,5 +5418,56 @@ mod tests {
     fn empty_dir_yields_no_model() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(resolve_model_name(dir.path(), None).unwrap(), "");
+    }
+
+    #[test]
+    fn model_base_capabilities_are_honest_and_model_aware() {
+        // A coding model claims Coding (INFERRED — a name cannot back VERIFIED).
+        let coding = model_base_capabilities("qwen2.5-coder-7b-instruct-q4_k_m.gguf");
+        assert!(coding.iter().any(
+            |c| c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
+        ));
+        // A general model claims only the general set (no Coding invented).
+        let general = model_base_capabilities("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        assert!(
+            !general
+                .iter()
+                .any(|c| c.capability == CapabilityKind::Coding)
+        );
+        assert!(general.iter().any(|c| c.capability == CapabilityKind::Chat));
+        // No capability is ever claimed VERIFIED from a model name.
+        assert!(coding.iter().all(|c| c.provenance == Provenance::Inferred));
+    }
+
+    #[test]
+    fn default_local_agents_reflect_the_served_model() {
+        // Runtime wiring: the generalist agent advertises the served model's
+        // base capabilities. A coding model -> Coding claim.
+        let agents = default_local_agents(
+            "dca-test",
+            "Node",
+            "hash123",
+            false,
+            "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        );
+        let g = agents
+            .iter()
+            .find(|a| a.agent_id == "dca-test:generalist")
+            .unwrap();
+        assert!(g.has_capability(CapabilityKind::Coding));
+        assert!(g.has_model("hash123"));
+        // A general model -> no Coding.
+        let gens = default_local_agents(
+            "dca-test",
+            "Node",
+            "",
+            false,
+            "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        );
+        let gg = gens
+            .iter()
+            .find(|a| a.agent_id == "dca-test:generalist")
+            .unwrap();
+        assert!(!gg.has_capability(CapabilityKind::Coding));
     }
 }
