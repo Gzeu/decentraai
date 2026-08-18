@@ -31,6 +31,12 @@ pub struct NodeConfig {
     /// existing installs unchanged.
     #[serde(default)]
     pub tiers: Option<TiersSection>,
+    /// Local text-to-speech (Kokoro-82M ONNX subprocess). Absent = TTS is
+    /// disabled; the dashboard chat shows no speak button and `/v1/tts`
+    /// returns 404. Enabling requires the TTS venv + model files installed
+    /// under the data dir (`tts/`).
+    #[serde(default)]
+    pub tts: Option<TtsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +300,45 @@ impl TiersSection {
             2 => Some(&self.tier2),
             3 => Some(&self.tier3),
             _ => None,
+        }
+    }
+}
+
+/// Local text-to-speech (TTS). Drives a Kokoro-82M ONNX Python subprocess
+/// (external engine — never FFI) exposed to the dashboard chat as `/v1/tts`.
+/// The model + voices live in `<data_dir>/tts/`; the Python venv lives in
+/// `<data_dir>/tts/venv/`. Absent section = TTS off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsSection {
+    /// Enable the TTS subprocess at node start. If true but the venv/model
+    /// files are missing, the node logs a warning and serves without TTS
+    /// (dashboard hides the speak button) instead of failing startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Kokoro voice name, e.g. `af_heart` (default feminine) / `am_michael`.
+    /// Defaults to `af_heart` when absent.
+    #[serde(default = "default_tts_voice")]
+    pub voice: String,
+    /// Speech rate multiplier (0.5 = half speed, 1.0 = normal, 1.5 = fast).
+    #[serde(default = "default_tts_speed")]
+    pub speed: f64,
+}
+
+fn default_tts_voice() -> String {
+    "af_heart".to_string()
+}
+
+fn default_tts_speed() -> f64 {
+    1.0
+}
+
+impl Default for TtsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            voice: default_tts_voice(),
+            speed: default_tts_speed(),
         }
     }
 }
@@ -644,6 +689,30 @@ security:
         assert_eq!(config.sharing.mode, ShareMode::Auto);
         assert_eq!(config.sharing.max_concurrent_downloads, 2);
         assert!(config.sharing.provision_models_on_demand);
+    }
+
+    #[test]
+    fn missing_tts_section_defaults_to_disabled() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(config.tts.is_none(), "example config must stay TTS-free");
+    }
+
+    #[test]
+    fn tts_section_parses_with_voice_and_speed() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let with_tts = format!("{raw}\ntts:\n  enabled: true\n  voice: af_heart\n  speed: 1.15\n");
+        std::fs::write(file.path(), with_tts).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let tts = config.tts.as_ref().expect("tts section should parse");
+        assert!(tts.enabled);
+        assert_eq!(tts.voice, "af_heart");
+        assert_eq!(tts.speed, 1.15);
     }
 
     #[test]

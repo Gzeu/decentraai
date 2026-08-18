@@ -163,7 +163,10 @@ td .run{color:var(--green)}td .wait{color:var(--warn)}td .down{color:var(--err)}
 .capbar i{display:block;height:100%;background:linear-gradient(90deg,var(--violet),var(--cyan));border-radius:4px;box-shadow:0 0 8px rgba(124,58,237,.55)}
 /* ---- Chat ---- */
 .chat{min-height:300px;max-height:54vh;overflow:auto;background:rgba(3,10,25,.55);border:1px solid var(--line);border-radius:12px;padding:14px}
-.msg{padding:10px 13px;border-radius:10px;max-width:85%;margin:7px 0;white-space:pre-wrap;font-size:13px;line-height:1.5}
+.msg{padding:10px 13px;border-radius:10px;max-width:85%;margin:7px 0;white-space:pre-wrap;font-size:13px;line-height:1.5;position:relative}
+.msg .speak{position:absolute;top:6px;right:6px;background:rgba(0,245,255,.08);border:1px solid rgba(0,245,255,.25);color:var(--ink);font-size:12px;border-radius:6px;padding:2px 7px;cursor:pointer;opacity:.85}
+.msg .speak:hover{background:rgba(0,245,255,.2)}
+.msg .speak.busy{opacity:.5;pointer-events:none}
 .msg.user{background:linear-gradient(135deg,rgba(0,245,255,.18),rgba(40,120,255,.18));color:var(--ink);margin-left:auto;border:1px solid rgba(0,245,255,.3)}
 .msg.assistant{background:var(--panel);border:1px solid var(--line);color:var(--ink)}
 textarea{width:100%;min-height:85px;padding:11px;resize:vertical;font:inherit;color:var(--ink);
@@ -342,6 +345,7 @@ function stateFromStatus(s) {
 }
 function renderStatus(s) {
   lastStatus = s;
+  ttsEnabled = !!(s.tts && s.tts.enabled);
   const sys = s.system || {}, gpu = sys.gpu;
   const st = stateFromStatus(s);
   const badge = $('state-badge'); badge.textContent = st.txt; badge.className = 'state-badge'+(st.cls?' '+st.cls:'');
@@ -671,8 +675,13 @@ function renderWorkersDetail() {
 }
 
 /* ---- Chat ---- */
-const chat = $('chat'); let history = [];
+const chat = $('chat'); let history = []; let ttsEnabled = false; let speaking = null;
 function addMessage(role, text) { if (chat.querySelector('.empty')) chat.innerHTML = ''; const el = document.createElement('div'); el.className = 'msg '+role; el.textContent = text; chat.appendChild(el); chat.scrollTop = chat.scrollHeight; return el; }
+// Adds the 🔊 speak button to an assistant message when TTS is enabled.
+function addSpeak(el, text) { if (!ttsEnabled || !text || el.querySelector('.speak')) return; const b = document.createElement('button'); b.className = 'speak'; b.textContent = '🔊'; b.title = 'Speak this answer'; b.onclick = () => speak(text, b); el.appendChild(b); }
+// Synthesizes text through /v1/tts and plays the WAV. Disables the button
+// while speaking; audio stops if the user clicks again.
+async function speak(text, btn) { if (speaking) { speaking.pause(); speaking = null; if (btn) btn.classList.remove('busy'); return; } btn.classList.add('busy'); try { const r = await fetch('/v1/tts',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify({text})}); if (!r.ok) { const err = await r.json().catch(()=>({})); $('chat-status').textContent = 'Speak failed: '+(err.error?.message||r.status); return; } const blob = await r.blob(); speaking = new Audio(URL.createObjectURL(blob)); speaking.onended = () => { speaking = null; URL.revokeObjectURL(blob); }; speaking.play(); } catch (err) { $('chat-status').textContent = 'Speak failed: '+err; } finally { if (btn) btn.classList.remove('busy'); } }
 async function readSse(response, node) { const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '', output = ''; for (;;) { const {done,value} = await reader.read(); if (done) break; buffer += decoder.decode(value,{stream:true}); const lines = buffer.split('\n'); buffer = lines.pop() || ''; for (const line of lines) { if (!line.startsWith('data:')) continue; const data = line.slice(5).trim(); if (data === '[DONE]') continue; try { const event = JSON.parse(data), delta = event.choices?.[0]?.delta?.content; if (delta) { output += delta; node.textContent = output; chat.scrollTop = chat.scrollHeight; } } catch (_) {} } } return output; }
 // A `remote:<node>:<file>` selection pins the worker via worker_hint and uses
 // the file as the model id (same contract as the v1 chat, fix P12).
@@ -681,5 +690,5 @@ const chatSelection = () => {
   if (v.startsWith('remote:')) { const i = v.indexOf(':', 7); return { model: v.slice(i+1), worker_hint: v.slice(7, i) }; }
   return { model: v || lastStatus?.model || 'auto', worker_hint: '' };
 };
-$('send').addEventListener('click', async () => { const prompt = $('prompt').value.trim(); if (!prompt) return; $('prompt').value = ''; addMessage('user',prompt); history.push({role:'user',content:prompt}); const streaming = $('stream').checked, sel = chatSelection(); $('chat-status').textContent = 'Generating…'; try { const response = await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify({model:sel.model,messages:history,stream:streaming,...(sel.worker_hint?{worker_hint:sel.worker_hint}:{})})}); let answer = ''; if (streaming && response.ok && response.body) { answer = await readSse(response,addMessage('assistant','')); } else { const body = await response.json(); answer = body.choices?.[0]?.message?.content || body.error?.message || 'No response'; addMessage('assistant',answer); } history.push({role:'assistant',content:answer}); history = history.slice(-24); $('chat-status').textContent = response.ok ? 'Done' : 'Request failed'; } catch (error) { addMessage('assistant','Request failed: '+error); $('chat-status').textContent = 'Request failed'; } });
+$('send').addEventListener('click', async () => { const prompt = $('prompt').value.trim(); if (!prompt) return; $('prompt').value = ''; addMessage('user',prompt); history.push({role:'user',content:prompt}); const streaming = $('stream').checked, sel = chatSelection(); $('chat-status').textContent = 'Generating…'; try { const response = await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify({model:sel.model,messages:history,stream:streaming,...(sel.worker_hint?{worker_hint:sel.worker_hint}:{})})}); let answer = '', node; if (streaming && response.ok && response.body) { node = addMessage('assistant',''); answer = await readSse(response,node); } else { const body = await response.json(); answer = body.choices?.[0]?.message?.content || body.error?.message || 'No response'; node = addMessage('assistant',answer); } history.push({role:'assistant',content:answer}); history = history.slice(-24); addSpeak(node, answer); $('chat-status').textContent = response.ok ? 'Done' : 'Request failed'; } catch (error) { addMessage('assistant','Request failed: '+error); $('chat-status').textContent = 'Request failed'; } });
 "##;

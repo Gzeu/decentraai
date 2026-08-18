@@ -35,6 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::ServeManager;
+use crate::TtsManager;
 use crate::dashboard::{DASHBOARD_HTML, JS_TEMPLATE};
 use crate::dashboard_v2::{DASHBOARD_V2_HTML, JS_V2_TEMPLATE};
 use crate::queue::InferenceQueue;
@@ -305,6 +306,10 @@ pub struct ApiState {
     memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
     /// The P8 talent tree (capability graph), read-only for the dashboard.
     talent_tree: Option<Arc<decentraai_agents::TalentTree>>,
+    /// Local text-to-speech (Kokoro subprocess). When enabled, `/v1/tts`
+    /// synthesizes speech for the chat speak button. `TtsManager::enabled()`
+    /// false = disabled; the dashboard hides the speak control.
+    tts: Arc<TtsManager>,
 }
 
 impl ApiState {
@@ -357,6 +362,7 @@ impl ApiState {
             retrieval: None,
             memory: None,
             talent_tree: None,
+            tts: Arc::new(TtsManager::disabled()),
         }
     }
 
@@ -373,6 +379,13 @@ impl ApiState {
         distributed: Arc<decentraai_distributed::DistributedInference>,
     ) {
         self.distributed = Some(distributed);
+    }
+
+    /// Attaches the local text-to-speech manager (Kokoro subprocess). Call
+    /// once at startup on the node daemon path. A disabled manager keeps the
+    /// dashboard honest: no speak button, no `/v1/tts`.
+    pub fn attach_tts(&mut self, tts: Arc<TtsManager>) {
+        self.tts = tts;
     }
 
     /// Attaches the collective-intelligence agent manager (P1) so the
@@ -4582,6 +4595,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/tts", post(tts_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -4807,6 +4821,12 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "top_k": gen_guard.top_k,
             "repeat_penalty": gen_guard.repeat_penalty,
             "system_prompt": gen_guard.system_prompt,
+        },
+        "tts": {
+            "enabled": state.tts.enabled(),
+            "healthy": state.tts.healthy(),
+            "voice": state.tts.voice,
+            "speed": state.tts.speed,
         },
         "tiers": state.tiers.as_ref().map(|tiers| serde_json::json!({
             "tier1": {
@@ -5610,6 +5630,113 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// POST /v1/tts — synthesize speech for the dashboard chat speak button.
+/// Body: `{"text": "...", "voice": "af_heart"?, "speed": 1.0?}`. Returns a
+/// 16-bit mono 24 kHz WAV when TTS is enabled. Auth: any valid token
+/// (same gate as inference) plus the tier rate limit — voice synthesis burns
+/// CPU, so the per-token window applies. Prompts/outputs are never logged.
+async fn tts_handler(State(state): State<ApiState>, headers: HeaderMap, body: String) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    // TTS burns CPU per request: apply the same per-token sliding-window
+    // limit as inference so a subscriber cannot hammer the synthesizer.
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": "invalid JSON body"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let text = payload
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim())
+        .unwrap_or_default();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "text is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    if text.chars().count() > 4096 {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "text exceeds 4096 chars"}}).to_string(),
+        )
+            .into_response();
+    }
+    let speed = payload
+        .get("speed")
+        .and_then(|s| s.as_f64())
+        .unwrap_or(state.tts.speed);
+    let speed = speed.clamp(0.5, 2.0);
+    let voice = payload
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(&state.tts.voice);
+    if !state.tts.enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"message": "TTS is not enabled on this node"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+    let Some(base) = state.tts.base_url() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let forwarded = serde_json::json!({
+        "text": text,
+        "voice": voice,
+        "speed": speed,
+    });
+    let request = match state
+        .client
+        .post(format!("{base}/v1/tts"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(forwarded.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "TTS backend unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "TTS backend unreachable"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let status = request.status();
+    if status != StatusCode::OK {
+        return (status, request.text().await.unwrap_or_default()).into_response();
+    }
+    let bytes = match request.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "TTS backend read failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "audio/wav")],
+        bytes.to_vec(),
     )
         .into_response()
 }
@@ -9694,6 +9821,86 @@ mod tests {
         assert_eq!(body["remote_peer_count"], 0);
         assert_eq!(body["total_count"], 0);
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// Builds an ApiState with the given TTS manager attached.
+    async fn test_state_with_tts(dir: &Path, tts: TtsManager) -> ApiState {
+        let backend = start_backend().await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            test_manager(dir).await,
+            test_info(dir, None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let mut state = state;
+        state.attach_tts(Arc::new(tts));
+        state
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tts_handler_returns_404_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/tts"))
+            .json(&serde_json::json!({"text": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tts_handler_rejects_empty_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_tts(
+            dir.path(),
+            TtsManager::new(None, "af_heart".to_string(), 1.0),
+        )
+        .await;
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/tts"))
+            .json(&serde_json::json!({"text": ""}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "text is required");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_reports_tts_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_tts(
+            dir.path(),
+            TtsManager::new(None, "af_bella".to_string(), 1.25),
+        )
+        .await;
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["tts"]["enabled"], false);
+        assert_eq!(body["tts"]["voice"], "af_bella");
+        assert_eq!(body["tts"]["speed"], 1.25);
     }
 
     #[cfg(unix)]

@@ -1067,7 +1067,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     };
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::queue::InferenceQueue;
-    use decentraai_runtime::{LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server};
+    use decentraai_runtime::{
+        LlamaServer, RuntimeConfig, TtsManager, TtsServer, ensure_admitted, find_llama_server,
+    };
     use libp2p::PeerId as Libp2pPeerId;
     use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
@@ -1773,6 +1775,33 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
+        // TTS: Kokoro subprocess for the chat speak button. Enabled only when
+        // `tts.enabled` is set AND the venv/model files exist; a missing setup
+        // logs a warning and serves without voice rather than failing startup.
+        if let Some(tts_cfg) = config.tts.clone() {
+            if tts_cfg.enabled {
+                match TtsServer::spawn(&data_dir, &tts_cfg.voice, tts_cfg.speed).await {
+                    Ok(server) => {
+                        info!(
+                            voice = %tts_cfg.voice,
+                            speed = tts_cfg.speed,
+                            "TTS online (Kokoro subprocess)"
+                        );
+                        state.attach_tts(Arc::new(TtsManager::new(
+                            Some(server),
+                            tts_cfg.voice.clone(),
+                            tts_cfg.speed,
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "TTS unavailable; chat speak disabled (run scripts/setup-tts.sh)"
+                        );
+                    }
+                }
+            }
+        }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());
         // P3.5/P9: the API can trigger collective workflows by delegating to

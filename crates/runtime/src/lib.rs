@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};
 use decentraai_registry::ModelRegistry;
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -558,6 +559,161 @@ fn probe_health(host: &str, port: u16) -> Result<()> {
         Ok(())
     } else {
         bail!("unexpected health response: {status}")
+    }
+}
+
+/// Embedded TTS server script (Kokoro-82M ONNX, stdlib HTTP). Written into
+/// `<data_dir>/tts/tts_server.py` by [`TtsServer::start`] so the binary stays
+/// self-contained and the operator can inspect what runs on the loopback.
+const TTS_SERVER_PY: &str = include_str!("tts_server.py");
+
+/// The running Kokoro TTS subprocess (external engine — never FFI). Listens
+/// on loopback only; the node proxies `/v1/tts` with Bearer auth.
+pub struct TtsServer {
+    child: tokio::process::Child,
+    host: String,
+    port: u16,
+}
+
+impl TtsServer {
+    /// Writes the embedded script and spawns the Python venv interpreter.
+    /// Fails fast when the venv or model files are missing so the caller can
+    /// disable TTS gracefully (the node must not fail startup for voice).
+    pub fn start(data_dir: &Path, voice: &str, speed: f64) -> Result<Self> {
+        let tts_dir = data_dir.join("tts");
+        let venv_python = tts_dir.join("venv").join("bin").join("python");
+        let model = tts_dir.join("models").join("kokoro-v1.0.onnx");
+        let voices = tts_dir.join("models").join("voices-v1.0.bin");
+        let script = tts_dir.join("tts_server.py");
+        for (what, path) in [
+            ("python venv", &venv_python),
+            ("model", &model),
+            ("voices", &voices),
+        ] {
+            if !path.exists() {
+                bail!(
+                    "TTS {what} missing at {}: run `scripts/setup-tts.sh` or disable `tts.enabled`",
+                    path.display()
+                );
+            }
+        }
+        fs::write(&script, TTS_SERVER_PY)
+            .with_context(|| format!("writing TTS server script to {}", script.display()))?;
+        let port = allocate_port("127.0.0.1")?;
+        let site_packages = tts_dir
+            .join("venv")
+            .join("lib")
+            .join("python3.13")
+            .join("site-packages");
+        // The venv interpreter resolves its own site-packages; pass PYTHONPATH
+        // as a fallback for unusual layouts.
+        let mut cmd = Command::new(&venv_python);
+        cmd.args([
+            script.to_string_lossy().as_ref(),
+            "--model",
+            model.to_string_lossy().as_ref(),
+            "--voices",
+            voices.to_string_lossy().as_ref(),
+            "--port",
+            &port.to_string(),
+            "--voice",
+            voice,
+        ])
+        .env("PYTHONPATH", site_packages.to_string_lossy().as_ref())
+        .env("KOKORO_SPEED", speed.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        let child = cmd.spawn().context("spawning TTS server")?;
+        Ok(Self {
+            child,
+            host: "127.0.0.1".to_string(),
+            port,
+        })
+    }
+
+    /// Spawns and waits for `/health` to answer 200 (Kokoro load + warmup
+    /// can take several seconds on CPU). Kills the child on timeout.
+    pub async fn spawn(data_dir: &Path, voice: &str, speed: f64) -> Result<Self> {
+        let server = Self::start(data_dir, voice, speed)?;
+        let port = server.port;
+        if let Err(e) = wait_until_ready(&server.host, port, Duration::from_secs(60)).await {
+            let _ = server.stop().await;
+            return Err(e.context("TTS server did not become ready"));
+        }
+        Ok(server)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+
+    /// Kills the child and reaps it.
+    pub async fn stop(mut self) -> Result<ExitStatus> {
+        self.child
+            .start_kill()
+            .context("failed to kill TTS server")?;
+        let status = self
+            .child
+            .wait()
+            .await
+            .context("failed to reap TTS server")?;
+        info!(port = self.port, "TTS server stopped");
+        Ok(status)
+    }
+}
+
+impl Drop for TtsServer {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Holds the TTS subprocess + the configured voice/speed the proxy applies.
+/// `None` server = TTS disabled; the dashboard hides the speak button.
+pub struct TtsManager {
+    server: Option<TtsServer>,
+    pub voice: String,
+    pub speed: f64,
+}
+
+impl TtsManager {
+    pub fn new(server: Option<TtsServer>, voice: String, speed: f64) -> Self {
+        Self {
+            server,
+            voice,
+            speed,
+        }
+    }
+
+    /// TTS disabled — used when the config omits `tts` or startup should not
+    /// fail on missing model files (dashboard hides the speak button).
+    pub fn disabled() -> Self {
+        Self {
+            server: None,
+            voice: "af_heart".to_string(),
+            speed: 1.0,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.base_url())
+    }
+
+    /// Health probe for the dashboard /status endpoint.
+    pub fn healthy(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|_| probe_health("127.0.0.1", self.server.as_ref().unwrap().port()).is_ok())
+            .unwrap_or(false)
     }
 }
 
