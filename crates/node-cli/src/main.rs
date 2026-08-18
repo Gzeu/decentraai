@@ -630,7 +630,7 @@ async fn main() -> Result<()> {
         Command::Trust { command } => trust_command(command),
         Command::Tier { command } => tier_command(command),
         Command::ConsumerKey { command } => consumer_key_command(command),
-        Command::Agent { command } => agent_command(command),
+        Command::Agent { command } => agent_command(command).await,
         Command::Node(args) => node_start(args).await,
         Command::Open(args) => open_dashboard(args),
         Command::Invite(args) => invite(args),
@@ -3296,7 +3296,7 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
 }
 
 /// `decentraai agent` subcommands (Collective Intelligence P1).
-fn agent_command(command: AgentCommand) -> Result<()> {
+async fn agent_command(command: AgentCommand) -> Result<()> {
     match command {
         AgentCommand::List { config } => agent_list(&config),
         AgentCommand::Show { config, agent } => agent_show(&config, &agent),
@@ -3306,7 +3306,7 @@ fn agent_command(command: AgentCommand) -> Result<()> {
             prompt,
             template,
             retrieve,
-        } => agent_workflow_run(&config, &prompt, &template, retrieve.as_deref()),
+        } => agent_workflow_run(&config, &prompt, &template, retrieve.as_deref()).await,
         AgentCommand::Reputation {
             agent, min_samples, ..
         } => agent_reputation(&agent, min_samples),
@@ -3544,7 +3544,7 @@ fn agent_workflow(template: &str) -> Result<()> {
 /// Runs a collective workflow on the local node via its API
 /// (POST /v1/agents/orchestrate). Reads the node's API port + token from the
 /// config/data dir. Prints the verdict + generated output for scripting.
-fn agent_workflow_run(
+async fn agent_workflow_run(
     config_path: &Path,
     prompt: &str,
     template: &str,
@@ -3576,13 +3576,12 @@ fn agent_workflow_run(
         req = req.bearer_auth(t);
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let (status, j): (reqwest::StatusCode, serde_json::Value) = rt.block_on(async {
+    let (status, j): (reqwest::StatusCode, serde_json::Value) = {
         let resp = req.send().await?;
         let status = resp.status();
         let j = resp.json().await?;
-        Ok::<_, reqwest::Error>((status, j))
-    })?;
+        (status, j)
+    };
     if !status.is_success() {
         anyhow::bail!(
             "workflow failed (HTTP {}): {}",
