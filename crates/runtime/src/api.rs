@@ -5700,38 +5700,9 @@ async fn agents_orchestrate_handler(
     }
     let outcome = orchestrator.orchestrate_plan(&plan, Some(&seed)).await;
 
-    // Collective memory: a completed workflow's final output is written to the
-    // persistent MemoryStore (best-effort) so the fabric accumulates verified
-    // knowledge across runs. The scope is team-level, owned by the orchestrator.
-    if matches!(
-        outcome.verdict,
-        decentraai_agents::DelegationVerdict::Completed
-    ) {
-        if let (Some(memory), Some(final_output)) = (&state.memory, &outcome.result.final_output) {
-            use decentraai_agents::{MemoryEntry, MemoryLevel, MemoryScope};
-            let _ = memory.register_scope(&MemoryScope::new(
-                "workflow_results",
-                "orchestrator",
-                MemoryLevel::Team,
-            ));
-            let content = serde_json::to_string(&final_output).unwrap_or_default();
-            let entry = MemoryEntry::new(
-                format!("wf-{}", outcome.result.plan_id),
-                "workflow_results",
-                "orchestrator",
-                "local",
-                content,
-            );
-            let _ = memory.write(
-                "workflow_results",
-                &entry,
-                "orchestrator",
-                true,
-                true,
-                false,
-            );
-        }
-    }
+    // Collective memory: the orchestrator itself writes completed workflows
+    // into the persistent MemoryStore (scope `workflow_results`, per-stage
+    // verified outputs + summary, idempotent). No duplicate write here.
 
     let body = serde_json::json!({
         "verdict": serde_json::to_value(&outcome.verdict).unwrap_or_default(),

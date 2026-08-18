@@ -182,6 +182,28 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Pure retrieval-augmentation: builds the prompt that asks the model to
+/// answer `query` using the retrieved docs as context. With no docs it
+/// returns the base prompt unchanged (no empty-context degradation).
+/// Separated from I/O so tests drive it with synthetic retrieval results.
+fn augment_prompt_with_retrieval(
+    base: &str,
+    query: &str,
+    docs: &[decentraai_agents::RetrievalResult],
+) -> String {
+    if docs.is_empty() {
+        return base.to_string();
+    }
+    let context = docs
+        .iter()
+        .map(|r| format!("[{}] {}", r.doc_id, r.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Use the following retrieved context to answer.\n\nContext:\n{context}\n\nQuestion: {query}\n\n{base}"
+    )
+}
+
 /// An [`AgentRuntime`] executor that runs a delegated LLM task.
 ///
 /// When a local OpenAI-compatible backend (this node's llama-server) is
@@ -257,14 +279,7 @@ impl InferenceAgentExecutor {
             if let Some(q) = map.get("retrieve").and_then(|v| v.as_str()) {
                 if let Ok(docs) = retrieval.query(q, 3).await {
                     if !docs.is_empty() {
-                        let context = docs
-                            .iter()
-                            .map(|r| format!("[{}] {}", r.doc_id, r.text))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        request.prompt = format!(
-                            "Use the following retrieved context to answer.\n\nContext:\n{context}\n\nQuestion: {q}"
-                        );
+                        request.prompt = augment_prompt_with_retrieval(&request.prompt, q, &docs);
                         retrieved = docs;
                     }
                 }
@@ -501,5 +516,46 @@ mod tests {
         let task = AgentTask::new("t");
         assert!(infer_request_from(&task, &serde_json::json!({"nope": 1}), "m").is_err());
         assert!(infer_request_from(&task, &serde_json::json!([1, 2]), "m").is_err());
+    }
+
+    // ---- Retrieval tool at runtime (pure prompt augmentation) ----
+
+    fn docs() -> Vec<decentraai_agents::RetrievalResult> {
+        vec![
+            decentraai_agents::RetrievalResult {
+                doc_id: "d1".into(),
+                score: 0.9,
+                text: "DecentraAI verifies model chunks with BLAKE3.".into(),
+                capability: None,
+            },
+            decentraai_agents::RetrievalResult {
+                doc_id: "d2".into(),
+                score: 0.7,
+                text: "The fabric routes inference to trusted peers.".into(),
+                capability: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn retrieval_augmentation_injects_docs_into_prompt() {
+        let prompt = augment_prompt_with_retrieval("Original prompt", "how does it work?", &docs());
+        assert!(
+            prompt.contains("Original prompt"),
+            "base prompt must be kept"
+        );
+        assert!(prompt.contains("[d1]"), "doc d1 id must appear");
+        assert!(prompt.contains("BLAKE3"), "doc d1 text must appear");
+        assert!(prompt.contains("[d2]"), "doc d2 id must appear");
+        assert!(
+            prompt.contains("Question: how does it work?"),
+            "query must be kept"
+        );
+    }
+
+    #[test]
+    fn retrieval_augmentation_without_docs_keeps_base() {
+        let prompt = augment_prompt_with_retrieval("just this", "q", &[]);
+        assert_eq!(prompt, "just this");
     }
 }
