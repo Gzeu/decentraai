@@ -1351,6 +1351,23 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // A production AgentRuntime per local agent answers delegated LLM tasks
     // through the fabric (inference executor); a SQLite MemoryStore persists
     // collective memory. Both are best-effort and never disturb the flow.
+    // RAG embeddings/retrieval are created once and shared by the inference
+    // executor (retrieval tool at runtime) and the API (/v1/embeddings, /v1/rag).
+    let (embedding_client, retrieval_manager): (
+        Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
+        Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
+    ) = match config.inference.embeddings_backend_url.as_deref() {
+        Some(url) if !url.is_empty() => {
+            let client = Arc::new(decentraai_distributed::embedding::EmbeddingClient::new(
+                url.to_string(),
+            ));
+            let rm = Arc::new(
+                decentraai_distributed::retrieval_manager::RetrievalManager::new(client.clone()),
+            );
+            (Some(client), Some(rm))
+        }
+        _ => (None, None),
+    };
     if is_worker && !model_hash.is_empty() {
         let mut inference_executor =
             decentraai_distributed::agent_runtime::InferenceAgentExecutor::new(
@@ -1363,6 +1380,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // re-read per call, so an engine respawn (new port) is always hit.
         if !backend_url.is_empty() {
             inference_executor.with_live_backend(live_engine_url.clone());
+        }
+        // RAG retrieval tool at runtime: a delegated task with a `retrieve`
+        // input gets its prompt augmented with semantic search results.
+        if let Some(rm) = &retrieval_manager {
+            inference_executor.with_retrieval(rm.clone());
         }
         // One runtime per local logical agent (the orchestrator selects these
         // as executors for delegated stages).
@@ -1637,19 +1659,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // The persistent registry drives the agent; the demo is shown only as a
         // labelled demonstration (the handler adds it).
         state.attach_skills(Arc::new(skills_registry.clone()));
-        // RAG: expose /v1/embeddings when an embeddings backend is configured
-        // (a llama-server launched with --embedding, e.g. on nomic-embed).
-        if let Some(url) = config.inference.embeddings_backend_url.as_deref() {
-            if !url.is_empty() {
-                let client = Arc::new(decentraai_distributed::embedding::EmbeddingClient::new(
-                    url.to_string(),
-                ));
-                state.attach_embedding(client.clone());
-                // RAG index + query over the embeddings backend.
-                state.attach_retrieval(Arc::new(
-                    decentraai_distributed::retrieval_manager::RetrievalManager::new(client),
-                ));
-            }
+        // RAG: expose /v1/embeddings + /v1/rag when an embeddings backend is
+        // configured (created once above, shared with the inference executor).
+        if let (Some(client), Some(rm)) = (&embedding_client, &retrieval_manager) {
+            state.attach_embedding(client.clone());
+            state.attach_retrieval(rm.clone());
         }
         // Collective memory (SQLite) for the dashboard + workflow results.
         if let Some(store) = agent_memory_store.clone() {

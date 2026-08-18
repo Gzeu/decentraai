@@ -2478,3 +2478,15 @@ history; `POST /v1/reputation` + a dashboard Reputation view render it.
 
 This is real, measured history — not the synthetic samples the CLI demo used.
 Empty until workflows run.
+
+## 111. Retrieval tool in execution (DONE)
+
+Commit `pending`. The inference executor now performs RAG at runtime: when a
+delegated task's inputs carry a `retrieve` string, `InferenceAgentExecutor`
+queries the RetrievalIndex (via nomic-embed) and augments the prompt with the
+top-k retrieved context before generating. Best-effort — retrieval failure
+degrades to a plain generation, never a hard error. The output records which
+docs were retrieved (`retrieved_docs`).
+
+Wiring: EmbeddingClient + RetrievalManager are created once and shared by the
+inference executor (retrieval tool) and the API (/v1/embeddings, /v1/rag).

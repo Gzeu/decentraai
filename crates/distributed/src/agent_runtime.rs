@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use decentraai_agents::{AgentMessage, AgentTask, MessageKind};
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -202,6 +203,10 @@ pub struct InferenceAgentExecutor {
     /// (new port) is always targeted. `None` = no local backend → fall back
     /// to the distributed routing path.
     local_backend: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// Optional RAG retrieval manager: when the task's inputs carry a
+    /// `retrieve` string, the executor queries the index and augments the
+    /// prompt with the retrieved context (retrieval tool at runtime).
+    retrieval: Option<Arc<crate::retrieval_manager::RetrievalManager>>,
 }
 
 impl InferenceAgentExecutor {
@@ -212,7 +217,18 @@ impl InferenceAgentExecutor {
             default_model_hash,
             client: reqwest::Client::new(),
             local_backend: None,
+            retrieval: None,
         }
+    }
+
+    /// Attaches the RAG retrieval manager so a task with a `retrieve` input
+    /// performs semantic retrieval and augments the prompt at runtime.
+    pub fn with_retrieval(
+        &mut self,
+        retrieval: Arc<crate::retrieval_manager::RetrievalManager>,
+    ) -> &mut Self {
+        self.retrieval = Some(retrieval);
+        self
     }
 
     /// Points the executor at the node's live local backend URL (the single
@@ -230,8 +246,30 @@ impl InferenceAgentExecutor {
         task: &AgentTask,
         inputs: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let request = infer_request_from(task, inputs, &self.default_model_hash)?;
+        let mut request = infer_request_from(task, inputs, &self.default_model_hash)?;
         let model_hash = request.model_hash.clone();
+        // RAG retrieval tool at runtime: if the inputs carry a `retrieve`
+        // string, query the index and augment the prompt with the retrieved
+        // context before generating. Best-effort — retrieval failure degrades
+        // to a plain generation, never a hard error.
+        let mut retrieved: Vec<decentraai_agents::RetrievalResult> = Vec::new();
+        if let (Some(retrieval), Value::Object(map)) = (&self.retrieval, inputs) {
+            if let Some(q) = map.get("retrieve").and_then(|v| v.as_str()) {
+                if let Ok(docs) = retrieval.query(q, 3).await {
+                    if !docs.is_empty() {
+                        let context = docs
+                            .iter()
+                            .map(|r| format!("[{}] {}", r.doc_id, r.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        request.prompt = format!(
+                            "Use the following retrieved context to answer.\n\nContext:\n{context}\n\nQuestion: {q}"
+                        );
+                        retrieved = docs;
+                    }
+                }
+            }
+        }
         let live_url = self
             .local_backend
             .as_ref()
@@ -256,6 +294,10 @@ impl InferenceAgentExecutor {
             "text": text,
             "model_hash": model_hash,
             "tokens": tokens,
+            "retrieved_docs": retrieved.iter().map(|r| serde_json::json!({
+                "doc_id": r.doc_id,
+                "score": r.score,
+            })).collect::<Vec<_>>(),
         }))
     }
 
