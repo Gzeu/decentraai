@@ -299,6 +299,8 @@ pub struct ApiState {
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
     /// Optional collective memory store (persistent scopes/entries).
     memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
+    /// The P8 talent tree (capability graph), read-only for the dashboard.
+    talent_tree: Option<Arc<decentraai_agents::TalentTree>>,
 }
 
 impl ApiState {
@@ -349,6 +351,7 @@ impl ApiState {
             embedding: None,
             retrieval: None,
             memory: None,
+            talent_tree: None,
         }
     }
 
@@ -404,6 +407,11 @@ impl ApiState {
         memory: Arc<decentraai_distributed::agent_memory::MemoryStore>,
     ) {
         self.memory = Some(memory);
+    }
+
+    /// Attaches the talent tree (capability graph) for the dashboard.
+    pub fn attach_talent_tree(&mut self, tree: Arc<decentraai_agents::TalentTree>) {
+        self.talent_tree = Some(tree);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4560,6 +4568,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/rag/query", post(rag_query_handler))
         .route("/v1/memory", get(memory_handler))
         .route("/v1/reputation", get(reputation_handler))
+        .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -6134,6 +6143,43 @@ async fn reputation_handler(State(state): State<ApiState>, headers: HeaderMap) -
     };
     let body =
         serde_json::json!({ "attached": true, "reputations": orchestrator.reputation_snapshot() });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// Talent tree (P8): the dynamic capability graph — nodes with prerequisites,
+/// resource estimates, confidence and experimental flag.
+async fn talent_tree_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(tree) = &state.talent_tree else {
+        let body = serde_json::json!({ "attached": false, "nodes": [] });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let nodes: Vec<serde_json::Value> = tree
+        .capabilities()
+        .into_iter()
+        .filter_map(|kind| {
+            tree.get(kind).map(|node| {
+                serde_json::json!({
+                    "capability": kind.label(),
+                    "prerequisites": node.prerequisites.iter().map(|p| p.label()).collect::<Vec<_>>(),
+                    "resource_mb": node.resource_estimate_mb,
+                    "confidence": node.confidence,
+                    "experimental": node.experimental,
+                })
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "attached": true, "nodes": nodes });
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&body).unwrap_or_default(),

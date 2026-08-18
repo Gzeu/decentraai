@@ -374,6 +374,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
     <button class="nav-item" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
     <button class="nav-item" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
+    <button class="nav-item" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
@@ -802,6 +803,16 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <table><thead><tr><th>Agent</th><th>Capability</th><th class="num">Score</th><th>Factors</th></tr></thead>
           <tbody id="reputation"><tr><td colspan="4" class="empty">loading…</td></tr></tbody></table>
           <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Measured from real verified executions (Reliability / Quality / Latency). Empty until workflows run.</p>
+        </div>
+      </section>
+
+      <!-- TALENT TREE (P8): the dynamic capability graph — prerequisites,
+           resource estimates, confidence, experimental. From /v1/talent-tree. -->
+      <section class="view" id="view-talents">
+        <div class="card">
+          <h2>Talent tree <span class="count" id="talents-count"></span></h2>
+          <div id="talents" class="worker-cards"><div class="empty">loading…</div></div>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Dynamic capability graph — prerequisites unlock a capability; experimental nodes are not production-verified.</p>
         </div>
       </section>
 
@@ -1306,8 +1317,8 @@ const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'a
 const isAdmin = !!token;
 
 // ---- navigation ------------------------------------------------------------
-const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','workers','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','talents','workers','network','models','observability','recovery','diag','security','settings'];
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   current = view;
@@ -2219,6 +2230,25 @@ function renderReputation(d){
       '<td class="num">'+score+'</td><td>'+reasons+'</td></tr>';
   }).join('');
   $('reputation').innerHTML = rows || '<tr><td colspan="4" class="empty">no reputation yet — run a verified workflow to build measured history</td></tr>';
+}
+
+// ---- Talent tree (P8) ----
+// Renders /v1/talent-tree: the dynamic capability graph (prerequisites,
+// resource estimates, confidence, experimental). Real data only.
+function renderTalentTree(d){
+  if (!d) return;
+  const nodes = d.nodes || [];
+  $('talents-count').textContent = nodes.length;
+  const cards = nodes.map(n => {
+    const prereqs = (n.prerequisites || []).map(p => '<span class="nc-model">'+esc(p)+'</span>').join(' ');
+    const exp = n.experimental ? '<span class="badge warn">experimental</span>' : '';
+    const conf = (n.confidence != null) ? ' <span class="badge faint">conf '+(n.confidence*100).toFixed(0)+'%</span>' : '';
+    return '<div class="worker-card"><div class="wc-head"><span class="wc-name">'+esc(n.capability)+'</span>'+exp+conf+
+      '<span class="badge accent">'+n.resource_mb+' MiB</span></div>'+
+      '<div class="wc-meta"><span><b>requires</b> '+(prereqs || '<span class="badge faint">none (base)</span>')+'</span></div>'+
+    '</div>';
+  }).join('');
+  $('talents').innerHTML = nodes.length ? cards : '<div class="empty">no talent tree</div>';
 }
 
 // ---- Memory (P5) ----
@@ -4252,6 +4282,7 @@ async function refresh(){
   try { const sk = await (await fetch('/v1/skills', { headers })).json(); renderSkills(sk); } catch (e) {}
   try { const mem = await (await fetch('/v1/memory', { headers })).json(); renderMemory(mem); } catch (e) {}
   try { const rep = await (await fetch('/v1/reputation', { headers })).json(); renderReputation(rep); } catch (e) {}
+  try { const tt = await (await fetch('/v1/talent-tree', { headers })).json(); renderTalentTree(tt); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}

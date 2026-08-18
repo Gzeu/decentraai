@@ -1659,6 +1659,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // The persistent registry drives the agent; the demo is shown only as a
         // labelled demonstration (the handler adds it).
         state.attach_skills(Arc::new(skills_registry.clone()));
+        // P8: expose the talent tree (capability graph) to the dashboard.
+        state.attach_talent_tree(Arc::new(decentraai_agents::seed_talent_tree()));
         // RAG: expose /v1/embeddings + /v1/rag when an embeddings backend is
         // configured (created once above, shared with the inference executor).
         if let (Some(client), Some(rm)) = (&embedding_client, &retrieval_manager) {
