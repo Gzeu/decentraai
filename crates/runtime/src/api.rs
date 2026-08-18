@@ -9487,6 +9487,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn dashboard_populates_chat_models_after_compute_fetch() {
+        // Regression: populateChatNodes/populateChatModels were called with
+        // c=null (before /v1/compute was fetched), so the chat model selector
+        // only ever showed local models — the remote-worker optgroup never
+        // appeared even though the fabric had remote workers. The calls must
+        // happen AFTER the /v1/compute fetch that assigns `c`.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let compute_fetch = body
+            .find("fetch('/v1/compute'")
+            .expect("dashboard must fetch /v1/compute");
+        let populate = body
+            .find("populateChatModels(s, c)")
+            .expect("dashboard must populate chat models from the compute payload");
+        assert!(
+            populate > compute_fetch,
+            "populateChatModels must run after /v1/compute is fetched (got c=null before)"
+        );
+        let populate_nodes = body
+            .find("populateChatNodes(c)")
+            .expect("dashboard must populate chat nodes from the compute payload");
+        assert!(
+            populate_nodes > compute_fetch,
+            "populateChatNodes must run after /v1/compute is fetched (got c=null before)"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn openapi_document_is_served_and_versioned() {
         let dir = tempfile::tempdir().unwrap();
         let (api, manager) = start_stateful_api(dir.path(), None, None).await;

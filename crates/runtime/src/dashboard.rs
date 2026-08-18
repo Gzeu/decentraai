@@ -4270,8 +4270,6 @@ async function refresh(){
     $('events').innerHTML = (s.recent_events||[]).map(e =>
       '<tr><td>'+tstr(e.timestamp)+'</td><td><code>'+esc(e.event)+'</code></td><td class="mono" style="font-size:11px">'+esc(JSON.stringify(e.details||{}))+'</td></tr>'
     ).join('') || '<tr><td colspan="3" class="empty">no security events yet</td></tr>';
-    populateChatNodes(c);
-    populateChatModels(s, c);
     renderModels(s, c);
     renderDiag(s, null, null);
     renderObservability(s, null);
@@ -4284,6 +4282,12 @@ async function refresh(){
   try { const rep = await (await fetch('/v1/reputation', { headers })).json(); renderReputation(rep); } catch (e) {}
   try { const tt = await (await fetch('/v1/talent-tree', { headers })).json(); renderTalentTree(tt); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
+  // Populate the chat model/node selectors ONLY after /v1/compute has been
+  // fetched: they need the real worker list (remote models come from
+  // c.workers). Calling them earlier with c=null silently produced a selector
+  // with local models only — the remote-worker optgroup never appeared.
+  populateChatNodes(c);
+  populateChatModels(s, c);
   loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
   try { x = await (await fetch('/v1/execution', { headers })).json(); renderExecutions(x); renderDecisions(x); renderRemoteExec(x, (c && c.local_peer) || stageData.localPeer); } catch (e) {}
