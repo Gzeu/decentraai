@@ -2457,3 +2457,13 @@ Commit `pending`. The RAG path is now fully functional end-to-end.
 This completes Dataset → indexed knowledge → embeddings → retrieval
 capability foundation. Exposing a `Retrieval` capability to agents (so a
 workflow can call retrieval) is the next step.
+
+## 109. Retrieval capability on the agent (DONE)
+
+Commit `pending`. A node with a configured embeddings backend now claims the
+`Retrieval` capability (INFERRED) on its generalist agent — the RAG path is
+advertised on the fabric, so a workflow/stage that requires `Retrieval` can be
+routed to a node that can actually perform semantic retrieval.
+
+Verified live: the agent advertises `retrieval` alongside its other
+capabilities (chat, coding, tool_calling, document_understanding, ...).

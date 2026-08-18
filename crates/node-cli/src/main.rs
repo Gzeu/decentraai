@@ -1276,6 +1276,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         config.inference.allow_remote_inference,
         &model_name,
         &skills_registry,
+        config.inference.embeddings_backend_url.is_some(),
     ));
     info!(
         agents = agent_manager.local_count(),
@@ -3320,6 +3321,7 @@ fn load_local_agents(config_path: &Path) -> Result<Vec<decentraai_agents::AgentR
         config.inference.allow_remote_inference,
         &config.node.name,
         &decentraai_agents::SkillRegistry::new(),
+        false,
     ))
 }
 
@@ -3903,10 +3905,12 @@ fn default_local_agents(
     allow_remote: bool,
     model_name: &str,
     skills: &decentraai_agents::SkillRegistry,
+    has_retrieval: bool,
 ) -> Vec<decentraai_agents::AgentRecord> {
     use decentraai_agents::{
         AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST, build_agent_capabilities,
     };
+    use decentraai_hub::capability::{CapabilityKind, Provenance};
 
     let mut agents = Vec::new();
     // Base capabilities are derived from the actually-served model (runtime
@@ -3923,6 +3927,11 @@ fn default_local_agents(
     .described("chat, reasoning and text generation on this node");
     for c in build.all() {
         generalist = generalist.with_capability(c.capability, c.provenance);
+    }
+    // RAG: a node with a configured embeddings backend can perform semantic
+    // retrieval, so its agent honestly claims the Retrieval capability.
+    if has_retrieval {
+        generalist = generalist.with_capability(CapabilityKind::Retrieval, Provenance::Inferred);
     }
     if !model_hash.is_empty() {
         generalist = generalist.with_model(model_hash);
@@ -4373,6 +4382,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         config.inference.allow_remote_inference,
         model_name.as_deref().unwrap_or(""),
         &decentraai_agents::SkillRegistry::new(),
+        false,
     ));
     // M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
@@ -5527,6 +5537,7 @@ mod tests {
             false,
             "",
             &decentraai_agents::SkillRegistry::new(),
+            false,
         );
         let generalist = find_agent_by_id(&agents, "dca-test:generalist")
             .expect("generalist agent must be present in the default set");
@@ -5730,6 +5741,7 @@ mod tests {
             false,
             "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
             &decentraai_agents::SkillRegistry::new(),
+            false,
         );
         let g = agents
             .iter()
@@ -5745,6 +5757,7 @@ mod tests {
             false,
             "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
             &decentraai_agents::SkillRegistry::new(),
+            false,
         );
         let gg = gens
             .iter()
