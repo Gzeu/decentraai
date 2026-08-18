@@ -148,7 +148,8 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         // branch, we only proceed as an agent advertisement when the inner
         // payload decodes as an AgentAdvertisement; otherwise we fall through
         // to the compute branch below.
-        if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(request,
+        if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(
+            request,
             decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
         ) {
             let inner_is_agent = serde_json::from_slice::<decentraai_agents::AgentAdvertisement>(
@@ -178,8 +179,10 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         // P3: a signed compute advertisement is verified before being trusted.
         // The signer's public key must map to the advertisement's own peer_id
         // (an attacker cannot forge a signature for a peer they don't control).
-        if let Ok(signed) = deserialize_message::<SignedComputeAdvertisement>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
-        {
+        if let Ok(signed) = deserialize_message::<SignedComputeAdvertisement>(
+            request,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+        ) {
             if let Ok(inner) = deserialize_message::<decentraai_compute::ComputeAdvertisement>(
                 &signed.advertisement,
                 signed.advertisement.len(),
@@ -218,8 +221,10 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as WorkerAnnouncement
-        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
-        {
+        if let Ok(announcement) = deserialize_message::<WorkerAnnouncement>(
+            request,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+        ) {
             if let Some(manager) = &self.worker_manager {
                 manager.process_announcement(announcement)?;
             }
@@ -242,7 +247,9 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as a generic InferMessage (progress/response/etc)
-        if let Ok(msg) = deserialize_message::<InferMessage>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES) {
+        if let Ok(msg) =
+            deserialize_message::<InferMessage>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
+        {
             if let Some(tracker) = &self.tracker {
                 let _ = futures::executor::block_on(tracker.deliver(msg));
                 return Ok(Vec::new());
@@ -251,7 +258,9 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         }
 
         // Try to deserialize as InferRequest
-        if let Ok(infer_request) = deserialize_message::<InferRequest>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES) {
+        if let Ok(infer_request) =
+            deserialize_message::<InferRequest>(request, decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES)
+        {
             if let Some(handler) = &self.infer_handler {
                 // The handler returns raw bytes so it may serialize an InferAccepted
                 // message and spawn background tasks for streaming progress.
@@ -688,7 +697,8 @@ mod tests {
 
         // The worker's advertised peer_id must match the signing identity
         // (anti-spoof): derive it from the identity's libp2p key.
-        let kp = libp2p::identity::Keypair::ed25519_from_bytes(identity.signing_key_bytes()).unwrap();
+        let kp =
+            libp2p::identity::Keypair::ed25519_from_bytes(identity.signing_key_bytes()).unwrap();
         let worker_peer = libp2p::PeerId::from(kp.public());
         let adv = decentraai_compute::ComputeAdvertisement {
             peer_id: worker_peer,
@@ -737,7 +747,10 @@ mod tests {
         let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
         let payload = serialize_message(&signed).unwrap();
         let result = handler.handle(&payload);
-        assert!(result.is_ok(), "signed compute ad must be processed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "signed compute ad must be processed: {result:?}"
+        );
 
         // The remote worker must land in the compute registry (not be dropped
         // by the agent branch).

@@ -57,7 +57,12 @@ impl ReservationLedger {
 
     /// Books the workload on `worker`. Returns `None` when the worker is
     /// already at its reservation cap.
-    pub fn reserve(&mut self, worker: PeerId, est_ram_mb: u64, est_vram_mb: u64) -> Option<ResourceReservation> {
+    pub fn reserve(
+        &mut self,
+        worker: PeerId,
+        est_ram_mb: u64,
+        est_vram_mb: u64,
+    ) -> Option<ResourceReservation> {
         let bucket = self.reservations.entry(worker).or_default();
         bucket.retain(|r| !r.is_expired(Instant::now()));
         if bucket.len() >= self.max_per_worker {
@@ -155,7 +160,9 @@ impl ReservationLedger {
         req_vram_mb: u64,
     ) -> Result<(), AdmitReason> {
         let total_ram = req_ram_mb.saturating_add(capacity.min_free_ram_mb);
-        let free_ram = capacity.available_ram_mb.saturating_sub(self.reserved_ram(worker));
+        let free_ram = capacity
+            .available_ram_mb
+            .saturating_sub(self.reserved_ram(worker));
         if free_ram < total_ram {
             return Err(AdmitReason::InsufficientRam {
                 available: free_ram,

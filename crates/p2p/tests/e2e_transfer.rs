@@ -645,8 +645,8 @@ async fn announced_model_auto_downloads_and_verifies() {
         tokio::spawn(async move {
             let mut reputation =
                 ReputationStore::load(&rep_path, 100, Duration::from_secs(300)).unwrap();
-            let result = download(&client_handle, peer, &m.model_id, &out_dir, &mut reputation)
-                .await;
+            let result =
+                download(&client_handle, peer, &m.model_id, &out_dir, &mut reputation).await;
             let _ = tx.send(result);
         });
     });
@@ -666,10 +666,7 @@ async fn announced_model_auto_downloads_and_verifies() {
         .expect("auto-download must complete")
         .expect("download must return a path")
         .expect("download must succeed");
-    assert_eq!(
-        outcome.file_name().unwrap().to_string_lossy(),
-        "model.gguf"
-    );
+    assert_eq!(outcome.file_name().unwrap().to_string_lossy(), "model.gguf");
     assert_eq!(
         std::fs::read(&outcome).unwrap(),
         data,

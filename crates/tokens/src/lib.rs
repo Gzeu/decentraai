@@ -52,7 +52,7 @@ impl Role {
 
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
-            "client" | "operator" => {}, // fallthrough below
+            "client" | "operator" => {} // fallthrough below
             _ => bail!("role must be 'client' or 'operator'"),
         }
         match value.to_ascii_lowercase().as_str() {
@@ -374,9 +374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path());
         // An expiry in the far past makes the token unusable immediately.
-        let expired = store
-            .create("dave", Tier::GUEST, Some(1))
-            .unwrap();
+        let expired = store.create("dave", Tier::GUEST, Some(1)).unwrap();
         assert!(
             store.lookup(&expired).is_none(),
             "a token whose expiry has passed must not resolve"
@@ -385,7 +383,9 @@ mod tests {
         assert!(!store.is_active(rec), "expired token must not be active");
 
         // A future or absent expiry stays active.
-        let live = store.create("erin", Tier::GUEST, Some(now_secs() + 3600)).unwrap();
+        let live = store
+            .create("erin", Tier::GUEST, Some(now_secs() + 3600))
+            .unwrap();
         assert!(store.lookup(&live).is_some());
         let never = store.create("frank", Tier::GUEST, None).unwrap();
         assert!(store.lookup(&never).is_some());

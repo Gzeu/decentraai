@@ -19,8 +19,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent_messenger::AgentMessenger;
 use crate::DistributedInference;
+use crate::agent_messenger::AgentMessenger;
 
 /// Executes a delegated task asynchronously and returns the output JSON value.
 ///
@@ -249,10 +249,7 @@ impl InferenceAgentExecutor {
                     .route_request(request)
                     .await
                     .context("routing delegated inference")?;
-                (
-                    response.output,
-                    serde_json::json!(response.tokens_used),
-                )
+                (response.output, serde_json::json!(response.tokens_used))
             }
         };
         Ok(serde_json::json!({
@@ -291,7 +288,10 @@ impl InferenceAgentExecutor {
         if !status.is_success() {
             anyhow::bail!(
                 "local backend returned {status}: {}",
-                payload.get("error").map(|e| e.to_string()).unwrap_or_default()
+                payload
+                    .get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
             );
         }
         payload
@@ -324,9 +324,14 @@ fn infer_request_from(
             let prompt = map
                 .get("prompt")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("delegate input object is missing a 'prompt' string"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("delegate input object is missing a 'prompt' string")
+                })?
                 .to_string();
-            let model = map.get("model_hash").and_then(|v| v.as_str()).map(str::to_string);
+            let model = map
+                .get("model_hash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             (prompt, model)
         }
         other => {
@@ -350,17 +355,15 @@ fn infer_request_from(
         .unwrap_or(1024);
 
     Ok(decentraai_protocol::InferRequest::new(
-        model_hash,
-        prompt,
-        max_tokens,
+        model_hash, prompt, max_tokens,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decentraai_p2p::P2PNode;
     use decentraai_identity::Identity;
+    use decentraai_p2p::P2PNode;
 
     /// A messenger with a dead transport node; push/pop work, send would fail
     /// (not reached on the NoExecutor/Ignored paths under test).

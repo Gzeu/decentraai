@@ -244,7 +244,11 @@ impl ModelRegistry {
                 if require_verified && !is_verified {
                     continue;
                 }
-                results.push((model.relative_path.as_str(), claim.capability.as_str(), claim.provenance.as_str()));
+                results.push((
+                    model.relative_path.as_str(),
+                    claim.capability.as_str(),
+                    claim.provenance.as_str(),
+                ));
             }
         }
         results.sort_by(|a, b| a.0.cmp(b.0));
@@ -298,10 +302,8 @@ impl ModelRegistry {
                 entry.1 += 1;
             }
         }
-        let mut result: Vec<(String, usize, usize)> = caps
-            .into_iter()
-            .map(|(cap, (v, i))| (cap, v, i))
-            .collect();
+        let mut result: Vec<(String, usize, usize)> =
+            caps.into_iter().map(|(cap, (v, i))| (cap, v, i)).collect();
         result.sort_by(|a, b| {
             a.0.to_lowercase()
                 .cmp(&b.0.to_lowercase())
@@ -320,9 +322,11 @@ impl ModelRegistry {
         if relative_path.contains("..") || relative_path.starts_with('/') {
             anyhow::bail!("invalid relative path: {}", relative_path);
         }
-        let _record = self.models.get(relative_path).cloned().ok_or_else(|| {
-            anyhow::anyhow!("model not found in registry: {}", relative_path)
-        })?;
+        let _record = self
+            .models
+            .get(relative_path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("model not found in registry: {}", relative_path))?;
 
         let full_path = PathBuf::from(&self.root).join(relative_path);
         let canonical = fs::canonicalize(&full_path)
@@ -340,7 +344,10 @@ impl ModelRegistry {
         fs::remove_file(&canonical)
             .with_context(|| format!("removing file {}", canonical.display()))?;
 
-        let removed = self.models.remove(relative_path).expect("exists by lookup above");
+        let removed = self
+            .models
+            .remove(relative_path)
+            .expect("exists by lookup above");
         Ok(removed)
     }
 
@@ -433,7 +440,11 @@ mod tests {
                 provenance: "inferred".into(),
             },
         ];
-        assert!(registry.set_capability_claims(&rel, claims.clone()).unwrap());
+        assert!(
+            registry
+                .set_capability_claims(&rel, claims.clone())
+                .unwrap()
+        );
 
         // A rescan must NOT wipe the persisted claims (idempotent projection).
         registry.scan_directory(temp_dir.path()).unwrap();
@@ -692,10 +703,12 @@ mod tests {
         assert_eq!(results[0], ("a.gguf", "coding", "inferred"));
 
         // z.gguf has no claims at all -> never returned.
-        assert!(registry
-            .models_with_capability("ocr", false)
-            .iter()
-            .all(|r| r.0 != "z.gguf"));
+        assert!(
+            registry
+                .models_with_capability("ocr", false)
+                .iter()
+                .all(|r| r.0 != "z.gguf")
+        );
     }
 
     #[test]
@@ -741,10 +754,7 @@ mod tests {
         // ocr: a.gguf verified + m.gguf inferred; coding: a.gguf inferred only.
         assert_eq!(
             summary,
-            vec![
-                ("coding".to_string(), 0, 1),
-                ("ocr".to_string(), 1, 1),
-            ]
+            vec![("coding".to_string(), 0, 1), ("ocr".to_string(), 1, 1),]
         );
         // z.gguf (no claims) is absent.
         assert!(summary.iter().all(|(cap, _, _)| cap != "z.gguf"));

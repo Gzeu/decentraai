@@ -321,7 +321,8 @@ impl Clone for DistributedInference {
             logs_dir: self.logs_dir.clone(),
             signing_key: self.signing_key,
             outbound_nonce: std::sync::atomic::AtomicU64::new(
-                self.outbound_nonce.load(std::sync::atomic::Ordering::SeqCst),
+                self.outbound_nonce
+                    .load(std::sync::atomic::Ordering::SeqCst),
             ),
         }
     }
@@ -394,7 +395,11 @@ impl DistributedInference {
         if let Some(logs_dir) = &self.logs_dir {
             decentraai_audit::record_best_effort(
                 logs_dir,
-                if ok { "inference_completed" } else { "inference_failed" },
+                if ok {
+                    "inference_completed"
+                } else {
+                    "inference_failed"
+                },
                 serde_json::json!({
                     "request_id": request.request_id.to_string(),
                     "session_id": request.session_id.clone().unwrap_or_default(),
@@ -593,24 +598,24 @@ impl DistributedInference {
         // P4: replay guard for inbound requests, keyed by the authenticated
         // sender peer. TTL wraps the request timeout so a captured frame can't
         // be replayed after the window; capacity bounds memory per peer.
-        let replay: Arc<std::sync::Mutex<crate::replay::ReplayGuard>> = Arc::new(
-            std::sync::Mutex::new(crate::replay::ReplayGuard::new(
+        let replay: Arc<std::sync::Mutex<crate::replay::ReplayGuard>> =
+            Arc::new(std::sync::Mutex::new(crate::replay::ReplayGuard::new(
                 std::time::Duration::from_secs(300),
                 4096,
-            )),
-        );
+            )));
         let replay_for_closure = replay.clone();
         // H1: per-peer sliding-window rate limit on the worker path, protecting
         // the engine from an abusive/anomalous coordinator regardless of how
         // many requests it sends. Window = 60s, burst = configured via a
         // module constant (self._peer_limit below).
         let peer_limit = 120usize;
-        let peer_limiter: Arc<std::sync::Mutex<crate::rate_limit::PeerRateLimiter>> =
-            Arc::new(std::sync::Mutex::new(crate::rate_limit::PeerRateLimiter::new(
+        let peer_limiter: Arc<std::sync::Mutex<crate::rate_limit::PeerRateLimiter>> = Arc::new(
+            std::sync::Mutex::new(crate::rate_limit::PeerRateLimiter::new(
                 std::time::Duration::from_secs(60),
                 peer_limit,
                 peer_limit * 2,
-            )));
+            )),
+        );
         let peer_limiter_for_closure = peer_limiter.clone();
         let logs_dir_for_infer = self.logs_dir.clone();
 
@@ -893,8 +898,7 @@ impl DistributedInference {
             // (M10 audit: the queue timeout helpers were defined but never wired
             // into the serving path). Every swept request is answered with a
             // single terminal `InferFailed` and its reservation is released.
-            let mut sweep =
-                tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut sweep = tokio::time::interval(std::time::Duration::from_millis(250));
 
             loop {
                 let inbound = tokio::select! {
@@ -928,7 +932,9 @@ impl DistributedInference {
                         continue;
                     }
                 };
-                let Some((req, reservation)) = inbound else { break };
+                let Some((req, reservation)) = inbound else {
+                    break;
+                };
 
                 // Queue the request; a full queue is answered immediately so the
                 // requester is never left hanging. The local reservation booked
@@ -1141,10 +1147,7 @@ impl DistributedInference {
                             "failed"
                         },
                         ExecutionAttribution {
-                            tokens_used: result
-                                .as_ref()
-                                .ok()
-                                .map(|resp| resp.tokens_used),
+                            tokens_used: result.as_ref().ok().map(|resp| resp.tokens_used),
                             processing_time_ms: result
                                 .as_ref()
                                 .ok()
@@ -1310,7 +1313,8 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         // P1: sign outbound requests so workers can authenticate them.
         self.sign_request(&mut request);
-        self.route_request_streamed_inner(request, progress, None).await
+        self.route_request_streamed_inner(request, progress, None)
+            .await
     }
 
     /// Like [`route_request_streamed`](Self::route_request_streamed) but prefers
@@ -1327,7 +1331,8 @@ impl DistributedInference {
     ) -> Result<InferResponse, DistributedError> {
         // P1: sign outbound requests so workers can authenticate them.
         self.sign_request(&mut request);
-        self.route_request_streamed_inner(request, progress, Some(preferred)).await
+        self.route_request_streamed_inner(request, progress, Some(preferred))
+            .await
     }
 
     /// Shared streamed-routing logic. `preferred` (optional) pins the first
@@ -1378,8 +1383,7 @@ impl DistributedInference {
                             )
                             .await
                     }
-                }
-                {
+                } {
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -1423,10 +1427,7 @@ impl DistributedInference {
                             "failed"
                         },
                         ExecutionAttribution {
-                            tokens_used: result
-                                .as_ref()
-                                .ok()
-                                .map(|resp| resp.tokens_used),
+                            tokens_used: result.as_ref().ok().map(|resp| resp.tokens_used),
                             processing_time_ms: result
                                 .as_ref()
                                 .ok()
@@ -1555,8 +1556,10 @@ impl DistributedInference {
         // the fabric facts for THAT model — a model served only by one node is
         // never pinned to a worker that does not serve it). Deterministic: group
         // by model hash, allocate each group with its own live facts, merge.
-        let mut by_model: std::collections::BTreeMap<String, Vec<(String, decentraai_fabric::RequestFacts)>> =
-            std::collections::BTreeMap::new();
+        let mut by_model: std::collections::BTreeMap<
+            String,
+            Vec<(String, decentraai_fabric::RequestFacts)>,
+        > = std::collections::BTreeMap::new();
         for (request_id, req) in requests {
             let is_continuation = req.session_id.is_some();
             let prefix = req
@@ -1564,28 +1567,25 @@ impl DistributedInference {
                 .as_deref()
                 .and_then(|s| compute.session_residency(s))
                 .map(|p| p.to_string());
-            by_model
-                .entry(req.model_hash.clone())
-                .or_default()
-                .push((
-                    request_id.clone(),
-                    decentraai_fabric::RequestFacts {
-                        model_hash: req.model_hash.clone(),
-                        est_ram_mb: 512,
-                        est_vram_mb: 0,
-                        context: decentraai_fabric::ContextProfile {
-                            prompt_tokens: prompt_token_estimate(&req.prompt),
-                            max_output_tokens: req.max_tokens,
-                            is_continuation,
-                            prefix_resident_on: prefix,
-                        },
-                        transfer_mib: 0,
-                        local_peer: Some(self.p2p_node.local_peer_id().to_string()),
-                        priority: req.priority,
-                        required_capability: None,
-                        capability_claims: Vec::new(),
+            by_model.entry(req.model_hash.clone()).or_default().push((
+                request_id.clone(),
+                decentraai_fabric::RequestFacts {
+                    model_hash: req.model_hash.clone(),
+                    est_ram_mb: 512,
+                    est_vram_mb: 0,
+                    context: decentraai_fabric::ContextProfile {
+                        prompt_tokens: prompt_token_estimate(&req.prompt),
+                        max_output_tokens: req.max_tokens,
+                        is_continuation,
+                        prefix_resident_on: prefix,
                     },
-                ));
+                    transfer_mib: 0,
+                    local_peer: Some(self.p2p_node.local_peer_id().to_string()),
+                    priority: req.priority,
+                    required_capability: None,
+                    capability_claims: Vec::new(),
+                },
+            ));
         }
 
         let mut assignments = Vec::new();
@@ -2263,10 +2263,7 @@ mod tests {
         assert!(!rejected.is_retryable());
         assert_eq!(Code::from(&rejected), Code::Rejected);
 
-        assert_eq!(
-            DistributedError::RequestTimeout(1000).code(),
-            Code::Timeout
-        );
+        assert_eq!(DistributedError::RequestTimeout(1000).code(), Code::Timeout);
         assert_eq!(
             DistributedError::P2PError(anyhow::anyhow!("conn refused")).code(),
             Code::Transport
@@ -2325,8 +2322,7 @@ mod tests {
         // plus resource attribution (tokens/time/attempt) when known.
         distributed.audit_routed(&req, &worker, true, Some(42), Some(1337), 2);
         let line = std::fs::read_to_string(logs_dir.join("audit.jsonl")).unwrap();
-        let event: serde_json::Value =
-            serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!(event["event"], "inference_completed");
         assert_eq!(event["details"]["request_id"], req.request_id.to_string());
         assert_eq!(event["details"]["trace_id"], "tr_audit_test");

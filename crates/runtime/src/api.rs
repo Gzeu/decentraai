@@ -341,16 +341,16 @@ impl ApiState {
     /// Attaches the fabric inference coordinator so the proxy can route chat
     /// inference to trusted remote workers (M18+). Call once at startup on
     /// the node daemon path, where a `DistributedInference` already exists.
-    pub fn attach_distributed(&mut self, distributed: Arc<decentraai_distributed::DistributedInference>) {
+    pub fn attach_distributed(
+        &mut self,
+        distributed: Arc<decentraai_distributed::DistributedInference>,
+    ) {
         self.distributed = Some(distributed);
     }
 
     /// Attaches the collective-intelligence agent manager (P1) so the
     /// dashboard AGENTS view renders local + remote logical agents.
-    pub fn attach_agents(
-        &mut self,
-        agents: Arc<decentraai_distributed::agents::AgentManager>,
-    ) {
+    pub fn attach_agents(&mut self, agents: Arc<decentraai_distributed::agents::AgentManager>) {
         self.agents = Some(agents);
     }
 
@@ -651,7 +651,11 @@ impl ApiState {
     /// Per-key rate limit for consumer API keys (Q2): a sliding window keyed
     /// by key_id, capped at the key's own `rate_limit_per_minute`. Independent
     /// from quota (frequency vs consumption) and from tier/execute limits.
-    fn check_consumer_rate_limit(&self, key_id: &str, limit_per_minute: u32) -> Result<(), GateError> {
+    fn check_consumer_rate_limit(
+        &self,
+        key_id: &str,
+        limit_per_minute: u32,
+    ) -> Result<(), GateError> {
         let limit = limit_per_minute as usize;
         let mut windows = self.consumer_rate_windows.lock().unwrap();
         let window = windows.entry(key_id.to_string()).or_default();
@@ -1079,7 +1083,10 @@ async fn admin_consumer_key_create_handler(
         Some(a) if !a.trim().is_empty() => a.trim().to_string(),
         _ => return forbidden("missing account"),
     };
-    let quota_ceiling = req.get("quota_ceiling").and_then(|v| v.as_u64()).unwrap_or(0);
+    let quota_ceiling = req
+        .get("quota_ceiling")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let rate_limit_per_minute = req
         .get("rate_limit_per_minute")
         .and_then(|v| v.as_u64())
@@ -1104,8 +1111,12 @@ async fn admin_consumer_key_create_handler(
         Ok(s) => s,
         Err(_) => return forbidden("consumer key store unreadable"),
     };
-    let plaintext = match store.create(&account, quota_ceiling, rate_limit_per_minute, scopes.clone())
-    {
+    let plaintext = match store.create(
+        &account,
+        quota_ceiling,
+        rate_limit_per_minute,
+        scopes.clone(),
+    ) {
         Ok(p) => p,
         Err(e) => return forbidden(&e.to_string()),
     };
@@ -1296,10 +1307,12 @@ fn hub_search_body(
     models: &[decentraai_hub::HubModel],
     capability: Option<decentraai_hub::CapabilityKind>,
 ) -> serde_json::Value {
-    let req = capability.map(|cap| vec![decentraai_hub::CapabilityRequirement {
-        capability: cap,
-        evidence: decentraai_hub::EvidenceLevel::Any,
-    }]);
+    let req = capability.map(|cap| {
+        vec![decentraai_hub::CapabilityRequirement {
+            capability: cap,
+            evidence: decentraai_hub::EvidenceLevel::Any,
+        }]
+    });
 
     let filtered: Vec<&decentraai_hub::HubModel> = models
         .iter()
@@ -1545,11 +1558,7 @@ async fn mcp_worker_capability(
 /// Honest by construction: a capability with no matching local model reports
 /// fit = UNKNOWN ("no local model"); a capability that resolves to a model with
 /// no workers also reports UNKNOWN via the aggregate. Nothing is fabricated.
-async fn mcp_intent_with_fit(
-    state: &ApiState,
-    intent: &str,
-    evidence: &str,
-) -> serde_json::Value {
+async fn mcp_intent_with_fit(state: &ApiState, intent: &str, evidence: &str) -> serde_json::Value {
     let registry_path = state.info.repo_root.join("db/registry.json");
     let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
     let require_verified = evidence == "verified";
@@ -1565,7 +1574,11 @@ async fn mcp_intent_with_fit(
         // Find a real local model with a persisted claim for this capability.
         let mut candidate: Option<(String, String)> = None; // (file, provenance)
         if let Some(reg) = &registry {
-            if let Some(m) = reg.models_with_capability(&cap_str, require_verified).into_iter().next() {
+            if let Some(m) = reg
+                .models_with_capability(&cap_str, require_verified)
+                .into_iter()
+                .next()
+            {
                 candidate = Some((m.0.to_string(), m.2.to_string()));
             }
         }
@@ -1662,7 +1675,13 @@ fn load_balance_for_workers(
     let eligible: Vec<(String, String, decentraai_compute::ComputeAvailability)> = workers
         .iter()
         .filter(|(w, _)| can_run_peer_ids.contains(&w.peer_id.to_string()))
-        .map(|(w, _)| (w.peer_id.to_string(), w.node_id.clone(), w.availability.clone()))
+        .map(|(w, _)| {
+            (
+                w.peer_id.to_string(),
+                w.node_id.clone(),
+                w.availability.clone(),
+            )
+        })
         .collect();
     if eligible.is_empty() {
         return Vec::new();
@@ -1782,8 +1801,14 @@ async fn unified_fabric_decision(
                         .collect()
                 })
                 .unwrap_or_default();
-            let results =
-                fabric_fit_for_model(model_file, &cap_str, evidence, &claims, &workers, &local_peer);
+            let results = fabric_fit_for_model(
+                model_file,
+                &cap_str,
+                evidence,
+                &claims,
+                &workers,
+                &local_peer,
+            );
             let fit = aggregate_can_i_run(&results);
             let verdict = match fit.verdict {
                 WorkerCapVerdict::CanRun => "CAN_RUN",
@@ -1860,10 +1885,9 @@ async fn unified_fabric_decision(
 /// pure aggregation as `GET /v1/fabric`, read-only, no execution. Real state
 /// only — never fabricated nodes/models/capabilities.
 async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
-    let registry = decentraai_registry::ModelRegistry::load(
-        &state.info.repo_root.join("db/registry.json"),
-    )
-    .ok();
+    let registry =
+        decentraai_registry::ModelRegistry::load(&state.info.repo_root.join("db/registry.json"))
+            .ok();
     let mut workers: Vec<(decentraai_distributed::ComputeAdvertisement, bool)> = Vec::new();
     let mut decisions: Vec<decentraai_fabric::ExecutionDecision> = Vec::new();
     let mut network = decentraai_fabric::NetworkGraph::new();
@@ -1892,10 +1916,7 @@ async fn mcp_fabric_graph(state: &ApiState) -> serde_json::Value {
 /// Resolve a BLAKE3 `model_hash` for a model file name from the live fabric
 /// advertisements (served or on-disk). `None` when no worker advertises the
 /// model (honest: cannot execute a model the fabric does not hold).
-async fn resolve_model_hash(
-    state: &ApiState,
-    file_name: &str,
-) -> Option<String> {
+async fn resolve_model_hash(state: &ApiState, file_name: &str) -> Option<String> {
     let cm = state.compute.as_ref()?;
     let workers = cm.workers().await;
     for adv in workers {
@@ -1956,15 +1977,15 @@ async fn execute_decision_handler(
 /// The STREAM step of decide→confirm→reserve→execute: run the decided model on
 /// the fabric and stream the output as SSE (like the chat proxy's remote route),
 /// reusing `route_request_streamed`. Enforces `confirm: true` (mutation safety).
-async fn execute_decision_stream(
-    state: &ApiState,
-    req: &serde_json::Value,
-) -> Response {
+async fn execute_decision_stream(state: &ApiState, req: &serde_json::Value) -> Response {
     // Mutation safety: explicit confirmation is required.
     if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
         return forbidden("mutating execution requires \"confirm\": true");
     }
-    let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
+    let prompt = req
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default();
     if prompt.trim().is_empty() {
         return forbidden("missing prompt");
     }
@@ -1979,8 +2000,15 @@ async fn execute_decision_stream(
         .and_then(|m| m.as_u64())
         .unwrap_or(1024)
         .min(4096) as u32;
-    let evidence = req.get("evidence").and_then(|e| e.as_str()).unwrap_or("any");
-    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let evidence = req
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .unwrap_or("any");
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    };
     let explicit_model = req.get("model").and_then(|m| m.as_str());
 
     // decide → chosen model.
@@ -2013,7 +2041,11 @@ async fn execute_decision_stream(
     // DRY-RUN: show exactly what would be reserved/routed without executing.
     // Requires the same confirm gate (it is part of the mutation path), but
     // never sends a request or holds a reservation.
-    if req.get("dry_run").and_then(|d| d.as_bool()).unwrap_or(false) {
+    if req
+        .get("dry_run")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false)
+    {
         let prompt_tokens = decentraai_distributed::prompt_token_estimate(prompt);
         let preview = match &state.compute {
             Some(cm) => {
@@ -2082,15 +2114,18 @@ async fn execute_decision_stream(
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(true);
     request.timeout_ms = 120_000;
-    if let Some(sid) = req.get("session_id").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(sid) = req
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+    {
         request = request.with_session(sid.to_string());
     }
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let dist = distributed.clone();
-    let resp_task = tokio::spawn(async move {
-        dist.route_request_streamed(request, progress_tx).await
-    });
+    let resp_task =
+        tokio::spawn(async move { dist.route_request_streamed(request, progress_tx).await });
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let state2 = state.clone();
     let started = std::time::Instant::now();
@@ -2119,8 +2154,7 @@ async fn execute_decision_stream(
                 let prompt_tokens = decentraai_distributed::prompt_token_estimate(&prompt_owned);
                 let usage = format!(
                     "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
-                    prompt_tokens,
-                    resp.tokens_used
+                    prompt_tokens, resp.tokens_used
                 );
                 state2.record_inference("/v1/execute", started.elapsed(), usage.as_bytes());
                 format!(
@@ -2138,7 +2172,9 @@ async fn execute_decision_stream(
             Err(_) => String::new(),
         };
         let _ = body_tx.send(Ok(Bytes::from(final_event))).await;
-        let _ = body_tx.send(Ok(Bytes::from("data: [DONE]\n\n".to_string()))).await;
+        let _ = body_tx
+            .send(Ok(Bytes::from("data: [DONE]\n\n".to_string())))
+            .await;
     });
     let body = Body::from_stream(futures::stream::unfold(body_rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -2159,19 +2195,24 @@ async fn execute_decision_stream(
 /// call: the explicit `intent` if present, else the `capability` (a snake_case
 /// capability name is itself resolvable by the intent lexicon), else empty.
 fn execute_decision_intent(req: &serde_json::Value) -> String {
-    if let Some(i) = req.get("intent").and_then(|i| i.as_str()).filter(|s| !s.trim().is_empty()) {
+    if let Some(i) = req
+        .get("intent")
+        .and_then(|i| i.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
         return i.trim().to_string();
     }
-    if let Some(c) = req.get("capability").and_then(|c| c.as_str()).filter(|s| !s.trim().is_empty()) {
+    if let Some(c) = req
+        .get("capability")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
         return c.trim().to_string();
     }
     String::new()
 }
 
-async fn run_execute_decision(
-    state: &ApiState,
-    req: &serde_json::Value,
-) -> Response {
+async fn run_execute_decision(state: &ApiState, req: &serde_json::Value) -> Response {
     // Mutation safety: explicit confirmation is required.
     if req.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
         return forbidden("mutating execution requires \"confirm\": true");
@@ -2180,7 +2221,10 @@ async fn run_execute_decision(
     if intent.trim().is_empty() {
         return forbidden("missing intent (or a capability to run)");
     }
-    let prompt = req.get("prompt").and_then(|p| p.as_str()).unwrap_or_default();
+    let prompt = req
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default();
     if prompt.trim().is_empty() {
         return forbidden("missing prompt");
     }
@@ -2194,7 +2238,11 @@ async fn run_execute_decision(
         .get("evidence")
         .and_then(|e| e.as_str())
         .unwrap_or("any");
-    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    };
     let explicit_model = req.get("model").and_then(|m| m.as_str());
 
     // decide: pick the first CAN_RUN model/worker from the unified projection.
@@ -2254,7 +2302,11 @@ async fn run_execute_decision(
     // Continuation support (KV locality): an optional session_id links this run
     // to an earlier one, steering the fabric router back to the worker holding
     // the session's KV prefix.
-    if let Some(sid) = req.get("session_id").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(sid) = req
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+    {
         request = request.with_session(sid.to_string());
     }
     let started = std::time::Instant::now();
@@ -2325,13 +2377,13 @@ async fn run_execute_decision(
                 })
                 .unwrap_or(0);
             let adv = decentraai_fabric::decision::adapt(
-                false,         // outcome_ok
-                retryable,     // retryable
-                false,         // cancelled
-                0,             // tokens_emitted (no output was returned)
-                alternatives,  // eligible_after_primary
-                1,             // replan_budget
-                false,         // is_continuation
+                false,        // outcome_ok
+                retryable,    // retryable
+                false,        // cancelled
+                0,            // tokens_emitted (no output was returned)
+                alternatives, // eligible_after_primary
+                1,            // replan_budget
+                false,        // is_continuation
             );
             let replan = match adv {
                 decentraai_fabric::decision::Adaptation::Retry
@@ -2558,19 +2610,23 @@ async fn admin_hub_pull_handler(
             }
         }
     });
-    let download = match decentraai_hub::download_model_with_progress(&hf_ref, &models_dir, Some(progress)).await {
-        Ok(d) => d,
-        Err(e) => {
-            state.hub_pulls.lock().unwrap().remove(&repo_key);
-            let body = serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}});
-            return (
-                StatusCode::BAD_GATEWAY,
-                [(header::CONTENT_TYPE, "application/json")],
-                body.to_string(),
-            )
-                .into_response();
-        }
-    };
+    let download =
+        match decentraai_hub::download_model_with_progress(&hf_ref, &models_dir, Some(progress))
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                state.hub_pulls.lock().unwrap().remove(&repo_key);
+                let body =
+                    serde_json::json!({"error": {"message": e.to_string(), "type": "hub_error"}});
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body.to_string(),
+                )
+                    .into_response();
+            }
+        };
     // Pull completed: remove from the in-flight registry (dashboard stops
     // polling; the final result below is authoritative).
     state.hub_pulls.lock().unwrap().remove(&repo_key);
@@ -2765,7 +2821,11 @@ async fn admin_hub_compare_handler(
             .into_response();
     }
 
-    let repos: Vec<&str> = repos_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let repos: Vec<&str> = repos_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if repos.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -3040,13 +3100,25 @@ fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
                     reasons.push(format!(
                         "capability {} — {} evidence",
                         cap.state,
-                        if cap.pass { "satisfied" } else { "insufficient" }
+                        if cap.pass {
+                            "satisfied"
+                        } else {
+                            "insufficient"
+                        }
                     ));
                 }
                 reasons.push(format!(
                     "RAM {} · VRAM {} ({} CAN_RUN workers)",
-                    if best.ram_sufficient { "sufficient" } else { "insufficient" },
-                    if best.vram_sufficient { "sufficient" } else { "insufficient" },
+                    if best.ram_sufficient {
+                        "sufficient"
+                    } else {
+                        "insufficient"
+                    },
+                    if best.vram_sufficient {
+                        "sufficient"
+                    } else {
+                        "insufficient"
+                    },
                     can_run.len()
                 ));
             }
@@ -3054,7 +3126,10 @@ fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
         WorkerCapVerdict::CannotRun => {
             // Report the first few distinct blockers across CANNOT_RUN workers.
             let mut seen = std::collections::BTreeSet::new();
-            for r in results.iter().filter(|r| r.verdict == WorkerCapVerdict::CannotRun) {
+            for r in results
+                .iter()
+                .filter(|r| r.verdict == WorkerCapVerdict::CannotRun)
+            {
                 for c in &r.checks {
                     if !c.pass {
                         let key = format!("{}:{}", c.check, c.state);
@@ -3069,7 +3144,9 @@ fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
             }
         }
         WorkerCapVerdict::Unknown => {
-            reasons.push("no worker can be confirmed to run it (evidence/telemetry unknown)".to_string());
+            reasons.push(
+                "no worker can be confirmed to run it (evidence/telemetry unknown)".to_string(),
+            );
         }
     }
 
@@ -3194,7 +3271,12 @@ fn worker_capability_verdict_with_policy(
         .served_models
         .iter()
         .find(|m| matches_model(m))
-        .or_else(|| adv.capability.available_models.iter().find(|m| matches_model(m)));
+        .or_else(|| {
+            adv.capability
+                .available_models
+                .iter()
+                .find(|m| matches_model(m))
+        });
 
     let model_availability = if served {
         "served"
@@ -3205,8 +3287,7 @@ fn worker_capability_verdict_with_policy(
     };
 
     let engine_compat = worker_engine_compat(&adv.capability.engine, served, on_disk);
-    let quantization = model_entry
-        .and_then(|m| variant_quantization_from_file_name(&m.file_name));
+    let quantization = model_entry.and_then(|m| variant_quantization_from_file_name(&m.file_name));
     let est_ram_mb = model_entry.map(|m| m.est_ram_mb).unwrap_or(0);
     let est_vram_mb = model_entry.map(|m| m.est_vram_mb).unwrap_or(0);
 
@@ -3216,11 +3297,8 @@ fn worker_capability_verdict_with_policy(
     let avail_vram = adv.availability.available_vram_mb;
     let ram_known = model_entry.is_some() && est_ram_mb > 0;
     let ram_sufficient = ram_known && avail_ram >= est_ram_mb;
-    let vram_known = model_entry.is_some()
-        && est_vram_mb > 0
-        && avail_vram.is_some();
-    let vram_sufficient = vram_known
-        && avail_vram.is_some_and(|v| v >= est_vram_mb);
+    let vram_known = model_entry.is_some() && est_vram_mb > 0 && avail_vram.is_some();
+    let vram_sufficient = vram_known && avail_vram.is_some_and(|v| v >= est_vram_mb);
 
     let mut checks: Vec<WorkerCheck> = Vec::new();
 
@@ -3292,7 +3370,12 @@ fn worker_capability_verdict_with_policy(
     checks.push(WorkerCheck {
         check: "policy",
         pass: policy_pass,
-        state: if policy_pass { "allowed" } else { "remote_not_accepted" }.into(),
+        state: if policy_pass {
+            "allowed"
+        } else {
+            "remote_not_accepted"
+        }
+        .into(),
         reason: if policy_pass {
             "worker may serve this fabric's request (local or remote-opt-in)".into()
         } else {
@@ -3308,8 +3391,14 @@ fn worker_capability_verdict_with_policy(
         state: engine_compat.to_string(),
         reason: match engine_compat {
             "compatible" => format!("engine '{}' can serve this model", adv.capability.engine),
-            "unknown" => format!("engine '{}' compatibility unknown for this model", adv.capability.engine),
-            _ => format!("engine '{}' incompatible with this model", adv.capability.engine),
+            "unknown" => format!(
+                "engine '{}' compatibility unknown for this model",
+                adv.capability.engine
+            ),
+            _ => format!(
+                "engine '{}' incompatible with this model",
+                adv.capability.engine
+            ),
         },
     });
 
@@ -3332,8 +3421,16 @@ fn worker_capability_verdict_with_policy(
         checks.push(WorkerCheck {
             check: "ram",
             pass: ram_sufficient,
-            state: if ram_sufficient { "sufficient" } else { "insufficient" }.into(),
-            reason: format!("available RAM {} MiB vs estimated {} MiB", avail_ram, est_ram_mb),
+            state: if ram_sufficient {
+                "sufficient"
+            } else {
+                "insufficient"
+            }
+            .into(),
+            reason: format!(
+                "available RAM {} MiB vs estimated {} MiB",
+                avail_ram, est_ram_mb
+            ),
         });
     }
 
@@ -3356,7 +3453,12 @@ fn worker_capability_verdict_with_policy(
         checks.push(WorkerCheck {
             check: "vram",
             pass: vram_sufficient,
-            state: if vram_sufficient { "sufficient" } else { "insufficient" }.into(),
+            state: if vram_sufficient {
+                "sufficient"
+            } else {
+                "insufficient"
+            }
+            .into(),
             reason: format!(
                 "available VRAM {} MiB vs estimated {} MiB",
                 avail_vram.unwrap_or(0),
@@ -3422,8 +3524,16 @@ async fn hub_compare_model_body(
     if let Some(cm) = &state.compute {
         let workers = cm.workers().await;
         for w in workers {
-            let served = w.capability.served_models.iter().any(|m| m.file_name == repo);
-            let available = w.capability.available_models.iter().any(|m| m.file_name == repo);
+            let served = w
+                .capability
+                .served_models
+                .iter()
+                .any(|m| m.file_name == repo);
+            let available = w
+                .capability
+                .available_models
+                .iter()
+                .any(|m| m.file_name == repo);
             if served || available {
                 fabric_nodes.push(serde_json::json!({
                     "node_id": w.node_id,
@@ -3780,7 +3890,10 @@ async fn admin_models_remove_handler(
         } else {
             // If we can't canonicalize, proceed with removal anyway.
             // This is defensive but risky.
-            tracing::debug!("failed to canonicalize target path for removal check: {}", full_target_path.display());
+            tracing::debug!(
+                "failed to canonicalize target path for removal check: {}",
+                full_target_path.display()
+            );
         }
     }
 
@@ -3836,8 +3949,7 @@ async fn admin_models_remove_handler(
 
     (
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({"success": true, "message": "model removed"})
-            .to_string(),
+        serde_json::json!({"success": true, "message": "model removed"}).to_string(),
     )
         .into_response()
 }
@@ -3924,7 +4036,9 @@ fn persist_generation_config(repo_root: &std::path::Path, g: &GenerationSection)
     if !path.exists() {
         return false;
     }
-    let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
     let temp = |line: &str, v: String| -> String {
         let trimmed = line.trim_start();
         if trimmed.starts_with("temperature:") {
@@ -3934,7 +4048,11 @@ fn persist_generation_config(repo_root: &std::path::Path, g: &GenerationSection)
         } else if trimmed.starts_with("top_k:") {
             format!("{}top_k: {}", &line[..line.len() - trimmed.len()], v)
         } else if trimmed.starts_with("repeat_penalty:") {
-            format!("{}repeat_penalty: {}", &line[..line.len() - trimmed.len()], v)
+            format!(
+                "{}repeat_penalty: {}",
+                &line[..line.len() - trimmed.len()],
+                v
+            )
         } else if trimmed.starts_with("system_prompt:") {
             format!(
                 "{}system_prompt: {}",
@@ -3983,7 +4101,12 @@ fn persist_generation_config(repo_root: &std::path::Path, g: &GenerationSection)
                         }
                         Some("top_k") => {
                             wrote = true;
-                            temp(line, g.top_k.map(|k| k.to_string()).unwrap_or_else(|| "null".into()))
+                            temp(
+                                line,
+                                g.top_k
+                                    .map(|k| k.to_string())
+                                    .unwrap_or_else(|| "null".into()),
+                            )
                         }
                         Some("repeat_penalty") => {
                             wrote = true;
@@ -4074,7 +4197,9 @@ async fn admin_settings_resources_handler(
 /// file write failed.
 fn persist_resource_config(path: &std::path::Path, req: &serde_json::Value) -> bool {
     use std::io::Write;
-    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
     let keys: [&str; 7] = [
         "cpu_max_percent",
         "memory_max_percent",
@@ -4097,7 +4222,12 @@ fn persist_resource_config(path: &std::path::Path, req: &serde_json::Value) -> b
                 if let Some(rest) = trimmed.strip_prefix(k).and_then(|r| r.strip_prefix(':')) {
                     if let Some(v) = req.get(k) {
                         let indent = &line[..line.len() - trimmed.len()];
-                        replaced = Some(format!("{indent}{k}: {}", serde_json::to_string(v).unwrap_or_default().replace('"', "")));
+                        replaced = Some(format!(
+                            "{indent}{k}: {}",
+                            serde_json::to_string(v)
+                                .unwrap_or_default()
+                                .replace('"', "")
+                        ));
                         wrote = true;
                     }
                     let _ = rest;
@@ -4141,10 +4271,7 @@ fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> 
 /// Reuses the live `ComputeManager::contribution_report` (the same data the
 /// CLI `decentraai tier suggest` prints) so the dashboard can show why each
 /// worker earned its suggested tier, then apply it.
-async fn admin_contribution_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn admin_contribution_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_master(&headers) {
         return e.into_response();
     }
@@ -4226,7 +4353,10 @@ async fn admin_tier_apply_handler(
     let changes = decentraai_tokens::plan_tier_changes(&suggestions, &tokens);
     let mut applied = 0usize;
     for c in &changes {
-        if store.set_tier(&c.name, decentraai_tokens::Tier(c.to)).is_ok() {
+        if store
+            .set_tier(&c.name, decentraai_tokens::Tier(c.to))
+            .is_ok()
+        {
             applied += 1;
             let a = state.info.repo_root.join("logs/audit.jsonl");
             let _ = decentraai_audit::record(
@@ -4317,10 +4447,7 @@ async fn admin_worker_revoke_handler(
 
 /// P3/M10 — Recent audit events for the Admin page, master-gated. Reuses the
 /// same best-effort reader as the dashboard's `/status` `recent_events`.
-async fn admin_audit_events_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn admin_audit_events_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_master(&headers) {
         return e.into_response();
     }
@@ -4404,23 +4531,47 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/admin/token/create", post(admin_token_create_handler))
         .route("/api/admin/token/revoke", post(admin_token_revoke_handler))
         // Q2 - Consumer API keys (master-gated; create/revoke/list metadata)
-        .route("/api/admin/consumer-key/create", post(admin_consumer_key_create_handler))
-        .route("/api/admin/consumer-key/revoke", post(admin_consumer_key_revoke_handler))
-        .route("/api/admin/consumer-key/list", get(admin_consumer_key_list_handler))
+        .route(
+            "/api/admin/consumer-key/create",
+            post(admin_consumer_key_create_handler),
+        )
+        .route(
+            "/api/admin/consumer-key/revoke",
+            post(admin_consumer_key_revoke_handler),
+        )
+        .route(
+            "/api/admin/consumer-key/list",
+            get(admin_consumer_key_list_handler),
+        )
         // P3/M10 - Worker trust + audit events (master-gated control plane)
         .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
-        .route("/api/admin/worker/revoke", post(admin_worker_revoke_handler))
+        .route(
+            "/api/admin/worker/revoke",
+            post(admin_worker_revoke_handler),
+        )
         .route("/api/admin/events", get(admin_audit_events_handler))
         // Part 16/22 - Model Hub (master-gated search + pull)
         .route("/api/admin/hub/search", get(admin_hub_search_handler))
         .route("/api/admin/hub/model/{repo}", get(admin_hub_model_handler))
         .route("/api/admin/hub/compare", get(admin_hub_compare_handler))
         .route("/api/admin/hub/pull", post(admin_hub_pull_handler))
-        .route("/api/admin/hub/pull/status", get(admin_hub_pull_status_handler))
+        .route(
+            "/api/admin/hub/pull/status",
+            get(admin_hub_pull_status_handler),
+        )
         // Model removal (Issue #26): master-gated delete from registry + disk
-        .route("/api/admin/models/remove", post(admin_models_remove_handler))
-        .route("/api/admin/settings/generation", post(admin_settings_generation_handler))
-        .route("/api/admin/settings/resources", post(admin_settings_resources_handler))
+        .route(
+            "/api/admin/models/remove",
+            post(admin_models_remove_handler),
+        )
+        .route(
+            "/api/admin/settings/generation",
+            post(admin_settings_generation_handler),
+        )
+        .route(
+            "/api/admin/settings/resources",
+            post(admin_settings_resources_handler),
+        )
         .route("/api/admin/contribution", get(admin_contribution_handler))
         .route("/api/admin/tier/apply", post(admin_tier_apply_handler))
         .route("/admin", get(admin_handler))
@@ -4474,7 +4625,12 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         let backend = manager
             .base_url()
             .unwrap_or_else(|| state.backend_url.clone());
-        (manager.is_loaded(), manager.idle_for().as_secs(), backend, manager.respawns)
+        (
+            manager.is_loaded(),
+            manager.idle_for().as_secs(),
+            backend,
+            manager.respawns,
+        )
     };
     let snapshot = decentraai_system_probe::SystemSnapshot::collect();
     let gpu = match decentraai_system_probe::probe_gpu() {
@@ -4601,10 +4757,14 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     body.push_str("# HELP decentraai_requests_failed_total Inference calls that reached the backend but failed.\n");
     body.push_str("# TYPE decentraai_requests_failed_total counter\n");
     body.push_str(&format!("decentraai_requests_failed_total {failed}\n"));
-    body.push_str("# HELP decentraai_tokens_generated_total Completion tokens generated by this node.\n");
+    body.push_str(
+        "# HELP decentraai_tokens_generated_total Completion tokens generated by this node.\n",
+    );
     body.push_str("# TYPE decentraai_tokens_generated_total counter\n");
     body.push_str(&format!("decentraai_tokens_generated_total {tokens}\n"));
-    body.push_str("# HELP decentraai_latency_ms Inference latency percentiles over recent requests.\n");
+    body.push_str(
+        "# HELP decentraai_latency_ms Inference latency percentiles over recent requests.\n",
+    );
     body.push_str("# TYPE decentraai_latency_ms gauge\n");
     body.push_str(&format!(
         "decentraai_latency_ms{{quantile=\"p50\"}} {}\n",
@@ -4630,9 +4790,14 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     body.push_str("# HELP decentraai_uptime_seconds Node uptime in seconds.\n");
     body.push_str("# TYPE decentraai_uptime_seconds gauge\n");
     body.push_str(&format!("decentraai_uptime_seconds {uptime_secs}\n"));
-    body.push_str("# HELP decentraai_model_loaded Whether the model is currently loaded (1) or not (0).\n");
+    body.push_str(
+        "# HELP decentraai_model_loaded Whether the model is currently loaded (1) or not (0).\n",
+    );
     body.push_str("# TYPE decentraai_model_loaded gauge\n");
-    body.push_str(&format!("decentraai_model_loaded {}\n", if loaded { 1 } else { 0 }));
+    body.push_str(&format!(
+        "decentraai_model_loaded {}\n",
+        if loaded { 1 } else { 0 }
+    ));
 
     // Fabric observability: real coordinator state (workers, trust, sessions).
     // The monitoring crate is NOT wired here — these are measured live from the
@@ -4652,13 +4817,23 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     }
     body.push_str("# HELP decentraai_fabric_workers_total Workers currently on the fabric.\n");
     body.push_str("# TYPE decentraai_fabric_workers_total gauge\n");
-    body.push_str(&format!("decentraai_fabric_workers_total {fabric_workers_total}\n"));
-    body.push_str("# HELP decentraai_fabric_trusted_workers_total Trusted workers on the fabric.\n");
+    body.push_str(&format!(
+        "decentraai_fabric_workers_total {fabric_workers_total}\n"
+    ));
+    body.push_str(
+        "# HELP decentraai_fabric_trusted_workers_total Trusted workers on the fabric.\n",
+    );
     body.push_str("# TYPE decentraai_fabric_trusted_workers_total gauge\n");
-    body.push_str(&format!("decentraai_fabric_trusted_workers_total {fabric_trusted_total}\n"));
-    body.push_str("# HELP decentraai_fabric_sessions_active Active KV sessions tracked by the coordinator.\n");
+    body.push_str(&format!(
+        "decentraai_fabric_trusted_workers_total {fabric_trusted_total}\n"
+    ));
+    body.push_str(
+        "# HELP decentraai_fabric_sessions_active Active KV sessions tracked by the coordinator.\n",
+    );
     body.push_str("# TYPE decentraai_fabric_sessions_active gauge\n");
-    body.push_str(&format!("decentraai_fabric_sessions_active {fabric_sessions_active}\n"));
+    body.push_str(&format!(
+        "decentraai_fabric_sessions_active {fabric_sessions_active}\n"
+    ));
 
     // OpenTelemetry GenAI semantic-convention projection (Phase 8). These are
     // ADDITIVE and derived from real node state — they never replace the
@@ -4669,14 +4844,18 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     // prompts or outputs.
     let genai_model = state.info.model_name.clone();
     let genai_provider = "decentraai";
-    body.push_str("# HELP gen_ai.server.request.count Number of inference requests served (OTel GenAI).\n");
+    body.push_str(
+        "# HELP gen_ai.server.request.count Number of inference requests served (OTel GenAI).\n",
+    );
     body.push_str("# TYPE gen_ai.server.request.count counter\n");
     body.push_str(&format!(
         "gen_ai.server.request.count{{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\"}} {served}\n",
         prometheus_escape(&genai_model),
         genai_provider
     ));
-    body.push_str("# HELP gen_ai.server.token.input Count of input tokens consumed (OTel GenAI).\n");
+    body.push_str(
+        "# HELP gen_ai.server.token.input Count of input tokens consumed (OTel GenAI).\n",
+    );
     body.push_str("# TYPE gen_ai.server.token.input counter\n");
     let total_input: u64 = recent.iter().map(|r| r.prompt_tokens).sum();
     body.push_str(&format!(
@@ -4684,14 +4863,18 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         prometheus_escape(&genai_model),
         genai_provider
     ));
-    body.push_str("# HELP gen_ai.server.token.output Count of output tokens generated (OTel GenAI).\n");
+    body.push_str(
+        "# HELP gen_ai.server.token.output Count of output tokens generated (OTel GenAI).\n",
+    );
     body.push_str("# TYPE gen_ai.server.token.output counter\n");
     body.push_str(&format!(
         "gen_ai.server.token.output{{gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\"}} {tokens}\n",
         prometheus_escape(&genai_model),
         genai_provider
     ));
-    body.push_str("# HELP gen_ai.server.request.duration Milliseconds per inference request (OTel GenAI).\n");
+    body.push_str(
+        "# HELP gen_ai.server.request.duration Milliseconds per inference request (OTel GenAI).\n",
+    );
     body.push_str("# TYPE gen_ai.server.request.duration gauge\n");
     body.push_str(&format!(
         "gen_ai.server.request.duration{{gen_ai.operation.name=\"chat\",gen_ai.request.model=\"{}\",gen_ai.provider.name=\"{}\",quantile=\"p50\"}} {}\n",
@@ -4707,7 +4890,10 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     ));
 
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
         .into_response()
@@ -4716,7 +4902,9 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
 /// Escape a label value for Prometheus exposition (backslash, double-quote,
 /// newline). Applies to any label we emit — currently the model name.
 fn prometheus_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// MCP (Model Context Protocol) read-only endpoint: `POST /mcp` speaking
@@ -4726,11 +4914,7 @@ fn prometheus_escape(s: &str) -> String {
 /// Consumer `dca_` keys (Q2) may call the inference-consumption tools
 /// (`decide`, `execute_decision`) with quota authorization; they are denied
 /// the operational/read views (which stay operator/admin).
-async fn mcp_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = match state.classify(&headers) {
         Ok(a) => a,
         Err(e) => return e.into_response(),
@@ -4783,7 +4967,8 @@ async fn mcp_handler(
     // A `find_local_models_by_capability` call filters THIS node's models by
     // persisted claims (no Hub round-trip). Precompute it here.
     if let Some((capability, evidence)) = crate::mcp::local_capability_search_request(&raw) {
-        ctx.local_capability_search = mcp_local_capability_search(&state, &capability, &evidence).await;
+        ctx.local_capability_search =
+            mcp_local_capability_search(&state, &capability, &evidence).await;
     }
     // A `get_worker_capability` call evaluates every fabric worker against a
     // model + capability requirement (read-only projection, no execution).
@@ -4830,12 +5015,20 @@ async fn mcp_handler(
     // MCP write tool `serve_model`: master-gated mutation that loads a local
     // model file into the engine. Returns the resolved model + load state.
     if let Some(args) = crate::mcp::serve_model_request(&raw) {
-        let model = args.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let model = args
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
         let registry_path = state.info.repo_root.join("db/registry.json");
         let registry = decentraai_registry::ModelRegistry::load(&registry_path).ok();
         let indexed = registry
             .as_ref()
-            .map(|r| r.list_models().iter().any(|m| m.relative_path == model || m.relative_path.ends_with(&model)))
+            .map(|r| {
+                r.list_models()
+                    .iter()
+                    .any(|m| m.relative_path == model || m.relative_path.ends_with(&model))
+            })
             .unwrap_or(false);
         let manager = state.manager.lock().await;
         let loaded = manager.is_loaded();
@@ -4851,14 +5044,23 @@ async fn mcp_handler(
     // from the Hub (verified) into the local registry. Synchronous; large
     // models take a while. Progress is visible via the dashboard / status.
     if let Some(args) = crate::mcp::pull_model_request(&raw) {
-        let reference = args.get("reference").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        let reference = args
+            .get("reference")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
         let models_dir = state.info.repo_root.join("models");
         let _ = std::fs::create_dir_all(&models_dir);
         let hf_ref = decentraai_hub::HfRef::parse(&reference);
         match hf_ref {
             Ok(hf_ref) => match decentraai_hub::download_model(&hf_ref, &models_dir).await {
                 Ok(d) => {
-                    let file_name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    let file_name = d
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     let registry_path = state.info.repo_root.join("db/registry.json");
                     if let Some(cm) = &state.compute {
                         cm.set_registry_path(registry_path.clone());
@@ -4923,7 +5125,9 @@ async fn mcp_handler(
                     "policy_version": policy_version,
                 })
             }
-            None => serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
+            None => {
+                serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null })
+            }
         };
     }
     // A `get_compensation` call projects the reputation-based compensation
@@ -4972,7 +5176,9 @@ async fn mcp_handler(
                     },
                 })
             }
-            None => serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
+            None => {
+                serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null })
+            }
         };
     }
     if crate::mcp::consumer_keys_request(&raw) {
@@ -5108,7 +5314,9 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         let manager = state.manager.lock().await;
         (
             manager.is_loaded(),
-            manager.base_url().unwrap_or_else(|| state.backend_url.clone()),
+            manager
+                .base_url()
+                .unwrap_or_else(|| state.backend_url.clone()),
         )
     };
     let (serving, waiting) = state.queue.snapshot();
@@ -5134,7 +5342,8 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
     let mut executions = serde_json::Value::Array(Vec::new());
     if let Some(compute) = &state.compute {
         let report = compute.metrics_report().await;
-        workers = serde_json::to_value(report.workers).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        workers = serde_json::to_value(report.workers)
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
         // Executions with an attached `recovery` timeline (Phase H) so MCP
         // agents can see the self-healing loop. The recovery is projected from
         // the real autonomous decisions keyed by request_id.
@@ -5169,7 +5378,13 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
     let mut peers = serde_json::Value::Array(Vec::new());
     if let Some(p2p) = &state.p2p {
         let snapshot = p2p.peers_snapshot().await;
-        peers = serde_json::json!(snapshot.connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        peers = serde_json::json!(
+            snapshot
+                .connected
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+        );
     }
     if let Some(compute) = &state.compute {
         let graph = compute.network_graph();
@@ -5244,10 +5459,7 @@ async fn peers_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
 /// WORKERS + OVERVIEW real state: the coordinator's live mesh (workers,
 /// health, load, capacity, models, reservations, local perf) and local node
 /// status. Empty structure when no compute manager is attached.
-async fn compute_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     // H4 role separation: the advanced operational view needs operator/admin.
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -5365,7 +5577,8 @@ async fn agents_orchestrate_handler(
         return e.into_response();
     }
     let Some(orchestrator) = &state.orchestrator else {
-        let body = serde_json::json!({ "error": "orchestrator not attached (node is not an agent host)" });
+        let body =
+            serde_json::json!({ "error": "orchestrator not attached (node is not an agent host)" });
         return (
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::to_string(&body).unwrap_or_default(),
@@ -5391,19 +5604,19 @@ async fn agents_orchestrate_handler(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let plan = match template {
-        "research_report" => match research_report_template()
-            .instantiate(&master_task, "workflow-run", now_ms)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let body = serde_json::json!({ "error": format!("template instantiation failed: {e}") });
-                return (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    serde_json::to_string(&body).unwrap_or_default(),
-                )
-                    .into_response();
+        "research_report" => {
+            match research_report_template().instantiate(&master_task, "workflow-run", now_ms) {
+                Ok(p) => p,
+                Err(e) => {
+                    let body = serde_json::json!({ "error": format!("template instantiation failed: {e}") });
+                    return (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&body).unwrap_or_default(),
+                    )
+                        .into_response();
+                }
             }
-        },
+        }
         other => {
             let body = serde_json::json!({
                 "error": format!("unknown workflow template '{other}' (supported: research_report)")
@@ -5436,10 +5649,7 @@ async fn agents_orchestrate_handler(
 /// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
 /// locality), connected peers, per-peer last-known LAN addresses, and the
 /// local peer + its own addresses. Empty when no compute/P2P.
-async fn network_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn network_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     // H4 role separation: the advanced operational view needs operator/admin.
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -5459,8 +5669,13 @@ async fn network_handler(
     });
     if let Some(p2p) = &state.p2p {
         let snapshot = p2p.peers_snapshot().await;
-        body["connected"] =
-            serde_json::json!(snapshot.connected.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        body["connected"] = serde_json::json!(
+            snapshot
+                .connected
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+        );
         body["addresses"] = serde_json::json!(
             snapshot
                 .addresses
@@ -5516,10 +5731,7 @@ async fn network_handler(
 
 /// EXECUTION real state: recent planner decisions with reasons, reservations
 /// and outcomes. Empty when no compute manager is attached.
-async fn execution_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn execution_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     // H4 role separation: the advanced operational view needs operator/admin.
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -5558,10 +5770,7 @@ async fn execution_handler(
 /// `GET /v1/sessions` — coordinator-tracked KV/session residency (M20): which
 /// worker holds each session's KV prefix, model, accounted tokens + capacity.
 /// Real accounted state only; empty when no compute manager. Operator/admin.
-async fn sessions_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn sessions_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -5640,8 +5849,20 @@ fn node_lifecycle(trusted: bool, healthy: bool, vs: &'static str) -> &'static st
         "UNKNOWN" => "UNKNOWN",
         _ if trusted && healthy && vs == "CURRENT" => "ONLINE",
         _ if trusted && healthy => "ONLINE_OUTDATED",
-        _ if trusted => if vs == "CURRENT" { "TRUSTED" } else { "TRUSTED_OUTDATED" },
-        _ => if vs == "CURRENT" { "DISCOVERED" } else { "DISCOVERED_OUTDATED" },
+        _ if trusted => {
+            if vs == "CURRENT" {
+                "TRUSTED"
+            } else {
+                "TRUSTED_OUTDATED"
+            }
+        }
+        _ => {
+            if vs == "CURRENT" {
+                "DISCOVERED"
+            } else {
+                "DISCOVERED_OUTDATED"
+            }
+        }
     }
 }
 
@@ -5667,10 +5888,18 @@ fn fabric_graph_aggregate(
     let nodes: Vec<serde_json::Value> = workers
         .iter()
         .map(|(w, trusted)| {
-            let served: Vec<String> =
-                w.capability.served_models.iter().map(|m| m.file_name.clone()).collect();
-            let available: Vec<String> =
-                w.capability.available_models.iter().map(|m| m.file_name.clone()).collect();
+            let served: Vec<String> = w
+                .capability
+                .served_models
+                .iter()
+                .map(|m| m.file_name.clone())
+                .collect();
+            let available: Vec<String> = w
+                .capability
+                .available_models
+                .iter()
+                .map(|m| m.file_name.clone())
+                .collect();
             serde_json::json!({
                 "peer_id": w.peer_id.to_string(),
                 "node_id": w.node_id,
@@ -5707,14 +5936,21 @@ fn fabric_graph_aggregate(
     for (w, _) in workers {
         // Legacy workers may advertise an empty node_id; fall back to the
         // peer id so identity is never an empty string.
-        let node = if w.node_id.is_empty() { w.peer_id.to_string() } else { w.node_id.clone() };
+        let node = if w.node_id.is_empty() {
+            w.peer_id.to_string()
+        } else {
+            w.node_id.clone()
+        };
         for m in w
             .capability
             .served_models
             .iter()
             .chain(w.capability.available_models.iter())
         {
-            models.entry(m.file_name.clone()).or_default().insert(node.clone());
+            models
+                .entry(m.file_name.clone())
+                .or_default()
+                .insert(node.clone());
         }
     }
 
@@ -5728,7 +5964,9 @@ fn fabric_graph_aggregate(
         ),
     > = std::collections::BTreeMap::new();
     for (file, node_ids) in &models {
-        let claims = registry.map(|reg| claims_for_file_name(reg, file)).unwrap_or_default();
+        let claims = registry
+            .map(|reg| claims_for_file_name(reg, file))
+            .unwrap_or_default();
         for claim in &claims {
             let (model_set, node_set) = caps.entry(claim.capability.clone()).or_default();
             model_set.insert(file.clone());
@@ -5823,10 +6061,7 @@ fn fabric_graph_aggregate(
 /// `GET /v1/fabric` (Phase C — Fabric Graph / Digital Twin). A read-only
 /// projection of the conceptual fabric graph from authoritative live state.
 /// Operator/admin-gated (H4 role separation).
-async fn fabric_graph_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn fabric_graph_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -5886,10 +6121,7 @@ fn mb(bytes: u64) -> u64 {
 /// coordinator's public API exposes only per-worker RAM reservations
 /// (`ComputeManager::reserved_ram`); VRAM reservation totals are held
 /// internally and not surfaced, so we omit them rather than guess.
-async fn resources_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn resources_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -6045,10 +6277,7 @@ async fn resources_handler(
 /// Historical Intelligence). Derived from real measured execution history
 /// (tokens, latency, outcomes per model/worker, retries). No ML, no synthetic
 /// benchmarks. Operator/admin. Read-only.
-async fn stats_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn stats_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -6083,11 +6312,12 @@ async fn can_run_handler(
     if model.trim().is_empty() || capability.trim().is_empty() {
         return forbidden("missing model and/or capability");
     }
-    let evidence = query
-        .get("evidence")
-        .map(String::as_str)
-        .unwrap_or("any");
-    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let evidence = query.get("evidence").map(String::as_str).unwrap_or("any");
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    };
     let body = mcp_worker_capability(&state, &model, &capability, evidence).await;
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -6112,11 +6342,12 @@ async fn decision_handler(
     if intent.trim().is_empty() {
         return forbidden("missing intent");
     }
-    let evidence = query
-        .get("evidence")
-        .map(String::as_str)
-        .unwrap_or("any");
-    let evidence = if evidence == "verified" { "verified" } else { "any" };
+    let evidence = query.get("evidence").map(String::as_str).unwrap_or("any");
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    };
     let model = query.get("model").map(String::as_str);
     let body = unified_fabric_decision(&state, &intent, evidence, model).await;
     (
@@ -6130,10 +6361,7 @@ async fn decision_handler(
 /// Twin): the distinct capabilities known across the fabric's on-disk models,
 /// each with verified/inferred model counts (from the real registry), plus the
 /// known capability taxonomy labels. Read-only. Operator/admin.
-async fn capabilities_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Response {
+async fn capabilities_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -6246,9 +6474,7 @@ fn enforce_size_caps(outgoing: &[u8]) -> Option<Response> {
 /// proper SSE ending; the browser then reports the meaningless "TypeError:
 /// Error in input stream". Instead, convert the failure into a clean OpenAI
 /// error event followed by `[DONE]`, so callers see a useful message.
-fn sse_safe_stream<S, E>(
-    upstream: S,
-) -> impl futures::Stream<Item = Result<Bytes, E>>
+fn sse_safe_stream<S, E>(upstream: S) -> impl futures::Stream<Item = Result<Bytes, E>>
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
@@ -6312,7 +6538,9 @@ fn stream_inference(
             let text = String::from_utf8_lossy(&body);
             let completion = sse_completion_tokens(&text);
             if completion > 0 {
-                state.tokens_generated.fetch_add(completion, Ordering::SeqCst);
+                state
+                    .tokens_generated
+                    .fetch_add(completion, Ordering::SeqCst);
                 state.note_token_usage(&auth, completion);
             }
         }
@@ -6323,9 +6551,8 @@ fn stream_inference(
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        content_type.unwrap_or_else(|| {
-            axum::http::header::HeaderValue::from_static("text/event-stream")
-        }),
+        content_type
+            .unwrap_or_else(|| axum::http::header::HeaderValue::from_static("text/event-stream")),
     );
     response
 }
@@ -6361,7 +6588,10 @@ fn resolve_chat_route(
 ) -> ChatRoute {
     for w in workers {
         if w.peer_id == *local_peer
-            && w.capability.served_models.iter().any(|m| m.file_name == model)
+            && w.capability
+                .served_models
+                .iter()
+                .any(|m| m.file_name == model)
         {
             return ChatRoute::Local;
         }
@@ -6370,7 +6600,12 @@ fn resolve_chat_route(
         if w.peer_id == *local_peer || !w.accepts_remote_inference {
             continue;
         }
-        if let Some(m) = w.capability.served_models.iter().find(|m| m.file_name == model) {
+        if let Some(m) = w
+            .capability
+            .served_models
+            .iter()
+            .find(|m| m.file_name == model)
+        {
             return ChatRoute::Remote {
                 worker: w.peer_id,
                 node_id: w.node_id.clone(),
@@ -6452,9 +6687,7 @@ fn select_best_model(
 /// response when the fabric is attached, so the dashboard can show *who*
 /// served a chat answer. `None` on plain (non-fabric) serve = no header, so
 /// non-fabric deployments keep byte-identical behaviour.
-fn local_origin_headers(
-    state: &ApiState,
-) -> Option<(header::HeaderValue, header::HeaderValue)> {
+fn local_origin_headers(state: &ApiState) -> Option<(header::HeaderValue, header::HeaderValue)> {
     let compute = state.compute.as_ref()?;
     let node_id = decentraai_distributed::short_node_id(&compute.local_peer());
     Some((
@@ -6464,11 +6697,7 @@ fn local_origin_headers(
 }
 
 /// Inserts the remote-serving origin headers on a fabric-routed response.
-fn tag_remote_response(
-    response: &mut Response,
-    worker: &decentraai_p2p::PeerId,
-    node_id: &str,
-) {
+fn tag_remote_response(response: &mut Response, worker: &decentraai_p2p::PeerId, node_id: &str) {
     let o = header::HeaderValue::from_static("remote");
     let Ok(w) = header::HeaderValue::from_str(&worker.to_string()) else {
         return;
@@ -6489,9 +6718,7 @@ fn tag_remote_response(
 /// glance *where* a model lives. Local copies win on duplicates; remote
 /// entries only come from workers that accept remote inference (a client must
 /// be able to actually reach them through this coordinator).
-async fn fabric_model_list(
-    state: &ApiState,
-) -> Option<serde_json::Value> {
+async fn fabric_model_list(state: &ApiState) -> Option<serde_json::Value> {
     let compute = state.compute.as_ref()?;
     let local_peer = compute.local_peer();
     let workers = compute.workers().await;
@@ -6652,11 +6879,7 @@ async fn proxy_handler(
 ///
 /// This is the operational surface for the adaptive fan-out of independent
 /// requests across the Laptop + Desktop fabric. Operator/admin gated.
-async fn batch_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn batch_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -6664,7 +6887,8 @@ async fn batch_handler(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "application/json")],
-            "{\"error\":{\"message\":\"fabric router unavailable\",\"type\":\"server_error\"}}".to_string(),
+            "{\"error\":{\"message\":\"fabric router unavailable\",\"type\":\"server_error\"}}"
+                .to_string(),
         )
             .into_response();
     };
@@ -6686,18 +6910,25 @@ async fn batch_handler(
             return forbidden("each request needs id, model, prompt");
         }
         let Some(model_hash) = resolve_model_hash(&state, model).await else {
-            return forbidden(&format!("model '{model}' has no advertised hash on the fabric"));
+            return forbidden(&format!(
+                "model '{model}' has no advertised hash on the fabric"
+            ));
         };
         let max_tokens = item
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(64)
             .min(4096) as u32;
-        let mut ir = decentraai_distributed::InferRequest::new(model_hash, prompt.to_string(), max_tokens)
-            .with_sender(sender)
-            .with_streaming(false);
+        let mut ir =
+            decentraai_distributed::InferRequest::new(model_hash, prompt.to_string(), max_tokens)
+                .with_sender(sender)
+                .with_streaming(false);
         ir.timeout_ms = 120_000;
-        if let Some(sid) = item.get("session_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(sid) = item
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             ir = ir.with_session(sid.to_string());
         }
         requests.push((id.to_string(), ir));
@@ -6706,7 +6937,10 @@ async fn batch_handler(
     // each independent request would be pinned to) WITHOUT executing anything.
     // Honest preview from the live allocation; never sends a request or holds a
     // reservation. Useful to understand the adaptive fan-out before running.
-    let dry_run = req.get("dry_run").and_then(|d| d.as_bool()).unwrap_or(false);
+    let dry_run = req
+        .get("dry_run")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
     if dry_run {
         let alloc = distributed.plan_batch(&requests).await;
         let assignments: Vec<serde_json::Value> = alloc
@@ -6873,12 +7107,8 @@ async fn proxy_with_auth(
                         trusted.push(w);
                     }
                 }
-                let mut remote_route: Option<(
-                    decentraai_p2p::PeerId,
-                    String,
-                    String,
-                    String,
-                )> = None;
+                let mut remote_route: Option<(decentraai_p2p::PeerId, String, String, String)> =
+                    None;
                 let mut local_rewrite: Option<String> = None;
 
                 if !worker_hint.is_empty() {
@@ -6923,8 +7153,7 @@ async fn proxy_with_auth(
                             model_hash,
                             file_name,
                         }) => {
-                            remote_route =
-                                Some((worker, node_id, model_hash, file_name));
+                            remote_route = Some((worker, node_id, model_hash, file_name));
                         }
                         Some(BestModel::Local(file_name)) => {
                             // Rewrite the outgoing body so the local backend
@@ -6940,8 +7169,7 @@ async fn proxy_with_auth(
                             node_id,
                             model_hash,
                         } => {
-                            remote_route =
-                                Some((worker, node_id, model_hash, model.clone()));
+                            remote_route = Some((worker, node_id, model_hash, model.clone()));
                         }
                         ChatRoute::Local | ChatRoute::Unknown => {
                             // Serve locally (headers added on the response).
@@ -6963,9 +7191,7 @@ async fn proxy_with_auth(
                     .await;
                 }
                 if let Some(new_model) = local_rewrite {
-                    if let Ok(mut v) =
-                        serde_json::from_slice::<serde_json::Value>(&outgoing)
-                    {
+                    if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&outgoing) {
                         v["model"] = serde_json::Value::String(new_model);
                         outgoing = serde_json::to_vec(&v).unwrap_or(outgoing);
                     }
@@ -7024,8 +7250,8 @@ async fn proxy_with_auth(
     let wants_stream = is_inference && detect_stream(&outgoing);
     match request.body(outgoing).send().await {
         Ok(upstream) => {
-            let status = StatusCode::from_u16(upstream.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
             if wants_stream && status.is_success() {
                 let local_headers = local_origin_headers(&state);
@@ -7141,20 +7367,19 @@ async fn route_remote_chat(
         }
     };
     let prompt = remote_chat_prompt(
-        body["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+        body["messages"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
     );
     // Owned copy: `prompt` is moved into InferRequest below, but the spawned
     // streamed path also needs it for the input-token estimate.
     let prompt_owned = prompt.clone();
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(1024).min(4096) as u32;
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let request = decentraai_distributed::InferRequest::new(
-        model_hash,
-        prompt,
-        max_tokens,
-    )
-    .with_sender(distributed.p2p_node().local_peer_id())
-    .with_streaming(stream);
+    let request = decentraai_distributed::InferRequest::new(model_hash, prompt, max_tokens)
+        .with_sender(distributed.p2p_node().local_peer_id())
+        .with_streaming(stream);
     // Inference on CPU is slow (a Mistral-7B response can take >30s per few
     // tokens). The protocol default timeout is 30s — far too tight for a
     // real chat turn. Derive the request deadline from the node config the
@@ -7170,14 +7395,12 @@ async fn route_remote_chat(
     let started = Instant::now();
 
     if stream {
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let dist = distributed.clone();
         let resp_task =
             tokio::spawn(async move { dist.route_request_streamed(request, progress_tx).await });
         // SSE body: consume progress chunks, then a final usage/error event.
-        let (body_tx, body_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
         let state2 = state.clone();
         let path2 = path.clone();
         let started2 = started;
@@ -7190,8 +7413,7 @@ async fn route_remote_chat(
                 }
                 let payload = format!(
                     "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
-                    serde_json::to_string(&chunk)
-                        .unwrap_or_else(|_| "\"\"".to_string())
+                    serde_json::to_string(&chunk).unwrap_or_else(|_| "\"\"".to_string())
                 );
                 if body_tx.send(Ok(Bytes::from(payload))).await.is_err() {
                     break;
@@ -7206,14 +7428,12 @@ async fn route_remote_chat(
                         decentraai_distributed::prompt_token_estimate(&prompt_owned);
                     let usage = format!(
                         "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
-                        prompt_tokens,
-                        resp.tokens_used
+                        prompt_tokens, resp.tokens_used
                     );
                     state2.record_inference(&path2, started2.elapsed(), usage.as_bytes());
                     format!(
                         "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}\n\n",
-                        prompt_tokens,
-                        resp.tokens_used
+                        prompt_tokens, resp.tokens_used
                     )
                 }
                 Ok(Err(_)) => {
@@ -7243,12 +7463,10 @@ async fn route_remote_chat(
     // Non-streaming fabric route.
     match distributed.route_request(request).await {
         Ok(resp) => {
-            let prompt_tokens =
-                decentraai_distributed::prompt_token_estimate(&prompt_owned);
+            let prompt_tokens = decentraai_distributed::prompt_token_estimate(&prompt_owned);
             let usage_json = format!(
                 "{{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
-                prompt_tokens,
-                resp.tokens_used
+                prompt_tokens, resp.tokens_used
             );
             state.record_inference(&path, started.elapsed(), usage_json.as_bytes());
             state.note_token_usage(&auth, resp.tokens_used.into());
@@ -7369,13 +7587,11 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-
 fn dashboard_js(state: &ApiState, share: &str) -> String {
     JS_TEMPLATE
         .replace("__SHARE__", &share.replace('"', "\\\""))
         .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
 }
-
 
 /// Real node + engine info derived from the local compute advertisement when a
 /// compute manager is attached. Falls back to empty markers otherwise — never
@@ -7489,7 +7705,9 @@ mod tests {
         // instead emit an OpenAI error event + [DONE] and never yield Err.
         let err = std::io::Error::other("worker died");
         let stream = futures::stream::iter(vec![
-            Ok(Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")),
+            Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
             Err(err),
         ]);
         let mut safe = Box::pin(sse_safe_stream(stream));
@@ -7507,7 +7725,10 @@ mod tests {
                 saw_done = true;
             }
         }
-        assert!(saw_error, "expected a clean SSE error event, got: {chunks:?}");
+        assert!(
+            saw_error,
+            "expected a clean SSE error event, got: {chunks:?}"
+        );
         assert!(saw_done, "expected [DONE] terminator, got: {chunks:?}");
         // The first chunk (a real delta) must pass through unchanged.
         assert!(chunks[0].contains("content\":\"hi\""));
@@ -7726,8 +7947,13 @@ mod tests {
         // None, so the proxy forwards to the configured backend.
         let dir = tempfile::tempdir().unwrap();
         let backend = start_backend().await;
-        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(3600))));
-        assert!(!manager.lock().await.is_loaded(), "remote mode has no local engine");
+        let manager = Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(
+            3600,
+        ))));
+        assert!(
+            !manager.lock().await.is_loaded(),
+            "remote mode has no local engine"
+        );
         assert!(manager.lock().await.base_url().is_none());
 
         let state = ApiState::new(
@@ -7744,7 +7970,9 @@ mod tests {
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
 
         // A metadata GET must round-trip to the remote backend.
-        let resp = reqwest::get(format!("http://{api}/v1/models")).await.unwrap();
+        let resp = reqwest::get(format!("http://{api}/v1/models"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         assert!(resp.text().await.unwrap().contains("\"list\""));
         manager.lock().await.shutdown().await.unwrap();
@@ -7893,7 +8121,10 @@ mod tests {
         assert_eq!(chat.status(), 200);
         let cj: serde_json::Value = chat.json().await.unwrap();
         assert_eq!(cj["object"], "chat.completion");
-        assert_eq!(cj["choices"][0]["message"]["content"], "Hello from the node");
+        assert_eq!(
+            cj["choices"][0]["message"]["content"],
+            "Hello from the node"
+        );
         assert_eq!(cj["usage"]["total_tokens"], 8);
         manager.lock().await.shutdown().await.unwrap();
     }
@@ -7976,7 +8207,11 @@ mod tests {
         let base = format!("http://{api}");
 
         // Fabric list includes both the served model and the on-disk one.
-        let models = client.get(format!("{base}/v1/models")).send().await.unwrap();
+        let models = client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(models.status(), 200);
         let mj: serde_json::Value = models.json().await.unwrap();
         assert_eq!(mj["object"], "list");
@@ -8021,7 +8256,12 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), 404);
         let xj: serde_json::Value = missing.json().await.unwrap();
-        assert!(xj["error"]["message"].as_str().unwrap().contains("nope.gguf"));
+        assert!(
+            xj["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nope.gguf")
+        );
 
         manager.lock().await.shutdown().await.unwrap();
     }
@@ -8194,8 +8434,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (api, manager) =
-            start_stateful_api_with_store(dir.path(), "master".to_string()).await;
+        let (api, manager) = start_stateful_api_with_store(dir.path(), "master".to_string()).await;
         let client = reqwest::Client::new();
 
         // A client token is denied the advanced operational view (H4)...
@@ -8205,7 +8444,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(denied.status(), 403, "client must not see operational views");
+        assert_eq!(
+            denied.status(),
+            403,
+            "client must not see operational views"
+        );
         let denied_net = client
             .get(format!("http://{api}/v1/network"))
             .header("Authorization", format!("Bearer {client_tok}"))
@@ -8255,8 +8498,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (api, manager) =
-            start_stateful_api_with_store(dir.path(), "master".to_string()).await;
+        let (api, manager) = start_stateful_api_with_store(dir.path(), "master".to_string()).await;
         let client = reqwest::Client::new();
         let mcp_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_decision","arguments":{"intent":"ocr","prompt":"read","confirm":true}}}"#;
 
@@ -8489,10 +8731,22 @@ mod tests {
             assert!(body.contains("Share a model"));
             // Multi-node fabric identity: per-node resource view + discovery
             // feed + worker pipe identity are part of the normal user view.
-            assert!(body.contains("Fabric nodes"), "fabric nodes strip must be in the normal view");
-            assert!(body.contains("id=\"fabric-nodes\""), "fabric nodes container id present");
-            assert!(body.contains("id=\"discovery-feed\""), "discovery feed container id present");
-            assert!(body.contains("id=\"pipe-worker-name\""), "worker pipe identity element present");
+            assert!(
+                body.contains("Fabric nodes"),
+                "fabric nodes strip must be in the normal view"
+            );
+            assert!(
+                body.contains("id=\"fabric-nodes\""),
+                "fabric nodes container id present"
+            );
+            assert!(
+                body.contains("id=\"discovery-feed\""),
+                "discovery feed container id present"
+            );
+            assert!(
+                body.contains("id=\"pipe-worker-name\""),
+                "worker pipe identity element present"
+            );
             // The JS that powers the identity view must exist (DOM without
             // renderers would stay empty — the dashboard never fakes state).
             for needle in [
@@ -8535,10 +8789,22 @@ mod tests {
         // The controls are wired to real behavior: Stop aborts the in-flight
         // request (AbortController) and the model select is populated from the
         // live /status `available_models` payload rather than a hardcoded list.
-        assert!(body.contains("new AbortController()"), "Stop must abort via AbortController");
-        assert!(body.contains("controller.signal"), "Stop aborts the fetch via its signal");
-        assert!(body.contains("s.available_models"), "chat-model must read live available_models");
-        assert!(body.contains("return v || activeModel;"), "send must fall back to the active model");
+        assert!(
+            body.contains("new AbortController()"),
+            "Stop must abort via AbortController"
+        );
+        assert!(
+            body.contains("controller.signal"),
+            "Stop aborts the fetch via its signal"
+        );
+        assert!(
+            body.contains("s.available_models"),
+            "chat-model must read live available_models"
+        );
+        assert!(
+            body.contains("return v || activeModel;"),
+            "send must fall back to the active model"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -8663,7 +8929,10 @@ mod tests {
             let idx = DASHBOARD_HTML
                 .find(needle)
                 .unwrap_or_else(|| panic!("collective graph element {needle} must be present"));
-            assert!(idx > adv_open, "{needle} must be inside the advanced container");
+            assert!(
+                idx > adv_open,
+                "{needle} must be inside the advanced container"
+            );
         }
         // The JS renders the collective graph and capability coverage from the
         // real /v1/agents payload.
@@ -8847,7 +9116,10 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(status["tiers"].is_null(), "tiers must be null when unconfigured");
+        assert!(
+            status["tiers"].is_null(),
+            "tiers must be null when unconfigured"
+        );
 
         manager.lock().await.shutdown().await.unwrap();
     }
@@ -8938,7 +9210,11 @@ mod tests {
         let client = reqwest::Client::new();
 
         // Unauthenticated -> 401/403.
-        let resp = client.get(format!("http://{api}/v1/stats")).send().await.unwrap();
+        let resp = client
+            .get(format!("http://{api}/v1/stats"))
+            .send()
+            .await
+            .unwrap();
         assert!(resp.status().is_client_error());
 
         // With the master token -> 200 JSON with a records field.
@@ -9017,7 +9293,10 @@ mod tests {
         assert!(j["capabilities"].is_array());
         assert!(j["why"].is_array());
         assert!(j["historical"].is_object(), "historical present (Phase 2)");
-        assert!(j["recent_recovery"].is_array(), "recent_recovery present (Phase 5)");
+        assert!(
+            j["recent_recovery"].is_array(),
+            "recent_recovery present (Phase 5)"
+        );
         // decision is null (no workers/models) — honest, not invented.
         assert!(j["decision"].is_null());
 
@@ -9072,7 +9351,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(resp.status().is_client_error(), "must refuse without confirm");
+        assert!(
+            resp.status().is_client_error(),
+            "must refuse without confirm"
+        );
 
         // Confirmed but no runnable fabric decision -> honest unprocessable,
         // never a fabricated execution.
@@ -9087,10 +9369,16 @@ mod tests {
         assert_eq!(resp.status(), 422);
         let j: serde_json::Value = resp.json().await.unwrap();
         assert!(
-            j["error"]["message"].as_str().unwrap().contains("no runnable decision"),
+            j["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no runnable decision"),
             "honest error: {j}"
         );
-        assert!(j["decision"].is_object(), "decision carried for explanation");
+        assert!(
+            j["decision"].is_object(),
+            "decision carried for explanation"
+        );
 
         // Dry-run: without a compute manager there is no model on the fabric, so
         // dry-run honestly returns 422 (nothing would have been executed) — never
@@ -9099,18 +9387,24 @@ mod tests {
             .post(&url)
             .header("content-type", "application/json")
             .bearer_auth("master")
-            .body(serde_json::json!({
-                "intent": "OCR these images",
-                "prompt": "read the text",
-                "max_tokens": 64,
-                "confirm": true,
-                "dry_run": true,
-            })
-            .to_string())
+            .body(
+                serde_json::json!({
+                    "intent": "OCR these images",
+                    "prompt": "read the text",
+                    "max_tokens": 64,
+                    "confirm": true,
+                    "dry_run": true,
+                })
+                .to_string(),
+            )
             .send()
             .await
             .unwrap();
-        assert_eq!(dry.status(), 422, "dry-run with no fabric model is honest 422");
+        assert_eq!(
+            dry.status(),
+            422,
+            "dry-run with no fabric model is honest 422"
+        );
 
         // Capability-only execute (no intent): accepted by the boundary and
         // honestly 422 without a fabric model (NOT 'missing intent').
@@ -9118,13 +9412,15 @@ mod tests {
             .post(&url)
             .header("content-type", "application/json")
             .bearer_auth("master")
-            .body(serde_json::json!({
-                "capability": "ocr",
-                "prompt": "read the text",
-                "max_tokens": 64,
-                "confirm": true,
-            })
-            .to_string())
+            .body(
+                serde_json::json!({
+                    "capability": "ocr",
+                    "prompt": "read the text",
+                    "max_tokens": 64,
+                    "confirm": true,
+                })
+                .to_string(),
+            )
             .send()
             .await
             .unwrap();
@@ -9182,30 +9478,42 @@ mod tests {
         // surface capabilities that come from real registry claims.
         let peer_a = decentraai_p2p::PeerId::random();
         let peer_b = decentraai_p2p::PeerId::random();
-        let adv_a = cap_adv(&peer_a, "dca-node-a", "llama_server", 8192, Some(8192), (1024, 2048), (true, true));
-        let adv_b = cap_adv(&peer_b, "dca-node-b", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let adv_a = cap_adv(
+            &peer_a,
+            "dca-node-a",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, true),
+        );
+        let adv_b = cap_adv(
+            &peer_b,
+            "dca-node-b",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
 
         let reg = decentraai_registry::ModelRegistry {
             version: 1,
             root: "/fake".into(),
-            models: std::collections::BTreeMap::from([
-                (
-                    "qwen.gguf".to_string(),
-                    decentraai_registry::ModelRecord {
-                        relative_path: "qwen.gguf".into(),
-                        canonical_path: "/fake/qwen.gguf".into(),
-                        size_bytes: 100,
-                        modification_time: 0,
-                        extension: "gguf".into(),
-                        capability_claims: vec![
-                            decentraai_registry::CapabilityClaimRecord {
-                                capability: "ocr".into(),
-                                provenance: "verified".into(),
-                            },
-                        ],
-                    },
-                ),
-            ]),
+            models: std::collections::BTreeMap::from([(
+                "qwen.gguf".to_string(),
+                decentraai_registry::ModelRecord {
+                    relative_path: "qwen.gguf".into(),
+                    canonical_path: "/fake/qwen.gguf".into(),
+                    size_bytes: 100,
+                    modification_time: 0,
+                    extension: "gguf".into(),
+                    capability_claims: vec![decentraai_registry::CapabilityClaimRecord {
+                        capability: "ocr".into(),
+                        provenance: "verified".into(),
+                    }],
+                },
+            )]),
         };
 
         let body = fabric_graph_aggregate(
@@ -9232,7 +9540,10 @@ mod tests {
         assert_eq!(models[0]["file"], "qwen.gguf");
         let model_nodes = models[0]["nodes"].as_array().unwrap();
         assert_eq!(model_nodes.len(), 2);
-        assert_eq!(models[0]["capabilities"].as_array().unwrap()[0]["capability"], "ocr");
+        assert_eq!(
+            models[0]["capabilities"].as_array().unwrap()[0]["capability"],
+            "ocr"
+        );
 
         // Capabilities: only from real registry claims (ocr), with the model
         // and both node ids attached.
@@ -9286,29 +9597,59 @@ mod tests {
         // Advisory only — never changes scheduling.
         let p1 = decentraai_p2p::PeerId::random();
         let p2 = decentraai_p2p::PeerId::random();
-        let mut w1 = cap_adv(&p1, "dca-fast", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        let mut w2 = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut w1 = cap_adv(
+            &p1,
+            "dca-fast",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let mut w2 = cap_adv(
+            &p2,
+            "dca-slow",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         w1.availability.tokens_per_second = 100;
         w1.availability.load_percent = 10; // idle 90 -> weight 90
         w2.availability.tokens_per_second = 10;
         w2.availability.load_percent = 50; // idle 50 -> weight 5
 
-        let can_run: std::collections::HashSet<String> =
-            [p1.to_string(), p2.to_string()].into();
+        let can_run: std::collections::HashSet<String> = [p1.to_string(), p2.to_string()].into();
         let lb = load_balance_for_workers(&[(w1, true), (w2, true)], &can_run);
         assert_eq!(lb.len(), 2);
         // fast/idle share (90) >> slow/busy share (5); total ~100.
         let fast = lb.iter().find(|x| x["node_id"] == "dca-fast").unwrap();
         let slow = lb.iter().find(|x| x["node_id"] == "dca-slow").unwrap();
-        assert!(fast["suggested_share_pct"].as_u64().unwrap()
-            > slow["suggested_share_pct"].as_u64().unwrap());
-        let total: u64 = lb.iter().map(|x| x["suggested_share_pct"].as_u64().unwrap()).sum();
+        assert!(
+            fast["suggested_share_pct"].as_u64().unwrap()
+                > slow["suggested_share_pct"].as_u64().unwrap()
+        );
+        let total: u64 = lb
+            .iter()
+            .map(|x| x["suggested_share_pct"].as_u64().unwrap())
+            .sum();
         assert!((95..=105).contains(&total), "shares sum ~100: {total}");
         assert!(fast["device_class"].is_string());
 
         // No eligible -> empty (honest).
-        let w2b = cap_adv(&p2, "dca-slow", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        assert!(load_balance_for_workers(&[(w2b, true)], &std::collections::HashSet::new()).is_empty());
+        let w2b = cap_adv(
+            &p2,
+            "dca-slow",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        assert!(
+            load_balance_for_workers(&[(w2b, true)], &std::collections::HashSet::new()).is_empty()
+        );
     }
 
     #[test]
@@ -9318,8 +9659,24 @@ mod tests {
         // and the share record exposes its adaptive factor.
         let p1 = decentraai_p2p::PeerId::random();
         let p2 = decentraai_p2p::PeerId::random();
-        let mut w1 = cap_adv(&p1, "dca-h", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        let mut w2 = cap_adv(&p2, "dca-hot", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut w1 = cap_adv(
+            &p1,
+            "dca-h",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let mut w2 = cap_adv(
+            &p2,
+            "dca-hot",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         w1.availability.tokens_per_second = 100;
         w1.availability.load_percent = 10;
         w2.availability.tokens_per_second = 100;
@@ -9332,7 +9689,8 @@ mod tests {
         let healthy = lb.iter().find(|x| x["node_id"] == "dca-h").unwrap();
         let hot = lb.iter().find(|x| x["node_id"] == "dca-hot").unwrap();
         assert!(
-            healthy["suggested_share_pct"].as_u64().unwrap() > hot["suggested_share_pct"].as_u64().unwrap(),
+            healthy["suggested_share_pct"].as_u64().unwrap()
+                > hot["suggested_share_pct"].as_u64().unwrap(),
             "thermally-stressed worker gets a smaller share"
         );
         assert!(
@@ -9360,7 +9718,10 @@ mod tests {
         // VERIFIED are NOT produced (no remote update mechanism exists yet).
         assert_eq!(node_lifecycle(false, false, "UNKNOWN"), "UNKNOWN");
         assert_eq!(node_lifecycle(false, true, "CURRENT"), "DISCOVERED");
-        assert_eq!(node_lifecycle(false, true, "OUTDATED"), "DISCOVERED_OUTDATED");
+        assert_eq!(
+            node_lifecycle(false, true, "OUTDATED"),
+            "DISCOVERED_OUTDATED"
+        );
         assert_eq!(node_lifecycle(true, false, "CURRENT"), "TRUSTED");
         assert_eq!(node_lifecycle(true, false, "OUTDATED"), "TRUSTED_OUTDATED");
         assert_eq!(node_lifecycle(true, true, "CURRENT"), "ONLINE");
@@ -9411,9 +9772,17 @@ mod tests {
 
         // node: RAM/CPU/disk always present; RAM and VRAM stay separate.
         assert!(j["node"]["ram"]["total_mb"].is_number());
-        assert_eq!(j["node"]["ram"]["reserved_mb"], 0, "node tracks no reservation");
-        assert_eq!(j["node"]["ram"]["in_use_mb"], j["node"]["ram"]["total_mb"].as_u64().unwrap()
-            .saturating_sub(j["node"]["ram"]["available_mb"].as_u64().unwrap()));
+        assert_eq!(
+            j["node"]["ram"]["reserved_mb"], 0,
+            "node tracks no reservation"
+        );
+        assert_eq!(
+            j["node"]["ram"]["in_use_mb"],
+            j["node"]["ram"]["total_mb"]
+                .as_u64()
+                .unwrap()
+                .saturating_sub(j["node"]["ram"]["available_mb"].as_u64().unwrap())
+        );
         assert_eq!(j["node"]["ram"]["provenance"], "MEASURED");
         assert_eq!(j["node"]["cpu"]["provenance"], "MEASURED");
         assert_eq!(j["node"]["disk"]["provenance"], "MEASURED");
@@ -9619,15 +9988,14 @@ mod tests {
             params: Some("1B".into()),
         }
         .fill_from_tags();
-        let files = vec![
-            decentraai_hub::HubModelFile {
-                path: "q4_k_m.gguf".into(),
-                size: Some(100 * 1024 * 1024),
-                lfs: None,
-            },
-        ];
+        let files = vec![decentraai_hub::HubModelFile {
+            path: "q4_k_m.gguf".into(),
+            size: Some(100 * 1024 * 1024),
+            lfs: None,
+        }];
         let caps = detail.capabilities();
-        let body = hub_compare_model_body(&detail, &files, &caps, &state, "org/test-model", None).await;
+        let body =
+            hub_compare_model_body(&detail, &files, &caps, &state, "org/test-model", None).await;
         assert_eq!(body["id"], "org/test-model");
         let variants = body["variants"].as_array().unwrap();
         assert_eq!(variants.len(), 1);
@@ -9685,8 +10053,14 @@ mod tests {
         .await;
         let fit = body["capabilities"]["fit"].clone();
         assert_eq!(fit["capability"], "ocr");
-        assert_eq!(fit["satisfied"], true, "verified claim must satisfy verified requirement");
-        assert_eq!(fit["checks"][0]["status"]["satisfied"]["provenance"], "verified");
+        assert_eq!(
+            fit["satisfied"], true,
+            "verified claim must satisfy verified requirement"
+        );
+        assert_eq!(
+            fit["checks"][0]["status"]["satisfied"]["provenance"],
+            "verified"
+        );
 
         // INFERRED coding only (id heuristic) must NOT satisfy Verified.
         let inferred = make_detail("org/codestral".into(), vec!["gguf".into()]);
@@ -9702,7 +10076,10 @@ mod tests {
         .await;
         let fit = body["capabilities"]["fit"].clone();
         assert_eq!(fit["capability"], "coding");
-        assert_eq!(fit["satisfied"], false, "inferred-only must not satisfy verified");
+        assert_eq!(
+            fit["satisfied"], false,
+            "inferred-only must not satisfy verified"
+        );
         assert_eq!(
             fit["checks"][0]["status"]["insufficient_provenance"]["found"],
             "inferred"
@@ -9860,7 +10237,9 @@ mod tests {
             .post(format!("http://{api}/api/admin/token/create"))
             .header("Authorization", "Bearer master_token")
             .header("Content-Type", "application/json")
-            .body(format!(r#"{{"name":"dev_token","tier":2,"expires_at":{exp}}}"#))
+            .body(format!(
+                r#"{{"name":"dev_token","tier":2,"expires_at":{exp}}}"#
+            ))
             .send()
             .await
             .unwrap();
@@ -9945,14 +10324,20 @@ mod tests {
         assert_eq!(ocr["total"], 2);
 
         // Vision: the image-text-to-text model qualifies (verified pipeline).
-        let vision =
-            hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Vision));
+        let vision = hub_search_body(
+            "models",
+            &models,
+            Some(decentraai_hub::CapabilityKind::Vision),
+        );
         assert_eq!(vision["matched"], 1);
         assert_eq!(vision["models"][0]["id"], "org/vision-model");
 
         // Coding is not claimed by either model (no name/tag hint) -> 0 hits.
-        let coding =
-            hub_search_body("models", &models, Some(decentraai_hub::CapabilityKind::Coding));
+        let coding = hub_search_body(
+            "models",
+            &models,
+            Some(decentraai_hub::CapabilityKind::Coding),
+        );
         assert_eq!(coding["matched"], 0);
     }
 
@@ -10028,9 +10413,15 @@ mod tests {
             capability: decentraai_distributed::compute::ComputeCapability {
                 cpu_cores: 4,
                 ram_mb: 16384,
-                gpu: if est_vram > 0 { Some(decentraai_distributed::compute::GpuSpec {
-                    name: "gpu".into(), vram_mb: est_vram + 1024, driver: "x".into(),
-                }) } else { None },
+                gpu: if est_vram > 0 {
+                    Some(decentraai_distributed::compute::GpuSpec {
+                        name: "gpu".into(),
+                        vram_mb: est_vram + 1024,
+                        driver: "x".into(),
+                    })
+                } else {
+                    None
+                },
                 engine: engine.to_string(),
                 served_models: if served { vec![sm.clone()] } else { vec![] },
                 can_provision: false,
@@ -10062,8 +10453,23 @@ mod tests {
     #[test]
     fn worker_cap_verified_claim_plus_compatible_worker_can_run() {
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::CanRun);
         assert_eq!(r.model_availability, "served");
         assert!(r.trusted);
@@ -10081,64 +10487,115 @@ mod tests {
 
     #[test]
     fn quantization_q4_k_m_is_q4() {
-        assert_eq!(variant_quantization_from_file_name("qwen2.5-7b-instruct-q4_k_m.gguf"), Some("Q4".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("qwen2.5-7b-instruct-q4_k_m.gguf"),
+            Some("Q4".to_string())
+        );
     }
 
     #[test]
     fn quantization_q8_0_is_q8() {
-        assert_eq!(variant_quantization_from_file_name("model-q8_0.gguf"), Some("Q8".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q8_0.gguf"),
+            Some("Q8".to_string())
+        );
     }
 
     #[test]
     fn quantization_q6_k_is_q6() {
-        assert_eq!(variant_quantization_from_file_name("model-q6_k.gguf"), Some("Q6".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q6_k.gguf"),
+            Some("Q6".to_string())
+        );
     }
 
     #[test]
     fn quantization_q5_1_is_q5() {
-        assert_eq!(variant_quantization_from_file_name("model-q5_1.gguf"), Some("Q5".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q5_1.gguf"),
+            Some("Q5".to_string())
+        );
     }
 
     #[test]
     fn quantization_q3_k_is_q3() {
-        assert_eq!(variant_quantization_from_file_name("model-q3_k.gguf"), Some("Q3".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q3_k.gguf"),
+            Some("Q3".to_string())
+        );
     }
 
     #[test]
     fn quantization_q2_k_is_q2() {
-        assert_eq!(variant_quantization_from_file_name("model-q2_k.gguf"), Some("Q2".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q2_k.gguf"),
+            Some("Q2".to_string())
+        );
     }
 
     #[test]
     fn quantization_fp16_is_fp16() {
-        assert_eq!(variant_quantization_from_file_name("model-fp16.gguf"), Some("FP16".to_string()));
-        assert_eq!(variant_quantization_from_file_name("model-f16.gguf"), Some("FP16".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-fp16.gguf"),
+            Some("FP16".to_string())
+        );
+        assert_eq!(
+            variant_quantization_from_file_name("model-f16.gguf"),
+            Some("FP16".to_string())
+        );
     }
 
     #[test]
     fn quantization_unknown_without_marker_is_none() {
         assert_eq!(variant_quantization_from_file_name("model.gguf"), None);
         assert_eq!(variant_quantization_from_file_name("qwen.gguf"), None);
-        assert_eq!(variant_quantization_from_file_name("no_quant_here.gguf"), None);
+        assert_eq!(
+            variant_quantization_from_file_name("no_quant_here.gguf"),
+            None
+        );
     }
 
     #[test]
     fn quantization_is_case_insensitive() {
-        assert_eq!(variant_quantization_from_file_name("model-Q4_K_M.gguf"), Some("Q4".to_string()));
-        assert_eq!(variant_quantization_from_file_name("MODEL-Q8_0.gguf"), Some("Q8".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-Q4_K_M.gguf"),
+            Some("Q4".to_string())
+        );
+        assert_eq!(
+            variant_quantization_from_file_name("MODEL-Q8_0.gguf"),
+            Some("Q8".to_string())
+        );
     }
 
     #[test]
     fn quantization_q4_0_is_q4() {
-        assert_eq!(variant_quantization_from_file_name("model-q4_0.gguf"), Some("Q4".to_string()));
+        assert_eq!(
+            variant_quantization_from_file_name("model-q4_0.gguf"),
+            Some("Q4".to_string())
+        );
     }
 
     #[test]
     fn worker_cap_insufficient_ram_cannot_run() {
         let peer = decentraai_p2p::PeerId::random();
         // Model needs 8192 MiB RAM but worker has only 512 free.
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 512, Some(8192), (8192, 2048), (true, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            512,
+            Some(8192),
+            (8192, 2048),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
         let ram = r.checks.iter().find(|c| c.check == "ram").unwrap();
         assert!(!ram.pass && ram.state == "insufficient");
@@ -10148,8 +10605,23 @@ mod tests {
     fn worker_cap_insufficient_vram_cannot_run() {
         let peer = decentraai_p2p::PeerId::random();
         // Model needs 8192 MiB VRAM but worker has only 512 free.
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(512), (1024, 8192), (true, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(512),
+            (1024, 8192),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
         let vram = r.checks.iter().find(|c| c.check == "vram").unwrap();
         assert!(!vram.pass && vram.state == "insufficient");
@@ -10158,7 +10630,15 @@ mod tests {
     #[test]
     fn worker_cap_inferred_claim_with_verified_evidence_cannot_run() {
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         // Only an INFERRED claim, but evidence=verified is required.
         let inferred = vec![("ocr".to_string(), "inferred".to_string())];
         let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "verified", &inferred);
@@ -10170,7 +10650,15 @@ mod tests {
     #[test]
     fn worker_cap_missing_claim_unknown() {
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         // No claim at all for the model -> UNKNOWN (never a false pass).
         let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &[]);
         assert_eq!(r.verdict, WorkerCapVerdict::Unknown);
@@ -10181,8 +10669,23 @@ mod tests {
     #[test]
     fn worker_cap_untrusted_cannot_run() {
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        let r = worker_capability_verdict(&adv, false, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            false,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::CannotRun);
         let t = r.checks.iter().find(|c| c.check == "trusted").unwrap();
         assert!(!t.pass && t.state == "not_trusted");
@@ -10195,15 +10698,47 @@ mod tests {
         // CANNOT_RUN via the policy check, even though it is trusted, healthy,
         // holds the model and has sufficient resources.
         let peer = decentraai_p2p::PeerId::random();
-        let mut adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         adv.accepts_remote_inference = false;
-        let r = worker_capability_verdict_with_policy(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr(), false);
-        assert_eq!(r.verdict, WorkerCapVerdict::CannotRun, "remote-no-opt-in must be CANNOT_RUN");
+        let r = worker_capability_verdict_with_policy(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+            false,
+        );
+        assert_eq!(
+            r.verdict,
+            WorkerCapVerdict::CannotRun,
+            "remote-no-opt-in must be CANNOT_RUN"
+        );
         let p = r.checks.iter().find(|c| c.check == "policy").unwrap();
         assert!(!p.pass && p.state == "remote_not_accepted");
         // The LOCAL node is always allowed its own work regardless of the flag.
-        let r = worker_capability_verdict_with_policy(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr(), true);
-        assert_eq!(r.verdict, WorkerCapVerdict::CanRun, "local worker always allowed");
+        let r = worker_capability_verdict_with_policy(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+            true,
+        );
+        assert_eq!(
+            r.verdict,
+            WorkerCapVerdict::CanRun,
+            "local worker always allowed"
+        );
     }
 
     #[test]
@@ -10212,8 +10747,23 @@ mod tests {
         // Unknown engine holding a model on disk -> compatibility unknown (not
         // a definitive incompatible); use a model the worker does NOT hold for
         // a hard engine failure via unavailable model.
-        let adv = cap_adv(&peer, "dca-node1", "weird-engine", 8192, Some(8192), (1024, 2048), (false, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "weird-engine",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (false, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::CannotRun); // model unavailable
     }
 
@@ -10222,8 +10772,23 @@ mod tests {
         let peer = decentraai_p2p::PeerId::random();
         // Model served but est_ram=0 (unknown footprint) -> RAM UNKNOWN, and no
         // VRAM telemetry -> overall UNKNOWN (no hard failure).
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, None, (0, 0), (true, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            None,
+            (0, 0),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.verdict, WorkerCapVerdict::Unknown);
         let ram = r.checks.iter().find(|c| c.check == "ram").unwrap();
         assert!(!ram.pass && ram.state == "unknown");
@@ -10245,8 +10810,23 @@ mod tests {
     #[test]
     fn worker_cap_json_keeps_identity_separate() {
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         let j = r.to_json();
         assert_eq!(j["worker"]["node_id"], "dca-node1");
         assert_eq!(j["worker"]["node_name"], "dca-node1");
@@ -10316,7 +10896,11 @@ mod tests {
     fn aggregate_can_i_run_no_workers_is_unknown_not_invented() {
         let fit = aggregate_can_i_run(&[]);
         assert_eq!(fit.verdict, WorkerCapVerdict::Unknown);
-        assert!(fit.reasons.iter().any(|r| r.contains("no compatible worker")));
+        assert!(
+            fit.reasons
+                .iter()
+                .any(|r| r.contains("no compatible worker"))
+        );
         assert_eq!(fit.chosen_worker, None);
     }
 
@@ -10328,12 +10912,28 @@ mod tests {
         let claims = claims_verified_ocr();
         let good = {
             let peer = decentraai_p2p::PeerId::random();
-            let adv = cap_adv(&peer, "dca-good", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+            let adv = cap_adv(
+                &peer,
+                "dca-good",
+                "llama_server",
+                8192,
+                Some(8192),
+                (1024, 2048),
+                (true, false),
+            );
             worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims)
         };
         let bad = {
             let peer = decentraai_p2p::PeerId::random();
-            let adv = cap_adv(&peer, "dca-bad", "llama_server", 512, Some(8192), (8192, 2048), (true, false));
+            let adv = cap_adv(
+                &peer,
+                "dca-bad",
+                "llama_server",
+                512,
+                Some(8192),
+                (8192, 2048),
+                (true, false),
+            );
             worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims)
         };
         assert_eq!(good.verdict, WorkerCapVerdict::CanRun);
@@ -10355,9 +10955,24 @@ mod tests {
         // must surface the INFERRED label in its JSON projection (and null when
         // the name has no marker).
         let peer = decentraai_p2p::PeerId::random();
-        let adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         // cap_adv uses "qwen.gguf" (no marker) => quantization stays None.
-        let r = worker_capability_verdict(&adv, true, "qwen.gguf", "ocr", "any", &claims_verified_ocr());
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.quantization, None);
         let j = r.to_json();
         assert!(j["quantization"].is_null());
@@ -10368,9 +10983,24 @@ mod tests {
         // A worker whose served model file name carries a quant marker: the
         // per-worker result surfaces the INFERRED label in its JSON projection.
         let peer = decentraai_p2p::PeerId::random();
-        let mut adv = cap_adv(&peer, "dca-node1", "llama_server", 8192, Some(8192), (1024, 2048), (true, false));
+        let mut adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
         adv.capability.served_models[0].file_name = "qwen2.5-7b-instruct-q4_k_m.gguf".to_string();
-        let r = worker_capability_verdict(&adv, true, "qwen2.5-7b-instruct-q4_k_m.gguf", "ocr", "any", &claims_verified_ocr());
+        let r = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen2.5-7b-instruct-q4_k_m.gguf",
+            "ocr",
+            "any",
+            &claims_verified_ocr(),
+        );
         assert_eq!(r.quantization.as_deref(), Some("Q4"));
         let j = r.to_json();
         assert_eq!(j["quantization"], "Q4");
@@ -10433,23 +11063,34 @@ mod tests {
 
         // `tools` tag -> VERIFIED tool calling claim.
         let claims = body["capabilities"]["claims"].as_array().unwrap();
-        assert!(claims.iter().any(|c| {
-            c["capability"] == "tool_calling" && c["provenance"] == "verified"
-        }));
+        assert!(
+            claims
+                .iter()
+                .any(|c| { c["capability"] == "tool_calling" && c["provenance"] == "verified" })
+        );
 
         // `code` in the id -> INFERRED coding + its tasks.
-        assert!(claims.iter().any(|c| {
-            c["capability"] == "coding" && c["provenance"] == "inferred"
-        }));
+        assert!(
+            claims
+                .iter()
+                .any(|c| { c["capability"] == "coding" && c["provenance"] == "inferred" })
+        );
         let tasks = body["capabilities"]["tasks"].as_array().unwrap();
-        assert!(tasks.iter().any(|t| t["task"] == "repository understanding"));
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t["task"] == "repository understanding")
+        );
 
         // Variants carry file + size + sha256 when the Hub reported it.
         let variants = body["variants"].as_array().unwrap();
         assert_eq!(variants.len(), 2);
         assert_eq!(variants[0]["file"], "q4_k_m.gguf");
         assert_eq!(variants[0]["sha256"], "abc123");
-        assert!(variants[1]["sha256"].is_null(), "absent digest stays unknown");
+        assert!(
+            variants[1]["sha256"].is_null(),
+            "absent digest stays unknown"
+        );
 
         // No compute manager attached -> empty fabric list (never fabricated).
         assert!(body["fabric"].as_array().unwrap().is_empty());
@@ -10501,7 +11142,10 @@ mod tests {
         .await;
         let fit = body["capabilities"]["fit"].clone();
         assert_eq!(fit["capability"], "coding");
-        assert_eq!(fit["satisfied"], false, "inferred-only must not satisfy verified");
+        assert_eq!(
+            fit["satisfied"], false,
+            "inferred-only must not satisfy verified"
+        );
         assert_eq!(
             fit["checks"][0]["status"]["insufficient_provenance"]["found"],
             "inferred"
@@ -10588,7 +11232,8 @@ mod tests {
     #[test]
     fn claims_for_file_name_matches_by_suffix_and_omits_unknown() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        let mut registry =
+            decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
         // Keyed by relative path (path under models/ ending with the file name).
         registry.models.insert(
             "org/codestral/codestral.gguf".to_string(),
@@ -10629,7 +11274,8 @@ mod tests {
     #[test]
     fn registry_variants_for_model_matches_and_sorts_deterministically() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
+        let mut registry =
+            decentraai_registry::ModelRegistry::new(dir.path().to_path_buf()).unwrap();
         let mut record = |relative_path: &str, size: u64| {
             registry.models.insert(
                 relative_path.to_string(),
@@ -10668,7 +11314,10 @@ mod tests {
         // Model string contains the record's file name -> still matches.
         let by_suffix = registry_variants_for_model(&registry, "q4_k_m.gguf");
         assert_eq!(by_suffix.len(), 1);
-        assert_eq!(by_suffix[0].0, "qwen2.5-7b-instruct/qwen2.5-7b-instruct-q4_k_m.gguf");
+        assert_eq!(
+            by_suffix[0].0,
+            "qwen2.5-7b-instruct/qwen2.5-7b-instruct-q4_k_m.gguf"
+        );
 
         // No records for an absent model -> empty, never invented.
         assert!(registry_variants_for_model(&registry, "does-not-exist").is_empty());
@@ -10789,19 +11438,32 @@ mod tests {
         );
 
         let body = mcp_intent_with_fit(&state, "I need OCR and coding", "any").await;
-        let caps = body["capabilities"].as_array().expect("capabilities present");
+        let caps = body["capabilities"]
+            .as_array()
+            .expect("capabilities present");
         assert!(!caps.is_empty(), "intent resolves to capabilities");
 
         // Find the OCR and coding entries.
-        let ocr = caps.iter().find(|c| c["capability"] == "ocr").expect("ocr present");
-        let coding = caps.iter().find(|c| c["capability"] == "coding").expect("coding present");
+        let ocr = caps
+            .iter()
+            .find(|c| c["capability"] == "ocr")
+            .expect("ocr present");
+        let coding = caps
+            .iter()
+            .find(|c| c["capability"] == "coding")
+            .expect("coding present");
         // OCR uses the real local model; no workers -> honest UNKNOWN fit.
         assert_eq!(ocr["model"], "qwen.gguf");
         assert_eq!(ocr["fit"]["verdict"], "UNKNOWN");
         // Coding has no local model -> UNKNOWN with an explicit reason.
         assert!(coding["model"].is_null());
         assert_eq!(coding["fit"]["verdict"], "UNKNOWN");
-        assert!(coding["fit"]["reasons"][0].as_str().unwrap().contains("no local model"));
+        assert!(
+            coding["fit"]["reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("no local model")
+        );
 
         // An intent with no recognized capability yields an empty list.
         let body = mcp_intent_with_fit(&state, "zzz unknown words", "any").await;
@@ -11008,8 +11670,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trust.status(), 200);
-        assert_eq!(trust.json::<serde_json::Value>().await.unwrap()["trusted"], true);
-        assert!(compute.is_trusted(&worker).await, "worker trusted after approve");
+        assert_eq!(
+            trust.json::<serde_json::Value>().await.unwrap()["trusted"],
+            true
+        );
+        assert!(
+            compute.is_trusted(&worker).await,
+            "worker trusted after approve"
+        );
 
         // In the /v1/compute worker report the trust flag reflects it too.
         let report: serde_json::Value = client
@@ -11045,7 +11713,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoke.status(), 200);
-        assert!(!compute.is_trusted(&worker).await, "worker revoked after revoke");
+        assert!(
+            !compute.is_trusted(&worker).await,
+            "worker revoked after revoke"
+        );
 
         // The actions were audited (security events are control-plane material).
         let ev = client
@@ -11095,7 +11766,10 @@ mod tests {
             .post(format!("http://{api}/api/admin/worker/trust"))
             .header("Authorization", "Bearer master_token")
             .header("Content-Type", "application/json")
-            .body(serde_json::json!({"peer_id": decentraai_p2p::PeerId::random().to_string()}).to_string())
+            .body(
+                serde_json::json!({"peer_id": decentraai_p2p::PeerId::random().to_string()})
+                    .to_string(),
+            )
             .send()
             .await
             .unwrap();
@@ -11143,7 +11817,12 @@ mod tests {
             .json()
             .await
             .unwrap();
-        let op = list["tokens"].as_array().unwrap().iter().find(|t| t["name"] == "op").unwrap();
+        let op = list["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "op")
+            .unwrap();
         assert_eq!(op["role"], "operator", "role must round-trip");
 
         // The Admin page itself offers the role selector and the audit list.
@@ -11156,9 +11835,18 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(html.contains("operator"), "admin page must offer the operator role");
-        assert!(html.contains("Audit Events"), "admin page must show audit events");
-        assert!(html.contains("/api/admin/events"), "audit list must fetch the gated events endpoint");
+        assert!(
+            html.contains("operator"),
+            "admin page must offer the operator role"
+        );
+        assert!(
+            html.contains("Audit Events"),
+            "admin page must show audit events"
+        );
+        assert!(
+            html.contains("/api/admin/events"),
+            "audit list must fetch the gated events endpoint"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
     #[test]
@@ -11226,7 +11914,9 @@ mod tests {
 
         // A subscriber token is not an admin: forbidden.
         let mut store = decentraai_tokens::TokenStore::load(&token_store).unwrap();
-        let sub = store.create("alice", decentraai_tokens::Tier(2), None).unwrap();
+        let sub = store
+            .create("alice", decentraai_tokens::Tier(2), None)
+            .unwrap();
         let subscriber = reqwest::Client::new()
             .post(format!("http://{api}/api/admin/token/create"))
             .header("Authorization", format!("Bearer {sub}"))
@@ -11308,7 +11998,10 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("data:"), "SSE body expected, got {body:?}");
         assert!(body.contains("Hel"), "first delta forwarded");
-        assert!(body.contains("Lo") || body.contains("lo"), "second delta forwarded");
+        assert!(
+            body.contains("Lo") || body.contains("lo"),
+            "second delta forwarded"
+        );
         assert!(body.contains("[DONE]"), "sentinel forwarded");
 
         // The token-use accounting picked up the streamed usage.
@@ -11322,10 +12015,7 @@ mod tests {
     /// returned [`ServeManager`] wraps the app; `dir` keeps the fake
     /// engine's temp dir alive for the test.
     #[cfg(unix)]
-    async fn start_echo_backend(
-        dir: &Path,
-        hits: Arc<AtomicU64>,
-    ) -> Arc<Mutex<ServeManager>> {
+    async fn start_echo_backend(dir: &Path, hits: Arc<AtomicU64>) -> Arc<Mutex<ServeManager>> {
         let app_hits = Arc::clone(&hits);
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -11365,7 +12055,8 @@ mod tests {
 
         // Oversized prompt text (> MAX_PROMPT_BYTES) -> 413, never forwarded.
         let big_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
-        let body = serde_json::json!({"model":"m","messages":[{"role":"user","content":big_prompt}]});
+        let body =
+            serde_json::json!({"model":"m","messages":[{"role":"user","content":big_prompt}]});
         let resp = client
             .post(&base)
             .header("Content-Type", "application/json")
@@ -11375,10 +12066,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 413);
         let err: serde_json::Value = resp.json().await.unwrap();
-        assert!(err["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("prompt exceeds"));
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("prompt exceeds")
+        );
 
         // Oversized max_tokens (> MAX_OUTPUT_TOKENS) -> 400, never forwarded.
         let big_tokens = MAX_OUTPUT_TOKENS + 1;
@@ -11396,10 +12089,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 400);
         let err: serde_json::Value = resp.json().await.unwrap();
-        assert!(err["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("max_tokens"));
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_tokens")
+        );
 
         // Neither oversized request reached the backend.
         assert_eq!(hits.load(Ordering::SeqCst), 0);
@@ -11438,7 +12133,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "in-limit request must reach the backend");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "in-limit request must reach the backend"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -11452,7 +12151,11 @@ mod tests {
 
         // A metadata GET must not reset the idle clock: it keeps growing.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let after_get_before_sleep = manager.lock().await.idle_for();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -11463,7 +12166,11 @@ mod tests {
         );
 
         // Another GET keeps it growing (no idle reset either).
-        client.get(format!("{base}/v1/models")).send().await.unwrap();
+        client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap();
         let after_more_get = manager.lock().await.idle_for();
         assert!(
             after_more_get >= after_get,
@@ -11495,10 +12202,7 @@ mod tests {
         accepts_remote: bool,
         models: &[(&str, &str)],
     ) -> decentraai_distributed::ComputeAdvertisement {
-        let sized: Vec<(&str, &str, u64)> = models
-            .iter()
-            .map(|(f, h)| (*f, *h, 1024))
-            .collect();
+        let sized: Vec<(&str, &str, u64)> = models.iter().map(|(f, h)| (*f, *h, 1024)).collect();
         test_adv_sized(peer, node_id, accepts_remote, &sized)
     }
 
@@ -11518,16 +12222,16 @@ mod tests {
                 engine: "llama_server".to_string(),
                 served_models: models
                     .iter()
-                    .map(|(f, h, size)| {
-                        decentraai_distributed::compute::ServedModel {
+                    .map(
+                        |(f, h, size)| decentraai_distributed::compute::ServedModel {
                             model_hash: h.to_string(),
                             file_name: f.to_string(),
                             size_mb: *size,
                             est_ram_mb: 1024,
                             est_vram_mb: 0,
                             context_tokens: 4096,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
                 can_provision: false,
                 available_models: vec![],
@@ -11618,10 +12322,7 @@ mod tests {
             r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#,
         )
         .unwrap();
-        assert_eq!(
-            remote_chat_prompt(&msgs),
-            "user: hi\n\nassistant: hello"
-        );
+        assert_eq!(remote_chat_prompt(&msgs), "user: hi\n\nassistant: hello");
     }
 
     #[test]
@@ -11768,7 +12469,10 @@ mod tests {
             .await
             .unwrap();
         let plaintext = created["token"].as_str().unwrap().to_string();
-        assert!(plaintext.starts_with("dca_"), "consumer key uses dca_ namespace");
+        assert!(
+            plaintext.starts_with("dca_"),
+            "consumer key uses dca_ namespace"
+        );
 
         // A consumer-key chat request authenticates and executes.
         let resp = client
@@ -11781,7 +12485,11 @@ mod tests {
         assert_eq!(resp.status(), 200, "consumer key must serve inference");
 
         // The reservation was settled against measured usage (20 tokens).
-        let acc = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
+        let acc = ledger
+            .lock()
+            .unwrap()
+            .account(&"consumer-account".to_string())
+            .unwrap();
         assert_eq!(acc.consumed, 20, "measured 20 completion tokens debited");
         assert_eq!(acc.reserved, 0, "no quota left reserved after settle");
         assert_eq!(acc.available, 980, "1000 - 20 consumed");
@@ -11794,7 +12502,10 @@ mod tests {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("http://{api}/v1/chat/completions"))
-            .header("Authorization", "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000")
+            .header(
+                "Authorization",
+                "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000",
+            )
             .json(&serde_json::json!({"model":"test","messages":[]}))
             .send()
             .await
@@ -11882,7 +12593,10 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(ops.status() == 403 || ops.status() == 401, "consumer key is not operator");
+        assert!(
+            ops.status() == 403 || ops.status() == 401,
+            "consumer key is not operator"
+        );
     }
 
     #[tokio::test]
@@ -11895,7 +12609,9 @@ mod tests {
         {
             let mut l = ledger.lock().unwrap();
             // Spend it all via a reservation + settle.
-            let res = l.reserve(&"consumer-account".to_string(), "drain", 1000).unwrap();
+            let res = l
+                .reserve(&"consumer-account".to_string(), "drain", 1000)
+                .unwrap();
             let _ = l.settle(&res.reservation_id, 1000);
         }
 
@@ -11923,7 +12639,10 @@ mod tests {
         // No spendable quota -> the request is refused (403) with a clear body.
         assert_eq!(resp.status(), 403, "no quota -> consumer request denied");
         let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
-        assert!(audit.contains("consumer_quota_denied"), "denial must be audited");
+        assert!(
+            audit.contains("consumer_quota_denied"),
+            "denial must be audited"
+        );
     }
 
     #[tokio::test]
@@ -11943,7 +12662,9 @@ mod tests {
             let mut state = ApiState::new(
                 "http://127.0.0.1:1".to_string(), // unreachable backend
                 Some("master".to_string()),
-                Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(3600)))),
+                Arc::new(Mutex::new(ServeManager::unloaded(Duration::from_secs(
+                    3600,
+                )))),
                 test_info(dir.path(), None),
                 None,
                 None,
@@ -11951,10 +12672,7 @@ mod tests {
                 None,
                 None,
             );
-            state.attach_consumer(
-                Some(keys_dir.path().join("ck.json")),
-                Some(ledger.clone()),
-            );
+            state.attach_consumer(Some(keys_dir.path().join("ck.json")), Some(ledger.clone()));
             state
         };
         let guard = state
@@ -12099,7 +12817,11 @@ mod tests {
         // execution cannot route. That is the failure case: the consumer's
         // reservation must be RELEASED (not leaked, not settled) because no
         // measured work completed.
-        let before = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
+        let before = ledger
+            .lock()
+            .unwrap()
+            .account(&"consumer-account".to_string())
+            .unwrap();
         let before_available = before.available;
 
         let r = client
@@ -12117,14 +12839,27 @@ mod tests {
         let content = j["result"]["content"][0]["text"].as_str().unwrap_or("");
         let parsed: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
         // Without a fabric router the execution cannot succeed (honest).
-        assert_eq!(parsed["ok"], false, "no fabric router -> execution fails honestly");
+        assert_eq!(
+            parsed["ok"], false,
+            "no fabric router -> execution fails honestly"
+        );
 
         // The reservation was released on failure: no quota leaked as reserved
         // and nothing was consumed (no measured work).
-        let after = ledger.lock().unwrap().account(&"consumer-account".to_string()).unwrap();
-        assert_eq!(after.reserved, 0, "failed execution must release its reservation");
+        let after = ledger
+            .lock()
+            .unwrap()
+            .account(&"consumer-account".to_string())
+            .unwrap();
+        assert_eq!(
+            after.reserved, 0,
+            "failed execution must release its reservation"
+        );
         assert_eq!(after.consumed, 0, "failed execution settles nothing");
-        assert_eq!(after.available, before_available, "quota fully returned to the pool");
+        assert_eq!(
+            after.available, before_available,
+            "quota fully returned to the pool"
+        );
     }
 
     #[tokio::test]
@@ -12136,7 +12871,13 @@ mod tests {
 
         // A consumer must NOT see the operational/read views (workers,
         // network, executions, sessions, quota, consumer keys).
-        for tool in ["list_workers", "list_sessions", "get_quota", "list_consumer_keys", "list_executions"] {
+        for tool in [
+            "list_workers",
+            "list_sessions",
+            "get_quota",
+            "list_consumer_keys",
+            "list_executions",
+        ] {
             let r = client
                 .post(format!("http://{api}/mcp"))
                 .header("Authorization", format!("Bearer {plaintext}"))
@@ -12158,7 +12899,10 @@ mod tests {
         let client = reqwest::Client::new();
         let r = client
             .post(format!("http://{api}/mcp"))
-            .header("Authorization", "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000")
+            .header(
+                "Authorization",
+                "Bearer dca_0000000000000000000000000000000000000000000000000000000000000000",
+            )
             .json(&serde_json::json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call",
                 "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
@@ -12166,7 +12910,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status(), 401, "unknown consumer key is unauthorized via MCP");
+        assert_eq!(
+            r.status(),
+            401,
+            "unknown consumer key is unauthorized via MCP"
+        );
     }
 
     #[tokio::test]

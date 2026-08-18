@@ -86,7 +86,12 @@ fn default_weight() -> f64 {
 
 impl OptimizationObservation {
     /// Builds an observation, clamping `weight` into `[0, 1]`.
-    pub fn new(dimension: OptimizationDimension, value: f64, weight: f64, observed_at_ms: u64) -> Self {
+    pub fn new(
+        dimension: OptimizationDimension,
+        value: f64,
+        weight: f64,
+        observed_at_ms: u64,
+    ) -> Self {
         Self {
             dimension,
             value,
@@ -199,7 +204,10 @@ impl SelfOptimizer {
     ///
     /// The base score is a distance from the neutral band, normalized into
     /// `[0, 1]`, then folded against the constraints (see `score_with_constraints`).
-    pub fn evaluate(&self, observations: &[OptimizationObservation]) -> Vec<OptimizationSuggestion> {
+    pub fn evaluate(
+        &self,
+        observations: &[OptimizationObservation],
+    ) -> Vec<OptimizationSuggestion> {
         let mut by_dimension: Vec<(OptimizationDimension, Vec<&OptimizationObservation>)> =
             Vec::new();
         for obs in observations {
@@ -230,7 +238,11 @@ impl SelfOptimizer {
     }
 
     /// Builds a single suggestion for one dimension from its weighted mean.
-    fn suggest_for_dimension(&self, dimension: OptimizationDimension, mean: f64) -> OptimizationSuggestion {
+    fn suggest_for_dimension(
+        &self,
+        dimension: OptimizationDimension,
+        mean: f64,
+    ) -> OptimizationSuggestion {
         let (direction, raw_score, reason) = if mean < LOW_MEAN {
             // Normalize the deficit (LOW_MEAN - mean) ∈ (0, LOW_MEAN] into [0, 1].
             (
@@ -374,11 +386,7 @@ fn weighted_mean(group: &[&OptimizationObservation]) -> f64 {
         sum += o.value * o.weight;
         wsum += o.weight;
     }
-    if wsum == 0.0 {
-        0.0
-    } else {
-        sum / wsum
-    }
+    if wsum == 0.0 { 0.0 } else { sum / wsum }
 }
 
 fn cost_estimate_for(dimension: OptimizationDimension, direction: Direction) -> f64 {
@@ -559,10 +567,7 @@ mod tests {
             serde_json::to_string(&Direction::Rebalance).unwrap(),
             "\"rebalance\""
         );
-        assert_eq!(
-            serde_json::to_string(&RiskLevel::High).unwrap(),
-            "\"high\""
-        );
+        assert_eq!(serde_json::to_string(&RiskLevel::High).unwrap(), "\"high\"");
         assert_eq!(
             serde_json::to_string(&ConstraintKind::Privacy).unwrap(),
             "\"privacy\""
@@ -591,12 +596,7 @@ mod tests {
 
     #[test]
     fn weight_clamps_to_unit_interval() {
-        let o = OptimizationObservation::new(
-            OptimizationDimension::ActiveTools,
-            0.5,
-            5.0,
-            0,
-        );
+        let o = OptimizationObservation::new(OptimizationDimension::ActiveTools, 0.5, 5.0, 0);
         assert_eq!(o.weight, 1.0);
         let o = OptimizationObservation::new(OptimizationDimension::ActiveTools, 0.5, -1.0, 0);
         assert_eq!(o.weight, 0.0);

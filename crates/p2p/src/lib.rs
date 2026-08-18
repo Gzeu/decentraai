@@ -17,10 +17,10 @@ use async_trait::async_trait;
 use decentraai_identity::Identity;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
+use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, dcutr, identify, kad, mdns, noise, ping, relay, tcp, yamux};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -79,7 +79,9 @@ impl NetworkConfig {
 /// trailing `/p2p/<PeerId>` component stripped (so it can be handed to the
 /// DHT's `add_address` or re-append for dialing).
 fn parse_bootstrap_peer(s: &str) -> Result<(PeerId, Multiaddr)> {
-    let mut addr: Multiaddr = s.parse().with_context(|| format!("invalid multiaddr {s:?}"))?;
+    let mut addr: Multiaddr = s
+        .parse()
+        .with_context(|| format!("invalid multiaddr {s:?}"))?;
     let peer_id = match addr.pop() {
         Some(Protocol::P2p(peer)) => peer,
         _ => bail!("bootstrap multiaddr must end with /p2p/<PeerId>: {s:?}"),
@@ -165,7 +167,8 @@ impl RequestHandler for StaticFileServer {
             deserialize_message, serialize_message,
         };
 
-        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES)
+        {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -254,7 +257,8 @@ impl RequestHandler for RegistryServer {
                 manifests: self.manifests(),
             });
         }
-        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES) {
+        if let Ok(req) = deserialize_message::<ManifestRequest>(request, DEFAULT_MAX_MESSAGE_BYTES)
+        {
             if req.protocol_version != CURRENT_PROTOCOL_VERSION {
                 bail!("unsupported protocol version {}", req.protocol_version);
             }
@@ -578,7 +582,13 @@ impl P2PNode {
                 ticker.tick().await;
                 for (peer, addr) in &bootstrap_repeat {
                     let dial_addr = addr.clone().with(Protocol::P2p(*peer));
-                    if bootstrap_sender.send(Command::Dial { addr: dial_addr, reply: None }).is_err() {
+                    if bootstrap_sender
+                        .send(Command::Dial {
+                            addr: dial_addr,
+                            reply: None,
+                        })
+                        .is_err()
+                    {
                         debug!(%peer, "bootstrap re-dial enqueue failed (swarm stopped)");
                     }
                 }
@@ -1191,13 +1201,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(addr2.to_string(), "/ip4/104.131.131.82/tcp/4001");
-        assert_eq!(peer2.to_string(), "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ");
+        assert_eq!(
+            peer2.to_string(),
+            "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
+        );
     }
 
     #[test]
     fn parse_bootstrap_peer_rejects_bad_input() {
         assert!(parse_bootstrap_peer("not-a-multiaddr").is_err());
-        assert!(parse_bootstrap_peer("/ip4/192.168.1.1/tcp/4001").is_err(), "missing /p2p PeerId");
+        assert!(
+            parse_bootstrap_peer("/ip4/192.168.1.1/tcp/4001").is_err(),
+            "missing /p2p PeerId"
+        );
     }
 
     #[test]

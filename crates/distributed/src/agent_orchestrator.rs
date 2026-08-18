@@ -22,9 +22,9 @@
 
 use anyhow::{Context, Result, bail};
 use decentraai_agents::{
-    AgentMessage, AgentTask, DelegationPlan, DelegationPlanner, DelegationStage,
-    DelegationVerdict, MessageKind, ReputationStore, StageResult, TaskVerification,
-    WorkflowOutcome, match_agent_semantic,
+    AgentMessage, AgentTask, DelegationPlan, DelegationPlanner, DelegationStage, DelegationVerdict,
+    MessageKind, ReputationStore, StageResult, TaskVerification, WorkflowOutcome,
+    match_agent_semantic,
 };
 use libp2p::PeerId;
 use serde_json::Value;
@@ -93,7 +93,12 @@ impl AgentOrchestrator {
             .map(|v| v.record.clone())
             .collect::<Vec<_>>();
         DelegationPlanner
-            .plan_task(master_task, &agents, format!("plan-{}", master_task.task_id), now_ms())
+            .plan_task(
+                master_task,
+                &agents,
+                format!("plan-{}", master_task.task_id),
+                now_ms(),
+            )
             .context("planning agent task")
     }
 
@@ -137,10 +142,10 @@ impl AgentOrchestrator {
                 .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| a.2.cmp(&b.2))
         });
-        candidates.into_iter().next().map(|(_, _, agent_id, peer)| StageExecutor {
-            agent_id,
-            peer,
-        })
+        candidates
+            .into_iter()
+            .next()
+            .map(|(_, _, agent_id, peer)| StageExecutor { agent_id, peer })
     }
 
     /// Delegates one stage to a remote (or local-peer) agent and awaits the
@@ -195,7 +200,10 @@ impl AgentOrchestrator {
                 return Ok(payload);
             }
             if Instant::now() > deadline {
-                bail!("timed out waiting for a reply to delegated stage '{}'", stage.stage_id);
+                bail!(
+                    "timed out waiting for a reply to delegated stage '{}'",
+                    stage.stage_id
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -317,7 +325,11 @@ impl AgentOrchestrator {
                         output: Some(output),
                         verified,
                         checks,
-                        error: if verified { None } else { Some("output failed verification".into()) },
+                        error: if verified {
+                            None
+                        } else {
+                            Some("output failed verification".into())
+                        },
                     });
                 }
                 Err(e) => {
@@ -338,7 +350,9 @@ impl AgentOrchestrator {
         let verdict = if failed.is_empty() {
             DelegationVerdict::Completed
         } else {
-            DelegationVerdict::Partial { failed_stages: failed }
+            DelegationVerdict::Partial {
+                failed_stages: failed,
+            }
         };
         let result = decentraai_agents::DelegationResult {
             plan_id: plan_id.clone(),
@@ -357,7 +371,10 @@ impl AgentOrchestrator {
 }
 
 /// Per-hop value-level verification (mirror of delegation's check).
-fn verify_value(output: &serde_json::Value, schema_hint: Option<&str>) -> decentraai_agents::VerificationCheck {
+fn verify_value(
+    output: &serde_json::Value,
+    schema_hint: Option<&str>,
+) -> decentraai_agents::VerificationCheck {
     match schema_hint {
         None => decentraai_agents::VerificationCheck {
             check_kind: decentraai_agents::CheckKind::Schema,
@@ -378,14 +395,16 @@ fn verify_value(output: &serde_json::Value, schema_hint: Option<&str>) -> decent
                         decentraai_agents::VerificationCheck {
                             check_kind: decentraai_agents::CheckKind::Schema,
                             passed: false,
-                            detail: "output is not a JSON object, but the schema hint requires one".to_string(),
+                            detail: "output is not a JSON object, but the schema hint requires one"
+                                .to_string(),
                         }
                     }
                 }
                 _ => decentraai_agents::VerificationCheck {
                     check_kind: decentraai_agents::CheckKind::Schema,
                     passed: true,
-                    detail: "schema hint not a JSON object — structural check only (honest)".to_string(),
+                    detail: "schema hint not a JSON object — structural check only (honest)"
+                        .to_string(),
                 },
             }
         }

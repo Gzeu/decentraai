@@ -296,9 +296,7 @@ impl RequestRouter {
                         tracker.remove(&request.request_id).await;
                         self.decrement_pending().await;
                         self.increment_failed().await;
-                        return Err(DistributedError::RequestTimeout(
-                            request.timeout_ms as u64,
-                        ));
+                        return Err(DistributedError::RequestTimeout(request.timeout_ms as u64));
                     }
                 }
             }
@@ -313,7 +311,8 @@ impl RequestRouter {
                     self.decrement_pending().await;
                     self.increment_failed().await;
                     return Err(DistributedError::AllWorkersFailed(
-                        resp.error.unwrap_or_else(|| "worker reported failure".to_string()),
+                        resp.error
+                            .unwrap_or_else(|| "worker reported failure".to_string()),
                     ));
                 }
                 self.decrement_pending().await;
@@ -500,8 +499,8 @@ mod tests {
         }];
 
         let request = create_test_request();
-        let placement = futures::executor::block_on(router.select_worker(&request, &workers))
-            .unwrap();
+        let placement =
+            futures::executor::block_on(router.select_worker(&request, &workers)).unwrap();
 
         assert_eq!(placement.selected_worker, worker_peer_id);
     }

@@ -82,7 +82,10 @@ pub fn fan_out_candidacy(
         .map(|w| w.tokens_per_second.max(1))
         .max()
         .unwrap_or(1);
-    let avg_tps = eligible.iter().map(|w| w.tokens_per_second.max(1)).sum::<u32>() as f64
+    let avg_tps = eligible
+        .iter()
+        .map(|w| w.tokens_per_second.max(1))
+        .sum::<u32>() as f64
         / eligible.len() as f64;
     let total = req.context.total_slots().max(1) as f64;
     let prompt = req.context.prompt_tokens.max(1) as f64;
@@ -90,8 +93,8 @@ pub fn fan_out_candidacy(
 
     let sequential_ms = prompt * 1000.0 / best_tps as f64 + output * 1000.0 / best_tps as f64;
     // Split decode across N workers; prompt still runs once on the fastest.
-    let parallel_ms = prompt * 1000.0 / best_tps as f64
-        + (output / eligible.len() as f64) * 1000.0 / avg_tps;
+    let parallel_ms =
+        prompt * 1000.0 / best_tps as f64 + (output / eligible.len() as f64) * 1000.0 / avg_tps;
 
     let gain = sequential_ms - parallel_ms;
     if gain <= 0.0 {
@@ -155,11 +158,7 @@ pub fn replan_decision(
 
 /// The current worker's tps for comparison in [`replan_decision`].
 fn current_best_tps(fresh: &[WorkerFacts]) -> u32 {
-    fresh
-        .iter()
-        .map(|w| w.tokens_per_second)
-        .max()
-        .unwrap_or(0)
+    fresh.iter().map(|w| w.tokens_per_second).max().unwrap_or(0)
 }
 
 /// Reports an ordered list of `HandoffFrom -> HandoffTo` pairings when the
@@ -185,11 +184,13 @@ pub fn rebalance_advisory(
     };
 
     // Deterministic: sort by pressure desc, then PeerId asc.
-    let mut sorted: Vec<(String, f32)> = workers
-        .iter()
-        .map(|w| (w.0.clone(), pressure(w)))
-        .collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    let mut sorted: Vec<(String, f32)> =
+        workers.iter().map(|w| (w.0.clone(), pressure(w))).collect();
+    sorted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let max_p = sorted[0].1;
     let min_p = sorted[sorted.len() - 1].1;
@@ -275,7 +276,10 @@ mod tests {
 
     #[test]
     fn fan_out_requires_staging_support() {
-        let ws = vec![reason_worker("a", 200, 10.0, 0), reason_worker("b", 200, 10.0, 0)];
+        let ws = vec![
+            reason_worker("a", 200, 10.0, 0),
+            reason_worker("b", 200, 10.0, 0),
+        ];
         // llama-server (conservative) never supports staging.
         assert_eq!(
             fan_out_candidacy(&req(), &ws, &PlannerConfig::default(), true),
@@ -296,7 +300,10 @@ mod tests {
     fn fan_out_candidacy_with_two_staging_workers() {
         let ws = vec![staging_worker("a", 300), staging_worker("b", 300)];
         match fan_out_candidacy(&req(), &ws, &PlannerConfig::default(), true) {
-            FanOutAdvisory::CandidateFanOut { targets, estimated_gain_ms } => {
+            FanOutAdvisory::CandidateFanOut {
+                targets,
+                estimated_gain_ms,
+            } => {
                 assert_eq!(targets.len(), 2);
                 assert!(estimated_gain_ms > 0.0);
             }
@@ -306,7 +313,10 @@ mod tests {
 
     #[test]
     fn replan_never_hands_off_after_tokens_emitted() {
-        let ws = vec![reason_worker("a", 500, 10.0, 0), reason_worker("b", 50, 10.0, 0)];
+        let ws = vec![
+            reason_worker("a", 500, 10.0, 0),
+            reason_worker("b", 50, 10.0, 0),
+        ];
         assert_eq!(
             replan_decision(1, "b", &ws, 100, &PlannerConfig::default()),
             ReplanDecision::Continue
@@ -315,7 +325,10 @@ mod tests {
 
     #[test]
     fn replan_continues_on_budget_exhaustion() {
-        let ws = vec![reason_worker("a", 500, 10.0, 0), reason_worker("b", 50, 10.0, 0)];
+        let ws = vec![
+            reason_worker("a", 500, 10.0, 0),
+            reason_worker("b", 50, 10.0, 0),
+        ];
         assert_eq!(
             replan_decision(0, "b", &ws, 0, &PlannerConfig::default()),
             ReplanDecision::Continue
@@ -343,7 +356,10 @@ mod tests {
 
     #[test]
     fn replan_continues_when_current_is_best() {
-        let fresh = vec![reason_worker("warp", 50, 10.0, 0), reason_worker("cur", 500, 10.0, 0)];
+        let fresh = vec![
+            reason_worker("warp", 50, 10.0, 0),
+            reason_worker("cur", 500, 10.0, 0),
+        ];
         assert_eq!(
             replan_decision(0, "cur", &fresh, 100, &PlannerConfig::default()),
             ReplanDecision::Continue
@@ -352,10 +368,7 @@ mod tests {
 
     #[test]
     fn rebalance_empty_when_balanced() {
-        let ws = vec![
-            ("a".to_string(), 30.0, 1, 0),
-            ("b".to_string(), 35.0, 1, 0),
-        ];
+        let ws = vec![("a".to_string(), 30.0, 1, 0), ("b".to_string(), 35.0, 1, 0)];
         assert!(rebalance_advisory(&ws, &PlannerConfig::default()).is_empty());
     }
 

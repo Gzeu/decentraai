@@ -233,7 +233,10 @@ mod tests {
             .with_capability(CapabilityKind::Chat, Provenance::Inferred)
             .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
             .with_model("abc123")
-            .with_tool(ToolDescriptor::new("registry.lookup", crate::TOOL_KIND_BUILTIN))
+            .with_tool(ToolDescriptor::new(
+                "registry.lookup",
+                crate::TOOL_KIND_BUILTIN,
+            ))
             .with_memory_scope("generalist.notes")
     }
 
@@ -250,7 +253,10 @@ mod tests {
         let rec = record()
             .with_capability(CapabilityKind::Chat, Provenance::Inferred)
             .with_model("abc123")
-            .with_tool(ToolDescriptor::new("registry.lookup", crate::TOOL_KIND_BUILTIN));
+            .with_tool(ToolDescriptor::new(
+                "registry.lookup",
+                crate::TOOL_KIND_BUILTIN,
+            ));
         assert_eq!(rec.semantic_capabilities.len(), 2);
         assert_eq!(rec.allowed_models.len(), 1);
         assert_eq!(rec.tools.len(), 1);
@@ -275,7 +281,10 @@ mod tests {
         let rec = record();
         assert_eq!(rec.policies.max_concurrent_tasks, 1);
         assert_eq!(rec.policies.sandbox, SandboxMode::Normal);
-        assert!(!rec.policies.allow_remote, "agents do not opt into remote use by default");
+        assert!(
+            !rec.policies.allow_remote,
+            "agents do not opt into remote use by default"
+        );
     }
 
     #[test]

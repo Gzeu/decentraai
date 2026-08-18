@@ -254,11 +254,7 @@ impl HubCatalog {
             .await
             .with_context(|| format!("searching Hub for '{query}'"))?;
         if !resp.status().is_success() {
-            anyhow::bail!(
-                "Hub search failed: HTTP {} for '{}'",
-                resp.status(),
-                query
-            );
+            anyhow::bail!("Hub search failed: HTTP {} for '{}'", resp.status(), query);
         }
         let models: Vec<HubModel> = resp
             .json()
@@ -381,8 +377,7 @@ mod tests {
     fn tree_url_is_built_from_repo() {
         let url = format!(
             "{}/models/{}/tree/main",
-            "https://api.test",
-            "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+            "https://api.test", "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
         );
         assert_eq!(
             url,
@@ -410,8 +405,9 @@ mod tests {
             "likes": 56,
             "description": "A Qwen chat model."
         });
-        let detail: HubModelDetail =
-            serde_json::from_value::<HubModelDetail>(json).unwrap().fill_from_tags();
+        let detail: HubModelDetail = serde_json::from_value::<HubModelDetail>(json)
+            .unwrap()
+            .fill_from_tags();
         assert_eq!(detail.id, "Qwen/Qwen2.5-7B-Instruct-GGUF");
         assert_eq!(detail.context_length, Some(32768));
         assert_eq!(detail.params.as_deref(), Some("7B"));
@@ -436,7 +432,10 @@ mod tests {
             "downloads": 1
         });
         let detail: HubModelDetail = serde_json::from_value(json).unwrap();
-        assert_eq!(detail.context_length, None, "absent -> UNKNOWN, never invented");
+        assert_eq!(
+            detail.context_length, None,
+            "absent -> UNKNOWN, never invented"
+        );
         assert_eq!(detail.params, None);
         assert_eq!(detail.license, None);
         assert_eq!(detail.description, None);

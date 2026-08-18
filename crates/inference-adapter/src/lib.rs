@@ -487,7 +487,10 @@ mod tests {
         .unwrap();
 
         // Follows the resolver's current value.
-        assert_eq!(b.endpoint("v1/chat/completions"), "http://127.0.0.1:10021/v1/chat/completions");
+        assert_eq!(
+            b.endpoint("v1/chat/completions"),
+            "http://127.0.0.1:10021/v1/chat/completions"
+        );
         // Engine respawned on a new port: the resolver moves, endpoint follows.
         *live.lock().unwrap() = Some("http://127.0.0.1:10022".to_string());
         assert_eq!(b.endpoint("v1/models"), "http://127.0.0.1:10022/v1/models");

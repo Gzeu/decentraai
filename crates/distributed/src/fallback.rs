@@ -137,7 +137,6 @@ impl FallbackHandler {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

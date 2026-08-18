@@ -95,10 +95,7 @@ impl CapabilityMatcher {
         }
 
         let booked_ram = ledger.reserved_ram(&adv.peer_id);
-        let available_ram = adv
-            .availability
-            .available_ram_mb
-            .saturating_sub(booked_ram);
+        let available_ram = adv.availability.available_ram_mb.saturating_sub(booked_ram);
         if available_ram < req.est_ram_mb + self.min_free_ram_mb {
             return MatchOutcome::Rejected(MatchReason::InsufficientRam {
                 available: available_ram,
@@ -146,15 +143,32 @@ mod tests {
     fn eligible_worker_passes() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
-        assert_eq!(matcher.matches(&adv, &req(), &ledger, true, None), MatchOutcome::Eligible);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
+        assert_eq!(
+            matcher.matches(&adv, &req(), &ledger, true, None),
+            MatchOutcome::Eligible
+        );
     }
 
     #[test]
     fn remote_worker_without_remote_opt_in_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let mut adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        let mut adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
         adv.accepts_remote_inference = false;
         // A remote worker that has not opted in is never a scheduling candidate.
         assert_eq!(
@@ -173,7 +187,14 @@ mod tests {
     fn untrusted_peer_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
         assert_eq!(
             matcher.matches(&adv, &req(), &ledger, false, None),
             MatchOutcome::Rejected(MatchReason::NotTrusted)
@@ -184,7 +205,14 @@ mod tests {
     fn unhealthy_worker_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Unhealthy);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Unhealthy,
+        );
         assert_eq!(
             matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::NotHealthy)
@@ -195,7 +223,14 @@ mod tests {
     fn missing_model_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
         let other = WorkloadRequirements::new("zzz".into(), 256, 3072);
         assert_eq!(
             matcher.matches(&adv, &other, &ledger, true, None),
@@ -250,9 +285,19 @@ mod tests {
     fn insufficient_ram_rejected_with_numbers() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 512, Some(18 * 1024), 32, 0, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            512,
+            Some(18 * 1024),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
         match matcher.matches(&adv, &req(), &ledger, true, None) {
-            MatchOutcome::Rejected(MatchReason::InsufficientRam { available, required }) => {
+            MatchOutcome::Rejected(MatchReason::InsufficientRam {
+                available,
+                required,
+            }) => {
                 assert!(available < required);
             }
             other => panic!("expected insufficient RAM, got {other:?}"),
@@ -263,7 +308,14 @@ mod tests {
     fn insufficient_vram_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(512), 32, 0, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(512),
+            32,
+            0,
+            WorkerHealth::Ready,
+        );
         assert_eq!(
             matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::InsufficientVram {
@@ -279,7 +331,10 @@ mod tests {
         let mut ledger = ReservationLedger::new(Duration::from_secs(60), 4);
         let p = test_peer();
         let adv = test_advertisement(p, 8 * 1024, Some(8 * 1024), 0, 0, WorkerHealth::Ready);
-        assert_eq!(matcher.matches(&adv, &req(), &ledger, true, None), MatchOutcome::Eligible);
+        assert_eq!(
+            matcher.matches(&adv, &req(), &ledger, true, None),
+            MatchOutcome::Eligible
+        );
 
         // Book two workloads; the third must hit the RAM/VRAM ceiling.
         ledger.reserve(p, 3072, 4096);
@@ -297,7 +352,14 @@ mod tests {
     fn overloaded_worker_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 99, 0, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            99,
+            0,
+            WorkerHealth::Ready,
+        );
         assert_eq!(
             matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::Overloaded)
@@ -308,7 +370,14 @@ mod tests {
     fn deep_queue_rejected() {
         let matcher = CapabilityMatcher::default();
         let ledger = ReservationLedger::new(Duration::from_secs(60), 2);
-        let adv = test_advertisement(test_peer(), 12 * 1024, Some(18 * 1024), 0, 8, WorkerHealth::Ready);
+        let adv = test_advertisement(
+            test_peer(),
+            12 * 1024,
+            Some(18 * 1024),
+            0,
+            8,
+            WorkerHealth::Ready,
+        );
         assert_eq!(
             matcher.matches(&adv, &req(), &ledger, true, None),
             MatchOutcome::Rejected(MatchReason::Overloaded)

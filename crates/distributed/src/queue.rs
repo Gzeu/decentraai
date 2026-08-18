@@ -476,7 +476,10 @@ mod tests {
             "the past-deadline request must be swept by cleanup_timed_out"
         );
         assert_eq!(swept[0].request_id, req.request_id);
-        assert!(swept[0].is_timed_out(), "the swept entry still reports expired");
+        assert!(
+            swept[0].is_timed_out(),
+            "the swept entry still reports expired"
+        );
         assert_eq!(
             futures::executor::block_on(manager.total_queued()),
             0,
@@ -492,8 +495,12 @@ mod tests {
         let req_id = req.request_id;
 
         // Two requests fit within the configured depth...
-        assert!(futures::executor::block_on(manager.queue_request(req.clone(), peer_id)));
-        assert!(futures::executor::block_on(manager.queue_request(req.clone(), peer_id)));
+        assert!(futures::executor::block_on(
+            manager.queue_request(req.clone(), peer_id)
+        ));
+        assert!(futures::executor::block_on(
+            manager.queue_request(req.clone(), peer_id)
+        ));
 
         // ...the third must be rejected (a peer cannot push unlimited work).
         let third = futures::executor::block_on(manager.queue_request(req.clone(), peer_id));

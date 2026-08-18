@@ -113,7 +113,10 @@ impl SessionAccount {
     /// Snapshot of every tracked session (sorted by session id via BTreeMap),
     /// for observability. Each entry is real accounted state.
     pub fn snapshot(&self) -> Vec<(String, SessionKv)> {
-        self.by_session.iter().map(|(id, kv)| (id.clone(), kv.clone())).collect()
+        self.by_session
+            .iter()
+            .map(|(id, kv)| (id.clone(), kv.clone()))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {

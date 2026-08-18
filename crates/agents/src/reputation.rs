@@ -317,14 +317,15 @@ impl ReputationStore {
             observed_at_ms,
         } = update;
         let key = (agent_id.clone(), capability.clone());
-        let entry = self.reputations.entry(key).or_insert_with(|| {
-            AgentReputation {
+        let entry = self
+            .reputations
+            .entry(key)
+            .or_insert_with(|| AgentReputation {
                 agent_id: agent_id.clone(),
                 capability: capability.clone(),
                 factors: BTreeMap::new(),
                 created_at_ms: observed_at_ms,
-            }
-        });
+            });
 
         let alpha = ema_alpha(sample_weight);
         let new_value = match entry.factors.get(&factor) {
@@ -346,7 +347,8 @@ impl ReputationStore {
 
     /// Looks up one (agent, capability) reputation.
     pub fn get(&self, agent_id: &str, capability: &str) -> Option<&AgentReputation> {
-        self.reputations.get(&(agent_id.to_string(), capability.to_string()))
+        self.reputations
+            .get(&(agent_id.to_string(), capability.to_string()))
     }
 
     /// All reputations of one agent, sorted by capability (deterministic).
@@ -365,11 +367,7 @@ impl ReputationStore {
     /// `min_samples`, as `(agent_id, aggregate score)`. Ties break
     /// deterministically on `agent_id` ascending. Agents whose reputation is
     /// unknown (nothing meaningful) never compete.
-    pub fn best_for_capability(
-        &self,
-        capability: &str,
-        min_samples: u64,
-    ) -> Option<(String, f32)> {
+    pub fn best_for_capability(&self, capability: &str, min_samples: u64) -> Option<(String, f32)> {
         self.reputations
             .values()
             .filter(|rep| rep.capability == capability && rep.is_meaningful(min_samples))
@@ -401,7 +399,8 @@ impl ReputationStore {
     /// of reputations pruned.
     pub fn prune_below(&mut self, min_samples: u64) -> usize {
         let before = self.reputations.len();
-        self.reputations.retain(|_, rep| rep.is_meaningful(min_samples));
+        self.reputations
+            .retain(|_, rep| rep.is_meaningful(min_samples));
         before - self.reputations.len()
     }
 }
@@ -460,8 +459,7 @@ mod tests {
         rep.set_factor(ReputationFactor::Uptime, FactorScore::new(0.9, 10, 1));
         rep.set_factor(ReputationFactor::Safety, FactorScore::new(1.0, 10, 1));
         rep.set_factor(ReputationFactor::Provenance, FactorScore::new(0.6, 10, 1));
-        let expected =
-            0.30 * 1.0 + 0.25 * 0.5 + 0.15 * 0.8 + 0.10 * 0.9 + 0.10 * 1.0 + 0.10 * 0.6;
+        let expected = 0.30 * 1.0 + 0.25 * 0.5 + 0.15 * 0.8 + 0.10 * 0.9 + 0.10 * 1.0 + 0.10 * 0.6;
         assert!((rep.score() - expected).abs() < 1e-6);
     }
 
@@ -491,7 +489,10 @@ mod tests {
             1000,
         ));
         let rep = store.get("dca-a:ocr", "ocr").unwrap();
-        assert_eq!(rep.factor_value(ReputationFactor::Reliability).unwrap(), 1.0);
+        assert_eq!(
+            rep.factor_value(ReputationFactor::Reliability).unwrap(),
+            1.0
+        );
         assert_eq!(rep.factors[&ReputationFactor::Reliability].samples, 1);
         // A low observation drags the estimate down by alpha = 0.2.
         store.observe(ReputationUpdate::new(
@@ -526,7 +527,13 @@ mod tests {
     #[test]
     fn heavier_observations_move_the_estimate_more() {
         let mut store = ReputationStore::new();
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Reliability, 1.0, 1));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Reliability,
+            1.0,
+            1,
+        ));
         // sample_weight 2 -> alpha 0.4: 1.0 moves to 0.6.
         store.observe(reliability("a", 0.0, 2, 2));
         let v = store
@@ -543,21 +550,36 @@ mod tests {
             .factor_value(ReputationFactor::Reliability)
             .unwrap();
         assert!((v - 0.9).abs() < 1e-6);
-        assert_eq!(store.get("a", "ocr").unwrap().factors[&ReputationFactor::Reliability].samples, 8);
+        assert_eq!(
+            store.get("a", "ocr").unwrap().factors[&ReputationFactor::Reliability].samples,
+            8
+        );
     }
 
     #[test]
     fn store_observations_upsert_and_query() {
         let mut store = ReputationStore::new();
         assert_eq!(store.count(), 0);
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Quality, 0.5, 100));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Quality,
+            0.5,
+            100,
+        ));
         assert_eq!(store.count(), 1);
         let first = store.get("a", "ocr").expect("stored");
         assert_eq!(first.agent_id, "a");
         assert_eq!(first.capability, "ocr");
         assert_eq!(first.created_at_ms, 100);
         // A second observation updates the same (agent, capability), not a new row.
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Reliability, 0.9, 200));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.9,
+            200,
+        ));
         assert_eq!(store.count(), 1);
         let rep = store.get("a", "ocr").unwrap();
         assert!(rep.factor_value(ReputationFactor::Quality).is_some());
@@ -568,9 +590,27 @@ mod tests {
     #[test]
     fn for_agent_returns_reputations_sorted_by_capability() {
         let mut store = ReputationStore::new();
-        store.observe(ReputationUpdate::new("a", "coding", ReputationFactor::Reliability, 0.5, 1));
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Reliability, 0.8, 1));
-        store.observe(ReputationUpdate::new("b", "ocr", ReputationFactor::Reliability, 0.7, 1));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "coding",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.8,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "b",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.7,
+            1,
+        ));
         let reps = store.for_agent("a");
         assert_eq!(reps.len(), 2);
         assert_eq!(reps[0].capability, "coding");
@@ -580,12 +620,30 @@ mod tests {
     #[test]
     fn best_for_capability_is_deterministic_and_respects_min_samples() {
         let mut store = ReputationStore::new();
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Reliability, 0.5, 1));
-        store.observe(ReputationUpdate::new("b", "ocr", ReputationFactor::Reliability, 0.9, 1));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "b",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.9,
+            1,
+        ));
         let best = store.best_for_capability("ocr", 1);
         assert_eq!(best, Some(("b".to_string(), 0.9)));
         // Tie on score -> agent_id ascending wins.
-        store.observe(ReputationUpdate::new("c", "ocr", ReputationFactor::Reliability, 0.9, 1));
+        store.observe(ReputationUpdate::new(
+            "c",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.9,
+            1,
+        ));
         let best = store.best_for_capability("ocr", 1);
         assert_eq!(best, Some(("b".to_string(), 0.9)));
         // Below the sample floor nothing competes (unknown is not a candidate).
@@ -597,9 +655,27 @@ mod tests {
     #[test]
     fn capabilities_are_sorted_and_deduped() {
         let mut store = ReputationStore::new();
-        store.observe(ReputationUpdate::new("a", "ocr", ReputationFactor::Reliability, 0.5, 1));
-        store.observe(ReputationUpdate::new("b", "coding", ReputationFactor::Reliability, 0.5, 1));
-        store.observe(ReputationUpdate::new("c", "ocr", ReputationFactor::Reliability, 0.5, 1));
+        store.observe(ReputationUpdate::new(
+            "a",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "b",
+            "coding",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "c",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
         assert_eq!(
             store.capabilities(),
             vec!["coding".to_string(), "ocr".to_string()]
@@ -610,8 +686,20 @@ mod tests {
     fn prune_below_drops_only_unknown_reputations() {
         let mut store = ReputationStore::new();
         // Known: two observations -> 2 samples, survives the floor.
-        store.observe(ReputationUpdate::new("known", "ocr", ReputationFactor::Reliability, 0.5, 1));
-        store.observe(ReputationUpdate::new("known", "ocr", ReputationFactor::Reliability, 0.6, 2));
+        store.observe(ReputationUpdate::new(
+            "known",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.5,
+            1,
+        ));
+        store.observe(ReputationUpdate::new(
+            "known",
+            "ocr",
+            ReputationFactor::Reliability,
+            0.6,
+            2,
+        ));
         // Unknown: factors exist but were never observed -> samples 0.
         let mut unknown = AgentReputation::new("unknown", "coding");
         unknown.set_factor(ReputationFactor::Safety, FactorScore::new(1.0, 0, 1));
@@ -644,7 +732,10 @@ mod tests {
     #[test]
     fn reputation_round_trips_over_wire() {
         let mut rep = AgentReputation::new("dca-a:ocr", "ocr");
-        rep.set_factor(ReputationFactor::Reliability, FactorScore::new(0.93, 12, 1234));
+        rep.set_factor(
+            ReputationFactor::Reliability,
+            FactorScore::new(0.93, 12, 1234),
+        );
         rep.set_factor(ReputationFactor::Safety, FactorScore::new(1.0, 3, 1234));
         let json = serde_json::to_string(&rep).unwrap();
         let back: AgentReputation = serde_json::from_str(&json).unwrap();
@@ -653,7 +744,8 @@ mod tests {
         assert!(json.contains("\"reliability\""));
         assert!(json.contains("\"capability\":\"ocr\""));
 
-        let update = ReputationUpdate::new("a", "ocr", ReputationFactor::Latency, 0.7, 9).sample_weight(2);
+        let update =
+            ReputationUpdate::new("a", "ocr", ReputationFactor::Latency, 0.7, 9).sample_weight(2);
         let json = serde_json::to_string(&update).unwrap();
         let back: ReputationUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(update, back);
@@ -670,13 +762,18 @@ mod tests {
     #[test]
     fn reasons_are_non_empty_and_human_readable() {
         let mut rep = AgentReputation::new("dca-a:ocr", "ocr");
-        rep.set_factor(ReputationFactor::Reliability, FactorScore::new(0.8, 12, 100));
+        rep.set_factor(
+            ReputationFactor::Reliability,
+            FactorScore::new(0.8, 12, 100),
+        );
         rep.set_factor(ReputationFactor::Quality, FactorScore::new(0.5, 7, 100));
         let reasons = rep.reasons();
         assert_eq!(reasons.len(), 2);
-        assert!(reasons
-            .iter()
-            .all(|line| line.contains(':') && line.contains("samples")));
+        assert!(
+            reasons
+                .iter()
+                .all(|line| line.contains(':') && line.contains("samples"))
+        );
         assert!(reasons[0].starts_with("reliability"));
     }
 

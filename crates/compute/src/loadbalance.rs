@@ -53,9 +53,7 @@ pub struct LoadShare {
 /// considered. Returns shares sorted by (share desc, peer_id asc) so the
 /// largest-share worker is first and the ordering is deterministic. Empty when
 /// there are no healthy workers.
-pub fn adaptive_load_shares(
-    workers: &[(String, String, ComputeAvailability)],
-) -> Vec<LoadShare> {
+pub fn adaptive_load_shares(workers: &[(String, String, ComputeAvailability)]) -> Vec<LoadShare> {
     // Healthy workers only (an unhealthy worker takes no share).
     let eligible: Vec<&(String, String, ComputeAvailability)> =
         workers.iter().filter(|(_, _, a)| a.healthy()).collect();
@@ -129,9 +127,16 @@ mod tests {
         assert_eq!(shares.len(), 2);
         // Equal capacity -> ~0.5 each (within float rounding).
         let total: f64 = shares.iter().map(|s| s.share).sum();
-        assert!((total - 1.0).abs() < 1e-6, "shares must sum to 1, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "shares must sum to 1, got {total}"
+        );
         for s in &shares {
-            assert!((s.share - 0.5).abs() < 1e-6, "equal workers -> 0.5 each, got {}", s.share);
+            assert!(
+                (s.share - 0.5).abs() < 1e-6,
+                "equal workers -> 0.5 each, got {}",
+                s.share
+            );
         }
     }
 
@@ -142,7 +147,10 @@ mod tests {
             ("slow".to_string(), "dca-s".to_string(), avail(10, 100)),
         ];
         let shares = adaptive_load_shares(&ws);
-        assert_eq!(shares[0].peer_id, "fast", "the faster worker is listed first");
+        assert_eq!(
+            shares[0].peer_id, "fast",
+            "the faster worker is listed first"
+        );
         assert!(
             shares[0].share > shares[1].share,
             "faster worker must get a larger share ({} vs {})",
@@ -160,7 +168,10 @@ mod tests {
             ("hot".to_string(), "dca-hot".to_string(), hot),
         ];
         let shares = adaptive_load_shares(&ws);
-        assert_eq!(shares[0].peer_id, "healthy", "healthy worker wins the larger share");
+        assert_eq!(
+            shares[0].peer_id, "healthy",
+            "healthy worker wins the larger share"
+        );
         let hot_share = shares.iter().find(|s| s.peer_id == "hot").unwrap();
         assert!(
             hot_share.share < shares[0].share,
@@ -216,6 +227,10 @@ mod tests {
                 .map(|x| (x.peer_id.clone(), (x.share * 1e6) as u64))
                 .collect()
         };
-        assert_eq!(key(&s1), key(&s2), "ordering and shares must be deterministic");
+        assert_eq!(
+            key(&s1),
+            key(&s2),
+            "ordering and shares must be deterministic"
+        );
     }
 }

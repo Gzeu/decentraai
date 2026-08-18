@@ -323,7 +323,10 @@ mod tests {
     #[test]
     fn infer_error_code_tokens_are_stable_lowercase() {
         assert_eq!(InferErrorCode::NoWorkers.code(), "no_workers");
-        assert_eq!(InferErrorCode::AllWorkersFailed.code(), "all_workers_failed");
+        assert_eq!(
+            InferErrorCode::AllWorkersFailed.code(),
+            "all_workers_failed"
+        );
         assert_eq!(InferErrorCode::Timeout.code(), "timeout");
         assert_eq!(InferErrorCode::Rejected.code(), "rejected");
         assert_eq!(InferErrorCode::Untrusted.code(), "untrusted");
@@ -367,8 +370,7 @@ mod tests {
                 "retryable":true
             }}}}"#
         );
-        let decoded: InferMessage =
-            serde_json::from_str(&legacy).expect("legacy frame must parse");
+        let decoded: InferMessage = serde_json::from_str(&legacy).expect("legacy frame must parse");
         match decoded {
             InferMessage::InferFailed { code, .. } => assert_eq!(code, None),
             other => panic!("expected InferFailed, got {other:?}"),

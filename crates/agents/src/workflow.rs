@@ -122,9 +122,8 @@ impl WorkflowTemplate {
         evidence: EvidenceLevel,
         depends_on: &[&str],
     ) -> Self {
-        self.steps.push(
-            WorkflowStep::new(step_id, capability, evidence).depends_on(depends_on),
-        );
+        self.steps
+            .push(WorkflowStep::new(step_id, capability, evidence).depends_on(depends_on));
         self
     }
 
@@ -242,11 +241,10 @@ impl WorkflowTemplate {
 
         for step in &self.steps {
             let mut sub_task = AgentTask::new(format!("{}.{}", master_task.task_id, step.step_id));
-            sub_task.required_capabilities =
-                vec![CapabilityRequirement {
-                    capability: step.capability,
-                    evidence: step.evidence,
-                }];
+            sub_task.required_capabilities = vec![CapabilityRequirement {
+                capability: step.capability,
+                evidence: step.evidence,
+            }];
             let deps: Vec<String> = step.depends_on.clone();
             stages.push(
                 DelegationStage::new(step.step_id.clone(), sub_task)
@@ -324,8 +322,18 @@ pub fn research_report_template() -> WorkflowTemplate {
             "Gathers research on a topic, a financial read, and a document
              understanding pass, then synthesizes a report.",
         )
-        .with_step("research", CapabilityKind::Reasoning, EvidenceLevel::Any, &[])
-        .with_step("finance", CapabilityKind::Reasoning, EvidenceLevel::Any, &["research"])
+        .with_step(
+            "research",
+            CapabilityKind::Reasoning,
+            EvidenceLevel::Any,
+            &[],
+        )
+        .with_step(
+            "finance",
+            CapabilityKind::Reasoning,
+            EvidenceLevel::Any,
+            &["research"],
+        )
         .with_step(
             "documents",
             CapabilityKind::DocumentUnderstanding,
@@ -426,7 +434,12 @@ where
                 stages: Vec::new(),
                 final_output: None,
             };
-            return WorkflowOutcome::new(&template.template_id, &master_task.task_id, empty, result);
+            return WorkflowOutcome::new(
+                &template.template_id,
+                &master_task.task_id,
+                empty,
+                result,
+            );
         }
     };
     let result = execute_plan(&plan, assignments, executor);
@@ -473,8 +486,12 @@ mod tests {
 
     #[test]
     fn validation_rejects_unknown_dependency() {
-        let template = WorkflowTemplate::new("t", "deps")
-            .with_step("a", CapabilityKind::Reasoning, EvidenceLevel::Any, &["ghost"]);
+        let template = WorkflowTemplate::new("t", "deps").with_step(
+            "a",
+            CapabilityKind::Reasoning,
+            EvidenceLevel::Any,
+            &["ghost"],
+        );
         assert!(matches!(
             template.validate(),
             Err(WorkflowError::UnknownDependency { depends_on, .. }) if depends_on == "ghost"
@@ -486,13 +503,20 @@ mod tests {
         let template = WorkflowTemplate::new("t", "cycle")
             .with_step("a", CapabilityKind::Reasoning, EvidenceLevel::Any, &["b"])
             .with_step("b", CapabilityKind::Reasoning, EvidenceLevel::Any, &["a"]);
-        assert!(matches!(template.validate(), Err(WorkflowError::CycleDetected { .. })));
+        assert!(matches!(
+            template.validate(),
+            Err(WorkflowError::CycleDetected { .. })
+        ));
     }
 
     #[test]
     fn validation_rejects_empty_template_id() {
-        let template = WorkflowTemplate::new("", "empty")
-            .with_step("a", CapabilityKind::Reasoning, EvidenceLevel::Any, &[]);
+        let template = WorkflowTemplate::new("", "empty").with_step(
+            "a",
+            CapabilityKind::Reasoning,
+            EvidenceLevel::Any,
+            &[],
+        );
         assert_eq!(template.validate(), Err(WorkflowError::EmptyTemplateId));
     }
 
@@ -506,11 +530,23 @@ mod tests {
         assert_eq!(ids, vec!["research", "finance", "documents"]);
         assert!(template.synthesis);
         // finance and documents both depend on research; research has none.
-        let finance = template.steps.iter().find(|s| s.step_id == "finance").unwrap();
+        let finance = template
+            .steps
+            .iter()
+            .find(|s| s.step_id == "finance")
+            .unwrap();
         assert_eq!(finance.depends_on, vec!["research".to_string()]);
-        let documents = template.steps.iter().find(|s| s.step_id == "documents").unwrap();
+        let documents = template
+            .steps
+            .iter()
+            .find(|s| s.step_id == "documents")
+            .unwrap();
         assert_eq!(documents.depends_on, vec!["research".to_string()]);
-        let research = template.steps.iter().find(|s| s.step_id == "research").unwrap();
+        let research = template
+            .steps
+            .iter()
+            .find(|s| s.step_id == "research")
+            .unwrap();
         assert!(research.depends_on.is_empty());
     }
 
@@ -548,13 +584,18 @@ mod tests {
     fn run_workflow_completes_and_feeds_all_inputs_to_synthesis() {
         let template = research_report_template();
         let assignments = assign_all(&template, "a:worker");
-        let outcome = run_workflow(&template, &master_task("m1"), &assignments, |_agent, _stage, input| {
-            let count = match input {
-                serde_json::Value::Object(m) => m.len(),
-                _ => 0,
-            };
-            Ok(json!({ "input_count": count }))
-        });
+        let outcome = run_workflow(
+            &template,
+            &master_task("m1"),
+            &assignments,
+            |_agent, _stage, input| {
+                let count = match input {
+                    serde_json::Value::Object(m) => m.len(),
+                    _ => 0,
+                };
+                Ok(json!({ "input_count": count }))
+            },
+        );
         assert_eq!(outcome.verdict, DelegationVerdict::Completed);
         assert_eq!(outcome.completed_stages, 4);
         assert_eq!(outcome.failed_stages, 0);
@@ -580,12 +621,17 @@ mod tests {
     fn run_workflow_surfaces_a_failing_capability_stage_as_partial() {
         let template = research_report_template();
         let assignments = assign_all(&template, "a:worker");
-        let outcome = run_workflow(&template, &master_task("m1"), &assignments, |_agent, stage, _| {
-            if stage.stage_id == "finance" {
-                return Err("finance service unavailable".to_string());
-            }
-            Ok(json!({ "ok": true }))
-        });
+        let outcome = run_workflow(
+            &template,
+            &master_task("m1"),
+            &assignments,
+            |_agent, stage, _| {
+                if stage.stage_id == "finance" {
+                    return Err("finance service unavailable".to_string());
+                }
+                Ok(json!({ "ok": true }))
+            },
+        );
         // finance failed AND synthesis could not run (its dependency produced
         // no output) — both are honestly reported.
         assert!(matches!(
@@ -612,13 +658,18 @@ mod tests {
     fn template_and_outcome_round_trip_over_json() {
         let template = research_report_template();
         let assignments = assign_all(&template, "a:worker");
-        let outcome = run_workflow(&template, &master_task("m1"), &assignments, |_agent, _stage, input| {
-            let count = match input {
-                serde_json::Value::Object(m) => m.len(),
-                _ => 0,
-            };
-            Ok(json!({ "input_count": count }))
-        });
+        let outcome = run_workflow(
+            &template,
+            &master_task("m1"),
+            &assignments,
+            |_agent, _stage, input| {
+                let count = match input {
+                    serde_json::Value::Object(m) => m.len(),
+                    _ => 0,
+                };
+                Ok(json!({ "input_count": count }))
+            },
+        );
 
         let t_json = serde_json::to_string(&template).unwrap();
         let t_back: WorkflowTemplate = serde_json::from_str(&t_json).unwrap();

@@ -136,17 +136,23 @@ impl CircuitBreaker {
             // If it was open but now succeeded, close it cleanly.
             if now < *until {
                 // (Shouldn't normally be routed while open, but be safe.)
-                self.workers.insert(*peer, State::Closed {
-                    failures: 0,
-                    fresh_at: now,
-                });
+                self.workers.insert(
+                    *peer,
+                    State::Closed {
+                        failures: 0,
+                        fresh_at: now,
+                    },
+                );
                 return;
             }
         }
-        self.workers.insert(*peer, State::Closed {
-            failures: 0,
-            fresh_at: now,
-        });
+        self.workers.insert(
+            *peer,
+            State::Closed {
+                failures: 0,
+                fresh_at: now,
+            },
+        );
     }
 
     /// Returns when `peer` is next eligible after an open, or `None` if closed.
@@ -212,7 +218,10 @@ mod tests {
         let c = peer();
         b.record_failure(&a, now);
         assert!(!b.allow(&a, now + Duration::from_millis(1)));
-        assert!(b.allow(&c, now + Duration::from_millis(1)), "other workers unaffected");
+        assert!(
+            b.allow(&c, now + Duration::from_millis(1)),
+            "other workers unaffected"
+        );
         assert!(b.allow(&peer(), now + Duration::from_millis(1)));
     }
 

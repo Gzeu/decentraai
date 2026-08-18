@@ -96,7 +96,12 @@ pub struct AgentMessage {
 impl AgentMessage {
     /// A new message with routing and kind set; every other field defaults
     /// to empty/zero and is filled with the `with_*` builders.
-    pub fn new(message_id: impl Into<String>, from: impl Into<String>, to: impl Into<String>, kind: MessageKind) -> Self {
+    pub fn new(
+        message_id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        kind: MessageKind,
+    ) -> Self {
         Self {
             message_id: message_id.into(),
             from_agent: from.into(),
@@ -260,7 +265,8 @@ mod tests {
 
     /// A valid message addressed to `b:executor`, ready for validation.
     fn valid(kind: MessageKind) -> AgentMessage {
-        AgentMessage::new("m-1", "a:planner", "b:executor", kind).with_created_at_ms(1_700_000_000_000)
+        AgentMessage::new("m-1", "a:planner", "b:executor", kind)
+            .with_created_at_ms(1_700_000_000_000)
     }
 
     /// A valid message to a chosen recipient.
@@ -312,8 +318,14 @@ mod tests {
         assert!(inbox.push("b:executor", valid(MessageKind::Delegate).with_task("t-2")));
         assert!(inbox.push("b:executor", valid(MessageKind::Ping)));
         assert_eq!(inbox.pending("b:executor"), 3);
-        assert_eq!(inbox.pop("b:executor").unwrap().task_id.as_deref(), Some("t-1"));
-        assert_eq!(inbox.pop("b:executor").unwrap().task_id.as_deref(), Some("t-2"));
+        assert_eq!(
+            inbox.pop("b:executor").unwrap().task_id.as_deref(),
+            Some("t-1")
+        );
+        assert_eq!(
+            inbox.pop("b:executor").unwrap().task_id.as_deref(),
+            Some("t-2")
+        );
         assert_eq!(inbox.pop("b:executor").unwrap().kind, MessageKind::Ping);
         assert!(inbox.pop("b:executor").is_none());
     }
@@ -358,7 +370,10 @@ mod tests {
         let mut inbox = AgentInbox::new(4);
         let m = valid(MessageKind::Ask).with_task("t-7");
         inbox.push("b:executor", m.clone());
-        assert_eq!(inbox.peek("b:executor").unwrap().task_id.as_deref(), Some("t-7"));
+        assert_eq!(
+            inbox.peek("b:executor").unwrap().task_id.as_deref(),
+            Some("t-7")
+        );
         assert_eq!(inbox.pending("b:executor"), 1);
         assert_eq!(inbox.pop("b:executor").unwrap(), m);
         assert!(inbox.peek("b:executor").is_none());
@@ -380,21 +395,36 @@ mod tests {
         assert_eq!(validate_message(&valid(MessageKind::Delegate)), Ok(()));
 
         let no_id = AgentMessage::new("", "a", "b", MessageKind::Ask).with_created_at_ms(1000);
-        assert_eq!(validate_message(&no_id), Err(MessageValidationError::EmptyMessageId));
+        assert_eq!(
+            validate_message(&no_id),
+            Err(MessageValidationError::EmptyMessageId)
+        );
 
         let no_from = AgentMessage::new("m-1", "", "b", MessageKind::Ask).with_created_at_ms(1000);
-        assert_eq!(validate_message(&no_from), Err(MessageValidationError::EmptyFromAgent));
+        assert_eq!(
+            validate_message(&no_from),
+            Err(MessageValidationError::EmptyFromAgent)
+        );
 
         let no_to = AgentMessage::new("m-1", "a", "", MessageKind::Ask).with_created_at_ms(1000);
-        assert_eq!(validate_message(&no_to), Err(MessageValidationError::EmptyToAgent));
+        assert_eq!(
+            validate_message(&no_to),
+            Err(MessageValidationError::EmptyToAgent)
+        );
 
         let no_time = AgentMessage::new("m-1", "a", "b", MessageKind::Ask);
-        assert_eq!(validate_message(&no_time), Err(MessageValidationError::InvalidTimestamp));
+        assert_eq!(
+            validate_message(&no_time),
+            Err(MessageValidationError::InvalidTimestamp)
+        );
     }
 
     #[test]
     fn message_kinds_serialize_to_snake_case() {
-        assert_eq!(serde_json::to_string(&MessageKind::Ask).unwrap(), r#""ask""#);
+        assert_eq!(
+            serde_json::to_string(&MessageKind::Ask).unwrap(),
+            r#""ask""#
+        );
         assert_eq!(
             serde_json::to_string(&MessageKind::Delegate).unwrap(),
             r#""delegate""#

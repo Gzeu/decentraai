@@ -17,16 +17,16 @@ use decentraai_agents::{
     ToolDescriptor,
 };
 use decentraai_compute::CapabilityMatcher;
-use decentraai_distributed::agents::AgentManager;
 use decentraai_distributed::DistributedP2PHandler;
+use decentraai_distributed::agents::AgentManager;
 use decentraai_hub::capability::{CapabilityKind, Provenance};
 use decentraai_identity::Identity;
 use decentraai_p2p::{
-    ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, NetworkConfig, P2PNode,
+    ChainedHandler, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, NetworkConfig,
+    P2PNode,
 };
 use libp2p::PeerId;
 use libp2p::identity::Keypair;
-
 
 /// Builds an isolated test P2P node with mDNS disabled, so E2E tests running in
 /// parallel on loopback never discover each other (each test dials its peers
@@ -66,11 +66,15 @@ fn ocr_agent(short_id: &str) -> AgentRecord {
 }
 
 fn generalist_agent(short_id: &str, model_hash: &str) -> AgentRecord {
-    let mut rec = AgentRecord::new(format!("{short_id}:generalist"), "Generalist", ROLE_GENERALIST)
-        .described("chat, reasoning and text generation on this node")
-        .with_capability(CapabilityKind::Chat, Provenance::Inferred)
-        .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
-        .with_model(model_hash);
+    let mut rec = AgentRecord::new(
+        format!("{short_id}:generalist"),
+        "Generalist",
+        ROLE_GENERALIST,
+    )
+    .described("chat, reasoning and text generation on this node")
+    .with_capability(CapabilityKind::Chat, Provenance::Inferred)
+    .with_capability(CapabilityKind::Reasoning, Provenance::Inferred)
+    .with_model(model_hash);
     rec.set_state(AgentState::Ready);
     rec
 }
@@ -84,7 +88,10 @@ async fn build_node(
     let peer = libp2p_peer_id(identity);
     let mut manager = AgentManager::new(peer, format!("node-{short_id}"));
     manager.set_signing_key(identity.signing_key_bytes());
-    manager.set_local_agents(vec![generalist_agent(short_id, model_hash), ocr_agent(short_id)]);
+    manager.set_local_agents(vec![
+        generalist_agent(short_id, model_hash),
+        ocr_agent(short_id),
+    ]);
     let manager = Arc::new(manager);
 
     let mut handler = DistributedP2PHandler::new();
@@ -114,7 +121,10 @@ async fn two_node_exchange_signed_agent_advertisements() {
 
     // The coordinator dials the worker (mDNS is not exercised in a loopback
     // test; a real node discovers peers via mDNS and dials them).
-    coordinator_node.dial(&worker_addr.to_string()).await.unwrap();
+    coordinator_node
+        .dial(&worker_addr.to_string())
+        .await
+        .unwrap();
 
     // The worker broadcasts its signed agent advertisement. Re-announce until
     // the dialed connection settles and the coordinator's agent manager sees
@@ -139,7 +149,10 @@ async fn two_node_exchange_signed_agent_advertisements() {
         remote.len() >= 2,
         "coordinator must see the worker's two logical agents, got {}: {:?}",
         remote.len(),
-        remote.iter().map(|v| v.record.agent_id.as_str()).collect::<Vec<_>>()
+        remote
+            .iter()
+            .map(|v| v.record.agent_id.as_str())
+            .collect::<Vec<_>>()
     );
 
     // The worker's agents arrive with their full capability shape.
@@ -412,7 +425,9 @@ async fn two_nodes_exchange_agent_messages_over_the_transport() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let received = messenger_b.pop("b:ocr").expect("inbox must hold the message");
+    let received = messenger_b
+        .pop("b:ocr")
+        .expect("inbox must hold the message");
     assert_eq!(received.message_id, message.message_id);
     assert_eq!(received.kind, MessageKind::Delegate);
     assert_eq!(received.task_id.as_deref(), Some("t-42"));
@@ -428,7 +443,7 @@ async fn two_nodes_exchange_agent_messages_over_the_transport() {
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
     use decentraai_agents::{
-        AgentAdvertisement, AgentRecord, AgentTask, AgentState, DelegationVerdict, ROLE_SPECIALIST,
+        AgentAdvertisement, AgentRecord, AgentState, AgentTask, DelegationVerdict, ROLE_SPECIALIST,
         TaskVerification,
     };
     use decentraai_distributed::agent_messenger::AgentMessenger;
@@ -469,10 +484,8 @@ async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
 
     // B's agent runtime: a production AgentRuntime that executes Delegates
     // and replies to the delegating peer (via the message's from_peer).
-    let mut agent_runtime = decentraai_distributed::agent_runtime::AgentRuntime::new(
-        "b:ocr",
-        messenger_b.clone(),
-    );
+    let mut agent_runtime =
+        decentraai_distributed::agent_runtime::AgentRuntime::new("b:ocr", messenger_b.clone());
     agent_runtime.with_executor(|_task, _inputs| async move {
         Ok(serde_json::json!({ "ocr_text": "parsed text" }))
     });
@@ -510,14 +523,11 @@ async fn orchestrator_delegates_a_workflow_to_a_remote_agent() {
         .with_capability(CapabilityKind::Ocr, Provenance::Verified)
         .with_model("m");
     ocr.set_state(AgentState::Ready);
-    agent_manager.process_advertisement(AgentAdvertisement::new(
-        peer_b,
-        "node-b",
-        vec![ocr],
-    ));
+    agent_manager.process_advertisement(AgentAdvertisement::new(peer_b, "node-b", vec![ocr]));
     let agent_manager = Arc::new(agent_manager);
 
-    let mut orchestrator = AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
+    let mut orchestrator =
+        AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
     orchestrator.with_delegate_timeout(Duration::from_secs(10));
 
     // A master task that needs OCR and an object output, self-check verified.
@@ -651,7 +661,8 @@ async fn orchestrator_runs_research_report_workflow_on_remote_agent() {
     ));
     let agent_manager = Arc::new(agent_manager);
 
-    let mut orchestrator = AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
+    let mut orchestrator =
+        AgentOrchestrator::new(messenger_a.clone(), agent_manager.clone(), peer_a);
     orchestrator.with_delegate_timeout(Duration::from_secs(15));
 
     // Instantiate the research-report workflow from the P9 template.

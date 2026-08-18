@@ -26,25 +26,59 @@ use crate::requirements::{CapabilityRequirement, EvidenceLevel};
 /// order determines precedence for overlapping phrases (e.g. "text to image"
 /// is checked before the generic "image").
 const LEXICON: &[(&[&str], CapabilityKind)] = &[
-    (&["vision", "image understanding", "analyze image", "image"], CapabilityKind::Vision),
-    (&["ocr", "extract text", "read text in image"], CapabilityKind::Ocr),
-    (&["summarize", "summary", "summarization"], CapabilityKind::Summarization),
+    (
+        &["vision", "image understanding", "analyze image", "image"],
+        CapabilityKind::Vision,
+    ),
+    (
+        &["ocr", "extract text", "read text in image"],
+        CapabilityKind::Ocr,
+    ),
+    (
+        &["summarize", "summary", "summarization"],
+        CapabilityKind::Summarization,
+    ),
     (&["coding", "code"], CapabilityKind::Coding),
     (&["translation", "translate"], CapabilityKind::Translation),
     (&["chat"], CapabilityKind::Chat),
     (&["embeddings", "embed"], CapabilityKind::Embeddings),
     (&["tool", "function call"], CapabilityKind::ToolCalling),
-    (&["speech to text", "transcribe", "transcription"], CapabilityKind::SpeechToText),
-    (&["image generation", "text to image"], CapabilityKind::ImageGeneration),
-    (&["classification", "classify"], CapabilityKind::Classification),
+    (
+        &["speech to text", "transcribe", "transcription"],
+        CapabilityKind::SpeechToText,
+    ),
+    (
+        &["image generation", "text to image"],
+        CapabilityKind::ImageGeneration,
+    ),
+    (
+        &["classification", "classify"],
+        CapabilityKind::Classification,
+    ),
     // --- appended conservative entries (relative order kept stable) ---
-    (&["retrieval", "search", "find relevant"], CapabilityKind::Retrieval),
+    (
+        &["retrieval", "search", "find relevant"],
+        CapabilityKind::Retrieval,
+    ),
     (&["rerank", "reranking"], CapabilityKind::Reranking),
     (
-        &["reason", "reasoning", "think step by step", "chain of thought"],
+        &[
+            "reason",
+            "reasoning",
+            "think step by step",
+            "chain of thought",
+        ],
         CapabilityKind::Reasoning,
     ),
-    (&["structured output", "json output", "output json", "json mode"], CapabilityKind::StructuredOutput),
+    (
+        &[
+            "structured output",
+            "json output",
+            "output json",
+            "json mode",
+        ],
+        CapabilityKind::StructuredOutput,
+    ),
     (&["agent", "agents", "autonomous"], CapabilityKind::Agents),
     (
         &["text to speech", "tts", "speech synthesis"],
@@ -53,7 +87,12 @@ const LEXICON: &[(&[&str], CapabilityKind)] = &[
     (&["audio", "speech"], CapabilityKind::Audio),
     (&["multimodal"], CapabilityKind::Multimodal),
     (
-        &["document understanding", "understand document", "understand", "pdf understanding"],
+        &[
+            "document understanding",
+            "understand document",
+            "understand",
+            "pdf understanding",
+        ],
         CapabilityKind::DocumentUnderstanding,
     ),
     (&["video", "video understanding"], CapabilityKind::Video),
@@ -99,9 +138,7 @@ pub fn capability_label(capability: CapabilityKind) -> &'static str {
 ///
 /// Convenience over [`capabilities_for_intent`] + [`capability_label`]; the
 /// capability kind is the machine value, the label is display-only.
-pub fn intent_capabilities_with_labels(
-    text: &str,
-) -> Vec<(CapabilityKind, &'static str)> {
+pub fn intent_capabilities_with_labels(text: &str) -> Vec<(CapabilityKind, &'static str)> {
     capabilities_for_intent(text)
         .into_iter()
         .map(|capability| (capability, capability_label(capability)))
@@ -116,7 +153,10 @@ pub fn intent_capabilities_with_labels(
 pub fn intent_requirements(text: &str, evidence: EvidenceLevel) -> Vec<CapabilityRequirement> {
     capabilities_for_intent(text)
         .into_iter()
-        .map(|capability| CapabilityRequirement { capability, evidence })
+        .map(|capability| CapabilityRequirement {
+            capability,
+            evidence,
+        })
         .collect()
 }
 
@@ -127,7 +167,10 @@ mod tests {
     #[test]
     fn ocr_and_summarization_intent() {
         let caps = capabilities_for_intent("I need OCR and summarization");
-        assert_eq!(caps, vec![CapabilityKind::Ocr, CapabilityKind::Summarization]);
+        assert_eq!(
+            caps,
+            vec![CapabilityKind::Ocr, CapabilityKind::Summarization]
+        );
     }
 
     #[test]
@@ -188,36 +231,29 @@ mod tests {
 
     #[test]
     fn think_step_by_step_maps_to_reasoning() {
-        assert!(
-            capabilities_for_intent("think step by step").contains(&CapabilityKind::Reasoning)
-        );
+        assert!(capabilities_for_intent("think step by step").contains(&CapabilityKind::Reasoning));
     }
 
     #[test]
     fn output_json_maps_to_structured_output() {
-        assert!(
-            capabilities_for_intent("output json").contains(&CapabilityKind::StructuredOutput)
-        );
+        assert!(capabilities_for_intent("output json").contains(&CapabilityKind::StructuredOutput));
     }
 
     #[test]
     fn autonomous_agent_maps_to_agents() {
-        assert!(
-            capabilities_for_intent("autonomous agent").contains(&CapabilityKind::Agents)
-        );
+        assert!(capabilities_for_intent("autonomous agent").contains(&CapabilityKind::Agents));
     }
 
     #[test]
     fn text_to_speech_maps_to_tts() {
-        assert!(
-            capabilities_for_intent("text to speech").contains(&CapabilityKind::TextToSpeech)
-        );
+        assert!(capabilities_for_intent("text to speech").contains(&CapabilityKind::TextToSpeech));
     }
 
     #[test]
     fn multimodal_maps_to_multimodal() {
         assert!(
-            capabilities_for_intent("multimodal understanding").contains(&CapabilityKind::Multimodal)
+            capabilities_for_intent("multimodal understanding")
+                .contains(&CapabilityKind::Multimodal)
         );
     }
 

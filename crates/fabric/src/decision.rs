@@ -69,11 +69,7 @@ pub enum WorkloadClass {
 }
 
 /// Classifies a request from its context and request facts.
-pub fn classify(
-    ctx: &ContextProfile,
-    priority: u8,
-    streaming: bool,
-) -> WorkloadClass {
+pub fn classify(ctx: &ContextProfile, priority: u8, streaming: bool) -> WorkloadClass {
     if ctx.is_continuation {
         WorkloadClass::Continuation
     } else if streaming {
@@ -186,25 +182,57 @@ pub struct ExecutionDecision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ExecutionEvent {
-    Discovered { workers: u32 },
-    Classified { workload_class: WorkloadClass },
-    Planned { selected_worker: Option<String> },
-    Reserved { worker: Option<String> },
-    Executing { worker: Option<String> },
+    Discovered {
+        workers: u32,
+    },
+    Classified {
+        workload_class: WorkloadClass,
+    },
+    Planned {
+        selected_worker: Option<String>,
+    },
+    Reserved {
+        worker: Option<String>,
+    },
+    Executing {
+        worker: Option<String>,
+    },
     /// The orchestrator is observing live runtime state for a running stage.
-    Observing { stage: String, worker: Option<String> },
-    Adapting { reason: String },
+    Observing {
+        stage: String,
+        worker: Option<String>,
+    },
+    Adapting {
+        reason: String,
+    },
     /// Re-planning because the fabric changed / the primary worker is no longer
     /// the best safe choice (before this request produced output).
-    Replanning { from: Option<String>, to: Option<String> },
+    Replanning {
+        from: Option<String>,
+        to: Option<String>,
+    },
     /// Recovering after a retryable worker failure onto an alternative.
-    Recovering { worker: Option<String>, attempt: u32 },
-    Replanned { retry_on: Option<String> },
+    Recovering {
+        worker: Option<String>,
+        attempt: u32,
+    },
+    Replanned {
+        retry_on: Option<String>,
+    },
     /// The request exceeded its deadline while still in a safe (no-output) stage.
-    DeadlineElapsed { deadline_ms: u32 },
-    Completed { ok: bool },
-    Released { worker: Option<String> },
-    Failed { cause: String, retryable: bool },
+    DeadlineElapsed {
+        deadline_ms: u32,
+    },
+    Completed {
+        ok: bool,
+    },
+    Released {
+        worker: Option<String>,
+    },
+    Failed {
+        cause: String,
+        retryable: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -311,16 +339,21 @@ pub fn evaluate(
         {
             cand.score = Some(cs.clone());
         }
-        cand.kv_prefix_resident = req.context.prefix_resident_on.as_deref()
-            == Some(cand.peer_id.as_str());
+        cand.kv_prefix_resident =
+            req.context.prefix_resident_on.as_deref() == Some(cand.peer_id.as_str());
         // Real network reach cost (M19) from the caller's measured graph.
-        cand.network_cost_ms = planner.network.reach_cost_ms(&cand.peer_id, req.transfer_mib);
+        cand.network_cost_ms = planner
+            .network
+            .reach_cost_ms(&cand.peer_id, req.transfer_mib);
     }
 
     let selected = plan_result.rationale.chosen_worker.clone();
     // Fan-out is only ever selected when a real engine advertises it.
     let fanout = allow_fanout
-        && matches!(crate::advisory::fan_out_candidacy(req, workers, &planner.config, true), crate::advisory::FanOutAdvisory::CandidateFanOut { .. });
+        && matches!(
+            crate::advisory::fan_out_candidacy(req, workers, &planner.config, true),
+            crate::advisory::FanOutAdvisory::CandidateFanOut { .. }
+        );
     let (plan, expected_mode) = if fanout {
         // Only build a fan-out from workers a real engine advertises as
         // staging-capable (never fabricate multi-worker execution).
@@ -353,10 +386,16 @@ pub fn evaluate(
             (Some(plan), "fan_out".to_string())
         } else {
             // Not really multi-worker capable: fall back to the single plan.
-            (Some(plan_result.plan.clone()), expected_mode_for(&plan_result.plan.kind, cls))
+            (
+                Some(plan_result.plan.clone()),
+                expected_mode_for(&plan_result.plan.kind, cls),
+            )
         }
     } else {
-        (Some(plan_result.plan.clone()), expected_mode_for(&plan_result.plan.kind, cls))
+        (
+            Some(plan_result.plan.clone()),
+            expected_mode_for(&plan_result.plan.kind, cls),
+        )
     };
 
     trace.push(ExecutionEvent::Planned {
@@ -568,12 +607,20 @@ pub fn orchestrate(o: &Observation) -> OrchestrationAction {
     // one that just failed in a way that suggests the worker itself.
     if o.phase == ExecutionPhase::Recovering && o.eligible_alternatives > 0 {
         return OrchestrationAction::Recover {
-            on: if o.is_continuation { o.prefix_on.clone() } else { None },
+            on: if o.is_continuation {
+                o.prefix_on.clone()
+            } else {
+                None
+            },
         };
     }
     if o.phase == ExecutionPhase::Replanning {
         return OrchestrationAction::Replan {
-            to: if o.is_continuation { o.prefix_on.clone() } else { None },
+            to: if o.is_continuation {
+                o.prefix_on.clone()
+            } else {
+                None
+            },
         };
     }
     if !o.worker_congested && o.retryable && o.worker.is_some() {
@@ -746,46 +793,31 @@ mod tests {
     #[test]
     fn adapt_never_retries_after_output_or_definitive_failure() {
         // tokens emitted → abort (never duplicate partial output)
-        assert_eq!(
-            adapt(false, true, false, 5, 3, 2, false),
-            Adaptation::Abort
-        );
+        assert_eq!(adapt(false, true, false, 5, 3, 2, false), Adaptation::Abort);
         // cancelled → abort
-        assert_eq!(
-            adapt(false, true, true, 0, 3, 2, false),
-            Adaptation::Abort
-        );
+        assert_eq!(adapt(false, true, true, 0, 3, 2, false), Adaptation::Abort);
         // non-retryable definitive failure → abort
         assert_eq!(
             adapt(false, false, false, 0, 3, 2, false),
             Adaptation::Abort
         );
         // success → continue
-        assert_eq!(adapt(true, true, false, 0, 3, 2, false), Adaptation::Continue);
+        assert_eq!(
+            adapt(true, true, false, 0, 3, 2, false),
+            Adaptation::Continue
+        );
     }
 
     #[test]
     fn adapt_replans_when_an_eligible_worker_remains() {
         // retryable transport failure, no tokens, candidate remains, budget left
-        assert_eq!(
-            adapt(false, true, false, 0, 2, 3, false),
-            Adaptation::Retry
-        );
+        assert_eq!(adapt(false, true, false, 0, 2, 3, false), Adaptation::Retry);
         // continuation honors affinity → Replan (steer to fresh candidate)
-        assert_eq!(
-            adapt(false, true, false, 0, 2, 3, true),
-            Adaptation::Replan
-        );
+        assert_eq!(adapt(false, true, false, 0, 2, 3, true), Adaptation::Replan);
         // no budget → abort
-        assert_eq!(
-            adapt(false, true, false, 0, 2, 0, false),
-            Adaptation::Abort
-        );
+        assert_eq!(adapt(false, true, false, 0, 2, 0, false), Adaptation::Abort);
         // no eligible after primary → abort
-        assert_eq!(
-            adapt(false, true, false, 0, 0, 3, false),
-            Adaptation::Abort
-        );
+        assert_eq!(adapt(false, true, false, 0, 0, 3, false), Adaptation::Abort);
     }
 
     #[test]
@@ -831,7 +863,11 @@ mod tests {
         assert!(!d.trace.is_empty());
         // The non-serving candidate records a ServesModel breach.
         let c = d.candidates.iter().find(|c| c.peer_id == "b").unwrap();
-        assert!(c.constraints.breaches.contains(&ConstraintKind::ServesModel));
+        assert!(
+            c.constraints
+                .breaches
+                .contains(&ConstraintKind::ServesModel)
+        );
     }
 
     #[test]
@@ -851,19 +887,20 @@ mod tests {
             0,
         );
         r.required_capability = Some("ocr".to_string());
-        let d = evaluate(
-            &ExecutionPlanner::default(),
-            "r-cap",
-            &r,
-            &[g],
-            true,
-            false,
-        );
-        let view = d.capability_requirement.expect("requirement must propagate");
+        let d = evaluate(&ExecutionPlanner::default(), "r-cap", &r, &[g], true, false);
+        let view = d
+            .capability_requirement
+            .expect("requirement must propagate");
         assert_eq!(view.capability, "ocr");
-        assert!(!view.satisfied, "fabric never claims satisfaction without evidence");
+        assert!(
+            !view.satisfied,
+            "fabric never claims satisfaction without evidence"
+        );
         assert_eq!(view.evidence, "UNKNOWN");
-        assert!(d.reasoning.contains("ocr"), "reasoning should mention the requirement");
+        assert!(
+            d.reasoning.contains("ocr"),
+            "reasoning should mention the requirement"
+        );
 
         // Without a requirement, the decision carries None.
         let r2 = req(
@@ -875,7 +912,14 @@ mod tests {
             },
             0,
         );
-        let d2 = evaluate(&ExecutionPlanner::default(), "r-none", &r2, &[worker("g", 150, 20, 10)], true, false);
+        let d2 = evaluate(
+            &ExecutionPlanner::default(),
+            "r-none",
+            &r2,
+            &[worker("g", 150, 20, 10)],
+            true,
+            false,
+        );
         assert!(d2.capability_requirement.is_none());
     }
 
@@ -917,12 +961,15 @@ mod tests {
             .network
             .set("near", LinkMetrics::prior(Locality::Lan, Some(1_000)));
         // One eligible candidate, transfer cost of 2 MiB.
-        let mut rf = req(ContextProfile {
-            prompt_tokens: 10,
-            max_output_tokens: 10,
-            is_continuation: false,
-            prefix_resident_on: None,
-        }, 0);
+        let mut rf = req(
+            ContextProfile {
+                prompt_tokens: 10,
+                max_output_tokens: 10,
+                is_continuation: false,
+                prefix_resident_on: None,
+            },
+            0,
+        );
         rf.transfer_mib = 2;
         let ws = vec![worker("far", 150, 40, 10)];
         let d = evaluate(&planner, "r1", &rf, &ws, false, false);
@@ -988,12 +1035,20 @@ mod tests {
         // recovering with an alternative (and session affinity) → Recover
         let mut r = obs(ExecutionPhase::Recovering);
         r.is_continuation = false;
-        assert!(matches!(orchestrate(&r), OrchestrationAction::Recover { .. }));
+        assert!(matches!(
+            orchestrate(&r),
+            OrchestrationAction::Recover { .. }
+        ));
         // replanning a continuation steers to the prefix-resident worker
         let mut p = obs(ExecutionPhase::Replanning);
         p.is_continuation = true;
         p.prefix_on = Some("kv1".into());
-        assert_eq!(orchestrate(&p), OrchestrationAction::Replan { to: Some("kv1".into()) });
+        assert_eq!(
+            orchestrate(&p),
+            OrchestrationAction::Replan {
+                to: Some("kv1".into())
+            }
+        );
     }
 
     #[test]
@@ -1038,23 +1093,31 @@ mod tests {
             false,
         );
         let before = d.trace.len();
-        observe(&mut d, ExecutionEvent::Observing {
-            stage: "s1".into(),
-            worker: Some("g".into()),
-        });
-        observe(&mut d, ExecutionEvent::Recovering {
-            worker: Some("g".into()),
-            attempt: 1,
-        });
+        observe(
+            &mut d,
+            ExecutionEvent::Observing {
+                stage: "s1".into(),
+                worker: Some("g".into()),
+            },
+        );
+        observe(
+            &mut d,
+            ExecutionEvent::Recovering {
+                worker: Some("g".into()),
+                attempt: 1,
+            },
+        );
         assert_eq!(d.trace.len(), before + 2);
-        assert!(d
-            .trace
-            .iter()
-            .any(|e| matches!(e, ExecutionEvent::Observing { .. })));
-        assert!(d
-            .trace
-            .iter()
-            .any(|e| matches!(e, ExecutionEvent::Recovering { attempt: 1, .. })));
+        assert!(
+            d.trace
+                .iter()
+                .any(|e| matches!(e, ExecutionEvent::Observing { .. }))
+        );
+        assert!(
+            d.trace
+                .iter()
+                .any(|e| matches!(e, ExecutionEvent::Recovering { attempt: 1, .. }))
+        );
     }
 
     // ---- Phase H: self-healing recovery timeline ----
@@ -1078,26 +1141,34 @@ mod tests {
             false,
             false,
         );
-        observe(&mut d, ExecutionEvent::Recovering {
-            worker: Some("g".into()),
-            attempt: 1,
-        });
-        observe(&mut d, ExecutionEvent::Replanned {
-            retry_on: Some("g".into()),
-        });
+        observe(
+            &mut d,
+            ExecutionEvent::Recovering {
+                worker: Some("g".into()),
+                attempt: 1,
+            },
+        );
+        observe(
+            &mut d,
+            ExecutionEvent::Replanned {
+                retry_on: Some("g".into()),
+            },
+        );
         observe(&mut d, ExecutionEvent::Completed { ok: true });
         d.outcome = Some("succeeded".into());
-        d.last_orchestration = Some(OrchestrationAction::Recover { on: Some("g".into()) });
+        d.last_orchestration = Some(OrchestrationAction::Recover {
+            on: Some("g".into()),
+        });
 
         let tl = recovery_timeline(&d);
         let recoveries = tl["recoveries"].as_u64().unwrap();
-        assert!(recoveries >= 2, "expected recovery events counted, got {recoveries}");
+        assert!(
+            recoveries >= 2,
+            "expected recovery events counted, got {recoveries}"
+        );
         // The recovery event name shows up in both the phase list and timeline.
         let phases = tl["phases_seen"].as_array().unwrap();
-        let names: Vec<&str> = phases
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let names: Vec<&str> = phases.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"recovering"));
         assert!(names.contains(&"replanned"));
         // Timeline preserves order and carries the snake_case event names.
@@ -1172,10 +1243,13 @@ mod tests {
             false,
             false,
         );
-        observe(&mut d, ExecutionEvent::Failed {
-            cause: "definitive".into(),
-            retryable: false,
-        });
+        observe(
+            &mut d,
+            ExecutionEvent::Failed {
+                cause: "definitive".into(),
+                retryable: false,
+            },
+        );
         d.outcome = Some("failed".into());
         let tl = recovery_timeline(&d);
         assert_eq!(tl["summary"], "aborted");

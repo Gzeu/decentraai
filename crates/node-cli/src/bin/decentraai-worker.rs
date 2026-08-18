@@ -36,18 +36,19 @@ use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
 /// Standard data directory (same layout as `decentraai setup` / `decentraai node`).
 fn default_data_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(
-        std::env::var("DECENTRAAI_DATA_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".into());
-            format!("{home}/.decentraai")
-        }),
-    )
+    std::path::PathBuf::from(std::env::var("DECENTRAAI_DATA_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".into());
+        format!("{home}/.decentraai")
+    }))
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "decentraai-worker", about = "Standalone DecentraAI lightweight worker (no control plane)")]
+#[command(
+    name = "decentraai-worker",
+    about = "Standalone DecentraAI lightweight worker (no control plane)"
+)]
 struct Args {
     /// Human-readable node name advertised in the compute advertisement.
     #[arg(long, default_value = "decentraai-worker")]
@@ -95,9 +96,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-    ).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .init();
 
     let args = Args::parse();
 
@@ -132,8 +133,8 @@ async fn main() -> Result<()> {
     let local_peer_id = libp2p::PeerId::from(keypair.public());
 
     // ---- config: load worker-relevant sections, not the control plane ----
-    let config = decentraai_config::NodeConfig::load(&args.config)
-        .context("loading node config")?;
+    let config =
+        decentraai_config::NodeConfig::load(&args.config).context("loading node config")?;
 
     // ---- engine: a real llama-server is REQUIRED (no silent mock) ----
     let model_path = resolve_model_path(&data_dir, args.model.as_deref()).await?;
@@ -180,8 +181,7 @@ async fn main() -> Result<()> {
         local_peer_id,
         InferenceConfig::default(),
     ));
-    let distributed_handler =
-        DistributedP2PHandler::with_worker_manager(worker_manager.clone());
+    let distributed_handler = DistributedP2PHandler::with_worker_manager(worker_manager.clone());
     let chained = ChainedHandler::new().add_handler(Arc::new(distributed_handler));
     let p2p_node = P2PNode::new(
         &identity,
@@ -211,8 +211,10 @@ async fn main() -> Result<()> {
         config.inference.allow_remote_inference,
     )?;
 
-    let size_mb = (std::fs::metadata(&model_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(1024))
-        .max(1);
+    let size_mb = (std::fs::metadata(&model_path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(1024))
+    .max(1);
     let served_models = build_served_models(&model_hash, &model_name, size_mb);
     advertise_and_broadcast(&compute_manager, &distributed, served_models).await;
 
@@ -250,8 +252,8 @@ fn parse_invite(invite: &str) -> Result<(String, String)> {
 /// and verified P2P dial mechanisms; it does NOT invent a new identity, token,
 /// trust, auth, or discovery system.
 async fn join_worker(invite: &str, data_dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     use decentraai_p2p::P2PNode;
+    use std::os::unix::fs::PermissionsExt;
 
     let (multiaddr, token) = parse_invite(invite)?;
     for directory in ["identity", "models", "registry", "db", "logs", "runtime"] {
@@ -294,7 +296,10 @@ async fn join_worker(invite: &str, data_dir: &std::path::Path) -> Result<()> {
     println!("Worker joined the fabric — connected to the coordinating peer at {multiaddr}");
     println!("  Worker PeerId : {}", identity.peer_id());
     println!("  Credential     : {} (0600)", credential_path.display());
-    println!("  Run the worker : decentraai-worker --model <file.gguf> [--data-dir {}]", data_dir.display());
+    println!(
+        "  Run the worker : decentraai-worker --model <file.gguf> [--data-dir {}]",
+        data_dir.display()
+    );
     Ok(())
 }
 
@@ -321,10 +326,38 @@ fn status_worker(args: &Args) -> Result<()> {
     };
 
     println!("== decentraai-worker status ==");
-    println!("  PeerId      : {}", if has_identity { Identity::load(&identity_path)?.peer_id().to_string() } else { "UNKNOWN (no identity)".into() });
-    println!("  Identity    : {}", if has_identity { "present" } else { "missing (run --join or --init)" });
-    println!("  Credential  : {}", if has_credential { "stored (0600)" } else { "none — not joined yet" });
-    println!("  Config      : {}", if config_ok { "valid" } else { "invalid/missing" });
+    println!(
+        "  PeerId      : {}",
+        if has_identity {
+            Identity::load(&identity_path)?.peer_id().to_string()
+        } else {
+            "UNKNOWN (no identity)".into()
+        }
+    );
+    println!(
+        "  Identity    : {}",
+        if has_identity {
+            "present"
+        } else {
+            "missing (run --join or --init)"
+        }
+    );
+    println!(
+        "  Credential  : {}",
+        if has_credential {
+            "stored (0600)"
+        } else {
+            "none — not joined yet"
+        }
+    );
+    println!(
+        "  Config      : {}",
+        if config_ok {
+            "valid"
+        } else {
+            "invalid/missing"
+        }
+    );
     // Evidence-backed worker-side lifecycle. Trust and BUSY are coordinator-side
     // (the coordinator decides trust and observes busy/queued), so the worker can
     // only honestly report DISCOVERED (joined, not yet runnable) vs READY (has
@@ -332,7 +365,10 @@ fn status_worker(args: &Args) -> Result<()> {
     // VERIFIED are never emitted (no remote update mechanism).
     let engine_ok = find_llama_server(args.binary.as_deref()).is_ok();
     let model_ok = std::fs::read_dir(data_dir.join("models"))
-        .map(|rd| rd.flatten().any(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false)))
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false))
+        })
         .unwrap_or(false);
     let lifecycle = if has_identity && has_credential && config_ok && engine_ok && model_ok {
         "READY (will advertise + serve when started)"
@@ -342,11 +378,29 @@ fn status_worker(args: &Args) -> Result<()> {
         "UNKNOWN (not joined)"
     };
     println!("  Lifecycle   : {lifecycle}");
-    println!("  Engine      : {}", if engine_ok { "found" } else { "UNKNOWN — llama-server not found" });
-    println!("  Model       : {}", if model_ok { "on disk" } else { "none on disk (UNKNOWN)" });
+    println!(
+        "  Engine      : {}",
+        if engine_ok {
+            "found"
+        } else {
+            "UNKNOWN — llama-server not found"
+        }
+    );
+    println!(
+        "  Model       : {}",
+        if model_ok {
+            "on disk"
+        } else {
+            "none on disk (UNKNOWN)"
+        }
+    );
     println!("  Trust       : (coordinator-side — see the fabric dashboard /v1/fabric)");
     println!("  CPU cores   : {}", snapshot.logical_cpus);
-    println!("  RAM         : {} MiB total / {} MiB available", snapshot.total_memory_bytes / (1024*1024), snapshot.available_memory_bytes / (1024*1024));
+    println!(
+        "  RAM         : {} MiB total / {} MiB available",
+        snapshot.total_memory_bytes / (1024 * 1024),
+        snapshot.available_memory_bytes / (1024 * 1024)
+    );
     println!("  GPU         : {gpu_line}");
     Ok(())
 }
@@ -365,7 +419,9 @@ fn doctor_worker(args: &Args) -> Result<()> {
         println!("  ✓ identity present");
     } else {
         problems += 1;
-        println!("  ✗ identity missing — run `decentraai-worker --join '<multiaddr> <dsk_ token>'`");
+        println!(
+            "  ✗ identity missing — run `decentraai-worker --join '<multiaddr> <dsk_ token>'`"
+        );
     }
 
     // Credential / joined.
@@ -398,7 +454,10 @@ fn doctor_worker(args: &Args) -> Result<()> {
     // Model availability (a worker should have a model to serve).
     match std::fs::read_dir(data_dir.join("models")) {
         Ok(rd) => {
-            let gguf = rd.flatten().filter(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false)).count();
+            let gguf = rd
+                .flatten()
+                .filter(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false))
+                .count();
             if gguf > 0 {
                 println!("  ✓ {gguf} GGUF model(s) on disk");
             } else {
@@ -423,7 +482,10 @@ fn doctor_worker(args: &Args) -> Result<()> {
 const DEFAULT_MAX_CHUNK_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Resolve the model file path (data-dir models/<name> or an absolute path).
-async fn resolve_model_path(data_dir: &std::path::Path, model: Option<&str>) -> Result<std::path::PathBuf> {
+async fn resolve_model_path(
+    data_dir: &std::path::Path,
+    model: Option<&str>,
+) -> Result<std::path::PathBuf> {
     match model {
         Some(m) => {
             let candidate = data_dir.join("models").join(m);
@@ -451,13 +513,18 @@ async fn resolve_model_path(data_dir: &std::path::Path, model: Option<&str>) -> 
                 }
             }
             found.sort();
-            found.into_iter().next().context("no GGUF model found in models/; pass --model <file>")
+            found
+                .into_iter()
+                .next()
+                .context("no GGUF model found in models/; pass --model <file>")
         }
     }
 }
 
 fn model_name_for(path: &std::path::Path) -> String {
-    path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model.gguf".to_string())
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model.gguf".to_string())
 }
 
 async fn hash_model(path: &std::path::Path) -> Result<String> {
@@ -467,14 +534,20 @@ async fn hash_model(path: &std::path::Path) -> Result<String> {
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Build the served-model list (single model) for the advertisement.
-fn build_served_models(model_hash: &str, model_name: &str, size_mb: u64) -> Vec<decentraai_compute::ServedModel> {
+fn build_served_models(
+    model_hash: &str,
+    model_name: &str,
+    size_mb: u64,
+) -> Vec<decentraai_compute::ServedModel> {
     vec![decentraai_compute::ServedModel {
         model_hash: model_hash.to_string(),
         file_name: model_name.to_string(),
@@ -520,7 +593,12 @@ async fn advertise_and_broadcast(
                 .await
                 .iter()
                 .find(|w| w.peer_id == cm.local_peer())
-                .map(|w| (w.capability.served_models.clone(), w.capability.available_models.clone()))
+                .map(|w| {
+                    (
+                        w.capability.served_models.clone(),
+                        w.capability.available_models.clone(),
+                    )
+                })
                 .unwrap_or((served_models.clone(), vec![]));
             let a = cm.advertise_local(snap, g, served, available, false).await;
             if let Ok(bytes) = cm.advertisement_wire_bytes(&a) {
@@ -536,8 +614,7 @@ mod tests {
 
     #[test]
     fn parse_invite_accepts_multiaddr_and_dsk_token() {
-        let (ma, tok) =
-            parse_invite("/ip4/192.168.1.50/tcp/41501 dsk_abc123").unwrap();
+        let (ma, tok) = parse_invite("/ip4/192.168.1.50/tcp/41501 dsk_abc123").unwrap();
         assert_eq!(ma, "/ip4/192.168.1.50/tcp/41501");
         assert_eq!(tok, "dsk_abc123");
     }
@@ -547,6 +624,9 @@ mod tests {
         assert!(parse_invite("/ip4/1.2.3.4/tcp/5 secret").is_err());
         assert!(parse_invite("/ip4/1.2.3.4/tcp/5").is_err(), "no token");
         assert!(parse_invite("").is_err());
-        assert!(parse_invite("dsk_only_no_multiaddr").is_err(), "no multiaddr");
+        assert!(
+            parse_invite("dsk_only_no_multiaddr").is_err(),
+            "no multiaddr"
+        );
     }
 }

@@ -538,7 +538,12 @@ async fn on_demand_provisioning_downloads_verifies_and_serves() {
         backend_factory: factory,
     };
     worker
-        .register_worker_backend(bound_backend, MODEL_HASH.to_string(), Some(provisioning), true)
+        .register_worker_backend(
+            bound_backend,
+            MODEL_HASH.to_string(),
+            Some(provisioning),
+            true,
+        )
         .unwrap();
 
     // ---- Coordinator: chained handler (distributed + registry server).

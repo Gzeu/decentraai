@@ -155,7 +155,13 @@ impl AgentManager {
     /// Total number of known agents (local + remote).
     pub fn total_count(&self) -> usize {
         let local = self.local.lock().unwrap().len();
-        let remote: usize = self.remote.lock().unwrap().values().map(|a| a.agents.len()).sum();
+        let remote: usize = self
+            .remote
+            .lock()
+            .unwrap()
+            .values()
+            .map(|a| a.agents.len())
+            .sum();
         local + remote
     }
 

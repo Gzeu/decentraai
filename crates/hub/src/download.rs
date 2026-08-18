@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-use crate::catalog::HubCatalog;
 use crate::HfRef;
+use crate::catalog::HubCatalog;
 
 /// Result of a completed download.
 #[derive(Debug, Clone)]
@@ -44,10 +44,7 @@ pub struct DownloadedModel {
 ///
 /// The file lands at `dest_dir/<file>` and is returned. The destination
 /// directory is created if missing.
-pub async fn download_model(
-    reference: &HfRef,
-    dest_dir: &Path,
-) -> Result<DownloadedModel> {
+pub async fn download_model(reference: &HfRef, dest_dir: &Path) -> Result<DownloadedModel> {
     download_model_with_progress(reference, dest_dir, None).await
 }
 
@@ -68,9 +65,7 @@ pub async fn download_model_with_progress(
             let largest = files
                 .iter()
                 .max_by_key(|f| f.size.unwrap_or(0))
-                .with_context(|| {
-                    format!("repository '{}' has no GGUF files", reference.repo)
-                })?;
+                .with_context(|| format!("repository '{}' has no GGUF files", reference.repo))?;
             largest.path.clone()
         }
     };
@@ -111,7 +106,9 @@ pub async fn download_verified(
 ) -> Result<DownloadedModel> {
     let client = reqwest::Client::new();
     let mut req = client.get(url);
-    if let Ok(token) = std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN")) {
+    if let Ok(token) =
+        std::env::var("HF_TOKEN").or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+    {
         if !token.trim().is_empty() {
             req = req.bearer_auth(token.trim());
         }

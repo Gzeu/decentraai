@@ -106,10 +106,7 @@ impl ComputeScheduler {
     /// then evicts peers that stay offline past `grace`. Returns the number of
     /// expired reservations plus the evicted (peer, node_name) records for
     /// audit.
-    pub fn reap_offline(
-        &mut self,
-        grace: std::time::Duration,
-    ) -> (usize, Vec<(PeerId, String)>) {
+    pub fn reap_offline(&mut self, grace: std::time::Duration) -> (usize, Vec<(PeerId, String)>) {
         let now = Instant::now();
         let expired = self.ledger.prune_expired(now);
         self.registry.prune_stale(now);
@@ -147,7 +144,8 @@ impl ComputeScheduler {
             .filter(|adv| self.trusted.contains(&adv.peer_id))
             .filter(|adv| {
                 matches!(
-                    self.matcher.matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
+                    self.matcher
+                        .matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
                     MatchOutcome::Eligible
                 )
             })
@@ -196,7 +194,8 @@ impl ComputeScheduler {
             return None;
         }
         if !matches!(
-            self.matcher.matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
+            self.matcher
+                .matches(adv, req, &self.ledger, true, self.local_peer.as_ref()),
             MatchOutcome::Eligible
         ) {
             return None;
@@ -233,7 +232,9 @@ impl ComputeScheduler {
             1.0
         };
 
-        load_score * 0.30 + queue_score * 0.20 + throughput_score * 0.20
+        load_score * 0.30
+            + queue_score * 0.20
+            + throughput_score * 0.20
             + latency_score * 0.15
             + headroom * 0.15
             // Adaptive contribution (roadmap): a stressed worker (high GPU
@@ -260,8 +261,8 @@ impl ComputeScheduler {
 mod tests {
     use super::*;
     use crate::availability::{ComputeAvailability, WorkerHealth};
-    use crate::testutil::test_advertisement;
     use crate::requirements::WorkloadRequirements;
+    use crate::testutil::test_advertisement;
     use std::time::Duration;
 
     fn peer() -> PeerId {
@@ -269,7 +270,15 @@ mod tests {
         PeerId::from(keypair.public())
     }
 
-    fn advertisement(peer: PeerId, ram: u64, vram: u64, load: u8, queue: u32, tps: u32, lat: u32) -> ComputeAdvertisement {
+    fn advertisement(
+        peer: PeerId,
+        ram: u64,
+        vram: u64,
+        load: u8,
+        queue: u32,
+        tps: u32,
+        lat: u32,
+    ) -> ComputeAdvertisement {
         test_advertisement(peer, ram, Some(vram), load, queue, WorkerHealth::Ready)
             .replace_availability(ComputeAvailability {
                 available_ram_mb: ram,
@@ -316,7 +325,9 @@ mod tests {
         sched.upsert(advertisement(p1, 12 * 1024, 18 * 1024, 80, 5, 40, 400));
         sched.upsert(advertisement(p2, 12 * 1024, 18 * 1024, 10, 0, 80, 60));
 
-        let placement = sched.select(&req(), Instant::now()).expect("a worker is eligible");
+        let placement = sched
+            .select(&req(), Instant::now())
+            .expect("a worker is eligible");
         assert_eq!(placement.worker, p2, "the idle, faster worker wins");
         assert_eq!(sched.ledger().in_flight(&p2), 1, "resources are reserved");
     }
@@ -346,9 +357,15 @@ mod tests {
         sched.upsert(advertisement(p, 3072, 3072 + 512, 0, 0, 80, 60));
 
         let first = sched.select(&req(), Instant::now()).expect("first fits");
-        assert!(sched.select(&req(), Instant::now()).is_none(), "second workload must be rejected");
+        assert!(
+            sched.select(&req(), Instant::now()).is_none(),
+            "second workload must be rejected"
+        );
         sched.release(first.reservation.reservation_id);
-        assert!(sched.select(&req(), Instant::now()).is_some(), "release frees the slot");
+        assert!(
+            sched.select(&req(), Instant::now()).is_some(),
+            "release frees the slot"
+        );
     }
 
     #[test]
@@ -411,7 +428,10 @@ mod tests {
         // GPU node with plenty RAM but only 1 GiB free VRAM.
         let adv = advertisement(p, 12 * 1024, 1024, 10, 0, 80, 60);
         sched.upsert(adv);
-        assert!(sched.select(&req(), Instant::now()).is_none(), "3 GiB workload needs more VRAM");
+        assert!(
+            sched.select(&req(), Instant::now()).is_none(),
+            "3 GiB workload needs more VRAM"
+        );
     }
 
     #[test]
@@ -439,7 +459,10 @@ mod tests {
         // p2 has no VRAM for the 3 GiB GPU workload.
         sched.upsert(advertisement(p2, 12 * 1024, 512, 10, 0, 80, 60));
 
-        assert!(sched.reserve_worker(&p2, &req(), Instant::now()).is_none(), "must not reserve an incapable worker");
+        assert!(
+            sched.reserve_worker(&p2, &req(), Instant::now()).is_none(),
+            "must not reserve an incapable worker"
+        );
         assert!(sched.reserve_worker(&p1, &req(), Instant::now()).is_some());
     }
 
@@ -448,10 +471,18 @@ mod tests {
         let p = peer();
         let mut sched = scheduler(HashSet::from([p]));
         sched.upsert(advertisement(p, 3072, 3072 + 512, 0, 0, 80, 60));
-        let first = sched.reserve_worker(&p, &req(), Instant::now()).expect("first fits");
-        assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_none(), "double-booking refused");
+        let first = sched
+            .reserve_worker(&p, &req(), Instant::now())
+            .expect("first fits");
+        assert!(
+            sched.reserve_worker(&p, &req(), Instant::now()).is_none(),
+            "double-booking refused"
+        );
         sched.release(first.reservation.reservation_id);
-        assert!(sched.reserve_worker(&p, &req(), Instant::now()).is_some(), "release frees the slot");
+        assert!(
+            sched.reserve_worker(&p, &req(), Instant::now()).is_some(),
+            "release frees the slot"
+        );
     }
 
     #[test]
@@ -469,7 +500,9 @@ mod tests {
         adv.availability.gpu_temperature_celsius = Some(95);
         sched.upsert(adv);
 
-        let winner = sched.select(&req(), Instant::now()).expect("a worker must be selected");
+        let winner = sched
+            .select(&req(), Instant::now())
+            .expect("a worker must be selected");
         assert_eq!(
             winner.worker, healthy,
             "the healthy worker must win over the thermally-stressed one"

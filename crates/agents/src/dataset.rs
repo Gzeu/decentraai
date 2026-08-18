@@ -206,9 +206,7 @@ impl SkillDescriptor {
             }
         }
         // All prerequisites must be present.
-        self.prerequisites
-            .iter()
-            .all(|p| model_caps.contains(p))
+        self.prerequisites.iter().all(|p| model_caps.contains(p))
     }
 }
 
@@ -220,7 +218,17 @@ pub enum DatasetError {
     #[error("skill '{id}' is already registered")]
     DuplicateSkill { id: String },
     #[error("dataset '{dataset_id}' referenced by skill '{skill_id}' is not registered")]
-    UnknownDataset { skill_id: String, dataset_id: String },
+    UnknownDataset {
+        skill_id: String,
+        dataset_id: String,
+    },
+    #[error(
+        "skill '{skill_id}' declares capability {capability:?} which its dataset does not develop"
+    )]
+    SkillDevelopsNotInDataset {
+        skill_id: String,
+        capability: CapabilityKind,
+    },
 }
 
 /// Deterministic registries of datasets and skills.
@@ -246,16 +254,34 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// Registers a skill, requiring its dataset to be known.
+    /// Registers a skill, requiring its dataset to be known and that the
+    /// skill only unlocks capabilities its dataset actually develops.
+    ///
+    /// Integrity invariant (audit B): a dataset is *evidence* — it declares
+    /// the capabilities it develops. A skill is an *application gate*; it must
+    /// not invent capabilities the dataset does not support, otherwise a
+    /// `Verified` dataset could lend `Verified` to capabilities it never
+    /// developed (provenance laundering).
     pub fn add_skill(&mut self, skill: SkillDescriptor) -> Result<(), DatasetError> {
         if self.skills.contains_key(&skill.id) {
-            return Err(DatasetError::DuplicateSkill { id: skill.id.clone() });
+            return Err(DatasetError::DuplicateSkill {
+                id: skill.id.clone(),
+            });
         }
-        if !self.datasets.contains_key(&skill.dataset_id) {
-            return Err(DatasetError::UnknownDataset {
+        let dataset = self
+            .datasets
+            .get(&skill.dataset_id)
+            .ok_or(DatasetError::UnknownDataset {
                 skill_id: skill.id.clone(),
                 dataset_id: skill.dataset_id.clone(),
-            });
+            })?;
+        for cap in &skill.develops {
+            if !dataset.develops.contains(cap) {
+                return Err(DatasetError::SkillDevelopsNotInDataset {
+                    skill_id: skill.id.clone(),
+                    capability: *cap,
+                });
+            }
         }
         self.skills.insert(skill.id.clone(), skill);
         Ok(())
@@ -334,10 +360,14 @@ pub fn build_agent_capabilities(
     let mut seen: BTreeSet<CapabilityKind> = base_kinds.iter().copied().collect();
     for skill in applicable {
         let dataset = registry.dataset(&skill.dataset_id);
-        // Capabilities come from the dataset's develops claims and the skill's
-        // own develops, with the dataset's provenance.
-        let prov = dataset.map(|d| d.provenance).unwrap_or(Provenance::Inferred);
-        for cap in skill.develops.iter().copied() {
+        // Capabilities come from the DATASET's develops (evidence) with the
+        // dataset's provenance — never from skill.develops (which is validated
+        // to be a subset, but the dataset is the authoritative evidence
+        // source). This prevents a skill from lending a dataset's Verified
+        // provenance to capabilities the dataset does not actually develop.
+        let Some(dataset) = dataset else { continue };
+        let prov = dataset.provenance;
+        for cap in dataset.develops.iter().copied() {
             if seen.insert(cap) {
                 unlocked.push(CapabilityClaim {
                     capability: cap,
@@ -346,7 +376,10 @@ pub fn build_agent_capabilities(
             }
         }
     }
-    CapabilityBuild { base: model_caps, unlocked }
+    CapabilityBuild {
+        base: model_caps,
+        unlocked,
+    }
 }
 
 #[cfg(test)]
@@ -448,7 +481,10 @@ mod tests {
             &reg,
         );
         let all = build.all();
-        assert!(all.iter().any(|c| c.capability == CapabilityKind::ToolCalling));
+        assert!(
+            all.iter()
+                .any(|c| c.capability == CapabilityKind::ToolCalling)
+        );
         assert!(all.iter().any(|c| c.capability == CapabilityKind::Coding));
     }
 
@@ -476,7 +512,12 @@ mod tests {
             }],
             &reg,
         );
-        assert!(!build.all().iter().any(|c| c.capability == CapabilityKind::ToolCalling));
+        assert!(
+            !build
+                .all()
+                .iter()
+                .any(|c| c.capability == CapabilityKind::ToolCalling)
+        );
         assert!(build.unlocked.is_empty());
     }
 
@@ -500,15 +541,119 @@ mod tests {
     #[test]
     fn registry_lists_sorted() {
         let mut reg = SkillRegistry::new();
-        reg.add_dataset(
-            DatasetDescriptor::new("b", "B", vec![CapabilityKind::Chat], DatasetKind::Training),
-        )
+        reg.add_dataset(DatasetDescriptor::new(
+            "b",
+            "B",
+            vec![CapabilityKind::Chat],
+            DatasetKind::Training,
+        ))
         .unwrap();
-        reg.add_dataset(
-            DatasetDescriptor::new("a", "A", vec![CapabilityKind::Coding], DatasetKind::Training),
-        )
+        reg.add_dataset(DatasetDescriptor::new(
+            "a",
+            "A",
+            vec![CapabilityKind::Coding],
+            DatasetKind::Training,
+        ))
         .unwrap();
         let ids: Vec<&str> = reg.datasets().iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn skill_cannot_declare_capabilities_outside_its_dataset() {
+        // Integrity invariant (audit B): a skill must not unlock capabilities
+        // its dataset does not develop — otherwise a Verified dataset could
+        // lend Verified provenance to capabilities it never trained for.
+        let mut reg = SkillRegistry::new();
+        reg.add_dataset(
+            DatasetDescriptor::new(
+                "code_finetune_2024",
+                "Code fine-tune",
+                vec![CapabilityKind::Coding],
+                DatasetKind::FineTune,
+            )
+            .with_provenance(Provenance::Verified),
+        )
+        .unwrap();
+
+        // A skill claiming Ocr (not developed by the code dataset) is rejected.
+        let bad = SkillDescriptor::new(
+            "bad-skill",
+            "Bad",
+            "code_finetune_2024",
+            Some(CapabilityKind::Coding),
+            vec![CapabilityKind::Ocr],
+        );
+        assert!(matches!(
+            reg.add_skill(bad),
+            Err(DatasetError::SkillDevelopsNotInDataset {
+                capability: CapabilityKind::Ocr,
+                ..
+            })
+        ));
+
+        // A skill claiming only capabilities the dataset develops is accepted.
+        let good = SkillDescriptor::new(
+            "good-skill",
+            "Good",
+            "code_finetune_2024",
+            Some(CapabilityKind::Coding),
+            vec![CapabilityKind::Coding],
+        );
+        assert!(reg.add_skill(good).is_ok());
+    }
+
+    #[test]
+    fn build_unlocks_dataset_develops_not_skill_develops() {
+        // The unlocked capabilities must come from the dataset (evidence),
+        // never from a skill's own declaration.
+        let mut reg = SkillRegistry::new();
+        reg.add_dataset(
+            DatasetDescriptor::new(
+                "code_finetune_2024",
+                "Code fine-tune",
+                vec![CapabilityKind::Coding, CapabilityKind::ToolCalling],
+                DatasetKind::FineTune,
+            )
+            .with_provenance(Provenance::Verified),
+        )
+        .unwrap();
+        reg.add_skill(SkillDescriptor::new(
+            "code-agent",
+            "Code agent",
+            "code_finetune_2024",
+            Some(CapabilityKind::Coding),
+            vec![CapabilityKind::Coding], // skill only re-declares Coding
+        ))
+        .unwrap();
+
+        // Model has only Coding + Reasoning (no ToolCalling yet).
+        let build = build_agent_capabilities(
+            vec![
+                CapabilityClaim {
+                    capability: CapabilityKind::Coding,
+                    provenance: Provenance::Inferred,
+                },
+                CapabilityClaim {
+                    capability: CapabilityKind::Reasoning,
+                    provenance: Provenance::Inferred,
+                },
+            ],
+            &reg,
+        );
+        // ToolCalling is unlocked because the DATASET develops it (evidence),
+        // even though the skill only re-declared Coding.
+        let all = build.all();
+        assert!(
+            all.iter()
+                .any(|c| c.capability == CapabilityKind::ToolCalling)
+        );
+        assert!(all.iter().any(|c| c.capability == CapabilityKind::Coding));
+        // Unlocked ToolCalling carries the dataset's Verified provenance.
+        let tc = all
+            .iter()
+            .find(|c| c.capability == CapabilityKind::ToolCalling)
+            .unwrap();
+        assert_eq!(tc.provenance, Provenance::Verified);
     }
 }

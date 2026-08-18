@@ -135,7 +135,10 @@ pub fn check_output_schema(output: &str, schema_hint: Option<&str>) -> Verificat
             "schema hint not JSON — structural check skipped (honest)".to_string(),
         ),
         Some(_) if looks_like_json(output) => (true, "output is valid JSON".to_string()),
-        Some(_) => (false, "output is not valid JSON per schema hint".to_string()),
+        Some(_) => (
+            false,
+            "output is not valid JSON per schema hint".to_string(),
+        ),
     };
     VerificationCheck {
         check_kind: CheckKind::Schema,
@@ -464,7 +467,9 @@ pub fn resolve_disagreement(
 ) -> Vec<DisagreementResolution> {
     use VerificationVerdict::{Rejected, Uncertain, Verified};
     match (&first.verdict, &second.verdict) {
-        (Uncertain { .. }, _) | (_, Uncertain { .. }) => vec![DisagreementResolution::MarkUncertain],
+        (Uncertain { .. }, _) | (_, Uncertain { .. }) => {
+            vec![DisagreementResolution::MarkUncertain]
+        }
         (Verified, Verified) | (Rejected { .. }, Rejected { .. }) => Vec::new(),
         (Verified, Rejected { .. }) | (Rejected { .. }, Verified) => vec![
             DisagreementResolution::ThirdAgent,
@@ -685,7 +690,10 @@ mod tests {
         let results = [result("a", true, 0.0), result("b", false, 1.0)];
         match evaluate_consensus(&results, &policy) {
             VerificationVerdict::Rejected { reason } => {
-                assert!(reason.contains("zero-confidence agreement from a"), "{reason}")
+                assert!(
+                    reason.contains("zero-confidence agreement from a"),
+                    "{reason}"
+                )
             }
             other => panic!("expected rejection, got {other:?}"),
         }
@@ -715,18 +723,8 @@ mod tests {
         let ok1 = report("t", VerificationVerdict::Verified);
         let ok2 = report("t", VerificationVerdict::Verified);
         assert!(resolve_disagreement(&ok1, &ok2).is_empty());
-        let bad1 = report(
-            "t",
-            VerificationVerdict::Rejected {
-                reason: "x".into(),
-            },
-        );
-        let bad2 = report(
-            "t",
-            VerificationVerdict::Rejected {
-                reason: "y".into(),
-            },
-        );
+        let bad1 = report("t", VerificationVerdict::Rejected { reason: "x".into() });
+        let bad2 = report("t", VerificationVerdict::Rejected { reason: "y".into() });
         assert!(resolve_disagreement(&bad1, &bad2).is_empty());
     }
 
@@ -759,7 +757,9 @@ mod tests {
     fn ledger_records_and_looks_up_reports() {
         let mut ledger = VerificationLedger::new();
         assert_eq!(ledger.count(), 0);
-        ledger.record(report("t:1", VerificationVerdict::Verified)).unwrap();
+        ledger
+            .record(report("t:1", VerificationVerdict::Verified))
+            .unwrap();
         ledger
             .record(report(
                 "t:2",
@@ -769,14 +769,19 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(ledger.count(), 2);
-        assert_eq!(ledger.get("t:1").unwrap().verdict, VerificationVerdict::Verified);
+        assert_eq!(
+            ledger.get("t:1").unwrap().verdict,
+            VerificationVerdict::Verified
+        );
         assert!(ledger.get("t:3").is_none());
     }
 
     #[test]
     fn ledger_rejects_duplicate_task_ids_as_immutable() {
         let mut ledger = VerificationLedger::new();
-        ledger.record(report("t:1", VerificationVerdict::Verified)).unwrap();
+        ledger
+            .record(report("t:1", VerificationVerdict::Verified))
+            .unwrap();
         let err = ledger
             .record(report(
                 "t:1",
@@ -791,14 +796,19 @@ mod tests {
                 task_id: "t:1".into()
             }
         );
-        assert_eq!(ledger.get("t:1").unwrap().verdict, VerificationVerdict::Verified);
+        assert_eq!(
+            ledger.get("t:1").unwrap().verdict,
+            VerificationVerdict::Verified
+        );
     }
 
     #[test]
     fn ledger_lists_newest_first_and_recent_slices() {
         let mut ledger = VerificationLedger::new();
         for i in 0..5 {
-            ledger.record(report(&format!("t:{i}"), VerificationVerdict::Verified)).unwrap();
+            ledger
+                .record(report(&format!("t:{i}"), VerificationVerdict::Verified))
+                .unwrap();
         }
         let list = ledger.list();
         assert_eq!(list.len(), 5);
@@ -815,7 +825,9 @@ mod tests {
     fn ledger_evicts_oldest_beyond_max_events() {
         let mut ledger = VerificationLedger::new();
         for i in 0..(MAX_EVENTS + 3) {
-            ledger.record(report(&format!("t:{i}"), VerificationVerdict::Verified)).unwrap();
+            ledger
+                .record(report(&format!("t:{i}"), VerificationVerdict::Verified))
+                .unwrap();
         }
         assert_eq!(ledger.count(), MAX_EVENTS);
         assert!(ledger.get("t:0").is_none());
@@ -862,10 +874,7 @@ mod tests {
             "\"critic_review\""
         );
         assert_eq!(
-            serde_json::to_string(&VerificationVerdict::Uncertain {
-                reason: "x".into()
-            })
-            .unwrap(),
+            serde_json::to_string(&VerificationVerdict::Uncertain { reason: "x".into() }).unwrap(),
             r#"{"uncertain":{"reason":"x"}}"#
         );
     }

@@ -529,19 +529,21 @@ async fn main() -> Result<()> {
             command: RegistryCommand::List { registry },
         } => list_registry(registry),
         Command::Model {
-            command: ModelCommand::Search {
-                query,
-                category,
-                categories,
-                limit,
-            },
+            command:
+                ModelCommand::Search {
+                    query,
+                    category,
+                    categories,
+                    limit,
+                },
         } => model_search(query, category, categories, limit).await,
         Command::Model {
-            command: ModelCommand::Pull {
-                reference,
-                models_dir,
-                registry,
-            },
+            command:
+                ModelCommand::Pull {
+                    reference,
+                    models_dir,
+                    registry,
+                },
         } => model_pull(reference, models_dir, registry).await,
         Command::Swarm {
             command: SwarmCommand::Start { config },
@@ -746,10 +748,7 @@ fn auto_detect_model(dir: &std::path::Path) -> Result<String> {
 /// (and must exist on disk — a wrong name is a hard error, not a silent
 /// fallback to auto-detect, so the operator notices the typo); otherwise the
 /// first `.gguf` in the models dir is auto-detected.
-fn resolve_model_name(
-    models_dir: &std::path::Path,
-    explicit: Option<&str>,
-) -> Result<String> {
+fn resolve_model_name(models_dir: &std::path::Path, explicit: Option<&str>) -> Result<String> {
     match explicit {
         Some(name) => {
             let trimmed = name.trim();
@@ -912,9 +911,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     };
     use decentraai_runtime::api::{ApiState, DashboardInfo, ensure_api_token, serve_api};
     use decentraai_runtime::queue::InferenceQueue;
-    use decentraai_runtime::{
-        LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server,
-    };
+    use decentraai_runtime::{LlamaServer, RuntimeConfig, ensure_admitted, find_llama_server};
     use libp2p::PeerId as Libp2pPeerId;
     use libp2p::identity::Keypair as Libp2pKeypair;
     use std::sync::Arc;
@@ -965,8 +962,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let models_dir = data_dir.join("models");
     // An explicit `node.model` wins over auto-detection (and errors on a
     // typo); otherwise the first .gguf in the models dir is chosen.
-    let model_name = resolve_model_name(&models_dir, config.node.model.as_deref())
-        .unwrap_or_default();
+    let model_name =
+        resolve_model_name(&models_dir, config.node.model.as_deref()).unwrap_or_default();
     let detected_model = if model_name.is_empty() {
         None
     } else {
@@ -1123,10 +1120,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             }) {
                 // Deterministic model id/hash for a remote worker (no local GGUF).
                 if model_hash.is_empty() {
-                    model_hash =
-                        blake3::hash(format!("{engine:?}:{model_name}").as_bytes())
-                            .to_hex()
-                            .to_string();
+                    model_hash = blake3::hash(format!("{engine:?}:{model_name}").as_bytes())
+                        .to_hex()
+                        .to_string();
                 }
                 if model_size_bytes == 0 {
                     model_size_bytes = 1024;
@@ -1335,11 +1331,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // The coordinator-side orchestrator runs collective workflows by delegating
     // stages to the local/remote agents. Shared with the API so a user can
     // trigger a workflow from the dashboard/CLI.
-    let agent_orchestrator = Arc::new(decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
-        agent_messenger.clone(),
-        agent_manager.clone(),
-        local_peer_id,
-    ));
+    let agent_orchestrator = Arc::new(
+        decentraai_distributed::agent_orchestrator::AgentOrchestrator::new(
+            agent_messenger.clone(),
+            agent_manager.clone(),
+            local_peer_id,
+        ),
+    );
     // Persistent collective memory (best-effort; the node keeps working if it
     // cannot open or create the store).
     let agent_memory_path = data_dir.join("db/agent_memory.sqlite");
@@ -1464,7 +1462,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         let available_models =
             build_available_models(&registry_path, config.inference.max_context_tokens)?;
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, available_models, can_provision)
+            .advertise_local(
+                snapshot,
+                gpu,
+                served_models,
+                available_models,
+                can_provision,
+            )
             .await;
         info!(
             peer_id = %local_peer_id,
@@ -1742,24 +1746,27 @@ fn run_online_check(config: &NodeConfig) {
             // 1.5s cap keeps the doctor command snappy and safe. The bind
             // address is normally a loopback literal, so parse directly.
             match addr.parse::<std::net::SocketAddr>() {
-                Ok(socket) => match std::net::TcpStream::connect_timeout(
-                    &socket,
-                    Duration::from_millis(1500),
-                ) {
-                    Ok(_) => {
-                        let latency_ms = start.elapsed().as_millis();
-                        println!("  Backend {} reachable (yes, {} ms)", addr, latency_ms);
-                        true
+                Ok(socket) => {
+                    match std::net::TcpStream::connect_timeout(&socket, Duration::from_millis(1500))
+                    {
+                        Ok(_) => {
+                            let latency_ms = start.elapsed().as_millis();
+                            println!("  Backend {} reachable (yes, {} ms)", addr, latency_ms);
+                            true
+                        }
+                        Err(e) => {
+                            let latency_ms = start.elapsed().as_millis();
+                            println!(
+                                "  Backend {} reachable (no, {} ms): {}",
+                                addr, latency_ms, e
+                            );
+                            println!(
+                                "  Is the node serving? Run 'decentraai node' or 'decentraai serve start' first."
+                            );
+                            false
+                        }
                     }
-                    Err(e) => {
-                        let latency_ms = start.elapsed().as_millis();
-                        println!("  Backend {} reachable (no, {} ms): {}", addr, latency_ms, e);
-                        println!(
-                            "  Is the node serving? Run 'decentraai node' or 'decentraai serve start' first."
-                        );
-                        false
-                    }
-                },
+                }
                 Err(e) => {
                     println!("  Backend {} address invalid ({}): {}", addr, e, addr);
                     false
@@ -1884,9 +1891,7 @@ async fn model_search(
         for (tag, count) in seen {
             println!("  {tag:<45} {count} model(s)");
         }
-        println!(
-            "\nFilter with: decentraai model search \"{query}\" --category <category>"
-        );
+        println!("\nFilter with: decentraai model search \"{query}\" --category <category>");
         return Ok(());
     }
 
@@ -1904,10 +1909,7 @@ async fn model_search(
             }
         }
         shown += 1;
-        println!(
-            "  {:<60} {:<40} {} downloads",
-            m.id, tag, m.downloads
-        );
+        println!("  {:<60} {:<40} {} downloads", m.id, tag, m.downloads);
     }
     if shown == 0 && category.is_some() {
         println!(
@@ -2268,10 +2270,10 @@ async fn serve_start(
     binary: Option<PathBuf>,
     backend: Option<String>,
 ) -> Result<()> {
+    use decentraai_inference_adapter::{BackendConfig, EngineKind, OpenAiCompatibleBackend};
     use decentraai_runtime::{
         LlamaServer, RuntimeConfig, ServeManager, ensure_admitted, find_llama_server, resolve_model,
     };
-    use decentraai_inference_adapter::{BackendConfig, EngineKind, OpenAiCompatibleBackend};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -2488,7 +2490,10 @@ async fn serve_common(
         lan_discovery: config.network.lan_discovery,
         bootstrap_peer_count: config.network.bootstrap_peers.len(),
     };
-    let token_store_path = config.tiers.as_ref().map(|_| data_dir.join("db/tokens.json"));
+    let token_store_path = config
+        .tiers
+        .as_ref()
+        .map(|_| data_dir.join("db/tokens.json"));
     // Q2: one request at a time reaches the backend with the machine's
     // full resources; the waiting room and wait limit come from config.
     let queue = InferenceQueue::new(
@@ -2510,7 +2515,11 @@ async fn serve_common(
 
     decentraai_audit::record_best_effort(
         &data_dir.join("logs"),
-        if remote { "remote_backend_started" } else { "inference_started" },
+        if remote {
+            "remote_backend_started"
+        } else {
+            "inference_started"
+        },
         serde_json::json!({
             "backend": backend_url,
             "api": api_addr.to_string(),
@@ -2532,7 +2541,10 @@ async fn serve_common(
     let mode_hint = if remote {
         format!("remote backend (no local engine): {backend_url}")
     } else {
-        format!("local llama-server: {backend_url}  idle unload: {} min", config.inference.idle_model_unload_minutes)
+        format!(
+            "local llama-server: {backend_url}  idle unload: {} min",
+            config.inference.idle_model_unload_minutes
+        )
     };
     println!(
         "DecentraAI inference running\n  Mode: {}\n  Queue: FIFO, {} waiting slots, {}s wait limit (dashboard shows it live)\n  Dashboard: http://{}/ (status, peers, share guide)\n  API: http://{}/v1 (OpenAI-compatible)\n  Auth: {}\n  Subscriptions: {}\n  Press Ctrl+C to stop",
@@ -2841,7 +2853,9 @@ fn invite(args: InviteArgs) -> Result<()> {
     })?;
     let addr = args.addr.trim();
     if addr.is_empty() {
-        anyhow::bail!("--addr must be this node's reachable address (e.g. /ip4/192.168.1.5/tcp/4001)");
+        anyhow::bail!(
+            "--addr must be this node's reachable address (e.g. /ip4/192.168.1.5/tcp/4001)"
+        );
     }
     // The reachable dial target uses the libp2p peer id (base58, e.g.
     // 12D3KooW...), NOT the identity hex id — libp2p cannot parse the raw
@@ -2893,7 +2907,9 @@ fn invite(args: InviteArgs) -> Result<()> {
     println!(
         "Share this with a newcomer, who runs exactly:\n  decentraai join \"{multiaddr} {token}\""
     );
-    println!("The token is shown once; notify 'decentraai token revoke --name {name}' to invalidate a seat.");
+    println!(
+        "The token is shown once; notify 'decentraai token revoke --name {name}' to invalidate a seat."
+    );
     Ok(())
 }
 
@@ -3066,8 +3082,12 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
         .with_context(|| format!("loading {}", config_path.display()))?;
     let data_dir = expand_tilde(&config.node.data_dir);
     let registry_path = data_dir.join("db/consumer_keys.json");
-    let mut store = ConsumerKeyStore::load(&registry_path)
-        .with_context(|| format!("loading consumer key registry from {}", registry_path.display()))?;
+    let mut store = ConsumerKeyStore::load(&registry_path).with_context(|| {
+        format!(
+            "loading consumer key registry from {}",
+            registry_path.display()
+        )
+    })?;
     let logs_dir = data_dir.join("logs");
 
     match command {
@@ -3084,7 +3104,12 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
-            let plaintext = store.create(&account, quota_ceiling, rate_limit_per_minute, scopes.clone())?;
+            let plaintext = store.create(
+                &account,
+                quota_ceiling,
+                rate_limit_per_minute,
+                scopes.clone(),
+            )?;
             decentraai_audit::record_best_effort(
                 &logs_dir,
                 "consumer_key_created",
@@ -3100,7 +3125,9 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
                 .lookup(&plaintext)
                 .map(|r| r.key_id.clone())
                 .unwrap_or_default();
-            println!("Consumer API key for account '{account}' (quota ceiling {quota_ceiling} units/req, {rate_limit_per_minute} req/min):");
+            println!(
+                "Consumer API key for account '{account}' (quota ceiling {quota_ceiling} units/req, {rate_limit_per_minute} req/min):"
+            );
             println!("  {plaintext}");
             println!("  key_id: {key_id}");
             println!("Store it now: it is shown once and only its BLAKE3 hash is kept.");
@@ -3109,7 +3136,9 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
         ConsumerKeyCommand::List { .. } => {
             let records = store.list();
             if records.is_empty() {
-                println!("No consumer API keys yet — create one with: decentraai consumer-key create --account <n> --quota-ceiling <u> --rate-limit-per-minute <n>");
+                println!(
+                    "No consumer API keys yet — create one with: decentraai consumer-key create --account <n> --quota-ceiling <u> --rate-limit-per-minute <n>"
+                );
             } else {
                 println!("Consumer API keys ({}):", records.len());
                 for r in records {
@@ -3117,7 +3146,13 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
                     let scopes = r.scopes.join(",");
                     println!(
                         "  {} ({}): account={}, ceiling={}, rate={}/min, scopes=[{}], created {}",
-                        r.key_id, status, r.owner_account, r.quota_ceiling, r.rate_limit_per_minute, scopes, r.created_at
+                        r.key_id,
+                        status,
+                        r.owner_account,
+                        r.quota_ceiling,
+                        r.rate_limit_per_minute,
+                        scopes,
+                        r.created_at
                     );
                 }
                 println!("The plaintext secrets are never stored or shown here.");
@@ -3130,7 +3165,9 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
                 "consumer_key_revoked",
                 serde_json::json!({"key_id": key_id}),
             );
-            println!("Consumer key '{key_id}' revoked; it stops authenticating at the next API request.");
+            println!(
+                "Consumer key '{key_id}' revoked; it stops authenticating at the next API request."
+            );
         }
     }
     Ok(())
@@ -3143,9 +3180,7 @@ fn agent_command(command: AgentCommand) -> Result<()> {
         AgentCommand::Show { config, agent } => agent_show(&config, &agent),
         AgentCommand::Workflow { template, .. } => agent_workflow(&template),
         AgentCommand::Reputation {
-            agent,
-            min_samples,
-            ..
+            agent, min_samples, ..
         } => agent_reputation(&agent, min_samples),
         AgentCommand::TalentTree {
             have,
@@ -3159,9 +3194,7 @@ fn agent_command(command: AgentCommand) -> Result<()> {
 
 /// Loads the config + identity and returns this node's default local agents
 /// (shared by `agent list` and `agent show` so the two never disagree).
-fn load_local_agents(
-    config_path: &Path,
-) -> Result<Vec<decentraai_agents::AgentRecord>> {
+fn load_local_agents(config_path: &Path) -> Result<Vec<decentraai_agents::AgentRecord>> {
     let config = NodeConfig::load(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     let data_dir = expand_tilde(&config.node.data_dir);
@@ -3222,7 +3255,11 @@ fn agent_list(config_path: &Path) -> Result<()> {
             agent.agent_id,
             agent.role,
             agent.state,
-            if caps.is_empty() { "(none)".to_string() } else { caps.join(", ") },
+            if caps.is_empty() {
+                "(none)".to_string()
+            } else {
+                caps.join(", ")
+            },
             models,
             tools,
         );
@@ -3368,11 +3405,7 @@ fn sample_reputation_store(
     for (factor, value) in factors {
         for _ in 0..samples {
             store.observe(ReputationUpdate::new(
-                agent,
-                capability,
-                *factor,
-                *value,
-                at,
+                agent, capability, *factor, *value, at,
             ));
             at += 1;
         }
@@ -3382,10 +3415,7 @@ fn sample_reputation_store(
 
 /// Aggregate score over the meaningful factors, honoring `min_samples`.
 /// Mirrors `AgentReputation::score` but lets the CLI respect a custom floor.
-fn aggregate_score(
-    rep: &decentraai_agents::AgentReputation,
-    min_samples: u64,
-) -> f32 {
+fn aggregate_score(rep: &decentraai_agents::AgentReputation, min_samples: u64) -> f32 {
     use decentraai_agents::default_weights;
     let weights = default_weights();
     let mut weighted_sum = 0.0f64;
@@ -3455,7 +3485,11 @@ fn agent_talent_tree(have: &str, budget_mb: u64, target: Option<&str>) -> Result
     println!("  all capabilities ({}):", tree.capabilities().len());
     for kind in &tree.capabilities() {
         let node = tree.get(*kind).expect("capability present");
-        let marker = if node.experimental { " (experimental)" } else { "" };
+        let marker = if node.experimental {
+            " (experimental)"
+        } else {
+            ""
+        };
         println!("    - {}{marker}", kind.label());
     }
 
@@ -3596,7 +3630,13 @@ fn agent_skill(config_path: &std::path::Path, model_override: Option<&str>) -> R
 
     println!("  model: {model_name}");
     let build = build_agent_capabilities(base.clone(), &registry);
-    println!("  base capabilities: {}", base.iter().map(|c| c.capability.label()).collect::<Vec<_>>().join(", "));
+    println!(
+        "  base capabilities: {}",
+        base.iter()
+            .map(|c| c.capability.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if build.unlocked.is_empty() {
         println!("  skills unlocked: (none — model does not satisfy skill prerequisites)");
     } else {
@@ -3627,9 +3667,7 @@ fn default_local_agents(
     model_hash: &str,
     allow_remote: bool,
 ) -> Vec<decentraai_agents::AgentRecord> {
-    use decentraai_agents::{
-        AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST,
-    };
+    use decentraai_agents::{AgentPolicies, AgentRecord, AgentState, ROLE_GENERALIST};
     use decentraai_hub::capability::{CapabilityKind, Provenance};
 
     let mut agents = Vec::new();
@@ -4050,14 +4088,14 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         model_hash.as_deref().unwrap_or(""),
         config.inference.allow_remote_inference,
     ));
-// M22: advertise the configured engine kind honestly rather than assuming
+    // M22: advertise the configured engine kind honestly rather than assuming
     // llama-server (which remains the default when unset).
     if let Some(engine) = config.inference.engine.as_deref() {
         if let Some(cm) = Arc::get_mut(&mut compute_manager) {
             cm.set_engine(engine);
         }
     }
-// Remote-sharing opt-in: the advertisement carries whether this node
+    // Remote-sharing opt-in: the advertisement carries whether this node
     // accepts inference routed from remote peers, so coordinators only ever
     // schedule remote workers that will actually serve the request.
     if let Some(cm) = Arc::get_mut(&mut compute_manager) {
@@ -4173,7 +4211,13 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let snapshot = SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let adv = compute_manager
-            .advertise_local(snapshot, gpu, served_models, available_models, can_provision)
+            .advertise_local(
+                snapshot,
+                gpu,
+                served_models,
+                available_models,
+                can_provision,
+            )
             .await;
         info!(
             peer_id = %local_peer_id,
@@ -4472,8 +4516,9 @@ fn spawn_agent_broadcaster(
 ) {
     use decentraai_compute::DEFAULT_ADVERTISEMENT_INTERVAL_MS;
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_millis(DEFAULT_ADVERTISEMENT_INTERVAL_MS));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+        ));
         loop {
             interval.tick().await;
             match agent_manager.advertisement_wire_bytes() {
@@ -4482,7 +4527,8 @@ fn spawn_agent_broadcaster(
             }
             // Expire remote agent views that have not refreshed (pure
             // bookkeeping — never touches trust or reputation).
-            let stale = std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
+            let stale =
+                std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
             let evicted = agent_manager.prune_stale(stale);
             if evicted > 0 {
                 tracing::debug!(evicted, "pruned stale remote agent views");
@@ -4873,13 +4919,15 @@ mod tests {
 
     #[test]
     fn parses_model_search_categories_flag() {
-        let cli =
-            Cli::try_parse_from(["decentraai", "model", "search", "mistral", "--categories"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["decentraai", "model", "search", "mistral", "--categories"])
+            .unwrap();
         assert!(matches!(
             cli.command,
             Command::Model {
-                command: ModelCommand::Search { categories: true, .. }
+                command: ModelCommand::Search {
+                    categories: true,
+                    ..
+                }
             }
         ));
     }
@@ -4915,18 +4963,27 @@ mod tests {
     #[test]
     fn parses_doctor_online_flag() {
         let cli = Cli::try_parse_from(["decentraai", "doctor", "--online"]).unwrap();
-        assert!(matches!(cli.command, Command::Doctor(DoctorArgs { online: true, .. })));
+        assert!(matches!(
+            cli.command,
+            Command::Doctor(DoctorArgs { online: true, .. })
+        ));
     }
 
     #[test]
     fn parses_doctor_without_online_flag() {
         let cli = Cli::try_parse_from(["decentraai", "doctor"]).unwrap();
-        assert!(matches!(cli.command, Command::Doctor(DoctorArgs { online: false, .. })));
+        assert!(matches!(
+            cli.command,
+            Command::Doctor(DoctorArgs { online: false, .. })
+        ));
     }
 
     #[test]
     fn base_api_addr_maps_bind_and_port() {
-        assert_eq!(base_api_addr("127.0.0.1", 8080), Some("127.0.0.1:8080".into()));
+        assert_eq!(
+            base_api_addr("127.0.0.1", 8080),
+            Some("127.0.0.1:8080".into())
+        );
         assert_eq!(base_api_addr("::1", 8080), Some("::1:8080".into()));
         // Empty bind falls back to loopback host.
         assert_eq!(base_api_addr("", 8080), Some("127.0.0.1:8080".into()));
@@ -4976,8 +5033,7 @@ mod tests {
             Command::Serve {
                 command:
                     ServeCommand::Start {
-                        backend: Some(url),
-                        ..
+                        backend: Some(url), ..
                     },
             } => assert_eq!(url, "http://192.168.1.50:8080"),
             other => panic!("expected remote-backend Start, got {other:?}"),
@@ -5105,13 +5161,19 @@ mod tests {
         let multiaddr = format!("/ip4/10.0.0.5/tcp/4001/p2p/{peer}");
         let (addr, token) =
             parse_invite(&format!("{multiaddr} dsk_abc123def456")).expect("valid invite");
-        assert_eq!(addr, multiaddr, "path multiaddr must round-trip (no spaces in it)");
+        assert_eq!(
+            addr, multiaddr,
+            "path multiaddr must round-trip (no spaces in it)"
+        );
         assert_eq!(token, "dsk_abc123def456");
     }
 
     #[test]
     fn invite_parsing_rejects_malformed_strings() {
-        assert!(parse_invite("/ip4/10.0.0.5/tcp/4001").is_err(), "missing token");
+        assert!(
+            parse_invite("/ip4/10.0.0.5/tcp/4001").is_err(),
+            "missing token"
+        );
         assert!(
             parse_invite("/ip4/10.0.0.5/tcp/4001 xyz_token").is_err(),
             "bad token prefix"
@@ -5126,8 +5188,8 @@ mod tests {
         // fresh node's reachability check failed with "invalid dial address /
         // Invalid base string". The invite must derive the libp2p peer id
         // (base58, 12D3KooW...) from the node key, exactly like the swarm.
-        use libp2p::identity::Keypair as Libp2pKeypair;
         use libp2p::PeerId as Libp2pPeerId;
+        use libp2p::identity::Keypair as Libp2pKeypair;
         let identity = Identity::generate();
         let keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
             .expect("node key must derive an ed25519 libp2p keypair");
@@ -5142,10 +5204,9 @@ mod tests {
             "raw identity hex must never be used in an invite multiaddr"
         );
         // The fully-qualified multiaddr must parse as a libp2p dial target.
-        let multiaddr: libp2p::Multiaddr =
-            format!("/ip4/10.0.0.5/tcp/4001/p2p/{peer_id}")
-                .parse()
-                .expect("invite multiaddr must be a valid libp2p multiaddr");
+        let multiaddr: libp2p::Multiaddr = format!("/ip4/10.0.0.5/tcp/4001/p2p/{peer_id}")
+            .parse()
+            .expect("invite multiaddr must be a valid libp2p multiaddr");
         assert!(multiaddr.to_string().contains("12D3KooW"));
     }
 
@@ -5155,13 +5216,17 @@ mod tests {
         // always Tier 1 (Guest) and stored only as a hash, so an invite leak is
         // never more than a guest — the least privilege roadmap (P5) guarantee.
         let dir = tempfile::tempdir().unwrap();
-        let mut store = decentraai_tokens::TokenStore::load(&dir.path().join("tokens.json")).unwrap();
+        let mut store =
+            decentraai_tokens::TokenStore::load(&dir.path().join("tokens.json")).unwrap();
         let plaintext = store
             .create("invite-0", decentraai_tokens::Tier::GUEST, None)
             .unwrap();
         assert_eq!(store.lookup(&plaintext).unwrap().tier, 1);
         let on_disk = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();
-        assert!(!on_disk.contains(&plaintext), "plaintext must never be persisted");
+        assert!(
+            !on_disk.contains(&plaintext),
+            "plaintext must never be persisted"
+        );
     }
 
     // ---- `decentraai agent` inspection subcommands (Show/Workflow/Reputation/TalentTree) ----
@@ -5188,7 +5253,11 @@ mod tests {
         let ids: Vec<&str> = template.steps.iter().map(|s| s.step_id.as_str()).collect();
         assert_eq!(ids, vec!["research", "finance", "documents"]);
         // finance and documents both depend on research.
-        let finance = template.steps.iter().find(|s| s.step_id == "finance").unwrap();
+        let finance = template
+            .steps
+            .iter()
+            .find(|s| s.step_id == "finance")
+            .unwrap();
         assert_eq!(finance.depends_on, vec!["research".to_string()]);
         assert_eq!(template.validate(), Ok(()));
     }
@@ -5233,15 +5302,16 @@ mod tests {
             decentraai_hub::capability::CapabilityKind::Retrieval,
             decentraai_hub::capability::CapabilityKind::Summarization,
         ] {
-            assert!(available.contains(&kind), "missing {kind:?} in {available:?}");
+            assert!(
+                available.contains(&kind),
+                "missing {kind:?} in {available:?}"
+            );
         }
-        assert!(!available.contains(
-            &decentraai_hub::capability::CapabilityKind::FunctionCalling
-        ));
+        assert!(!available.contains(&decentraai_hub::capability::CapabilityKind::FunctionCalling));
         // DocumentUnderstanding (4096 MiB) is out of budget.
-        assert!(!available.contains(
-            &decentraai_hub::capability::CapabilityKind::DocumentUnderstanding
-        ));
+        assert!(
+            !available.contains(&decentraai_hub::capability::CapabilityKind::DocumentUnderstanding)
+        );
         // Target resolution: reach Retrieval starting from Embeddings. The path
         // may pick up other unlocked leaves first, but must end at Retrieval.
         let path = tree.resolve_path(
@@ -5254,9 +5324,8 @@ mod tests {
         );
 
         // CLI parsing: the new inspection subcommands accept their args.
-        let cli =
-            Cli::try_parse_from(["decentraai", "agent", "show", "--agent", "x:generalist"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["decentraai", "agent", "show", "--agent", "x:generalist"])
+            .unwrap();
         assert!(matches!(
             cli.command,
             Command::Agent {
@@ -5270,9 +5339,14 @@ mod tests {
                 command: AgentCommand::Workflow { .. }
             }
         ));
-        let cli =
-            Cli::try_parse_from(["decentraai", "agent", "reputation", "--agent", "x:generalist"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "agent",
+            "reputation",
+            "--agent",
+            "x:generalist",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
             Command::Agent {

@@ -173,7 +173,10 @@ mod tests {
         assert_eq!(EngineKind::parse("llama-server"), EngineKind::LlamaServer);
         assert_eq!(EngineKind::parse("ollama"), EngineKind::Ollama);
         // Unknown never fails; degrades to remote OpenAI.
-        assert_eq!(EngineKind::parse("some-future-engine"), EngineKind::RemoteOpenAI);
+        assert_eq!(
+            EngineKind::parse("some-future-engine"),
+            EngineKind::RemoteOpenAI
+        );
     }
 
     #[test]
@@ -196,9 +199,21 @@ mod tests {
 
     #[test]
     fn only_kv_separating_engines_support_staging() {
-        assert!(EngineKind::Vllm.advertised_capabilities().supports_staging());
-        assert!(!EngineKind::Ollama.advertised_capabilities().supports_staging());
-        assert!(!EngineKind::LlamaServer.advertised_capabilities().supports_staging());
+        assert!(
+            EngineKind::Vllm
+                .advertised_capabilities()
+                .supports_staging()
+        );
+        assert!(
+            !EngineKind::Ollama
+                .advertised_capabilities()
+                .supports_staging()
+        );
+        assert!(
+            !EngineKind::LlamaServer
+                .advertised_capabilities()
+                .supports_staging()
+        );
     }
 
     // Against engine.rs documentation: these capabilities are *parked* (M21 /

@@ -24,7 +24,7 @@ pub(crate) fn test_advertisement(
         peer_id: peer,
         node_name: "worker".into(),
         node_id: "dca-test01".into(),
-            node_version: env!("CARGO_PKG_VERSION").to_string(),
+        node_version: env!("CARGO_PKG_VERSION").to_string(),
         capability: ComputeCapability {
             cpu_cores: 8,
             ram_mb: 16 * 1024,

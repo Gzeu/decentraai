@@ -103,7 +103,8 @@ impl ComputeCapability {
         self.served_models
             .iter()
             .any(|m| m.model_hash == model_hash)
-            || self.available_models
+            || self
+                .available_models
                 .iter()
                 .any(|m| m.model_hash == model_hash)
     }
@@ -202,12 +203,14 @@ mod tests {
         assert_eq!(ServedModel::estimate_vram_mb(1 << 30, false, 4096), 0);
         // GPU offload: model bytes dominate + KV headroom; a bigger model
         // needs more VRAM (pure, monotone), so GPU vs CPU workers differ.
-        let small =
-            ServedModel::estimate_vram_mb(2_147_483_648, true, 4096); // 2 GiB model
+        let small = ServedModel::estimate_vram_mb(2_147_483_648, true, 4096); // 2 GiB model
         let big = ServedModel::estimate_vram_mb(8_589_934_592, true, 8192); // 8 GiB model
         assert!(small > 0);
         assert!(big > small, "larger model must advertise more VRAM");
-        assert!(small >= (2048 + (4096 / 256)) as u64, "model MiB + KV headroom");
+        assert!(
+            small >= (2048 + (4096 / 256)) as u64,
+            "model MiB + KV headroom"
+        );
     }
 
     #[test]

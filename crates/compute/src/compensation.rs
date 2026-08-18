@@ -43,8 +43,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contribution::{contribution_score, ContributionProfile};
 use crate::contribution::CONTRIBUTOR_SCORE;
+use crate::contribution::{ContributionProfile, contribution_score};
 
 /// The contribution-reward policy (M9-9). Plain data, serde-serializable for
 /// transport/config, with named constants so the admin tunes it in one place.
@@ -98,10 +98,7 @@ impl RewardPolicy {
 /// - Otherwise `verified * rate` scaled by contribution quality and the
 ///   reputation multiplier; the result is rounded to a whole number of
 ///   credits, so the ledger stays integer-valued.
-pub fn reward_tokens(
-    profile: &ContributionProfile,
-    policy: &RewardPolicy,
-) -> u64 {
+pub fn reward_tokens(profile: &ContributionProfile, policy: &RewardPolicy) -> u64 {
     let RewardPolicy {
         tokens_per_verified_request,
         quality_min,
@@ -113,7 +110,9 @@ pub fn reward_tokens(
         return 0;
     }
 
-    let base = profile.verified_requests.saturating_mul(tokens_per_verified_request) as f64;
+    let base = profile
+        .verified_requests
+        .saturating_mul(tokens_per_verified_request) as f64;
     // Scale raw hardware×uptime×work down to a quality factor around 1.0.
     let quality = (contribution_score(profile) / CONTRIBUTOR_SCORE).clamp(quality_min, quality_max);
     // Reputation term.
@@ -131,7 +130,9 @@ pub fn reward_tokens(
 
 /// Total serving attempts (verified + failed) for a profile.
 pub fn total_attempts(profile: &ContributionProfile) -> u64 {
-    profile.verified_requests.saturating_add(profile.failed_requests)
+    profile
+        .verified_requests
+        .saturating_add(profile.failed_requests)
 }
 
 /// Lifetime compensation credits accumulated by one worker.
@@ -233,7 +234,10 @@ impl CompensationLedger {
     /// request. Returns the credits credited (0 when the worker had no verified
     /// work yet — you earn by *serving*, exactly as the module docs promise).
     pub fn credit(&mut self, account: &str, ref_id: &str, profile: &ContributionProfile) -> u64 {
-        if !self.applied.insert(("credit".to_string(), ref_id.to_string())) {
+        if !self
+            .applied
+            .insert(("credit".to_string(), ref_id.to_string()))
+        {
             return 0; // duplicate: already credited this ref_id exactly once.
         }
         let amount = reward_tokens(profile, &self.policy);
@@ -349,9 +353,18 @@ mod tests {
     #[test]
     fn reputation_multiplier_boundaries() {
         let p = RewardPolicy::default();
-        assert!((p.reputation_multiplier(100, 0) - 1.0).abs() < 1e-9, "flawless -> 1.0");
-        assert!((p.reputation_multiplier(0, 100) - 0.0).abs() < 1e-9, "all fail -> 0.0");
-        assert!((p.reputation_multiplier(0, 0) - 1.0).abs() < 1e-9, "idle -> 1.0");
+        assert!(
+            (p.reputation_multiplier(100, 0) - 1.0).abs() < 1e-9,
+            "flawless -> 1.0"
+        );
+        assert!(
+            (p.reputation_multiplier(0, 100) - 0.0).abs() < 1e-9,
+            "all fail -> 0.0"
+        );
+        assert!(
+            (p.reputation_multiplier(0, 0) - 1.0).abs() < 1e-9,
+            "idle -> 1.0"
+        );
     }
 
     // ---- CompensationLedger ----
@@ -379,7 +392,10 @@ mod tests {
         };
         let amount = ledger.credit("peer-b", "req-fail", &failing);
         assert_eq!(amount, 0, "a worker that only failed earns nothing");
-        assert!(ledger.account("peer-b").is_none(), "no record for zero earnings");
+        assert!(
+            ledger.account("peer-b").is_none(),
+            "no record for zero earnings"
+        );
     }
 
     #[test]

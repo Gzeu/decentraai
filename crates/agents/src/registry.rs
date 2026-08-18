@@ -94,7 +94,10 @@ impl AgentRegistry {
 
     /// Agents that are ready to accept work.
     pub fn ready(&self) -> Vec<AgentRecord> {
-        self.list().into_iter().filter(|a| a.can_accept_work()).collect()
+        self.list()
+            .into_iter()
+            .filter(|a| a.can_accept_work())
+            .collect()
     }
 
     /// Whether the registry holds no agents.

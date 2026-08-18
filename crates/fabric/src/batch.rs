@@ -90,10 +90,8 @@ pub fn allocate_batch(
     _config: &PlannerConfig,
 ) -> BatchAllocation {
     // Deterministic worker set (peer id asc) + eligibility map.
-    let by_id: BTreeMap<String, &WorkerFacts> = workers
-        .iter()
-        .map(|w| (w.peer_id.clone(), w))
-        .collect();
+    let by_id: BTreeMap<String, &WorkerFacts> =
+        workers.iter().map(|w| (w.peer_id.clone(), w)).collect();
 
     // Eligible workers: trusted + healthy + serves the model. We do not check
     // capability claims here (the caller builds a batch of requests that are
@@ -105,31 +103,32 @@ pub fn allocate_batch(
         .collect();
 
     // Adaptive shares for the eligible set, from real availability signals.
-    let share_inputs: Vec<(String, String, decentraai_compute::ComputeAvailability)> = eligible_peers
-        .iter()
-        .filter_map(|p| by_id.get(p))
-        .map(|w| {
-            // Convert WorkerFacts availability to the compute availability the
-            // share function consumes. We carry the signals WorkerFacts holds.
-            let a = decentraai_compute::ComputeAvailability {
-                available_ram_mb: w.available_ram_mb,
-                available_vram_mb: Some(w.available_vram_mb),
-                load_percent: w.load_percent,
-                queue_depth: w.queue_depth,
-                tokens_per_second: w.tokens_per_second,
-                current_latency_ms: w.latency_ms,
-                status: if w.healthy {
-                    decentraai_compute::WorkerHealth::Ready
-                } else {
-                    decentraai_compute::WorkerHealth::Unhealthy
-                },
-                gpu_temperature_celsius: None,
-                gpu_utilization_percent: None,
-                battery_percent: None,
-            };
-            (w.peer_id.clone(), String::new(), a)
-        })
-        .collect();
+    let share_inputs: Vec<(String, String, decentraai_compute::ComputeAvailability)> =
+        eligible_peers
+            .iter()
+            .filter_map(|p| by_id.get(p))
+            .map(|w| {
+                // Convert WorkerFacts availability to the compute availability the
+                // share function consumes. We carry the signals WorkerFacts holds.
+                let a = decentraai_compute::ComputeAvailability {
+                    available_ram_mb: w.available_ram_mb,
+                    available_vram_mb: Some(w.available_vram_mb),
+                    load_percent: w.load_percent,
+                    queue_depth: w.queue_depth,
+                    tokens_per_second: w.tokens_per_second,
+                    current_latency_ms: w.latency_ms,
+                    status: if w.healthy {
+                        decentraai_compute::WorkerHealth::Ready
+                    } else {
+                        decentraai_compute::WorkerHealth::Unhealthy
+                    },
+                    gpu_temperature_celsius: None,
+                    gpu_utilization_percent: None,
+                    battery_percent: None,
+                };
+                (w.peer_id.clone(), String::new(), a)
+            })
+            .collect();
     let shares = decentraai_compute::adaptive_load_shares(&share_inputs);
     let worker_shares: BTreeMap<String, f64> = shares
         .iter()
@@ -276,7 +275,12 @@ pub fn allocate_batch(
         .enumerate()
         .map(|(i, (id, _))| (id.clone(), i))
         .collect();
-    assignments.sort_by_key(|a| original_order.get(&a.request_id).copied().unwrap_or(usize::MAX));
+    assignments.sort_by_key(|a| {
+        original_order
+            .get(&a.request_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 
     BatchAllocation {
         assignments,
@@ -298,7 +302,10 @@ pub fn set_kv_affinity(
         .map(|w| {
             let mut w2 = w.clone();
             w2.kv = if kv_residency.get(&w.peer_id).copied().unwrap_or(false) {
-                KVCacheState::Partial { used: 100, capacity: 4096 }
+                KVCacheState::Partial {
+                    used: 100,
+                    capacity: 4096,
+                }
             } else {
                 KVCacheState::Empty
             };
@@ -438,7 +445,12 @@ mod tests {
             alloc.assignments.iter().all(|a| a.worker != "no-model"),
             "a worker that does not serve the model must never receive the request"
         );
-        assert!(alloc.assignments.iter().all(|a| a.worker == "ok" && a.eligible));
+        assert!(
+            alloc
+                .assignments
+                .iter()
+                .all(|a| a.worker == "ok" && a.eligible)
+        );
     }
 
     #[test]
@@ -447,7 +459,11 @@ mod tests {
         let n = 15;
         let reqs: Vec<(String, RequestFacts)> = (0..n).map(|i| req(&format!("r{i}"))).collect();
         let alloc = allocate_batch(&reqs, &ws, &PlannerConfig::default());
-        assert_eq!(alloc.assignments.len(), n, "every request gets an assignment");
+        assert_eq!(
+            alloc.assignments.len(),
+            n,
+            "every request gets an assignment"
+        );
         // Each request id appears exactly once.
         let mut ids: std::collections::BTreeSet<String> = alloc
             .assignments
@@ -479,7 +495,10 @@ mod tests {
 
     #[test]
     fn continuation_is_pinned_to_its_kv_worker() {
-        let mut ws = vec![worker("host", true, 100, 10), worker("other", true, 300, 10)];
+        let mut ws = vec![
+            worker("host", true, 100, 10),
+            worker("other", true, 300, 10),
+        ];
         let residency: std::collections::HashMap<String, bool> =
             [("host".to_string(), true)].into();
         ws = set_kv_affinity(&ws, &residency);
@@ -494,7 +513,14 @@ mod tests {
     #[test]
     fn allocation_is_deterministic_regardless_of_input_order() {
         let ws = vec![worker("a", true, 200, 10), worker("b", true, 100, 20)];
-        let reqs = vec![req("r1"), req("r2"), req("r3"), req("r4"), req("r5"), req("r6")];
+        let reqs = vec![
+            req("r1"),
+            req("r2"),
+            req("r3"),
+            req("r4"),
+            req("r5"),
+            req("r6"),
+        ];
         let a1 = allocate_batch(&reqs, &ws, &PlannerConfig::default());
         let mut rev = reqs.clone();
         rev.reverse();
@@ -508,7 +534,11 @@ mod tests {
                 .map(|x| (x.request_id.clone(), x.worker.clone()))
                 .collect()
         };
-        assert_eq!(key(&a1), key(&a2), "each request id maps to the same worker");
+        assert_eq!(
+            key(&a1),
+            key(&a2),
+            "each request id maps to the same worker"
+        );
     }
 
     #[test]
@@ -521,6 +551,10 @@ mod tests {
         assert_eq!(alloc.assignments[0].worker, "");
         assert!(!alloc.assignments[0].eligible);
 
-        assert!(allocate_batch(&[], &ws, &PlannerConfig::default()).assignments.is_empty());
+        assert!(
+            allocate_batch(&[], &ws, &PlannerConfig::default())
+                .assignments
+                .is_empty()
+        );
     }
 }

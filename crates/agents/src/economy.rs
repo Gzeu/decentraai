@@ -227,7 +227,10 @@ pub fn negotiate(request: &BookingRequest, offer: &CapabilityOffer) -> BookingVe
     }
     if offer.max_concurrency == 0 {
         return BookingVerdict::Rejected {
-            reason: format!("offer {} has zero concurrency and accepts no bookings", offer.offer_id),
+            reason: format!(
+                "offer {} has zero concurrency and accepts no bookings",
+                offer.offer_id
+            ),
         };
     }
     if offer.quality < QUALITY_FLOOR {
@@ -376,17 +379,7 @@ mod tests {
     use super::*;
 
     fn mk_offer(id: &str, cap: &str, price: u64) -> CapabilityOffer {
-        CapabilityOffer::new(
-            id,
-            "agent-a",
-            cap,
-            0.9,
-            0.9,
-            price,
-            1,
-            Some(500),
-            1000,
-        )
+        CapabilityOffer::new(id, "agent-a", cap, 0.9, 0.9, price, 1, Some(500), 1000)
     }
 
     fn mk_request(id: &str, cap: &str, budget: u64, units: u64) -> BookingRequest {
@@ -405,7 +398,10 @@ mod tests {
         let offer = mk_offer("o1", "ocr", 5);
         let req = mk_request("r1", "ocr", 10, 3);
         match negotiate(&req, &offer) {
-            BookingVerdict::Booked { offer_id, total_price } => {
+            BookingVerdict::Booked {
+                offer_id,
+                total_price,
+            } => {
                 assert_eq!(offer_id, "o1");
                 assert_eq!(total_price, 15);
             }
@@ -418,16 +414,25 @@ mod tests {
         let mut offer = mk_offer("o1", "ocr", 5);
         offer.status = OfferStatus::Suspended;
         let req = mk_request("r1", "ocr", 10, 1);
-        assert!(matches!(negotiate(&req, &offer), BookingVerdict::Rejected { .. }));
+        assert!(matches!(
+            negotiate(&req, &offer),
+            BookingVerdict::Rejected { .. }
+        ));
         offer.status = OfferStatus::Retired;
-        assert!(matches!(negotiate(&req, &offer), BookingVerdict::Rejected { .. }));
+        assert!(matches!(
+            negotiate(&req, &offer),
+            BookingVerdict::Rejected { .. }
+        ));
     }
 
     #[test]
     fn capability_mismatch_is_rejected() {
         let offer = mk_offer("o1", "ocr", 5);
         let req = mk_request("r1", "coding", 10, 1);
-        assert!(matches!(negotiate(&req, &offer), BookingVerdict::Rejected { .. }));
+        assert!(matches!(
+            negotiate(&req, &offer),
+            BookingVerdict::Rejected { .. }
+        ));
     }
 
     #[test]
@@ -481,11 +486,17 @@ mod tests {
         let offer = mk_offer("o1", "ocr", 5); // sla 500ms
         let mut req = mk_request("r1", "ocr", 10, 1);
         req.latency_requirement_ms = Some(1000);
-        assert!(matches!(negotiate(&req, &offer), BookingVerdict::Booked { .. }));
+        assert!(matches!(
+            negotiate(&req, &offer),
+            BookingVerdict::Booked { .. }
+        ));
         // No requirement on either side is satisfied.
         let offer = mk_offer("o1", "ocr", 5);
         let req = mk_request("r1", "ocr", 10, 1);
-        assert!(matches!(negotiate(&req, &offer), BookingVerdict::Booked { .. }));
+        assert!(matches!(
+            negotiate(&req, &offer),
+            BookingVerdict::Booked { .. }
+        ));
     }
 
     #[test]
@@ -525,7 +536,12 @@ mod tests {
 
         // Duplicate rejected.
         let dup = ledger.register(mk_offer("o1", "ocr", 9));
-        assert_eq!(dup, Err(EconomyError::DuplicateOffer { offer_id: "o1".into() }));
+        assert_eq!(
+            dup,
+            Err(EconomyError::DuplicateOffer {
+                offer_id: "o1".into()
+            })
+        );
 
         // Unknown retire is a no-op.
         assert!(!ledger.retire("nope"));
@@ -562,7 +578,9 @@ mod tests {
         ledger.register(mk_offer("o-cheap", "ocr", 4)).unwrap();
         ledger.register(mk_offer("o-cheapest", "ocr", 2)).unwrap();
         // Out of budget / wrong capability / non-active must not be chosen.
-        ledger.register(mk_offer("o-over-budget", "ocr", 20)).unwrap();
+        ledger
+            .register(mk_offer("o-over-budget", "ocr", 20))
+            .unwrap();
         ledger.register(mk_offer("o-code", "coding", 1)).unwrap();
         // The cheapest candidate is suspended, so it must not win either.
         let mut suspended = mk_offer("o-cheap-suspended", "ocr", 1);
@@ -601,22 +619,40 @@ mod tests {
     #[test]
     fn statuses_and_verdicts_serialize_snake_case() {
         let offer = mk_offer("o1", "ocr", 5);
-        assert!(serde_json::to_string(&offer).unwrap().contains("\"status\":\"active\""));
+        assert!(
+            serde_json::to_string(&offer)
+                .unwrap()
+                .contains("\"status\":\"active\"")
+        );
 
         let suspended = {
             let mut o = mk_offer("o1", "ocr", 5);
             o.status = OfferStatus::Suspended;
             o
         };
-        assert!(serde_json::to_string(&suspended).unwrap().contains("\"status\":\"suspended\""));
+        assert!(
+            serde_json::to_string(&suspended)
+                .unwrap()
+                .contains("\"status\":\"suspended\"")
+        );
 
         let verdict = BookingVerdict::Booked {
             offer_id: "o1".into(),
             total_price: 15,
         };
-        assert!(serde_json::to_string(&verdict).unwrap().contains("\"booked\":"));
-        let rejected = BookingVerdict::Rejected { reason: "no".into() };
-        assert!(serde_json::to_string(&rejected).unwrap().contains("\"rejected\":"));
+        assert!(
+            serde_json::to_string(&verdict)
+                .unwrap()
+                .contains("\"booked\":")
+        );
+        let rejected = BookingVerdict::Rejected {
+            reason: "no".into(),
+        };
+        assert!(
+            serde_json::to_string(&rejected)
+                .unwrap()
+                .contains("\"rejected\":")
+        );
     }
 
     #[test]
@@ -639,7 +675,8 @@ mod tests {
 
     #[test]
     fn offer_clamps_quality_and_reliability_to_unit_range() {
-        let clamped = CapabilityOffer::new("o1", "agent-a", "ocr", 1.5, -0.2, 5, 1, Some(500), 1000);
+        let clamped =
+            CapabilityOffer::new("o1", "agent-a", "ocr", 1.5, -0.2, 5, 1, Some(500), 1000);
         assert_eq!(clamped.quality, 1.0);
         assert_eq!(clamped.reliability, 0.0);
         assert_eq!(clamped.offer_id, "o1");

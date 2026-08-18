@@ -20,9 +20,7 @@
 //! - Physical eligibility runs through the existing compute matcher so
 //!   trust, reservations and capacity rules are never bypassed.
 
-use decentraai_compute::{
-    CapabilityMatcher, MatchReason, ReservationLedger, WorkloadRequirements,
-};
+use decentraai_compute::{CapabilityMatcher, MatchReason, ReservationLedger, WorkloadRequirements};
 use decentraai_hub::capability::CapabilityKind;
 use decentraai_hub::requirements::{
     CapabilityMatch, CapabilityRequirement, EvidenceLevel, match_requirements,
@@ -60,7 +58,11 @@ impl AgentRequirement {
     }
 
     /// Adds one semantic requirement.
-    pub fn require_capability(mut self, capability: CapabilityKind, evidence: EvidenceLevel) -> Self {
+    pub fn require_capability(
+        mut self,
+        capability: CapabilityKind,
+        evidence: EvidenceLevel,
+    ) -> Self {
         self.semantic.push(CapabilityRequirement {
             capability,
             evidence,
@@ -190,9 +192,7 @@ pub fn match_agent(
 mod tests {
     use super::*;
     use crate::agent::{AgentRecord, ROLE_GENERALIST, ROLE_PLANNER, ROLE_SPECIALIST};
-    use decentraai_compute::{
-        ComputeAdvertisement, GpuSpec, ServedModel, WorkerHealth,
-    };
+    use decentraai_compute::{ComputeAdvertisement, GpuSpec, ServedModel, WorkerHealth};
     use decentraai_hub::capability::Provenance;
     use libp2p::identity::Keypair;
     use std::time::Duration;

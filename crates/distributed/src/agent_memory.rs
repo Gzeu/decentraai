@@ -226,14 +226,8 @@ impl MemoryStore {
     pub fn unregister_scope(&self, name: &str) -> Result<bool, MemoryStoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let deleted = tx.execute(
-            "DELETE FROM memory_entries WHERE scope = ?1",
-            params![name],
-        )?;
-        let removed = tx.execute(
-            "DELETE FROM memory_scopes WHERE name = ?1",
-            params![name],
-        )?;
+        let deleted = tx.execute("DELETE FROM memory_entries WHERE scope = ?1", params![name])?;
+        let removed = tx.execute("DELETE FROM memory_scopes WHERE name = ?1", params![name])?;
         tx.commit()?;
         let _ = deleted;
         Ok(removed > 0)
@@ -253,11 +247,11 @@ impl MemoryStore {
         trusted: bool,
         verified_provenance: bool,
     ) -> Result<(), MemoryStoreError> {
-        let scope = self.get_scope(scope_name)?.ok_or_else(|| {
-            MemoryStoreError::UnknownScope {
+        let scope = self
+            .get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
                 name: scope_name.to_string(),
-            }
-        })?;
+            })?;
         match can_write(
             &scope,
             writer_agent,
@@ -329,11 +323,11 @@ impl MemoryStore {
         reader_agent: &str,
         trusted: bool,
     ) -> Result<Vec<MemoryEntry>, MemoryStoreError> {
-        let scope = self.get_scope(scope_name)?.ok_or_else(|| {
-            MemoryStoreError::UnknownScope {
+        let scope = self
+            .get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
                 name: scope_name.to_string(),
-            }
-        })?;
+            })?;
         let reader_is_owner = scope.owner_agent == reader_agent;
         match can_read(&scope, reader_agent, reader_is_owner, trusted) {
             MemoryAccessDecision::Granted => {}
@@ -389,26 +383,16 @@ impl MemoryStore {
     /// Number of registered scopes.
     pub fn scope_count(&self) -> Result<usize, MemoryStoreError> {
         let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memory_scopes",
-            [],
-            |r| r.get(0),
-        )?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM memory_scopes", [], |r| r.get(0))?;
         Ok(n as usize)
     }
 }
 
 fn scope_from_row(
-    (name, owner_agent, level, policy_json, created_at_ms): (
-        String,
-        String,
-        String,
-        String,
-        i64,
-    ),
+    (name, owner_agent, level, policy_json, created_at_ms): (String, String, String, String, i64),
 ) -> Result<MemoryScope, MemoryStoreError> {
-    let policy: MemoryPolicy = serde_json::from_str(&policy_json)
-        .map_err(|e| MemoryStoreError::Sql(e.to_string()))?;
+    let policy: MemoryPolicy =
+        serde_json::from_str(&policy_json).map_err(|e| MemoryStoreError::Sql(e.to_string()))?;
     Ok(MemoryScope {
         name,
         owner_agent,
@@ -421,8 +405,7 @@ fn scope_from_row(
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let tags_json: String = row.get(5)?;
     let provenance: Option<String> = row.get(8)?;
-    let tags: Vec<String> =
-        serde_json::from_str(&tags_json).unwrap_or_default();
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let provenance = provenance
         .as_deref()
         .and_then(|s| provenance_from_str(s).ok());
@@ -459,8 +442,12 @@ mod tests {
     #[test]
     fn register_rejects_duplicates_and_list_scopes_is_sorted() {
         let store = store_in_memory();
-        store.register_scope(&scope("zeta", "agent-a", MemoryLevel::Agent)).unwrap();
-        store.register_scope(&scope("alpha", "agent-b", MemoryLevel::Team)).unwrap();
+        store
+            .register_scope(&scope("zeta", "agent-a", MemoryLevel::Agent))
+            .unwrap();
+        store
+            .register_scope(&scope("alpha", "agent-b", MemoryLevel::Team))
+            .unwrap();
         // Duplicate name rejected.
         let err = store.register_scope(&scope("alpha", "agent-c", MemoryLevel::Network));
         assert!(matches!(err, Err(MemoryStoreError::DuplicateScope { name }) if name == "alpha"));
@@ -498,25 +485,57 @@ mod tests {
     #[test]
     fn write_enforces_owner_write_and_denies_remote_without_opt_in() {
         let store = store_in_memory();
-        store.register_scope(&scope("notes", "agent-a", MemoryLevel::Agent)).unwrap();
+        store
+            .register_scope(&scope("notes", "agent-a", MemoryLevel::Agent))
+            .unwrap();
         // Owner may write.
         store
-            .write("notes", &entry("e1", "notes", "agent-a", "mine"), "agent-a", true, false, false)
+            .write(
+                "notes",
+                &entry("e1", "notes", "agent-a", "mine"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         // A stranger (non-owner) without allow_remote_write is denied.
-        let err = store.write("notes", &entry("e2", "notes", "agent-b", "x"), "agent-b", false, true, false);
+        let err = store.write(
+            "notes",
+            &entry("e2", "notes", "agent-b", "x"),
+            "agent-b",
+            false,
+            true,
+            false,
+        );
         assert!(matches!(err, Err(MemoryStoreError::AccessDenied { .. })));
         // Unknown scope.
-        let err = store.write("nope", &entry("e3", "nope", "agent-a", "x"), "agent-a", true, false, false);
+        let err = store.write(
+            "nope",
+            &entry("e3", "nope", "agent-a", "x"),
+            "agent-a",
+            true,
+            false,
+            false,
+        );
         assert!(matches!(err, Err(MemoryStoreError::UnknownScope { .. })));
     }
 
     #[test]
     fn write_then_read_returns_persisted_entry_and_read_enforces_access() {
         let store = store_in_memory();
-        store.register_scope(&scope("notes", "agent-a", MemoryLevel::Agent)).unwrap();
         store
-            .write("notes", &entry("e1", "notes", "agent-a", "hello").tagged("greeting"), "agent-a", true, false, false)
+            .register_scope(&scope("notes", "agent-a", MemoryLevel::Agent))
+            .unwrap();
+        store
+            .write(
+                "notes",
+                &entry("e1", "notes", "agent-a", "hello").tagged("greeting"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         let seen = store.read("notes", "agent-a", false).unwrap();
         assert_eq!(seen.len(), 1);
@@ -549,23 +568,51 @@ mod tests {
                 )
                 .unwrap();
         }
-        let ids: Vec<String> = store.read("notes", "agent-a", false).unwrap().into_iter().map(|e| e.entry_id).collect();
-        assert_eq!(ids, vec!["e3", "e2"], "oldest entry is pruned, newest-first");
+        let ids: Vec<String> = store
+            .read("notes", "agent-a", false)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.entry_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["e3", "e2"],
+            "oldest entry is pruned, newest-first"
+        );
         assert_eq!(store.entry_count("notes").unwrap(), 2);
     }
 
     #[test]
     fn expiry_drops_expired_entries_on_write_and_read() {
         let store = store_in_memory();
-        store.register_scope(&scope("notes", "agent-a", MemoryLevel::Agent)).unwrap();
+        store
+            .register_scope(&scope("notes", "agent-a", MemoryLevel::Agent))
+            .unwrap();
         // An entry that expires in the past (relative to now) is never returned.
         store
-            .write("notes", &entry("old", "notes", "agent-a", "old").expires_at(1), "agent-a", true, false, false)
+            .write(
+                "notes",
+                &entry("old", "notes", "agent-a", "old").expires_at(1),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
-        assert!(store.read("notes", "agent-a", false).unwrap().is_empty(), "expired entry must not surface");
+        assert!(
+            store.read("notes", "agent-a", false).unwrap().is_empty(),
+            "expired entry must not surface"
+        );
         // Writing a fresh entry prunes the expired one.
         store
-            .write("notes", &entry("fresh", "notes", "agent-a", "fresh"), "agent-a", true, false, false)
+            .write(
+                "notes",
+                &entry("fresh", "notes", "agent-a", "fresh"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         let seen = store.read("notes", "agent-a", false).unwrap();
         assert_eq!(seen.len(), 1);
@@ -581,13 +628,34 @@ mod tests {
             .register_scope(&scope("team.notes", "agent-a", MemoryLevel::Team).with_policy(policy))
             .unwrap();
         store
-            .write("team.notes", &entry("e1", "team.notes", "agent-a", "a").tagged("arch"), "agent-a", true, false, false)
+            .write(
+                "team.notes",
+                &entry("e1", "team.notes", "agent-a", "a").tagged("arch"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         store
-            .write("team.notes", &entry("e2", "team.notes", "agent-a", "b").tagged("flaky"), "agent-a", true, false, false)
+            .write(
+                "team.notes",
+                &entry("e2", "team.notes", "agent-a", "b").tagged("flaky"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         store
-            .write("team.notes", &entry("e3", "team.notes", "agent-a", "c").tagged("arch"), "agent-a", true, false, false)
+            .write(
+                "team.notes",
+                &entry("e3", "team.notes", "agent-a", "c").tagged("arch"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         let hits: Vec<String> = store
             .search("team.notes", "arch", "agent-b", true)
@@ -598,20 +666,38 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.contains(&"e1".to_string()));
         assert!(hits.contains(&"e3".to_string()));
-        assert!(store.search("team.notes", "flaky", "agent-a", false).unwrap().len() == 1);
+        assert!(
+            store
+                .search("team.notes", "flaky", "agent-a", false)
+                .unwrap()
+                .len()
+                == 1
+        );
     }
 
     #[test]
     fn unregister_removes_scope_and_entries() {
         let store = store_in_memory();
-        store.register_scope(&scope("notes", "agent-a", MemoryLevel::Agent)).unwrap();
         store
-            .write("notes", &entry("e1", "notes", "agent-a", "x"), "agent-a", true, false, false)
+            .register_scope(&scope("notes", "agent-a", MemoryLevel::Agent))
+            .unwrap();
+        store
+            .write(
+                "notes",
+                &entry("e1", "notes", "agent-a", "x"),
+                "agent-a",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         assert_eq!(store.scope_count().unwrap(), 1);
         assert_eq!(store.entry_count("notes").unwrap(), 1);
         assert!(store.unregister_scope("notes").unwrap());
-        assert!(!store.unregister_scope("notes").unwrap(), "second remove reports absent");
+        assert!(
+            !store.unregister_scope("notes").unwrap(),
+            "second remove reports absent"
+        );
         assert_eq!(store.scope_count().unwrap(), 0);
         // Entries are gone; reading the removed scope is UnknownScope.
         assert!(matches!(
@@ -626,9 +712,18 @@ mod tests {
         let db_path = dir.path().join("memory.db");
         {
             let store = MemoryStore::open(&db_path).unwrap();
-            store.register_scope(&scope("notes", "agent-a", MemoryLevel::Agent)).unwrap();
             store
-                .write("notes", &entry("e1", "notes", "agent-a", "durable"), "agent-a", true, false, false)
+                .register_scope(&scope("notes", "agent-a", MemoryLevel::Agent))
+                .unwrap();
+            store
+                .write(
+                    "notes",
+                    &entry("e1", "notes", "agent-a", "durable"),
+                    "agent-a",
+                    true,
+                    false,
+                    false,
+                )
                 .unwrap();
         }
         // Drop the store, reopen from the same file: the entry must survive.
@@ -647,7 +742,9 @@ mod tests {
             .with_remote_write()
             .with_retention(7200);
         store
-            .register_scope(&scope("net.bench", "agent-a", MemoryLevel::Network).with_policy(policy))
+            .register_scope(
+                &scope("net.bench", "agent-a", MemoryLevel::Network).with_policy(policy),
+            )
             .unwrap();
         let got = store.get_scope("net.bench").unwrap().unwrap();
         assert!(got.policy.require_verified_provenance);

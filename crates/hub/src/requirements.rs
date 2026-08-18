@@ -49,7 +49,10 @@ pub enum RequirementStatus {
     /// The capability is claimed, but only with weaker provenance than the
     /// requirement demands (e.g. requirement wants VERIFIED, model only has
     /// INFERRED). Reported as a distinct, visible state — never flattened.
-    InsufficientProvenance { found: Provenance, required: EvidenceLevel },
+    InsufficientProvenance {
+        found: Provenance,
+        required: EvidenceLevel,
+    },
     /// No claim exists for this capability.
     Missing,
 }
@@ -136,10 +139,9 @@ pub fn match_requirements(
                 "{} — only INFERRED evidence, but VERIFIED required",
                 req.capability.label()
             ),
-            RequirementStatus::Missing => format!(
-                "{} — no evidence (UNKNOWN)",
-                req.capability.label()
-            ),
+            RequirementStatus::Missing => {
+                format!("{} — no evidence (UNKNOWN)", req.capability.label())
+            }
         };
 
         checks.push(RequirementCheck {
@@ -168,10 +170,7 @@ pub fn match_requirements(
 }
 
 /// Convenience: does the model satisfy all required capabilities (any evidence)?
-pub fn satisfies_any(
-    model: &ModelCapabilities,
-    requirements: &[CapabilityRequirement],
-) -> bool {
+pub fn satisfies_any(model: &ModelCapabilities, requirements: &[CapabilityRequirement]) -> bool {
     match_requirements(model, requirements).is_satisfied()
 }
 
@@ -194,7 +193,10 @@ mod tests {
     }
 
     fn req(capability: CapabilityKind, evidence: EvidenceLevel) -> CapabilityRequirement {
-        CapabilityRequirement { capability, evidence }
+        CapabilityRequirement {
+            capability,
+            evidence,
+        }
     }
 
     #[test]
@@ -230,7 +232,10 @@ mod tests {
     #[test]
     fn inferred_claim_satisfies_any_requirement() {
         let model = model_with(&[(CapabilityKind::Summarization, Provenance::Inferred)]);
-        let m = match_requirements(&model, &[req(CapabilityKind::Summarization, EvidenceLevel::Any)]);
+        let m = match_requirements(
+            &model,
+            &[req(CapabilityKind::Summarization, EvidenceLevel::Any)],
+        );
         assert!(m.is_satisfied());
         assert_eq!(
             m.checks[0].status,
@@ -262,7 +267,10 @@ mod tests {
                 req(CapabilityKind::Vision, EvidenceLevel::Verified),
             ],
         );
-        assert!(!m.is_satisfied(), "missing Vision must fail the whole match");
+        assert!(
+            !m.is_satisfied(),
+            "missing Vision must fail the whole match"
+        );
         assert_eq!(m.checks[1].status, RequirementStatus::Missing);
     }
 
@@ -280,8 +288,14 @@ mod tests {
     #[test]
     fn satisfies_any_helper() {
         let model = model_with(&[(CapabilityKind::Ocr, Provenance::Verified)]);
-        assert!(satisfies_any(&model, &[req(CapabilityKind::Ocr, EvidenceLevel::Any)]));
-        assert!(!satisfies_any(&model, &[req(CapabilityKind::Vision, EvidenceLevel::Any)]));
+        assert!(satisfies_any(
+            &model,
+            &[req(CapabilityKind::Ocr, EvidenceLevel::Any)]
+        ));
+        assert!(!satisfies_any(
+            &model,
+            &[req(CapabilityKind::Vision, EvidenceLevel::Any)]
+        ));
     }
 
     #[test]

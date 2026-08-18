@@ -193,7 +193,14 @@ mod tests {
         };
         let workers = vec![
             ("worker-a".into(), true, KVCacheState::Empty),
-            ("worker-b".into(), true, KVCacheState::Partial { used: 5, capacity: 4096 }),
+            (
+                "worker-b".into(),
+                true,
+                KVCacheState::Partial {
+                    used: 5,
+                    capacity: 4096,
+                },
+            ),
         ];
         let hint = KvPlanner.route(&ctx, &workers, false);
         assert_eq!(hint.cache_locality_worker.as_deref(), Some("worker-b"));
@@ -208,8 +215,22 @@ mod tests {
             prefix_resident_on: None,
         };
         let workers = vec![
-            ("tight".into(), true, KVCacheState::Partial { used: 3900, capacity: 4000 }),
-            ("roomy".into(), true, KVCacheState::Partial { used: 100, capacity: 8000 }),
+            (
+                "tight".into(),
+                true,
+                KVCacheState::Partial {
+                    used: 3900,
+                    capacity: 4000,
+                },
+            ),
+            (
+                "roomy".into(),
+                true,
+                KVCacheState::Partial {
+                    used: 100,
+                    capacity: 8000,
+                },
+            ),
         ];
         let hint = KvPlanner.route(&ctx, &workers, false);
         assert!(hint.prefer_kv_headroom);
@@ -222,8 +243,20 @@ mod tests {
         assert!(!KVCacheState::Full.can_accommodate(1));
         assert!(KVCacheState::Empty.can_accommodate(1000));
         assert!(KVCacheState::Unknown.can_accommodate(1000));
-        assert!(KVCacheState::Partial { used: 90, capacity: 100 }.can_accommodate(10));
-        assert!(!KVCacheState::Partial { used: 90, capacity: 100 }.can_accommodate(11));
+        assert!(
+            KVCacheState::Partial {
+                used: 90,
+                capacity: 100
+            }
+            .can_accommodate(10)
+        );
+        assert!(
+            !KVCacheState::Partial {
+                used: 90,
+                capacity: 100
+            }
+            .can_accommodate(11)
+        );
     }
 
     #[test]

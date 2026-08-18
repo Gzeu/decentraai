@@ -71,11 +71,8 @@ impl From<WorkloadRequirements> for AgentWorkloadRequirement {
 impl AgentWorkloadRequirement {
     /// Back to the compute type for the fabric's scheduler/matcher.
     pub fn to_compute(&self) -> WorkloadRequirements {
-        let mut wl = WorkloadRequirements::new(
-            self.model_hash.clone(),
-            self.est_ram_mb,
-            self.est_vram_mb,
-        );
+        let mut wl =
+            WorkloadRequirements::new(self.model_hash.clone(), self.est_ram_mb, self.est_vram_mb);
         wl.max_tokens = self.max_tokens;
         wl.stream = self.stream;
         wl.priority = self.priority;
@@ -134,7 +131,11 @@ impl AgentTask {
     }
 
     /// Adds a semantic capability requirement.
-    pub fn require_capability(mut self, capability: CapabilityKind, evidence: EvidenceLevel) -> Self {
+    pub fn require_capability(
+        mut self,
+        capability: CapabilityKind,
+        evidence: EvidenceLevel,
+    ) -> Self {
         self.required_capabilities.push(CapabilityRequirement {
             capability,
             evidence,

@@ -175,22 +175,19 @@ mod tests {
     fn transfer_estimate_is_deterministic() {
         // 1 Gbps → ~0.067 ms/MiB → 0. Transfer tiny payloads are ~free.
         assert_eq!(transfer_ms_per_mib(1_000), 67);
-        assert_eq!(estimated_transfer_ms(0, &LinkMetrics::prior(Locality::Lan, None)), 0);
+        assert_eq!(
+            estimated_transfer_ms(0, &LinkMetrics::prior(Locality::Lan, None)),
+            0
+        );
     }
 
     #[test]
     fn reach_cost_combines_rtt_and_transfer() {
         let mut g = NetworkGraph::new();
         // 10ms RTT, 10 Mbps → 6710 ms/MiB.
-        g.set(
-            "far",
-            LinkMetrics::prior(Locality::Remote, Some(10_000)),
-        );
+        g.set("far", LinkMetrics::prior(Locality::Remote, Some(10_000)));
         // 1ms RTT, 1000 Mbps.
-        g.set(
-            "near",
-            LinkMetrics::prior(Locality::Lan, Some(1_000)),
-        );
+        g.set("near", LinkMetrics::prior(Locality::Lan, Some(1_000)));
         let cost_far = g.reach_cost_ms("far", 2);
         let cost_near = g.reach_cost_ms("near", 2);
         assert!(cost_far > cost_near, "far node must cost more to reach");

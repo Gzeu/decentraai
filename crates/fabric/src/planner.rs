@@ -237,11 +237,7 @@ impl ExecutionPlanner {
     }
 
     /// Builds the best execution plan for a request over the given fabric.
-    pub fn plan(
-        &self,
-        req: &RequestFacts,
-        workers: &[WorkerFacts],
-    ) -> PlanResult {
+    pub fn plan(&self, req: &RequestFacts, workers: &[WorkerFacts]) -> PlanResult {
         // Deterministic candidate order: eligibility first, then score.
         let by_id: BTreeMap<String, WorkerFacts> = workers
             .iter()
@@ -309,10 +305,7 @@ impl ExecutionPlanner {
                     }),
                     fallback_orders: Vec::new(),
                 },
-                reasoning: append_capability_note(
-                    "no eligible worker serves this model",
-                    req,
-                ),
+                reasoning: append_capability_note("no eligible worker serves this model", req),
                 estimated_ms: 0,
                 rationale,
             };
@@ -369,10 +362,7 @@ impl ExecutionPlanner {
             // not just the chosen one: a split can only be sound when the
             // router sees all capable shards (a single candidate can never
             // produce an ExpertSplit — it would always fall back whole-model).
-            let candidates: Vec<String> = eligible
-                .iter()
-                .map(|e| e.peer_id.clone())
-                .collect();
+            let candidates: Vec<String> = eligible.iter().map(|e| e.peer_id.clone()).collect();
             if let crate::expert::ExpertDecision::ExpertSplit { workers, .. } =
                 ExpertRouter.route(&req.model_hash, &self.experts, candidates)
             {
@@ -639,8 +629,14 @@ mod tests {
         let hi = planner.candidate_score(&fast, &high, false, None, &cfg);
         // At priority 0 the boost factor is exactly 1.0; at 255 it is 1.5, so
         // the latency*queue contribution (and thus the total) strictly grows.
-        assert!(hi.total > lo.total, "high-priority must value the fast worker more");
-        assert!((lo.latency - hi.latency).abs() < f32::EPSILON, "latency term unchanged");
+        assert!(
+            hi.total > lo.total,
+            "high-priority must value the fast worker more"
+        );
+        assert!(
+            (lo.latency - hi.latency).abs() < f32::EPSILON,
+            "latency term unchanged"
+        );
     }
 
     #[test]
@@ -652,7 +648,10 @@ mod tests {
         // only won via the PeerId tiebreak.
         let fast = worker_facts("fast", 180, 50, 10);
         let mut host = worker_facts("host", 150, 80, 20);
-        host.kv = KVCacheState::Partial { used: 5, capacity: 4096 };
+        host.kv = KVCacheState::Partial {
+            used: 5,
+            capacity: 4096,
+        };
 
         let mut continuation = req();
         continuation.context.is_continuation = true;
@@ -706,7 +705,11 @@ mod tests {
         let p = ExecutionPlanner::default().plan(&req(), &ws);
         assert!(!p.plan.fallback_orders.is_empty());
         for order in &p.plan.fallback_orders {
-            assert!(order.contains(&"a".to_string()) || order.contains(&"b".to_string()) || order.contains(&"c".to_string()));
+            assert!(
+                order.contains(&"a".to_string())
+                    || order.contains(&"b".to_string())
+                    || order.contains(&"c".to_string())
+            );
         }
     }
 
@@ -819,7 +822,13 @@ mod tests {
         let headroom: f32 = (4096.0_f32 / 512.0_f32).min(1.0_f32);
         let net = p.rationale.chosen.as_ref().unwrap().net; // network default
         let kv = 0.0;
-        let expect = 0.25 * tps + 0.15 * latency + 0.15 * load + 0.10 * queue + 0.15 * headroom + 0.10 * net + 0.10 * kv;
+        let expect = 0.25 * tps
+            + 0.15 * latency
+            + 0.15 * load
+            + 0.10 * queue
+            + 0.15 * headroom
+            + 0.10 * net
+            + 0.10 * kv;
         assert!((chosen.total - expect).abs() < 1e-4);
         assert!(p.rationale.runner_up_delta.unwrap() >= 0.0);
         assert_eq!(p.rationale.ranked.len(), 2);
@@ -843,7 +852,10 @@ mod tests {
         let cs_estimated = planner.candidate_score(&e_a, &req(), false, None, &cfg);
         assert!(cs_measured.perf_measured);
         assert!(!cs_estimated.perf_measured);
-        assert_eq!(cs_measured.total, cs_estimated.total, "marker must not change the score");
+        assert_eq!(
+            cs_measured.total, cs_estimated.total,
+            "marker must not change the score"
+        );
 
         // Through the plan, the chosen worker's rationale records the marker.
         // The measured worker has strictly better perf, so it wins and is
@@ -854,13 +866,19 @@ mod tests {
         estimated.perf_measured = false;
         let p = planner.plan(&req(), &[estimated.clone(), measured]);
         let chosen = p.rationale.chosen.as_ref().expect("chosen score present");
-        assert!(chosen.perf_measured, "measured worker must win and be marked measured");
+        assert!(
+            chosen.perf_measured,
+            "measured worker must win and be marked measured"
+        );
         assert!(p.rationale.ranked[0].perf_measured);
 
         // And the estimated-only case records the ESTIMATED marker.
         let p = planner.plan(&req(), &[estimated]);
         let chosen = p.rationale.chosen.as_ref().expect("chosen score present");
-        assert!(!chosen.perf_measured, "unmeasured worker is marked estimated");
+        assert!(
+            !chosen.perf_measured,
+            "unmeasured worker is marked estimated"
+        );
     }
 
     #[test]
@@ -882,7 +900,10 @@ mod tests {
         // Rationale is serde-serializable too.
         let p = ExecutionPlanner::default().plan(
             &req(),
-            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &[
+                worker_facts("a", 180, 50, 10),
+                worker_facts("b", 150, 60, 20),
+            ],
         );
         let rj = serde_json::to_string(&p.rationale).unwrap();
         let rback: PlannerRationale = serde_json::from_str(&rj).unwrap();
@@ -895,7 +916,10 @@ mod tests {
         // verdict: the rationale field stays `None`.
         let p = ExecutionPlanner::default().plan(
             &req(),
-            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &[
+                worker_facts("a", 180, 50, 10),
+                worker_facts("b", 150, 60, 20),
+            ],
         );
         assert!(p.rationale.capability_requirement.is_none());
     }
@@ -910,7 +934,10 @@ mod tests {
         with_ocr.required_capability = Some("ocr".to_string());
         let p = ExecutionPlanner::default().plan(
             &with_ocr,
-            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &[
+                worker_facts("a", 180, 50, 10),
+                worker_facts("b", 150, 60, 20),
+            ],
         );
 
         let view = p
@@ -919,7 +946,10 @@ mod tests {
             .expect("a requirement was requested, so a verdict must be recorded");
         assert_eq!(view.capability, "ocr");
         assert_eq!(view.label, "ocr");
-        assert!(!view.satisfied, "fabric cannot verify capabilities: never satisfied");
+        assert!(
+            !view.satisfied,
+            "fabric cannot verify capabilities: never satisfied"
+        );
         assert_eq!(view.evidence, "UNKNOWN");
         assert!(
             p.reasoning.contains("capability requirement 'ocr'"),
@@ -940,7 +970,9 @@ mod tests {
             let mut r = req();
             r.required_capability = Some("ocr".to_string());
             r.capability_claims = claims;
-            ExecutionPlanner::default().plan(&r, &ws()).rationale
+            ExecutionPlanner::default()
+                .plan(&r, &ws())
+                .rationale
                 .capability_requirement
                 .expect("requirement requested -> verdict present")
         };
@@ -974,7 +1006,10 @@ mod tests {
         with_ocr.required_capability = Some("ocr".to_string());
         let p = ExecutionPlanner::default().plan(
             &with_ocr,
-            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &[
+                worker_facts("a", 180, 50, 10),
+                worker_facts("b", 150, 60, 20),
+            ],
         );
         let view = p.rationale.capability_requirement.as_ref().unwrap();
         let json = serde_json::to_string(view).unwrap();
@@ -1011,7 +1046,8 @@ mod tests {
     #[test]
     fn resolve_requirement_with_no_matching_capability_is_missing() {
         // No matching capability at all → MISSING.
-        let view = resolve_capability_requirement("ocr", &[("asr", "verified"), ("tts", "inferred")]);
+        let view =
+            resolve_capability_requirement("ocr", &[("asr", "verified"), ("tts", "inferred")]);
         assert!(!view.satisfied);
         assert_eq!(view.evidence, "MISSING");
     }
@@ -1032,7 +1068,7 @@ mod tests {
         assert_eq!(view.capability, "image_ocr");
     }
 
-#[test]
+    #[test]
     fn resolve_requirement_is_a_pure_free_function() {
         // Call the free function directly with a synthetic claims slice; it
         // needs no planner, no I/O, and only depends on its inputs.
@@ -1112,10 +1148,16 @@ mod tests {
         // KV reporting; LlamaServer does not), so the planner scores engines by
         // their true surface.
         let vllm_caps = EngineKind::Vllm.advertised_capabilities();
-        assert!(vllm_caps.supports_staging(), "vLLM advertises staged transfers");
+        assert!(
+            vllm_caps.supports_staging(),
+            "vLLM advertises staged transfers"
+        );
         assert!(vllm_caps.kv_report, "vLLM advertises KV reporting");
         assert!(vllm_caps.tensor_parallel, "vLLM advertises tensor parallel");
-        assert!(!vllm_caps.expert_routing, "no engine advertises expert routing today");
+        assert!(
+            !vllm_caps.expert_routing,
+            "no engine advertises expert routing today"
+        );
         let llama_caps = EngineKind::LlamaServer.advertised_capabilities();
         assert!(!llama_caps.supports_staging());
         assert!(llama_caps.kv_report, "llama-server exposes KV params");
@@ -1127,6 +1169,9 @@ mod tests {
         // parse round-trip used by fabric_facts on the live coordinator.
         assert_eq!(EngineKind::parse("vllm"), EngineKind::Vllm);
         assert_eq!(EngineKind::parse("llama-server"), EngineKind::LlamaServer);
-        assert_eq!(EngineKind::parse("unknown-engine"), EngineKind::RemoteOpenAI);
+        assert_eq!(
+            EngineKind::parse("unknown-engine"),
+            EngineKind::RemoteOpenAI
+        );
     }
 }

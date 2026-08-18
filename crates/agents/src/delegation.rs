@@ -61,19 +61,22 @@ fn check_value_schema(output: &Value, schema_hint: Option<&str>) -> Verification
                         VerificationCheck {
                             check_kind: crate::verification::CheckKind::Schema,
                             passed: false,
-                            detail: "output is not a JSON object, but the schema hint requires one".to_string(),
+                            detail: "output is not a JSON object, but the schema hint requires one"
+                                .to_string(),
                         }
                     }
                 }
                 Ok(_) => VerificationCheck {
                     check_kind: crate::verification::CheckKind::Schema,
                     passed: true,
-                    detail: "schema hint is JSON but not an object — structural check only".to_string(),
+                    detail: "schema hint is JSON but not an object — structural check only"
+                        .to_string(),
                 },
                 Err(_) => VerificationCheck {
                     check_kind: crate::verification::CheckKind::Schema,
                     passed: true,
-                    detail: "schema hint is not JSON — structural check skipped (honest)".to_string(),
+                    detail: "schema hint is not JSON — structural check skipped (honest)"
+                        .to_string(),
                 },
             }
         }
@@ -143,11 +146,20 @@ pub struct StageAssignment {
 pub enum DelegationError {
     EmptyPlanId,
     EmptyMasterTaskId,
-    DuplicateStage { stage_id: String },
-    UnknownDependency { stage_id: String, depends_on: String },
-    CycleDetected { stage_id: String },
+    DuplicateStage {
+        stage_id: String,
+    },
+    UnknownDependency {
+        stage_id: String,
+        depends_on: String,
+    },
+    CycleDetected {
+        stage_id: String,
+    },
     /// No agent in the registry can satisfy a required capability.
-    UnroutableCapability { capability: String },
+    UnroutableCapability {
+        capability: String,
+    },
 }
 
 impl fmt::Display for DelegationError {
@@ -160,8 +172,14 @@ impl fmt::Display for DelegationError {
             DelegationError::DuplicateStage { stage_id } => {
                 write!(f, "duplicate stage '{stage_id}' in plan")
             }
-            DelegationError::UnknownDependency { stage_id, depends_on } => {
-                write!(f, "stage '{stage_id}' depends on unknown stage '{depends_on}'")
+            DelegationError::UnknownDependency {
+                stage_id,
+                depends_on,
+            } => {
+                write!(
+                    f,
+                    "stage '{stage_id}' depends on unknown stage '{depends_on}'"
+                )
             }
             DelegationError::CycleDetected { stage_id } => {
                 write!(f, "stage '{stage_id}' is part of a dependency cycle")
@@ -213,7 +231,10 @@ impl DelegationPlan {
         for stage in &self.stages {
             for dep in &stage.depends_on {
                 *indegree.get_mut(&stage.stage_id).unwrap() += 1;
-                dependents.get_mut(dep).unwrap().push(stage.stage_id.clone());
+                dependents
+                    .get_mut(dep)
+                    .unwrap()
+                    .push(stage.stage_id.clone());
             }
         }
         let mut queue: VecDeque<String> = indegree
@@ -240,15 +261,16 @@ impl DelegationPlan {
         }
         if visited != self.stages.len() {
             // Find a stage that was never visited for a precise error.
-            let visited_set: BTreeSet<String> =
-                indegree.keys().cloned().collect();
+            let visited_set: BTreeSet<String> = indegree.keys().cloned().collect();
             let unvisited = self
                 .stages
                 .iter()
                 .find(|s| !visited_set.contains(&s.stage_id))
                 .map(|s| s.stage_id.clone())
                 .unwrap_or_else(|| self.stages[0].stage_id.clone());
-            return Err(DelegationError::CycleDetected { stage_id: unvisited });
+            return Err(DelegationError::CycleDetected {
+                stage_id: unvisited,
+            });
         }
         Ok(())
     }
@@ -268,7 +290,10 @@ impl DelegationPlan {
         for stage in &self.stages {
             for dep in &stage.depends_on {
                 *indegree.get_mut(&stage.stage_id).unwrap() += 1;
-                dependents.get_mut(dep).unwrap().push(stage.stage_id.clone());
+                dependents
+                    .get_mut(dep)
+                    .unwrap()
+                    .push(stage.stage_id.clone());
             }
         }
         let mut queue: VecDeque<String> = indegree
@@ -355,10 +380,13 @@ impl DelegationPlanner {
             let mut candidates: Vec<&AgentRecord> = agents
                 .iter()
                 .filter(|a| {
-                    match_agent_semantic(a, &[decentraai_hub::requirements::CapabilityRequirement {
-                        capability: cap,
-                        evidence: req.evidence,
-                    }])
+                    match_agent_semantic(
+                        a,
+                        &[decentraai_hub::requirements::CapabilityRequirement {
+                            capability: cap,
+                            evidence: req.evidence,
+                        }],
+                    )
                     .is_satisfied()
                 })
                 .collect();
@@ -369,10 +397,11 @@ impl DelegationPlanner {
                 });
             }
             let mut sub_task = AgentTask::new(format!("{}.{}", master_task.task_id, cap_name));
-            sub_task.required_capabilities = vec![decentraai_hub::requirements::CapabilityRequirement {
-                capability: cap,
-                evidence: req.evidence,
-            }];
+            sub_task.required_capabilities =
+                vec![decentraai_hub::requirements::CapabilityRequirement {
+                    capability: cap,
+                    evidence: req.evidence,
+                }];
             sub_task.verification = TaskVerification::SelfCheck;
             stages.push(
                 DelegationStage::new(format!("cap:{cap_name}"), sub_task)
@@ -532,10 +561,7 @@ where
                 let mut checks = Vec::new();
                 let mut verified = true;
                 if stage.verification != TaskVerification::None {
-                    let check = check_value_schema(
-                        &output,
-                        stage.task.output_schema.as_deref(),
-                    );
+                    let check = check_value_schema(&output, stage.task.output_schema.as_deref());
                     verified = check.passed;
                     checks.push(check);
                 }
@@ -550,7 +576,11 @@ where
                     output: Some(output),
                     verified,
                     checks,
-                    error: if verified { None } else { Some("output failed verification".into()) },
+                    error: if verified {
+                        None
+                    } else {
+                        Some("output failed verification".into())
+                    },
                 });
             }
             Err(e) => {
@@ -570,7 +600,10 @@ where
     if let Some(synth) = plan.stage("synthesis") {
         if let Some(out) = outputs.get("synthesis") {
             final_output = Some(out.clone());
-        } else if results.iter().any(|r| r.stage_id == "synthesis" && r.error.is_some()) {
+        } else if results
+            .iter()
+            .any(|r| r.stage_id == "synthesis" && r.error.is_some())
+        {
             // synthesis explicitly failed
         } else if synth.depends_on.is_empty() && plan.stages.len() == 1 {
             final_output = outputs.get("synthesis").cloned();
@@ -632,7 +665,11 @@ mod tests {
 
     #[test]
     fn planner_builds_capability_stages_plus_synthesis() {
-        let agents = vec![ocr_agent("a:ocr"), coding_agent("a:code"), generalist_agent("a:gen")];
+        let agents = vec![
+            ocr_agent("a:ocr"),
+            coding_agent("a:code"),
+            generalist_agent("a:gen"),
+        ];
         let plan = DelegationPlanner
             .plan_task(&master_task(), &agents, "p1", 1_700_000_000_000)
             .unwrap();
@@ -670,7 +707,10 @@ mod tests {
             stages: vec![a, b],
             created_at_ms: 0,
         };
-        assert!(matches!(plan.validate(), Err(DelegationError::CycleDetected { .. })));
+        assert!(matches!(
+            plan.validate(),
+            Err(DelegationError::CycleDetected { .. })
+        ));
         assert!(plan.stages_in_order().is_empty());
     }
 
@@ -683,7 +723,10 @@ mod tests {
             stages: vec![stage],
             created_at_ms: 0,
         };
-        assert!(matches!(plan.validate(), Err(DelegationError::UnknownDependency { .. })));
+        assert!(matches!(
+            plan.validate(),
+            Err(DelegationError::UnknownDependency { .. })
+        ));
     }
 
     #[test]
@@ -693,9 +736,18 @@ mod tests {
             .plan_task(&master_task(), &agents, "p1", 0)
             .unwrap();
         let assignments = vec![
-            StageAssignment { stage_id: "cap:coding".into(), agent_id: "a:code".into() },
-            StageAssignment { stage_id: "cap:ocr".into(), agent_id: "a:ocr".into() },
-            StageAssignment { stage_id: "synthesis".into(), agent_id: "a:gen".into() },
+            StageAssignment {
+                stage_id: "cap:coding".into(),
+                agent_id: "a:code".into(),
+            },
+            StageAssignment {
+                stage_id: "cap:ocr".into(),
+                agent_id: "a:ocr".into(),
+            },
+            StageAssignment {
+                stage_id: "synthesis".into(),
+                agent_id: "a:gen".into(),
+            },
         ];
         let result = execute_plan(&plan, &assignments, |agent_id, _stage, input| {
             assert!(
@@ -728,7 +780,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        assert!(synth_inputs.contains("::2"), "synthesis got two inputs: {synth_inputs}");
+        assert!(
+            synth_inputs.contains("::2"),
+            "synthesis got two inputs: {synth_inputs}"
+        );
         assert!(result.final_output.is_some());
     }
 
@@ -739,9 +794,18 @@ mod tests {
             .plan_task(&master_task(), &agents, "p1", 0)
             .unwrap();
         let assignments = vec![
-            StageAssignment { stage_id: "cap:coding".into(), agent_id: "a:code".into() },
-            StageAssignment { stage_id: "cap:ocr".into(), agent_id: "a:ocr".into() },
-            StageAssignment { stage_id: "synthesis".into(), agent_id: "a:gen".into() },
+            StageAssignment {
+                stage_id: "cap:coding".into(),
+                agent_id: "a:code".into(),
+            },
+            StageAssignment {
+                stage_id: "cap:ocr".into(),
+                agent_id: "a:ocr".into(),
+            },
+            StageAssignment {
+                stage_id: "synthesis".into(),
+                agent_id: "a:gen".into(),
+            },
         ];
         let result = execute_plan(&plan, &assignments, |agent_id, stage, _| {
             if stage.stage_id == "cap:ocr" {
@@ -773,10 +837,18 @@ mod tests {
             .require_capability(CapabilityKind::Ocr, EvidenceLevel::Verified)
             .verified_by(TaskVerification::SelfCheck);
         task.output_schema = Some(r#"{"type":"object"}"#.into());
-        let plan = DelegationPlanner.plan_task(&task, &agents, "p1", 0).unwrap();
+        let plan = DelegationPlanner
+            .plan_task(&task, &agents, "p1", 0)
+            .unwrap();
         let assignments = vec![
-            StageAssignment { stage_id: "cap:ocr".into(), agent_id: "a:ocr".into() },
-            StageAssignment { stage_id: "synthesis".into(), agent_id: "a:gen".into() },
+            StageAssignment {
+                stage_id: "cap:ocr".into(),
+                agent_id: "a:ocr".into(),
+            },
+            StageAssignment {
+                stage_id: "synthesis".into(),
+                agent_id: "a:gen".into(),
+            },
         ];
         let result = execute_plan(&plan, &assignments, |_agent, _stage, _| {
             Ok(Value::String("not valid json object".to_string()))

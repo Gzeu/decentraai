@@ -42,11 +42,15 @@ impl Permission {
     }
     /// A model permission.
     pub fn model(model_hash: impl Into<String>) -> Self {
-        Permission::Model { model_hash: model_hash.into() }
+        Permission::Model {
+            model_hash: model_hash.into(),
+        }
     }
     /// A peer permission.
     pub fn peer(peer_id: impl Into<String>) -> Self {
-        Permission::Peer { peer_id: peer_id.into() }
+        Permission::Peer {
+            peer_id: peer_id.into(),
+        }
     }
 }
 
@@ -66,7 +70,9 @@ impl PolicyDecision {
 
 /// Deny a permission with a reason (small helper for readable rules).
 fn deny(reason: impl Into<String>) -> PolicyDecision {
-    PolicyDecision::Deny { reason: reason.into() }
+    PolicyDecision::Deny {
+        reason: reason.into(),
+    }
 }
 
 /// The policy engine. Stateless and pure: every check is a decision function
@@ -88,7 +94,9 @@ impl PolicyEngine {
         if agent.has_tool(name) {
             PolicyDecision::Allow
         } else {
-            deny(format!("tool '{name}' is not in the agent's declared tool set"))
+            deny(format!(
+                "tool '{name}' is not in the agent's declared tool set"
+            ))
         }
     }
 
@@ -105,7 +113,9 @@ impl PolicyEngine {
         if agent.allowed_models.is_empty() || agent.has_model(model_hash) {
             PolicyDecision::Allow
         } else {
-            deny(format!("model '{model_hash}' is not in the agent's allowlist"))
+            deny(format!(
+                "model '{model_hash}' is not in the agent's allowlist"
+            ))
         }
     }
 
@@ -182,16 +192,12 @@ impl PolicyEngine {
             return deny("agent is not in a working state");
         }
         match agent.policies.sandbox {
-            SandboxMode::Normal => {
-                deny("network egress is denied in Normal sandbox mode")
-            }
+            SandboxMode::Normal => deny("network egress is denied in Normal sandbox mode"),
             SandboxMode::Exploration => {
                 if allowed_hosts.iter().any(|h| h == host) {
                     PolicyDecision::Allow
                 } else {
-                    deny(format!(
-                        "host '{host}' is not in the exploration allowlist"
-                    ))
+                    deny(format!("host '{host}' is not in the exploration allowlist"))
                 }
             }
             SandboxMode::Experimental => PolicyDecision::Allow,
@@ -262,7 +268,10 @@ mod tests {
     fn declared_tool_allowed_undeclared_denied() {
         let agent = active_agent();
         let engine = PolicyEngine;
-        assert_eq!(engine.check_tool(&agent, "mcp.filesystem"), PolicyDecision::Allow);
+        assert_eq!(
+            engine.check_tool(&agent, "mcp.filesystem"),
+            PolicyDecision::Allow
+        );
         assert!(matches!(
             engine.check_tool(&agent, "ocr.api"),
             PolicyDecision::Deny { .. }
@@ -275,7 +284,10 @@ mod tests {
         agent.allowed_models = Vec::new();
         let engine = PolicyEngine;
         // Empty allowlist = the agent may use any model the node serves.
-        assert_eq!(engine.check_model(&agent, "anything"), PolicyDecision::Allow);
+        assert_eq!(
+            engine.check_model(&agent, "anything"),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
@@ -294,7 +306,10 @@ mod tests {
         let agent = active_agent();
         let engine = PolicyEngine;
         // Local peer always allowed.
-        assert_eq!(engine.check_peer(&agent, "local", "local"), PolicyDecision::Allow);
+        assert_eq!(
+            engine.check_peer(&agent, "local", "local"),
+            PolicyDecision::Allow
+        );
         // Remote denied unless allow_remote.
         assert!(matches!(
             engine.check_peer(&agent, "remote-1", "local"),
@@ -302,7 +317,10 @@ mod tests {
         ));
         let mut open = active_agent();
         open.policies.allow_remote = true;
-        assert_eq!(engine.check_peer(&open, "remote-1", "local"), PolicyDecision::Allow);
+        assert_eq!(
+            engine.check_peer(&open, "remote-1", "local"),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
@@ -311,8 +329,14 @@ mod tests {
         agent.policies.max_concurrent_tasks = 2;
         let engine = PolicyEngine;
         // 0 and 1 active tasks are within the budget of 2.
-        assert_eq!(engine.check_resource(&agent, 1024, 0), PolicyDecision::Allow);
-        assert_eq!(engine.check_resource(&agent, 1024, 1), PolicyDecision::Allow);
+        assert_eq!(
+            engine.check_resource(&agent, 1024, 0),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            engine.check_resource(&agent, 1024, 1),
+            PolicyDecision::Allow
+        );
         // The 2-slot budget is fully occupied — a new request is denied.
         assert!(matches!(
             engine.check_resource(&agent, 1024, 2),

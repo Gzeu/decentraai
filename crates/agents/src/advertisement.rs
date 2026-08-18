@@ -15,8 +15,8 @@
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentRecord;
 use crate::AGENT_ADVERTISEMENT_VERSION;
+use crate::agent::AgentRecord;
 
 /// The set of logical agents a node advertises at one moment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

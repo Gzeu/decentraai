@@ -2388,3 +2388,25 @@ The mechanism that lets the Talent Tree evolve — the chain
 - `decentraai agent skill` demonstrates the chain with a seeded
   code-finetune dataset + code-agent skill: a coding model unlocks
   `tool calling`. Honest provenance — a dataset claims only what it develops.
+
+## 105. P8 dataset/skill audit + integrity fix (DONE)
+
+Commit `pending`. Following the dataset-layer audit (docs/DATASET_AUDIT.md),
+the provenance-laundering hole is closed:
+
+- **Invariant enforced**: a skill can only unlock capabilities its dataset
+  actually develops (`SkillDevelopsNotInDataset` on `add_skill`). A Verified
+  dataset can no longer lend Verified provenance to capabilities it never
+  trained for.
+- **`build_agent_capabilities` unlocks `dataset.develops`** (the evidence
+  source), never a skill's own declaration — so unlocked capabilities are
+  exactly those with dataset evidence, carrying the dataset's provenance.
+- Added tests: skill.develops outside dataset.develops is rejected; build
+  unlocks dataset-developed capabilities with dataset provenance.
+- `docs/DATASET_AUDIT.md` documents the A–K findings: dataset=evidence,
+  skill=application gate, quality/confidence currently inert (TalentTree
+  ignores provenance), talent/execution runtime wiring is the next milestone.
+- Ran `cargo fmt --all` (formatting-only; also fixed a pre-existing
+  inference-adapter formatting diff).
+
+944 workspace tests green; clippy clean.

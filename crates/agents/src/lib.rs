@@ -58,8 +58,8 @@ pub mod workflow;
 pub use advertisement::AgentAdvertisement;
 pub use agent::{
     AgentPolicies, AgentRecord, AgentState, ROLE_COORDINATOR, ROLE_CRITIC, ROLE_EXECUTOR,
-    ROLE_GENERALIST, ROLE_INFRASTRUCTURE, ROLE_MEMORY, ROLE_PLANNER, ROLE_RESEARCHER,
-    ROLE_ROUTER, ROLE_SPECIALIST, ROLE_TOOL, ROLE_VERIFIER, SandboxMode,
+    ROLE_GENERALIST, ROLE_INFRASTRUCTURE, ROLE_MEMORY, ROLE_PLANNER, ROLE_RESEARCHER, ROLE_ROUTER,
+    ROLE_SPECIALIST, ROLE_TOOL, ROLE_VERIFIER, SandboxMode,
 };
 pub use capability::{AgentCapability, model_capabilities_from_claims};
 pub use dataset::{
@@ -84,9 +84,7 @@ pub use memory::{
 pub use message::{
     AgentInbox, AgentMessage, MessageKind, MessageValidationError, validate_message,
 };
-pub use policy::{
-    ExplorationLimit, Permission, PolicyDecision, PolicyEngine, policy_engine,
-};
+pub use policy::{ExplorationLimit, Permission, PolicyDecision, PolicyEngine, policy_engine};
 pub use registry::{AgentRegistry, AgentRegistryError};
 pub use reputation::{
     AgentReputation, DEFAULT_MIN_SAMPLES, FactorScore, ReputationFactor, ReputationStore,
@@ -99,7 +97,7 @@ pub use selfopt::{
 pub use talent_tree::{TalentError, TalentNode, TalentTree, seed_talent_tree};
 pub use task::{AgentTask, AgentWorkloadRequirement, TaskVerification};
 pub use tool::{
-    ToolDescriptor, TOOL_KIND_BUILTIN, TOOL_KIND_CUSTOM, TOOL_KIND_HTTP, TOOL_KIND_MCP,
+    TOOL_KIND_BUILTIN, TOOL_KIND_CUSTOM, TOOL_KIND_HTTP, TOOL_KIND_MCP, ToolDescriptor,
 };
 pub use verification::{
     CheckKind, ConsensusPolicy, ConsensusResult, DisagreementResolution, VerificationCheck,

@@ -411,7 +411,10 @@ impl NodeConfig {
 pub fn is_known_engine(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
-        "llama-server" | "llama_server" | "llamacpp" | "llama.cpp"
+        "llama-server"
+            | "llama_server"
+            | "llamacpp"
+            | "llama.cpp"
             | "vllm"
             | "sglang"
             | "sglang_server"
@@ -650,10 +653,7 @@ security:
         file.write_all(include_bytes!("../../../configs/node.example.yaml"))
             .unwrap();
         let raw = std::fs::read_to_string(file.path()).unwrap();
-        let bad = raw.replace(
-            "max_concurrent_downloads: 2",
-            "max_concurrent_downloads: 0",
-        );
+        let bad = raw.replace("max_concurrent_downloads: 2", "max_concurrent_downloads: 0");
         std::fs::write(file.path(), bad).unwrap();
         let err = NodeConfig::load(file.path()).unwrap_err();
         assert!(err.to_string().contains("max_concurrent_downloads"));
@@ -775,7 +775,13 @@ security:
 
     #[test]
     fn known_engine_wire_values_recognized() {
-        for known in ["llama-server", "vllm", "sglang", "ollama", "openai-compatible"] {
+        for known in [
+            "llama-server",
+            "vllm",
+            "sglang",
+            "ollama",
+            "openai-compatible",
+        ] {
             assert!(is_known_engine(known), "{known} should be known");
         }
         assert!(!is_known_engine("baz-engine"));

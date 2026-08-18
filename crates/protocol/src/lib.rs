@@ -226,12 +226,8 @@ pub fn canonical_infer_request_bytes(req: &InferRequest) -> Vec<u8> {
 /// peer (P1/P2). Fails if the request is unsigned, its embedded public key
 /// does not map to `connected_peer` (anti-spoof: `sender_peer_id` is not
 /// trusted), or the Ed25519 signature does not verify over the canonical bytes.
-pub fn verify_infer_request_signature(
-    connected_peer: &PeerId,
-    req: &InferRequest,
-) -> Result<()> {
-    let (Some(sig_bytes), Some(pk_bytes)) =
-        (req.signature.as_deref(), req.sender_public_key)
+pub fn verify_infer_request_signature(connected_peer: &PeerId, req: &InferRequest) -> Result<()> {
+    let (Some(sig_bytes), Some(pk_bytes)) = (req.signature.as_deref(), req.sender_public_key)
     else {
         anyhow::bail!("unsigned inference request");
     };
@@ -239,8 +235,7 @@ pub fn verify_infer_request_signature(
         .context("invalid sender public key")?;
     // Anti-spoof: the sender's public key must map to the authenticated
     // connected peer. `sender_peer_id` in the payload is never trusted.
-    let expected =
-        PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey_kp));
+    let expected = PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey_kp));
     if &expected != connected_peer {
         anyhow::bail!(
             "sender public key maps to {expected}, not the connected peer {connected_peer}"

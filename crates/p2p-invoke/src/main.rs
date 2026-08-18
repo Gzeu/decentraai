@@ -17,8 +17,8 @@
 
 use anyhow::{Context, Result, bail};
 use decentraai_identity::Identity;
-use decentraai_protocol::{InferMessage, InferRequest};
 use decentraai_p2p::{P2PNode, RequestHandler};
+use decentraai_protocol::{InferMessage, InferRequest};
 use libp2p::PeerId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +36,7 @@ struct IncomingHandler {
 
 impl RequestHandler for IncomingHandler {
     fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
-        if decentraai_protocol::deserialize_message::<InferMessage>(request, request.len())
-            .is_ok()
+        if decentraai_protocol::deserialize_message::<InferMessage>(request, request.len()).is_ok()
         {
             let _ = self.tx.send(request.to_vec());
         }
@@ -51,9 +50,7 @@ impl RequestHandler for IncomingHandler {
 fn parse_peer_target(addr: &str) -> Result<PeerId> {
     let parts: Vec<&str> = addr.split("/p2p/").collect();
     if parts.len() != 2 {
-        bail!(
-            "peer address must include a /p2p/<peer-id> suffix, got: {addr}"
-        );
+        bail!("peer address must include a /p2p/<peer-id> suffix, got: {addr}");
     }
     let peer = parts[1];
     let peer_id: PeerId = peer.parse().context("parsing /p2p/ peer id")?;
@@ -78,28 +75,27 @@ async fn main() -> Result<()> {
     }
 
     let get = |name: &str| -> Option<String> {
-        args.windows(2)
-            .find(|w| w[0] == name)
-            .map(|w| w[1].clone())
+        args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
     };
 
-    let peer_addr = get("--peer")
-        .context("missing --peer (worker multiaddr with /p2p/<peer-id> suffix)")?;
+    let peer_addr =
+        get("--peer").context("missing --peer (worker multiaddr with /p2p/<peer-id> suffix)")?;
     // Either the exact model hash or a path to the GGUF whose BLAKE3 is the
     // model hash (the same computation the worker performs at startup).
     let model_hash = match get("--model-hash") {
         Some(hash) => hash,
         None => {
             let path = get("--model").context("need --model-hash or --model")?;
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading model {}", path))?;
+            let bytes = std::fs::read(&path).with_context(|| format!("reading model {}", path))?;
             tracing::info!(bytes = bytes.len(), "computing BLAKE3 model hash");
             blake3::hash(&bytes).to_hex().to_string()
         }
     };
     let prompt = get("--prompt").unwrap_or_else(|| "Hello".to_string());
     let max_tokens: u32 = get("--max-tokens").unwrap_or_else(|| "96".into()).parse()?;
-    let timeout_ms: u64 = get("--timeout-ms").unwrap_or_else(|| "90000".into()).parse()?;
+    let timeout_ms: u64 = get("--timeout-ms")
+        .unwrap_or_else(|| "90000".into())
+        .parse()?;
 
     let worker_peer = parse_peer_target(&peer_addr)?;
 
@@ -188,10 +184,8 @@ async fn main() -> Result<()> {
             };
             match tokio::time::timeout(deadline, rx.recv()).await {
                 Ok(Some(bytes)) => {
-                    let msg: InferMessage = decentraai_protocol::deserialize_message(
-                        &bytes,
-                        bytes.len(),
-                    )?;
+                    let msg: InferMessage =
+                        decentraai_protocol::deserialize_message(&bytes, bytes.len())?;
                     match msg {
                         InferMessage::InferProgress(p) => {
                             output.push_str(&p.partial_output);

@@ -171,10 +171,7 @@ impl TalentTree {
     pub fn can_unlock(&self, target: CapabilityKind, have: &[CapabilityKind]) -> bool {
         match self.nodes.get(&target) {
             None => false,
-            Some(node) => node
-                .prerequisites
-                .iter()
-                .all(|p| have.contains(p)),
+            Some(node) => node.prerequisites.iter().all(|p| have.contains(p)),
         }
     }
 
@@ -225,7 +222,11 @@ impl TalentTree {
     /// breadth-first expansion of the "all prerequisites held" frontier, and
     /// because the frontier is iterated in `CapabilityKind` order the result is
     /// deterministic.
-    pub fn resolve_path(&self, target: CapabilityKind, have: &[CapabilityKind]) -> Vec<CapabilityKind> {
+    pub fn resolve_path(
+        &self,
+        target: CapabilityKind,
+        have: &[CapabilityKind],
+    ) -> Vec<CapabilityKind> {
         if have.contains(&target) {
             return Vec::new();
         }
@@ -330,8 +331,15 @@ pub fn seed_talent_tree() -> TalentTree {
         (CapabilityKind::Coding, 2048),
     ];
     for (kind, mb) in leaves {
-        tree.add(TalentNode::new(*kind, Vec::new(), *mb, Some(Provenance::Verified), 1.0, false))
-            .expect("leaf capabilities are unique keys");
+        tree.add(TalentNode::new(
+            *kind,
+            Vec::new(),
+            *mb,
+            Some(Provenance::Verified),
+            1.0,
+            false,
+        ))
+        .expect("leaf capabilities are unique keys");
     }
 
     // Chain 1: knowledge (Embeddings → SemanticSearch → RAG → KnowledgeAgent).
@@ -491,10 +499,7 @@ mod tests {
         let tree = chain_tree();
         // Agents needs Retrieval, which needs Embeddings.
         assert!(tree.can_unlock(CapabilityKind::Retrieval, &[CapabilityKind::Embeddings]));
-        assert!(!tree.can_unlock(
-            CapabilityKind::Retrieval,
-            &[CapabilityKind::Coding]
-        ));
+        assert!(!tree.can_unlock(CapabilityKind::Retrieval, &[CapabilityKind::Coding]));
         assert!(!tree.can_unlock(CapabilityKind::Agents, &[CapabilityKind::Embeddings]));
         assert!(tree.can_unlock(
             CapabilityKind::Agents,
@@ -521,7 +526,10 @@ mod tests {
 
         let got = tree.direct_prerequisites(CapabilityKind::Agents);
         // Sorted by declaration order (derive Ord): Reasoning < Embeddings.
-        assert_eq!(got, vec![CapabilityKind::Reasoning, CapabilityKind::Embeddings]);
+        assert_eq!(
+            got,
+            vec![CapabilityKind::Reasoning, CapabilityKind::Embeddings]
+        );
         // Leaf and unknown both yield empty.
         assert!(tree.direct_prerequisites(CapabilityKind::Coding).is_empty());
         assert!(tree.direct_prerequisites(CapabilityKind::Vision).is_empty());
@@ -543,16 +551,21 @@ mod tests {
     #[test]
     fn resolve_path_is_empty_when_target_already_held() {
         let tree = chain_tree();
-        assert!(tree
-            .resolve_path(CapabilityKind::Embeddings, &[CapabilityKind::Embeddings])
-            .is_empty());
-        assert!(tree
-            .resolve_path(CapabilityKind::Agents, &[
-                CapabilityKind::Embeddings,
-                CapabilityKind::Retrieval,
+        assert!(
+            tree.resolve_path(CapabilityKind::Embeddings, &[CapabilityKind::Embeddings])
+                .is_empty()
+        );
+        assert!(
+            tree.resolve_path(
                 CapabilityKind::Agents,
-            ])
-            .is_empty());
+                &[
+                    CapabilityKind::Embeddings,
+                    CapabilityKind::Retrieval,
+                    CapabilityKind::Agents,
+                ]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -570,9 +583,10 @@ mod tests {
             false,
         ))
         .unwrap();
-        assert!(tree
-            .resolve_path(CapabilityKind::Agents, &[CapabilityKind::Embeddings])
-            .is_empty());
+        assert!(
+            tree.resolve_path(CapabilityKind::Agents, &[CapabilityKind::Embeddings])
+                .is_empty()
+        );
         assert!(!tree.reachable(CapabilityKind::Agents, &[CapabilityKind::Embeddings]));
     }
 
@@ -647,9 +661,10 @@ mod tests {
         let tree = seed_talent_tree();
 
         // Embeddings is a leaf.
-        assert!(tree
-            .direct_prerequisites(CapabilityKind::Embeddings)
-            .is_empty());
+        assert!(
+            tree.direct_prerequisites(CapabilityKind::Embeddings)
+                .is_empty()
+        );
 
         // Composite nodes are present.
         for kind in [
@@ -724,33 +739,12 @@ mod tests {
     #[test]
     fn node_constructor_clamps_confidence_to_unit_range() {
         let high = node(CapabilityKind::Embeddings);
-        let over = TalentNode::new(
-            CapabilityKind::Coding,
-            Vec::new(),
-            256,
-            None,
-            7.5,
-            false,
-        );
+        let over = TalentNode::new(CapabilityKind::Coding, Vec::new(), 256, None, 7.5, false);
         assert_eq!(over.confidence, 1.0);
-        let under = TalentNode::new(
-            CapabilityKind::Agents,
-            Vec::new(),
-            256,
-            None,
-            -2.0,
-            false,
-        );
+        let under = TalentNode::new(CapabilityKind::Agents, Vec::new(), 256, None, -2.0, false);
         assert_eq!(under.confidence, 0.0);
         assert_eq!(high.confidence, 1.0);
-        let mid = TalentNode::new(
-            CapabilityKind::Vision,
-            Vec::new(),
-            256,
-            None,
-            0.37,
-            false,
-        );
+        let mid = TalentNode::new(CapabilityKind::Vision, Vec::new(), 256, None, 0.37, false);
         assert_eq!(mid.confidence, 0.37);
     }
 

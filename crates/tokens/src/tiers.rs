@@ -38,19 +38,13 @@ pub struct SuggestedTier {
 /// suggestions with no matching active token, and out-of-range tiers, are
 /// skipped. Tokens already at the suggested tier are not emitted. The result
 /// is deterministic (sorted by name) so a dry-run matches a later apply.
-pub fn plan_tier_changes(
-    suggestions: &[SuggestedTier],
-    tokens: &[TokenRecord],
-) -> Vec<TierChange> {
+pub fn plan_tier_changes(suggestions: &[SuggestedTier], tokens: &[TokenRecord]) -> Vec<TierChange> {
     let mut changes = Vec::new();
     for s in suggestions {
         if !Tier::parse(s.suggested).is_ok() {
             continue;
         }
-        let Some(rec) = tokens
-            .iter()
-            .find(|r| !r.revoked && r.name == s.name)
-        else {
+        let Some(rec) = tokens.iter().find(|r| !r.revoked && r.name == s.name) else {
             continue;
         };
         if rec.tier != s.suggested {

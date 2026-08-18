@@ -58,12 +58,7 @@ impl ExpertRegistry {
     }
 
     /// Records an expert shard for (model, worker).
-    pub fn record(
-        &mut self,
-        model_hash: &str,
-        worker: &str,
-        shard: ExpertShard,
-    ) {
+    pub fn record(&mut self, model_hash: &str, worker: &str, shard: ExpertShard) {
         self.by_model
             .entry(model_hash.to_string())
             .or_default()
@@ -80,20 +75,18 @@ impl ExpertRegistry {
 
     /// The layout for a model if recorded.
     pub fn layout(&self, model_hash: &str) -> Option<ExpertLayout> {
-        self.by_model
-            .get(model_hash)
-            .map(|m| {
-                let count = m
-                    .values()
-                    .map(|s| s.experts.len() as u32)
-                    .max()
-                    .unwrap_or(0);
-                ExpertLayout {
-                    expert_count: count,
-                    top_k: 1,
-                    routing_capable: m.values().any(|s| s.routing_capable),
-                }
-            })
+        self.by_model.get(model_hash).map(|m| {
+            let count = m
+                .values()
+                .map(|s| s.experts.len() as u32)
+                .max()
+                .unwrap_or(0);
+            ExpertLayout {
+                expert_count: count,
+                top_k: 1,
+                routing_capable: m.values().any(|s| s.routing_capable),
+            }
+        })
     }
 
     pub fn model_workers(&self, model_hash: &str) -> Vec<(String, ExpertShard)> {
@@ -133,10 +126,7 @@ impl ExpertRouter {
     ) -> ExpertDecision {
         if !registry.has_expert_capable_workers(model_hash) {
             // No engine can route at expert level: honest whole-model result.
-            let best = candidate_workers
-                .into_iter()
-                .min()
-                .unwrap_or_default();
+            let best = candidate_workers.into_iter().min().unwrap_or_default();
             return ExpertDecision::WholeModel(best);
         }
         // At least one worker is capable. Split across all capable workers.
@@ -148,7 +138,13 @@ impl ExpertRouter {
             .filter(|(id, _)| candidate_workers.contains(id))
             .collect();
         if capable.len() < 2 {
-            return ExpertDecision::WholeModel(capable.first().map(|(id, _)| id).cloned().unwrap_or_default());
+            return ExpertDecision::WholeModel(
+                capable
+                    .first()
+                    .map(|(id, _)| id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
         // Degenerate / invalid-split guard: a split is only sound when every
         // selected shard is actually servable at expert granularity and free of

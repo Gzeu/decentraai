@@ -65,7 +65,9 @@ impl AgentMessenger {
             self.push_inbound(message);
             return Ok(());
         }
-        p2p.request(peer, bytes).await.context("agent message transport")?;
+        p2p.request(peer, bytes)
+            .await
+            .context("agent message transport")?;
         Ok(())
     }
 
@@ -178,13 +180,15 @@ mod tests {
         // A single-node workflow must not depend on libp2p self-dial: sending
         // to this node's own peer pushes into the local inbox directly.
         use decentraai_agents::MessageKind;
-        let messenger = AgentMessenger::new(P2PNode::new(
-            &Identity::generate(),
-            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
-            decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
-            None,
-        )
-        .unwrap());
+        let messenger = AgentMessenger::new(
+            P2PNode::new(
+                &Identity::generate(),
+                decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+                decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+                None,
+            )
+            .unwrap(),
+        );
         let own = messenger.p2p.lock().unwrap().local_peer_id();
         let msg = AgentMessage::new("m", "a:1", "b:1", MessageKind::Delegate)
             .with_from_peer(own.to_string())

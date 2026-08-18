@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 /// fabric uses this taxonomy as the *semantic* half of its capability model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityKind {    Chat,
+pub enum CapabilityKind {
+    Chat,
     TextGeneration,
     Reasoning,
     Coding,
@@ -182,12 +183,7 @@ pub fn tasks_for(capability: CapabilityKind) -> &'static [&'static str] {
             "structured output",
             "planning",
         ],
-        CapabilityKind::Embeddings => &[
-            "semantic search",
-            "retrieval",
-            "clustering",
-            "similarity",
-        ],
+        CapabilityKind::Embeddings => &["semantic search", "retrieval", "clustering", "similarity"],
         CapabilityKind::SpeechToText => &[
             "transcription",
             "speech recognition",
@@ -199,10 +195,7 @@ pub fn tasks_for(capability: CapabilityKind) -> &'static [&'static str] {
             "extractive summarization",
             "meeting notes",
         ],
-        CapabilityKind::Translation => &[
-            "machine translation",
-            "document translation",
-        ],
+        CapabilityKind::Translation => &["machine translation", "document translation"],
         _ => &[],
     }
 }
@@ -214,11 +207,7 @@ pub fn tasks_for(capability: CapabilityKind) -> &'static [&'static str] {
 /// `tools`/`vision`/etc. as VERIFIED, plus `gguf` family markers).
 /// `id` is the repo id (`org/name`) used only for conservative name
 /// heuristics labeled INFERRED.
-pub fn classify(
-    pipeline_tag: Option<&str>,
-    tags: &[String],
-    id: &str,
-) -> ModelCapabilities {
+pub fn classify(pipeline_tag: Option<&str>, tags: &[String], id: &str) -> ModelCapabilities {
     let mut claims: Vec<CapabilityClaim> = Vec::new();
 
     // --- VERIFIED from the Hub pipeline tag ---
@@ -250,8 +239,10 @@ pub fn classify(
         Some("summarization") => {
             claims.push(claim(CapabilityKind::Summarization, Provenance::Verified));
         }
-        Some("text-classification") | Some("token-classification")
-        | Some("zero-shot-classification") | Some("question-answering") => {
+        Some("text-classification")
+        | Some("token-classification")
+        | Some("zero-shot-classification")
+        | Some("question-answering") => {
             claims.push(claim(CapabilityKind::Classification, Provenance::Verified));
         }
         Some("feature-extraction") | Some("sentence-similarity") => {
@@ -277,7 +268,10 @@ pub fn classify(
         claims.push(claim(CapabilityKind::Agents, Provenance::Inferred));
     }
     if has("structured-output") || has("json-mode") || has("json") {
-        claims.push(claim(CapabilityKind::StructuredOutput, Provenance::Verified));
+        claims.push(claim(
+            CapabilityKind::StructuredOutput,
+            Provenance::Verified,
+        ));
     }
     if has("vision") {
         claims.push(claim(CapabilityKind::Vision, Provenance::Verified));
@@ -288,7 +282,10 @@ pub fn classify(
     }
     if has("ocr") || has("document-ai") {
         claims.push(claim(CapabilityKind::Ocr, Provenance::Verified));
-        claims.push(claim(CapabilityKind::DocumentUnderstanding, Provenance::Verified));
+        claims.push(claim(
+            CapabilityKind::DocumentUnderstanding,
+            Provenance::Verified,
+        ));
     }
     if has("embeddings") || has("sentence-transformers") || has("feature-extraction") {
         claims.push(claim(CapabilityKind::Embeddings, Provenance::Verified));
@@ -310,29 +307,51 @@ pub fn classify(
     if name_has("reason") || name_has("think") || name_has("deepseek-r1") || name_has("qwq") {
         push_unique(&mut claims, CapabilityKind::Reasoning, Provenance::Inferred);
     }
-    if name_has("llava") || name_has("vision") || name_has("qwen2-vl") || name_has("qwen2.5-vl")
-    {
+    if name_has("llava") || name_has("vision") || name_has("qwen2-vl") || name_has("qwen2.5-vl") {
         push_unique(&mut claims, CapabilityKind::Vision, Provenance::Inferred);
-        push_unique(&mut claims, CapabilityKind::Multimodal, Provenance::Inferred);
+        push_unique(
+            &mut claims,
+            CapabilityKind::Multimodal,
+            Provenance::Inferred,
+        );
     }
     if name_has("embed") || name_has("e5-") || name_has("bge-") || name_has("gte-") {
-        push_unique(&mut claims, CapabilityKind::Embeddings, Provenance::Inferred);
+        push_unique(
+            &mut claims,
+            CapabilityKind::Embeddings,
+            Provenance::Inferred,
+        );
         push_unique(&mut claims, CapabilityKind::Retrieval, Provenance::Inferred);
     }
     if name_has("rerank") {
         push_unique(&mut claims, CapabilityKind::Reranking, Provenance::Inferred);
     }
     if name_has("whisper") {
-        push_unique(&mut claims, CapabilityKind::SpeechToText, Provenance::Inferred);
+        push_unique(
+            &mut claims,
+            CapabilityKind::SpeechToText,
+            Provenance::Inferred,
+        );
         push_unique(&mut claims, CapabilityKind::Audio, Provenance::Inferred);
     }
-    if name_has("tinyllama") || name_has("small") || name_has("phi-3-mini") || name_has("phi-4-mini")
+    if name_has("tinyllama")
+        || name_has("small")
+        || name_has("phi-3-mini")
+        || name_has("phi-4-mini")
     {
-        push_unique(&mut claims, CapabilityKind::SmallModels, Provenance::Inferred);
+        push_unique(
+            &mut claims,
+            CapabilityKind::SmallModels,
+            Provenance::Inferred,
+        );
         push_unique(&mut claims, CapabilityKind::Local, Provenance::Inferred);
     }
     if name_has("experimental") || name_has("dev") {
-        push_unique(&mut claims, CapabilityKind::Experimental, Provenance::Inferred);
+        push_unique(
+            &mut claims,
+            CapabilityKind::Experimental,
+            Provenance::Inferred,
+        );
     }
 
     // Deduplicate while preserving order.
@@ -360,7 +379,11 @@ fn claim(capability: CapabilityKind, provenance: Provenance) -> CapabilityClaim 
     }
 }
 
-fn push_unique(claims: &mut Vec<CapabilityClaim>, capability: CapabilityKind, provenance: Provenance) {
+fn push_unique(
+    claims: &mut Vec<CapabilityClaim>,
+    capability: CapabilityKind,
+    provenance: Provenance,
+) {
     if !claims
         .iter()
         .any(|c| c.capability == capability && c.provenance == provenance)
@@ -382,8 +405,7 @@ mod tests {
         let caps = classify(Some("text-generation"), &tags(&["gguf"]), "org/any-model");
         // The pipeline tag states text generation — VERIFIED.
         assert!(caps.claims.iter().any(|c| {
-            c.capability == CapabilityKind::TextGeneration
-                && c.provenance == Provenance::Verified
+            c.capability == CapabilityKind::TextGeneration && c.provenance == Provenance::Verified
         }));
         // It does NOT state chat capability — Chat must never be VERIFIED
         // (honesty §49), only INFERRED.
@@ -407,8 +429,7 @@ mod tests {
             c.capability == CapabilityKind::ToolCalling && c.provenance == Provenance::Verified
         }));
         assert!(caps.claims.iter().any(|c| {
-            c.capability == CapabilityKind::StructuredOutput
-                && c.provenance == Provenance::Verified
+            c.capability == CapabilityKind::StructuredOutput && c.provenance == Provenance::Verified
         }));
         // The tag states tool/function calling (VERIFIED) but not full agentic
         // capability — Agents must be INFERRED, never VERIFIED (honesty §49).
@@ -419,15 +440,16 @@ mod tests {
             c.capability == CapabilityKind::Agents && c.provenance == Provenance::Verified
         }));
         // Tool calling exposes task filters.
-        assert!(caps
-            .tasks
-            .iter()
-            .any(|t| t.task == "tool calling"));
+        assert!(caps.tasks.iter().any(|t| t.task == "tool calling"));
     }
 
     #[test]
     fn coding_is_inferred_from_name_only() {
-        let caps = classify(Some("text-generation"), &tags(&["gguf"]), "org/codestral-7b");
+        let caps = classify(
+            Some("text-generation"),
+            &tags(&["gguf"]),
+            "org/codestral-7b",
+        );
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
         }));
@@ -436,7 +458,11 @@ mod tests {
             c.capability == CapabilityKind::Coding && c.provenance == Provenance::Verified
         }));
         // Coding tasks appear once coding is claimed.
-        assert!(caps.tasks.iter().any(|t| t.task == "repository understanding"));
+        assert!(
+            caps.tasks
+                .iter()
+                .any(|t| t.task == "repository understanding")
+        );
     }
 
     #[test]
@@ -446,8 +472,7 @@ mod tests {
             c.capability == CapabilityKind::Vision && c.provenance == Provenance::Verified
         }));
         assert!(caps.claims.iter().any(|c| {
-            c.capability == CapabilityKind::Multimodal
-                && c.provenance == Provenance::Verified
+            c.capability == CapabilityKind::Multimodal && c.provenance == Provenance::Verified
         }));
     }
 

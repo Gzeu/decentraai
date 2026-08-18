@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 /// The reach of a memory scope: how far the scope extends by design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLevel {
     /// Private to one agent: personal learnings, session context.
@@ -276,7 +278,11 @@ pub struct MemoryScope {
 impl MemoryScope {
     /// A scope with a default policy at the given level: the policy starts at
     /// the same reach as the scope, conservative and owner-controlled.
-    pub fn new(name: impl Into<String>, owner_agent: impl Into<String>, level: MemoryLevel) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        owner_agent: impl Into<String>,
+        level: MemoryLevel,
+    ) -> Self {
         Self {
             name: name.into(),
             owner_agent: owner_agent.into(),
@@ -464,9 +470,7 @@ impl MemoryRegistry {
     /// collisions instead of silently overwriting an existing scope.
     pub fn register_scope(&mut self, scope: MemoryScope) -> Result<(), MemoryError> {
         if self.scopes.contains_key(&scope.name) {
-            return Err(MemoryError::DuplicateScope {
-                name: scope.name,
-            });
+            return Err(MemoryError::DuplicateScope { name: scope.name });
         }
         self.entries.entry(scope.name.clone()).or_default();
         self.scopes.insert(scope.name.clone(), scope);
@@ -511,13 +515,13 @@ impl MemoryRegistry {
         verified_provenance: bool,
         now_ms: u64,
     ) -> Result<(), MemoryError> {
-        let scope = self
-            .scopes
-            .get(scope_name)
-            .cloned()
-            .ok_or_else(|| MemoryError::UnknownScope {
-                name: scope_name.to_string(),
-            })?;
+        let scope =
+            self.scopes
+                .get(scope_name)
+                .cloned()
+                .ok_or_else(|| MemoryError::UnknownScope {
+                    name: scope_name.to_string(),
+                })?;
         match can_write(
             &scope,
             writer_agent,
@@ -610,7 +614,10 @@ mod tests {
         assert_eq!(p.access, MemoryAccess::Private);
         assert_eq!(p.retention_secs, None);
         assert!(!p.require_verified_provenance);
-        assert!(!p.allow_remote_write, "peers never write without explicit opt-in");
+        assert!(
+            !p.allow_remote_write,
+            "peers never write without explicit opt-in"
+        );
         assert_eq!(p.max_entries, 1024);
     }
 
@@ -712,10 +719,16 @@ mod tests {
     #[test]
     fn entry_expiry_is_checked_against_now() {
         let entry = MemoryEntry::new("e1", "notes", "agent-a", "peer-1", "hello");
-        assert!(!entry_expired(&entry, 1000), "no expiry means never expired");
+        assert!(
+            !entry_expired(&entry, 1000),
+            "no expiry means never expired"
+        );
         let entry = entry.expires_at(500);
         assert!(entry_expired(&entry, 1000));
-        assert!(!entry_expired(&entry, 500), "expiring exactly at now is still valid");
+        assert!(
+            !entry_expired(&entry, 500),
+            "expiring exactly at now is still valid"
+        );
         assert!(!entry_expired(&entry, 499));
     }
 
@@ -746,7 +759,11 @@ mod tests {
             .collect();
         let kept = enforce_retention(entries, &policy, 10_000);
         let ids: Vec<&str> = kept.iter().map(|e| e.entry_id.as_str()).collect();
-        assert_eq!(ids, vec!["e2", "e3", "e4"], "oldest entries are pruned first");
+        assert_eq!(
+            ids,
+            vec!["e2", "e3", "e4"],
+            "oldest entries are pruned first"
+        );
     }
 
     #[test]
@@ -784,7 +801,12 @@ mod tests {
             false,
             1000,
         );
-        assert_eq!(err, Err(MemoryError::UnknownScope { name: "nope".into() }));
+        assert_eq!(
+            err,
+            Err(MemoryError::UnknownScope {
+                name: "nope".into()
+            })
+        );
 
         let err = reg.write(
             "notes",
@@ -875,7 +897,11 @@ mod tests {
         .unwrap();
         let seen = reg.read("notes", "agent-a", false, 150).unwrap();
         let ids: Vec<String> = seen.into_iter().map(|e| e.entry_id).collect();
-        assert_eq!(ids, vec!["fresh"], "expired entries are pruned on the next write");
+        assert_eq!(
+            ids,
+            vec!["fresh"],
+            "expired entries are pruned on the next write"
+        );
     }
 
     #[test]
@@ -918,12 +944,36 @@ mod tests {
             }
             e
         };
-        reg.write("team.notes", mk("e1", "architecture", Some(1000)), "agent-a", true, false, false, 500)
-            .unwrap();
-        reg.write("team.notes", mk("e2", "flaky", Some(600)), "agent-a", true, false, false, 500)
-            .unwrap();
-        reg.write("team.notes", mk("e3", "architecture", None), "agent-a", true, false, false, 500)
-            .unwrap();
+        reg.write(
+            "team.notes",
+            mk("e1", "architecture", Some(1000)),
+            "agent-a",
+            true,
+            false,
+            false,
+            500,
+        )
+        .unwrap();
+        reg.write(
+            "team.notes",
+            mk("e2", "flaky", Some(600)),
+            "agent-a",
+            true,
+            false,
+            false,
+            500,
+        )
+        .unwrap();
+        reg.write(
+            "team.notes",
+            mk("e3", "architecture", None),
+            "agent-a",
+            true,
+            false,
+            false,
+            500,
+        )
+        .unwrap();
 
         let hits: Vec<String> = reg
             .search("team.notes", "architecture", 700)
@@ -1013,7 +1063,8 @@ mod tests {
         let nj = serde_json::to_string(&no_prov).unwrap();
         assert_eq!(serde_json::from_str::<MemoryEntry>(&nj).unwrap(), no_prov);
 
-        let scope = MemoryScope::new("team.notes", "agent-a", MemoryLevel::Team).with_policy(policy);
+        let scope =
+            MemoryScope::new("team.notes", "agent-a", MemoryLevel::Team).with_policy(policy);
         let sj = serde_json::to_string(&scope).unwrap();
         assert_eq!(serde_json::from_str::<MemoryScope>(&sj).unwrap(), scope);
 
@@ -1021,21 +1072,45 @@ mod tests {
             reason: "nope".into(),
         };
         let dj = serde_json::to_string(&decision).unwrap();
-        assert_eq!(serde_json::from_str::<MemoryAccessDecision>(&dj).unwrap(), decision);
+        assert_eq!(
+            serde_json::from_str::<MemoryAccessDecision>(&dj).unwrap(),
+            decision
+        );
     }
 
     #[test]
     fn wire_names_are_stable_snake_case() {
-        assert_eq!(serde_json::to_string(&MemoryLevel::Agent).unwrap(), "\"agent\"");
-        assert_eq!(serde_json::to_string(&MemoryLevel::Team).unwrap(), "\"team\"");
-        assert_eq!(serde_json::to_string(&MemoryLevel::Network).unwrap(), "\"network\"");
-        assert_eq!(serde_json::to_string(&MemoryLevel::Fabric).unwrap(), "\"fabric\"");
-        assert_eq!(serde_json::to_string(&MemoryAccess::Private).unwrap(), "\"private\"");
-        assert_eq!(serde_json::to_string(&MemoryAccess::TeamOnly).unwrap(), "\"team_only\"");
+        assert_eq!(
+            serde_json::to_string(&MemoryLevel::Agent).unwrap(),
+            "\"agent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryLevel::Team).unwrap(),
+            "\"team\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryLevel::Network).unwrap(),
+            "\"network\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryLevel::Fabric).unwrap(),
+            "\"fabric\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryAccess::Private).unwrap(),
+            "\"private\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MemoryAccess::TeamOnly).unwrap(),
+            "\"team_only\""
+        );
         assert_eq!(
             serde_json::to_string(&MemoryAccess::TrustedNetwork).unwrap(),
             "\"trusted_network\""
         );
-        assert_eq!(serde_json::to_string(&MemoryAccess::Public).unwrap(), "\"public\"");
+        assert_eq!(
+            serde_json::to_string(&MemoryAccess::Public).unwrap(),
+            "\"public\""
+        );
     }
 }

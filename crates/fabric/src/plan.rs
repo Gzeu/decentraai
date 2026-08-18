@@ -86,10 +86,7 @@ pub struct ExecutionPlan {
 impl ExecutionPlan {
     /// A trivial single-worker plan (the safest construction the planner can
     /// always produce).
-    pub fn single(
-        model_hash: &str,
-        stage: ExecutionStage,
-    ) -> Self {
+    pub fn single(model_hash: &str, stage: ExecutionStage) -> Self {
         Self {
             plan_id: uuid::Uuid::new_v4().to_string(),
             model_hash: model_hash.to_string(),
@@ -112,9 +109,9 @@ impl ExecutionPlan {
             PlanKind::Single(s) => vec![s],
             PlanKind::Sequential(ss) | PlanKind::FanOut(ss) => ss.iter().collect(),
         };
-        stages.iter().fold((0, 0), |(r, v), s| {
-            (r + s.est_ram_mb, v + s.est_vram_mb)
-        })
+        stages
+            .iter()
+            .fold((0, 0), |(r, v), s| (r + s.est_ram_mb, v + s.est_vram_mb))
     }
 }
 

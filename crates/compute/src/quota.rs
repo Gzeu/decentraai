@@ -164,7 +164,10 @@ pub enum QuotaError {
 impl std::fmt::Display for QuotaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientQuota { available, requested } => write!(
+            Self::InsufficientQuota {
+                available,
+                requested,
+            } => write!(
                 f,
                 "insufficient quota: requested {requested}, available {available}"
             ),
@@ -332,11 +335,7 @@ impl QuotaLedger {
     /// completion (the reservation is fully released).
     ///
     /// Returns the amount actually consumed (≤ the reserved amount).
-    pub fn settle(
-        &mut self,
-        reservation_id: &str,
-        used: u64,
-    ) -> Result<u64, QuotaError> {
+    pub fn settle(&mut self, reservation_id: &str, used: u64) -> Result<u64, QuotaError> {
         let Some(res) = self.reservations.get_mut(reservation_id) else {
             return Err(QuotaError::UnknownReservation);
         };
@@ -444,7 +443,11 @@ mod tests {
         let units = l.credit(&acct, "exec-1", None, None);
         assert_eq!(units, 0, "UNKNOWN measurement must not fabricate quota");
         // Honest UNKNOWN: no measured work means no account record is created.
-        assert_eq!(l.account(&acct), None, "no record for an unmeasured execution");
+        assert_eq!(
+            l.account(&acct),
+            None,
+            "no record for an unmeasured execution"
+        );
     }
 
     #[test]
@@ -503,7 +506,10 @@ mod tests {
         let err = l.reserve(&acct, "res-1", 100).unwrap_err();
         assert!(matches!(
             err,
-            QuotaError::InsufficientQuota { available: 50, requested: 100 }
+            QuotaError::InsufficientQuota {
+                available: 50,
+                requested: 100
+            }
         ));
         let acc = l.account(&acct).unwrap();
         assert_eq!(acc.reserved, 0, "failed reservation books nothing");
@@ -592,6 +598,9 @@ mod tests {
         l.credit(&"c".to_string(), "exec-3", Some(1), None);
         let snap = l.accounts();
         let keys: Vec<_> = snap.keys().cloned().collect();
-        assert_eq!(keys, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

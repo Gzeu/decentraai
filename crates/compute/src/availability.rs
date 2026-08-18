@@ -76,11 +76,7 @@ impl ComputeAvailability {
             return "UNAVAILABLE";
         }
         let loaded = self.load_percent >= 80 || self.queue_depth >= 6;
-        if loaded {
-            "LIMITED"
-        } else {
-            "FULL"
-        }
+        if loaded { "LIMITED" } else { "FULL" }
     }
 
     /// Adaptive-contribution load factor (0.0..1.0), derived ONLY from real

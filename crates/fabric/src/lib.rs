@@ -39,12 +39,14 @@ pub mod network;
 pub mod plan;
 pub mod planner;
 
-pub use advisory::{FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision};
+pub use advisory::{
+    FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision,
+};
 pub use batch::{BatchAllocation, BatchAssignment, allocate_batch, set_kv_affinity};
 pub use decision::{
     Adaptation, CandidateOutcome, ConstraintKind, ConstraintResult, ExecutionDecision,
-    ExecutionEvent, ExecutionPhase, Observation, OrchestrationAction, WorkloadClass, adapt, classify,
-    evaluate, observe, orchestrate, recovery_timeline,
+    ExecutionEvent, ExecutionPhase, Observation, OrchestrationAction, WorkloadClass, adapt,
+    classify, evaluate, observe, orchestrate, recovery_timeline,
 };
 pub use engine::{EngineCapabilities, EngineKind};
 pub use expert::{ExpertDecision, ExpertLayout, ExpertRegistry, ExpertRouter, ExpertShard};

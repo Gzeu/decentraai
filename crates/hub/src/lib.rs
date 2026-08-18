@@ -31,8 +31,7 @@ pub use capability::{CapabilityClaim, CapabilityKind, ModelCapabilities, Provena
 pub use catalog::{HubCatalog, HubLfs, HubModel, HubModelDetail, HubModelFile, PipelineTag};
 pub use download::{download_model, download_model_with_progress};
 pub use intent::{
-    capabilities_for_intent, capability_label, intent_capabilities_with_labels,
-    intent_requirements,
+    capabilities_for_intent, capability_label, intent_capabilities_with_labels, intent_requirements,
 };
 pub use requirements::{
     CapabilityMatch, CapabilityRequirement, EvidenceLevel, RequirementCheck, RequirementStatus,
@@ -81,9 +80,7 @@ impl HfRef {
         }
         let parts: Vec<&str> = repo.split('/').collect();
         if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-            anyhow::bail!(
-                "model reference '{input}' must be 'org/repo' (got '{repo}')"
-            );
+            anyhow::bail!("model reference '{input}' must be 'org/repo' (got '{repo}')");
         }
 
         if let Some(file) = &file {
@@ -103,10 +100,7 @@ impl HfRef {
 
     /// The download URL for the resolved file on the Hub CDN.
     pub fn resolve_url(&self, file: &str) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            self.repo, file
-        )
+        format!("https://huggingface.co/{}/resolve/main/{}", self.repo, file)
     }
 }
 
@@ -132,8 +126,7 @@ mod tests {
 
     #[test]
     fn parse_repo_and_file() {
-        let r =
-            HfRef::parse("hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF:q4_k_m.gguf").unwrap();
+        let r = HfRef::parse("hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF:q4_k_m.gguf").unwrap();
         assert_eq!(r.repo, "Qwen/Qwen2.5-1.5B-Instruct-GGUF");
         assert_eq!(r.file, Some("q4_k_m.gguf".into()));
     }

@@ -104,13 +104,8 @@ impl Identity {
             f.sync_all()
                 .with_context(|| format!("syncing temp file {}", tmp.display()))?;
         }
-        fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "renaming {} to {}",
-                tmp.display(),
-                path.display()
-            )
-        })?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
         // Durability: fsync the parent directory so the rename is persistent.
         if let Some(parent) = path.parent() {
             if let Ok(dir) = fs::File::open(parent) {

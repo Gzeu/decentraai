@@ -335,14 +335,16 @@ pub fn capability_search_request(raw: &str) -> Option<(String, Option<String>, u
     if name != "search_models_by_capability" {
         return None;
     }
-    let args = msg
-        .get("params")
-        .and_then(|p| p.get("arguments"))?;
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let capability = args.get("capability").and_then(|c| c.as_str())?.to_string();
     if capability.is_empty() {
         return None;
     }
-    let query = args.get("query").and_then(|q| q.as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    let query = args
+        .get("query")
+        .and_then(|q| q.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let limit = args
         .get("limit")
         .and_then(|l| l.as_u64())
@@ -378,7 +380,12 @@ pub fn local_capability_search_request(raw: &str) -> Option<(String, String)> {
         .and_then(|e| e.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| "any".to_string());
-    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    }
+    .to_string();
     Some((capability, evidence))
 }
 
@@ -409,7 +416,12 @@ pub fn worker_capability_request(raw: &str) -> Option<(String, String, String)> 
         .and_then(|e| e.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| "any".to_string());
-    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    }
+    .to_string();
     Some((model, capability, evidence))
 }
 
@@ -417,7 +429,8 @@ pub fn worker_capability_request(raw: &str) -> Option<(String, String, String)> 
 /// is one. Pure — lets the HTTP layer precompute the resolution into
 /// [`McpContext::intent_resolution`]. Returns `(intent, evidence)` where
 /// evidence defaults to "any".
-pub fn intent_request(raw: &str) -> Option<(String, String)> {    let msg: Value = serde_json::from_str(raw).ok()?;
+pub fn intent_request(raw: &str) -> Option<(String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return None;
     }
@@ -438,7 +451,12 @@ pub fn intent_request(raw: &str) -> Option<(String, String)> {    let msg: Value
         .and_then(|e| e.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| "any".to_string());
-    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    }
+    .to_string();
     Some((intent, evidence))
 }
 
@@ -469,7 +487,12 @@ pub fn intent_fit_request(raw: &str) -> Option<(String, String)> {
         .and_then(|e| e.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| "any".to_string());
-    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    }
+    .to_string();
     Some((intent, evidence))
 }
 
@@ -516,8 +539,16 @@ pub fn decision_request(raw: &str) -> Option<(String, String, Option<String>)> {
         .and_then(|e| e.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| "any".to_string());
-    let evidence = if evidence == "verified" { "verified" } else { "any" }.to_string();
-    let model = args.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    let evidence = if evidence == "verified" {
+        "verified"
+    } else {
+        "any"
+    }
+    .to_string();
+    let model = args
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
     Some((intent, evidence, model))
 }
 
@@ -538,10 +569,24 @@ pub fn execution_request(raw: &str) -> Option<serde_json::Value> {
         return None;
     }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?.clone();
-    let has_intent = args.get("intent").and_then(|i| i.as_str()).unwrap_or("").trim() != "";
-    let has_cap = args.get("capability").and_then(|c| c.as_str()).unwrap_or("").trim() != "";
+    let has_intent = args
+        .get("intent")
+        .and_then(|i| i.as_str())
+        .unwrap_or("")
+        .trim()
+        != "";
+    let has_cap = args
+        .get("capability")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .trim()
+        != "";
     if !(has_intent || has_cap)
-        || args.get("prompt").and_then(|p| p.as_str()).unwrap_or("").is_empty()
+        || args
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .is_empty()
     {
         return None;
     }
@@ -736,7 +781,11 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
     let method = match msg.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
-            return Some(error_response(id, -32600, "Invalid Request: missing method"));
+            return Some(error_response(
+                id,
+                -32600,
+                "Invalid Request: missing method",
+            ));
         }
     };
 
@@ -777,7 +826,13 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
             // Notification: no response.
             return None;
         }
-        _ => return Some(error_response(id, -32601, format!("Method not found: {method}"))),
+        _ => {
+            return Some(error_response(
+                id,
+                -32601,
+                format!("Method not found: {method}"),
+            ));
+        }
     };
 
     if is_notification {
@@ -863,7 +918,9 @@ mod tests {
 
     #[test]
     fn initialize_negotiates_protocol() {
-        let r = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        );
         assert_eq!(r["id"], 1);
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(r["result"]["capabilities"]["tools"].is_object());
@@ -893,7 +950,9 @@ mod tests {
 
     #[test]
     fn tools_call_returns_real_snapshot_data() {
-        let r = call(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_workers","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_workers","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("w1"), "must return the supplied snapshot");
     }
@@ -902,9 +961,14 @@ mod tests {
     fn capability_search_returns_the_precomputed_hub_result() {
         // The HTTP layer precomputes the Hub search into `capability_search`;
         // the protocol layer returns it unchanged (no I/O here).
-        let r = call(r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_models_by_capability","arguments":{"capability":"vision"}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_models_by_capability","arguments":{"capability":"vision"}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(content.contains("org/vision"), "must return the supplied snapshot");
+        assert!(
+            content.contains("org/vision"),
+            "must return the supplied snapshot"
+        );
         assert!(content.contains("\"matched\":1"));
     }
 
@@ -912,9 +976,14 @@ mod tests {
     fn local_capability_search_returns_precomputed_local_filter() {
         // Same pattern: HTTP layer precomputes the local-claims filter; the
         // protocol layer returns it unchanged.
-        let r = call(r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find_local_models_by_capability","arguments":{"capability":"ocr","evidence":"verified"}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find_local_models_by_capability","arguments":{"capability":"ocr","evidence":"verified"}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(content.contains("local.gguf"), "must return the supplied snapshot");
+        assert!(
+            content.contains("local.gguf"),
+            "must return the supplied snapshot"
+        );
         assert!(content.contains("verified"));
     }
 
@@ -934,15 +1003,22 @@ mod tests {
         .unwrap();
         assert_eq!(ev, "verified");
         // Non-matching methods yield None.
-        assert!(local_capability_search_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
+        assert!(
+            local_capability_search_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none()
+        );
     }
 
     #[test]
     fn get_worker_capability_returns_precomputed_verdict() {
         // HTTP layer precomputes the per-worker verdict; protocol returns it.
-        let r = call(r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_worker_capability","arguments":{"model":"qwen.gguf","capability":"ocr","evidence":"verified"}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_worker_capability","arguments":{"model":"qwen.gguf","capability":"ocr","evidence":"verified"}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(content.contains("CAN_RUN"), "must return the supplied snapshot");
+        assert!(
+            content.contains("CAN_RUN"),
+            "must return the supplied snapshot"
+        );
         assert!(content.contains("\"node_id\":\"w1\""));
     }
 
@@ -966,7 +1042,9 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_invalid_params() {
-        let r = call(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
+        );
         assert_eq!(r["error"]["code"], -32602);
     }
 
@@ -979,8 +1057,11 @@ mod tests {
     #[test]
     fn initialized_notification_yields_no_response() {
         assert!(
-            handle_message(&ctx(), r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-                .is_none()
+            handle_message(
+                &ctx(),
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            )
+            .is_none()
         );
     }
 
@@ -1011,12 +1092,17 @@ mod tests {
     fn tools_list_exposes_resolve_intent() {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
-        let resolve = tools.iter().find(|t| t["name"] == "resolve_intent").unwrap();
-        assert!(resolve["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
+        let resolve = tools
             .iter()
-            .any(|r| r == "intent"));
+            .find(|t| t["name"] == "resolve_intent")
+            .unwrap();
+        assert!(
+            resolve["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "intent")
+        );
     }
 
     #[test]
@@ -1078,8 +1164,14 @@ mod tests {
         };
         // evidence "any" includes inferred claims.
         let out = resolve_intent(&c, "ocr", "any");
-        assert_eq!(out["matching_local_models"]["ocr"][0]["id"], "local-ocr.gguf");
-        assert_eq!(out["matching_local_models"]["ocr"][0]["evidence"], "inferred");
+        assert_eq!(
+            out["matching_local_models"]["ocr"][0]["id"],
+            "local-ocr.gguf"
+        );
+        assert_eq!(
+            out["matching_local_models"]["ocr"][0]["evidence"],
+            "inferred"
+        );
         assert!(out["unmatched"].as_array().unwrap().is_empty());
         // evidence "verified" excludes the inferred claim -> unmatched.
         let out = resolve_intent(&c, "ocr", "verified");
@@ -1116,7 +1208,10 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(unmatched, vec!["chat"]);
-        assert_eq!(out["matching_local_models"]["ocr"][0]["id"], "local-ocr.gguf");
+        assert_eq!(
+            out["matching_local_models"]["ocr"][0]["id"],
+            "local-ocr.gguf"
+        );
     }
 
     #[test]
@@ -1144,18 +1239,25 @@ mod tests {
     fn tools_list_exposes_resolve_intent_with_fit() {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
-        let fit = tools.iter().find(|t| t["name"] == "resolve_intent_with_fit").unwrap();
-        assert!(fit["inputSchema"].is_object());
-        assert!(fit["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
+        let fit = tools
             .iter()
-            .any(|req| req == "intent"));
+            .find(|t| t["name"] == "resolve_intent_with_fit")
+            .unwrap();
+        assert!(fit["inputSchema"].is_object());
+        assert!(
+            fit["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|req| req == "intent")
+        );
         assert!(fit["inputSchema"]["additionalProperties"] == json!(false));
-        assert!(fit["description"]
-            .as_str()
-            .unwrap()
-            .contains("capabilities"));
+        assert!(
+            fit["description"]
+                .as_str()
+                .unwrap()
+                .contains("capabilities")
+        );
     }
 
     #[test]
@@ -1199,12 +1301,12 @@ mod tests {
     fn tools_list_exposes_get_fabric_graph() {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
-        let g = tools.iter().find(|t| t["name"] == "get_fabric_graph").unwrap();
+        let g = tools
+            .iter()
+            .find(|t| t["name"] == "get_fabric_graph")
+            .unwrap();
         assert!(g["inputSchema"].is_object());
-        assert!(g["description"]
-            .as_str()
-            .unwrap()
-            .contains("fabric graph"));
+        assert!(g["description"].as_str().unwrap().contains("fabric graph"));
     }
 
     #[test]
@@ -1220,7 +1322,9 @@ mod tests {
     #[test]
     fn get_fabric_graph_returns_precomputed_projection() {
         // The protocol layer returns the HTTP-precomputed fabric graph unchanged.
-        let r = call(r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"get_fabric_graph","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"get_fabric_graph","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"nodes\":[]"));
         assert!(content.contains("\"capabilities\":[]"));
@@ -1233,11 +1337,13 @@ mod tests {
         let tools = r["result"]["tools"].as_array().unwrap();
         let d = tools.iter().find(|t| t["name"] == "decide").unwrap();
         assert!(d["inputSchema"].is_object());
-        assert!(d["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|req| req == "intent"));
+        assert!(
+            d["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|req| req == "intent")
+        );
         assert!(d["description"].as_str().unwrap().contains("coherent"));
     }
 
@@ -1263,7 +1369,9 @@ mod tests {
     #[test]
     fn decide_returns_precomputed_decision() {
         // The protocol layer returns the HTTP-precomputed unified decision.
-        let r = call(r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"decide","arguments":{"intent":"ocr"}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"decide","arguments":{"intent":"ocr"}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"request\":\"ocr\""));
         assert!(content.contains("\"capabilities\":[]"));
@@ -1274,7 +1382,10 @@ mod tests {
     fn tools_list_exposes_execute_decision() {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
-        let d = tools.iter().find(|t| t["name"] == "execute_decision").unwrap();
+        let d = tools
+            .iter()
+            .find(|t| t["name"] == "execute_decision")
+            .unwrap();
         let required = d["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|r| r == "confirm"));
         assert!(required.iter().any(|r| r == "prompt"));
@@ -1333,13 +1444,19 @@ mod tests {
         assert!(sessions_request(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}"#
         ));
-        assert!(!sessions_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
-        assert!(!sessions_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#));
+        assert!(!sessions_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!sessions_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#
+        ));
     }
 
     #[test]
     fn list_sessions_returns_precomputed_snapshot() {
-        let r = call(r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"sessions_active\":0"));
         assert!(content.contains("\"sessions\":[]"));
@@ -1358,12 +1475,16 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#
         ));
         assert!(!quota_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
-        assert!(!quota_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#));
+        assert!(!quota_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#
+        ));
     }
 
     #[test]
     fn get_quota_returns_precomputed_snapshot() {
-        let r = call(r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"total_earned\":0"));
         assert!(content.contains("\"policy_version\":1"));
@@ -1381,8 +1502,12 @@ mod tests {
         assert!(consumer_keys_request(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_consumer_keys","arguments":{}}}"#
         ));
-        assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
-        assert!(!consumer_keys_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#));
+        assert!(!consumer_keys_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!consumer_keys_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#
+        ));
     }
 
     #[test]
@@ -1390,13 +1515,19 @@ mod tests {
         assert!(compensation_request(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_compensation","arguments":{}}}"#
         ));
-        assert!(!compensation_request(r#"{"jsonrpc":"2.0","method":"tools/list"}"#));
-        assert!(!compensation_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#));
+        assert!(!compensation_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!compensation_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_quota","arguments":{}}}"#
+        ));
     }
 
     #[test]
     fn get_compensation_returns_precomputed_snapshot() {
-        let r = call(r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"get_compensation","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"get_compensation","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("\"total_earned\":0"));
         assert!(content.contains("\"recent_events\":[]"));
@@ -1412,10 +1543,15 @@ mod tests {
 
     #[test]
     fn list_consumer_keys_returns_precomputed_metadata() {
-        let r = call(r#"{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"list_consumer_keys","arguments":{}}}"#);
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"list_consumer_keys","arguments":{}}}"#,
+        );
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         // Default empty projection; never leaks a secret.
         assert!(content.contains("\"keys\":[]"));
-        assert!(!content.contains("dca_"), "metadata must not leak the secret prefix value");
+        assert!(
+            !content.contains("dca_"),
+            "metadata must not leak the secret prefix value"
+        );
     }
 }

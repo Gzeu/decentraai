@@ -377,9 +377,11 @@ impl ComputeManager {
             contribution: std::sync::Mutex::new(BTreeMap::new()),
             credited_executions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             measured_contribution: std::sync::Mutex::new(MeasuredContribution::default()),
-            quota: std::sync::Arc::new(std::sync::Mutex::new(decentraai_compute::QuotaLedger::new(
-                decentraai_compute::ContributionPolicy::default(),
-            ))),
+            quota: std::sync::Arc::new(std::sync::Mutex::new(
+                decentraai_compute::QuotaLedger::new(
+                    decentraai_compute::ContributionPolicy::default(),
+                ),
+            )),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
@@ -490,9 +492,15 @@ impl ComputeManager {
                 return;
             }
         }
-        let Ok(json) = serde_json::to_string(rec) else { return };
+        let Ok(json) = serde_json::to_string(rec) else {
+            return;
+        };
         use std::io::Write;
-        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open executions history file");
@@ -636,7 +644,9 @@ impl ComputeManager {
 
     /// Snapshot of the quota ledger's per-account balances (read-only, for
     /// observability). `BTreeMap` so iteration order is deterministic.
-    pub fn quota_accounts(&self) -> std::collections::BTreeMap<String, decentraai_compute::QuotaAccount> {
+    pub fn quota_accounts(
+        &self,
+    ) -> std::collections::BTreeMap<String, decentraai_compute::QuotaAccount> {
         self.quota.lock().unwrap().accounts()
     }
 
@@ -653,7 +663,9 @@ impl ComputeManager {
     /// Shared handle to the authoritative quota ledger. The runtime's consumer
     /// path holds a clone so worker credits and consumer reserve/settle are
     /// one ledger (Q2: no second balance).
-    pub fn quota_ledger(&self) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>> {
+    pub fn quota_ledger(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::QuotaLedger>> {
         self.quota.clone()
     }
 
@@ -666,7 +678,10 @@ impl ComputeManager {
     }
 
     /// Balance of one account's compensation credits (M9-9, read-only).
-    pub fn compensation_account(&self, account: &str) -> Option<decentraai_compute::CompensationAccount> {
+    pub fn compensation_account(
+        &self,
+        account: &str,
+    ) -> Option<decentraai_compute::CompensationAccount> {
         self.compensation.lock().unwrap().account(account)
     }
 
@@ -905,10 +920,8 @@ impl ComputeManager {
             }
         };
         let (est_ram_mb, est_vram_mb) = plan.reservation_budget();
-        let (is_continuation, prefix_worker) = (
-            continuation.is_some(),
-            continuation.map(|p| p.to_string()),
-        );
+        let (is_continuation, prefix_worker) =
+            (continuation.is_some(), continuation.map(|p| p.to_string()));
         ring.push_back(ExecutedPlan {
             request_id: request_id.to_string(),
             plan_id: plan.plan_id.clone(),
@@ -1059,7 +1072,11 @@ impl ComputeManager {
             plan.plan_id = plan_id.to_string();
         }
         d.reservation_id = Some(reservation_id.to_string());
-        d.outcome = Some(if ok { "succeeded".into() } else { "failed".into() });
+        d.outcome = Some(if ok {
+            "succeeded".into()
+        } else {
+            "failed".into()
+        });
         d.trace.push(decentraai_fabric::ExecutionEvent::Reserved {
             worker: Some(selected_worker.to_string()),
         });
@@ -1067,10 +1084,13 @@ impl ComputeManager {
             worker: Some(selected_worker.to_string()),
         });
         if ok {
-            d.trace.push(decentraai_fabric::ExecutionEvent::Completed { ok: true });
-        } else {
             d.trace
-                .push(decentraai_fabric::ExecutionEvent::Failed { cause: "execution_error".into(), retryable: false });
+                .push(decentraai_fabric::ExecutionEvent::Completed { ok: true });
+        } else {
+            d.trace.push(decentraai_fabric::ExecutionEvent::Failed {
+                cause: "execution_error".into(),
+                retryable: false,
+            });
         }
         d.trace.push(decentraai_fabric::ExecutionEvent::Released {
             worker: Some(selected_worker.to_string()),
@@ -1321,7 +1341,9 @@ impl ComputeManager {
     ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
         // The coordinator never schedules a remote request onto itself.
         if preferred == &self.local_peer {
-            return self.plan_and_reserve(req, prompt_tokens, session_id, priority).await;
+            return self
+                .plan_and_reserve(req, prompt_tokens, session_id, priority)
+                .await;
         }
         // Reserve exactly this worker; `reserve_worker` validates trusted +
         // healthy + serves + capacity. None => not eligible now → fall back.
@@ -1331,7 +1353,9 @@ impl ComputeManager {
             .await
             .reserve_worker(preferred, req, Instant::now());
         let Some(placement) = placement else {
-            return self.plan_and_reserve(req, prompt_tokens, session_id, priority).await;
+            return self
+                .plan_and_reserve(req, prompt_tokens, session_id, priority)
+                .await;
         };
         // Build a single-stage plan targeting the preferred worker.
         let facts = self.fabric_facts(&req.model_hash).await;
@@ -1504,7 +1528,7 @@ impl ComputeManager {
     /// set (P3), otherwise the raw advertisement (legacy). Recipients verify the
     /// signed envelope and reject spoofed advertisements.
     pub fn advertisement_wire_bytes(&self, adv: &ComputeAdvertisement) -> anyhow::Result<Vec<u8>> {
-        use decentraai_protocol::{sign_compute_advertisement, serialize_message};
+        use decentraai_protocol::{serialize_message, sign_compute_advertisement};
         let raw = serialize_message(adv)?;
         if let Some(key) = &self.signing_key {
             let signed = sign_compute_advertisement(key, &raw);
@@ -1533,7 +1557,8 @@ impl ComputeManager {
         &self,
         registry_path: &std::path::Path,
         context_tokens: u32,
-    ) -> anyhow::Result<ComputeAdvertisement> {        use decentraai_registry::ModelRegistry;
+    ) -> anyhow::Result<ComputeAdvertisement> {
+        use decentraai_registry::ModelRegistry;
         use std::io::Read;
 
         let gpu_present = matches!(
@@ -1612,10 +1637,7 @@ impl ComputeManager {
     /// registry. Returns `(capability snake_case, provenance)` pairs, or empty
     /// when the hash/file is unknown, the registry is unavailable, or the model
     /// has no claims (honest: empty = UNKNOWN, never fabricated).
-    fn capability_claims_for_model(
-        &self,
-        model_hash: &str,
-    ) -> Vec<(String, String)> {
+    fn capability_claims_for_model(&self, model_hash: &str) -> Vec<(String, String)> {
         let Some(adv) = self.last_local_advertisement_sync() else {
             return Vec::new();
         };
@@ -1634,10 +1656,7 @@ impl ComputeManager {
 
     /// Resolves persisted capability claims for a model file name (the registry
     /// stores records keyed by relative path, which ends in the file name).
-    fn capability_claims_for_file(
-        &self,
-        file_name: &str,
-    ) -> Vec<(String, String)> {
+    fn capability_claims_for_file(&self, file_name: &str) -> Vec<(String, String)> {
         let Some(path) = self.registry_path.lock().unwrap().clone() else {
             return Vec::new();
         };
@@ -1904,7 +1923,11 @@ pub fn execution_statistics(history: &[ExecutedPlan]) -> serde_json::Value {
     let measured_count = measured.len();
     let total_tokens_measured: u64 = measured.iter().map(|(t, _)| *t as u64).sum();
     let avg_tokens_per_sec = if measured_count > 0 {
-        measured.iter().map(|(t, ms)| t / (ms / 1000.0)).sum::<f64>() / measured_count as f64
+        measured
+            .iter()
+            .map(|(t, ms)| t / (ms / 1000.0))
+            .sum::<f64>()
+            / measured_count as f64
     } else {
         0.0
     };
@@ -1940,7 +1963,10 @@ pub fn execution_statistics(history: &[ExecutedPlan]) -> serde_json::Value {
     // Per-worker outcomes (deterministic key order).
     let mut per_worker: Vec<(String, usize, usize, usize)> = Vec::new();
     for p in history {
-        if let Some(e) = per_worker.iter_mut().find(|(w, _, _, _)| *w == p.selected_worker) {
+        if let Some(e) = per_worker
+            .iter_mut()
+            .find(|(w, _, _, _)| *w == p.selected_worker)
+        {
             e.1 += 1;
             if p.outcome == "succeeded" {
                 e.2 += 1;
@@ -2120,7 +2146,7 @@ impl ComputeManager {
         &self,
         workers: Vec<ComputeAdvertisement>,
     ) -> Vec<ContributionRow> {
-        use decentraai_compute::{contribution_score, reward_tokens, suggest_tier, RewardPolicy};
+        use decentraai_compute::{RewardPolicy, contribution_score, reward_tokens, suggest_tier};
         let ledger = self.contribution.lock().unwrap();
         let mut rows = Vec::with_capacity(workers.len());
         for adv in workers {
@@ -2167,7 +2193,10 @@ mod tests {
         // participant is known by). Format: `dca-` + 6 chars.
         let p = peer();
         let id = short_node_id(&p);
-        assert!(id.starts_with("dca-"), "id must carry the dca- prefix: {id}");
+        assert!(
+            id.starts_with("dca-"),
+            "id must carry the dca- prefix: {id}"
+        );
         assert_eq!(id.len(), 10, "dca-xxxxxx is exactly 10 chars: {id}");
         assert_eq!(short_node_id(&p), id, "must be deterministic per peer");
         // Distinct peers should almost never collide in the first 6 chars.
@@ -2175,7 +2204,11 @@ mod tests {
         for _ in 0..64 {
             distinct.insert(short_node_id(&peer()));
         }
-        assert!(distinct.len() >= 60, "6 hex chars must spread well: {}", distinct.len());
+        assert!(
+            distinct.len() >= 60,
+            "6 hex chars must spread well: {}",
+            distinct.len()
+        );
     }
 
     fn snapshot() -> SystemSnapshot {
@@ -2250,7 +2283,11 @@ mod tests {
             .advertise_local(snapshot(), gpu(), vec![model()], vec![], false)
             .await;
         assert_eq!(
-            manager.last_local_advertisement_sync().unwrap().capability.engine,
+            manager
+                .last_local_advertisement_sync()
+                .unwrap()
+                .capability
+                .engine,
             ENGINE_LLAMA_SERVER
         );
 
@@ -2288,8 +2325,15 @@ mod tests {
             .await;
         let adv = manager.last_local_advertisement_sync().unwrap();
         assert_eq!(adv.capability.available_models.len(), 1);
-        assert_eq!(adv.capability.available_models[0].file_name, "other-model.gguf");
-        assert_eq!(adv.capability.served_models.len(), 1, "served set unchanged");
+        assert_eq!(
+            adv.capability.available_models[0].file_name,
+            "other-model.gguf"
+        );
+        assert_eq!(
+            adv.capability.served_models.len(),
+            1,
+            "served set unchanged"
+        );
 
         // The planner facts carry the full on-disk collection too.
         let facts = manager.fabric_facts("abc").await;
@@ -2322,7 +2366,10 @@ mod tests {
         );
         manager.process_advertisement(fresh).await;
         let facts = manager.fabric_facts("abc").await;
-        let f = facts.iter().find(|f| f.peer_id == fresh_peer.to_string()).unwrap();
+        let f = facts
+            .iter()
+            .find(|f| f.peer_id == fresh_peer.to_string())
+            .unwrap();
         assert!(!f.perf_measured, "zero advertised perf must be ESTIMATED");
         assert_eq!(f.tokens_per_second, 0);
         assert_eq!(f.latency_ms, 0);
@@ -2347,7 +2394,10 @@ mod tests {
         );
         manager.process_advertisement(busy).await;
         let facts = manager.fabric_facts("abc").await;
-        let f = facts.iter().find(|f| f.peer_id == busy_peer.to_string()).unwrap();
+        let f = facts
+            .iter()
+            .find(|f| f.peer_id == busy_peer.to_string())
+            .unwrap();
         assert!(f.perf_measured, "nonzero advertised perf must be MEASURED");
         assert_eq!(f.tokens_per_second, 180);
         assert_eq!(f.latency_ms, 50);
@@ -2372,8 +2422,14 @@ mod tests {
         );
         manager.process_advertisement(lat).await;
         let facts = manager.fabric_facts("abc").await;
-        let f = facts.iter().find(|f| f.peer_id == lat_peer.to_string()).unwrap();
-        assert!(f.perf_measured, "latency-only measurement must count as measured");
+        let f = facts
+            .iter()
+            .find(|f| f.peer_id == lat_peer.to_string())
+            .unwrap();
+        assert!(
+            f.perf_measured,
+            "latency-only measurement must count as measured"
+        );
     }
 
     #[tokio::test]
@@ -2398,7 +2454,10 @@ mod tests {
         // Before any install there is no local advertisement.
         assert!(manager.last_local_advertisement_sync().is_none());
 
-        let adv = manager.refresh_local_models(&registry_path, 4096).await.unwrap();
+        let adv = manager
+            .refresh_local_models(&registry_path, 4096)
+            .await
+            .unwrap();
         assert_eq!(adv.capability.available_models.len(), 1);
         assert_eq!(adv.capability.available_models[0].file_name, "fresh.gguf");
         assert_eq!(adv.capability.available_models[0].context_tokens, 4096);
@@ -2410,7 +2469,10 @@ mod tests {
         let mut reg = decentraai_registry::ModelRegistry::load(&registry_path).unwrap();
         reg.scan_directory(&models_dir).unwrap();
         reg.save(&registry_path).unwrap();
-        let adv2 = manager.refresh_local_models(&registry_path, 4096).await.unwrap();
+        let adv2 = manager
+            .refresh_local_models(&registry_path, 4096)
+            .await
+            .unwrap();
         let names: Vec<_> = adv2
             .capability
             .available_models
@@ -2521,8 +2583,16 @@ mod tests {
         for (p, name) in [(a, "w-a"), (b, "w-b")] {
             manager
                 .process_advertisement(build_advertisement(
-                    p, name, ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()],
-                    false, true, 0, LivePerf::default(),
+                    p,
+                    name,
+                    ENGINE_LLAMA_SERVER,
+                    snapshot(),
+                    gpu(),
+                    vec![model()],
+                    false,
+                    true,
+                    0,
+                    LivePerf::default(),
                 ))
                 .await;
             manager.record_rtt(&p, 2_000, 1_000);
@@ -2549,8 +2619,16 @@ mod tests {
         let manager = ComputeManager::new(local, "c".into(), HashSet::from([remote]));
         manager
             .process_advertisement(build_advertisement(
-                remote, "w", ENGINE_LLAMA_SERVER, snapshot(), gpu(), vec![model()],
-                false, true, 0, LivePerf::default(),
+                remote,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
         manager.record_rtt(&remote, 2_000, 1_000);
@@ -2573,11 +2651,8 @@ mod tests {
         let local = peer();
         let incompatible = peer();
         let compatible = peer();
-        let manager = ComputeManager::new(
-            local,
-            "c".into(),
-            HashSet::from([incompatible, compatible]),
-        );
+        let manager =
+            ComputeManager::new(local, "c".into(), HashSet::from([incompatible, compatible]));
         // `incompatible` advertises a DIFFERENT model hash than the request.
         let other_model = ServedModel {
             model_hash: "xyz".into(),
@@ -2585,14 +2660,30 @@ mod tests {
         };
         manager
             .process_advertisement(build_advertisement(
-                incompatible, "w-incompat", ENGINE_LLAMA_SERVER, snapshot(), gpu(),
-                vec![other_model], false, true, 0, LivePerf::default(),
+                incompatible,
+                "w-incompat",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![other_model],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
         manager
             .process_advertisement(build_advertisement(
-                compatible, "w-compat", ENGINE_LLAMA_SERVER, snapshot(), gpu(),
-                vec![model()], false, true, 0, LivePerf::default(),
+                compatible,
+                "w-compat",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
         manager.record_rtt(&incompatible, 2_000, 1_000);
@@ -3085,24 +3176,29 @@ mod tests {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::new());
         let worker = peer();
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        ))
-        .await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
 
         // New worker is not trusted and reachable (heartbeat fresh).
         assert!(!manager.is_trusted(&worker).await);
         let before = manager.metrics_report().await;
-        let row = before.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        let row = before
+            .workers
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .unwrap();
         assert!(!row.trusted, "must start untrusted");
         assert!(row.reachable, "fresh advertisement is reachable");
         assert_eq!(row.connection_errors, 0);
@@ -3111,14 +3207,22 @@ mod tests {
         manager.add_trusted(worker).await;
         assert!(manager.is_trusted(&worker).await);
         let after = manager.metrics_report().await;
-        let row = after.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        let row = after
+            .workers
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .unwrap();
         assert!(row.trusted, "approve must mark trusted");
 
         // Revoking flips it back.
         manager.remove_trusted(&worker).await;
         assert!(!manager.is_trusted(&worker).await);
         let revoked = manager.metrics_report().await;
-        let row = revoked.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        let row = revoked
+            .workers
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .unwrap();
         assert!(!row.trusted, "revoke must clear trust");
     }
 
@@ -3127,25 +3231,33 @@ mod tests {
         let p = peer();
         let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
         let worker = peer();
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        ))
-        .await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
 
         manager.mark_offline(&worker).await;
         let report = manager.metrics_report().await;
-        let row = report.workers.iter().find(|r| r.peer_id == worker.to_string()).unwrap();
+        let row = report
+            .workers
+            .iter()
+            .find(|r| r.peer_id == worker.to_string())
+            .unwrap();
         assert!(!row.reachable, "offline worker is unreachable");
-        assert_eq!(row.connection_errors, 1, "offline is surfaced as a connection error");
+        assert_eq!(
+            row.connection_errors, 1,
+            "offline is surfaced as a connection error"
+        );
         assert_eq!(row.status, "Offline");
     }
 
@@ -3293,7 +3405,10 @@ mod tests {
 
         // The history file exists and carries the record.
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("persist-1"), "history appended: {contents}");
+        assert!(
+            contents.contains("persist-1"),
+            "history appended: {contents}"
+        );
         let first: ExecutedPlan = serde_json::from_str(contents.trim()).unwrap();
         assert_eq!(first.tokens_used, Some(99));
 
@@ -3343,7 +3458,10 @@ mod tests {
         let d = &ds[0];
         assert_eq!(d.request_id, "r1");
         // The eligible worker is selected and its constraints are satisfied.
-        assert_eq!(d.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        assert_eq!(
+            d.selected_worker.as_deref(),
+            Some(worker.to_string().as_str())
+        );
         let cand = d
             .candidates
             .iter()
@@ -3352,10 +3470,9 @@ mod tests {
         assert!(cand.constraints.is_satisfied());
         assert!(cand.score.is_some(), "eligible candidate has a score");
         assert!(
-            d.trace.iter().any(|e| matches!(
-                e,
-                decentraai_fabric::ExecutionEvent::Planned { .. }
-            )),
+            d.trace
+                .iter()
+                .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Planned { .. })),
             "trace includes the Planned event"
         );
         // Finalize correlates the decision with the reservation/plan/outcome
@@ -3366,14 +3483,16 @@ mod tests {
         assert_eq!(d.reservation_id.as_deref(), Some("res-1"));
         assert_eq!(d.outcome.as_deref(), Some("succeeded"));
         assert_eq!(d.plan.as_ref().map(|p| p.plan_id.as_str()), Some("plan-1"));
-        assert!(d
-            .trace
-            .iter()
-            .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Reserved { .. })));
-        assert!(d
-            .trace
-            .iter()
-            .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Completed { ok: true })));
+        assert!(
+            d.trace
+                .iter()
+                .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Reserved { .. }))
+        );
+        assert!(
+            d.trace
+                .iter()
+                .any(|e| matches!(e, decentraai_fabric::ExecutionEvent::Completed { ok: true }))
+        );
         // Ring buffer bounds.
         for i in 0..70 {
             manager
@@ -3395,8 +3514,7 @@ mod tests {
         let registry_path = dir.path().join("db/registry.json");
         std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
         {
-            let mut reg =
-                decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+            let mut reg = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
             reg.scan_directory(&models_dir).unwrap();
             reg.set_capability_claims(
                 "model.gguf",
@@ -3467,7 +3585,13 @@ mod tests {
     fn execution_statistics_derives_deterministic_aggregates() {
         // Build a small synthetic history with real measured fields: two
         // succeeded records (with tokens+time), one failed, one retry.
-        let rec = |id: &str, model: &str, worker: &str, outcome: &str, tokens: Option<u32>, ms: Option<u32>, attempt: u32| ExecutedPlan {
+        let rec = |id: &str,
+                   model: &str,
+                   worker: &str,
+                   outcome: &str,
+                   tokens: Option<u32>,
+                   ms: Option<u32>,
+                   attempt: u32| ExecutedPlan {
             request_id: id.to_string(),
             plan_id: "p".into(),
             model_hash: model.to_string(),
@@ -3535,28 +3659,50 @@ mod tests {
         // Register the worker so record_outcome's tracker exists.
         manager
             .process_advertisement(build_advertisement(
-                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
                 GpuProbeStatus::Unavailable("none".into()),
-                vec![model()], false, true, 0, LivePerf::default(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
 
         // First credit: real measured tokens + processing time.
         assert!(manager.record_credited_contribution(
-            &worker, "exec-1", true, Some(100), Some(2000),
+            &worker,
+            "exec-1",
+            true,
+            Some(100),
+            Some(2000),
         ));
         // Duplicate (replay/double-settlement): must NOT credit again.
         assert!(!manager.record_credited_contribution(
-            &worker, "exec-1", true, Some(9999), Some(9999),
+            &worker,
+            "exec-1",
+            true,
+            Some(9999),
+            Some(9999),
         ));
 
         // Another distinct execution credits once.
         assert!(manager.record_credited_contribution(
-            &worker, "exec-2", true, Some(50), Some(1000),
+            &worker,
+            "exec-2",
+            true,
+            Some(50),
+            Some(1000),
         ));
 
         let mc = manager.measured_contribution();
-        assert_eq!(mc.credited_executions, 2, "two distinct executions credited");
+        assert_eq!(
+            mc.credited_executions, 2,
+            "two distinct executions credited"
+        );
         assert_eq!(mc.verified_completions, 2);
         assert_eq!(mc.total_tokens, 150, "duplicate tokens not counted");
         assert_eq!(mc.total_processing_ms, 3000, "duplicate time not counted");
@@ -3564,7 +3710,10 @@ mod tests {
         // A failed execution (tokens None) still dedups but contributes no work.
         assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
         let mc = manager.measured_contribution();
-        assert_eq!(mc.credited_executions, 2, "failed executions earn no measured credit");
+        assert_eq!(
+            mc.credited_executions, 2,
+            "failed executions earn no measured credit"
+        );
     }
 
     #[tokio::test]
@@ -3577,18 +3726,43 @@ mod tests {
         let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
         manager
             .process_advertisement(build_advertisement(
-                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
                 GpuProbeStatus::Unavailable("none".into()),
-                vec![model()], false, true, 0, LivePerf::default(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
 
         // First credited execution: 100 tokens + 2000ms -> 2100 units (v1 policy).
-        assert!(manager.record_credited_contribution(&worker, "exec-1", true, Some(100), Some(2000)));
+        assert!(manager.record_credited_contribution(
+            &worker,
+            "exec-1",
+            true,
+            Some(100),
+            Some(2000)
+        ));
         // Duplicate must not re-credit quota.
-        assert!(!manager.record_credited_contribution(&worker, "exec-1", true, Some(9999), Some(9999)));
+        assert!(!manager.record_credited_contribution(
+            &worker,
+            "exec-1",
+            true,
+            Some(9999),
+            Some(9999)
+        ));
         // A second distinct execution credits independently.
-        assert!(manager.record_credited_contribution(&worker, "exec-2", true, Some(50), Some(1000)));
+        assert!(manager.record_credited_contribution(
+            &worker,
+            "exec-2",
+            true,
+            Some(50),
+            Some(1000)
+        ));
 
         let account = manager.quota_account(&worker.to_string()).unwrap();
         assert_eq!(account.earned, 3150, "2100 + 1050 units");
@@ -3597,25 +3771,56 @@ mod tests {
 
         // Failed executions earn no quota.
         assert!(manager.record_credited_contribution(&worker, "exec-3", false, None, None));
-        assert_eq!(manager.quota_account(&worker.to_string()).unwrap().earned, 3150);
+        assert_eq!(
+            manager.quota_account(&worker.to_string()).unwrap().earned,
+            3150
+        );
 
         // M9-9: verified executions also earn reputation-based compensation
         // credits (distinct ledger from quota); failures and duplicates earn
         // nothing and cannot double-pay.
         let comp = manager.compensation_account(&worker.to_string()).unwrap();
-        assert!(comp.earned > 0, "verified work accumulates compensation credits");
+        assert!(
+            comp.earned > 0,
+            "verified work accumulates compensation credits"
+        );
         let comp_before = comp.earned;
         // Re-credit the same execution: both ledgers refuse (idempotency).
-        assert!(!manager.record_credited_contribution(&worker, "exec-1", true, Some(100), Some(2000)));
-        assert_eq!(manager.compensation_account(&worker.to_string()).unwrap().earned, comp_before);
+        assert!(!manager.record_credited_contribution(
+            &worker,
+            "exec-1",
+            true,
+            Some(100),
+            Some(2000)
+        ));
+        assert_eq!(
+            manager
+                .compensation_account(&worker.to_string())
+                .unwrap()
+                .earned,
+            comp_before
+        );
         // A failed execution after some verified work still earns nothing more.
         assert!(manager.record_credited_contribution(&worker, "exec-4", false, None, None));
-        assert_eq!(manager.compensation_account(&worker.to_string()).unwrap().earned, comp_before);
+        assert_eq!(
+            manager
+                .compensation_account(&worker.to_string())
+                .unwrap()
+                .earned,
+            comp_before
+        );
         // The audit trail records exactly the two verified credits.
         let events = manager.compensation_events();
-        assert_eq!(events.len(), 2, "one compensation event per verified execution");
+        assert_eq!(
+            events.len(),
+            2,
+            "one compensation event per verified execution"
+        );
         assert!(events.iter().all(|e| e.op == "credit"));
-        assert_eq!(manager.reward_policy(), decentraai_compute::RewardPolicy::default());
+        assert_eq!(
+            manager.reward_policy(),
+            decentraai_compute::RewardPolicy::default()
+        );
     }
 
     #[tokio::test]
@@ -3625,9 +3830,16 @@ mod tests {
         let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
         manager
             .process_advertisement(build_advertisement(
-                worker, "w", ENGINE_LLAMA_SERVER, snapshot(),
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
                 GpuProbeStatus::Unavailable("none".into()),
-                vec![model()], false, true, 0, LivePerf::default(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
             ))
             .await;
 
@@ -3642,7 +3854,13 @@ mod tests {
             units_per_processing_ms: 0,
         });
         assert_eq!(manager.contribution_policy().version, 7);
-        assert!(manager.record_credited_contribution(&worker, "exec-2", true, Some(100), Some(9999)));
+        assert!(manager.record_credited_contribution(
+            &worker,
+            "exec-2",
+            true,
+            Some(100),
+            Some(9999)
+        ));
 
         let account = manager.quota_account(&worker.to_string()).unwrap();
         assert_eq!(account.earned, 300, "v1: 100 units + v7: 200 units");
