@@ -276,10 +276,15 @@ const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = (n,d=1) => Number.isFinite(n) ? n.toFixed(d) : '—';
 const fmtBytes = b => { if (!Number.isFinite(b)) return '—'; const u=['B','KiB','MiB','GiB','TiB']; let i=0; while(b>=1024&&i<u.length-1){b/=1024;i++} return b.toFixed(i?1:0)+' '+u[i]; };
-const auth = () => $('token').value.trim() ? {Authorization:'Bearer '+$('token').value.trim()} : {};
+const auth = () => $('token').value.trim() ? {Authorization:'Bearer '+$('token').value.trim()} : (autoToken ? {Authorization:'Bearer '+autoToken} : {});
 const tokenKey = 'decentraai.dashboard-v2.token';
 try { $('token').value = localStorage.getItem(tokenKey) || ''; } catch (_) {}
 $('token').addEventListener('change', () => { try { localStorage.setItem(tokenKey, $('token').value.trim()); } catch (_) {} });
+// Loopback convenience: the node serves its own operator token at /v1/token
+// (same mechanism as the v1 dashboard), so the fabric views work without
+// typing the token manually. A token typed in the field always wins.
+let autoToken = '';
+(async () => { try { autoToken = (await (await fetch('/v1/token')).text()).trim(); } catch (_) {} })();
 
 const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',settings:'Settings',diagnostics:'Diagnostics'};
 let currentView = 'overview', lastStatus = null;
@@ -478,13 +483,18 @@ function renderWorkers() {
 async function refresh() {
   try {
     const s = await (await fetch('/status')).json();
-    renderStatus(s); renderTopology(s); renderPipeline();
+    renderStatus(s); renderTopology(s);
   } catch (_) { $('node-line').textContent = 'Status unavailable — is the node running?'; }
   try { const peers = await (await fetch('/v1/peers',{headers:auth()})).json(); renderPeers(peers); } catch (_) {}
-  try { lastCompute = await (await fetch('/v1/compute',{headers:auth()})).json(); renderWorkers(); } catch (_) {}
+  try { lastCompute = await (await fetch('/v1/compute',{headers:auth()})).json(); } catch (_) {}
   try { lastNetwork = await (await fetch('/v1/network',{headers:auth()})).json(); } catch (_) {}
   try { lastExec = await (await fetch('/v1/execution',{headers:auth()})).json(); } catch (_) {}
-  try { lastAgents = await (await fetch('/v1/agents',{headers:auth()})).json(); renderAgents(); } catch (_) {}
+  try { lastAgents = await (await fetch('/v1/agents',{headers:auth()})).json(); } catch (_) {}
+  // Second pass: cards that depend on /v1/* data (workload, p2p, KPI workers,
+  // topology rings, pipeline) must reflect the fresh values in the SAME tick,
+  // not one poll later.
+  if (lastStatus) { renderStatus(lastStatus); renderTopology(lastStatus); renderPipeline(); }
+  renderWorkers(); renderAgents();
   if (lastCompute?.local_perf?.tokens_per_second) { sparkHistory.push(lastCompute.local_perf.tokens_per_second); if (sparkHistory.length > 24) sparkHistory.shift(); }
 }
 $('refresh').addEventListener('click', refresh);
