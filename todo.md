@@ -19,24 +19,32 @@
   - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
         end-to-end (orchestrator pe un nod, executa pe celalalt prin
         `route_request`). Referinta: `docs/NODE_UPGRADE.md`.
-- [ ] **Collective memory written from workflows + UI** — when a workflow
-  completes, write its verified results into the SQLite `MemoryStore` scopes
-  (ownership + access per the pure P5 model) and surface a Memory view in the
-  dashboard (`/v1/memory`).
-- [ ] **Reputation fed from real results + UI** — after each verified delegated
-  stage, feed the outcome into the `ReputationStore` so executor selection
-  ranks real history (not synthetic samples); surface reputation in the
-  dashboard.
+- [x] **Collective memory written from workflows + UI** — DONE 2026-08-18
+  (commit `3b55830`): workflow outcomes cu verdict Completed sunt scrise in
+  SQLite `MemoryStore` (scope `workflow_results`, MemoryLevel::Team): verified
+  stage outputs + summary, idempotent, best-effort. `AgentOrchestrator`
+  `.with_memory_store()` wired in node. Dashboard `/v1/memory` arata rezultate
+  reale. 3 teste noi (completed/partial/idempotent).
+- [x] **Reputation fed from real results + UI** — DONE 2026-08-18: `record_execution`
+  alimenteaza `ReputationStore` din `run_plan` (succes/esec + latenta),
+  `select_executor` rank-uiește cu score real (local first, score desc,
+  deterministic), `/v1/reputation` + dashboard `renderReputation` (score +
+  reasons cu sample counts). Verificat live: 3 entries cu reliability/quality/
+  latency reale.
 - [ ] **Retrieval tool in execution** — a workflow/agent that *calls* semantic
   retrieval during generation (RAG at runtime, not just the endpoint).
-- [ ] **CLI `decentraai agent workflow run`** — trigger `/v1/agents/orchestrate`
-  from the CLI (not just dashboard/curl) for scripting.
+- [x] **CLI `decentraai agent workflow run`** — DONE 2026-08-18 (commits
+  `02ae867` + `2ff46fb`): `decentraai agent workflow-run` ruleaza
+  `/v1/agents/orchestrate` din CLI (verdict + output), cu `--template` si
+  `--retrieve`. CLI complet cu meniu coerent (commit `e944545`): `rag index/
+  query` + `memory list` + `build_local_client()`.
 - [ ] **Node `node.model` on the Desktop** — serve Mistral-7B there for a
   higher-quality remote executor.
 
 ## Product / polish
 
-- [ ] Dashboard: surface reputation + talent tree views (currently CLI-only).
+- [x] Dashboard: reputation + talent tree views — DONE 2026-08-18: Talents
+  (commit `8d2c5eb`), Reputation + Memory views live in Mesh.
 - [ ] `decentraai agent` — add `memory` and `economy` inspection subcommands.
 - [ ] Persist agent records (AgentManager) to disk so restarts keep local
       agents stable.
