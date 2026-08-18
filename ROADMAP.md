@@ -100,6 +100,11 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
   choice sends `worker_hint: <node_id>` and the proxy routes to exactly that
   node (400 with a clear message if it is not trusted / not accepting remote
   inference / does not serve the model).
+  - Regression fix `6e92ffe` (2026-08-18): the selector silently showed only
+    local models — `populateChatNodes`/`populateChatModels` ran with `c=null`
+    before `/v1/compute` was fetched in `refresh()`, so the `Remote workers`
+    optgroup never appeared. Calls moved after the compute fetch; pinned by
+    `dashboard_populates_chat_models_after_compute_fetch`.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<libp2p-peer-id> <guest-token>` string;
