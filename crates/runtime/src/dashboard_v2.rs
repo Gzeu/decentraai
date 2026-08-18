@@ -423,9 +423,21 @@ function renderStatus(s) {
 
   renderTrust();
 
-  // Models select in chat
+  // Models select in chat — local models + remote workers from /v1/compute
+  // (fix P12: the remote optgroup must come from real served_models, never a
+  // stale/local-only list; a remote:<node>:<file> value turns into worker_hint).
   const select = $('chat-model'), chosen = select.value;
-  select.innerHTML = '<option value="">Current model</option>'+(s.available_models || []).map(m => '<option value="'+esc(m)+'">'+esc(m)+'</option>').join('');
+  let modelHtml = '<option value="">Current model</option>'+(s.available_models || []).map(m => '<option value="'+esc(m)+'">'+esc(m)+'</option>').join('');
+  const remote = [];
+  (lastCompute?.workers || []).forEach(w => {
+    if (w && w.peer_id === lastCompute?.local_peer) return;
+    const n = w.node_id || w.node_name || w.peer_id;
+    (w.served_models || []).forEach(m => { if (m && m.file_name) remote.push({file:m.file_name, node:n}); });
+  });
+  if (remote.length) {
+    modelHtml += '<optgroup label="Remote workers">'+remote.map(r => '<option value="remote:'+esc(r.node)+':'+esc(r.file)+'">'+esc(r.file)+'  (remote · '+esc(r.node)+')</option>').join('')+'</optgroup>';
+  }
+  select.innerHTML = modelHtml;
   select.value = chosen;
 
   // Models view (advanced)
@@ -662,5 +674,12 @@ function renderWorkersDetail() {
 const chat = $('chat'); let history = [];
 function addMessage(role, text) { if (chat.querySelector('.empty')) chat.innerHTML = ''; const el = document.createElement('div'); el.className = 'msg '+role; el.textContent = text; chat.appendChild(el); chat.scrollTop = chat.scrollHeight; return el; }
 async function readSse(response, node) { const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '', output = ''; for (;;) { const {done,value} = await reader.read(); if (done) break; buffer += decoder.decode(value,{stream:true}); const lines = buffer.split('\n'); buffer = lines.pop() || ''; for (const line of lines) { if (!line.startsWith('data:')) continue; const data = line.slice(5).trim(); if (data === '[DONE]') continue; try { const event = JSON.parse(data), delta = event.choices?.[0]?.delta?.content; if (delta) { output += delta; node.textContent = output; chat.scrollTop = chat.scrollHeight; } } catch (_) {} } } return output; }
-$('send').addEventListener('click', async () => { const prompt = $('prompt').value.trim(); if (!prompt) return; $('prompt').value = ''; addMessage('user',prompt); history.push({role:'user',content:prompt}); const streaming = $('stream').checked, model = $('chat-model').value || lastStatus?.model || 'auto'; $('chat-status').textContent = 'Generating…'; try { const response = await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify({model,messages:history,stream:streaming})}); let answer = ''; if (streaming && response.ok && response.body) { answer = await readSse(response,addMessage('assistant','')); } else { const body = await response.json(); answer = body.choices?.[0]?.message?.content || body.error?.message || 'No response'; addMessage('assistant',answer); } history.push({role:'assistant',content:answer}); history = history.slice(-24); $('chat-status').textContent = response.ok ? 'Done' : 'Request failed'; } catch (error) { addMessage('assistant','Request failed: '+error); $('chat-status').textContent = 'Request failed'; } });
+// A `remote:<node>:<file>` selection pins the worker via worker_hint and uses
+// the file as the model id (same contract as the v1 chat, fix P12).
+const chatSelection = () => {
+  const v = $('chat-model').value || '';
+  if (v.startsWith('remote:')) { const i = v.indexOf(':', 7); return { model: v.slice(i+1), worker_hint: v.slice(7, i) }; }
+  return { model: v || lastStatus?.model || 'auto', worker_hint: '' };
+};
+$('send').addEventListener('click', async () => { const prompt = $('prompt').value.trim(); if (!prompt) return; $('prompt').value = ''; addMessage('user',prompt); history.push({role:'user',content:prompt}); const streaming = $('stream').checked, sel = chatSelection(); $('chat-status').textContent = 'Generating…'; try { const response = await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...auth()},body:JSON.stringify({model:sel.model,messages:history,stream:streaming,...(sel.worker_hint?{worker_hint:sel.worker_hint}:{})})}); let answer = ''; if (streaming && response.ok && response.body) { answer = await readSse(response,addMessage('assistant','')); } else { const body = await response.json(); answer = body.choices?.[0]?.message?.content || body.error?.message || 'No response'; addMessage('assistant',answer); } history.push({role:'assistant',content:answer}); history = history.slice(-24); $('chat-status').textContent = response.ok ? 'Done' : 'Request failed'; } catch (error) { addMessage('assistant','Request failed: '+error); $('chat-status').textContent = 'Request failed'; } });
 "##;
