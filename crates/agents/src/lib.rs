@@ -48,6 +48,7 @@ pub mod message;
 pub mod policy;
 pub mod registry;
 pub mod reputation;
+pub mod retrieval;
 pub mod selfopt;
 pub mod talent_tree;
 pub mod task;
@@ -90,6 +91,7 @@ pub use reputation::{
     AgentReputation, DEFAULT_MIN_SAMPLES, FactorScore, ReputationFactor, ReputationStore,
     ReputationUpdate, default_weights, safety_penalty,
 };
+pub use retrieval::{IndexedDocument, RetrievalIndex, RetrievalResult, cosine_similarity};
 pub use selfopt::{
     Constraint, ConstraintKind, Direction, OptimizationDimension, OptimizationObservation,
     OptimizationSuggestion, RiskLevel, SelfOptimizer,
