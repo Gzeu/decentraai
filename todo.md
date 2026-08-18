@@ -19,12 +19,16 @@
   - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
         end-to-end (orchestrator pe un nod, executa pe celalalt prin
         `route_request`). Referinta: `docs/NODE_UPGRADE.md`.
-- [ ] **Collective memory written from workflows** — when a workflow completes,
-  write its verified results into the SQLite `MemoryStore` scopes (ownership +
-  access per the pure P5 model), so the fabric accumulates real knowledge.
-- [ ] **Reputation fed from real results** — after each verified delegated
+- [ ] **Collective memory written from workflows + UI** — when a workflow
+  completes, write its verified results into the SQLite `MemoryStore` scopes
+  (ownership + access per the pure P5 model) and surface a Memory view in the
+  dashboard (`/v1/memory`).
+- [ ] **Reputation fed from real results + UI** — after each verified delegated
   stage, feed the outcome into the `ReputationStore` so executor selection
-  ranks real history (not synthetic samples).
+  ranks real history (not synthetic samples); surface reputation in the
+  dashboard.
+- [ ] **Retrieval tool in execution** — a workflow/agent that *calls* semantic
+  retrieval during generation (RAG at runtime, not just the endpoint).
 - [ ] **CLI `decentraai agent workflow run`** — trigger `/v1/agents/orchestrate`
   from the CLI (not just dashboard/curl) for scripting.
 - [ ] **Node `node.model` on the Desktop** — serve Mistral-7B there for a

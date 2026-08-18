@@ -297,6 +297,8 @@ pub struct ApiState {
     embedding: Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
     /// Optional RAG retrieval manager (index + query over embeddings).
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
+    /// Optional collective memory store (persistent scopes/entries).
+    memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
 }
 
 impl ApiState {
@@ -346,6 +348,7 @@ impl ApiState {
             skills: None,
             embedding: None,
             retrieval: None,
+            memory: None,
         }
     }
 
@@ -393,6 +396,14 @@ impl ApiState {
         retrieval: Arc<decentraai_distributed::retrieval_manager::RetrievalManager>,
     ) {
         self.retrieval = Some(retrieval);
+    }
+
+    /// Attaches the collective memory store.
+    pub fn attach_memory(
+        &mut self,
+        memory: Arc<decentraai_distributed::agent_memory::MemoryStore>,
+    ) {
+        self.memory = Some(memory);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4547,6 +4558,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
         .route("/v1/rag/query", post(rag_query_handler))
+        .route("/v1/memory", get(memory_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5668,6 +5680,39 @@ async fn agents_orchestrate_handler(
     let seed = serde_json::json!({ "prompt": prompt });
     let outcome = orchestrator.orchestrate_plan(&plan, Some(&seed)).await;
 
+    // Collective memory: a completed workflow's final output is written to the
+    // persistent MemoryStore (best-effort) so the fabric accumulates verified
+    // knowledge across runs. The scope is team-level, owned by the orchestrator.
+    if matches!(
+        outcome.verdict,
+        decentraai_agents::DelegationVerdict::Completed
+    ) {
+        if let (Some(memory), Some(final_output)) = (&state.memory, &outcome.result.final_output) {
+            use decentraai_agents::{MemoryEntry, MemoryLevel, MemoryScope};
+            let _ = memory.register_scope(&MemoryScope::new(
+                "workflow_results",
+                "orchestrator",
+                MemoryLevel::Team,
+            ));
+            let content = serde_json::to_string(&final_output).unwrap_or_default();
+            let entry = MemoryEntry::new(
+                format!("wf-{}", outcome.result.plan_id),
+                "workflow_results",
+                "orchestrator",
+                "local",
+                content,
+            );
+            let _ = memory.write(
+                "workflow_results",
+                &entry,
+                "orchestrator",
+                true,
+                true,
+                false,
+            );
+        }
+    }
+
     let body = serde_json::json!({
         "verdict": serde_json::to_value(&outcome.verdict).unwrap_or_default(),
         "stages": serde_json::to_value(&outcome.result.stages).unwrap_or_default(),
@@ -5999,6 +6044,67 @@ async fn rag_query_handler(
                 .into_response()
         }
     }
+}
+
+/// Collective memory: lists scopes + their entries (metadata only — prompts
+/// and outputs are never audit/telemetry material, but memory entries carry
+/// their content by design; here we return content for the operator view).
+async fn memory_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        let body = serde_json::json!({ "attached": false, "scopes": [] });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let scopes = match memory.list_scopes() {
+        Ok(s) => s,
+        Err(e) => {
+            let body =
+                serde_json::json!({ "attached": true, "error": e.to_string(), "scopes": [] });
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response();
+        }
+    };
+    let mut scope_rows = Vec::new();
+    for s in scopes {
+        let entries = memory
+            .read(&s.name, "orchestrator", true)
+            .unwrap_or_default();
+        let latest: Vec<serde_json::Value> = entries
+            .iter()
+            .take(20)
+            .map(|e| {
+                serde_json::json!({
+                    "entry_id": e.entry_id,
+                    "author_agent": e.author_agent,
+                    "content": e.content,
+                    "created_at_ms": e.created_at_ms,
+                    "tags": e.tags,
+                })
+            })
+            .collect();
+        scope_rows.push(serde_json::json!({
+            "name": s.name,
+            "owner_agent": s.owner_agent,
+            "level": serde_json::to_value(s.level).unwrap_or_default(),
+            "entry_count": entries.len(),
+            "latest": latest,
+        }));
+    }
+    let body = serde_json::json!({ "attached": true, "scopes": scope_rows });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
 }
 
 /// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,

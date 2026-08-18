@@ -1397,12 +1397,20 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         ),
     );
     // Persistent collective memory (best-effort; the node keeps working if it
-    // cannot open or create the store).
+    // cannot open or create the store). Held and shared with the API so the
+    // dashboard can show it and workflows can write verified results to it.
     let agent_memory_path = data_dir.join("db/agent_memory.sqlite");
-    match decentraai_distributed::agent_memory::MemoryStore::open(&agent_memory_path) {
-        Ok(_store) => info!(path = %agent_memory_path.display(), "collective memory store ready"),
-        Err(e) => tracing::warn!(error = %e, "failed to open collective memory store"),
-    }
+    let agent_memory_store: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>> =
+        match decentraai_distributed::agent_memory::MemoryStore::open(&agent_memory_path) {
+            Ok(store) => {
+                info!(path = %agent_memory_path.display(), "collective memory store ready");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open collective memory store");
+                None
+            }
+        };
 
     // The dashboard owns the llama-server lifecycle; the worker advertises in
     // sync with its LIVE health (see spawn_compute_broadcaster). Create the
@@ -1639,6 +1647,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     decentraai_distributed::retrieval_manager::RetrievalManager::new(client),
                 ));
             }
+        }
+        // Collective memory (SQLite) for the dashboard + workflow results.
+        if let Some(store) = agent_memory_store.clone() {
+            state.attach_memory(store);
         }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
