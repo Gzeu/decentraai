@@ -50,8 +50,12 @@
 - [x] Dashboard: reputation + talent tree views — DONE 2026-08-18: Talents
   (commit `8d2c5eb`), Reputation + Memory views live in Mesh.
 - [ ] `decentraai agent` — add `memory` and `economy` inspection subcommands.
-- [ ] Persist agent records (AgentManager) to disk so restarts keep local
-      agents stable.
+- [x] Persist agent records (AgentManager) to disk so restarts keep local
+      agents stable — DONE 2026-08-18 (commit `0143ba8`): `db/agents.json`
+      incarcat la startup (operator-editable), default persistat la primul
+      boot; CLI `agent add` (capabilities verificate) + `agent remove`
+      (refuza ultimul); verificat live ca un agent custom supravietuieste
+      restart-ului si e anuntat pe fabric.
 
 ## Backlog (larger / later)
 
