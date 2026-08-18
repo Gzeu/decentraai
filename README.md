@@ -121,6 +121,42 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+### Chat can speak (local TTS)
+
+Enable the chat 🔊 speak button with a **local** Kokoro-82M voice — no cloud, no
+GPU. The node runs a managed Python subprocess (same invariant as the llama.cpp
+engine) reading `<data_dir>/tts/`:
+
+```bash
+bash scripts/setup-tts.sh     # idempotent: venv + models + smoke test
+```
+
+Then add to `~/.decentraai/node.yaml` and restart:
+
+```yaml
+tts:
+  enabled: true
+  voice: "af_heart"   # default feminine; try "am_michael" for a male voice
+  speed: 1.0
+```
+
+```bash
+systemctl --user restart decentraai-node
+```
+
+The API is `POST /v1/tts` (Bearer auth, WAV 16-bit mono 24 kHz):
+
+```bash
+TOKEN=$(cat ~/.decentraai/runtime/api.token)
+curl http://127.0.0.1:8080/v1/tts \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "The fabric speaks."}' --output reply.wav
+```
+
+`/status` reports `tts {enabled, healthy, voice, speed}`; without the section
+the chat simply hides the speak button.
+
 ---
 
 ## 🖥️ CLI Reference

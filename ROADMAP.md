@@ -105,6 +105,20 @@ nodes, Fabric nodes cards and Workers cards, with a client-side fallback
     before `/v1/compute` was fetched in `refresh()`, so the `Remote workers`
     optgroup never appeared. Calls moved after the compute fetch; pinned by
     `dashboard_populates_chat_models_after_compute_fetch`.
+- [x] P13: chat can speak — local text-to-speech (Kokoro-82M ONNX) behind the
+  dashboard chat. The node runs a managed Python `tts_server.py` subprocess
+  (external engine, never FFI — same invariant as llama.cpp) driven from
+  `<data_dir>/tts/` (venv + `kokoro-v1.0.onnx` + `voices-v1.0.bin`, set up by
+  `scripts/setup-tts.sh`). Config section `tts: {enabled, voice, speed}`
+  (default feminine `af_heart`); absent section = TTS off and the chat hides
+  the speak control. `/v1/tts` proxies Bearer-authenticated requests to the
+  loopback subprocess and returns 16-bit mono 24 kHz WAV (4096-char cap, tier
+  rate limit, 401 without a token, 404 when disabled). `/status` reports
+  `tts {enabled, healthy, voice, speed}`; the v2 chat adds a 🔊 speak button
+  per assistant message with stop-on-reclick. Live-validated on
+  `dca-GriBWu` (CPU, ~1.1× RTF): 200 audio/wav with the master token, 401
+  without; 12/12 v2 polling contracts unchanged; 974 tests green (was 969).
+  Commit `f07d0a6`.
 - [x] P4: contribution-based tier suggestions from catalog + reputation
 - [x] P5: invites (`decentraai invite` prints a copy-pastable
   `<reachable-multiaddr>/p2p/<libp2p-peer-id> <guest-token>` string;
