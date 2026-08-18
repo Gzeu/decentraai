@@ -2340,3 +2340,27 @@ laptop.
 - [ ] **Blocked on Desktop**: run `git pull && bash scripts/upgrade-node.sh`
   on the Desktop so it advertises agents + `accepts_remote_inference`, then
   `bash scripts/validate-lan.sh` on this laptop.
+
+## 103. Two-node LAN validation VERIFIED (DONE)
+
+Commit `80829be` (fix) + `..` (script). Two-node remote inference is verified
+end-to-end on real hardware (Laptop i5 ↔ Desktop i7).
+
+- [x] **Root-cause bug fixed**: `SignedAgentAdvertisement` and
+  `SignedComputeAdvertisement` share the same wire envelope; the handler tried
+  the agent branch first and dropped the compute advertisement (its inner
+  payload is a ComputeAdvertisement, so the agent verify failed with "missing
+  field protocol_version" and returned). The remote worker therefore never
+  appeared in `/v1/compute`, even though the same node's agent advertisement
+  arrived. Fix: decode the inner payload as an `AgentAdvertisement` first;
+  only treat it as an agent ad when that succeeds, otherwise fall through to
+  the compute branch. Regression test added.
+- [x] **Verified live**: after the fix, the Desktop (i7) appears in the
+  Laptop's `/v1/compute` as a **trusted, remote_ok remote worker**; a real
+  chat request to the shared Llama model routes remote and returns a reply.
+- [x] `scripts/validate-lan.sh` now works without a remote-only model (both
+  nodes share the tiny Llama) — it verifies the remote worker is trusted +
+  remote_ok, routes a real request, and reports the reply.
+- [x] E2E isolation: test P2P nodes disable mDNS (parallel loopback tests no
+  longer discover each other); the forged-ad test asserts the specific peer is
+  rejected (deterministic under parallel runs).

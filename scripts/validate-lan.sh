@@ -62,6 +62,11 @@ for w in d.get('workers',[]):
 
 # Pick a remote model that this node does NOT serve, so routing is forced
 # remote (a model present only on the Desktop proves remote execution).
+# Pick a remote model that this node does NOT serve, so routing is forced
+# remote (a model present only on the remote node proves remote execution).
+# If every worker shares the same model (e.g. both nodes serve the tiny
+# Llama), fall back to the first model of the first trusted remote worker and
+# note that routing may be remote (the router picks the remote worker).
 REMOTE_MODEL="$(echo "$WORKERS" | python3 -c "
 import sys,json
 d=json.load(sys.stdin); local=d.get('local_peer','')
@@ -75,12 +80,19 @@ for w in d.get('workers',[]):
     for m in (w.get('served_models') or []):
         if m.get('file_name') not in local_models:
             print(m.get('file_name')); raise SystemExit(0)
-raise SystemExit('no remote-only model on a trusted, remote-ok worker')
+# No remote-only model: fall back to the first served model of the first
+# trusted remote-ok worker (both nodes may share the same model).
+for w in d.get('workers',[]):
+    if w.get('peer_id')==local: continue
+    if not w.get('trusted') or not w.get('accepts_remote_inference'): continue
+    for m in (w.get('served_models') or []):
+        print(m.get('file_name')); raise SystemExit(0)
+raise SystemExit('no served model on a trusted, remote-ok worker')
 ")"
 
 echo "==> Routing a real request to remote model: $REMOTE_MODEL"
 RESP="$(curl -sf -m 180 "${AUTH[@]}" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$REMOTE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK in one word.\"}],\"max_tokens\":16}" \
+  -d "{\"model\":\"$REMOTE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly one word: REMOTE if you are running on a remote node, otherwise LOCAL.\"}],\"max_tokens\":16}" \
   "$API/v1/chat/completions")"
 
 REPLY="$(echo "$RESP" | python3 -c "import sys,json; print((json.load(sys.stdin).get('choices') or [{}])[0].get('message',{}).get('content',''))")"
