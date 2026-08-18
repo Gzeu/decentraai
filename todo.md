@@ -31,8 +31,12 @@
   deterministic), `/v1/reputation` + dashboard `renderReputation` (score +
   reasons cu sample counts). Verificat live: 3 entries cu reliability/quality/
   latency reale.
-- [ ] **Retrieval tool in execution** — a workflow/agent that *calls* semantic
-  retrieval during generation (RAG at runtime, not just the endpoint).
+- [x] **Retrieval tool in execution** — DONE 2026-08-18 (commit `5a14936`):
+  `augment_prompt_with_retrieval()` pur — un task cu input `retrieve` face RAG
+  la runtime si augmenteaza promptul cu docs din index (fara docs pastreaza
+  base). Wiring complet: `RetrievalManager` → `InferenceAgentExecutor.with_retrieval()`
+  → CLI `--retrieve` → seed → stage inputs. Eliminata si dubla scriere memory
+  in orchestrate handler. 2 teste noi.
 - [x] **CLI `decentraai agent workflow run`** — DONE 2026-08-18 (commits
   `02ae867` + `2ff46fb`): `decentraai agent workflow-run` ruleaza
   `/v1/agents/orchestrate` din CLI (verdict + output), cu `--template` si
