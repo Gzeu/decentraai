@@ -224,6 +224,18 @@ impl RequestRouter {
                 tracker.remove(&request.request_id).await;
             }
             self.decrement_pending().await;
+            // A worker that answered directly with a failed response (e.g.
+            // hash mismatch on the configured model) must surface as an error,
+            // never as an empty "success": the API layer maps this to a clear
+            // failure instead of returning `output: ""` to the caller.
+            if !infer_resp.success {
+                self.increment_failed().await;
+                return Err(DistributedError::AllWorkersFailed(
+                    infer_resp
+                        .error
+                        .unwrap_or_else(|| "worker reported failure".to_string()),
+                ));
+            }
             self.increment_success().await;
             info!(
                 request_id = %request.request_id,

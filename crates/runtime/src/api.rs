@@ -8185,14 +8185,29 @@ async fn route_remote_chat(
             state.requests_failed.fetch_add(1, Ordering::SeqCst);
             let (code, msg) = match e.code() {
                 decentraai_distributed::InferErrorCode::Untrusted => {
-                    (StatusCode::FORBIDDEN, "worker is not trusted")
+                    (StatusCode::FORBIDDEN, "worker is not trusted".to_string())
                 }
                 decentraai_distributed::InferErrorCode::Timeout
                 | decentraai_distributed::InferErrorCode::Capacity
-                | decentraai_distributed::InferErrorCode::Transport => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "remote worker unavailable")
+                | decentraai_distributed::InferErrorCode::Transport => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "remote worker unavailable".to_string(),
+                ),
+                decentraai_distributed::InferErrorCode::Rejected
+                | decentraai_distributed::InferErrorCode::AllWorkersFailed
+                | decentraai_distributed::InferErrorCode::NoWorkers
+                | decentraai_distributed::InferErrorCode::Engine
+                | decentraai_distributed::InferErrorCode::Serialization
+                | decentraai_distributed::InferErrorCode::Cancelled
+                | decentraai_distributed::InferErrorCode::Unknown => {
+                    // Surface the worker's real message (e.g. "Model not
+                    // available on this worker") so the caller can act on it
+                    // instead of a generic 502.
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("remote inference failed: {e}"),
+                    )
                 }
-                _ => (StatusCode::BAD_GATEWAY, "remote inference failed"),
             };
             (
                 code,
@@ -9647,6 +9662,47 @@ mod tests {
             populate_nodes > compute_fetch,
             "populateChatNodes must run after /v1/compute is fetched (got c=null before)"
         );
+        // Regression: /status available_models are objects {name,size_bytes}
+        // (registry), so the local chat selector must render `m.name`, never
+        // the raw object (which produced `[object Object]` and hid all local
+        // models). The code must extract a name from the object.
+        assert!(
+            body.contains("m.name"),
+            "chat local selector must extract the model name from objects"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dashboard_v2_local_selector_handles_available_models_objects() {
+        // V2 (/ui2) regression: the local chat model selector rendered
+        // `available_models` objects directly (`esc(m)` → "[object Object]"),
+        // hiding every local model. It must extract `m.name` and accept plain
+        // strings as well (the same shape V1 already handles).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/ui2"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("DecentraAI · Node"),
+            "ui2 must serve the v2 dashboard"
+        );
+        for needle in [
+            "m.name",
+            "(typeof m === 'string') ? m : (m && m.name) || ''",
+        ] {
+            assert!(
+                body.contains(needle),
+                "v2 chat local selector must extract the model name from objects, missing {needle}"
+            );
+        }
         manager.lock().await.shutdown().await.unwrap();
     }
 

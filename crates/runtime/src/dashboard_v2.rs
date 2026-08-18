@@ -430,8 +430,13 @@ function renderStatus(s) {
   // Models select in chat — local models + remote workers from /v1/compute
   // (fix P12: the remote optgroup must come from real served_models, never a
   // stale/local-only list; a remote:<node>:<file> value turns into worker_hint).
+  // Note: /status available_models are objects {name,size_bytes} (registry),
+  // so the local options must render `m.name`, never the raw object.
   const select = $('chat-model'), chosen = select.value;
-  let modelHtml = '<option value="">Current model</option>'+(s.available_models || []).map(m => '<option value="'+esc(m)+'">'+esc(m)+'</option>').join('');
+  let modelHtml = '<option value="">Current model</option>'+(s.available_models || []).map(m => {
+    const name = (typeof m === 'string') ? m : (m && m.name) || '';
+    return name ? '<option value="'+esc(name)+'">'+esc(name)+'</option>' : '';
+  }).join('');
   const remote = [];
   (lastCompute?.workers || []).forEach(w => {
     if (w && w.peer_id === lastCompute?.local_peer) return;

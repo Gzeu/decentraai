@@ -1602,10 +1602,25 @@ impl ComputeManager {
                 });
             }
         }
-        let served_models = self
-            .last_local_advertisement_sync()
-            .map(|a| a.capability.served_models)
-            .unwrap_or_default();
+        // Served models must stay honest after a registry change: a model that
+        // no longer exists on disk (pulled away, pruned, replaced) must not be
+        // advertised anymore — coordinators would keep routing requests to us
+        // that the worker then has to reject with "Model not available".
+        // Intersect the previous served set with the freshly scanned disk set
+        // (by hash); anything still present stays advertised.
+        let served_models = {
+            let prev = self
+                .last_local_advertisement_sync()
+                .map(|a| a.capability.served_models)
+                .unwrap_or_default();
+            let on_disk: std::collections::HashSet<&str> = available_models
+                .iter()
+                .map(|m| m.model_hash.as_str())
+                .collect();
+            prev.into_iter()
+                .filter(|m| on_disk.contains(m.model_hash.as_str()))
+                .collect::<Vec<_>>()
+        };
         let snapshot = decentraai_system_probe::SystemSnapshot::collect();
         let gpu = decentraai_system_probe::probe_gpu();
         let can_provision = self
@@ -2481,6 +2496,82 @@ mod tests {
             .collect();
         assert!(names.contains(&"fresh.gguf"));
         assert!(names.contains(&"second.gguf"));
+    }
+
+    #[tokio::test]
+    async fn refresh_local_models_drops_stale_served_models() {
+        // A worker that no longer holds a model on disk must stop advertising
+        // it: coordinators would otherwise keep routing requests to us that
+        // the worker then rejects with "Model not available on this worker"
+        // (the stale served_models bug observed live on dca-NGE65Z).
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("present.gguf"), b"not a real gguf").unwrap();
+        let registry_path = dir.path().join("db/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        {
+            let mut reg = decentraai_registry::ModelRegistry::new(models_dir.clone()).unwrap();
+            reg.scan_directory(&models_dir).unwrap();
+            reg.save(&registry_path).unwrap();
+        }
+
+        let p = peer();
+        let manager = ComputeManager::new(p, "n".into(), HashSet::from([p]));
+        // Seed a stale local advertisement that claims to serve a model which
+        // is NOT on disk anymore (e.g. advertised before a pull replaced it).
+        let stale_hash = "stale-hash-not-on-disk";
+        let stale_adv = decentraai_compute::ComputeAdvertisement {
+            peer_id: p,
+            node_name: "n".into(),
+            node_id: "dca-n".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
+            capability: decentraai_compute::ComputeCapability {
+                cpu_cores: 4,
+                ram_mb: 8 * 1024,
+                gpu: None,
+                engine: ENGINE_LLAMA_SERVER.into(),
+                served_models: vec![ServedModel {
+                    model_hash: stale_hash.into(),
+                    file_name: "gone.gguf".into(),
+                    size_mb: 100,
+                    est_ram_mb: 200,
+                    est_vram_mb: 0,
+                    context_tokens: 4096,
+                }],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: decentraai_compute::ComputeAvailability {
+                available_ram_mb: 4096,
+                available_vram_mb: None,
+                load_percent: 0,
+                queue_depth: 0,
+                tokens_per_second: 0,
+                current_latency_ms: 0,
+                status: decentraai_compute::WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
+                battery_percent: None,
+            },
+            announced_at_ms: 0,
+            accepts_remote_inference: true,
+        };
+        *manager.last_local_ad.lock().unwrap() = Some(stale_adv);
+
+        let adv = manager
+            .refresh_local_models(&registry_path, 4096)
+            .await
+            .unwrap();
+        // The stale served model is gone: only "present.gguf" remains on disk
+        // and the advertisement no longer promises anything it cannot serve.
+        assert!(
+            adv.capability.served_models.is_empty(),
+            "stale served model must not be re-advertised, got {:?}",
+            adv.capability.served_models
+        );
+        assert_eq!(adv.capability.available_models.len(), 1);
+        assert_eq!(adv.capability.available_models[0].file_name, "present.gguf");
     }
 
     #[test]
