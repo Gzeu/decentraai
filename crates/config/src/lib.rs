@@ -196,6 +196,11 @@ pub struct InferenceSection {
     /// of a local llama-server. Must start with `http://` or `https://`.
     #[serde(default)]
     pub backend_url: Option<String>,
+    /// Optional local OpenAI-compatible embeddings backend (a llama-server
+    /// launched with `--embedding`, e.g. on `nomic-embed-text-v1.5`). When
+    /// set, the node exposes `/v1/embeddings` for the RAG retrieval path.
+    #[serde(default)]
+    pub embeddings_backend_url: Option<String>,
 }
 
 /// Generation defaults injected into inference requests that do not

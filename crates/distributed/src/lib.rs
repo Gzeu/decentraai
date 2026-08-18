@@ -83,6 +83,7 @@ pub mod agents;
 pub mod breaker;
 pub mod compute;
 pub mod config;
+pub mod embedding;
 pub mod fallback;
 pub mod p2p_handler;
 pub mod queue;

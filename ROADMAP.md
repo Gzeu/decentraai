@@ -2425,3 +2425,19 @@ has a pure retrieval index in `crates/agents/src/retrieval.rs`:
 Next wiring step (documented): a runtime `/v1/embeddings` path that serves
 `nomic-embed-text-v1.5` and feeds this index, exposing a `Retrieval` capability
 to agents.
+
+## 107. RAG embeddings endpoint (DONE)
+
+Commit `pending`. The RAG retrieval path now has a live embeddings endpoint:
+
+- `EmbeddingClient` (distributed): a thin HTTP client to an OpenAI-compatible
+  embeddings backend (`/v1/embeddings`), not managing the backend process.
+- `POST /v1/embeddings` on the node: `{ "input": "..." }` →
+  `{ "embedding": [...], "dim": N }`, wired when
+  `inference.embeddings_backend_url` is set (a llama-server launched with
+  `--embedding`, e.g. on `nomic-embed-text-v1.5`).
+- Verified live: nomic-embed-text-v1.5 via llama-server --embedding returns a
+  768-dim vector through the node endpoint.
+
+The RetrievalIndex (retrieval.rs) is ready to be populated from these vectors;
+a query/index endpoint is the next wiring step.

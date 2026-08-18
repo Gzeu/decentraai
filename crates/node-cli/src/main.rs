@@ -1625,6 +1625,16 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // The persistent registry drives the agent; the demo is shown only as a
         // labelled demonstration (the handler adds it).
         state.attach_skills(Arc::new(skills_registry.clone()));
+        // RAG: expose /v1/embeddings when an embeddings backend is configured
+        // (a llama-server launched with --embedding, e.g. on nomic-embed).
+        if let Some(url) = config.inference.embeddings_backend_url.as_deref() {
+            if !url.is_empty() {
+                let client = Arc::new(decentraai_distributed::embedding::EmbeddingClient::new(
+                    url.to_string(),
+                ));
+                state.attach_embedding(client);
+            }
+        }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.

@@ -292,6 +292,9 @@ pub struct ApiState {
     /// The P8 dataset/skill registry (read-only view for the dashboard).
     /// `None` when the node does not expose a skill registry.
     skills: Option<Arc<decentraai_agents::SkillRegistry>>,
+    /// Optional embeddings client for the RAG retrieval path
+    /// (`/v1/embeddings`). `None` when no embeddings backend is configured.
+    embedding: Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
 }
 
 impl ApiState {
@@ -339,6 +342,7 @@ impl ApiState {
             agents: None,
             orchestrator: None,
             skills: None,
+            embedding: None,
         }
     }
 
@@ -370,6 +374,14 @@ impl ApiState {
     /// Attaches the P8 dataset/skill registry (read-only) for the dashboard.
     pub fn attach_skills(&mut self, skills: Arc<decentraai_agents::SkillRegistry>) {
         self.skills = Some(skills);
+    }
+
+    /// Attaches the embeddings client for the RAG retrieval path.
+    pub fn attach_embedding(
+        &mut self,
+        embedding: Arc<decentraai_distributed::embedding::EmbeddingClient>,
+    ) {
+        self.embedding = Some(embedding);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4521,6 +4533,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/agents", get(agents_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/skills", get(skills_handler))
+        .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5804,7 +5817,60 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
         .into_response()
 }
 
-/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,/// locality), connected peers, per-peer last-known LAN addresses, and the
+/// Embeddings (RAG): embeds a text via the configured embeddings backend and
+/// returns the vector. `{ "input": "..." }` → `{ "embedding": [...], "dim": N }`.
+async fn embeddings_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(embedding) = &state.embedding else {
+        let body = serde_json::json!({ "error": "embeddings not configured (set inference.embeddings_backend_url)" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if input.is_empty() {
+        let body = serde_json::json!({ "error": "'input' must be a non-empty string" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    }
+    match embedding.embed(&input).await {
+        Ok(vec) => {
+            let dim = vec.len();
+            let body = serde_json::json!({ "embedding": vec, "dim": dim });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let body = serde_json::json!({ "error": e.to_string() });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
+/// locality), connected peers, per-peer last-known LAN addresses, and the
 /// local peer + its own addresses. Empty when no compute/P2P.
 async fn network_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     // H4 role separation: the advanced operational view needs operator/admin.
