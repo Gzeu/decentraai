@@ -19,6 +19,18 @@
   - [ ] Laptop: `bash scripts/validate-lan.sh` — dovedeste remote execution
         end-to-end (orchestrator pe un nod, executa pe celalalt prin
         `route_request`). Referinta: `docs/NODE_UPGRADE.md`.
+  - [x] **Remote execution verificata live de pe Laptop** (DONE 2026-08-18,
+        dupa update-ul Desktop): `curl /v1/chat/completions` cu
+        `model=tinyllama.gguf` (model existent DOAR pe Desktop) a returnat
+        raspuns real remote. M19 RTT probe masurarea: `links rtt_ms=180,
+        locality=Lan` in `/v1/network`.
+  - [x] **Fix bug placeholder messenger** (DONE 2026-08-18, commit `7e489fb`):
+        AgentMessenger pornea pe un P2PNode placeholder cu handler None care
+        dial-uia peeri si lasa probe-urile M19 InferPing (5s) fara raspuns —
+        warning `request ignored` + `InboundFailure` la fiecare 5s. Acum
+        messenger-ul incepe fara transport (`uninitialized()`) si e setat dupa
+        node-ul real. Verificat live: 0 warning-uri, RTT masurat, inferenta
+        remote OK.
 - [x] **Collective memory written from workflows + UI** — DONE 2026-08-18
   (commit `3b55830`): workflow outcomes cu verdict Completed sunt scrise in
   SQLite `MemoryStore` (scope `workflow_results`, MemoryLevel::Team): verified
