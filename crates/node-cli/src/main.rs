@@ -88,6 +88,17 @@ enum Command {
     /// service drives it. Detects and provisions a model automatically; the
     /// node is usable without any manual topology or port configuration.
     Node(NodeArgs),
+    /// RAG: index documents into / query the local semantic retrieval index
+    /// (needs an embeddings backend configured).
+    Rag {
+        #[command(subcommand)]
+        command: RagCommand,
+    },
+    /// Collective memory: inspect the persistent memory scopes/entries.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Open the running node's dashboard in the default browser.
     Open(OpenArgs),
     /// Issue a join invite for a newcomer (P5): creates a Tier-1 Guest token
@@ -566,6 +577,52 @@ enum SkillCommand {
     },
 }
 
+/// `decentraai rag` subcommands — index documents and query the semantic
+/// retrieval index backed by the node's embeddings store.
+#[derive(Debug, Subcommand)]
+enum RagCommand {
+    /// Index a document into the semantic retrieval index.
+    /// The text is embedded and stored under `doc_id`.
+    Index {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Unique document identifier.
+        #[arg(long)]
+        doc_id: String,
+        /// Document text to embed and index.
+        #[arg(long)]
+        text: String,
+        /// Optional capability tag for the document (filters lookup later).
+        #[arg(long)]
+        capability: Option<String>,
+    },
+    /// Query the semantic retrieval index. Returns the top-k most relevant
+    /// chunks for the given query text.
+    Query {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Free-text query against the index.
+        #[arg(long)]
+        text: String,
+        /// Number of results to return (default 5).
+        #[arg(long, default_value = "5")]
+        k: usize,
+    },
+}
+
+/// `decentraai memory` subcommands — inspect collective memory entries and
+/// scopes managed by the agent orchestrator.
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// List all persistent memory entries with their scope, level and access
+    /// policy. Each entry shows the memory key, scope (agent|team|global),
+    /// confidence and timestamp.
+    List {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -631,6 +688,8 @@ async fn main() -> Result<()> {
         Command::Tier { command } => tier_command(command),
         Command::ConsumerKey { command } => consumer_key_command(command),
         Command::Agent { command } => agent_command(command).await,
+        Command::Rag { command } => rag_command(command).await,
+        Command::Memory { command } => memory_command(command).await,
         Command::Node(args) => node_start(args).await,
         Command::Open(args) => open_dashboard(args),
         Command::Invite(args) => invite(args),
@@ -3344,6 +3403,202 @@ async fn agent_command(command: AgentCommand) -> Result<()> {
             ),
         },
     }
+}
+
+/// Dispatches `decentraai rag` subcommands — index/query the semantic retrieval index.
+async fn rag_command(command: RagCommand) -> Result<()> {
+    match command {
+        RagCommand::Index {
+            config,
+            doc_id,
+            text,
+            capability,
+        } => rag_index(&config, &doc_id, &text, capability.as_deref()).await,
+        RagCommand::Query { config, text, k } => rag_query(&config, &text, k).await,
+    }
+}
+
+/// Dispatches `decentraai memory` subcommands — inspect collective memory entries.
+async fn memory_command(command: MemoryCommand) -> Result<()> {
+    match command {
+        MemoryCommand::List { config } => memory_list(&config).await,
+    }
+}
+
+/// Shared helper: build a reqwest client pointed at the local node's API.
+/// Reads the api_port from NodeConfig and loads the master token from the
+/// data dir if present. Returns `(Client, base_url, Option<bearer_token>)`.
+fn build_local_client(config_path: &Path) -> Result<(reqwest::Client, String, Option<String>)> {
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let api_port = config.inference.api_port;
+    let token = std::fs::read_to_string(data_dir.join("runtime/api.token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{api_port}/v1");
+    Ok((client, base_url, token))
+}
+
+/// Index a document into the semantic retrieval index.
+async fn rag_index(
+    config_path: &Path,
+    doc_id: &str,
+    text: &str,
+    capability: Option<&str>,
+) -> Result<()> {
+    if doc_id.trim().is_empty() || text.trim().is_empty() {
+        anyhow::bail!("--doc-id and --text must not be empty");
+    }
+    let (client, base_url, token) = build_local_client(config_path)?;
+    let url = format!("{base_url}/rag/index");
+    let mut body = serde_json::json!({
+        "doc_id": doc_id,
+        "text": text,
+    });
+    if let Some(cap) = capability {
+        if !cap.is_empty() {
+            body["capability"] = serde_json::Value::String(cap.to_string());
+        }
+    }
+    let mut req = client.post(&url).json(&body);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let j: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "index failed (HTTP {}): {}",
+            status,
+            j.get("error").map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    println!("indexed document '{doc_id}' successfully");
+    if let Some(meta) = j.get("metadata") {
+        println!("metadata: {meta}");
+    }
+    Ok(())
+}
+
+/// Query the semantic retrieval index and return top-k results.
+async fn rag_query(config_path: &Path, text: &str, k: usize) -> Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!("--text must not be empty");
+    }
+    let (client, base_url, token) = build_local_client(config_path)?;
+    let url = format!("{base_url}/rag/query");
+    let body = serde_json::json!({
+        "query": text,
+        "k": k,
+    });
+    let mut req = client.post(&url).json(&body);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let j: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "query failed (HTTP {}): {}",
+            status,
+            j.get("error").map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    let results = j
+        .get("results")
+        .or_else(|| j.get("chunks"))
+        .cloned()
+        .unwrap_or_default();
+    let results_array: Vec<_> = if let Some(arr) = results.as_array() {
+        arr.clone()
+    } else {
+        vec![results]
+    };
+    println!("retrieval results ({count}):", count = results_array.len());
+    for (i, chunk) in results_array.iter().enumerate() {
+        let score = chunk
+            .get("score")
+            .map(|s| format!(" (score: {s})"))
+            .unwrap_or_default();
+        let content = if let Some(t) = chunk.get("text").and_then(|t| t.as_str()) {
+            t.to_string()
+        } else {
+            chunk
+                .to_string()
+                .trim_matches('"')
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        let truncated: String = content.chars().take(200).collect();
+        println!("\n[{}]{}{}", i + 1, score, truncated);
+    }
+    if results_array.is_empty() {
+        println!("no matching chunks found");
+    }
+    Ok(())
+}
+
+/// List all persistent memory entries with scope, level and access policy.
+async fn memory_list(config_path: &Path) -> Result<()> {
+    let (client, base_url, token) = build_local_client(config_path)?;
+    let url = format!("{base_url}/memory");
+    let mut req = client.get(&url);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let j: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "memory query failed (HTTP {}): {}",
+            status,
+            j.get("error").map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    let entries = j
+        .get("entries")
+        .or_else(|| j.get("memory"))
+        .cloned()
+        .unwrap_or_default();
+    let entries_array = if let Some(arr) = entries.as_array() {
+        arr.clone()
+    } else {
+        vec![entries]
+    };
+    println!(
+        "persistent memory entries ({count}):",
+        count = entries_array.len()
+    );
+    for entry in &entries_array {
+        let key = entry.get("key").and_then(|k| k.as_str()).unwrap_or("?");
+        let scope = entry.get("scope").and_then(|s| s.as_str()).unwrap_or("?");
+        let level = entry.get("level").and_then(|l| l.as_str()).unwrap_or("?");
+        let confidence = entry
+            .get("confidence")
+            .map(|c| c.to_string())
+            .unwrap_or("?".to_string());
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?");
+        let preview = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        println!("  [{key}] scope={scope} level={level} conf={confidence} ts={timestamp}");
+        if !preview.is_empty() {
+            println!("    \"{preview}\"");
+        }
+    }
+    if entries_array.is_empty() {
+        println!("no persistent memory entries found");
+    }
+    Ok(())
 }
 
 /// Loads the config + identity and returns this node's default local agents
