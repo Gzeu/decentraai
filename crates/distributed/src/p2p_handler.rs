@@ -140,23 +140,39 @@ impl decentraai_p2p::RequestHandler for DistributedP2PHandler {
         // P1 (Collective Intelligence): a signed agent advertisement is
         // verified before the agent view is updated. The signer's public key
         // must map to the advertisement's own peer_id (anti-spoof).
+        //
+        // NOTE: SignedAgentAdvertisement and SignedComputeAdvertisement share
+        // the same wire envelope (opaque bytes + signature), so an unsigned
+        // inner payload that is really a ComputeAdvertisement would deserialize
+        // into the agent envelope too. To avoid swallowing a compute ad in this
+        // branch, we only proceed as an agent advertisement when the inner
+        // payload decodes as an AgentAdvertisement; otherwise we fall through
+        // to the compute branch below.
         if let Ok(signed) = deserialize_message::<SignedAgentAdvertisement>(request,
             decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
         ) {
-            match crate::agents::verify_agent_advertisement_signed(&signed) {
-                Ok(adv) => {
-                    if let Some(agents) = &self.agents {
-                        let agents = agents.clone();
-                        tokio::spawn(async move {
-                            agents.process_advertisement(adv);
-                        });
+            let inner_is_agent = serde_json::from_slice::<decentraai_agents::AgentAdvertisement>(
+                &signed.advertisement,
+            )
+            .is_ok();
+            if inner_is_agent {
+                match crate::agents::verify_agent_advertisement_signed(&signed) {
+                    Ok(adv) => {
+                        if let Some(agents) = &self.agents {
+                            let agents = agents.clone();
+                            tokio::spawn(async move {
+                                agents.process_advertisement(adv);
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "rejected signed agent advertisement");
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "rejected signed agent advertisement");
-                }
+                return Ok(Vec::new()); // No response for advertisements
             }
-            return Ok(Vec::new()); // No response for advertisements
+            // Not an agent advertisement (e.g. a compute advertisement in the
+            // same envelope) — fall through to the compute branch.
         }
 
         // P3: a signed compute advertisement is verified before being trusted.
@@ -644,5 +660,94 @@ mod tests {
             "advertisement lands in the compute registry"
         );
         assert_eq!(workers[0].node_name, "gpu-rig");
+    }
+
+    #[tokio::test]
+    async fn signed_compute_advertisement_is_not_swallowed_by_the_agent_branch() {
+        // Regression: SignedAgentAdvertisement and SignedComputeAdvertisement
+        // share the same wire envelope. A SIGNED compute advertisement used to
+        // be caught by the agent branch first, whose verify failed with
+        // "missing field protocol_version" (the inner payload is a
+        // ComputeAdvertisement, not an AgentAdvertisement), and the branch
+        // returned without processing — so the remote worker never appeared.
+        use decentraai_compute::{GpuSpec, ServedModel};
+        use decentraai_identity::Identity;
+        use decentraai_protocol::sign_compute_advertisement;
+
+        let identity = Identity::generate();
+        let peer_id = create_test_peer_id();
+        let manager = Arc::new(crate::compute::ComputeManager::new(
+            peer_id,
+            "coordinator".into(),
+            std::collections::HashSet::new(),
+        ));
+
+        let mut handler = DistributedP2PHandler::new();
+        handler.set_compute_manager(manager.clone());
+        handler.set_tracker(Arc::new(crate::tracker::RequestTracker::new()));
+
+        // The worker's advertised peer_id must match the signing identity
+        // (anti-spoof): derive it from the identity's libp2p key.
+        let kp = libp2p::identity::Keypair::ed25519_from_bytes(identity.signing_key_bytes()).unwrap();
+        let worker_peer = libp2p::PeerId::from(kp.public());
+        let adv = decentraai_compute::ComputeAdvertisement {
+            peer_id: worker_peer,
+            node_name: "signed-rig".into(),
+            node_id: "dca-signedrig".into(),
+            node_version: env!("CARGO_PKG_VERSION").to_string(),
+            capability: decentraai_compute::ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 32 * 1024,
+                gpu: Some(GpuSpec {
+                    name: "RTX".into(),
+                    vram_mb: 24 * 1024,
+                    driver: "565".into(),
+                }),
+                engine: "llama_server".into(),
+                served_models: vec![ServedModel {
+                    model_hash: "abc".into(),
+                    file_name: "m.gguf".into(),
+                    size_mb: 2048,
+                    est_ram_mb: 256,
+                    est_vram_mb: 3072,
+                    context_tokens: 0,
+                }],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: decentraai_compute::ComputeAvailability {
+                available_ram_mb: 16 * 1024,
+                available_vram_mb: Some(18 * 1024),
+                load_percent: 10,
+                queue_depth: 0,
+                tokens_per_second: 60,
+                current_latency_ms: 90,
+                status: decentraai_compute::WorkerHealth::Ready,
+                gpu_temperature_celsius: None,
+                gpu_utilization_percent: None,
+                battery_percent: None,
+            },
+            announced_at_ms: 1_700_000_000_000,
+            accepts_remote_inference: true,
+        };
+
+        // Sign the compute advertisement with an identity whose peer id maps
+        // to the advertisement's own peer_id.
+        let adv_bytes = serde_json::to_vec(&adv).unwrap();
+        let signed = sign_compute_advertisement(&identity.signing_key_bytes(), &adv_bytes);
+        let payload = serialize_message(&signed).unwrap();
+        let result = handler.handle(&payload);
+        assert!(result.is_ok(), "signed compute ad must be processed: {result:?}");
+
+        // The remote worker must land in the compute registry (not be dropped
+        // by the agent branch).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let workers = manager.workers().await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "signed compute advertisement must reach the compute registry"
+        );
+        assert_eq!(workers[0].node_name, "signed-rig");
     }
 }
