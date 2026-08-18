@@ -1564,6 +1564,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // P3.5/P9: the API can trigger collective workflows by delegating to
         // the node's local agents.
         state.attach_orchestrator(agent_orchestrator.clone());
+        // P8: expose the dataset/skill registry to the dashboard (read-only).
+        state.attach_skills(Arc::new(decentraai_agents::demo_skill_registry()));
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.
@@ -3533,35 +3535,12 @@ fn agent_talent_tree(have: &str, budget_mb: u64, target: Option<&str>) -> Result
 /// Demonstrates the mechanism with a seeded code-finetune dataset/skill and
 /// the local model's inferred base capabilities.
 fn agent_skill(config_path: &std::path::Path, model_override: Option<&str>) -> Result<()> {
-    use decentraai_agents::{
-        DatasetDescriptor, DatasetKind, SkillDescriptor, SkillRegistry, build_agent_capabilities,
-    };
+    use decentraai_agents::{build_agent_capabilities, demo_skill_registry};
     use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
 
-    // Seed a dataset + a skill (demonstration data, clearly labelled).
-    let mut registry = SkillRegistry::new();
-    let dataset = DatasetDescriptor::new(
-        "code_finetune_2024",
-        "Code fine-tune 2024",
-        vec![CapabilityKind::Coding, CapabilityKind::ToolCalling],
-        DatasetKind::FineTune,
-    )
-    .from("hf:example/code-finetune")
-    .sized(10 * 1024 * 1024 * 1024, 0.9)
-    .with_provenance(Provenance::Verified)
-    .with_license("MIT");
-    registry.add_dataset(dataset.clone())?;
-    registry.add_skill(
-        SkillDescriptor::new(
-            "code-agent",
-            "Code agent",
-            "code_finetune_2024",
-            Some(CapabilityKind::Coding),
-            vec![CapabilityKind::ToolCalling],
-        )
-        .with_prerequisites(vec![CapabilityKind::Reasoning])
-        .with_resource(1024),
-    )?;
+    // Single source of truth for the demo data (shared with the runtime
+    // /v1/skills view) — never duplicated.
+    let registry = demo_skill_registry();
 
     // Resolve the served model (override or default local agents' model).
     let model_name = match model_override {

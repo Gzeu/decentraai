@@ -289,6 +289,9 @@ pub struct ApiState {
     /// delegating stages to local/remote agents (P3.5/P9). `None` when the
     /// node is not an agent host.
     orchestrator: Option<Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>>,
+    /// The P8 dataset/skill registry (read-only view for the dashboard).
+    /// `None` when the node does not expose a skill registry.
+    skills: Option<Arc<decentraai_agents::SkillRegistry>>,
 }
 
 impl ApiState {
@@ -335,6 +338,7 @@ impl ApiState {
             distributed: None,
             agents: None,
             orchestrator: None,
+            skills: None,
         }
     }
 
@@ -361,6 +365,11 @@ impl ApiState {
         orchestrator: Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>,
     ) {
         self.orchestrator = Some(orchestrator);
+    }
+
+    /// Attaches the P8 dataset/skill registry (read-only) for the dashboard.
+    pub fn attach_skills(&mut self, skills: Arc<decentraai_agents::SkillRegistry>) {
+        self.skills = Some(skills);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4511,6 +4520,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/agents", get(agents_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
+        .route("/v1/skills", get(skills_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5646,8 +5656,154 @@ async fn agents_orchestrate_handler(
         .into_response()
 }
 
-/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,
-/// locality), connected peers, per-peer last-known LAN addresses, and the
+/// Skills (P8 dataset/skill) view-model — read-only, for the dashboard.
+///
+/// Returns the dataset/skill registry plus, for each skill, its status
+/// (AVAILABLE when applicable to the local agent's base capabilities, BLOCKED
+/// otherwise) and the capabilities the *dataset* develops. Includes a clearly
+/// labelled demonstration for the Qwen-Coder model (Coding + Reasoning →
+/// Tool Calling) computed from the real registry, never duplicated frontend
+/// constants. `runtime_evidence: false` — no talent/agent-power is claimed
+/// until the dataset→talent→execution runtime wiring lands.
+async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    use decentraai_agents::build_agent_capabilities;
+    use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
+
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(registry) = &state.skills else {
+        let body = serde_json::json!({ "attached": false, "datasets": [], "skills": [], "runtime_evidence": false });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+
+    // The local agent's base capabilities (the live agent view, real).
+    let local_base: Vec<CapabilityClaim> = state
+        .agents
+        .as_ref()
+        .map(|agents| agents.view())
+        .map(|views| {
+            views
+                .into_iter()
+                .filter(|v| !v.remote)
+                .flat_map(|v| v.record.semantic_capabilities)
+                .collect()
+        })
+        .unwrap_or_default();
+    let local_base_kinds: Vec<CapabilityKind> = local_base.iter().map(|c| c.capability).collect();
+
+    let datasets: Vec<serde_json::Value> = registry
+        .datasets()
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "kind": serde_json::to_value(d.kind).unwrap_or_default(),
+                "source": d.source,
+                "size_bytes": d.size_bytes,
+                "quality": d.quality,
+                "provenance": serde_json::to_value(d.provenance).unwrap_or_default(),
+                "license": d.license,
+                "develops": d.develops.iter().map(|k| k.label()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let local_build = build_agent_capabilities(local_base.clone(), registry);
+    let local_unlocked: Vec<String> = local_build
+        .unlocked
+        .iter()
+        .map(|c| c.capability.label().to_string())
+        .collect();
+
+    let skills: Vec<serde_json::Value> = registry
+        .skills()
+        .into_iter()
+        .map(|s| {
+            let dataset = registry.dataset(&s.dataset_id);
+            let applicable = s.applicable_to(&local_base_kinds, dataset);
+            // Dataset is evidence: the skill's unlocked capabilities are the
+            // dataset's develops (build path), filtered by applicability.
+            let unlocked: Vec<String> = if applicable {
+                dataset
+                    .map(|d| d.develops.iter().map(|k| k.label().to_string()).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let status = if applicable { "available" } else { "blocked" };
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "dataset_id": s.dataset_id,
+                "requires_model": s.requires_model.map(|k| k.label()),
+                "prerequisites": s.prerequisites.iter().map(|k| k.label()).collect::<Vec<_>>(),
+                "resource_mb": s.resource_mb,
+                "develops": s.develops.iter().map(|k| k.label()).collect::<Vec<_>>(),
+                "unlocked": unlocked,
+                "status": status,
+            })
+        })
+        .collect();
+
+    // Demonstration: the Qwen-Coder model (Coding + Reasoning base) computed
+    // from the real registry — this is the visible P8 demo.
+    let demo_base = vec![
+        CapabilityClaim {
+            capability: CapabilityKind::Chat,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::TextGeneration,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::Coding,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::Reasoning,
+            provenance: Provenance::Inferred,
+        },
+    ];
+    let demo_build = build_agent_capabilities(demo_base.clone(), registry);
+    let demo_unlocked: Vec<String> = demo_build
+        .unlocked
+        .iter()
+        .map(|c| c.capability.label().to_string())
+        .collect();
+
+    let body = serde_json::json!({
+        "attached": true,
+        "datasets": datasets,
+        "skills": skills,
+        "model": {
+            "name": state.info.model_name,
+            "base_capabilities": local_base_kinds.iter().map(|k| k.label()).collect::<Vec<_>>(),
+            "applicable_skills": local_build.unlocked.len(),
+            "unlocked": local_unlocked,
+        },
+        "demo": {
+            "model": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+            "base": ["chat", "text_generation", "coding", "reasoning"],
+            "skill_id": "code-agent",
+            "unlocked": demo_unlocked,
+        },
+        "runtime_evidence": false,
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// NETWORK real state: measured per-peer link metrics (RTT, bandwidth,/// locality), connected peers, per-peer last-known LAN addresses, and the
 /// local peer + its own addresses. Empty when no compute/P2P.
 async fn network_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     // H4 role separation: the advanced operational view needs operator/admin.
@@ -8941,6 +9097,43 @@ mod tests {
         assert!(JS_TEMPLATE.contains("cg-capability-claims"));
         assert!(JS_TEMPLATE.contains("cg-coverage"));
         assert!(JS_TEMPLATE.contains("semantic_capabilities"));
+    }
+
+    #[test]
+    fn dashboard_skills_view_is_present_and_advanced() {
+        let adv_open = DASHBOARD_HTML
+            .find("<div id=\"advanced\"")
+            .expect("advanced container present");
+        // Nav entry under MESH + the view section, both in the advanced area.
+        assert!(
+            DASHBOARD_HTML.contains("data-view=\"skills\""),
+            "Skills nav entry must exist"
+        );
+        for needle in [
+            "id=\"view-skills\"",
+            "id=\"skills-count\"",
+            "id=\"skills-flow\"",
+            "id=\"skills-demo\"",
+        ] {
+            let idx = DASHBOARD_HTML
+                .find(needle)
+                .unwrap_or_else(|| panic!("skills element {needle} must be present"));
+            assert!(
+                idx > adv_open,
+                "{needle} must be inside the advanced container"
+            );
+        }
+        // Overview summary elements (normal-user view, not advanced).
+        assert!(DASHBOARD_HTML.contains("skills-summary-registered"));
+        assert!(DASHBOARD_HTML.contains("skills-summary-applicable"));
+        // The JS renders skills from the real /v1/skills view-model — never
+        // inventing capabilities/talents/powers in the frontend.
+        assert!(JS_TEMPLATE.contains("function renderSkills(d)"));
+        assert!(JS_TEMPLATE.contains("renderSkills(sk)"));
+        assert!(JS_TEMPLATE.contains("skillCard(s, datasets)"));
+        assert!(JS_TEMPLATE.contains("runtime_evidence"));
+        assert!(JS_TEMPLATE.contains("awaiting runtime evidence"));
+        assert!(JS_TEMPLATE.contains("unlocked"));
     }
 
     // The /v1/agents handler must keep returning a well-formed payload when the

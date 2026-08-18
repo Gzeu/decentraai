@@ -371,6 +371,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 
     <div class="rail-label">Mesh</div>
     <button class="nav-item" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
+    <button class="nav-item" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
@@ -406,6 +407,17 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
         <span class="now-label">NOW</span>
         <span id="now-state">connecting to the fabric…</span>
         <span class="planner-chip" id="planner-chip"><span class="pd" id="planner-dot"></span>planner · <b id="planner-state">idle</b></span>
+      </div>
+
+      <!-- SKILLS SUMMARY (P8): compact, clickable → Skills view -->
+      <div class="card" style="margin-top:12px;cursor:pointer" onclick="show('skills')" title="Open Skills view">
+        <h2>Skills <span class="count">P8 · dataset/skill</span></h2>
+        <div class="metric-row" style="display:flex;gap:16px;flex-wrap:wrap">
+          <div class="metric"><div class="label">Registered</div><div class="value" id="skills-summary-registered">—</div></div>
+          <div class="metric"><div class="label">Applicable</div><div class="value" id="skills-summary-applicable">—</div></div>
+          <div class="metric"><div class="label">Unlocked caps</div><div class="value" id="skills-summary-unlocked">—</div></div>
+          <div class="metric"><div class="label">Verified evidence</div><div class="value" id="skills-summary-verified">—</div></div>
+        </div>
       </div>
 
       <!-- primary: the living fabric stage -->
@@ -743,6 +755,27 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
             </div>
           </div>
           <div id="wf-result" class="muted" style="font-size:12px;margin-top:10px">Run a workflow to see its stages and final output.</div>
+        </div>
+      </section>
+
+      <!-- SKILLS (P8 dataset/skill): the dataset → skill → capability chain.
+           Data comes from /v1/skills (the real SkillRegistry) — never invented
+           in the frontend. Provenance is shown exactly as the backend reports
+           it; no talent/agent-power is claimed until runtime evidence exists. -->
+      <section class="view" id="view-skills">
+        <div class="card">
+          <h2>Dataset / Skill registry <span class="count" id="skills-count"></span></h2>
+          <div id="skills-loading" class="empty">loading…</div>
+          <div id="skills" class="worker-cards"></div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Capability flow <span class="count">dataset = evidence · skill = application gate</span></h2>
+          <div id="skills-flow" class="muted" style="font-size:12px">no skills registered</div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Demonstration <span class="count">P8 demo · real registry data</span></h2>
+          <div id="skills-demo" class="muted" style="font-size:12px">loading…</div>
+          <p class="mono" style="font-size:11px;color:var(--faint);margin-top:8px">Demonstration dataset/skill — not production evidence. Capabilities are unlocked by <code>build_agent_capabilities</code> from the dataset's evidence; provenance is shown as the backend reports it.</p>
         </div>
       </section>
 
@@ -1247,8 +1280,8 @@ const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'a
 const isAdmin = !!token;
 
 // ---- navigation ------------------------------------------------------------
-const VIEWS = ['overview','chat','fabric','decisions','execution','agents','workers','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','workers','network','models','observability','recovery','diag','security','settings'];
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   current = view;
@@ -2114,9 +2147,98 @@ function runCollectiveWorkflow(){
       '<div style="margin-top:10px"><b style="font-size:12px">Final output</b><div class="mono" style="font-size:11px;color:var(--muted);word-break:break-word;margin-top:4px">'+out+'</div></div>';
   }).catch(e => { status.textContent = 'error'; result.innerHTML = '<div class="badge bad">network error</div> ' + esc(String(e)); });
 }
+// ---- Skills (P8 dataset/skill) ----
+// Renders /v1/skills: the real dataset/skill registry, per-skill status and
+// unlocked capabilities (from build_agent_capabilities), the capability flow,
+// and the demonstration. Provenance is shown exactly as the backend reports
+// it; no talent/agent-power is claimed until runtime_evidence is true.
+function capChips(caps){
+  return (caps || []).map(c => '<span class="nc-model" title="'+esc(c)+'">'+esc(c)+'</span>').join('');
+}
+function provBadge(prov){
+  if (prov === 'verified') return '<span class="badge ok" title="verified evidence">VERIFIED</span>';
+  if (prov === 'inferred') return '<span class="badge warn" title="inferred, not verified">INFERRED</span>';
+  return '<span class="badge faint">'+esc(prov||'—')+'</span>';
+}
+function statusBadge(status){
+  if (status === 'available') return '<span class="badge ok">available</span>';
+  if (status === 'blocked') return '<span class="badge warn">blocked</span>';
+  return '<span class="badge faint">'+esc(status||'—')+'</span>';
+}
+function skillCard(s, datasets){
+  const ds = (datasets || []).find(d => d.id === s.dataset_id) || {};
+  const prov = ds.provenance || 'inferred';
+  const requires = s.requires_model ? esc(s.requires_model) : 'any model';
+  const prereqs = (s.prerequisites || []).join(', ') || 'none';
+  return '<div class="worker-card">'+
+    '<div class="wc-head">'+
+      '<span class="wc-name">'+esc(s.name)+'</span>'+
+      statusBadge(s.status)+
+      provBadge(prov)+
+      '<span class="nc-tag">'+esc(s.id)+'</span>'+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>dataset</b> '+esc(ds.name || s.dataset_id)+'</span>'+
+      '<span><b>kind</b> '+esc(ds.kind || '—')+'</span>'+
+      '<span><b>quality</b> '+((ds.quality != null) ? Math.round(ds.quality*100)+'%' : '—')+'</span>'+
+    '</div>'+
+    '<div class="wc-meta">'+
+      '<span><b>source</b> <code>'+esc(ds.source || '—')+'</code></span>'+
+      '<span><b>requires model</b> '+requires+'</span>'+
+      '<span><b>prerequisites</b> '+esc(prereqs)+'</span>'+
+    '</div>'+
+    '<div class="wc-meta"><span><b>resource</b> '+((s.resource_mb||0)+' MiB')+'</span></div>'+
+    '<div class="wc-meta"><span><b>unlocks</b> '+(capChips(s.unlocked) || '<span class="badge faint">none (blocked)</span>')+'</span></div>'+
+  '</div>';
+}
+function skillFlow(d){
+  // MODEL -> DATASET -> SKILL -> CAPABILITIES -> TALENT TREE -> AGENT POWER
+  // The final steps show "awaiting runtime evidence" until runtime_evidence.
+  const step = (label, val, extra) => '<div class="ds-step" style="margin-bottom:4px"><span class="pipe-name">'+label+'</span><div>'+val+(extra||'')+'</div></div>';
+  const demo = d.demo || {};
+  const modelCaps = capChips(demo.base || []);
+  const unlocked = capChips(demo.unlocked || []);
+  const runtimeNote = d.runtime_evidence
+    ? '<span class="badge ok">runtime evidence</span>'
+    : '<span class="badge faint">awaiting runtime evidence</span>';
+  return '<div class="card sub">'+
+    step('MODEL', '<code>'+esc(demo.model||'—')+'</code> '+modelCaps)+
+    step('DATASET', '<code>'+esc((d.datasets||[])[0] ? d.datasets[0].name : '—')+'</code> '+provBadge((d.datasets||[])[0] ? d.datasets[0].provenance : null))+
+    step('SKILL', '<code>'+esc(demo.skill_id||'—')+'</code>')+
+    step('CAPABILITIES', unlocked)+
+    step('TALENT TREE', runtimeNote)+
+    step('AGENT POWER', runtimeNote)+
+  '</div>';
+}
+function renderSkills(d){
+  if (!d) { return; }
+  if (!d.attached) { $('skills-count').textContent = 'not attached'; $('skills').innerHTML = '<div class="empty">registry unavailable</div>'; $('skills-flow').textContent = 'registry unavailable'; return; }
+  $('skills-count').textContent = (d.skills || []).length + ' skill(s)';
+  const skills = d.skills || [];
+  $('skills').innerHTML = skills.length
+    ? skills.map(s => skillCard(s, d.datasets)).join('')
+    : '<div class="empty">no skills registered</div>';
+  $('skills-flow').innerHTML = skills.length ? skillFlow(d) : 'no skills registered';
+  // Demonstration card.
+  const demo = d.demo || {};
+  const demoUnlocked = capChips(demo.unlocked || []);
+  $('skills-demo').innerHTML = demo.model
+    ? '<div class="card sub"><div class="wc-meta"><span><b>model</b> <code>'+esc(demo.model)+'</code></span><span><b>skill</b> <code>'+esc(demo.skill_id||'—')+'</code></span></div><div class="wc-meta"><span><b>base</b> '+capChips(demo.base||[])+'</span></div><div class="wc-meta"><span><b>unlocks</b> '+demoUnlocked+'</span></div></div>'
+    : 'no demonstration';
+  // Overview summary.
+  const applicable = skills.filter(s => s.status === 'available').length;
+  const unlockedSet = new Set();
+  skills.forEach(s => (s.unlocked||[]).forEach(u => unlockedSet.add(u)));
+  const verified = (d.datasets||[]).filter(ds => ds.provenance === 'verified').length;
+  const setV = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  setV('skills-summary-registered', skills.length);
+  setV('skills-summary-applicable', applicable);
+  setV('skills-summary-unlocked', unlockedSet.size);
+  setV('skills-summary-verified', verified);
+}
+
 // Collective graph (P16): aggregate metrics, role breakdown and a
-// provenance-aware capability coverage table — all derived from the real
-// /v1/agents payload, never mock data.
+// provenance-aware capability coverage table — all derived from the real// /v1/agents payload, never mock data.
 function renderCollectiveGraph(a){
   const agents = (a && a.agents) || [];
   const capClaims = agents.reduce((n, ag) => n + ((ag.semantic_capabilities || []).length), 0);
@@ -4036,6 +4158,7 @@ async function refresh(){
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
   try { const ag = await (await fetch('/v1/agents', { headers })).json(); renderAgents(ag); } catch (e) {}
+  try { const sk = await (await fetch('/v1/skills', { headers })).json(); renderSkills(sk); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   loadTierSuggest();
   try { n = await (await fetch('/v1/network', { headers })).json(); renderNetwork(n); } catch (e) {}
@@ -4102,7 +4225,7 @@ Object.assign(window, {
   hubCloseDetail, hubCompareFit, hubCompareSelected, hubOpenDetail, hubPull,
   hubPullVariant, hubSearch, hubToggleCompare, loadVariantFit, openGenEdit,
   openResEdit, previewDecision, removeModel, revokeConsumerKey,
-  runCollectiveWorkflow, useModelOption, variantCompare,
+  runCollectiveWorkflow, show, useModelOption, variantCompare,
 });
 refresh(); setInterval(refresh, 3000);
 "##;

@@ -382,6 +382,41 @@ pub fn build_agent_capabilities(
     }
 }
 
+/// Builds the demonstration dataset/skill registry (the P8 dataset demo).
+///
+/// Single source of truth for the seeded example so the CLI (`agent skill`)
+/// and the runtime (`/v1/skills` view) render the exact same data — never
+/// duplicated frontend constants. Clearly labelled demonstration data, not
+/// production evidence: it exists to show the dataset → skill → capability
+/// mechanism, and its capability claims are marked with their provenance.
+pub fn demo_skill_registry() -> SkillRegistry {
+    let mut registry = SkillRegistry::new();
+    let dataset = DatasetDescriptor::new(
+        "code_finetune_2024",
+        "Code fine-tune 2024",
+        vec![CapabilityKind::Coding, CapabilityKind::ToolCalling],
+        DatasetKind::FineTune,
+    )
+    .from("hf:example/code-finetune")
+    .sized(10 * 1024 * 1024 * 1024, 0.9)
+    .with_provenance(Provenance::Verified)
+    .with_license("MIT");
+    // A registered dataset is not silently inserted — the demo is deterministic.
+    let _ = registry.add_dataset(dataset);
+    let _ = registry.add_skill(
+        SkillDescriptor::new(
+            "code-agent",
+            "Code agent",
+            "code_finetune_2024",
+            Some(CapabilityKind::Coding),
+            vec![CapabilityKind::Coding, CapabilityKind::ToolCalling],
+        )
+        .with_prerequisites(vec![CapabilityKind::Reasoning])
+        .with_resource(1024),
+    );
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

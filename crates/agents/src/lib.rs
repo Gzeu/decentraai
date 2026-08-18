@@ -64,7 +64,7 @@ pub use agent::{
 pub use capability::{AgentCapability, model_capabilities_from_claims};
 pub use dataset::{
     CapabilityBuild, DatasetDescriptor, DatasetError, DatasetKind, SkillDescriptor, SkillRegistry,
-    build_agent_capabilities,
+    build_agent_capabilities, demo_skill_registry,
 };
 pub use delegation::{
     DelegationError, DelegationPlan, DelegationPlanner, DelegationResult, DelegationStage,
