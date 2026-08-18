@@ -212,7 +212,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let own = messenger.p2p.lock().unwrap().as_ref().unwrap().local_peer_id();
+        let own = messenger
+            .p2p
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .local_peer_id();
         let msg = AgentMessage::new("m", "a:1", "b:1", MessageKind::Delegate)
             .with_from_peer(own.to_string())
             .with_created_at_ms(1_700_000_000_000);
