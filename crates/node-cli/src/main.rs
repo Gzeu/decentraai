@@ -458,6 +458,21 @@ enum AgentCommand {
         #[arg(long, default_value = "research_report")]
         template: String,
     },
+    /// Run a collective workflow on the local node via its API
+    /// (POST /v1/agents/orchestrate). Useful for scripting.
+    WorkflowRun {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// The workflow prompt.
+        #[arg(long)]
+        prompt: String,
+        /// The workflow template id.
+        #[arg(long, default_value = "research_report")]
+        template: String,
+        /// Optional semantic retrieval query (RAG context per stage).
+        #[arg(long)]
+        retrieve: Option<String>,
+    },
     /// Show a reputation profile for one local agent, built from synthetic
     /// sample data (this demonstrates the P6 reputation model locally — the
     /// numbers are NOT real measurements). Read-only.
@@ -3286,6 +3301,12 @@ fn agent_command(command: AgentCommand) -> Result<()> {
         AgentCommand::List { config } => agent_list(&config),
         AgentCommand::Show { config, agent } => agent_show(&config, &agent),
         AgentCommand::Workflow { template, .. } => agent_workflow(&template),
+        AgentCommand::WorkflowRun {
+            config,
+            prompt,
+            template,
+            retrieve,
+        } => agent_workflow_run(&config, &prompt, &template, retrieve.as_deref()),
         AgentCommand::Reputation {
             agent, min_samples, ..
         } => agent_reputation(&agent, min_samples),
@@ -3516,6 +3537,69 @@ fn agent_workflow(template: &str) -> Result<()> {
             step.evidence,
             deps
         );
+    }
+    Ok(())
+}
+
+/// Runs a collective workflow on the local node via its API
+/// (POST /v1/agents/orchestrate). Reads the node's API port + token from the
+/// config/data dir. Prints the verdict + generated output for scripting.
+fn agent_workflow_run(
+    config_path: &Path,
+    prompt: &str,
+    template: &str,
+    retrieve: Option<&str>,
+) -> Result<()> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("--prompt must not be empty");
+    }
+    let config = NodeConfig::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let data_dir = expand_tilde(&config.node.data_dir);
+    let api_port = config.inference.api_port;
+    // Read the master token if present (optional; the API may be open).
+    let token = std::fs::read_to_string(data_dir.join("runtime/api.token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{api_port}/v1/agents/orchestrate");
+    let mut body = serde_json::json!({ "prompt": prompt, "template": template });
+    if let Some(r) = retrieve {
+        if !r.is_empty() {
+            body["retrieve"] = serde_json::Value::String(r.to_string());
+        }
+    }
+    let mut req = client.post(&url).json(&body);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (status, j): (reqwest::StatusCode, serde_json::Value) = rt.block_on(async {
+        let resp = req.send().await?;
+        let status = resp.status();
+        let j = resp.json().await?;
+        Ok::<_, reqwest::Error>((status, j))
+    })?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "workflow failed (HTTP {}): {}",
+            status,
+            j.get("error").map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    let verdict = j.get("verdict").cloned().unwrap_or_default();
+    println!("verdict: {verdict}");
+    let fo = j
+        .get("final_output")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(text) = fo.get("text").and_then(|v| v.as_str()) {
+        println!("output: {text}");
+    } else {
+        println!("output: {fo}");
     }
     Ok(())
 }

@@ -979,6 +979,7 @@ dependencies = [
  "decentraai-system-probe",
  "decentraai-tokens",
  "libp2p",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
