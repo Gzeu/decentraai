@@ -3944,6 +3944,22 @@ fn model_base_capabilities(model_name: &str) -> Vec<decentraai_hub::capability::
             capability: CapabilityKind::Reasoning,
             provenance: Provenance::Inferred,
         },
+        CapabilityClaim {
+            capability: CapabilityKind::DocumentUnderstanding,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::Summarization,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::Classification,
+            provenance: Provenance::Inferred,
+        },
+        CapabilityClaim {
+            capability: CapabilityKind::StructuredOutput,
+            provenance: Provenance::Inferred,
+        },
     ];
     if lower.contains("coder") {
         caps.push(CapabilityClaim {
