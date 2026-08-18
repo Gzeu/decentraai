@@ -579,16 +579,26 @@ impl TtsServer {
     /// Writes the embedded script and spawns the Python venv interpreter.
     /// Fails fast when the venv or model files are missing so the caller can
     /// disable TTS gracefully (the node must not fail startup for voice).
-    pub fn start(data_dir: &Path, voice: &str, speed: f64) -> Result<Self> {
+    ///
+    /// `voice` is a Piper voice id (`ro_RO-raluca-high`, `ro_RO-lili-high`,
+    /// `ro_RO-mihai-medium`, …) whose `.onnx` + `.onnx.json` live in
+    /// `<data_dir>/tts/models/piper-ro/`.
+    pub fn start(data_dir: &Path, voice: &str, _speed: f64) -> Result<Self> {
         let tts_dir = data_dir.join("tts");
         let venv_python = tts_dir.join("venv").join("bin").join("python");
-        let model = tts_dir.join("models").join("kokoro-v1.0.onnx");
-        let voices = tts_dir.join("models").join("voices-v1.0.bin");
+        let model = tts_dir
+            .join("models")
+            .join("piper-ro")
+            .join(format!("{voice}.onnx"));
+        let config = tts_dir
+            .join("models")
+            .join("piper-ro")
+            .join(format!("{voice}.onnx.json"));
         let script = tts_dir.join("tts_server.py");
         for (what, path) in [
             ("python venv", &venv_python),
             ("model", &model),
-            ("voices", &voices),
+            ("voice config", &config),
         ] {
             if !path.exists() {
                 bail!(
@@ -612,15 +622,14 @@ impl TtsServer {
             script.to_string_lossy().as_ref(),
             "--model",
             model.to_string_lossy().as_ref(),
-            "--voices",
-            voices.to_string_lossy().as_ref(),
+            "--config",
+            config.to_string_lossy().as_ref(),
             "--port",
             &port.to_string(),
             "--voice",
             voice,
         ])
         .env("PYTHONPATH", site_packages.to_string_lossy().as_ref())
-        .env("KOKORO_SPEED", speed.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -695,7 +704,7 @@ impl TtsManager {
     pub fn disabled() -> Self {
         Self {
             server: None,
-            voice: "af_heart".to_string(),
+            voice: "ro_RO-raluca-high".to_string(),
             speed: 1.0,
         }
     }

@@ -5635,7 +5635,7 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
 }
 
 /// POST /v1/tts — synthesize speech for the dashboard chat speak button.
-/// Body: `{"text": "...", "voice": "af_heart"?, "speed": 1.0?}`. Returns a
+/// Body: `{"text": "...", "voice": "ro_RO-raluca-high"?, "speed": 1.0?}`. Returns a
 /// 16-bit mono 24 kHz WAV when TTS is enabled. Auth: any valid token
 /// (same gate as inference) plus the tier rate limit — voice synthesis burns
 /// CPU, so the per-token window applies. Prompts/outputs are never logged.
@@ -9864,7 +9864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state_with_tts(
             dir.path(),
-            TtsManager::new(None, "af_heart".to_string(), 1.0),
+            TtsManager::new(None, "ro_RO-raluca-high".to_string(), 1.0),
         )
         .await;
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
@@ -9886,7 +9886,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state_with_tts(
             dir.path(),
-            TtsManager::new(None, "af_bella".to_string(), 1.25),
+            TtsManager::new(None, "ro_RO-lili-high".to_string(), 1.25),
         )
         .await;
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
@@ -9899,7 +9899,7 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["tts"]["enabled"], false);
-        assert_eq!(body["tts"]["voice"], "af_bella");
+        assert_eq!(body["tts"]["voice"], "ro_RO-lili-high");
         assert_eq!(body["tts"]["speed"], 1.25);
     }
 

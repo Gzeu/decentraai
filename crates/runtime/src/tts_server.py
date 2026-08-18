@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""DecentraAI TTS server — Kokoro-82M ONNX voice synthesis.
+"""DecentraAI TTS server — Piper VITS voice synthesis (Romanian-capable).
 
 External subprocess (never FFI): the node spawns this process and proxies
 audio through the authenticated `/v1/tts` API. Prompts and outputs are
-never logged. The model/voices live in the node data dir under `tts/`.
+never logged. Models live in the node data dir under `tts/models/piper-ro/`.
+
+Piper (VITS + espeak-ng, embedded in the wheel) supports Romanian natively:
+`ro_RO-raluca-high` (female, WER 2.2%), `ro_RO-lili-high`, `ro_RO-mihai-medium`
+(male). Non-autoregressive — no hallucinations, reliable on CPU.
 
 Endpoints:
   GET  /health   -> 200 "ok" (used by the node's health probe)
-  POST /v1/tts   -> audio/wav (body: {"text": "...", "voice": "...", "speed": 1.0})
+  POST /v1/tts   -> audio/wav (body: {"text": "...", "speed": 1.0})
 """
 
 import argparse
-import base64
 import io
 import json
 import os
@@ -23,13 +26,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # node used to launch us (the node passes PYTHONPATH=/venv site-packages).
 sys.path.insert(0, os.environ.get("PYTHONPATH", ""))
 
-from kokoro_onnx import Kokoro  # noqa: E402
-import numpy as np  # noqa: E402
-import soundfile  # noqa: E402  (ensures libsndfile is available for wave io)
+from piper import PiperVoice, SynthesisConfig  # noqa: E402
 
-MODEL = None
-VOICES = None
-VOICE_DEFAULT = "af_heart"
+VOICE = None
 
 
 class TtsHandler(BaseHTTPRequestHandler):
@@ -70,27 +69,25 @@ class TtsHandler(BaseHTTPRequestHandler):
         if len(text) > 4096:
             self._error(400, "text exceeds 4096 chars")
             return
-        voice = str(payload.get("voice", VOICE_DEFAULT) or VOICE_DEFAULT)
+        # speed > 1 = faster -> shorter phoneme length scale.
         speed = float(payload.get("speed", 1.0) or 1.0)
+        length_scale = 1.0 / max(0.5, min(speed, 2.0))
         try:
-            samples, sr = MODEL.create(text, voice=voice, speed=speed)
-        except Exception as exc:  # kokoro raises for unknown voices etc.
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                VOICE.synthesize_wav(
+                    text,
+                    w,
+                    syn_config=SynthesisConfig(length_scale=length_scale),
+                )
+        except Exception as exc:  # phonemizer/synthesis failures
             self._error(400, f"TTS synthesis failed: {exc}")
             return
-        buf = io.BytesIO()
-        # Kokoro returns float32 mono at 24 kHz; encode as 16-bit PCM WAV.
-        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(int(sr))
-            w.writeframes(pcm.tobytes())
         audio = buf.getvalue()
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(audio)))
-        self.send_header("X-TTS-Voice", voice)
-        self.send_header("X-TTS-Sample-Rate", str(sr))
+        self.send_header("X-TTS-Voice", args_voice)
         self.end_headers()
         self.wfile.write(audio)
 
@@ -103,30 +100,35 @@ class TtsHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+args_voice = "ro_RO-raluca-high"
+
+
 def main():
-    global MODEL, VOICES, VOICE_DEFAULT
+    global VOICE, args_voice
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--voices", default=None)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--config", required=True)
     parser.add_argument("--port", type=int, default=8731)
-    parser.add_argument("--voice", default="af_heart")
+    parser.add_argument("--voice", default="ro_RO-raluca-high")
     args = parser.parse_args()
 
-    VOICE_DEFAULT = args.voice
-    model_path = args.model or os.environ.get("KOKORO_MODEL")
-    voices_path = args.voices or os.environ.get("KOKORO_VOICES")
-    if not model_path or not voices_path:
-        sys.stderr.write("TTS: --model and --voices are required\n")
+    args_voice = args.voice
+    model_path = args.model or os.environ.get("PIPER_MODEL")
+    config_path = args.config or os.environ.get("PIPER_CONFIG")
+    if not model_path or not config_path:
+        sys.stderr.write("TTS: --model and --config are required\n")
         sys.exit(2)
-    if not os.path.exists(model_path) or not os.path.exists(voices_path):
-        sys.stderr.write(f"TTS: missing model/voices at {model_path} / {voices_path}\n")
+    if not os.path.exists(model_path) or not os.path.exists(config_path):
+        sys.stderr.write(f"TTS: missing model/config at {model_path} / {config_path}\n")
         sys.exit(2)
 
-    MODEL = Kokoro(model_path, voices_path)
+    VOICE = PiperVoice.load(model_path, config_path=config_path)
     # Warm up so the first user request does not pay the load latency.
-    MODEL.create("DecentraAI voice online.", voice=VOICE_DEFAULT, speed=1.0)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        VOICE.synthesize_wav("Fabricul DecentraAI este online.", w)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TtsHandler)
-    sys.stderr.write(f"TTS ready on 127.0.0.1:{args.port}\n")
+    sys.stderr.write(f"TTS ready on 127.0.0.1:{args.port} voice={args_voice}\n")
     sys.stderr.flush()
     try:
         server.serve_forever()

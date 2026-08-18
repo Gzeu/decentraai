@@ -304,10 +304,11 @@ impl TiersSection {
     }
 }
 
-/// Local text-to-speech (TTS). Drives a Kokoro-82M ONNX Python subprocess
+/// Local text-to-speech (TTS). Drives a Piper VITS Python subprocess
 /// (external engine — never FFI) exposed to the dashboard chat as `/v1/tts`.
-/// The model + voices live in `<data_dir>/tts/`; the Python venv lives in
-/// `<data_dir>/tts/venv/`. Absent section = TTS off.
+/// Piper supports Romanian natively; voices live in `<data_dir>/tts/models/
+/// piper-ro/` and the Python venv in `<data_dir>/tts/venv/`. Absent section
+/// = TTS off.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtsSection {
@@ -316,8 +317,9 @@ pub struct TtsSection {
     /// (dashboard hides the speak button) instead of failing startup.
     #[serde(default)]
     pub enabled: bool,
-    /// Kokoro voice name, e.g. `af_heart` (default feminine) / `am_michael`.
-    /// Defaults to `af_heart` when absent.
+    /// Piper voice id, e.g. `ro_RO-raluca-high` (female, Romanian),
+    /// `ro_RO-lili-high` (female), `ro_RO-mihai-medium` (male). Defaults to
+    /// the Romanian female voice `ro_RO-raluca-high` when absent.
     #[serde(default = "default_tts_voice")]
     pub voice: String,
     /// Speech rate multiplier (0.5 = half speed, 1.0 = normal, 1.5 = fast).
@@ -326,7 +328,7 @@ pub struct TtsSection {
 }
 
 fn default_tts_voice() -> String {
-    "af_heart".to_string()
+    "ro_RO-raluca-high".to_string()
 }
 
 fn default_tts_speed() -> f64 {
@@ -706,12 +708,13 @@ security:
         file.write_all(include_bytes!("../../../configs/node.example.yaml"))
             .unwrap();
         let raw = std::fs::read_to_string(file.path()).unwrap();
-        let with_tts = format!("{raw}\ntts:\n  enabled: true\n  voice: af_heart\n  speed: 1.15\n");
+        let with_tts =
+            format!("{raw}\ntts:\n  enabled: true\n  voice: ro_RO-raluca-high\n  speed: 1.15\n");
         std::fs::write(file.path(), with_tts).unwrap();
         let config = NodeConfig::load(file.path()).unwrap();
         let tts = config.tts.as_ref().expect("tts section should parse");
         assert!(tts.enabled);
-        assert_eq!(tts.voice, "af_heart");
+        assert_eq!(tts.voice, "ro_RO-raluca-high");
         assert_eq!(tts.speed, 1.15);
     }
 
