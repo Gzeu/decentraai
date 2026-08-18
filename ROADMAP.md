@@ -2441,3 +2441,19 @@ Commit `pending`. The RAG retrieval path now has a live embeddings endpoint:
 
 The RetrievalIndex (retrieval.rs) is ready to be populated from these vectors;
 a query/index endpoint is the next wiring step.
+
+## 108. RAG index + query (DONE)
+
+Commit `pending`. The RAG path is now fully functional end-to-end.
+
+- `RetrievalManager` (distributed): holds a `RetrievalIndex` fed by the
+  embeddings backend — `index(doc_id, text, capability)` and
+  `query(text, k)` (embed → cosine search).
+- `POST /v1/rag/index` — `{ doc_id, text, capability? }` → embeds + indexes.
+- `POST /v1/rag/query` — `{ text, k? }` → top-k similar documents.
+- Verified live: index a document, query "collective intelligence network"
+  returns it with score 0.76 (real nomic-embed vectors, deterministic cosine).
+
+This completes Dataset → indexed knowledge → embeddings → retrieval
+capability foundation. Exposing a `Retrieval` capability to agents (so a
+workflow can call retrieval) is the next step.

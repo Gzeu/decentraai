@@ -295,6 +295,8 @@ pub struct ApiState {
     /// Optional embeddings client for the RAG retrieval path
     /// (`/v1/embeddings`). `None` when no embeddings backend is configured.
     embedding: Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
+    /// Optional RAG retrieval manager (index + query over embeddings).
+    retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
 }
 
 impl ApiState {
@@ -343,6 +345,7 @@ impl ApiState {
             orchestrator: None,
             skills: None,
             embedding: None,
+            retrieval: None,
         }
     }
 
@@ -382,6 +385,14 @@ impl ApiState {
         embedding: Arc<decentraai_distributed::embedding::EmbeddingClient>,
     ) {
         self.embedding = Some(embedding);
+    }
+
+    /// Attaches the RAG retrieval manager (index + query).
+    pub fn attach_retrieval(
+        &mut self,
+        retrieval: Arc<decentraai_distributed::retrieval_manager::RetrievalManager>,
+    ) {
+        self.retrieval = Some(retrieval);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -4534,6 +4545,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/rag/index", post(rag_index_handler))
+        .route("/v1/rag/query", post(rag_query_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/sessions", get(sessions_handler))
@@ -5852,6 +5865,125 @@ async fn embeddings_handler(
         Ok(vec) => {
             let dim = vec.len();
             let body = serde_json::json!({ "embedding": vec, "dim": dim });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let body = serde_json::json!({ "error": e.to_string() });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// RAG index: embeds `text` and adds it to the retrieval index.
+/// `{ "doc_id": "...", "text": "...", "capability": "retrieval" (optional) }`
+async fn rag_index_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(retrieval) = &state.retrieval else {
+        let body = serde_json::json!({ "error": "retrieval not configured (set inference.embeddings_backend_url)" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let doc_id = body
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let capability = body
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if doc_id.is_empty() || text.is_empty() {
+        let body = serde_json::json!({ "error": "'doc_id' and 'text' are required" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    }
+    match retrieval.index(&doc_id, &text, capability).await {
+        Ok(count) => {
+            let body = serde_json::json!({ "indexed": true, "doc_id": doc_id, "count": count });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let body = serde_json::json!({ "error": e.to_string() });
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// RAG query: embeds `text` and returns the top `k` similar documents.
+/// `{ "text": "...", "k": 5 (optional) }`
+async fn rag_query_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(retrieval) = &state.retrieval else {
+        let body = serde_json::json!({ "error": "retrieval not configured (set inference.embeddings_backend_url)" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    };
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let k = body
+        .get("k")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(5);
+    if text.is_empty() {
+        let body = serde_json::json!({ "error": "'text' is required" });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    }
+    match retrieval.query(&text, k).await {
+        Ok(results) => {
+            let body = serde_json::json!({
+                "results": serde_json::to_value(&results).unwrap_or_default(),
+                "count": results.len(),
+            });
             (
                 [(header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&body).unwrap_or_default(),

@@ -1632,7 +1632,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 let client = Arc::new(decentraai_distributed::embedding::EmbeddingClient::new(
                     url.to_string(),
                 ));
-                state.attach_embedding(client);
+                state.attach_embedding(client.clone());
+                // RAG index + query over the embeddings backend.
+                state.attach_retrieval(Arc::new(
+                    decentraai_distributed::retrieval_manager::RetrievalManager::new(client),
+                ));
             }
         }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative

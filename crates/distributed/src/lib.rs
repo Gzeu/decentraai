@@ -89,6 +89,7 @@ pub mod p2p_handler;
 pub mod queue;
 pub mod rate_limit;
 pub mod replay;
+pub mod retrieval_manager;
 pub mod router;
 pub mod session;
 pub mod tracker;
