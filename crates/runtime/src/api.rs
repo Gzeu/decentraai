@@ -5678,7 +5678,17 @@ async fn agents_orchestrate_handler(
         }
     };
 
-    let seed = serde_json::json!({ "prompt": prompt });
+    // Optional RAG: a `retrieve` query in the body augments every stage's
+    // inputs so the inference executor performs semantic retrieval at runtime.
+    let retrieve = body
+        .get("retrieve")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut seed = serde_json::json!({ "prompt": prompt });
+    if !retrieve.is_empty() {
+        seed["retrieve"] = serde_json::Value::String(retrieve);
+    }
     let outcome = orchestrator.orchestrate_plan(&plan, Some(&seed)).await;
 
     // Collective memory: a completed workflow's final output is written to the

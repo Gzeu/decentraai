@@ -750,6 +750,7 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <h2>Collective workflow <span class="count">P9 · delegate → verify</span></h2>
           <div style="display:flex;flex-direction:column;gap:8px">
             <textarea id="wf-prompt" rows="2" placeholder="e.g. Analyze this company and build a report." style="resize:vertical"></textarea>
+            <input id="wf-retrieve" type="text" placeholder="optional: semantic retrieval query (RAG context)" style="width:100%">
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
               <select id="wf-template">
                 <option value="research_report">research_report (Research → Finance → Documents → Synthesis)</option>
@@ -2165,15 +2166,18 @@ function renderAgents(a){
 // + template, show the per-stage verdicts and the final output. Real state.
 function runCollectiveWorkflow(){
   const prompt = $('wf-prompt').value.trim();
+  const retrieve = ($('wf-retrieve') ? $('wf-retrieve').value.trim() : '');
   const template = $('wf-template').value;
   const status = $('wf-status'), result = $('wf-result');
   if (!prompt) { status.textContent = 'enter a prompt first'; return; }
   status.textContent = 'running…';
-  result.innerHTML = '<span class="badge accent">running</span> delegating stages…';
+  result.innerHTML = '<span class="badge accent">running</span> delegating stages' + (retrieve ? ' · RAG retrieval: <code>'+esc(retrieve)+'</code>' : '') + '…';
+  const body = { prompt, template };
+  if (retrieve) body.retrieve = retrieve;
   fetch('/v1/agents/orchestrate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, template }),
+    body: JSON.stringify(body),
   }).then(r => r.json().then(j => ({ ok: r.ok, j }))).then(({ ok, j }) => {
     status.textContent = ok ? 'done' : 'error';
     if (!ok) { result.innerHTML = '<div class="badge bad">error</div> ' + esc((j && j.error) || 'request failed'); return; }
@@ -2181,18 +2185,24 @@ function runCollectiveWorkflow(){
     const badge = v === 'completed' ? '<span class="badge ok">completed</span>'
       : v === 'partial' ? '<span class="badge warn">partial</span>'
       : '<span class="badge bad">' + esc(v) + '</span>';
-    const stages = (j.stages || []).map(s =>
-      '<tr><td><code>'+esc(s.stage_id)+'</code></td><td><code>'+esc(s.agent_id)+'</code></td>'+
-      '<td>'+(s.verified ? '<span class="badge ok">verified</span>' : s.error ? '<span class="badge bad">failed</span>' : '<span class="badge faint">—</span>')+'</td>'+
-      '<td class="mono" style="font-size:11px">'+esc(JSON.stringify(s.output || (s.error || ''))).slice(0,160)+'</td></tr>'
-    ).join('');
-    const out = (j.final_output && j.final_output.prompt !== undefined)
-      ? esc(JSON.stringify(j.final_output)).slice(0, 800)
-      : esc(JSON.stringify(j.final_output || null)).slice(0, 800);
-    result.innerHTML = '<div style="margin-bottom:8px">'+badge+' <span class="muted">'+esc(prompt).slice(0,80)+'</span></div>'+
+    const stages = (j.stages || []).map(s => {
+      const outObj = (typeof s.output === 'object' && s.output) ? s.output : {};
+      const text = outObj.text || '';
+      const docs = (outObj.retrieved_docs || []).map(d => '<span class="badge faint" title="retrieved doc">'+esc(d.doc_id)+' '+(d.score!=null?d.score.toFixed(2):'')+'</span>').join(' ');
+      return '<tr><td><code>'+esc(s.stage_id)+'</code></td><td><code>'+esc(s.agent_id)+'</code></td>'+
+        '<td>'+(s.verified ? '<span class="badge ok">verified</span>' : s.error ? '<span class="badge bad">failed</span>' : '<span class="badge faint">—</span>')+'</td>'+
+        '<td class="mono" style="font-size:11px">'+esc((text || JSON.stringify(s.output || s.error || '')).slice(0,140))+(docs?'<br>'+docs:'')+'</td></tr>';
+    }).join('');
+    // Final output: prefer the generated text; also surface latency/tokens if present.
+    const fo = j.final_output || {};
+    const finalText = fo.text || '';
+    const foTokens = (fo.tokens != null && fo.tokens !== null) ? ' · '+fo.tokens+' tokens' : '';
+    const out = finalText ? esc(finalText) : esc(JSON.stringify(fo || null));
+    const memoryNote = v === 'completed' ? '<div class="mono" style="margin-top:6px;font-size:11px;color:var(--faint)">✓ written to collective memory (workflow_results)</div>' : '';
+    result.innerHTML = '<div style="margin-bottom:8px">'+badge+' <span class="muted">'+esc(prompt).slice(0,80)+'</span>'+foTokens+'</div>'+
       '<table><thead><tr><th>Stage</th><th>Agent</th><th>Verdict</th><th>Output</th></tr></thead><tbody>'+
       (stages || '<tr><td colspan="4" class="empty">no stages executed</td></tr>')+'</tbody></table>'+
-      '<div style="margin-top:10px"><b style="font-size:12px">Final output</b><div class="mono" style="font-size:11px;color:var(--muted);word-break:break-word;margin-top:4px">'+out+'</div></div>';
+      '<div style="margin-top:10px"><b style="font-size:12px">Final output</b><div class="mono" style="font-size:11px;color:var(--muted);word-break:break-word;margin-top:4px">'+out+'</div>'+memoryNote+'</div>';
   }).catch(e => { status.textContent = 'error'; result.innerHTML = '<div class="badge bad">network error</div> ' + esc(String(e)); });
 }
 // ---- Reputation (P6) ----
