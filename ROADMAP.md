@@ -2410,3 +2410,18 @@ the provenance-laundering hole is closed:
   inference-adapter formatting diff).
 
 944 workspace tests green; clippy clean.
+
+## 106. RAG retrieval foundation (DONE)
+
+Commit `b32e09c`. The RAG direction (nomic-embed-text-v1.5 downloaded) now
+has a pure retrieval index in `crates/agents/src/retrieval.rs`:
+
+- `IndexedDocument` (id, text, optional capability, embedding `Vec<f32>`, tags).
+- `RetrievalIndex`: add/remove/get/len/ids + `search(query_embedding, top_k)`
+  ranking by cosine similarity desc, tie-break doc id asc (deterministic);
+  empty-vector/orthogonal queries match nothing (honest).
+- `cosine_similarity` pure function.
+
+Next wiring step (documented): a runtime `/v1/embeddings` path that serves
+`nomic-embed-text-v1.5` and feeds this index, exposing a `Retrieval` capability
+to agents.
