@@ -689,6 +689,10 @@ pub use adapter::{ModelAdapter, OpenAICompatibleProvider, ProviderAdapter};
 
 pub mod health;
 
+pub mod manager;
+pub use manager::ProviderManager;
+pub use manager::{CatalogEntry, FabricModelView, LocalModelView, SharedModelHandle};
+
 // ─── Tests (domain types) ─────────────────────────────────────────────
 
 #[cfg(test)]
