@@ -76,18 +76,31 @@ impl BenchmarkInference for InferenceBenchmarkExecutor {
             let started = std::time::Instant::now();
             let out = self.inference.execute(&task, &inputs).await?;
             let latency = started.elapsed().as_millis() as u64;
-            let text = out
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tokens = out
-                .get("tokens_used")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let (text, tokens) = parse_executor_output(&out);
             Ok((text, tokens, latency))
         })
     }
+}
+
+/// Extracts `(text, tokens)` from the agent executor's output JSON.
+///
+/// The live `InferenceAgentExecutor` returns `{ "text": …, "tokens": N }`
+/// (see agent_runtime.rs); other executors may return `content` /
+/// `tokens_used`. This parser accepts both so the lab keeps working if the
+/// executor contract evolves — and it is pure, so tests pin the contract.
+fn parse_executor_output(out: &serde_json::Value) -> (String, u64) {
+    let text = out
+        .get("text")
+        .and_then(|v| v.as_str())
+        .or_else(|| out.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let tokens = out
+        .get("tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| out.get("tokens_used").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+    (text, tokens)
 }
 
 /// The lab runtime: owns the registry + optional evidence feed.
@@ -443,15 +456,36 @@ mod tests {
 
     #[test]
     fn execution_error_is_honest_abstained() {
-        // Mock that always errors — use an empty answers table with an
-        // ungradable gold: prompt "X" has no canned answer → output "wrong",
-        // gold "g" → Incorrect. For a real error path we simulate via a mock
-        // that fails; here we assert the honest Abstained path for no-gold.
         let mock = MockInference::new(&[]);
         let mgr = manager_with(mock, None);
         let task = BenchmarkTask::ungradable("t1", "Q?");
         let run = futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
         assert_eq!(run.verdict, BenchmarkVerdict::Abstained);
+    }
+
+    #[test]
+    fn executor_output_parser_reads_live_contract_and_fallback() {
+        // The live InferenceAgentExecutor returns { text, tokens } — the
+        // parser must read that contract (this test pins it so a future
+        // executor change cannot silently blank every benchmark run).
+        let (text, tokens) = parse_executor_output(&serde_json::json!({
+            "text": "paris",
+            "model_hash": "abc",
+            "tokens": 42,
+        }));
+        assert_eq!(text, "paris");
+        assert_eq!(tokens, 42);
+        // Fallback contract ({ content, tokens_used }) also accepted.
+        let (text, tokens) = parse_executor_output(&serde_json::json!({
+            "content": "paris",
+            "tokens_used": 7,
+        }));
+        assert_eq!(text, "paris");
+        assert_eq!(tokens, 7);
+        // Missing text → empty (grading will Abstain honestly, never crash).
+        let (text, tokens) = parse_executor_output(&serde_json::json!({"x": 1}));
+        assert_eq!(text, "");
+        assert_eq!(tokens, 0);
     }
 
     #[test]
