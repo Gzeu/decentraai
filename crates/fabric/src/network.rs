@@ -62,6 +62,11 @@ pub struct LinkMetrics {
     /// Derived, deterministic; owned here so callers read one number.
     pub transfer_ms_per_mib: u32,
     pub locality: Locality,
+    /// RTT jitter (mean absolute deviation) in microseconds. `None` =
+    /// unmeasured; the planner must treat it as UNKNOWN (P2 NetworkFacts).
+    pub jitter_us: Option<u32>,
+    /// Packet loss rate in percent (0.0..=100.0). `None` = unmeasured.
+    pub packet_loss_percent: Option<f64>,
 }
 
 impl LinkMetrics {
@@ -75,6 +80,8 @@ impl LinkMetrics {
             bandwidth_mbps,
             transfer_ms_per_mib: transfer_ms_per_mib(bandwidth_mbps),
             locality,
+            jitter_us: None,
+            packet_loss_percent: None,
         }
     }
 
@@ -82,6 +89,26 @@ impl LinkMetrics {
     pub fn refresh(mut self) -> Self {
         self.transfer_ms_per_mib = transfer_ms_per_mib(self.bandwidth_mbps);
         self
+    }
+
+    /// A deterministic stability score in 0.0..=1.0 used to compare links that
+    /// otherwise tie on raw RTT. Unmeasured jitter/packet loss are UNKNOWN and
+    /// score 0 (conservative); a lossy link with measured 10% loss scores
+    /// meaningfully below a clean one.
+    pub fn stability(&self) -> f64 {
+        let jitter_penalty = match self.jitter_us {
+            Some(j) if j <= 20_000 => 1.0 - (j as f64 / 20_000.0).min(1.0),
+            Some(_) => 0.0,
+            None => 0.0,
+        };
+        let loss_penalty = match self.packet_loss_percent {
+            Some(p) if p <= 10.0 => 1.0 - (p / 10.0).min(1.0),
+            Some(_) => 0.0,
+            None => 0.0,
+        };
+        // Both penalties are gates: a link with severe loss OR jitter is
+        // unstable regardless of the other dimension being clean.
+        (jitter_penalty + loss_penalty) / 2.0
     }
 }
 
@@ -151,7 +178,8 @@ impl NetworkGraph {
     }
 
     /// A deterministic total ordering (best link first) for tie-breaking when
-    /// two workers score equally. Prefers low RTT, then high bandwidth.
+    /// two workers score equally. Prefers low RTT, then high bandwidth, then
+    /// better stability (jitter/packet loss).
     pub fn sort_peers(&self, peers: Vec<String>) -> Vec<String> {
         let mut with_link: Vec<(String, LinkMetrics)> = peers
             .into_iter()
@@ -161,9 +189,38 @@ impl NetworkGraph {
             a.1.rtt_us
                 .cmp(&b.1.rtt_us)
                 .then_with(|| b.1.bandwidth_mbps.cmp(&a.1.bandwidth_mbps))
+                .then_with(|| {
+                    b.1.stability()
+                        .partial_cmp(&a.1.stability())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.0.cmp(&b.0))
         });
         with_link.into_iter().map(|(p, _)| p).collect()
+    }
+}
+
+/// Aggregated network facts for a worker, as consumed by the execution planner
+/// (P2 NetworkFacts). The coordinator folds raw `LinkMetrics` into this shape
+/// so the planner sees one coherent view per candidate worker.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NetworkFacts {
+    pub link: LinkMetrics,
+    /// Combined reach cost in ms (RTT + transfer for the current payload).
+    pub reach_cost_ms: u32,
+    /// Stability fold of the link (0.0..=1.0); 0 = unknown or unstable.
+    pub stability: f64,
+}
+
+impl NetworkFacts {
+    /// Folds raw link metrics + payload size into planner-ready facts.
+    pub fn from_link(peer: &str, graph: &NetworkGraph, payload_mib: u64) -> Self {
+        let link = graph.get(peer);
+        Self {
+            link,
+            reach_cost_ms: graph.reach_cost_ms(peer, payload_mib),
+            stability: link.stability(),
+        }
     }
 }
 
@@ -208,5 +265,93 @@ mod tests {
         let g = NetworkGraph::new();
         let link = g.get("some-peer");
         assert_eq!(link.locality, Locality::Lan);
+        assert_eq!(link.jitter_us, None);
+        assert_eq!(link.packet_loss_percent, None);
+    }
+
+    #[test]
+    fn stability_scores_unmeasured_as_unknown() {
+        // No jitter/loss measured → UNKNOWN → 0 (conservative).
+        let prior = LinkMetrics::prior(Locality::Lan, Some(1_000));
+        assert_eq!(prior.stability(), 0.0);
+    }
+
+    #[test]
+    fn stability_rewards_clean_links_and_punishes_lossy_ones() {
+        let clean = LinkMetrics {
+            jitter_us: Some(1_000),
+            packet_loss_percent: Some(0.0),
+            ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+        };
+        let lossy = LinkMetrics {
+            jitter_us: Some(1_000),
+            packet_loss_percent: Some(10.0),
+            ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+        };
+        let jittery = LinkMetrics {
+            jitter_us: Some(50_000),
+            packet_loss_percent: Some(0.0),
+            ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+        };
+        assert!(clean.stability() > lossy.stability());
+        assert!(clean.stability() > jittery.stability());
+        // 0 jitter + 0 loss is the best possible.
+        let perfect = LinkMetrics {
+            jitter_us: Some(0),
+            packet_loss_percent: Some(0.0),
+            ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+        };
+        assert!(perfect.stability() > clean.stability());
+    }
+
+    #[test]
+    fn old_wire_payload_deserializes_with_new_fields() {
+        // Payloads written before the jitter/packet-loss fields must load.
+        let json =
+            r#"{"rtt_us":1000,"bandwidth_mbps":1000,"transfer_ms_per_mib":67,"locality":"Lan"}"#;
+        let link: LinkMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(link.rtt_us, 1000);
+        assert_eq!(link.jitter_us, None);
+        assert_eq!(link.packet_loss_percent, None);
+    }
+
+    #[test]
+    fn network_facts_folds_link_and_reach_cost() {
+        let mut g = NetworkGraph::new();
+        g.set(
+            "peer",
+            LinkMetrics {
+                jitter_us: Some(2_000),
+                packet_loss_percent: Some(1.0),
+                ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+            },
+        );
+        let facts = NetworkFacts::from_link("peer", &g, 2);
+        assert_eq!(facts.link.rtt_us, 1_000);
+        assert!(facts.stability > 0.0);
+        assert!(facts.reach_cost_ms >= 1); // 1ms RTT + transfer
+    }
+
+    #[test]
+    fn sorting_prefers_stable_link_when_rtt_and_bandwidth_tie() {
+        let mut g = NetworkGraph::new();
+        g.set(
+            "stable",
+            LinkMetrics {
+                jitter_us: Some(0),
+                packet_loss_percent: Some(0.0),
+                ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+            },
+        );
+        g.set(
+            "flaky",
+            LinkMetrics {
+                jitter_us: Some(40_000),
+                packet_loss_percent: Some(8.0),
+                ..LinkMetrics::prior(Locality::Lan, Some(1_000))
+            },
+        );
+        let order = g.sort_peers(vec!["flaky".into(), "stable".into()]);
+        assert_eq!(order, vec!["stable", "flaky"]);
     }
 }

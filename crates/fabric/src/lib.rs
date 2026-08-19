@@ -52,7 +52,7 @@ pub use engine::{EngineCapabilities, EngineKind};
 pub use expert::{ExpertDecision, ExpertLayout, ExpertRegistry, ExpertRouter, ExpertShard};
 pub use kv::{ContextProfile, KVCacheState, KvPlanner, KvRoutingHint};
 pub use network::{
-    LinkMetrics, Locality, NetworkGraph, estimated_transfer_ms, prior_bandwidth_mbps,
+    LinkMetrics, Locality, NetworkFacts, NetworkGraph, estimated_transfer_ms, prior_bandwidth_mbps,
     transfer_ms_per_mib,
 };
 pub use plan::{
