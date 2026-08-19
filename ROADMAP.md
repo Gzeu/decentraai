@@ -2626,7 +2626,19 @@ without changing any existing behavior:
 - A real fan-out decision (engine-advertised staging + `allow_fanout` + ≥2
   ranked workers) carries `BatchFanOut`; everything else stays `SingleWorker`.
 
-Tests: 1026 workspace tests green; clippy `-D warnings` clean; fmt clean.
+**P1 follow-up — Model-Fabric Execution Spec (`8c3df13`)**: the research branch
+added `docs/research/MODEL-FABRIC-EXECUTION-SPEC.md` tying M11 Adaptive Compute
+Fabric to ExecutionStrategy. Implemented as pure foundation (no behavior
+change): `ExecutionMode` enum + `StrategyKind::execution_mode()` mapping (§1.3),
+`MultiModelPipeline` as the 7th strategy kind, `TrustTier`
+(`public`/`trusted-remote`/`trusted-cluster`) with per-tier strategy + mode
+filtering (§4; planner must filter candidates by tier before scoring, KV/cache
+migration across tiers disallowed), and `PlannerConfig` scoring profiles
+(`latency_profile`/`throughput_profile`/`cost_profile`, §3.2 — hard constraints
+are never overridden by scores). All pure; the planner still emits only
+SingleWorker/BatchFanOut and no code path consults TrustTier today.
+
+Tests: 1034 workspace tests green; clippy `-D warnings` clean; fmt clean.
 Remaining research phases (P2 NetworkFacts, P3 speculative, P4 prefill/decode,
 P5 cache-aware, P6 collaborative/RPC) stay **experimental** — they require live
 LAN measurements (Laptop ↔ Desktop) before the planner may select them.
