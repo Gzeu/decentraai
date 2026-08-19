@@ -159,6 +159,11 @@ pub enum StrategyKind {
     /// Tensor/pipeline-parallel model execution across workers (gated
     /// experimental; llama.cpp RPC / vLLM TP/PP backends).
     CollaborativeModel,
+    /// A sequence of stages, each potentially on a different worker/engine
+    /// with its own model (e.g. OCR → summarize → generate). Each stage is
+    /// itself an `ExecutionPlan` (usually SingleWorker or DataParallelReplica)
+    /// and the strategy is the composition (gated experimental).
+    MultiModelPipeline,
 }
 
 impl StrategyKind {
@@ -171,7 +176,130 @@ impl StrategyKind {
                 | Self::DisaggregatedPrefillDecode
                 | Self::CacheAwareRoute
                 | Self::CollaborativeModel
+                | Self::MultiModelPipeline
         )
+    }
+
+    /// The M11 execution mode this strategy maps to (Model-Fabric Execution
+    /// Spec §1.3). The planner must always produce strategies that can be
+    /// expressed as valid `ExecutionPlan`s under these modes.
+    pub fn execution_mode(&self) -> ExecutionMode {
+        match self {
+            Self::SingleWorker | Self::CacheAwareRoute => ExecutionMode::SingleWorker,
+            Self::BatchFanOut => ExecutionMode::DataParallelReplica,
+            Self::SpeculativeDraftVerify => ExecutionMode::Speculative,
+            Self::DisaggregatedPrefillDecode => ExecutionMode::PrefillDecodeDisaggregated,
+            Self::CollaborativeModel => ExecutionMode::TensorPipelineParallel,
+            Self::MultiModelPipeline => ExecutionMode::MultiModelPipeline,
+        }
+    }
+
+    /// Whether the strategy is permitted within a trust tier (spec §4.2).
+    /// The planner must filter candidate strategies by tier before scoring;
+    /// KV/cache migration across tiers is disallowed.
+    pub fn allowed_in(&self, tier: TrustTier) -> bool {
+        match tier {
+            TrustTier::Public => {
+                matches!(self, Self::SingleWorker | Self::BatchFanOut)
+            }
+            TrustTier::TrustedRemote => {
+                matches!(
+                    self,
+                    Self::SingleWorker | Self::BatchFanOut | Self::CacheAwareRoute
+                )
+            }
+            TrustTier::TrustedCluster => {
+                matches!(
+                    self,
+                    Self::SingleWorker
+                        | Self::BatchFanOut
+                        | Self::SpeculativeDraftVerify
+                        | Self::DisaggregatedPrefillDecode
+                        | Self::CacheAwareRoute
+                        | Self::CollaborativeModel
+                )
+            }
+        }
+    }
+}
+
+/// The M11 execution mode at the fabric level (Model-Fabric Execution Spec §1.2).
+/// A strategy kind maps to exactly one mode; the mode describes *how* the
+/// request physically runs across the fabric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Entire request runs on a single worker.
+    SingleWorker,
+    /// Multiple replicas of the same model; each request runs on one replica.
+    DataParallelReplica,
+    /// Tensor + pipeline parallelism across multiple GPUs/workers.
+    TensorPipelineParallel,
+    /// Draft + verify models.
+    Speculative,
+    /// Prefill and decode split across engines.
+    PrefillDecodeDisaggregated,
+    /// A sequence of stages, each with its own execution mode (usually
+    /// SingleWorker or DataParallelReplica per stage).
+    MultiModelPipeline,
+}
+
+impl ExecutionMode {
+    /// Whether the mode is permitted within a trust tier (spec §4.1).
+    pub fn allowed_in(&self, tier: TrustTier) -> bool {
+        match tier {
+            TrustTier::Public => {
+                matches!(self, Self::SingleWorker | Self::DataParallelReplica)
+            }
+            TrustTier::TrustedRemote => {
+                matches!(
+                    self,
+                    Self::SingleWorker
+                        | Self::DataParallelReplica
+                        | Self::PrefillDecodeDisaggregated
+                )
+            }
+            TrustTier::TrustedCluster => {
+                matches!(
+                    self,
+                    Self::SingleWorker
+                        | Self::DataParallelReplica
+                        | Self::Speculative
+                        | Self::PrefillDecodeDisaggregated
+                        | Self::TensorPipelineParallel
+                )
+            }
+        }
+    }
+}
+
+/// Trust tiers for fabric collaboration (Model-Fabric Execution Spec §4).
+///
+/// The tier is derived from WorkerFacts, policy and configuration; the planner
+/// filters candidate strategies and execution modes by tier before scoring.
+/// KV/cache migration across tiers is disallowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustTier {
+    /// Public/heterogeneous peers: only complete replica execution.
+    #[default]
+    Public,
+    /// Trusted same-region peers (known operators): replica execution and
+    /// limited prefill/decode split.
+    TrustedRemote,
+    /// Trusted low-latency clusters: tensor/pipeline parallelism after
+    /// benchmark verification.
+    TrustedCluster,
+}
+
+impl TrustTier {
+    /// Conservative rank for ordering: higher = more permissive.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Public => 0,
+            Self::TrustedRemote => 1,
+            Self::TrustedCluster => 2,
+        }
     }
 }
 
@@ -352,5 +480,102 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: CanRunReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    // ---- Model-Fabric Execution Spec §1.3: StrategyKind ↔ ExecutionMode ----
+
+    #[test]
+    fn strategy_to_execution_mode_mapping() {
+        assert_eq!(
+            StrategyKind::SingleWorker.execution_mode(),
+            ExecutionMode::SingleWorker
+        );
+        assert_eq!(
+            StrategyKind::BatchFanOut.execution_mode(),
+            ExecutionMode::DataParallelReplica
+        );
+        assert_eq!(
+            StrategyKind::SpeculativeDraftVerify.execution_mode(),
+            ExecutionMode::Speculative
+        );
+        assert_eq!(
+            StrategyKind::DisaggregatedPrefillDecode.execution_mode(),
+            ExecutionMode::PrefillDecodeDisaggregated
+        );
+        assert_eq!(
+            StrategyKind::CollaborativeModel.execution_mode(),
+            ExecutionMode::TensorPipelineParallel
+        );
+        assert_eq!(
+            StrategyKind::MultiModelPipeline.execution_mode(),
+            ExecutionMode::MultiModelPipeline
+        );
+        // CacheAwareRoute is orthogonal to mode: it stays SingleWorker (or
+        // DataParallelReplica) with cache-aware routing.
+        assert_eq!(
+            StrategyKind::CacheAwareRoute.execution_mode(),
+            ExecutionMode::SingleWorker
+        );
+    }
+
+    // ---- Model-Fabric Execution Spec §4: trust tiers ----
+
+    #[test]
+    fn public_tier_allows_only_replica_strategies() {
+        for (kind, allowed) in [
+            (StrategyKind::SingleWorker, true),
+            (StrategyKind::BatchFanOut, true),
+            (StrategyKind::SpeculativeDraftVerify, false),
+            (StrategyKind::DisaggregatedPrefillDecode, false),
+            (StrategyKind::CacheAwareRoute, false),
+            (StrategyKind::CollaborativeModel, false),
+            (StrategyKind::MultiModelPipeline, false),
+        ] {
+            assert_eq!(kind.allowed_in(TrustTier::Public), allowed, "{kind:?}");
+        }
+        assert!(ExecutionMode::SingleWorker.allowed_in(TrustTier::Public));
+        assert!(ExecutionMode::DataParallelReplica.allowed_in(TrustTier::Public));
+        assert!(!ExecutionMode::TensorPipelineParallel.allowed_in(TrustTier::Public));
+        assert!(!ExecutionMode::Speculative.allowed_in(TrustTier::Public));
+    }
+
+    #[test]
+    fn trusted_remote_adds_limited_cache_and_pd() {
+        assert!(StrategyKind::CacheAwareRoute.allowed_in(TrustTier::TrustedRemote));
+        assert!(ExecutionMode::PrefillDecodeDisaggregated.allowed_in(TrustTier::TrustedRemote));
+        assert!(!StrategyKind::CollaborativeModel.allowed_in(TrustTier::TrustedRemote));
+        assert!(!ExecutionMode::TensorPipelineParallel.allowed_in(TrustTier::TrustedRemote));
+    }
+
+    #[test]
+    fn trusted_cluster_allows_advanced_strategies() {
+        for kind in [
+            StrategyKind::SingleWorker,
+            StrategyKind::BatchFanOut,
+            StrategyKind::SpeculativeDraftVerify,
+            StrategyKind::DisaggregatedPrefillDecode,
+            StrategyKind::CacheAwareRoute,
+            StrategyKind::CollaborativeModel,
+        ] {
+            assert!(kind.allowed_in(TrustTier::TrustedCluster), "{kind:?}");
+        }
+        // MultiModelPipeline is a composition of per-stage plans; each stage
+        // must be tier-checked individually (the composite itself is a
+        // planning-time construct).
+        assert!(ExecutionMode::TensorPipelineParallel.allowed_in(TrustTier::TrustedCluster));
+        assert!(ExecutionMode::Speculative.allowed_in(TrustTier::TrustedCluster));
+    }
+
+    #[test]
+    fn trust_tier_defaults_public_and_ranks() {
+        assert_eq!(TrustTier::default(), TrustTier::Public);
+        assert_eq!(TrustTier::Public.rank(), 0);
+        assert_eq!(TrustTier::TrustedRemote.rank(), 1);
+        assert_eq!(TrustTier::TrustedCluster.rank(), 2);
+        // Serde round-trip with snake_case wire names.
+        let json = serde_json::to_string(&TrustTier::TrustedRemote).unwrap();
+        assert_eq!(json, "\"trusted_remote\"");
+        let back: TrustTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, TrustTier::TrustedRemote);
     }
 }

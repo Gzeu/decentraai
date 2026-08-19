@@ -125,6 +125,59 @@ impl Default for PlannerConfig {
     }
 }
 
+/// Named scoring profiles (Model-Fabric Execution Spec §3.2). The planner
+/// selects a profile based on workload classification (interactive vs batch,
+/// critical vs best-effort) and uses it to score ExecutionPlans. Hard
+/// constraints (trust, memory, deadlines, interconnect policies) are never
+/// overridden by scores.
+impl PlannerConfig {
+    /// Latency-sensitive profile: heavy weight on latency/queue (TTFT,
+    /// interactive). Throughput matters less.
+    pub fn latency_profile() -> Self {
+        Self {
+            w_tps: 0.10,
+            w_latency: 0.30,
+            w_load: 0.10,
+            w_queue: 0.25,
+            w_headroom: 0.10,
+            w_net: 0.10,
+            w_kv: 0.05,
+            w_locality: 0.05,
+        }
+    }
+
+    /// Throughput profile: heavy weight on throughput and headroom (batch,
+    /// long generations). TTFT matters less.
+    pub fn throughput_profile() -> Self {
+        Self {
+            w_tps: 0.35,
+            w_latency: 0.05,
+            w_load: 0.10,
+            w_queue: 0.05,
+            w_headroom: 0.25,
+            w_net: 0.05,
+            w_kv: 0.05,
+            w_locality: 0.05,
+        }
+    }
+
+    /// Cost profile: balances cost vs latency/throughput. Cost is not a
+    /// planner term yet, so this profile tilts toward the cheapest-to-reach,
+    /// least-loaded workers and defers to the network term.
+    pub fn cost_profile() -> Self {
+        Self {
+            w_tps: 0.10,
+            w_latency: 0.10,
+            w_load: 0.20,
+            w_queue: 0.10,
+            w_headroom: 0.10,
+            w_net: 0.30,
+            w_kv: 0.05,
+            w_locality: 0.05,
+        }
+    }
+}
+
 /// The per-candidate component scores that made up a planner score. Kept pure
 /// and serde-serializable so a coordinator can persist / display *why* the
 /// chosen worker won without re-running the score.
@@ -1317,5 +1370,52 @@ mod tests {
         let p = ExecutionPlanner::default().plan(&req(), &[w]);
         assert_eq!(p.strategy.kind, StrategyKind::SingleWorker);
         assert!(p.can_reports.iter().all(|(_, r)| !r.can_run));
+    }
+
+    // ---- Model-Fabric Execution Spec §3.2: scoring profiles ----
+
+    #[test]
+    fn latency_profile_weights_latency_over_throughput() {
+        let l = PlannerConfig::latency_profile();
+        let t = PlannerConfig::throughput_profile();
+        assert!(l.w_latency > l.w_tps, "latency profile favors latency");
+        assert!(t.w_tps > t.w_latency, "throughput profile favors tps");
+        assert!(l.w_queue > t.w_queue, "latency profile favors low queue");
+        assert!(
+            t.w_headroom > l.w_headroom,
+            "throughput profile favors headroom"
+        );
+    }
+
+    #[test]
+    fn cost_profile_weights_network_and_load() {
+        let c = PlannerConfig::cost_profile();
+        let d = PlannerConfig::default();
+        assert!(c.w_net > d.w_net, "cost profile favors cheap reach");
+        assert!(c.w_load > d.w_load, "cost profile favors low load");
+        // Profiles are deterministic and round-trip.
+        for p in [
+            PlannerConfig::latency_profile(),
+            PlannerConfig::throughput_profile(),
+            PlannerConfig::cost_profile(),
+        ] {
+            let json = serde_json::to_string(&p).unwrap();
+            let back: PlannerConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, p);
+        }
+    }
+
+    #[test]
+    fn latency_profile_steers_to_fast_unqueued_worker() {
+        // With the latency profile, a fast low-queue worker must win over a
+        // high-throughput but loaded worker.
+        let planner = ExecutionPlanner {
+            config: PlannerConfig::latency_profile(),
+            ..ExecutionPlanner::default()
+        };
+        let fast_idle = worker_facts("fast_idle", 120, 40, 5);
+        let fast_busy = worker_facts("fast_busy", 300, 30, 95);
+        let p = planner.plan(&req(), &[fast_idle, fast_busy]);
+        assert_eq!(p.plan.workers(), vec!["fast_idle"]);
     }
 }

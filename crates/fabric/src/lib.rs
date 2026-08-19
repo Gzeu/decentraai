@@ -56,8 +56,9 @@ pub use network::{
     transfer_ms_per_mib,
 };
 pub use plan::{
-    CanRunReport, EvidenceProvenance, ExecutionPlan, ExecutionStage, ExecutionStrategy, PlanCost,
-    PlanKind, RejectedStrategy, StrategyKind, StrategyRationale,
+    CanRunReport, EvidenceProvenance, ExecutionMode, ExecutionPlan, ExecutionStage,
+    ExecutionStrategy, PlanCost, PlanKind, RejectedStrategy, StrategyKind, StrategyRationale,
+    TrustTier,
 };
 pub use planner::{
     CandidateScore, ExecutionPlanner, PlanResult, PlannerConfig, PlannerRationale, RequestFacts,
