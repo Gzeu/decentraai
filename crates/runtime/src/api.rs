@@ -11060,6 +11060,123 @@ mod tests {
         assert_eq!(ko["confidence_label"], "low");
     }
 
+    // P12 auto-seed over the real API: a receipt for a worker that the
+    // ComputeManager has *measured* credits from the live M17 tracker — no
+    // manual profile wiring, and the ledger shared with compute is the same
+    // one the receipt credits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn knowledge_receipt_auto_seeds_from_compute_measurement() {
+        use decentraai_distributed::{
+            ComputeManager, LivePerf, build_advertisement,
+        };
+        use decentraai_p2p::PeerId;
+        use decentraai_system_probe::{GpuProbeStatus, SystemSnapshot};
+        use std::collections::HashSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+
+        // A real ComputeManager coordinator with one measured worker.
+        let worker = PeerId::random();
+        let compute = Arc::new(ComputeManager::new(
+            PeerId::random(),
+            "coord-test".into(),
+            HashSet::from([worker]),
+        ));
+        let snapshot = SystemSnapshot {
+            logical_cpus: 8,
+            cpu_usage_percent: 25.0,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+            available_memory_bytes: 16 * 1024 * 1024 * 1024,
+            used_swap_bytes: 0,
+            total_disk_free_bytes: 200 * 1024 * 1024 * 1024,
+            battery_percent: None,
+        };
+        compute
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                "llama-server",
+                snapshot,
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+        // Measure verified work for the worker: this is what auto-seed reads.
+        assert!(compute.record_credited_contribution(&worker, "exec-m1", true, Some(100), Some(2000)));
+
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager,
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        // KnowledgeRuntime shares the SAME compensation ledger as compute.
+        let memory = Arc::new(
+            decentraai_distributed::agent_memory::MemoryStore::open(
+                &dir.path().join("agent_memory_autoseed.sqlite"),
+            )
+            .unwrap(),
+        );
+        let runtime = decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
+            compute.compensation_ledger(),
+            "peer-local-test",
+            Some(memory),
+        )
+        .unwrap();
+        state.attach_knowledge(Arc::new(runtime));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        // A receipt for the MEASURED worker credits automatically — no manual
+        // profile wiring anywhere.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/receipt"))
+            .json(&serde_json::json!({
+                "execution_id": "exec-r1",
+                "worker_node": worker.to_string(),
+                "worker_agent": "a:worker",
+                "capability": "inference",
+                "duration_ms": 150,
+                "verdict": "verified",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["credits"].as_u64().unwrap() > 0,
+            "auto-seeded measured profile must credit, got {:?}",
+            body
+        );
+
+        // The credit landed in the ledger shared with compute. `earned` is at
+        // least the receipt's credit (the earlier record_credited_contribution
+        // for exec-m1 also credited the same ledger) — proving the receipt
+        // wrote to the SAME bookkeeping compute shows.
+        let balances = compute.compensation_ledger().lock().unwrap().account(&worker.to_string());
+        assert!(balances.is_some());
+        let earned = balances.unwrap().earned;
+        assert!(
+            earned >= body["credits"].as_u64().unwrap(),
+            "receipt must credit the shared ledger (earned {earned} >= {}), got {:?}",
+            body["credits"].as_u64().unwrap(),
+            body
+        );
+    }
+
     /// Builds an ApiState with the given TTS manager attached.
     async fn test_state_with_tts(dir: &Path, tts: TtsManager) -> ApiState {
         let backend = start_backend().await;
