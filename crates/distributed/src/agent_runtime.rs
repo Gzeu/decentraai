@@ -23,6 +23,18 @@ use std::time::Duration;
 use crate::DistributedInference;
 use crate::agent_messenger::AgentMessenger;
 
+/// Pure decision: is `model` a Model Fabric provider reference?
+///
+/// Agent Model Powers (P9): an agent may pin a provider model for a task by
+/// naming its symbolic hash (`prov-…`), its provider handle
+/// (`provider:{provider_id}:{model_id}`), or its raw upstream name. Such a
+/// model can only be served by the node's local OpenAI-compatible proxy (the
+/// fabric `route_request` path knows nothing about providers), so the
+/// executor must route through `local_backend` — never through the fabric.
+pub fn is_provider_model_ref(model: &str) -> bool {
+    model.starts_with("prov-") || model.starts_with("provider:") || model.contains('/')
+}
+
 /// Executes a delegated task asynchronously and returns the output JSON value.
 ///
 /// This is the seam to the real engine: the runtime calls this with the
@@ -290,6 +302,16 @@ impl InferenceAgentExecutor {
             .as_ref()
             .and_then(|m| m.lock().ok())
             .and_then(|g| g.clone());
+        // Agent Model Powers (P9): a provider model reference can only be
+        // served by the local proxy (which resolves providers). The fabric
+        // route_request path has no provider knowledge — routing a provider
+        // ref through it would fail with a confusing "model not found".
+        if is_provider_model_ref(&model_hash) && live_url.is_none() {
+            anyhow::bail!(
+                "task requests provider model '{model_hash}' but the node has no local backend \
+                 (provider models require the local OpenAI-compatible proxy)"
+            );
+        }
         let (text, tokens): (String, serde_json::Value) = match live_url {
             Some(url) => {
                 let text = self.call_local_backend(&url, &request).await?;
@@ -557,5 +579,54 @@ mod tests {
     fn retrieval_augmentation_without_docs_keeps_base() {
         let prompt = augment_prompt_with_retrieval("just this", "q", &[]);
         assert_eq!(prompt, "just this");
+    }
+
+    // ---- Agent Model Powers (P9): provider model references ----
+
+    #[test]
+    fn provider_model_ref_detection() {
+        assert!(is_provider_model_ref(
+            "prov-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_provider_model_ref("provider:p1:m1"));
+        assert!(is_provider_model_ref("anthropic/claude-3.5-sonnet"));
+        assert!(!is_provider_model_ref("llama-3.2-1b.gguf"));
+        assert!(!is_provider_model_ref("abcd1234"));
+        assert!(!is_provider_model_ref(""));
+    }
+
+    #[test]
+    fn infer_request_preserves_provider_model_ref_from_input() {
+        let task = AgentTask::new("t");
+        let req = infer_request_from(
+            &task,
+            &serde_json::json!({ "prompt": "x", "model_hash": "provider:p1:m1" }),
+            "m-default",
+        )
+        .unwrap();
+        assert_eq!(req.model_hash, "provider:p1:m1");
+    }
+
+    #[tokio::test]
+    async fn provider_model_ref_without_local_backend_errors_clearly() {
+        let node = P2PNode::new(
+            &Identity::generate(),
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+            decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap();
+        let distributed = Arc::new(
+            DistributedInference::new(node, crate::InferenceConfig::default(), None, None).unwrap(),
+        );
+        let executor = InferenceAgentExecutor::new(distributed, "m-default".into());
+        let task = AgentTask::new("t");
+        let inputs = serde_json::json!({ "prompt": "x", "model_hash": "prov-0123456789abcdef0123456789abcdef" });
+        let err = executor.execute(&task, &inputs).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("provider model") && msg.contains("local backend"),
+            "error must explain the provider/local-backend constraint, got: {msg}"
+        );
     }
 }
