@@ -6277,10 +6277,23 @@ async fn knowledge_receipt_handler(
     if let Some(w) = b.get("workload_id").and_then(|v| v.as_str()) {
         receipt = receipt.with_workload_id(w);
     }
-    // Compensation uses the worker's measured profile (wired from the compute
-    // manager) — a client must never be able to inflate its own profile.
-    let profile = knowledge
-        .contribution_profile(&receipt.worker_node)
+    // Compensation uses the worker's *measured* contribution profile. Source
+    // order (all honest, none client-suppliable):
+    //   1. The live ComputeManager M17 tracker for the peer — the same
+    //      measured reality that feeds tier suggestions and M9-9 credits.
+    //   2. A profile explicitly wired into the knowledge runtime (node-cli
+    //      operator override for peers the coordinator has not measured).
+    //   3. Default (zero verified work) → the receipt registers as knowledge
+    //      but earns 0 credits: compensation rewards measured service.
+    let profile = state
+        .compute
+        .as_ref()
+        .and_then(|compute| {
+            decentraai_p2p::PeerId::from_str(&receipt.worker_node)
+                .ok()
+                .and_then(|peer| compute.contribution_profile(&peer))
+        })
+        .or_else(|| knowledge.contribution_profile(&receipt.worker_node))
         .unwrap_or_default();
     match knowledge.record_receipt(&receipt, &profile) {
         Ok(credits) => (

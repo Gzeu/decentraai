@@ -631,6 +631,23 @@ impl ComputeManager {
         self.measured_contribution.lock().unwrap().clone()
     }
 
+    /// The live measured contribution profile of one worker (M17 tracker),
+    /// or `None` when the coordinator has no measurement for the peer yet.
+    ///
+    /// This is the *measured reality* that feeds the tier-suggestion engine
+    /// and the M9-9 compensation ledger. P12 receipts use it as the primary
+    /// contribution profile source (falling back to wired/manual profiles),
+    /// so a receipt for a real worker credits from the same measured history
+    /// the Workers view and tier suggestions reflect — never from a
+    /// client-supplied value.
+    pub fn contribution_profile(&self, peer: &PeerId) -> Option<decentraai_compute::ContributionProfile> {
+        self.contribution
+            .lock()
+            .unwrap()
+            .get(peer)
+            .map(|t| t.profile)
+    }
+
     /// Replaces the active contribution→quota conversion policy (Q3). The pure
     /// ledger keeps every historical credit under the version that produced it.
     pub fn set_contribution_policy(&self, policy: decentraai_compute::ContributionPolicy) {
@@ -3891,6 +3908,46 @@ mod tests {
             mc.credited_executions, 2,
             "failed executions earn no measured credit"
         );
+    }
+
+    #[tokio::test]
+    async fn contribution_profile_exposes_measured_reality_per_worker() {
+        // P12 auto-seed: the receipt handler reads the worker's live measured
+        // profile from the ComputeManager M17 tracker (never client-supplied).
+        // Verify the accessor reflects verified/failed work as it accrues.
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        // No measurement yet → None (unknown worker, honest).
+        assert!(manager.contribution_profile(&worker).is_none());
+
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "w",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                GpuProbeStatus::Unavailable("none".into()),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
+        // After advertising, hardware is observed; no served work yet.
+        let p0 = manager.contribution_profile(&worker).expect("tracker exists");
+        assert_eq!(p0.verified_requests, 0);
+        assert_eq!(p0.cpu_cores, snapshot().logical_cpus as u16, "hardware from advertisement");
+
+        // One verified + one failed execution.
+        assert!(manager.record_credited_contribution(&worker, "a-1", true, Some(100), Some(2000)));
+        assert!(manager.record_credited_contribution(&worker, "a-2", false, None, None));
+        let p1 = manager.contribution_profile(&worker).expect("tracker exists");
+        assert_eq!(p1.verified_requests, 1);
+        assert_eq!(p1.failed_requests, 1);
+        // A peer we never measured stays None.
+        assert!(manager.contribution_profile(&peer()).is_none());
     }
 
     #[tokio::test]

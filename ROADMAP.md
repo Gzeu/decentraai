@@ -2820,11 +2820,18 @@ VerifiedComputeReceipt → CompensationLedger → evidence → KnowledgeObject
   /v1/knowledge/decide` (operator+); the v2 dashboard gained a Knowledge view
   that renders derived confidence labels (none/low/medium/high), verdicts and
   credits — all from `/v1/knowledge`, never mock numbers.
+- **Auto-seed contribution profiles** (follow-up landed, commit `…`): the
+  receipt handler now reads the worker's **live measured profile from the
+  ComputeManager M17 tracker** first (`ComputeManager::contribution_profile`,
+  the same measured reality that feeds tier suggestions and M9-9 credits),
+  then falls back to an explicitly wired profile, then to zero. A receipt for
+  a real worker therefore credits from real measured history with zero manual
+  wiring — and a client can still never supply its own profile.
 
-Tests: 1101 workspace tests green (knowledge 8, decision 7, receipt 6,
-knowledge_runtime 5, API roundtrip 3); clippy `-D warnings` clean.
+Tests: 1102 workspace tests green (knowledge 8, decision 7, receipt 6,
+knowledge_runtime 5, API roundtrip 3, contribution_profile 1); clippy
+`-D warnings` clean.
 
-Follow-ups (documented, not blocking): auto-seed per-worker contribution
-profiles from the compute manager's contribution tracker; ACI measurement as a
-separate observability milestone (never a feature); P2P distribution of
-knowledge objects/decisions between nodes.
+Follow-ups (documented, not blocking): ACI measurement as a separate
+observability milestone (never a feature); P2P distribution of knowledge
+objects/decisions between nodes.

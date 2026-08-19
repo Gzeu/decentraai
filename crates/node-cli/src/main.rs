@@ -2027,10 +2027,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // authoritative compensation ledger with the compute manager, so a
         // verified compute receipt credits the SAME earnings bookkeeping the
         // Workers view shows. A receipt's credit always uses the worker's
-        // *measured* contribution profile (set via set_contribution_profile;
-        // unknown workers earn 0 — honest by default). Auto-seeding per-worker
-        // profiles from the compute manager's contribution tracker is a
-        // documented follow-up (the runtime is honest without it).
+        // *measured* contribution profile: the receipt handler reads the live
+        // ComputeManager M17 tracker first (auto-seed — no manual wiring
+        // needed), falls back to an explicitly wired profile, then to zero
+        // (unknown workers earn 0 — honest by default). A client can never
+        // supply its own profile through the API.
         if let Some(store) = agent_memory_store.clone() {
             match decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
                 compute_manager.compensation_ledger(),
