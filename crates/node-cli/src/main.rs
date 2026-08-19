@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
 use decentraai_identity::Identity;
@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+mod upgrade;
 
 #[derive(Debug, Parser)]
 #[command(name = "decentraai", version, about = "DecentraAI node control CLI")]
@@ -110,6 +112,32 @@ enum Command {
     /// identity + config, store the guest token as the node's credential, and
     /// verify it can reach the coordinating peer.
     Join(JoinArgs),
+    /// Self-upgrade the node software from its git remote (origin/main).
+    Upgrade(UpgradeArgs),
+}
+#[derive(Debug, Subcommand)]
+enum UpgradeCommand {
+    /// Read-only: fetch origin and report whether a newer main exists.
+    Check,
+    /// Pull main, rebuild, swap the binary and restart the service. Fails
+    /// (with rollback) unless the working tree is clean.
+    Apply,
+    /// Loop forever: check every interval; apply when behind.
+    Auto(AutoUpgradeArgs),
+}
+#[derive(Debug, Args)]
+struct UpgradeArgs {
+    #[command(subcommand)]
+    command: UpgradeCommand,
+    /// Repository root (defaults to the current directory).
+    #[arg(long, global = true, default_value = ".")]
+    repo: PathBuf,
+}
+#[derive(Debug, Args)]
+struct AutoUpgradeArgs {
+    /// Seconds between update checks.
+    #[arg(long, default_value_t = 21_600)] // 6h
+    interval_secs: u64,
 }
 #[derive(Debug, Args)]
 struct InitArgs {
@@ -146,6 +174,13 @@ struct NodeArgs {
     /// back to the worker that already holds that session's KV prefix.
     #[arg(long)]
     session: Option<String>,
+    /// Self-upgrade watcher: check the git remote every interval and apply a
+    /// newer main automatically (build + binary swap + service restart).
+    #[arg(long)]
+    auto_upgrade: bool,
+    /// Seconds between auto-upgrade checks (default 6h).
+    #[arg(long, default_value_t = 21_600)]
+    auto_upgrade_interval_secs: u64,
 }
 #[derive(Debug, Args)]
 struct OpenArgs {
@@ -725,6 +760,7 @@ async fn main() -> Result<()> {
         Command::Open(args) => open_dashboard(args),
         Command::Invite(args) => invite(args),
         Command::Join(args) => join(args).await,
+        Command::Upgrade(args) => upgrade_command(args).await,
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -1076,6 +1112,46 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     use std::time::Duration;
 
     let config_path = expand_tilde(&args.config.to_string_lossy());
+
+    // 0. Self-upgrade watcher (before identity/config are loaded, so an
+    //    upgrade that restarts the service does not race the node's own
+    //    startup). Runs in the background; logs, never blocks the node.
+    if args.auto_upgrade {
+        let repo = PathBuf::from(".");
+        let interval = args.auto_upgrade_interval_secs;
+        tokio::spawn(async move {
+            loop {
+                match upgrade::check_for_update(&repo) {
+                    upgrade::UpdateStatus::Behind { behind, .. } if behind > 0 => {
+                        info!(behind, "auto-upgrade: update available, applying");
+                        match upgrade::apply_update(&repo) {
+                            Ok(report) => info!(
+                                from = %report.from,
+                                to = %report.to,
+                                "auto-upgrade: upgraded — node service restarted"
+                            ),
+                            Err(e) => {
+                                warn!(error = %e, "auto-upgrade: apply failed, retrying next interval")
+                            }
+                        }
+                    }
+                    upgrade::UpdateStatus::UpToDate => {}
+                    upgrade::UpdateStatus::NoRepo => {
+                        warn!(
+                            "auto-upgrade: not a git checkout ({}); disabling watcher",
+                            repo.display()
+                        );
+                        break;
+                    }
+                    upgrade::UpdateStatus::Error(e) => {
+                        warn!(error = %e, "auto-upgrade: check failed, retrying next interval");
+                    }
+                    upgrade::UpdateStatus::Behind { .. } => {}
+                }
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        });
+    }
 
     // 1. Auto-provision identity + config if this is a truly first run.
     if !config_path.exists() {
@@ -3187,6 +3263,68 @@ fn invite(args: InviteArgs) -> Result<()> {
 /// credential (`runtime/invite.token`, 0600), and verifies the multiaddr is
 /// actually reachable before declaring success. Ongoing peer discovery is
 /// handled by the node's normal mDNS/discovery path.
+/// Handler for `decentraai upgrade check|apply|auto`.
+async fn upgrade_command(args: UpgradeArgs) -> Result<()> {
+    use std::time::Duration;
+    use upgrade::{ApplyReport, UpdateStatus, apply_update, check_for_update, installed_bin_path};
+
+    let repo = expand_tilde(&args.repo.to_string_lossy());
+    match args.command {
+        UpgradeCommand::Check => match check_for_update(Path::new(&repo)) {
+            UpdateStatus::UpToDate => {
+                println!("up to date (HEAD == origin/main)");
+            }
+            UpdateStatus::Behind {
+                behind,
+                local_head,
+                remote_head,
+            } => {
+                println!(
+                    "update available: {behind} commit(s) behind — {local_head} -> {remote_head}"
+                );
+                println!("  run `decentraai upgrade apply` to update");
+            }
+            UpdateStatus::NoRepo => bail!("not a git checkout: {}", repo.display()),
+            UpdateStatus::Error(e) => bail!("update check failed: {e}"),
+        },
+        UpgradeCommand::Apply => {
+            let report: ApplyReport = apply_update(Path::new(&repo))?;
+            println!("upgraded {} -> {}", report.from, report.to);
+            println!("binary backed up at {}", report.binary_backup.display());
+            println!(
+                "installed at {} — node service restarted (if installed)",
+                installed_bin_path().display()
+            );
+        }
+        UpgradeCommand::Auto(args) => {
+            println!(
+                "auto-upgrade watcher: checking every {}s against {}",
+                args.interval_secs,
+                repo.display()
+            );
+            loop {
+                match check_for_update(Path::new(&repo)) {
+                    UpdateStatus::Behind { behind, .. } if behind > 0 => {
+                        println!("==> update found ({behind} commits behind); applying");
+                        match apply_update(Path::new(&repo)) {
+                            Ok(report) => {
+                                println!("==> upgraded {} -> {}", report.from, report.to)
+                            }
+                            Err(e) => eprintln!("==> upgrade failed (will retry): {e:#}"),
+                        }
+                    }
+                    UpdateStatus::UpToDate => println!("==> up to date"),
+                    UpdateStatus::NoRepo => bail!("not a git checkout: {}", repo.display()),
+                    UpdateStatus::Error(e) => eprintln!("==> update check failed: {e}"),
+                    UpdateStatus::Behind { .. } => {}
+                }
+                tokio::time::sleep(Duration::from_secs(args.interval_secs)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn join(args: JoinArgs) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
