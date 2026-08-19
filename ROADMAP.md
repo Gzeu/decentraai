@@ -2699,3 +2699,32 @@ A full two-node session on real hardware, all verified live:
   reasons reliability/quality/latency with sample counts).
 
 Tests: 1056 workspace tests green; clippy `-D warnings` clean.
+
+## 119. Tool Runtime — OCR + STT subprocesses (DONE)
+
+Local AI tool subprocesses beyond TTS, same pattern (never FFI): an embedded
+Python server written to `<data_dir>/tools/<tool>/server.py` at start, spawned
+as a child on an ephemeral loopback port, health-probed, and proxied through
+an authenticated `/v1/<tool>` endpoint. Missing setup (venv/model absent) never
+fails startup — the node serves without the tool and logs a warning.
+
+- **OCR** (`/v1/ocr`, `scripts/setup-ocr.sh`): RapidOCR (PP-OCRv4 on
+  onnxruntime, CPU-friendly, models bundled in the wheel). Request body:
+  `{"image_b64": "...", "lang": "en"}`; response: `{text, lines, boxes}`.
+  50 MiB body cap; per-token rate limit shared with inference.
+- **STT** (`/v1/stt`, `scripts/setup-stt.sh`): faster-whisper (CTranslate2,
+  CPU int8). Request body: `{"audio_b64": "...", "lang": "ro"}`; response:
+  `{text, language, duration_s}`. 100 MiB body cap; model `tiny|base|small|
+  medium|large-v3`, HF cache pinned under the data dir via HF_HOME.
+- **Generic `ToolServer`** (`crates/runtime/src/tools.rs`): shared subprocess
+  lifecycle (write script → spawn venv python → wait `/health` → stop+kill on
+  drop) used by both tools; TTS keeps its own manager untouched.
+- **Config**: `[ocr]` and `[stt]` sections in `node.yaml`, both off by default
+  (absent = disabled), `deny_unknown_fields` like every other section; example
+  config documents all three tool sections.
+- **Status**: `/status` reports `ocr.enabled/healthy` and `stt.enabled/
+  healthy/model` for the dashboard.
+
+Tests: 1061 workspace tests green (was 1056); clippy `-D warnings` clean.
+New tests: config parse + deny-unknown-fields for both sections, status
+defaults, TTS handler untouched.

@@ -37,6 +37,14 @@ pub struct NodeConfig {
     /// under the data dir (`tts/`).
     #[serde(default)]
     pub tts: Option<TtsSection>,
+    /// Local OCR (RapidOCR onnxruntime subprocess). Absent = OCR is disabled;
+    /// `/v1/ocr` returns 404. Enabling requires `<data_dir>/tools/ocr/venv`.
+    #[serde(default)]
+    pub ocr: Option<OcrSection>,
+    /// Local STT (faster-whisper subprocess). Absent = STT is disabled;
+    /// `/v1/stt` returns 404. Enabling requires `<data_dir>/tools/stt/venv`.
+    #[serde(default)]
+    pub stt: Option<SttSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +353,66 @@ impl Default for TtsSection {
     }
 }
 
+/// Local optical character recognition (OCR). Drives a RapidOCR
+/// (PP-OCRv4 on onnxruntime) Python subprocess — external engine, never FFI —
+/// exposed as `/v1/ocr`. Models are bundled in the wheel; the venv lives in
+/// `<data_dir>/tools/ocr/venv/`. Absent section = OCR off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrSection {
+    /// Enable the OCR subprocess at node start. If true but the venv is
+    /// missing, the node logs a warning and serves without OCR instead of
+    /// failing startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default recognition language passed to the engine (`en`, `ro`, …).
+    #[serde(default = "default_ocr_lang")]
+    pub lang: String,
+}
+
+fn default_ocr_lang() -> String {
+    "en".to_string()
+}
+
+impl Default for OcrSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lang: default_ocr_lang(),
+        }
+    }
+}
+
+/// Local speech-to-text (STT). Drives a faster-whisper (CTranslate2) Python
+/// subprocess — external engine, never FFI — exposed as `/v1/stt`. Models
+/// download on first use (or are pre-placed in `<data_dir>/tools/stt/models`
+/// via HF_HOME). Absent section = STT off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SttSection {
+    /// Enable the STT subprocess at node start. If true but the venv is
+    /// missing, the node logs a warning and serves without STT instead of
+    /// failing startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// faster-whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3`.
+    #[serde(default = "default_stt_model")]
+    pub model: String,
+}
+
+fn default_stt_model() -> String {
+    "base".to_string()
+}
+
+impl Default for SttSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_stt_model(),
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -604,6 +672,58 @@ mod tests {
             err.to_string().contains("tiers require"),
             "tiers without api_auth_required must be rejected, got: {err}"
         );
+    }
+
+    #[test]
+    fn ocr_and_stt_are_optional_and_off_by_default() {
+        // The example config has no ocr/stt sections: they must parse as
+        // absent (= disabled) and never break existing installs.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(config.ocr.is_none());
+        assert!(config.stt.is_none());
+    }
+
+    #[test]
+    fn ocr_section_parses_and_unknown_fields_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let with_ocr = format!(
+            "{raw}\nocr:\n  enabled: true\n  lang: \"ro\"\n"
+        );
+        std::fs::write(file.path(), with_ocr).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let ocr = config.ocr.expect("ocr section parsed");
+        assert!(ocr.enabled);
+        assert_eq!(ocr.lang, "ro");
+
+        // deny_unknown_fields: a typo must fail validation, not be ignored.
+        let bad = format!("{raw}\nocr:\n  enabled: true\n  lenguage: \"en\"\n");
+        std::fs::write(file.path(), bad).unwrap();
+        assert!(NodeConfig::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn stt_section_parses_and_unknown_fields_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let with_stt = format!("{raw}\nstt:\n  enabled: true\n  model: \"tiny\"\n");
+        std::fs::write(file.path(), with_stt).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let stt = config.stt.expect("stt section parsed");
+        assert!(stt.enabled);
+        assert_eq!(stt.model, "tiny");
+
+        // deny_unknown_fields: a typo must fail validation, not be ignored.
+        let bad = format!("{raw}\nstt:\n  enabled: true\n  modle: \"base\"\n");
+        std::fs::write(file.path(), bad).unwrap();
+        assert!(NodeConfig::load(file.path()).is_err());
     }
 
     #[test]

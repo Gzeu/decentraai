@@ -112,3 +112,23 @@ tiers:
   tier3: # core — large contributions, clean reputation
     models: []
     rate_limit_per_minute: 120
+
+# Tool Runtime — local AI tool subprocesses exposed as authenticated API
+# endpoints. All are off by default (absent = disabled); each needs its
+# setup script run once (scripts/setup-ocr.sh, scripts/setup-stt.sh,
+# scripts/setup-tts.sh) which installs the Python venv + models under the
+# data dir. Missing setup never fails startup — the node serves without
+# the tool and logs a warning.
+#
+# tts:                    # text-to-speech — Kokoro-82M ONNX subprocess
+#   enabled: true
+#   voice: "ro_RO-raluca-high"
+#   speed: 1.0
+#
+# ocr:                    # optical character recognition — RapidOCR
+#   enabled: true
+#   lang: "en"            # recognition language (en, ro, ...)
+#
+# stt:                    # speech-to-text — faster-whisper
+#   enabled: true
+#   model: "base"         # tiny | base | small | medium | large-v3

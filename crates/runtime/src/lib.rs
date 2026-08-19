@@ -15,6 +15,7 @@ pub mod dashboard_v2;
 pub mod mcp;
 pub mod providers_api;
 pub mod queue;
+pub mod tools;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};
@@ -543,7 +544,7 @@ pub async fn wait_until_ready(host: &str, port: u16, timeout: Duration) -> Resul
 }
 
 /// Single blocking health probe: `GET /health`, expecting an HTTP 200 status.
-fn probe_health(host: &str, port: u16) -> Result<()> {
+pub(crate) fn probe_health(host: &str, port: u16) -> Result<()> {
     let addr = (host, port)
         .to_socket_addrs()?
         .next()

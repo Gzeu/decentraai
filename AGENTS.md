@@ -47,6 +47,11 @@ Current state: ROADMAP.md is fully done (M0–M8). The next roadmap
   `api.rs` (thin axum proxy + Bearer auth + inference metrics + web
   dashboard; the dashboard NEVER polls the proxy — only `/status` and
   `/v1/peers` — so watching the page cannot reset the idle clock).
+  `tools.rs` is the Tool Runtime: generic `ToolServer` subprocess lifecycle
+  (embedded Python server → ephemeral loopback port → health probe →
+  authenticated `/v1/<tool>` proxy) shared by OCR (`/v1/ocr`, RapidOCR) and
+  STT (`/v1/stt`, faster-whisper). Missing venv/models never fails startup —
+  the node serves without the tool and logs a warning.
 - `crates/audit` — append-only JSON-lines security log
   (`logs/audit.jsonl`): peer bans, chunk verification failures,
   admission rejections, inference starts. Prompts and outputs are never

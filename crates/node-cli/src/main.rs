@@ -1878,6 +1878,46 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 }
             }
         }
+        // OCR: RapidOCR subprocess for `/v1/ocr`. Enabled only when `ocr.enabled`
+        // is set AND the venv exists; missing setup logs a warning and serves
+        // without OCR rather than failing startup.
+        if let Some(ocr_cfg) = config.ocr.clone() {
+            if ocr_cfg.enabled {
+                match decentraai_runtime::tools::OcrServer::spawn(&data_dir).await {
+                    Ok(server) => {
+                        info!("OCR online (RapidOCR subprocess)");
+                        state.attach_ocr(Arc::new(
+                            decentraai_runtime::tools::OcrManager::new(Some(server)),
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "OCR unavailable (run scripts/setup-ocr.sh)"
+                        );
+                    }
+                }
+            }
+        }
+        // STT: faster-whisper subprocess for `/v1/stt`. Enabled only when
+        // `stt.enabled` is set AND the venv exists; missing setup logs a
+        // warning and serves without STT rather than failing startup.
+        if let Some(stt_cfg) = config.stt.clone() {
+            if stt_cfg.enabled {
+                match decentraai_runtime::tools::SttServer::spawn(&data_dir, &stt_cfg.model).await {
+                    Ok(server) => {
+                        info!(model = %stt_cfg.model, "STT online (faster-whisper subprocess)");
+                        state.attach_stt(Arc::new(decentraai_runtime::tools::SttManager::new(
+                            Some(server),
+                            stt_cfg.model.clone(),
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "STT unavailable (run scripts/setup-stt.sh)");
+                    }
+                }
+            }
+        }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());
         // P3.5/P9: the API can trigger collective workflows by delegating to

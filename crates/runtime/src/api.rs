@@ -322,6 +322,10 @@ pub struct ApiState {
     /// synthesizes speech for the chat speak button. `TtsManager::enabled()`
     /// false = disabled; the dashboard hides the speak control.
     tts: Arc<TtsManager>,
+    /// Local OCR (RapidOCR subprocess). `/v1/ocr` when enabled.
+    ocr: Arc<crate::tools::OcrManager>,
+    /// Local STT (faster-whisper subprocess). `/v1/stt` when enabled.
+    stt: Arc<crate::tools::SttManager>,
 }
 
 impl ApiState {
@@ -376,6 +380,8 @@ impl ApiState {
             talent_tree: None,
             providers: None,
             tts: Arc::new(TtsManager::disabled()),
+            ocr: Arc::new(crate::tools::OcrManager::disabled()),
+            stt: Arc::new(crate::tools::SttManager::disabled()),
         }
     }
 
@@ -399,6 +405,16 @@ impl ApiState {
     /// dashboard honest: no speak button, no `/v1/tts`.
     pub fn attach_tts(&mut self, tts: Arc<TtsManager>) {
         self.tts = tts;
+    }
+
+    /// Attaches the OCR tool runtime (subprocess). Disabled by default.
+    pub fn attach_ocr(&mut self, ocr: Arc<crate::tools::OcrManager>) {
+        self.ocr = ocr;
+    }
+
+    /// Attaches the STT tool runtime (subprocess). Disabled by default.
+    pub fn attach_stt(&mut self, stt: Arc<crate::tools::SttManager>) {
+        self.stt = stt;
     }
 
     /// Attaches the collective-intelligence agent manager (P1) so the
@@ -4617,6 +4633,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
         .route("/v1/tts", post(tts_handler))
+        .route("/v1/ocr", post(ocr_handler))
+        .route("/v1/stt", post(stt_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -4879,6 +4897,15 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "healthy": state.tts.healthy(),
             "voice": state.tts.voice,
             "speed": state.tts.speed,
+        },
+        "ocr": {
+            "enabled": state.ocr.enabled(),
+            "healthy": state.ocr.healthy(),
+        },
+        "stt": {
+            "enabled": state.stt.enabled(),
+            "healthy": state.stt.healthy(),
+            "model": state.stt.model,
         },
         "tiers": state.tiers.as_ref().map(|tiers| serde_json::json!({
             "tier1": {
@@ -5789,6 +5816,201 @@ async fn tts_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
         StatusCode::OK,
         [(header::CONTENT_TYPE, "audio/wav")],
         bytes.to_vec(),
+    )
+        .into_response()
+}
+
+/// POST /v1/ocr — extract text from an image (RapidOCR subprocess proxy).
+///
+/// Body: `{"image_b64": "<base64>", "lang": "en"}`. Prompts/outputs are never
+/// logged. 404 when OCR is not enabled on this node.
+async fn ocr_handler(State(state): State<ApiState>, headers: HeaderMap, body: String) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": "invalid JSON body"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let image_b64 = payload
+        .get("image_b64")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim())
+        .unwrap_or_default();
+    if image_b64.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "image_b64 is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    // Guard against absurd bodies (base64 of a huge image).
+    if image_b64.len() > 50 * 1024 * 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "image_b64 exceeds 50 MiB"}}).to_string(),
+        )
+            .into_response();
+    }
+    if !state.ocr.enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"message": "OCR is not enabled on this node"}}).to_string(),
+        )
+            .into_response();
+    }
+    let Some(base) = state.ocr.base_url() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let lang = payload
+        .get("lang")
+        .and_then(|l| l.as_str())
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or("en");
+    let forwarded = serde_json::json!({
+        "image_b64": image_b64,
+        "lang": lang,
+    });
+    let request = match state
+        .client
+        .post(format!("{base}/v1/ocr"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(forwarded.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "OCR backend unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "OCR backend unreachable"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let status = request.status();
+    if status != StatusCode::OK {
+        return (status, request.text().await.unwrap_or_default()).into_response();
+    }
+    let text = match request.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "OCR backend read failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        text,
+    )
+        .into_response()
+}
+
+/// POST /v1/stt — transcribe audio to text (faster-whisper subprocess proxy).
+///
+/// Body: `{"audio_b64": "<base64>", "lang": "ro"}`. Prompts/outputs are never
+/// logged. 404 when STT is not enabled on this node.
+async fn stt_handler(State(state): State<ApiState>, headers: HeaderMap, body: String) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": "invalid JSON body"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let audio_b64 = payload
+        .get("audio_b64")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim())
+        .unwrap_or_default();
+    if audio_b64.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "audio_b64 is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    if audio_b64.len() > 100 * 1024 * 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "audio_b64 exceeds 100 MiB"}}).to_string(),
+        )
+            .into_response();
+    }
+    if !state.stt.enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"message": "STT is not enabled on this node"}}).to_string(),
+        )
+            .into_response();
+    }
+    let Some(base) = state.stt.base_url() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let lang = payload
+        .get("lang")
+        .and_then(|l| l.as_str())
+        .filter(|l| !l.trim().is_empty());
+    let forwarded = serde_json::json!({
+        "audio_b64": audio_b64,
+        "lang": lang,
+        "model": state.stt.model,
+    });
+    let request = match state
+        .client
+        .post(format!("{base}/v1/stt"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(forwarded.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "STT backend unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "STT backend unreachable"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let status = request.status();
+    if status != StatusCode::OK {
+        return (status, request.text().await.unwrap_or_default()).into_response();
+    }
+    let text = match request.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "STT backend read failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        text,
     )
         .into_response()
 }
@@ -10265,6 +10487,26 @@ mod tests {
         assert_eq!(body["tts"]["enabled"], false);
         assert_eq!(body["tts"]["voice"], "ro_RO-lili-high");
         assert_eq!(body["tts"]["speed"], 1.25);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_reports_ocr_and_stt_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ocr"]["enabled"], false);
+        assert_eq!(body["ocr"]["healthy"], false);
+        assert_eq!(body["stt"]["enabled"], false);
+        assert_eq!(body["stt"]["healthy"], false);
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
