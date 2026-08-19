@@ -121,6 +121,46 @@ impl ComputeCapability {
             .iter()
             .find(|m| m.model_hash == model_hash)
     }
+
+    /// The model on disk (registry) matching `model_hash`, if any — present
+    /// but not necessarily loaded into the engine right now.
+    pub fn available_model(&self, model_hash: &str) -> Option<&ServedModel> {
+        self.available_models
+            .iter()
+            .find(|m| m.model_hash == model_hash)
+    }
+
+    /// Marginal host RAM (MiB) a *new request* for `model_hash` costs this
+    /// worker, given what is already resident.
+    ///
+    /// A model that is currently served (`served_models`) is already loaded
+    /// into the engine: its weights are in RAM and already subtracted from
+    /// `available_ram_mb` (the probe measures live free memory). Charging
+    /// `est_ram_mb` again would double-count the resident weights and make
+    /// the admission gate reject requests for the very model the engine is
+    /// running — exactly what happened on the Desktop worker for its active
+    /// Llama model (required 2240 MiB vs ~1992 MiB free). For a resident
+    /// model the marginal cost is the KV-cache/context working set plus
+    /// compute buffers, estimated conservatively from the advertised context
+    /// window (`~128 KiB/token`, floored at 64 MiB — a coarse safe ceiling).
+    ///
+    /// A model that is only *available on disk* (not loaded yet) still costs
+    /// its full load estimate. Unknown hashes cost nothing extra; the caller
+    /// applies its own provisioning default.
+    pub fn request_ram_mb(&self, model_hash: &str) -> u64 {
+        if let Some(m) = self.model(model_hash) {
+            match m.context_tokens {
+                // Unknown context window (pre-M20 worker): assume a
+                // conservative ~4k-token working set rather than a tiny floor.
+                0 => 512,
+                ctx => (u64::from(ctx) / 8).max(64),
+            }
+        } else if let Some(m) = self.available_model(model_hash) {
+            m.est_ram_mb
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +262,56 @@ mod tests {
         assert!(big > small, "larger model needs more full-load RAM");
         // A tiny file still gets a floor of at least 1 MiB budget.
         assert!(ServedModel::estimate_ram_mb(1) >= 1);
+    }
+
+    #[test]
+    fn request_ram_for_resident_model_is_context_only() {
+        // The worker *serves* the model (weights already resident). A new
+        // request must NOT be charged the full-load estimate again — that
+        // double-counts the resident weights and rejects the very model the
+        // engine is running. Only the KV/context working set is marginal.
+        let cap = capability();
+        // `capability()` uses context_tokens: 0 (unknown window, pre-M20): the
+        // conservative 512 MiB default must still be far below a real full
+        // load, proving the resident path never re-charges the weights.
+        // Give the served model a realistic full-load est (Desktop Llama was
+        // ~2240 MiB required vs ~1992 MiB free — the bug this fixes).
+        let mut cap = capability();
+        cap.served_models[0].est_ram_mb = 2240;
+        let resident = cap.request_ram_mb("abc");
+        assert_eq!(
+            resident, 512,
+            "unknown context window defaults conservatively"
+        );
+        assert!(
+            resident < cap.model("abc").unwrap().est_ram_mb,
+            "resident model charges context, not a second full load"
+        );
+        assert!(resident >= 64, "context floor still reserves headroom");
+
+        // A known context window scales with it (128 KiB/token).
+        let mut known = capability();
+        known.served_models[0].context_tokens = 4096;
+        assert_eq!(known.request_ram_mb("abc"), 512);
+        known.served_models[0].context_tokens = 16384;
+        assert_eq!(known.request_ram_mb("abc"), 2048);
+    }
+
+    #[test]
+    fn request_ram_for_disk_only_model_is_full_load() {
+        // A model present on disk but not loaded yet still costs the full
+        // load estimate — serving it means loading the weights.
+        let mut cap = capability();
+        cap.available_models.push(ServedModel {
+            model_hash: "disk-only".into(),
+            file_name: "other.gguf".into(),
+            size_mb: 1024,
+            est_ram_mb: 128,
+            est_vram_mb: 0,
+            context_tokens: 4096,
+        });
+        assert_eq!(cap.request_ram_mb("disk-only"), 128);
+        // Unknown hashes charge nothing; the caller applies its own default.
+        assert_eq!(cap.request_ram_mb("unknown-hash"), 0);
     }
 }

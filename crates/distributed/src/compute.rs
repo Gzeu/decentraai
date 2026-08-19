@@ -1466,9 +1466,18 @@ impl ComputeManager {
         let mut vram: u64 = 0;
         let mut can_provision = false;
         for adv in &workers {
-            if let Some(model) = adv.capability.model(model_hash) {
-                ram = ram.max(model.est_ram_mb);
-                vram = vram.max(model.est_vram_mb);
+            // A worker that *serves* the model already has its weights
+            // resident; the marginal cost of a new request is the KV/context
+            // working set, not a second full load (see
+            // `ComputeCapability::request_ram_mb`). A worker that only has
+            // the model on disk still charges the full load estimate.
+            if adv.capability.has_model(model_hash) {
+                ram = ram.max(adv.capability.request_ram_mb(model_hash));
+                vram = vram.max(
+                    adv.capability
+                        .model(model_hash)
+                        .map_or(0, |m| m.est_vram_mb),
+                );
             }
             if adv.capability.can_provision {
                 can_provision = true;
@@ -3053,6 +3062,83 @@ mod tests {
             .expect("routes");
         assert_eq!(placement.worker, worker);
         assert_eq!(plan.workers(), vec![worker.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn requirements_for_resident_model_charges_context_not_full_load() {
+        // A worker that *serves* a model already holds its weights resident;
+        // a new request must cost the KV/context working set, not a second
+        // full load (the Desktop bug: required 2240 MiB vs ~1992 MiB free).
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let mut adv = build_advertisement(
+            p,
+            "worker",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        // Force a realistic "resident" footprint: the 256 MiB `model()` est is
+        // only ~context headroom for a served model; the full load would be
+        // much larger. Give the served model a large full-load est so the two
+        // paths diverge clearly.
+        adv.capability.served_models[0].est_ram_mb = 2240;
+        adv.capability.served_models[0].context_tokens = 4096;
+        manager.process_advertisement(adv).await;
+
+        let req = manager
+            .requirements_for("abc")
+            .await
+            .expect("served model is routable");
+        assert!(
+            req.est_ram_mb < 2240,
+            "resident model must not re-charge the full load: {}",
+            req.est_ram_mb
+        );
+        assert!(req.est_ram_mb > 0, "context reservation is never zero");
+    }
+
+    #[tokio::test]
+    async fn requirements_for_disk_only_model_charges_full_load() {
+        // A model present on disk but not yet loaded still costs its full
+        // load estimate: serving it means loading the weights.
+        let p = peer();
+        let manager = ComputeManager::new(p, "coordinator".into(), HashSet::from([p]));
+        let mut adv = build_advertisement(
+            p,
+            "worker",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        adv.capability.available_models.push(ServedModel {
+            model_hash: "disk-only".into(),
+            file_name: "big.gguf".into(),
+            size_mb: 2048,
+            est_ram_mb: 2240,
+            est_vram_mb: 0,
+            context_tokens: 4096,
+        });
+        manager.process_advertisement(adv).await;
+
+        let req = manager
+            .requirements_for("disk-only")
+            .await
+            .expect("on-disk model is routable");
+        assert_eq!(
+            req.est_ram_mb, 2240,
+            "loading still costs the full footprint"
+        );
     }
 
     #[tokio::test]

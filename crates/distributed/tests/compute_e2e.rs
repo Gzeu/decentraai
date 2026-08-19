@@ -199,7 +199,11 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         .requirements_for(MODEL_HASH)
         .await
         .expect("the advertised model must yield workload requirements");
-    assert_eq!(req.est_ram_mb, 1024);
+    // The worker *serves* the model (weights resident), so a new request
+    // costs the KV/context working set only — for a pre-M20 worker with an
+    // unknown context window that is the conservative 512 MiB default, not
+    // the full-load est_ram_mb (the Desktop double-count bug).
+    assert_eq!(req.est_ram_mb, 512);
     assert_eq!(req.est_vram_mb, 3072);
 
     // Selection books a reservation (M13).
@@ -209,7 +213,7 @@ async fn two_node_compute_advertisement_routes_and_releases_reservation() {
         .expect("trusted, eligible worker must be selected");
     assert_eq!(placement.worker, worker_peer);
     assert_eq!(coord_compute.in_flight(&worker_peer).await, 1);
-    assert_eq!(coord_compute.reserved_ram(&worker_peer).await, 1024);
+    assert_eq!(coord_compute.reserved_ram(&worker_peer).await, 512);
     // Leave a clean ledger: the routed request below books its own booking.
     coord_compute
         .release(placement.reservation.reservation_id)
@@ -694,14 +698,17 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
     use decentraai_inference_adapter::{BackendConfig, OpenAiCompatibleBackend};
     use decentraai_protocol::{InferMessage, deserialize_message};
 
-    // A model too large for a worker advertising only 2 GiB free RAM.
+    // A model too large for a worker advertising only 2 GiB free RAM. It is
+    // *served* (weights resident), so a request charges the KV/context
+    // working set — an extreme 16384-token window costs 2048 MiB, which plus
+    // the 1024 MiB min-free headroom exceeds the worker's 2048 MiB free RAM.
     let big_model = decentraai_compute::ServedModel {
         model_hash: MODEL_HASH.to_string(),
         file_name: "big.gguf".into(),
         size_mb: 8192,
         est_ram_mb: 8192,
         est_vram_mb: 0,
-        context_tokens: 0,
+        context_tokens: 16384,
     };
     let tiny_snapshot = SystemSnapshot {
         logical_cpus: 8,

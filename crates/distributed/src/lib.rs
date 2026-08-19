@@ -796,18 +796,34 @@ impl DistributedInference {
                         .and_then(|c| c.last_local_advertisement_sync())
                     {
                         Some(ad) => {
-                            let est = ad
+                            // The model we are asked to serve is our *active*
+                            // model (`req.model_hash == model_hash_clone` was
+                            // already enforced above), so its weights are
+                            // resident and already reflected in the live
+                            // `available_ram_mb` probe. Charging `est_ram_mb`
+                            // again double-counts them and rejects requests
+                            // for the very model the engine is running — e.g.
+                            // Llama-3.2-1B (1216 MiB est) + min-free 1024 =
+                            // 2240 MiB on a worker with ~1992 MiB free. The
+                            // marginal cost of a new request on a resident
+                            // model is the KV/context working set only.
+                            let est_ram = {
+                                let e = ad.capability.request_ram_mb(&req.model_hash);
+                                // Defensive: an unknown hash costs the default
+                                // full-load estimate. In practice the hash was
+                                // already validated against the active model
+                                // above, so this branch is unreachable.
+                                if e == 0 { DEFAULT_EST_RAM_MB } else { e }
+                            };
+                            let est_vram = ad
                                 .capability
-                                .served_models
-                                .iter()
-                                .find(|m| m.model_hash == req.model_hash)
-                                .map(|m| (m.est_ram_mb, m.est_vram_mb))
-                                .unwrap_or((DEFAULT_EST_RAM_MB, 0));
+                                .model(&req.model_hash)
+                                .map_or(0, |m| m.est_vram_mb);
                             (
                                 ad.availability.available_ram_mb,
                                 ad.availability.available_vram_mb,
-                                est.0,
-                                est.1,
+                                est_ram,
+                                est_vram,
                             )
                         }
                         None => (0, None, 0, 0),
