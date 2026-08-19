@@ -117,6 +117,14 @@ enum Command {
     Join(JoinArgs),
     /// Self-upgrade the node software from its git remote (origin/main).
     Upgrade(UpgradeArgs),
+    /// DecentraAI Benchmark Lab: run single vs RAG vs collective tasks through
+    /// a running node's `/v1/bench` API. `run` fires one task; `dataset`
+    /// loads a decrypted benchmark JSONL (see scripts/bench-browsecomp-plus.py)
+    /// and runs a batch, printing the honest comparison.
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
 }
 #[derive(Debug, Subcommand)]
 enum UpgradeCommand {
@@ -692,6 +700,40 @@ enum MemoryCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum BenchCommand {
+    /// Run one benchmark task through the node's live executor and print the
+    /// graded verdict. `--gold` is optional: ungradable tasks are Abstained.
+    Run {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        gold: Option<String>,
+        #[arg(long, default_value = "single")]
+        mode: String,
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    /// Load a decrypted benchmark JSONL (BrowseComp-Plus format) and run up
+    /// to `--limit` tasks through the node's `/v1/bench` API in the given
+    /// mode. Prints the registry comparison after the batch — the honest
+    /// verdict needs MIN_SAMPLES graded runs per mode and a MIN_MARGIN delta.
+    Dataset {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        #[arg(long, default_value = "single")]
+        mode: String,
+        #[arg(long, default_value = "3")]
+        agents: usize,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -764,6 +806,7 @@ async fn main() -> Result<()> {
         Command::Invite(args) => invite(args),
         Command::Join(args) => join(args).await,
         Command::Upgrade(args) => upgrade_command(args).await,
+        Command::Bench { command } => bench_command(command).await,
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -3838,6 +3881,179 @@ async fn rag_command(command: RagCommand) -> Result<()> {
 async fn memory_command(command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::List { config } => memory_list(&config).await,
+    }
+}
+
+/// DecentraAI Benchmark Lab CLI: run tasks through the node's live executor.
+async fn bench_command(command: BenchCommand) -> Result<()> {
+    match command {
+        BenchCommand::Run {
+            config,
+            prompt,
+            gold,
+            mode,
+            evidence,
+        } => {
+            let mut body = serde_json::json!({ "prompt": prompt, "mode": mode });
+            if let Some(gold) = gold {
+                if !gold.trim().is_empty() {
+                    body["gold"] = serde_json::Value::String(gold);
+                }
+            }
+            if let Some(evidence) = evidence {
+                if !evidence.trim().is_empty() {
+                    body["evidence"] = serde_json::Value::Array(
+                        evidence
+                            .split(',')
+                            .map(|s| serde_json::Value::String(s.trim().to_string()))
+                            .collect(),
+                    );
+                }
+            }
+            if mode == "collective" {
+                body["agents"] = serde_json::json!(3);
+            }
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.post(format!("{base_url}/bench/run")).json(&body);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "bench run failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            let run = &j["run"];
+            let verdict = run.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
+            let metrics = &run["metrics"];
+            let latency = metrics.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tokens = metrics.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("verdict: {verdict} ({latency}ms, {tokens} tokens)");
+            let output = run.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            if !output.is_empty() {
+                println!("output: {}", &output[..output.len().min(300)]);
+            }
+        }
+        BenchCommand::Dataset {
+            config,
+            file,
+            limit,
+            mode,
+            agents,
+        } => {
+            let tasks =
+                decentraai_distributed::benchmark_datasets::load_browsecomp_plus(&file, limit)?;
+            if tasks.is_empty() {
+                anyhow::bail!("no tasks loaded from {}", file.display());
+            }
+            println!(
+                "running {} task(s) in mode '{mode}' (agents={agents}) through {}",
+                tasks.len(),
+                config.display()
+            );
+            let (client, base_url, token) = build_local_client(&config)?;
+            for (i, task) in tasks.iter().enumerate() {
+                let mut body = serde_json::json!({
+                    "prompt": task.prompt,
+                    "mode": mode,
+                    "agents": agents,
+                });
+                if let Some(gold) = &task.gold {
+                    body["gold"] = serde_json::Value::String(gold.clone());
+                }
+                if !task.evidence.is_empty() {
+                    body["evidence"] = serde_json::Value::Array(
+                        task.evidence
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
+                    );
+                }
+                let mut req = client.post(format!("{base_url}/bench/run")).json(&body);
+                if let Some(t) = &token {
+                    req = req.bearer_auth(t);
+                }
+                let resp = req.send().await?;
+                let status = resp.status();
+                let j: serde_json::Value = resp.json().await?;
+                if !status.is_success() {
+                    eprintln!(
+                        "  [{}/{}] {} failed (HTTP {}): {}",
+                        i + 1,
+                        tasks.len(),
+                        task.task_id,
+                        status,
+                        j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                    );
+                    continue;
+                }
+                let verdict = j["run"]
+                    .get("verdict")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let latency = j["run"]["metrics"]
+                    .get("latency_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!(
+                    "  [{}/{}] {} -> {verdict} ({latency}ms)",
+                    i + 1,
+                    tasks.len(),
+                    task.task_id
+                );
+            }
+            // After the batch, show the node's honest comparison.
+            let mut req = client.get(format!("{base_url}/bench"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let j: serde_json::Value = resp.json().await?;
+            print_bench_comparison(&j);
+        }
+    }
+    Ok(())
+}
+
+/// Prints the `/v1/bench` payload as a compact comparison table.
+fn print_bench_comparison(j: &serde_json::Value) {
+    let runs = j.get("runs").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("\nregistry runs: {runs}");
+    if !j.get("attached").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!("benchmark runtime not attached on this node");
+        return;
+    }
+    let cmp = &j["comparison"];
+    let pct = |mode: &str| -> String {
+        let m = &cmp[mode];
+        let graded = m.get("graded").and_then(|v| v.as_u64()).unwrap_or(0);
+        if graded == 0 {
+            "—".to_string()
+        } else {
+            let acc = m.get("accuracy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            format!("{:.0}%", acc * 100.0)
+        }
+    };
+    println!(
+        "  single     : {}   rag: {}   collective: {}",
+        pct("single"),
+        pct("rag"),
+        pct("collective")
+    );
+    let verdict = cmp
+        .get("collective_beats_single")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let reasoning = cmp.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
+    if verdict {
+        println!("  verdict: COLLECTIVE BEATS SINGLE — {reasoning}");
+    } else {
+        println!("  verdict: no conclusion yet — {reasoning}");
     }
 }
 

@@ -336,6 +336,13 @@ plus the runtime half in `decentraai-distributed`:
   API: `GET /v1/bench` + `POST /v1/bench/run` (operator+; real tokens);
   the dashboard has a Bench view. The verdict is a hypothesis about this
   fabric on this hardware, never a universal claim.
+  **Dataset adapter (F1)**: `scripts/bench-browsecomp-plus.py` downloads and
+  de-obfuscates BrowseComp-Plus (MIT, fixed 100K-doc corpus, 830 reasoning
+  queries) into `bench/browsecomp_plus.jsonl`; `crates/distributed/src/
+  benchmark_datasets.rs` reads it into tasks (deduped/truncated evidence
+  passages — the corpus averages 32K chars/doc). CLI: `decentraai bench run`
+  and `decentraai bench dataset --file … --limit N --mode … --agents N`,
+  which runs a batch through the live node and prints the honest comparison.
 
 **Runtime half (`decentraai-distributed`)**:
 - `AgentOrchestrator`: binds the pure fabric to the live P2P channel —

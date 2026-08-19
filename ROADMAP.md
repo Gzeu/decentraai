@@ -2932,5 +2932,19 @@ public datasets into `BenchmarkTask`s — the graded runs then feed the same
 registry + evidence loop. The lab's verdict is a **hypothesis about this
 fabric on this hardware**, not a universal claim.
 
-Tests: 6 pure + 5 manager + 2 API (1128 workspace total, 1115 + 13 new);
-clippy `-D warnings` clean.
+**Phase F1 — BrowseComp-Plus adapter (DONE)**: `scripts/bench-browsecomp-plus.py`
+downloads the MIT deep-research benchmark (830 reasoning-intensive queries,
+each with gold answer + gold/evidence/negative documents) and de-obfuscates
+it (the dataset ships XOR-encrypted over the published canary) into
+`bench/browsecomp_plus.jsonl`. `crates/distributed/src/benchmark_datasets.rs`
+(4 tests) reads that JSONL into `BenchmarkTask`s — evidence passages are
+deduped, capped at 6 docs and truncated to 2048 chars (the corpus averages
+32K chars/doc; a budgeted retriever sees the beginning). CLI:
+`decentraai bench run --prompt … --gold … --mode single|rag|collective` and
+`decentraai bench dataset --file bench/browsecomp_plus.jsonl --limit N
+--mode single|collective --agents 3`, which runs the batch through the live
+node and prints the honest comparison (no conclusion until MIN_SAMPLES +
+MIN_MARGIN).
+
+Tests: 6 pure + 5 manager + 4 dataset + 2 API (1132 workspace total, 1115 + 17
+new); clippy `-D warnings` clean.
