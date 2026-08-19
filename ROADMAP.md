@@ -2599,3 +2599,34 @@ serves the connected provider model over a loopback OpenAI-compatible mock,
 pinning the resolver→adapter wiring.
 
 Tests: 1018 workspace tests green; clippy `-D warnings` clean; fmt clean.
+
+## 117. ExecutionStrategy foundation (P1, research roadmap — DONE, commits `996b73a`, `004680c`)
+
+The research branch `research/distributed-inference-multi-worker` documented a
+multi-phase execution-strategy roadmap (`docs/research/EXECUTION-STRATEGY-ROADMAP.md`).
+**P1 — ExecutionStrategy foundation** is now implemented in `crates/fabric`,
+without changing any existing behavior:
+
+- `StrategyKind` — `SingleWorker`, `BatchFanOut`, plus 4 **gated experimental**
+  kinds (`SpeculativeDraftVerify`, `DisaggregatedPrefillDecode`,
+  `CacheAwareRoute`, `CollaborativeModel`) that the planner never emits today.
+- `EvidenceProvenance` — MEASURED / ESTIMATED / INFERRED / EXPERIMENTAL /
+  UNKNOWN (no fabricated measurements; missing data is UNKNOWN).
+- `StrategyRationale` + `RejectedStrategy` — why a strategy was chosen and why
+  alternatives were rejected.
+- `ExecutionStrategy` + `CanRunReport` — every `PlanResult` and
+  `ExecutionDecision` now carries the strategy and a per-worker
+  CAN_RUN/CAN_COLLABORATE snapshot (serde-defaulted so pre-P1 persisted
+  decisions deserialize cleanly).
+- `CAN_RUN` mirrors the existing eligibility projection (trusted + healthy +
+  serves the model); `CAN_COLLABORATE` is **deliberately conservative** —
+  `false` for every worker today, because no engine DecentraAI runs advertises
+  speculative / disaggregated / collaborative capabilities. Claiming
+  collaboration the fabric cannot execute would be a lie.
+- A real fan-out decision (engine-advertised staging + `allow_fanout` + ≥2
+  ranked workers) carries `BatchFanOut`; everything else stays `SingleWorker`.
+
+Tests: 1026 workspace tests green; clippy `-D warnings` clean; fmt clean.
+Remaining research phases (P2 NetworkFacts, P3 speculative, P4 prefill/decode,
+P5 cache-aware, P6 collaborative/RPC) stay **experimental** — they require live
+LAN measurements (Laptop ↔ Desktop) before the planner may select them.
