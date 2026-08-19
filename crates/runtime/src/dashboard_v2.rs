@@ -230,6 +230,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <button data-view="skills"><span class="ico">⚡</span>Skills</button>
     <button data-view="knowledge"><span class="ico">✦</span>Knowledge</button>
     <button data-view="evidence"><span class="ico">✎</span>Evidence</button>
+    <button data-view="bench"><span class="ico">⚗</span>Bench</button>
     <button data-view="workers"><span class="ico">▤</span>Workers</button>
     <button data-view="network"><span class="ico">○</span>Network</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
@@ -327,7 +328,28 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
       </div>
       <div class="card" style="margin-top:14px"><h2>Recent Evidence</h2><div id="evidence-recent" class="stack"></div></div>
     </section>
-    <section class="view" id="view-workers"><div class="card"><h2>Workers — Distributed Compute Registry <span class="live">● Live</span></h2><div id="workers-detail"></div></div></section>
+    <section class="view" id="view-bench">
+      <div class="card"><h2>Benchmark Lab <span class="live">● Live</span> · single vs RAG vs collective</h2>
+        <p class="hint">The architecture question DecentraAI exists to answer with data: <b>does the collective beat a single agent?</b> Every run is graded deterministically against the task's gold answer and feeds the Evidence RAG — the fabric learns from the lab. A verdict is honest: it needs ≥5 graded runs per mode and a ≥5% accuracy margin.</p>
+        <div id="bench-kpis" class="grid kpis-4" style="margin-top:12px"></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Verdict</h2><div id="bench-verdict" class="stack"></div></div>
+      <div class="card" style="margin-top:14px"><h2>Run a Task</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="bench-prompt" placeholder="Question (e.g. 'What is the capital of France?')" style="flex:2;min-width:240px">
+          <input id="bench-gold" placeholder="Gold answer (optional — ungradable runs are Abstained)" style="flex:1;min-width:180px">
+          <select id="bench-mode" style="flex:0 0 auto">
+            <option value="single">Single</option>
+            <option value="rag">RAG (evidence)</option>
+            <option value="collective">Collective</option>
+          </select>
+          <input id="bench-evidence" placeholder="Evidence passages, comma-separated (RAG mode)" style="flex:2;min-width:240px">
+          <button class="button primary" id="bench-run">Run</button>
+        </div>
+        <div id="bench-result" class="stack" style="margin-top:12px"></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Recent Runs</h2><div id="bench-runs" class="stack"></div></div>
+    </section>
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
     <section class="view" id="view-models"><div class="card"><h2>Models</h2><div id="models" class="list"></div></div></section>
@@ -378,6 +400,7 @@ function show(view) {
   $('title').textContent = title[view] || view;
   if (!['overview','chat','models','providers'].includes(view)) loadAdvanced(view);
   if (view==='providers') renderProviders();
+  if (view==='bench') renderBench();
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => show(button.dataset.view)));
 const advanced = $('advanced');
@@ -671,6 +694,9 @@ renderCapFeedback();
 // Evidence RAG: ask the experimental memory.
 $('evidence-ask').addEventListener('click', evidenceAsk);
 $('evidence-query').addEventListener('keydown', (e) => { if (e.key==='Enter') evidenceAsk(); });
+// Benchmark Lab: run a task through the live executor.
+$('bench-run').addEventListener('click', benchRun);
+$('bench-prompt').addEventListener('keydown', (e) => { if (e.key==='Enter') benchRun(); });
 // Model Fabric: add a provider through the master-gated admin endpoint.
 // The api key is sent once over the loopback API and then only ever kept in
 // the node's in-memory credential store.
@@ -834,6 +860,65 @@ async function evidenceAsk() {
       ? hits.map(h => '<div class="row"><b>'+esc(h.id)+'</b><span class="status idle" style="text-transform:none;letter-spacing:0">'+esc(h.mode)+' · '+Math.round((h.score||0)*100)+'%</span><span class="hint">'+esc(h.text)+'</span></div>').join('')
       : '<div class="empty">No evidence matches — the honest answer is "nothing learned yet".</div>';
   } catch (_) { $('evidence-hits').innerHTML = '<div class="empty">Query needs a valid operator token.</div>'; }
+}
+function renderBench() {
+  // Benchmark Lab: single vs RAG vs collective comparison from real graded
+  // runs. A verdict needs MIN_SAMPLES graded runs per mode and a MIN_MARGIN
+  // accuracy delta — the UI shows the honest "not enough samples" state.
+  (async () => {
+    let d = null;
+    try { d = await (await fetch('/v1/bench',{headers:auth()})).json(); } catch (_) { $('bench-kpis').innerHTML = '<div class="empty">Bench view needs a valid operator token.</div>'; return; }
+    if (!d || d.attached === false) {
+      $('bench-kpis').innerHTML = kpi('Bench', '—', 'not attached');
+      $('bench-verdict').innerHTML = '<div class="empty">The benchmark runtime is not attached on this node (needs a servable model + operator token).</div>';
+      $('bench-runs').innerHTML = '';
+      return;
+    }
+    const cmp = d.comparison || {};
+    const s = cmp.single || {}, r = cmp.rag || {}, c = cmp.collective || {};
+    const pct = v => (v && v.graded > 0) ? Math.round(v.accuracy*100)+'%' : '—';
+    $('bench-kpis').innerHTML =
+      kpi('Runs', d.runs ?? 0, 'total graded/ungraded') +
+      kpi('Single', pct(s), (s.runs||0)+' runs') +
+      kpi('RAG', pct(r), (r.runs||0)+' runs') +
+      kpi('Collective', pct(c), (c.runs||0)+' runs');
+    const verdict = cmp.collective_beats_single
+      ? '<div class="row"><b>Collective beats single</b><span class="status">'+esc(cmp.reasoning||'')+'</span></div>'
+      : '<div class="row"><b>No verdict yet</b><span class="status idle">'+esc(cmp.reasoning||'')+'</span></div>';
+    $('bench-verdict').innerHTML = verdict;
+    const rows = [
+      ['Single', s, 'mode A'],
+      ['RAG', r, 'mode B'],
+      ['Collective', c, 'mode C'],
+    ].map(([name, v, tag]) =>
+      '<div class="row"><b>'+name+'</b><span>'+pct(v)+' <span class="hint">('+(v?.graded||0)+' graded / '+(v?.runs||0)+' runs · '+(v?.avg_latency_ms||0)+'ms · '+(v?.avg_tokens||0)+' tok)</span></span></div>'
+    ).join('');
+    $('bench-runs').innerHTML = rows;
+  })();
+}
+async function benchRun() {
+  const prompt = $('bench-prompt').value.trim();
+  const gold = $('bench-gold').value.trim();
+  const mode = $('bench-mode').value;
+  const evidence = $('bench-evidence').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if (!prompt) { alert('Question is required.'); return; }
+  $('bench-result').innerHTML = '<div class="empty">Running through the live executor… (collective runs N agents — may take a while)</div>';
+  const body = { prompt, mode };
+  if (gold) body.gold = gold;
+  if (evidence.length) body.evidence = evidence;
+  if (mode === 'collective') body.agents = 3;
+  try {
+    const r = await fetch('/v1/bench/run',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},auth()),body:JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) { $('bench-result').innerHTML = '<div class="empty">Run failed: '+esc(d.error || r.status)+'</div>'; return; }
+    const run = d.run || {};
+    const v = run.verdict || 'ABSTAINED';
+    const cls = v==='Correct' ? '' : (v==='Incorrect' ? 'warn' : 'idle');
+    $('bench-result').innerHTML =
+      '<div class="row"><b>'+esc(v)+'</b><span class="status '+cls+'">'+(run.metrics ? run.metrics.latency_ms+'ms · '+run.metrics.tokens+' tokens' : '')+'</span></div>'+
+      '<div class="hint" style="margin-top:6px">'+esc((run.output||'').slice(0,400))+'</div>';
+    renderBench();
+  } catch (err) { $('bench-result').innerHTML = '<div class="empty">Run needs a valid operator token: '+esc(err)+'</div>'; }
 }
 function renderProviders() {
   // Model Fabric: fetch /v1/providers (operator+admin) and render the

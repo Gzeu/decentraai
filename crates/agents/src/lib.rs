@@ -38,6 +38,7 @@
 
 pub mod advertisement;
 pub mod agent;
+pub mod benchmark;
 pub mod capability;
 pub mod dataset;
 pub mod decision;
@@ -65,6 +66,11 @@ pub use agent::{
     AgentPolicies, AgentRecord, AgentState, ROLE_COORDINATOR, ROLE_CRITIC, ROLE_EXECUTOR,
     ROLE_GENERALIST, ROLE_INFRASTRUCTURE, ROLE_MEMORY, ROLE_PLANNER, ROLE_RESEARCHER, ROLE_ROUTER,
     ROLE_SPECIALIST, ROLE_TOOL, ROLE_VERIFIER, SandboxMode,
+};
+pub use benchmark::{
+    BenchmarkMode, BenchmarkRegistry, BenchmarkRun, BenchmarkTask, BenchmarkVerdict, MIN_MARGIN,
+    MIN_SAMPLES, ModeAggregate, ModeComparison, RunMetrics, aggregate, compare_modes,
+    grade_answer, normalize_answer,
 };
 pub use capability::{AgentCapability, model_capabilities_from_claims};
 pub use dataset::{

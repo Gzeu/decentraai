@@ -2885,3 +2885,52 @@ Next (documented): semantic query with a real embedding backend already wired
 (`/v1/embeddings` when configured); P2P distribution of knowledge
 objects/decisions between nodes; feeding planner decisions with evidence
 lessons (e.g. success-rate-weighted worker ranking).
+
+## 124. DecentraAI Benchmark Lab — single vs RAG vs collective (DONE, commits to land)
+
+The architecture question DecentraAI exists to answer with data: **does the
+collective beat a single agent?** The lab runs real tasks through the live
+inference executor, grades them deterministically against a gold answer, and
+feeds every run into the Evidence RAG (`EvidenceFamily::Benchmark`) so the
+fabric learns from the lab.
+
+- **`crates/agents/src/benchmark.rs`** (pure, 6 tests): `BenchmarkTask`
+  (id, prompt, gold, evidence passages), `BenchmarkMode` (Single / Rag /
+  Collective, tags A/B/C), `BenchmarkVerdict` (Correct / Incorrect /
+  Abstained), `RunMetrics` (tokens, latency), `BenchmarkRun` (idempotent in
+  `BenchmarkRegistry`), `ModeAggregate` + `ModeComparison` with honest gates —
+  **`MIN_SAMPLES = 5` graded runs per mode and `MIN_MARGIN = 0.05` accuracy
+  delta** before `collective_beats_single` may be true; below that the verdict
+  is "not enough samples". `normalize_answer` treats any non-alphanumeric as a
+  separator ("forty-two" == "forty two"); `grade_answer` is deterministic and
+  Abstains on missing gold or empty output. Evidence is graded, never guessed.
+- **`crates/distributed/src/benchmark_manager.rs`** (runtime, 5 tests): the
+  `BenchmarkInference` trait (live `InferenceBenchmarkExecutor` over the real
+  executor; mocks in tests — production never fakes a generation). Single = one
+  generation; RAG = one generation with the task's evidence passages injected
+  into the prompt; Collective = N independent generations with a **plurality
+  vote on grades** (ties → Abstained — honest, no fabricated consensus). Every
+  run feeds `EvidenceFamily::Benchmark` with facts only (task, mode, verdict,
+  metrics).
+- **API**: `GET /v1/bench` (comparison + run count) and
+  `POST /v1/bench/run` (`{prompt, gold?, evidence?, mode?, agents?}` — runs a
+  task through the live executor, grades it, records the run). Operator+ only
+  (real inference tokens). 2 API tests incl. the graded roundtrip and the
+  honest "not enough samples" state.
+- **Dashboard**: Bench view (advanced block) — per-mode accuracy KPIs, the
+  honest verdict ("Collective beats single" or "No verdict yet — not enough
+  samples"), a task runner (question + optional gold + mode + RAG evidence)
+  and per-mode aggregates.
+- **node-cli**: the lab is wired when a worker has a servable model — it
+  shares the live `InferenceAgentExecutor` (local backend / distributed
+  routing / tool calling) and the shared `EvidenceManager`, so lab runs
+  appear in the Evidence view as `bench:*` entries.
+
+The dataset phases (BrowseComp-Plus first, then HotpotQA + AgentProcessBench +
+MemoryCraft; license-safe: MIT/cc-by-sa only) land as task adapters that turn
+public datasets into `BenchmarkTask`s — the graded runs then feed the same
+registry + evidence loop. The lab's verdict is a **hypothesis about this
+fabric on this hardware**, not a universal claim.
+
+Tests: 6 pure + 5 manager + 2 API (1128 workspace total, 1115 + 13 new);
+clippy `-D warnings` clean.

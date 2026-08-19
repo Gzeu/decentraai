@@ -1619,11 +1619,23 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
         _ => (None, None),
     };
+    // Evidence RAG (experimental memory) is created once here because the
+    // Benchmark Lab shares it: benchmark runs feed `EvidenceFamily::Benchmark`
+    // entries so the fabric's lessons include lab results. The index itself
+    // syncs lazily from the live sources at request time.
+    let evidence_rag = Arc::new(decentraai_distributed::evidence_manager::EvidenceManager::new(
+        embedding_client.clone(),
+    ));
     // Tool Runtime managers are created at most once and shared by the agent
     // executors (as real tool bindings) and the API (as /v1/<tool> proxies).
     let mut ocr_manager: Option<OcrManager> = None;
     let mut stt_manager: Option<SttManager> = None;
     let mut skills_manager: Option<HfSkillsManager> = None;
+    // DecentraAI Benchmark Lab: populated when an inference executor exists
+    // (worker with a servable model). The lab runs single/RAG/collective
+    // tasks through the real executor and feeds evidence.
+    let mut benchmark_manager: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>> =
+        None;
     if is_worker && !model_hash.is_empty() {
         // Tool Runtime: spawn OCR/STT/HF-skills subprocesses BEFORE the agent
         // executors so the real tool bindings (name + description + loopback
@@ -1712,6 +1724,20 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             agents = local_agents.len(),
             "node is a live agent host (inference executor wired)"
         );
+        // Benchmark Lab: run single vs RAG vs collective tasks through the
+        // live executor, graded deterministically, feeding evidence. The
+        // executor is consumed here — the agent runtimes above each hold
+        // their own clone.
+        benchmark_manager = Some(Arc::new(
+            decentraai_distributed::benchmark_manager::BenchmarkManager::new(
+                Arc::new(
+                    decentraai_distributed::benchmark_manager::InferenceBenchmarkExecutor::new(
+                        Arc::new(inference_executor),
+                    ),
+                ),
+                Some(evidence_rag.clone()),
+            ),
+        ));
     } else {
         info!("node agent host: no servable model — agent runtime idle");
     }
@@ -2048,14 +2074,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // decisions and collective memory; `/v1/evidence` answers "what have we
         // learned?" with derived lessons (never invented numbers). The index
         // syncs lazily from the live sources at request time, so it needs no
-        // background task and never falls out of step with the sources.
-        {
-            let evidence = Arc::new(
-                decentraai_distributed::evidence_manager::EvidenceManager::new(
-                    embedding_client.clone(),
-                ),
-            );
-            state.attach_evidence(evidence);
+        // background task and never falls out of step with the sources. The
+        // same runtime is shared with the Benchmark Lab (bench runs feed it).
+        state.attach_evidence(evidence_rag);
+        // Benchmark Lab: expose `/v1/bench` when an inference executor was
+        // wired (the lab needs a real model to run tasks).
+        if let Some(benchmark) = benchmark_manager {
+            state.attach_benchmark(benchmark);
         }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and

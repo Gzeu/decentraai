@@ -323,6 +323,19 @@ plus the runtime half in `decentraai-distributed`:
   scopes). API: `GET /v1/evidence` + `POST /v1/evidence/query` (operator+,
   lazy sync at request time); the dashboard has an Evidence view. Evidence
   carries **facts, never prompts/outputs**.
+- **Benchmark Lab (DONE)** — "does the collective beat a single agent?":
+  `crates/agents/src/benchmark.rs` (pure) is the deterministic task/run
+  registry (Single/RAG/Collective modes, `grade_answer` on normalized gold,
+  `Abstained` on missing gold/empty output) with honest gates — a
+  `collective_beats_single` verdict needs **MIN_SAMPLES=5 graded runs per mode
+  and a MIN_MARGIN=0.05 accuracy delta**, otherwise "not enough samples".
+  `crates/distributed/src/benchmark_manager.rs` (runtime) runs tasks through
+  the live inference executor via the `BenchmarkInference` trait (collective
+  = N generations, plurality vote on grades, ties → Abstained) and feeds every
+  run into the Evidence RAG as `EvidenceFamily::Benchmark` (facts only).
+  API: `GET /v1/bench` + `POST /v1/bench/run` (operator+; real tokens);
+  the dashboard has a Bench view. The verdict is a hypothesis about this
+  fabric on this hardware, never a universal claim.
 
 **Runtime half (`decentraai-distributed`)**:
 - `AgentOrchestrator`: binds the pure fabric to the live P2P channel —

@@ -338,6 +338,10 @@ pub struct ApiState {
     /// exposes the fabric's derived lessons over real executions, receipts,
     /// decisions and memory. `None` on plain serve.
     evidence: Option<Arc<decentraai_distributed::evidence_manager::EvidenceManager>>,
+    /// DecentraAI Benchmark Lab: when attached, `/v1/bench` exposes the
+    /// single vs RAG vs collective comparison and lets an operator run a
+    /// benchmark task inline. `None` on plain serve.
+    benchmark: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>>,
 }
 
 impl ApiState {
@@ -397,6 +401,7 @@ impl ApiState {
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
             knowledge: None,
             evidence: None,
+            benchmark: None,
         }
     }
 
@@ -500,6 +505,14 @@ impl ApiState {
         evidence: Arc<decentraai_distributed::evidence_manager::EvidenceManager>,
     ) {
         self.evidence = Some(evidence);
+    }
+
+    /// Attaches the DecentraAI Benchmark Lab control plane.
+    pub fn attach_benchmark(
+        &mut self,
+        benchmark: Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>,
+    ) {
+        self.benchmark = Some(benchmark);
     }
 
     /// Attaches the provider control plane (Model Fabric).
@@ -4685,6 +4698,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/knowledge/decide", post(knowledge_decide_handler))
         .route("/v1/evidence", get(evidence_handler))
         .route("/v1/evidence/query", post(evidence_query_handler))
+        .route("/v1/bench", get(bench_handler))
+        .route("/v1/bench/run", post(bench_run_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -6535,6 +6550,115 @@ async fn evidence_query_handler(
         serde_json::json!({ "hits": hits, "count": hits.len() }).to_string(),
     )
         .into_response()
+}
+
+/// DecentraAI Benchmark Lab: the current single vs RAG vs collective
+/// comparison over real graded runs. Real state only — a comparison is
+/// honest ("not enough samples") until MIN_SAMPLES graded runs per mode and
+/// a MIN_MARGIN accuracy delta are observed. Operator+ view.
+async fn bench_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(bench) = &state.benchmark else {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "attached": false,
+                "comparison": null,
+                "runs": 0,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+    let comparison = bench.comparison();
+    let runs = bench
+        .registry()
+        .lock()
+        .map(|r| r.runs().len())
+        .unwrap_or(0);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "attached": true,
+            "comparison": comparison,
+            "runs": runs,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Benchmark Lab run: `{ prompt, gold?, evidence?, mode: "single"|"rag"|"collective", agents? }`
+/// executes the task through the live inference executor, grades it and
+/// records the run + evidence. Operator+ view (running inference costs
+/// real tokens — not exposed to subscribers).
+async fn bench_run_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(bench) = &state.benchmark else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "benchmark runtime not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let b = body.0;
+    let prompt = match b.get("prompt").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "prompt is required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let gold = b.get("gold").and_then(|v| v.as_str()).map(str::to_string);
+    let evidence: Vec<String> = b
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mode = match b.get("mode").and_then(|v| v.as_str()) {
+        Some("rag") => decentraai_agents::benchmark::BenchmarkMode::Rag,
+        Some("collective") => decentraai_agents::benchmark::BenchmarkMode::Collective,
+        _ => decentraai_agents::benchmark::BenchmarkMode::Single,
+    };
+    let agents = b.get("agents").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let task = match gold {
+        Some(gold) => decentraai_agents::benchmark::BenchmarkTask::new("api", prompt, gold)
+            .with_evidence(evidence),
+        None => {
+            let mut t = decentraai_agents::benchmark::BenchmarkTask::ungradable("api", prompt);
+            if !evidence.is_empty() {
+                t = t.with_evidence(evidence);
+            }
+            t
+        }
+    };
+    match bench.run_task(&task, mode, agents).await {
+        Ok(run) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "run": run, "comparison": bench.comparison() }).to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": e.to_string() }).to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// AGENTS real state (Collective Intelligence P1): the node's local logical
@@ -11387,6 +11511,114 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0]["mode"], "structural");
         assert_eq!(hits[0]["kind"], "receipt");
+    }
+
+    // Benchmark Lab: without the manager attached `/v1/bench` returns a
+    // well-formed payload (never a crash).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bench_handler_returns_empty_payload_when_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/v1/bench"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], false);
+        assert_eq!(body["runs"], 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // Benchmark Lab: a run through the real API is graded and the comparison
+    // aggregates honestly (mock inference answers the gold).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bench_run_grades_and_comparison_aggregates() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let calls = Arc::new(AtomicU32::new(0));
+        struct EchoExecutor {
+            calls: Arc<AtomicU32>,
+        }
+        impl decentraai_distributed::benchmark_manager::BenchmarkInference for EchoExecutor {
+            fn execute<'a>(
+                &'a self,
+                prompt: &'a str,
+                _evidence: &'a [String],
+            ) -> decentraai_distributed::benchmark_manager::InferenceFuture<'a> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    // Extract the question after the RAG prefix if present.
+                    let q = prompt
+                        .rsplit("Question: ")
+                        .next()
+                        .unwrap_or(prompt)
+                        .trim();
+                    let out = if q.contains("capital") { "paris".to_string() } else { "wrong".to_string() };
+                    Ok((out, 100, 50))
+                })
+            }
+        }
+        let bench = Arc::new(
+            decentraai_distributed::benchmark_manager::BenchmarkManager::new(
+                Arc::new(EchoExecutor { calls: calls.clone() }),
+                None,
+            ),
+        );
+        state.attach_benchmark(bench);
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Run a single task: capital question → Correct.
+        let resp = client
+            .post(format!("http://{api}/v1/bench/run"))
+            .json(&serde_json::json!({
+                "prompt": "What is the capital of France?",
+                "gold": "paris",
+                "mode": "single",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["run"]["verdict"], "correct");
+        assert_eq!(body["run"]["metrics"]["tokens"], 100);
+
+        // GET /v1/bench shows the aggregate with a single run.
+        let resp = client
+            .get(format!("http://{api}/v1/bench"))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], true);
+        assert_eq!(body["runs"], 1);
+        assert_eq!(body["comparison"]["single"]["runs"], 1);
+        assert_eq!(body["comparison"]["single"]["graded"], 1);
+        assert!(!body["comparison"]["collective_beats_single"].as_bool().unwrap());
+        // 1 run is below MIN_SAMPLES — honest "not enough".
+        let reason = body["comparison"]["reasoning"].as_str().unwrap();
+        assert!(reason.contains("not enough"));
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     /// Builds an ApiState with the given TTS manager attached.

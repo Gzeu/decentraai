@@ -80,6 +80,7 @@ pub mod agent_messenger;
 pub mod agent_orchestrator;
 pub mod agent_runtime;
 pub mod agents;
+pub mod benchmark_manager;
 pub mod breaker;
 pub mod compute;
 pub mod config;

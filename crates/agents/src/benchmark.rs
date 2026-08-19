@@ -1,0 +1,457 @@
+//! DecentraAI Benchmark Fabric (pure) — the experimental lab foundation.
+//!
+//! The fabric answers one question with data, not assumptions: **does the
+//! collective architecture beat a single agent on the same task?** Every
+//! benchmark run (single / RAG / collective) produces a `BenchmarkRun` that is
+//! graded deterministically against a gold answer, aggregated into metrics and
+//! compared across modes. The runtime half (`decentraai-distributed`) turns
+//! these runs into evidence entries, receipts and memory — closing the loop the
+//! Evidence RAG reads back.
+//!
+//! Honesty rules (same as the rest of `crates/agents`):
+//! - grading is **deterministic** (`grade_answer`): normalized text matching
+//!   against the gold answer, never an LLM judge and never a vibe score;
+//! - a task **without** a gold answer cannot be graded — it is `Abstained`,
+//!   never guessed (BrowseComp-Plus golds are exact answers, so this stays
+//!   strict and useful);
+//! - `collective_beats_single` requires a **meaningful margin** (`MIN_MARGIN`),
+//!   not a hair-thin difference, and reports the sample counts so a tiny run
+//!   cannot masquerade as evidence.
+//!
+//! No I/O, no async, no external model — pure and unit-testable.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// The three execution modes the lab compares. Mirrors the product evolution:
+/// A = single agent, B = RAG agent, C = DecentraAI collective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkMode {
+    /// Single agent: one model call, no retrieval, no consensus.
+    Single,
+    /// RAG agent: prompt augmented with retrieved evidence, one model call.
+    Rag,
+    /// Collective: N agents answer independently, consensus decides.
+    Collective,
+}
+
+impl BenchmarkMode {
+    /// Short tag used in evidence entries and metrics.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Single => "A",
+            Self::Rag => "B",
+            Self::Collective => "C",
+        }
+    }
+}
+
+/// One benchmark task: a prompt + an optional gold answer + optional evidence
+/// passages (for RAG mode).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkTask {
+    /// Stable id within the benchmark (e.g. BrowseComp-Plus query id).
+    pub task_id: String,
+    /// The question / instruction given to the agent(s).
+    pub prompt: String,
+    /// The exact gold answer when the benchmark provides one. `None` = the
+    /// task cannot be graded (Abstained).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gold: Option<String>,
+    /// Evidence passages injected in RAG mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+impl BenchmarkTask {
+    /// A task with a gold answer.
+    pub fn new(task_id: impl Into<String>, prompt: impl Into<String>, gold: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            prompt: prompt.into(),
+            gold: Some(gold.into()),
+            evidence: Vec::new(),
+        }
+    }
+
+    /// A task without a gold answer (un-gradable, honest Abstained).
+    pub fn ungradable(task_id: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            prompt: prompt.into(),
+            gold: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Attaches evidence passages for RAG mode.
+    pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+}
+
+/// The grade of one run. `Abstained` is the honest answer for un-gradable
+/// tasks or empty outputs — never a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkVerdict {
+    Correct,
+    Incorrect,
+    Abstained,
+}
+
+/// Measured cost/quality fields of one run.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct RunMetrics {
+    /// Total tokens the executor reported (input + output).
+    pub tokens: u64,
+    /// Wall-clock execution time (ms).
+    pub latency_ms: u64,
+    /// Number of tool calls made during the run.
+    pub tool_calls: u32,
+}
+
+/// One graded execution of a benchmark task in a given mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRun {
+    /// Stable run id (e.g. `<mode>:<task_id>:<attempt>`).
+    pub run_id: String,
+    /// The task executed.
+    pub task_id: String,
+    /// The mode this run used.
+    pub mode: BenchmarkMode,
+    /// The model's final text.
+    pub output: String,
+    /// Deterministic grade against the gold.
+    pub verdict: BenchmarkVerdict,
+    /// Cost/quality measurements.
+    pub metrics: RunMetrics,
+    /// Wall-clock timestamp (unix ms).
+    pub created_at_ms: u64,
+}
+
+/// A per-mode aggregate over its runs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModeAggregate {
+    pub mode: BenchmarkMode,
+    /// Number of runs in this mode.
+    pub runs: usize,
+    /// Number of graded runs (Correct + Incorrect; Abstained excluded).
+    pub graded: usize,
+    /// Accuracy over graded runs (0.0 when nothing graded — honest).
+    pub accuracy: f64,
+    /// Average tokens across all runs in the mode.
+    pub avg_tokens: f64,
+    /// Average latency (ms) across all runs in the mode.
+    pub avg_latency_ms: f64,
+}
+
+/// The lab's headline question, answered deterministically.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeComparison {
+    pub single: ModeAggregate,
+    pub rag: ModeAggregate,
+    pub collective: ModeAggregate,
+    /// `collective.accuracy - single.accuracy` (positive = collective better).
+    pub delta: f64,
+    /// Whether collective beats single by at least `MIN_MARGIN` on graded
+    /// runs AND both modes have at least `MIN_SAMPLES` graded runs.
+    pub collective_beats_single: bool,
+    /// Human-readable reasoning (what the data says, not a promise).
+    pub reasoning: String,
+}
+
+/// Minimum accuracy margin for `collective_beats_single` to be true.
+pub const MIN_MARGIN: f64 = 0.05;
+/// Minimum number of graded runs per mode for a comparison to be meaningful.
+pub const MIN_SAMPLES: usize = 5;
+
+/// Normalizes an answer for deterministic grading: lowercase, trim, collapse
+/// whitespace, strip punctuation. Keeps digits/letters only for stability
+/// across formatting differences (BrowseComp-Plus golds are short exact
+/// answers — numbers, names, dates).
+pub fn normalize_answer(s: &str) -> String {
+    // Any non-alphanumeric character is a separator ("forty-two" == "forty
+    // two"); collapse runs of separators to single spaces.
+    s.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Deterministic grading: exact normalized match, or (for short golds)
+/// containment either way. `None` gold or empty output → `Abstained`.
+pub fn grade_answer(output: &str, gold: Option<&str>) -> BenchmarkVerdict {
+    let Some(gold) = gold else {
+        return BenchmarkVerdict::Abstained;
+    };
+    let out = normalize_answer(output);
+    let gold = normalize_answer(gold);
+    if out.is_empty() || gold.is_empty() {
+        return BenchmarkVerdict::Abstained;
+    }
+    if out == gold {
+        return BenchmarkVerdict::Correct;
+    }
+    // Containment is only meaningful for short answers (a sentence-long
+    // output trivially contains a one-word gold; a long gold inside a short
+    // output is still a hit when the gold is the exact expected phrase).
+    if gold.len() <= 24 && (out.contains(&gold) || gold.contains(&out)) {
+        return BenchmarkVerdict::Correct;
+    }
+    BenchmarkVerdict::Incorrect
+}
+
+/// Aggregates one mode's runs into a `ModeAggregate` (accuracy over graded
+/// runs only; no graded runs → accuracy 0.0 with `graded: 0`, honest).
+pub fn aggregate(mode: BenchmarkMode, runs: &[BenchmarkRun]) -> ModeAggregate {
+    let graded: Vec<&BenchmarkRun> = runs
+        .iter()
+        .filter(|r| r.verdict == BenchmarkVerdict::Correct || r.verdict == BenchmarkVerdict::Incorrect)
+        .collect();
+    let correct = graded
+        .iter()
+        .filter(|r| r.verdict == BenchmarkVerdict::Correct)
+        .count();
+    let accuracy = if graded.is_empty() {
+        0.0
+    } else {
+        correct as f64 / graded.len() as f64
+    };
+    let (tokens, latency): (f64, f64) = if runs.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let t: u64 = runs.iter().map(|r| r.metrics.tokens).sum();
+        let l: u64 = runs.iter().map(|r| r.metrics.latency_ms).sum();
+        (t as f64 / runs.len() as f64, l as f64 / runs.len() as f64)
+    };
+    ModeAggregate {
+        mode,
+        runs: runs.len(),
+        graded: graded.len(),
+        accuracy,
+        avg_tokens: tokens,
+        avg_latency_ms: latency,
+    }
+}
+
+/// Answers the lab's headline question over the three modes' runs. A run
+/// belongs to its `mode` field; runs are split deterministically.
+pub fn compare_modes(all_runs: &[BenchmarkRun]) -> ModeComparison {
+    let single = aggregate(BenchmarkMode::Single, &by_mode(all_runs, BenchmarkMode::Single));
+    let rag = aggregate(BenchmarkMode::Rag, &by_mode(all_runs, BenchmarkMode::Rag));
+    let collective = aggregate(
+        BenchmarkMode::Collective,
+        &by_mode(all_runs, BenchmarkMode::Collective),
+    );
+    let delta = collective.accuracy - single.accuracy;
+    let meaningful = collective.graded >= MIN_SAMPLES
+        && single.graded >= MIN_SAMPLES
+        && delta >= MIN_MARGIN;
+    let reasoning = if meaningful {
+        format!(
+            "collective {:.0}% > single {:.0}% (+{:.0}pp) on {} vs {} graded runs",
+            collective.accuracy * 100.0,
+            single.accuracy * 100.0,
+            delta * 100.0,
+            collective.graded,
+            single.graded
+        )
+    } else if collective.graded < MIN_SAMPLES || single.graded < MIN_SAMPLES {
+        format!(
+            "not enough graded runs yet (collective {}, single {}; need {} each)",
+            collective.graded, single.graded, MIN_SAMPLES
+        )
+    } else {
+        format!(
+            "collective {:.0}% vs single {:.0}% — no meaningful margin (+{:.0}pp, need +{:.0}pp)",
+            collective.accuracy * 100.0,
+            single.accuracy * 100.0,
+            delta * 100.0,
+            MIN_MARGIN * 100.0
+        )
+    };
+    ModeComparison {
+        single,
+        rag,
+        collective,
+        delta,
+        collective_beats_single: meaningful,
+        reasoning,
+    }
+}
+
+fn by_mode(runs: &[BenchmarkRun], mode: BenchmarkMode) -> Vec<BenchmarkRun> {
+    runs.iter().filter(|r| r.mode == mode).cloned().collect()
+}
+
+/// Deterministic in-memory registry of benchmark tasks and runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BenchmarkRegistry {
+    tasks: BTreeMap<String, BenchmarkTask>,
+    runs: Vec<BenchmarkRun>,
+}
+
+impl BenchmarkRegistry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a task (replaces by id).
+    pub fn add_task(&mut self, task: BenchmarkTask) {
+        self.tasks.insert(task.task_id.clone(), task);
+    }
+
+    /// Number of registered tasks.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Looks up a task.
+    pub fn task(&self, task_id: &str) -> Option<&BenchmarkTask> {
+        self.tasks.get(task_id)
+    }
+
+    /// Records a run (idempotent on run id).
+    pub fn add_run(&mut self, run: BenchmarkRun) {
+        if !self.runs.iter().any(|r| r.run_id == run.run_id) {
+            self.runs.push(run);
+        }
+    }
+
+    /// All runs, oldest-first (deterministic).
+    pub fn runs(&self) -> &[BenchmarkRun] {
+        &self.runs
+    }
+
+    /// The lab's current verdict over everything recorded.
+    pub fn comparison(&self) -> ModeComparison {
+        compare_modes(&self.runs)
+    }
+
+    /// Per-mode run counts.
+    pub fn counts(&self) -> BTreeMap<BenchmarkMode, usize> {
+        let mut m = BTreeMap::new();
+        for r in &self.runs {
+            *m.entry(r.mode).or_insert(0) += 1;
+        }
+        m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(id: &str, task: &str, mode: BenchmarkMode, output: &str, gold: Option<&str>) -> BenchmarkRun {
+        BenchmarkRun {
+            run_id: id.into(),
+            task_id: task.into(),
+            mode,
+            output: output.into(),
+            verdict: grade_answer(output, gold),
+            metrics: RunMetrics {
+                tokens: 100,
+                latency_ms: 50,
+                tool_calls: 0,
+            },
+            created_at_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn grade_answer_is_deterministic_and_strict() {
+        assert_eq!(grade_answer("42", Some("42")), BenchmarkVerdict::Correct);
+        assert_eq!(grade_answer(" 42. ", Some("42")), BenchmarkVerdict::Correct);
+        assert_eq!(
+            grade_answer("The answer is forty-two.", Some("forty two")),
+            BenchmarkVerdict::Correct
+        );
+        assert_eq!(grade_answer("43", Some("42")), BenchmarkVerdict::Incorrect);
+        assert_eq!(grade_answer("I don't know", Some("42")), BenchmarkVerdict::Incorrect);
+        // No gold → honest Abstained, never guessed.
+        assert_eq!(grade_answer("anything", None), BenchmarkVerdict::Abstained);
+        // Empty output → Abstained.
+        assert_eq!(grade_answer("", Some("42")), BenchmarkVerdict::Abstained);
+    }
+
+    #[test]
+    fn normalize_answer_collapses_formatting() {
+        assert_eq!(normalize_answer("  Hello,   World! "), "hello world");
+        assert_eq!(normalize_answer("42."), "42");
+    }
+
+    #[test]
+    fn aggregate_honest_with_no_graded_runs() {
+        let runs = vec![
+            run("1", "t", BenchmarkMode::Single, "?", None),
+            run("2", "t", BenchmarkMode::Single, "?", None),
+        ];
+        let a = aggregate(BenchmarkMode::Single, &runs);
+        assert_eq!(a.graded, 0);
+        assert_eq!(a.accuracy, 0.0);
+        assert_eq!(a.runs, 2);
+        assert_eq!(a.avg_tokens, 100.0);
+    }
+
+    #[test]
+    fn compare_modes_decides_collective_only_with_margin_and_samples() {
+        // 6 tasks; collective 5/6 correct, single 3/6 → delta 0.33 > margin.
+        let mut registry = BenchmarkRegistry::new();
+        for i in 0..6 {
+            let task = format!("t{i}");
+            let gold = Some("g");
+            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, if i < 3 { "g" } else { "x" }, gold));
+            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, if i < 5 { "g" } else { "x" }, gold));
+        }
+        let cmp = registry.comparison();
+        assert!(cmp.collective_beats_single);
+        assert!(cmp.delta >= 0.05);
+        assert_eq!(cmp.single.graded, 6);
+        assert_eq!(cmp.collective.graded, 6);
+        assert!((cmp.single.accuracy - 0.5).abs() < 1e-9);
+        assert!((cmp.collective.accuracy - 5.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compare_modes_refuses_meaningless_margins_and_tiny_samples() {
+        // Same accuracy → no claim.
+        let mut registry = BenchmarkRegistry::new();
+        for i in 0..6 {
+            let task = format!("t{i}");
+            let gold = Some("g");
+            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, "g", gold));
+            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, "g", gold));
+        }
+        let cmp = registry.comparison();
+        assert!(!cmp.collective_beats_single);
+        assert!(cmp.reasoning.contains("margin"));
+
+        // Fewer than MIN_SAMPLES graded runs → honest "not enough".
+        let mut tiny = BenchmarkRegistry::new();
+        tiny.add_run(run("A0", "t", BenchmarkMode::Single, "g", Some("g")));
+        tiny.add_run(run("C0", "t", BenchmarkMode::Collective, "g", Some("g")));
+        let cmp = tiny.comparison();
+        assert!(!cmp.collective_beats_single);
+        assert!(cmp.reasoning.contains("not enough"));
+    }
+
+    #[test]
+    fn registry_is_idempotent_on_run_id_and_sorts_counts() {
+        let mut registry = BenchmarkRegistry::new();
+        registry.add_task(BenchmarkTask::new("t1", "Q", "g"));
+        registry.add_task(BenchmarkTask::new("t2", "Q2", "g2"));
+        registry.add_run(run("r1", "t1", BenchmarkMode::Single, "g", Some("g")));
+        registry.add_run(run("r1", "t1", BenchmarkMode::Single, "g", Some("g"))); // dup id
+        assert_eq!(registry.task_count(), 2);
+        assert_eq!(registry.runs().len(), 1);
+        assert_eq!(registry.counts()[&BenchmarkMode::Single], 1);
+    }
+}
