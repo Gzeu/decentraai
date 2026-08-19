@@ -29,16 +29,21 @@ node's API from the other; only the P2P port is open between them.
 - Never touches node data/identity. Idempotent.
 - Usage: `bash scripts/upgrade-node.sh [commit]`
 
-### `scripts/upgrade-remote-node.sh` — REMOTE upgrade (run from the Desktop)
+### `scripts/upgrade-remote-node.sh` — REMOTE upgrade (run from the coordinating machine)
 
-- SSHes into the target (default `i5@192.168.1.132:22`), runs
-  `git pull --rebase` + `bash scripts/upgrade-node.sh` there, then verifies
-  from the Desktop that the target appears in `/v1/fabric`.
+- SSHes into the target, runs `git fetch + checkout main + pull --rebase` +
+  `bash scripts/upgrade-node.sh` there, then verifies from the local machine
+  that the target appears as a remote worker in `/v1/compute`.
+- **Bidirectional** — point it at either node:
+  - from the Laptop → Desktop: `bash scripts/upgrade-remote-node.sh dca@192.168.1.138`
+  - from the Desktop → Laptop: `bash scripts/upgrade-remote-node.sh i5@192.168.1.132`
+  - `VALIDATE_LAN=1 bash scripts/upgrade-remote-node.sh …` also runs
+    `validate-lan.sh` (end-to-end remote routing) after the upgrade.
 - **This is operator ops over SSH between George's own machines — NOT remote
   shell from the application.** DecentraAI never runs remote shell or pushes
   binaries through the mesh.
 - **Prerequisite on the target: sshd must be running**
-  (`sudo systemctl enable --now ssh`) and the Desktop's key in
+  (`sudo systemctl enable --now ssh`) and the local machine's key in
   `~/.ssh/authorized_keys`. As of 2026-08-18 the laptop's SSH port is closed.
 - Usage: `bash scripts/upgrade-remote-node.sh [user@host]` (`REMOTE_PORT=…` to
   override the port).
@@ -92,6 +97,21 @@ node's API from the other; only the P2P port is open between them.
 > `node.model` at Mistral on the Desktop (it cannot host it comfortably).
 > Both nodes serving the same tiny model is fine: remote routing is forced by
 > trust + `route_request_on`/a remote-only placement, not by a distinct model.
+
+### Fully automatic (recommended) — one command from the Laptop
+
+The Desktop must have sshd running once (`sudo systemctl enable --now ssh`)
+and the Laptop's public key in `~/.ssh/authorized_keys`. After that, from the
+Laptop:
+
+```bash
+cd ~/decentraai
+git pull --rebase
+bash scripts/upgrade-remote-node.sh dca@192.168.1.138   # builds + swaps + restarts the Desktop
+VALIDATE_LAN=1 bash scripts/upgrade-remote-node.sh dca@192.168.1.138  # …and then proves remote routing
+```
+
+### Manual (fallback)
 
 ```bash
 cd ~/decentraai
