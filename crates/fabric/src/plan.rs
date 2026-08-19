@@ -515,6 +515,60 @@ pub struct CanRunReport {
     pub can_collaborate: bool,
 }
 
+/// Evidence a strategy must show before it may be promoted from EXPERIMENTAL
+/// to BETA/PRODUCTION (Model-Fabric Execution Spec §6). Every criterion is a
+/// hard gate: a strategy that cannot prove all of them stays experimental,
+/// regardless of how attractive its expected speedup looks on paper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PromotionEvidence {
+    /// Required capabilities are verified on the target engines and not stale
+    /// (measurements are younger than their freshness window).
+    pub capabilities_verified: bool,
+    /// PerformanceProfile shows consistent net benefit vs the SingleWorker
+    /// baseline across repeated runs (not one lucky measurement).
+    pub net_benefit_proven: bool,
+    /// Network and trust tiers are enforced (planner filters by tier before
+    /// scoring; KV/cache migration across tiers is disallowed).
+    pub tiers_enforced: bool,
+    /// Threat model updated and security implications reviewed by a human.
+    pub threat_model_reviewed: bool,
+    /// Rollback/fallback paths to SingleWorker/DataParallelReplica are tested.
+    pub rollback_tested: bool,
+}
+
+impl PromotionEvidence {
+    /// Whether every hard gate passes. A single missing gate keeps the
+    /// strategy EXPERIMENTAL — promotion is deliberately conservative.
+    pub fn promotable(&self) -> bool {
+        self.capabilities_verified
+            && self.net_benefit_proven
+            && self.tiers_enforced
+            && self.threat_model_reviewed
+            && self.rollback_tested
+    }
+
+    /// Human-readable breakdown of which gates are open (empty = promotable).
+    pub fn unmet(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.capabilities_verified {
+            out.push("capabilities not verified");
+        }
+        if !self.net_benefit_proven {
+            out.push("net benefit not proven");
+        }
+        if !self.tiers_enforced {
+            out.push("trust tiers not enforced");
+        }
+        if !self.threat_model_reviewed {
+            out.push("threat model not reviewed");
+        }
+        if !self.rollback_tested {
+            out.push("rollback not tested");
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +865,37 @@ mod tests {
         assert_eq!(p.ttft_ms, Some(10.0));
         assert_eq!(p.inter_token_ms, None);
         assert_eq!(p.measured_count(), 1);
+    }
+
+    // ---- Model-Fabric Execution Spec §6: promotion gates ----
+
+    #[test]
+    fn promotion_requires_all_gates() {
+        let empty = PromotionEvidence::default();
+        assert!(!empty.promotable());
+        assert_eq!(empty.unmet().len(), 5);
+
+        let full = PromotionEvidence {
+            capabilities_verified: true,
+            net_benefit_proven: true,
+            tiers_enforced: true,
+            threat_model_reviewed: true,
+            rollback_tested: true,
+        };
+        assert!(full.promotable());
+        assert!(full.unmet().is_empty());
+    }
+
+    #[test]
+    fn one_open_gate_blocks_promotion() {
+        let almost = PromotionEvidence {
+            capabilities_verified: true,
+            net_benefit_proven: true,
+            tiers_enforced: true,
+            threat_model_reviewed: true,
+            rollback_tested: false,
+        };
+        assert!(!almost.promotable());
+        assert_eq!(almost.unmet(), vec!["rollback not tested"]);
     }
 }

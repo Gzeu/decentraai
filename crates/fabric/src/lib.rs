@@ -57,8 +57,8 @@ pub use network::{
 };
 pub use plan::{
     CanRunReport, EvidenceProvenance, ExecutionMode, ExecutionPlan, ExecutionStage,
-    ExecutionStrategy, PerformanceProfile, PlanCost, PlanKind, RejectedStrategy, StrategyKind,
-    StrategyRationale, TrustTier,
+    ExecutionStrategy, PerformanceProfile, PlanCost, PlanKind, PromotionEvidence, RejectedStrategy,
+    StrategyKind, StrategyRationale, TrustTier,
 };
 pub use planner::{
     CandidateScore, ExecutionPlanner, NormalizedMetrics, PlanResult, PlannerConfig,
