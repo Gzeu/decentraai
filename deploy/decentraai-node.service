@@ -26,7 +26,9 @@ Wants=network-online.target
 Type=exec
 # $HOME/.decentraai/node.yaml is what `decentraai setup` writes. If it does
 # not exist the node auto-generates it (and its identity) on first start.
-ExecStart=%h/.cargo/bin/decentraai node --config %h/.decentraai/node.yaml
+ExecStart=%h/.cargo/bin/decentraai node --config %h/.decentraai/node.yaml --auto-upgrade
+# The auto-upgrade watcher needs the git checkout to pull/build from.
+WorkingDirectory=%h/decentraai
 Restart=always
 RestartSec=5
 # A fresh user service starts only after this many seconds have passed since
