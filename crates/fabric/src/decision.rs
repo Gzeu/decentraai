@@ -416,6 +416,24 @@ pub fn evaluate(
         .map(|w| w.capabilities)
         .unwrap_or_else(EngineCapabilities::conservative);
 
+    // P1: the decision's strategy must match the plan it actually selected.
+    // A real fan-out (engine-advertised staging, >= 2 stages) is BatchFanOut;
+    // everything else stays SingleWorker. This is the ONLY path where the
+    // planner-based decision may deviate from the planner's default strategy.
+    let strategy = if matches!(plan.as_ref().map(|p| &p.kind), Some(PlanKind::FanOut(_))) {
+        crate::plan::ExecutionStrategy {
+            kind: crate::plan::StrategyKind::BatchFanOut,
+            rationale: crate::plan::StrategyRationale {
+                reason: "engine advertises staging and >= 2 ranked workers can participate"
+                    .to_string(),
+                rejected: Vec::new(),
+            },
+            provenance: crate::plan::EvidenceProvenance::Inferred,
+        }
+    } else {
+        plan_result.strategy.clone()
+    };
+
     ExecutionDecision {
         request_id: request_id.to_string(),
         model_hash: req.model_hash.clone(),
@@ -439,7 +457,7 @@ pub fn evaluate(
         outcome: None,
         trace,
         last_orchestration: None,
-        strategy: plan_result.strategy.clone(),
+        strategy: strategy.clone(),
         can_reports: plan_result.can_reports.clone(),
     }
 }
@@ -1265,5 +1283,51 @@ mod tests {
         assert_eq!(tl["summary"], "aborted");
         assert_eq!(tl["phase"], "failed");
         assert_eq!(tl["outcome"], "failed");
+    }
+
+    #[test]
+    fn real_fanout_decision_carries_batch_fanout_strategy() {
+        // P1: when evaluate() selects a real fan-out (engine advertises
+        // staging AND allow_fanout is true AND >= 2 ranked workers qualify),
+        // the decision's strategy must be BatchFanOut — never SingleWorker.
+        // This is the only path where the decision deviates from the planner's
+        // default strategy, and it must stay honest.
+        use crate::engine::{EngineCapabilities, EngineKind};
+        let mut a = worker("a", 180, 50, 10);
+        a.capabilities = EngineCapabilities {
+            prefill_decode_separation: true,
+            ..EngineCapabilities::conservative()
+        };
+        a.engine = EngineKind::Vllm;
+        let mut b = worker("b", 150, 60, 20);
+        b.capabilities = EngineCapabilities {
+            prefill_decode_separation: true,
+            ..EngineCapabilities::conservative()
+        };
+        b.engine = EngineKind::Vllm;
+
+        let d = evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(
+                ContextProfile {
+                    prompt_tokens: 10,
+                    max_output_tokens: 10,
+                    is_continuation: false,
+                    prefix_resident_on: None,
+                },
+                0,
+            ),
+            &[a, b],
+            false,
+            true, // allow_fanout
+        );
+        assert!(
+            matches!(d.plan.as_ref().map(|p| &p.kind), Some(PlanKind::FanOut(_))),
+            "staging-capable workers + allow_fanout must produce a FanOut plan"
+        );
+        assert_eq!(d.strategy.kind, crate::plan::StrategyKind::BatchFanOut);
+        assert!(d.strategy.is_multi_worker());
+        assert_eq!(d.expected_mode, "fan_out");
     }
 }
