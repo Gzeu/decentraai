@@ -311,6 +311,18 @@ plus the runtime half in `decentraai-distributed`:
   from an HTTP body — unknown workers earn 0 honestly). API: `GET
   /v1/knowledge` + `POST /v1/knowledge/receipt` + `POST
   /v1/knowledge/decide` (operator+); the dashboard has a Knowledge view.
+- **Evidence RAG (experimental memory, DONE)** — "what have we learned?":
+  `crates/agents/src/evidence.rs` (pure) is the deterministic index over five
+  evidence families (benchmark/execution/receipt/memory/consensus) with two
+  honest query paths — structural (keyword/tag, always available) and semantic
+  (cosine over real embeddings only, never a fake score) — plus derived
+  `lessons()` (success rate, median duration/RTT, verified-work rate, adoption
+  rate; zero evidence in, zero lessons out). `crates/distributed/src/
+  evidence_manager.rs` syncs idempotently from live sources (`ComputeManager`
+  executions, `KnowledgeRuntime` receipts/decisions, `MemoryStore` collective
+  scopes). API: `GET /v1/evidence` + `POST /v1/evidence/query` (operator+,
+  lazy sync at request time); the dashboard has an Evidence view. Evidence
+  carries **facts, never prompts/outputs**.
 
 **Runtime half (`decentraai-distributed`)**:
 - `AgentOrchestrator`: binds the pure fabric to the live P2P channel —

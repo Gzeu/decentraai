@@ -334,6 +334,10 @@ pub struct ApiState {
     /// (knowledge objects with derived confidence, decisions, receipts,
     /// compensation balances). `None` on plain serve (no agent host).
     knowledge: Option<Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>>,
+    /// Evidence RAG (experimental memory): when attached, `/v1/evidence`
+    /// exposes the fabric's derived lessons over real executions, receipts,
+    /// decisions and memory. `None` on plain serve.
+    evidence: Option<Arc<decentraai_distributed::evidence_manager::EvidenceManager>>,
 }
 
 impl ApiState {
@@ -392,6 +396,7 @@ impl ApiState {
             stt: Arc::new(crate::tools::SttManager::disabled()),
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
             knowledge: None,
+            evidence: None,
         }
     }
 
@@ -487,6 +492,14 @@ impl ApiState {
         knowledge: Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>,
     ) {
         self.knowledge = Some(knowledge);
+    }
+
+    /// Attaches the evidence RAG (experimental memory) control plane.
+    pub fn attach_evidence(
+        &mut self,
+        evidence: Arc<decentraai_distributed::evidence_manager::EvidenceManager>,
+    ) {
+        self.evidence = Some(evidence);
     }
 
     /// Attaches the provider control plane (Model Fabric).
@@ -4670,6 +4683,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/knowledge", get(knowledge_handler))
         .route("/v1/knowledge/receipt", post(knowledge_receipt_handler))
         .route("/v1/knowledge/decide", post(knowledge_decide_handler))
+        .route("/v1/evidence", get(evidence_handler))
+        .route("/v1/evidence/query", post(evidence_query_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -6434,6 +6449,92 @@ async fn knowledge_decide_handler(
         )
             .into_response(),
     }
+}
+
+/// Evidence RAG control plane (experimental memory): the fabric's derived
+/// lessons over real executions, receipts, decisions and memory. Real state
+/// only — zero evidence in, zero lessons out. Operator+ view.
+async fn evidence_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(evidence) = &state.evidence else {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "attached": false,
+                "total": 0,
+                "counts": {},
+                "recent": [],
+                "lessons": [],
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+    // Lazy sync from every live source (idempotent, bounded, never fails).
+    evidence.sync_all(
+        state.compute.as_deref(),
+        state.knowledge.as_deref(),
+        state.memory.as_deref(),
+    );
+    let summary = evidence.summary(20);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "attached": true,
+            "total": summary.total,
+            "counts": summary.counts,
+            "recent": summary.recent,
+            "lessons": summary.lessons,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Evidence RAG query: `{ text, k? }` → ranked hits. Honest about the path:
+/// `mode` is `"semantic"` when a real embedding backend ranked the results,
+/// `"structural"` otherwise (keyword/tag matching). Operator+ view.
+async fn evidence_query_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(evidence) = &state.evidence else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "evidence runtime not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let b = body.0;
+    let text = match b.get("text").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "text is required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    // Lazy sync so the query answers over the freshest real evidence.
+    evidence.sync_all(
+        state.compute.as_deref(),
+        state.knowledge.as_deref(),
+        state.memory.as_deref(),
+    );
+    let k = b.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let hits = evidence.query(&text, k).await;
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "hits": hits, "count": hits.len() }).to_string(),
+    )
+        .into_response()
 }
 
 /// AGENTS real state (Collective Intelligence P1): the node's local logical
@@ -11175,6 +11276,117 @@ mod tests {
             body["credits"].as_u64().unwrap(),
             body
         );
+    }
+
+    // Evidence RAG: without the manager attached the endpoint returns a
+    // well-formed empty payload (never a crash, never mock lessons).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evidence_handler_returns_empty_payload_when_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/v1/evidence"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], false);
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["lessons"].as_array().unwrap().len(), 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // Evidence RAG closed loop over the real API: a receipt + decision become
+    // evidence, the summary derives real lessons, and the query answers
+    // structurally (no embedding backend in tests).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evidence_receipts_decisions_and_query_roundtrip() {
+        use decentraai_compute::CompensationLedger;
+        use std::sync::Mutex as StdMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager,
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let memory_path = dir.path().join("agent_memory_evidence.sqlite");
+        let memory = Arc::new(
+            decentraai_distributed::agent_memory::MemoryStore::open(&memory_path).unwrap(),
+        );
+        let compensation = Arc::new(StdMutex::new(CompensationLedger::default()));
+        let runtime = decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
+            compensation.clone(),
+            "peer-local-test",
+            Some(memory),
+        )
+        .unwrap();
+        state.attach_knowledge(Arc::new(runtime));
+        state.attach_evidence(Arc::new(
+            decentraai_distributed::evidence_manager::EvidenceManager::new(None),
+        ));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let client = reqwest::Client::new();
+        // 1. A verified receipt + an adopted decision become evidence.
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/receipt"))
+            .json(&serde_json::json!({
+                "execution_id": "exec-ev-1",
+                "worker_node": "peer-worker-ev",
+                "worker_agent": "a:worker",
+                "capability": "inference",
+                "duration_ms": 120,
+                "verdict": "verified",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // 2. Summary derives real lessons (receipt evidence present).
+        let resp = client
+            .get(format!("http://{api}/v1/evidence"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], true);
+        assert!(body["total"].as_u64().unwrap() >= 1);
+        let lessons = body["lessons"].as_array().unwrap();
+        let verified = lessons
+            .iter()
+            .find(|l| l["id"] == "receipts/verified_rate")
+            .unwrap();
+        assert_eq!(verified["sample"].as_u64().unwrap(), 1);
+        assert_eq!(verified["value"].as_f64().unwrap(), 1.0);
+
+        // 3. Structural query (no embedding backend in tests → honest mode).
+        let resp = client
+            .post(format!("http://{api}/v1/evidence/query"))
+            .json(&serde_json::json!({ "text": "exec-ev-1" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let q: serde_json::Value = resp.json().await.unwrap();
+        let hits = q["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0]["mode"], "structural");
+        assert_eq!(hits[0]["kind"], "receipt");
     }
 
     /// Builds an ApiState with the given TTS manager attached.

@@ -2044,6 +2044,19 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 Err(e) => warn!(error = %e, "P12 knowledge runtime failed to attach"),
             }
         }
+        // Evidence RAG (experimental memory): indexes real executions, receipts,
+        // decisions and collective memory; `/v1/evidence` answers "what have we
+        // learned?" with derived lessons (never invented numbers). The index
+        // syncs lazily from the live sources at request time, so it needs no
+        // background task and never falls out of step with the sources.
+        {
+            let evidence = Arc::new(
+                decentraai_distributed::evidence_manager::EvidenceManager::new(
+                    embedding_client.clone(),
+                ),
+            );
+            state.attach_evidence(evidence);
+        }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.

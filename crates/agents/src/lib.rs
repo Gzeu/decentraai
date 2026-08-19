@@ -43,6 +43,7 @@ pub mod dataset;
 pub mod decision;
 pub mod delegation;
 pub mod economy;
+pub mod evidence;
 pub mod knowledge;
 pub mod matcher;
 pub mod memory;
@@ -81,6 +82,9 @@ pub use delegation::{
 pub use economy::{
     BookingRequest, BookingVerdict, CapabilityOffer, EconomyError, EconomyLedger, MAX_OFFERS,
     OfferStatus, negotiate,
+};
+pub use evidence::{
+    EvidenceEntry, EvidenceFamily, EvidenceHit, EvidenceIndex, EvidenceSummary, Lesson, lessons,
 };
 pub use knowledge::{
     Evidence, EvidenceKind, KnowledgeConfidence, KnowledgeError, KnowledgeObject, KnowledgeRegistry,

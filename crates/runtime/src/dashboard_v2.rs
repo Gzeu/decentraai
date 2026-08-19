@@ -229,6 +229,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <button data-view="agents"><span class="ico">◎</span>Agents</button>
     <button data-view="skills"><span class="ico">⚡</span>Skills</button>
     <button data-view="knowledge"><span class="ico">✦</span>Knowledge</button>
+    <button data-view="evidence"><span class="ico">✎</span>Evidence</button>
     <button data-view="workers"><span class="ico">▤</span>Workers</button>
     <button data-view="network"><span class="ico">○</span>Network</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
@@ -311,6 +312,21 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
      <div class="card" style="margin-top:14px"><h2>Verified Compute Receipts</h2><div id="knowledge-receipts" class="stack"></div></div>
      <div class="card" style="margin-top:14px"><h2>Compensation Balances</h2><div id="knowledge-balances" class="stack"></div></div>
    </section>
+    <section class="view" id="view-evidence">
+      <div class="card"><h2>Evidence — Experimental Memory <span class="live">● Live</span> · Evidence RAG</h2>
+        <p class="hint">The fabric's lessons, <b>derived from real evidence</b>: executions, verified receipts, decisions, collective memory. Zero evidence in, zero lessons out. Query below uses a real embedding backend when configured, honest keyword matching otherwise.</p>
+        <div id="evidence-kpis" class="grid kpis-4" style="margin-top:12px"></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Lessons Learned</h2><div id="evidence-lessons" class="stack"></div></div>
+      <div class="card" style="margin-top:14px"><h2>Ask the Evidence</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="evidence-query" placeholder="e.g. 'succeeded worker latency' — what have we learned?" style="flex:2;min-width:240px">
+          <button class="button primary" id="evidence-ask">Ask</button>
+        </div>
+        <div id="evidence-hits" class="stack" style="margin-top:12px"></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Recent Evidence</h2><div id="evidence-recent" class="stack"></div></div>
+    </section>
     <section class="view" id="view-workers"><div class="card"><h2>Workers — Distributed Compute Registry <span class="live">● Live</span></h2><div id="workers-detail"></div></div></section>
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
@@ -652,6 +668,9 @@ async function refresh() {
 $('refresh').addEventListener('click', refresh);
 refresh();
 renderCapFeedback();
+// Evidence RAG: ask the experimental memory.
+$('evidence-ask').addEventListener('click', evidenceAsk);
+$('evidence-query').addEventListener('keydown', (e) => { if (e.key==='Enter') evidenceAsk(); });
 // Model Fabric: add a provider through the master-gated admin endpoint.
 // The api key is sent once over the loopback API and then only ever kept in
 // the node's in-memory credential store.
@@ -682,6 +701,7 @@ async function loadAdvanced(view) {
   if (view==='agents') { renderAgents(); return; }
   if (view==='skills') { renderSkills(); return; }
   if (view==='knowledge') { renderKnowledge(); return; }
+  if (view==='evidence') { renderEvidence(); return; }
   if (view==='models') return;
   if (loadedAdvanced.has(view) || !advancedEndpoints[view]) return;
   const target = $(view);
@@ -773,6 +793,47 @@ function renderKnowledge() {
       ? balRows.map(([w,c]) => '<div class="row"><b>'+esc(w)+'</b><span>'+c+' credits</span></div>').join('')
       : '<div class="empty">No compensation balances yet (verified work only).</div>';
   })();
+}
+function renderEvidence() {
+  // Evidence RAG — experimental memory. Lessons are derived from real
+  // evidence; zero evidence in, zero lessons out. Never mock numbers.
+  (async () => {
+    let d = null;
+    try { d = await (await fetch('/v1/evidence',{headers:auth()})).json(); } catch (_) { $('evidence-recent').innerHTML='<div class="empty">Evidence view needs a valid operator token.</div>'; return; }
+    if (!d || d.attached === false) {
+      $('evidence-kpis').innerHTML = kpi('Evidence', '—', 'not attached');
+      $('evidence-lessons').innerHTML = '<div class="empty">The evidence runtime is not attached on this node.</div>';
+      $('evidence-recent').innerHTML = '';
+      return;
+    }
+    const counts = d.counts || {}, lessons = d.lessons || [], recent = d.recent || [];
+    const total = d.total ?? 0;
+    $('evidence-kpis').innerHTML =
+      kpi('Evidence', total, 'indexed entries') +
+      kpi('Executions', counts.execution ?? 0, 'plans') +
+      kpi('Receipts', counts.receipt ?? 0, 'verified work') +
+      kpi('Decisions', counts.consensus ?? 0, 'collective');
+    $('evidence-lessons').innerHTML = lessons.map(l => {
+      const pct = l.sample > 0 ? Math.round(l.value*100)+'%' : '—';
+      return '<div class="row"><b>'+esc(l.label)+'</b><span>'+pct+' <span class="hint">('+l.sample+' samples · '+esc(l.detail)+')</span></span></div>';
+    }).join('') || '<div class="empty">No evidence yet — the fabric has not learned anything.</div>';
+    $('evidence-recent').innerHTML = recent.map(e =>
+      '<div class="row"><b>'+esc(e.id)+'</b><span class="status idle" style="text-transform:none;letter-spacing:0">'+esc(e.kind)+'</span><span class="hint">'+esc(e.text)+'</span></div>'
+    ).join('') || '<div class="empty">No evidence indexed yet.</div>';
+  })();
+}
+async function evidenceAsk() {
+  const q = $('evidence-query').value.trim();
+  $('evidence-hits').innerHTML = '';
+  if (!q) return;
+  try {
+    const r = await fetch('/v1/evidence/query',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},auth()),body:JSON.stringify({text:q,k:10})});
+    const d = await r.json();
+    const hits = d.hits || [];
+    $('evidence-hits').innerHTML = hits.length
+      ? hits.map(h => '<div class="row"><b>'+esc(h.id)+'</b><span class="status idle" style="text-transform:none;letter-spacing:0">'+esc(h.mode)+' · '+Math.round((h.score||0)*100)+'%</span><span class="hint">'+esc(h.text)+'</span></div>').join('')
+      : '<div class="empty">No evidence matches — the honest answer is "nothing learned yet".</div>';
+  } catch (_) { $('evidence-hits').innerHTML = '<div class="empty">Query needs a valid operator token.</div>'; }
 }
 function renderProviders() {
   // Model Fabric: fetch /v1/providers (operator+admin) and render the

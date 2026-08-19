@@ -2838,3 +2838,50 @@ knowledge_runtime 5, API roundtrip 4, contribution_profile 1); clippy
 Follow-ups (documented, not blocking): ACI measurement as a separate
 observability milestone (never a feature); P2P distribution of knowledge
 objects/decisions between nodes.
+
+## 123. Evidence RAG — the fabric's experimental memory (DONE)
+
+The fabric can now answer **"what have we learned so far?"** from its own real
+evidence — no invented numbers, no mock lessons. This is the memory loop
+feeding collective knowledge back into planning.
+
+- **`crates/agents/src/evidence.rs`** (pure, 10 tests): `EvidenceEntry` is the
+  canonical shape every runtime source maps into (five families: benchmark,
+  execution, receipt, memory, consensus); `EvidenceIndex` is deterministic
+  (idempotent on id, sorted newest-first). Two honest query paths: structural
+  (keyword/tag AND-matching, always available, `mode: "structural"`) and
+  semantic (cosine over real embeddings only — an entry without a vector never
+  matches, `mode: "semantic"`; never a fake score). `lessons()` derives
+  deterministic aggregations over real evidence — execution success rate,
+  median duration, verified-work rate, consensus adoption rate, median network
+  RTT. **Zero evidence in, zero lessons out** (same honesty rule as knowledge
+  confidence). Invariant: evidence carries **facts**, never prompts/outputs.
+- **`crates/distributed/src/evidence_manager.rs`** (runtime, 5 tests): owns the
+  index and syncs idempotently from the live sources — `ComputeManager`
+  executions (`exec:<request_id>`), `KnowledgeRuntime` receipts + decisions
+  (`receipt:<exec_id>`, `decision:<id>`), `MemoryStore` collective scopes
+  (`memory:<entry_id>`). The source of truth stays the sources; the index is a
+  derived, bounded view (never persisted on its own). Query falls back
+  honestly: embedding backend present → semantic; backend failure or absent →
+  structural terms, clearly labeled.
+- **API**: `GET /v1/evidence` (summary + derived lessons) and
+  `POST /v1/evidence/query` (`{text, k?}` → ranked hits with honest `mode`);
+  both operator+ and lazy-sync from every live source at request time (no
+  background task). 2 API tests incl. the closed loop (receipt → evidence →
+  lessons → query).
+- **Dashboard**: Evidence view (advanced block) — KPIs per family, Lessons
+  Learned (derived values + sample counts + derivation detail), an "Ask the
+  Evidence" query box, recent evidence rows.
+
+Direction this encodes (from the benchmark/test reality): network-aware
+routing + continuation affinity + local execution stay the execution core;
+the differentiator is *orchestration intelligence* — knowing when, where and
+why to use each machine, backed by evidence the fabric itself produced.
+
+Tests: 1115 workspace tests green (evidence pure 10, evidence_manager 5, API
+evidence 2); clippy `-D warnings` clean.
+
+Next (documented): semantic query with a real embedding backend already wired
+(`/v1/embeddings` when configured); P2P distribution of knowledge
+objects/decisions between nodes; feeding planner decisions with evidence
+lessons (e.g. success-rate-weighted worker ranking).

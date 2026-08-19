@@ -84,6 +84,7 @@ pub mod breaker;
 pub mod compute;
 pub mod config;
 pub mod embedding;
+pub mod evidence_manager;
 pub mod fallback;
 pub mod knowledge_runtime;
 pub mod p2p_handler;
