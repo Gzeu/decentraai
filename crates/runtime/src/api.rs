@@ -7827,8 +7827,17 @@ async fn proxy_with_auth(
         // upstream model name) is served directly by the provider adapter —
         // no local engine slot, no fabric worker. This runs before fabric
         // routing so a provider model never occupies the local queue.
-        if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
-            return provider_route;
+        // `auto`/`__auto__` is NOT intercepted here: fabric routing decides
+        // first, and only falls back to the provider `auto` selection when no
+        // fabric/local model is runnable (see below).
+        let is_auto_model = serde_json::from_slice::<serde_json::Value>(&outgoing)
+            .ok()
+            .and_then(|v| v["model"].as_str().map(str::to_string))
+            .is_some_and(|m| m == "__auto__" || m == "auto");
+        if !is_auto_model {
+            if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
+                return provider_route;
+            }
         }
         if let (Some(compute), Some(_distributed)) = (&state.compute, &state.distributed) {
             let body_val: Option<serde_json::Value> = serde_json::from_slice(&outgoing).ok();
@@ -7903,7 +7912,18 @@ async fn proxy_with_auth(
                             // receives the real chosen model, not "auto".
                             local_rewrite = Some(file_name);
                         }
-                        None => { /* no model anywhere: local passthrough */ }
+                        None => {
+                            // No fabric/local model is runnable → fall back to
+                            // the provider `auto` selection (cost-aware best
+                            // enabled provider model). The fabric still wins
+                            // when it has any model, keeping local-first.
+                            if let Some(provider_route) =
+                                resolve_provider_model(&state, &outgoing).await
+                            {
+                                return provider_route;
+                            }
+                            /* no model anywhere: local passthrough */
+                        }
                     }
                 } else {
                     match resolve_chat_route(&trusted, &local_peer, &model) {
@@ -7939,6 +7959,12 @@ async fn proxy_with_auth(
                         outgoing = serde_json::to_vec(&v).unwrap_or(outgoing);
                     }
                 }
+            }
+        } else if is_auto_model {
+            // No fabric plane at all → `auto` still resolves through the
+            // provider cost-aware selection (best enabled provider model).
+            if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
+                return provider_route;
             }
         }
     }
@@ -9208,7 +9234,8 @@ mod tests {
         // fingerprint + models, connect a model, verify the symbolic hash
         // handle, then delete the model and provider.
         let dir = tempfile::tempdir().unwrap();
-        let (_api, manager) = start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
+        let (_api, manager) =
+            start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
         // Attach a provider plane (fresh, empty) so the CRUD invariants below
         // can be driven directly against the manager.
         let plane = Arc::new(tokio::sync::Mutex::new(

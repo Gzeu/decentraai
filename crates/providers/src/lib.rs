@@ -679,6 +679,82 @@ pub enum ProviderError {
     Adapter(String),
 }
 
+// ─── Cost-aware model selection (pure decision) ──────────────────────
+
+/// Health rank used by [`best_provider_model`]: higher = preferred.
+/// Healthy > Degraded > Unknown > Offline/Disabled. A disabled model is
+/// filtered out before ranking anyway; the rank makes degraded providers
+/// lose to healthy ones deterministically.
+fn health_rank(health: &ModelHealth) -> u8 {
+    match health {
+        ModelHealth::Healthy => 3,
+        ModelHealth::Degraded => 2,
+        ModelHealth::Unknown => 1,
+        ModelHealth::Offline | ModelHealth::Disabled => 0,
+    }
+}
+
+/// Total known USD cost per 1M tokens (input + output). `None` when the
+/// provider reports no pricing — unknown cost never beats a known one.
+fn total_cost_per_1m(model: &ConnectedModel) -> Option<f64> {
+    let p = model.pricing?;
+    match (p.input_per_1m, p.output_per_1m) {
+        (Some(i), Some(o)) => Some(i + o),
+        _ => None,
+    }
+}
+
+/// Deterministic cost-aware pick of the best **enabled** provider model for
+/// `auto` routing. Pure decision — no I/O, no async; drives the runtime
+/// resolver with synthetic inputs in tests.
+///
+/// Selection order (deterministic):
+///   1. Filter: provider enabled + model enabled, neither circuit-OPEN.
+///   2. Rank by model health (Healthy > Degraded > Unknown > Offline).
+///   3. Cheaper total cost wins when BOTH candidates report pricing.
+///   4. Tie-break: provider_id asc, then model_id asc.
+///
+/// Returns `(provider, model)` clones so the caller can build an adapter
+/// without holding the manager lock across await.
+pub fn best_provider_model(providers: &[Provider]) -> Option<(Provider, ConnectedModel)> {
+    let mut best: Option<(Provider, ConnectedModel)> = None;
+    for provider in providers {
+        if !provider.enabled || provider.circuit == CircuitState::Open {
+            continue;
+        }
+        for model in &provider.models {
+            if !model.enabled || model.circuit == CircuitState::Open {
+                continue;
+            }
+            let candidate = (provider.clone(), model.clone());
+            let better = match &best {
+                None => true,
+                Some((bp, bm)) => {
+                    let rank_a = health_rank(&candidate.1.health);
+                    let rank_b = health_rank(&bm.health);
+                    if rank_a != rank_b {
+                        rank_a > rank_b
+                    } else {
+                        match (total_cost_per_1m(&candidate.1), total_cost_per_1m(bm)) {
+                            (Some(ca), Some(cb)) if ca != cb => ca < cb,
+                            // Unknown cost on either side → fall through to
+                            // the deterministic tie-break.
+                            _ => {
+                                (&bp.provider_id, &bm.model_id)
+                                    > (&provider.provider_id, &model.model_id)
+                            }
+                        }
+                    }
+                }
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
 // ─── Module declarations ──────────────────────────────────────────────
 
 mod credential_store;
@@ -873,5 +949,124 @@ mod tests {
         provider.models[0].sharing.enabled = false;
         assert_eq!(provider.shared_models().count(), 0);
         assert!(!provider.has_shared_models());
+    }
+
+    // ── best_provider_model (cost-aware auto selection) ──────────────
+
+    fn model(id: &str, enabled: bool, health: ModelHealth, cost: Option<f64>) -> ConnectedModel {
+        ConnectedModel {
+            model_id: id.into(),
+            provider_id: "p1".into(),
+            upstream_model: id.into(),
+            display_name: String::new(),
+            capabilities: vec![],
+            capability_provenance: CapabilityProvenance::Unknown,
+            context_window: None,
+            pricing: cost.map(|c| Pricing {
+                input_per_1m: Some(c / 2.0),
+                output_per_1m: Some(c / 2.0),
+                provenance: PriceProvenance::ProviderReported,
+            }),
+            enabled,
+            sharing: SharingPolicy::default(),
+            budget: ModelBudget::default(),
+            health,
+            last_latency_ms: None,
+            last_success_at_ms: None,
+            last_failure_at_ms: None,
+            consecutive_failures: 0,
+            circuit: CircuitState::Healthy,
+            usage: ModelUsage::default(),
+        }
+    }
+
+    fn provider(id: &str, models: Vec<ConnectedModel>) -> Provider {
+        Provider {
+            provider_id: id.into(),
+            kind: ProviderKind::OpenAi,
+            display_name: id.into(),
+            base_url: "https://x".into(),
+            credential_ref: "cred".into(),
+            enabled: true,
+            health: ProviderHealth::Unknown,
+            last_health_check_at_ms: None,
+            last_latency_ms: None,
+            failure_count: 0,
+            last_error_class: None,
+            last_success_at_ms: None,
+            circuit: CircuitState::Healthy,
+            budget_metadata: None,
+            models,
+        }
+    }
+
+    #[test]
+    fn best_provider_model_prefers_healthy_over_unknown_and_disabled() {
+        let providers = vec![provider(
+            "p1",
+            vec![
+                model("m-disabled", false, ModelHealth::Healthy, None),
+                model("m-unknown", true, ModelHealth::Unknown, None),
+                model("m-healthy", true, ModelHealth::Healthy, None),
+            ],
+        )];
+        let (p, m) = best_provider_model(&providers).unwrap();
+        assert_eq!(p.provider_id, "p1");
+        assert_eq!(m.model_id, "m-healthy");
+    }
+
+    #[test]
+    fn best_provider_model_prefers_cheaper_when_both_report_pricing() {
+        let providers = vec![provider(
+            "p1",
+            vec![
+                model("m-expensive", true, ModelHealth::Healthy, Some(20.0)),
+                model("m-cheap", true, ModelHealth::Healthy, Some(1.0)),
+            ],
+        )];
+        let (_, m) = best_provider_model(&providers).unwrap();
+        assert_eq!(m.model_id, "m-cheap");
+    }
+
+    #[test]
+    fn best_provider_model_skips_open_circuit_and_disabled_provider() {
+        let mut p_off = provider("p-off", vec![model("m1", true, ModelHealth::Healthy, None)]);
+        p_off.enabled = false;
+        let mut p_open = provider(
+            "p-open",
+            vec![model("m1", true, ModelHealth::Healthy, None)],
+        );
+        p_open.circuit = CircuitState::Open;
+        let mut m_open = model("m-open", true, ModelHealth::Healthy, None);
+        m_open.circuit = CircuitState::Open;
+        let p_mixed = provider(
+            "p-mixed",
+            vec![m_open, model("m-ok", true, ModelHealth::Healthy, None)],
+        );
+        let providers = vec![p_off, p_open, p_mixed];
+        let (p, m) = best_provider_model(&providers).unwrap();
+        assert_eq!(p.provider_id, "p-mixed");
+        assert_eq!(m.model_id, "m-ok");
+    }
+
+    #[test]
+    fn best_provider_model_tie_breaks_deterministically() {
+        let providers = vec![
+            provider("p-b", vec![model("m1", true, ModelHealth::Healthy, None)]),
+            provider("p-a", vec![model("m1", true, ModelHealth::Healthy, None)]),
+        ];
+        let (p, _) = best_provider_model(&providers).unwrap();
+        assert_eq!(p.provider_id, "p-a");
+    }
+
+    #[test]
+    fn best_provider_model_returns_none_when_nothing_eligible() {
+        let providers = vec![
+            provider("p1", vec![model("m1", false, ModelHealth::Healthy, None)]),
+            provider("p2", vec![model("m1", true, ModelHealth::Healthy, None)]),
+        ];
+        let mut only_disabled = providers.clone();
+        only_disabled[1].enabled = false;
+        assert!(best_provider_model(&only_disabled).is_none());
     }
 }

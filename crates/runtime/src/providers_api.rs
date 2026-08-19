@@ -12,6 +12,7 @@ use futures::StreamExt;
 use serde_json::json;
 
 use crate::api::ApiState;
+use decentraai_providers::best_provider_model;
 
 fn forbidden(msg: &str) -> Response {
     (
@@ -458,7 +459,8 @@ fn record_provider_audit(state: &ApiState, event: &str, details: serde_json::Val
 /// Try to serve a `/v1/chat/completions` request from a connected provider
 /// model. Returns `Some(response)` when the requested model resolves to a
 /// provider model (symbolic hash `prov-…`, provider handle
-/// `provider:{provider_id}:{model_id}`, or the raw upstream model name), and
+/// `provider:{provider_id}:{model_id}`, the raw upstream model name, or
+/// `auto`/`__auto__` which picks the best enabled provider model), and
 /// `None` when the model is local/fabric/unknown (proxy continues as usual).
 ///
 /// Never sends credentials anywhere except the configured provider base URL;
@@ -499,22 +501,27 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
     // Resolve the model to a connected provider model. Only enabled models
     // are reachable. An explicit provider handle wins over name matching;
     // otherwise match the symbolic hash or the raw upstream model name.
+    // `auto`/`__auto__` picks the best provider model via cost-aware scoring.
     let (provider, model_entry) = {
         let mgr = providers.lock().await;
-        let found = mgr.providers().iter().find_map(|p| {
-            p.models.iter().find_map(|m| {
-                let handle = format!("provider:{}:{}", p.provider_id, m.model_id);
-                let hash = m.symbolic_hash();
-                let upstream = m.upstream_model.clone();
-                let name_matches = m.display_name == model;
-                if handle == model || hash == model || upstream == model || name_matches {
-                    Some((p.clone(), m.clone()))
-                } else {
-                    None
-                }
-            })
-        });
-        found?
+        if model == "__auto__" || model == "auto" {
+            best_provider_model(mgr.providers())?
+        } else {
+            let found = mgr.providers().iter().find_map(|p| {
+                p.models.iter().find_map(|m| {
+                    let handle = format!("provider:{}:{}", p.provider_id, m.model_id);
+                    let hash = m.symbolic_hash();
+                    let upstream = m.upstream_model.clone();
+                    let name_matches = m.display_name == model;
+                    if handle == model || hash == model || upstream == model || name_matches {
+                        Some((p.clone(), m.clone()))
+                    } else {
+                        None
+                    }
+                })
+            });
+            found?
+        }
     };
     if !model_entry.enabled {
         return Some(bad("model is disabled"));
