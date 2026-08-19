@@ -1,0 +1,26 @@
+[package]
+name = "decentraai-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Model Fabric provider control plane: provider registry, connected models, credential store, health + circuit breaker, sharing policy"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+http = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["time"] }
+chrono = { workspace = true }
+futures-util = "0.3"
+
+# Internal dependency: the provider adapter reuses the existing
+# backend-neutral OpenAI-compatible inference adapter.
+decentraai-inference-adapter = { path = "../inference-adapter" }
+decentraai-hub = { path = "../hub" }
