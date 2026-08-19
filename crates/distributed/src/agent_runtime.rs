@@ -241,6 +241,13 @@ pub struct InferenceAgentExecutor {
     /// `retrieve` string, the executor queries the index and augments the
     /// prompt with the retrieved context (retrieval tool at runtime).
     retrieval: Option<Arc<crate::retrieval_manager::RetrievalManager>>,
+    /// Optional real tool bindings (OCR, STT, HF skills). When non-empty the
+    /// model is told about them and may emit a `[TOOL_CALL]` block; the
+    /// executor runs it over loopback HTTP and re-asks (bounded rounds).
+    tools: Vec<crate::tool_calling::ToolBinding>,
+    /// Max tool-call rounds per task (each round = one model call + one tool
+    /// execution). Bounded so a chatty model cannot loop forever.
+    max_tool_rounds: usize,
 }
 
 impl InferenceAgentExecutor {
@@ -252,6 +259,8 @@ impl InferenceAgentExecutor {
             client: reqwest::Client::new(),
             local_backend: None,
             retrieval: None,
+            tools: Vec::new(),
+            max_tool_rounds: 3,
         }
     }
 
@@ -271,6 +280,13 @@ impl InferenceAgentExecutor {
     /// self-routing path.
     pub fn with_live_backend(&mut self, url: Arc<std::sync::Mutex<Option<String>>>) -> &mut Self {
         self.local_backend = Some(url);
+        self
+    }
+
+    /// Attaches real tool bindings (OCR, STT, HF skills). The model may emit
+    /// a `[TOOL_CALL]` block; the executor runs the tool and re-asks.
+    pub fn with_tools(&mut self, tools: Vec<crate::tool_calling::ToolBinding>) -> &mut Self {
+        self.tools = tools;
         self
     }
 
@@ -312,25 +328,63 @@ impl InferenceAgentExecutor {
                  (provider models require the local OpenAI-compatible proxy)"
             );
         }
-        let (text, tokens): (String, serde_json::Value) = match live_url {
-            Some(url) => {
-                let text = self.call_local_backend(&url, &request).await?;
-                // Token count is unknown on the raw local path.
-                (text, serde_json::Value::Null)
+        // Real tool calling (bounded rounds): the model may emit a
+        // [TOOL_CALL] block; execute the tool over loopback HTTP and re-ask
+        // until it answers plainly or the round budget is spent. A malformed
+        // or unknown tool call stops the loop (never a hard task failure —
+        // the model's latest text is returned as-is).
+        let mut tool_results: Vec<serde_json::Value> = Vec::new();
+        let mut final_text = String::new();
+        let mut final_tokens = serde_json::Value::Null;
+        let mut prompt = request.prompt.clone();
+        for round in 0..=self.max_tool_rounds {
+            request.prompt = crate::tool_calling::tool_prompt(&self.tools, &prompt);
+            let (text, tokens): (String, serde_json::Value) = match &live_url {
+                Some(url) => {
+                    let text = self.call_local_backend(url, &request).await?;
+                    (text, serde_json::Value::Null)
+                }
+                None => {
+                    let response = self
+                        .distributed
+                        .route_request(request.clone())
+                        .await
+                        .context("routing delegated inference")?;
+                    (response.output, serde_json::json!(response.tokens_used))
+                }
+            };
+            final_text = text;
+            final_tokens = tokens;
+            if self.tools.is_empty() || round == self.max_tool_rounds {
+                break;
             }
-            None => {
-                let response = self
-                    .distributed
-                    .route_request(request)
-                    .await
-                    .context("routing delegated inference")?;
-                (response.output, serde_json::json!(response.tokens_used))
-            }
-        };
+            let Ok(Some(call)) = crate::tool_calling::parse_tool_call(&final_text) else {
+                break; // plain answer, no tool ceremony — done
+            };
+            let result =
+                match crate::tool_calling::execute_tool_call(&self.client, &self.tools, &call).await
+                {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::warn!(error = %e, tool = %call.name, "agent tool call failed");
+                        tool_results.push(serde_json::json!({
+                            "tool": call.name,
+                            "error": e.to_string(),
+                        }));
+                        break;
+                    }
+                };
+            tool_results.push(serde_json::json!({
+                "tool": call.name,
+                "arguments": call.arguments,
+            }));
+            prompt = crate::tool_calling::tool_result_block(&call.name, &result);
+        }
         Ok(serde_json::json!({
-            "text": text,
+            "text": final_text,
             "model_hash": model_hash,
-            "tokens": tokens,
+            "tokens": final_tokens,
+            "tool_calls": tool_results,
             "retrieved_docs": retrieved.iter().map(|r| serde_json::json!({
                 "doc_id": r.doc_id,
                 "score": r.score,

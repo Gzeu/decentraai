@@ -2754,3 +2754,32 @@ authenticated `/v1/skills/<id>` endpoint.
 Tests: 1063 workspace tests green; clippy `-D warnings` clean. New tests:
 config parse + unknown-skill rejection, status defaults, `/v1/skills/<id>`
 404 when disabled.
+
+## 121. Real tool calling in the agent executor (DONE)
+
+The agent executor (`InferenceAgentExecutor`) can now call the node's real
+Tool Runtime: OCR, STT and every enabled HF skill are exposed to the model as
+tool bindings (name + description + loopback URL). When the model decides it
+needs a tool it emits a fenced JSON block; the executor runs the tool over
+loopback HTTP and re-asks with the result injected.
+
+- **Protocol** (`crates/distributed/src/tool_calling.rs`, pure, no I/O):
+  the tool catalog is prepended to the task prompt only when tools exist; the
+  model requests a call with `[TOOL_CALL]{"name":"...","arguments":{...}}[/TOOL_CALL]`;
+  the executor parses, executes, and follows up with `[TOOL_RESULT]` before
+  re-asking. A malformed/unknown tool call stops the loop (never a hard task
+  failure — the model's latest text is returned as-is).
+- **Bounded rounds**: max 3 model calls per task (`max_tool_rounds`), so a
+  chatty model cannot loop forever. Each round = one model call + one tool
+  execution; the output JSON carries `tool_calls` (tool + arguments) and the
+  final `text`.
+- **Wiring**: `spawn_tool_runtimes` runs before the agent executors in the
+  node daemon; only tools that actually spawned become bindings (missing venv
+  = no binding, node keeps working). The same managers are attached to the
+  API state (`/v1/ocr`, `/v1/stt`, `/v1/skills/<id>`).
+- **E2E**: `tool_calling_e2e` spins a mock backend that answers the first
+  round with a `[TOOL_CALL]` block, a mock tool server that returns a
+  sentiment result, and a mock backend that answers the follow-up — the test
+  asserts exactly one tool hit and the final text with the tool result.
+
+Tests: 1073 workspace tests green; clippy `-D warnings` clean.

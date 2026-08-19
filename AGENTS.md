@@ -55,6 +55,11 @@ Current state: ROADMAP.md is fully done (M0–M8). The next roadmap
   per-skill `runtime_evidence` flag in the Skills view is true only when this
   node actually executes the skill). Missing venv/models never fails startup —
   the node serves without the tool and logs a warning.
+  `tool_calling.rs` (distributed) is the real tool-calling protocol: the
+  agent executor exposes the spawned tools to the model as bindings, parses a
+  fenced `[TOOL_CALL]` JSON block, executes the tool over loopback HTTP and
+  re-asks with `[TOOL_RESULT]` injected (bounded rounds, malformed calls stop
+  the loop).
 - `crates/audit` — append-only JSON-lines security log
   (`logs/audit.jsonl`): peer bans, chunk verification failures,
   admission rejections, inference starts. Prompts and outputs are never

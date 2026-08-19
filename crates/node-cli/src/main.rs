@@ -3,6 +3,9 @@ use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
 use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
+use decentraai_runtime::tools::{
+    HfSkillsManager, HfSkillsServer, OcrManager, OcrServer, SttManager, SttServer,
+};
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1094,6 +1097,59 @@ fn open_dashboard(args: OpenArgs) -> Result<()> {
 /// Congestion and topology are hidden: the node just comes up and peers on the
 /// same LAN discover each other automatically. Shuts down cleanly on
 /// SIGINT/SIGTERM (which is what Ctrl+C and systemd send).
+///
+/// Spawns the opt-in Tool Runtime subprocesses (OCR/STT/HF skills). Returns
+/// the managers (empty = disabled/missing setup) so callers can both attach
+/// them to the API state and build real tool bindings for the agent executor.
+/// Missing venv/model files never fail startup — the node serves without the
+/// tool and logs a warning.
+async fn spawn_tool_runtimes(
+    config: &decentraai_config::NodeConfig,
+    data_dir: &std::path::Path,
+) -> (
+    Option<OcrManager>,
+    Option<SttManager>,
+    Option<HfSkillsManager>,
+) {
+    let mut ocr = None;
+    if let Some(cfg) = config.ocr.clone() {
+        if cfg.enabled {
+            match OcrServer::spawn(data_dir).await {
+                Ok(server) => {
+                    info!("OCR online (RapidOCR subprocess)");
+                    ocr = Some(OcrManager::new(Some(server)));
+                }
+                Err(e) => warn!(error = %e, "OCR unavailable (run scripts/setup-ocr.sh)"),
+            }
+        }
+    }
+    let mut stt = None;
+    if let Some(cfg) = config.stt.clone() {
+        if cfg.enabled {
+            match SttServer::spawn(data_dir, &cfg.model).await {
+                Ok(server) => {
+                    info!(model = %cfg.model, "STT online (faster-whisper subprocess)");
+                    stt = Some(SttManager::new(Some(server), cfg.model.clone()));
+                }
+                Err(e) => warn!(error = %e, "STT unavailable (run scripts/setup-stt.sh)"),
+            }
+        }
+    }
+    let mut skills = None;
+    if let Some(cfg) = config.skills.clone() {
+        if cfg.enabled {
+            match HfSkillsServer::spawn(data_dir, &cfg.list).await {
+                Ok(server) => {
+                    info!(skills = ?cfg.list, "HF skills online (transformers subprocess)");
+                    skills = Some(HfSkillsManager::new(Some(server)));
+                }
+                Err(e) => warn!(error = %e, "HF skills unavailable (run scripts/setup-skills.sh)"),
+            }
+        }
+    }
+    (ocr, stt, skills)
+}
+
 async fn node_start(args: NodeArgs) -> Result<()> {
     use PathBuf;
     use decentraai_distributed::{DistributedInference, InferenceConfig};
@@ -1563,7 +1619,61 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         }
         _ => (None, None),
     };
+    // Tool Runtime managers are created at most once and shared by the agent
+    // executors (as real tool bindings) and the API (as /v1/<tool> proxies).
+    let mut ocr_manager: Option<OcrManager> = None;
+    let mut stt_manager: Option<SttManager> = None;
+    let mut skills_manager: Option<HfSkillsManager> = None;
     if is_worker && !model_hash.is_empty() {
+        // Tool Runtime: spawn OCR/STT/HF-skills subprocesses BEFORE the agent
+        // executors so the real tool bindings (name + description + loopback
+        // URL) can be attached to the executor. Missing setups fail graceful —
+        // the node runs without the tool and logs a warning.
+        (ocr_manager, stt_manager, skills_manager) =
+            spawn_tool_runtimes(&config, &data_dir).await;
+        // Real tool bindings for the agent executor — only for tools that are
+        // actually online (spawn succeeded). The model is told about them and
+        // may emit a [TOOL_CALL] block; the executor runs the tool and re-asks.
+        let mut tool_bindings: Vec<decentraai_distributed::tool_calling::ToolBinding> = Vec::new();
+        if let Some(m) = &ocr_manager {
+            if let Some(base) = m.base_url() {
+                tool_bindings.push(decentraai_distributed::tool_calling::ToolBinding::new(
+                    "ocr",
+                    "extracts text from an image (input: image_b64, the base64 of an image)",
+                    format!("{base}/v1/ocr"),
+                ));
+            }
+        }
+        if let Some(m) = &stt_manager {
+            if let Some(base) = m.base_url() {
+                tool_bindings.push(decentraai_distributed::tool_calling::ToolBinding::new(
+                    "stt",
+                    "transcribes speech to text (input: audio_b64, the base64 of a WAV/MP3/OGG)",
+                    format!("{base}/v1/stt"),
+                ));
+            }
+        }
+        if let Some(m) = &skills_manager {
+            if let Some(base) = m.base_url() {
+                for skill in m.skills() {
+                    let desc = match skill.as_str() {
+                        "sentiment" => "classifies text sentiment (input: text)",
+                        "ner" => "extracts named entities (input: text)",
+                        "summarize" => "summarizes text (input: text)",
+                        "translate_ro_en" => "translates Romanian to English (input: text)",
+                        "translate_en_ro" => "translates English to Romanian (input: text)",
+                        other => return Err(anyhow::anyhow!("unknown skill '{other}'")),
+                    };
+                    tool_bindings.push(
+                        decentraai_distributed::tool_calling::ToolBinding::new(
+                            skill.clone(),
+                            desc,
+                            format!("{base}/v1/skills/{skill}"),
+                        ),
+                    );
+                }
+            }
+        }
         let mut inference_executor =
             decentraai_distributed::agent_runtime::InferenceAgentExecutor::new(
                 Arc::new(distributed.clone()),
@@ -1581,6 +1691,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(rm) = &retrieval_manager {
             inference_executor.with_retrieval(rm.clone());
         }
+        // Real tool calling: attach the spawned OCR/STT/HF-skills bindings.
+        inference_executor.with_tools(tool_bindings);
         // One runtime per local logical agent (the orchestrator selects these
         // as executors for delegated stages).
         let local_agents = agent_manager.local_agents();
@@ -1878,64 +1990,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 }
             }
         }
-        // OCR: RapidOCR subprocess for `/v1/ocr`. Enabled only when `ocr.enabled`
-        // is set AND the venv exists; missing setup logs a warning and serves
-        // without OCR rather than failing startup.
-        if let Some(ocr_cfg) = config.ocr.clone() {
-            if ocr_cfg.enabled {
-                match decentraai_runtime::tools::OcrServer::spawn(&data_dir).await {
-                    Ok(server) => {
-                        info!("OCR online (RapidOCR subprocess)");
-                        state.attach_ocr(Arc::new(
-                            decentraai_runtime::tools::OcrManager::new(Some(server)),
-                        ));
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "OCR unavailable (run scripts/setup-ocr.sh)"
-                        );
-                    }
-                }
-            }
+        // OCR: attach the manager spawned earlier (subprocess for `/v1/ocr`).
+        if let Some(manager) = ocr_manager {
+            state.attach_ocr(Arc::new(manager));
         }
-        // STT: faster-whisper subprocess for `/v1/stt`. Enabled only when
-        // `stt.enabled` is set AND the venv exists; missing setup logs a
-        // warning and serves without STT rather than failing startup.
-        if let Some(stt_cfg) = config.stt.clone() {
-            if stt_cfg.enabled {
-                match decentraai_runtime::tools::SttServer::spawn(&data_dir, &stt_cfg.model).await {
-                    Ok(server) => {
-                        info!(model = %stt_cfg.model, "STT online (faster-whisper subprocess)");
-                        state.attach_stt(Arc::new(decentraai_runtime::tools::SttManager::new(
-                            Some(server),
-                            stt_cfg.model.clone(),
-                        )));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "STT unavailable (run scripts/setup-stt.sh)");
-                    }
-                }
-            }
+        // STT: attach the manager spawned earlier (subprocess for `/v1/stt`).
+        if let Some(manager) = stt_manager {
+            state.attach_stt(Arc::new(manager));
         }
-        // HF skills: small transformers pipelines subprocess for
-        // `/v1/skills/<id>`. Enabled only when `skills.enabled` is set AND the
-        // venv exists; missing setup logs a warning and serves without skills
-        // rather than failing startup. Pipelines load lazily on first call.
-        if let Some(skills_cfg) = config.skills.clone() {
-            if skills_cfg.enabled {
-                match decentraai_runtime::tools::HfSkillsServer::spawn(&data_dir, &skills_cfg.list).await {
-                    Ok(server) => {
-                        info!(skills = ?skills_cfg.list, "HF skills online (transformers subprocess)");
-                        state.attach_skills_tool(Arc::new(
-                            decentraai_runtime::tools::HfSkillsManager::new(Some(server)),
-                        ));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "HF skills unavailable (run scripts/setup-skills.sh)");
-                    }
-                }
-            }
+        // HF skills: attach the manager spawned earlier (`/v1/skills/<id>`).
+        if let Some(manager) = skills_manager {
+            state.attach_skills_tool(Arc::new(manager));
         }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());

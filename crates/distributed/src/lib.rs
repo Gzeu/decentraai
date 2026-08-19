@@ -92,6 +92,7 @@ pub mod replay;
 pub mod retrieval_manager;
 pub mod router;
 pub mod session;
+pub mod tool_calling;
 pub mod tracker;
 pub mod worker;
 
