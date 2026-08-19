@@ -111,6 +111,26 @@ bash scripts/upgrade-remote-node.sh dca@192.168.1.138   # builds + swaps + resta
 VALIDATE_LAN=1 bash scripts/upgrade-remote-node.sh dca@192.168.1.138  # …and then proves remote routing
 ```
 
+### Fully automatic — self-upgrade on schedule (no SSH needed)
+
+The node can refresh itself from its own git remote (no operator login needed
+on the machine, works on any node):
+
+```bash
+# one-shot check: is there a newer main?
+decentraai upgrade check
+# apply now (build + binary swap + service restart, rollback on failure)
+decentraai upgrade apply
+# keep checking every 6h and upgrade automatically when a new main exists
+decentraai node --auto-upgrade --auto-upgrade-interval-secs 21600
+# or the standalone watcher
+decentraai upgrade auto --interval-secs 21600
+```
+
+Safety: never touches node data/config/identity, requires a clean working
+tree, backs up the binary before the swap, and stops the service only for the
+brief swap (not for the minutes-long build).
+
 ### Manual (fallback)
 
 ```bash
