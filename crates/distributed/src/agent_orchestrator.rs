@@ -568,7 +568,7 @@ fn write_workflow_to_memory(
         })
         .to_string();
         let entry = decentraai_agents::MemoryEntry::new(
-            format!("wf:{plan_id}:{task_short}:{}", sr.stage_id),
+            format!("wf:{plan_id}:{now}:{task_short}:{}", sr.stage_id),
             "workflow_results".to_string(),
             "orchestrator".to_string(),
             "local".to_string(),
@@ -588,7 +588,7 @@ fn write_workflow_to_memory(
     })
     .to_string();
     let summary_entry = decentraai_agents::MemoryEntry::new(
-        format!("wf:{plan_id}:{task_short}:summary"),
+        format!("wf:{plan_id}:{now}:{task_short}:summary"),
         "workflow_results".to_string(),
         "orchestrator".to_string(),
         "local".to_string(),
@@ -699,7 +699,44 @@ mod tests {
     }
 
     #[test]
-    fn workflow_memory_write_is_idempotent() {
+    fn repeated_workflow_runs_each_write_memory_entries() {
+        // Regression: entry ids were derived from plan_id + task_id (both
+        // fixed across template instantiations), so a second research_report
+        // run hit the PRIMARY KEY on memory_entries and its writes were
+        // silently swallowed (`let _ =`). The fix folds the run timestamp
+        // into each entry id — every run must write fresh, observable rows.
+        let store = temp_store("repeat");
+        let result = DelegationResult {
+            plan_id: "workflow-run".into(),
+            task_id: "workflow-master".into(),
+            verdict: DelegationVerdict::Completed,
+            stages: vec![verified_stage("research"), verified_stage("synthesis")],
+            final_output: Some(json!({"text": "done"})),
+        };
+        write_workflow_to_memory(&store, "workflow-run", "workflow-master", &result);
+        write_workflow_to_memory(&store, "workflow-run", "workflow-master", &result);
+
+        let entries = store
+            .read("workflow_results", "orchestrator", true)
+            .unwrap();
+        // 2 runs × (2 stages + 1 summary) = 6 entries. Before the fix the
+        // second run wrote nothing, leaving only 3.
+        assert_eq!(
+            entries.len(),
+            6,
+            "each completed run must write its own entries; got {}",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn workflow_memory_write_does_not_duplicate_within_a_single_run() {
+        // Idempotency at the run level: a run's entries carry a per-run
+        // timestamp id, so re-invoking the *same* writer with the same result
+        // still writes a second run's rows (each run is a distinct event).
+        // What must never happen is duplicated rows WITHIN one run — that is
+        // structurally impossible via the PRIMARY KEY, and the scope's
+        // max_entries pruning bounds growth over many runs.
         let store = temp_store("idempotent");
         let result = DelegationResult {
             plan_id: "p3".into(),
@@ -709,7 +746,6 @@ mod tests {
             final_output: Some(json!({"text": "done"})),
         };
         write_workflow_to_memory(&store, "p3", "t3", &result);
-        write_workflow_to_memory(&store, "p3", "t3", &result);
 
         let entries = store
             .read("workflow_results", "orchestrator", true)
@@ -717,7 +753,13 @@ mod tests {
         assert_eq!(
             entries.len(),
             2,
-            "idempotent write must not duplicate entries"
+            "one run = 1 verified stage + 1 summary"
+        );
+        let ids: Vec<String> = entries.iter().map(|e| e.entry_id.clone()).collect();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            "entry ids must be unique within a run"
         );
     }
 }
