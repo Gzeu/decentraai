@@ -618,7 +618,17 @@ impl ExecutionPlanner {
     fn network_score(&self, link: &LinkMetrics) -> f32 {
         let rtt_ms = link.rtt_us / 1000;
         let rtt_score = (1.0 - (rtt_ms as f32 / 200.0)).clamp(0.0, 1.0);
-        rtt_score * 0.7 + (if link.bandwidth_mbps >= 100 { 0.3 } else { 0.1 })
+        let base = rtt_score * 0.7 + (if link.bandwidth_mbps >= 100 { 0.3 } else { 0.1 });
+        // P2 NetworkFacts: fold jitter/packet-loss stability into the network
+        // score ONLY when measured. (None, None) is neutral (1.0) so links
+        // that only carry RTT keep the exact pre-P2 score; a measured bad
+        // link loses up to 30% of its network score, so a flaky link loses to
+        // a clean one at equal RTT/bandwidth.
+        let stability_factor = match (link.jitter_us, link.packet_loss_percent) {
+            (None, None) => 1.0,
+            _ => 0.7 + 0.3 * link.stability() as f32,
+        };
+        base * stability_factor
     }
 
     /// Builds deterministic fallback worker orders (ranked, minus already used).
@@ -924,6 +934,59 @@ mod tests {
         ];
         let p = planner.plan(&req(), &ws);
         assert_eq!(p.plan.workers(), vec!["near"]);
+    }
+
+    #[test]
+    fn p2_network_score_is_neutral_when_jitter_loss_unmeasured() {
+        // Regression: a link with only RTT (the live M19 case) must keep the
+        // exact pre-P2 network score — (None, None) is neutral, not a penalty.
+        let planner = ExecutionPlanner::default();
+        let plain = LinkMetrics::prior(crate::network::Locality::Lan, Some(1_000));
+        let clean = LinkMetrics {
+            jitter_us: Some(0),
+            packet_loss_percent: Some(0.0),
+            ..plain
+        };
+        assert_eq!(planner.network_score(&plain), planner.network_score(&clean));
+        // And a measured flaky link scores strictly below the neutral one.
+        let flaky = LinkMetrics {
+            jitter_us: Some(40_000),
+            packet_loss_percent: Some(8.0),
+            ..plain
+        };
+        assert!(
+            planner.network_score(&flaky) < planner.network_score(&plain),
+            "flaky link must lose to a plain link at equal RTT"
+        );
+    }
+
+    #[test]
+    fn p2_stability_steers_planner_to_clean_link_when_rtt_ties() {
+        // Two workers with identical RTT/bandwidth/perf: the measured clean
+        // link wins over the measured flaky one.
+        let mut planner = ExecutionPlanner::default();
+        planner.network.set(
+            "clean",
+            LinkMetrics {
+                jitter_us: Some(500),
+                packet_loss_percent: Some(0.0),
+                ..LinkMetrics::prior(crate::network::Locality::Lan, Some(2_000))
+            },
+        );
+        planner.network.set(
+            "flaky",
+            LinkMetrics {
+                jitter_us: Some(30_000),
+                packet_loss_percent: Some(5.0),
+                ..LinkMetrics::prior(crate::network::Locality::Lan, Some(2_000))
+            },
+        );
+        let ws = vec![
+            worker_facts("clean", 150, 40, 10),
+            worker_facts("flaky", 150, 40, 10),
+        ];
+        let p = planner.plan(&req(), &ws);
+        assert_eq!(p.plan.workers(), vec!["clean"]);
     }
 
     #[test]
