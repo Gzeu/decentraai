@@ -9291,6 +9291,92 @@ mod tests {
         manager.lock().await.shutdown().await.unwrap();
     }
 
+    /// P7/P10: `auto` through `resolve_provider_model` reaches a connected
+    /// provider model over a real loopback OpenAI-compatible mock. Proves the
+    /// cost-aware selection + adapter path work end-to-end without a network.
+    #[tokio::test]
+    async fn resolve_provider_model_auto_serves_best_provider_model() {
+        // Mock upstream: one OpenAI-compatible /v1/chat/completions endpoint.
+        let mock = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|body: axum::body::Bytes| async move {
+                let _ = body;
+                axum::Json(serde_json::json!({
+                    "id": "mock-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-4o-mini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "auto-routed from provider"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7 }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+
+        // Provider plane with one enabled connected model behind the mock.
+        let dir = tempfile::tempdir().unwrap();
+        let plane = Arc::new(tokio::sync::Mutex::new(
+            decentraai_providers::ProviderManager::new(dir.path()),
+        ));
+        {
+            let mut mgr = plane.lock().await;
+            let pid = mgr
+                .add_provider(
+                    decentraai_providers::ProviderKind::OpenAi,
+                    "mock",
+                    format!("http://{addr}"),
+                    "sk-mock",
+                )
+                .unwrap();
+            mgr.connect_model(&pid, "gpt-4o-mini", None).unwrap();
+        }
+
+        // A minimal ApiState carrying only the provider plane (no compute).
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:1".to_string(),
+            Some("secret".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let mut state = state;
+        state.attach_providers(plane);
+
+        let outgoing = serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = resolve_provider_model(&state, &serde_json::to_vec(&outgoing).unwrap())
+            .await
+            .expect("auto must resolve to the connected provider model");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["choices"][0]["message"]["content"],
+            "auto-routed from provider"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn subscriber_tokens_get_tier_policies() {
