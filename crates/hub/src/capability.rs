@@ -301,7 +301,26 @@ pub fn classify(pipeline_tag: Option<&str>, tags: &[String], id: &str) -> ModelC
     // --- INFERRED from conservative name heuristics ---
     let id_lower = id.to_lowercase();
     let name_has = |needle: &str| id_lower.contains(needle);
-    if name_has("codestral") || name_has("code") || name_has("coder") || name_has("starcoder") {
+
+    // BUGFIX (audit finding): a bare `name_has("code")` substring check
+    // false-positives on "encoder", "decoder", "codec" and "vocoder" — "code"
+    // is a literal substring of all four (e.g. "en-C-O-D-E-r"). Any
+    // embedding/vision/audio model with one of those extremely common words in
+    // its name was silently mislabeled `Coding: Inferred`, directly
+    // contradicting this module's own "never claim a capability merely because
+    // it would be convenient" rule. Exclude the codec/encoder/decoder family
+    // explicitly before applying the broad "code" check, and detect the real
+    // codellama/code-llama family the old heuristic actually missed.
+    let is_codec_family =
+        name_has("encoder") || name_has("decoder") || name_has("codec") || name_has("vocoder");
+    if !is_codec_family
+        && (name_has("codestral")
+            || name_has("code")
+            || name_has("coder")
+            || name_has("starcoder")
+            || name_has("codellama")
+            || name_has("code-llama"))
+    {
         push_unique(&mut claims, CapabilityKind::Coding, Provenance::Inferred);
     }
     if name_has("reason") || name_has("think") || name_has("deepseek-r1") || name_has("qwq") {
@@ -463,6 +482,47 @@ mod tests {
                 .iter()
                 .any(|t| t.task == "repository understanding")
         );
+    }
+
+    #[test]
+    fn encoder_named_models_never_claim_coding() {
+        // Regression: "code" is a literal substring of encoder/decoder/codec/
+        // vocoder — embedding/vision/audio models with those words in their
+        // name must never be silently labeled Coding:Inferred.
+        for id in [
+            "org/bge-large-encoder-v1.5",
+            "org/vae-decoder",
+            "org/hifi-vocoder",
+            "org/audio-codec-large",
+        ] {
+            let caps = classify(Some("feature-extraction"), &tags(&["gguf"]), id);
+            assert!(
+                !caps.claims.iter().any(|c| {
+                    c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
+                }),
+                "{id} must not claim Coding"
+            );
+        }
+    }
+
+    #[test]
+    fn real_coding_families_still_inferred() {
+        // No loss of real detections: coder/starcoder/codestral/codellama.
+        for id in [
+            "org/coder-7b",
+            "org/starcoder2-15b",
+            "org/codestral-latest",
+            "org/codellama-13b",
+            "org/code-llama-34b",
+        ] {
+            let caps = classify(Some("text-generation"), &tags(&["gguf"]), id);
+            assert!(
+                caps.claims.iter().any(|c| {
+                    c.capability == CapabilityKind::Coding && c.provenance == Provenance::Inferred
+                }),
+                "{id} must still claim Coding"
+            );
+        }
     }
 
     #[test]
