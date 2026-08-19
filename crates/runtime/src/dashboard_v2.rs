@@ -766,7 +766,7 @@ function renderKnowledge() {
     }).join('') || '<div class="empty">No collective decisions yet.</div>';
     $('knowledge-receipts').innerHTML = recs.map(r => {
       const st = r.verdict==='Verified'?'status':'status off';
-      return '<div class="row"><b>'+esc(r.execution_id)+'</b><span>'+esc(r.capability)+' · '+r.duration_ms+'ms · <span class="'+st+'">'+esc(r.verdict)+'</span></span></div>';
+      return '<div class="row"><b>'+esc(r.execution_id)+'</b><span>'+esc(r.capability)+' · '+r.duration_ms+'ms · <span class="'+st+'">'+esc(r.verdict)+'</span> · '+(r.credits||0)+' credits</span></div>';
     }).join('') || '<div class="empty">No verified compute receipts yet.</div>';
     const balRows = Object.entries(bal);
     $('knowledge-balances').innerHTML = balRows.length

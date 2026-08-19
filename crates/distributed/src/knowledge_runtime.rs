@@ -121,6 +121,10 @@ pub struct KnowledgeRuntime {
     /// profile to earn more credits). A worker with no measured profile earns
     /// nothing (honest: `reward_tokens` returns 0 with zero verified work).
     profiles: Arc<Mutex<std::collections::HashMap<String, ContributionProfile>>>,
+    /// Credits actually credited per execution id (recorded when the receipt
+    /// is applied). Surfaced by the dashboard so each receipt shows what it
+    /// really earned — never a synthetic 0.
+    receipt_credits: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl KnowledgeRuntime {
@@ -145,6 +149,7 @@ impl KnowledgeRuntime {
             memory_store,
             local_node: local_node.into(),
             profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            receipt_credits: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
@@ -205,7 +210,13 @@ impl KnowledgeRuntime {
                 .compensation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("compensation ledger lock poisoned"))?;
-            receipt.apply_compensation(&mut compensation, profile)
+            let credits = receipt.apply_compensation(&mut compensation, profile);
+            // Remember what this execution really earned (0 for failed/unknown
+            // workers is honest — the dashboard must show it, not a fake gap).
+            if let Ok(mut rc) = self.receipt_credits.lock() {
+                rc.insert(receipt.execution_id.clone(), credits);
+            }
+            credits
         };
         // The receipt becomes knowledge — the evidence half of the loop.
         let object_id = format!("k:receipt:{}", receipt.execution_id);
@@ -359,14 +370,22 @@ impl KnowledgeRuntime {
                 .collect(),
             receipts: receipts
                 .into_iter()
-                .map(|r| ReceiptView {
-                    execution_id: r.execution_id,
-                    worker_node: r.worker_node,
-                    capability: r.capability,
-                    duration_ms: r.duration_ms,
-                    verdict: format!("{:?}", r.verdict),
-                    credits: 0, // credits are computed per-profile at record time
-                    created_at_ms: r.created_at_ms,
+                .map(|r| {
+                    let execution_id = r.execution_id.clone();
+                    let credits = self
+                        .receipt_credits
+                        .lock()
+                        .map(|rc| rc.get(&execution_id).copied().unwrap_or(0))
+                        .unwrap_or(0); // real credited amount, never synthetic
+                    ReceiptView {
+                        execution_id,
+                        worker_node: r.worker_node,
+                        capability: r.capability,
+                        duration_ms: r.duration_ms,
+                        verdict: format!("{:?}", r.verdict),
+                        credits,
+                        created_at_ms: r.created_at_ms,
+                    }
                 })
                 .collect(),
             balances,
@@ -557,6 +576,10 @@ mod tests {
         assert_eq!(view.knowledge_objects.len(), 2);
         assert_eq!(view.decisions.len(), 1);
         assert_eq!(view.total_credits, credits);
+        // The receipt view carries the REAL credited amount (never a
+        // synthetic 0) so the dashboard shows what the execution earned.
+        assert_eq!(view.receipts.len(), 1);
+        assert_eq!(view.receipts[0].credits, credits);
     }
 
     #[test]
