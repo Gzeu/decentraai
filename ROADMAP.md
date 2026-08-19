@@ -2651,6 +2651,19 @@ All pure — the planner still emits only SingleWorker/BatchFanOut and no code
 path consults the new primitives yet.
 
 Tests: 1042 workspace tests green; clippy `-D warnings` clean; fmt clean.
-Remaining research phases (P2 NetworkFacts, P3 speculative, P4 prefill/decode,
-P5 cache-aware, P6 collaborative/RPC) stay **experimental** — they require live
-LAN measurements (Laptop ↔ Desktop) before the planner may select them.
+
+**P1 follow-up — NetworkFacts (`cf27cb4`)**: `LinkMetrics` gains `jitter_us` +
+`packet_loss_percent` (Option, serde back-compat) + `stability()` fold
+(unmeasured = UNKNOWN = 0, conservative); `sort_peers` tie-breaks on
+stability; `NetworkFacts` aggregates link + reach cost + stability per worker
+(P2 shape, no planner consumer yet — waits for live jitter/loss measurement).
+
+**P1 follow-up — Promotion gates (`931cbb9`)**: `PromotionEvidence` encodes the
+§6 hard gates for moving a strategy from EXPERIMENTAL to BETA/PRODUCTION:
+capabilities verified, net benefit proven, tiers enforced, threat model
+reviewed, rollback tested. `promotable()`/`unmet()` make the decision explicit
+and auditable.
+
+Remaining research phases (P3 speculative, P4 prefill/decode, P5 cache-aware,
+P6 collaborative/RPC) stay **experimental** — they require live LAN
+measurements (Laptop ↔ Desktop) before the planner may select them.
