@@ -329,6 +329,11 @@ pub struct ApiState {
     /// Local HF skills (transformers pipelines subprocess). `/v1/skills/<id>`
     /// when enabled; drives the P8 `runtime_evidence` flag on the Skills view.
     skills_tool: Arc<crate::tools::HfSkillsManager>,
+    /// P12 collective knowledge & decisions runtime. When attached, the
+    /// KNOWLEDGE dashboard view + `/v1/knowledge` endpoints render real state
+    /// (knowledge objects with derived confidence, decisions, receipts,
+    /// compensation balances). `None` on plain serve (no agent host).
+    knowledge: Option<Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>>,
 }
 
 impl ApiState {
@@ -386,6 +391,7 @@ impl ApiState {
             ocr: Arc::new(crate::tools::OcrManager::disabled()),
             stt: Arc::new(crate::tools::SttManager::disabled()),
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
+            knowledge: None,
         }
     }
 
@@ -473,6 +479,14 @@ impl ApiState {
     /// Attaches the talent tree (capability graph) for the dashboard.
     pub fn attach_talent_tree(&mut self, tree: Arc<decentraai_agents::TalentTree>) {
         self.talent_tree = Some(tree);
+    }
+
+    /// Attaches the P12 collective knowledge & decisions runtime.
+    pub fn attach_knowledge(
+        &mut self,
+        knowledge: Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>,
+    ) {
+        self.knowledge = Some(knowledge);
     }
 
     /// Attaches the provider control plane (Model Fabric).
@@ -866,6 +880,14 @@ fn percentile_ms(mut samples: Vec<u64>, q: f64) -> u64 {
     samples.sort_unstable();
     let idx = ((samples.len() - 1) as f64 * q / 100.0).floor() as usize;
     samples[idx]
+}
+
+/// Current unix time in milliseconds (used by P12 receipt/decision records).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Builds an [`InferenceStats`] from the recent-request ring buffer and the
@@ -4645,6 +4667,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/ocr", post(ocr_handler))
         .route("/v1/stt", post(stt_handler))
         .route("/v1/skills/{skill}", post(skills_run_handler))
+        .route("/v1/knowledge", get(knowledge_handler))
+        .route("/v1/knowledge/receipt", post(knowledge_receipt_handler))
+        .route("/v1/knowledge/decide", post(knowledge_decide_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -6123,6 +6148,279 @@ async fn skills_run_handler(
         json,
     )
         .into_response()
+}
+
+/// P12 collective knowledge & decisions real state (operator+). Returns knowledge objects (each with its *derived* confidence — never a
+/// declared score), collective decisions, verified compute receipts and
+/// compensation balances. Empty structure when the node does not run the P12
+/// runtime (`knowledge: false`), never mock numbers.
+async fn knowledge_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(knowledge) = &state.knowledge else {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "attached": false,
+                "knowledge_objects": [],
+                "decisions": [],
+                "receipts": [],
+                "balances": {},
+                "total_credits": 0,
+                "memory_scope": "",
+                "memory_attached": false,
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
+    let view = knowledge.view();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "attached": true,
+            "knowledge_objects": view.knowledge_objects,
+            "decisions": view.decisions,
+            "receipts": view.receipts,
+            "balances": view.balances,
+            "total_credits": view.total_credits,
+            "memory_scope": view.memory_scope,
+            "memory_attached": view.memory_attached,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// P12 record a verified compute receipt (operator+).
+///
+/// Body: `{ execution_id, worker_node, worker_agent, capability, duration_ms,
+/// verdict: "verified"|"failed", output_hash?, workload_id? }`. The receipt is
+/// registered exactly once per execution id, credits compensation for verified
+/// work using the worker's *measured* contribution profile (set at wiring from
+/// the compute manager — never from this body), and turns the receipt into a
+/// knowledge object that closes the collective loop.
+async fn knowledge_receipt_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(knowledge) = &state.knowledge else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "knowledge runtime not attached (node is not an agent host)"})
+                .to_string(),
+        )
+            .into_response();
+    };
+    use decentraai_agents::{ReceiptVerdict, VerifiedComputeReceipt};
+    let b = body.0;
+    let execution_id = match b.get("execution_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "execution_id is required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let worker_node = match b.get("worker_node").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "worker_node is required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let worker_agent = b
+        .get("worker_agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent")
+        .to_string();
+    let capability = b
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inference")
+        .to_string();
+    let duration_ms = b.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    let verdict = match b.get("verdict").and_then(|v| v.as_str()) {
+        Some("verified") => ReceiptVerdict::Verified,
+        Some("failed") => ReceiptVerdict::Failed,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "verdict must be 'verified' or 'failed'"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let created_at_ms = now_ms();
+    let mut receipt = VerifiedComputeReceipt::new(
+        execution_id,
+        worker_node,
+        worker_agent,
+        capability,
+        duration_ms,
+        verdict,
+        created_at_ms,
+    );
+    if let Some(h) = b.get("output_hash").and_then(|v| v.as_str()) {
+        receipt = receipt.with_output_hash(h);
+    }
+    if let Some(w) = b.get("workload_id").and_then(|v| v.as_str()) {
+        receipt = receipt.with_workload_id(w);
+    }
+    // Compensation uses the worker's measured profile (wired from the compute
+    // manager) — a client must never be able to inflate its own profile.
+    let profile = knowledge
+        .contribution_profile(&receipt.worker_node)
+        .unwrap_or_default();
+    match knowledge.record_receipt(&receipt, &profile) {
+        Ok(credits) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "execution_id": receipt.execution_id,
+                "verdict": format!("{:?}", receipt.verdict),
+                "credits": credits,
+                "knowledge_object": format!("k:receipt:{}", receipt.execution_id),
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+/// P12 run a collective decision over knowledge objects (operator+).
+///
+/// Body: `{ decision_id, summary, initiator_agent?, objects: [object_id, ...],
+/// policy: { required_agents, agreement_threshold, require_schema }? }`. The
+/// decision is registered exactly once and its feedback (adopted only) becomes
+/// a new knowledge object backed by consensus evidence.
+async fn knowledge_decide_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(knowledge) = &state.knowledge else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "knowledge runtime not attached (node is not an agent host)"})
+                .to_string(),
+        )
+            .into_response();
+    };
+    use decentraai_agents::ConsensusPolicy;
+    let b = body.0;
+    let decision_id = match b.get("decision_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "decision_id is required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let summary = b
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("collective decision")
+        .to_string();
+    let initiator_agent = b
+        .get("initiator_agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runtime")
+        .to_string();
+    let object_ids: Vec<String> = b
+        .get("objects")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if object_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "objects (knowledge object ids) are required"}).to_string(),
+        )
+            .into_response();
+    }
+    let mut objects = Vec::new();
+    for id in &object_ids {
+        match knowledge.knowledge_object(id) {
+            Some(o) => objects.push(o),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"error": format!("knowledge object '{id}' not found")})
+                        .to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let policy = {
+        let default = ConsensusPolicy::default();
+        let empty = serde_json::json!({});
+        let p = b.get("policy").unwrap_or(&empty);
+        ConsensusPolicy {
+            required_agents: p
+                .get("required_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(default.required_agents as u64) as u32,
+            agreement_threshold: p
+                .get("agreement_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(default.agreement_threshold as f64) as f32,
+            require_schema: p
+                .get("require_schema")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default.require_schema),
+        }
+    };
+    let created_at_ms = now_ms();
+    match knowledge.decide(
+        &decision_id,
+        &summary,
+        &initiator_agent,
+        &objects,
+        &policy,
+        created_at_ms,
+    ) {
+        Ok(decision) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "decision_id": decision.decision_id,
+                "verdict": format!("{:?}", decision.verdict),
+                "aggregated_confidence": decision.aggregated_confidence,
+                "considered": decision.considered.iter().map(|c| c.object_id.clone()).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// AGENTS real state (Collective Intelligence P1): the node's local logical
@@ -10528,6 +10826,225 @@ mod tests {
         assert_eq!(body["remote_peer_count"], 0);
         assert_eq!(body["total_count"], 0);
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // The /v1/knowledge handler must return a well-formed payload when the P12
+    // runtime is not attached (the Knowledge view shows its empty state).
+    #[tokio::test]
+    async fn knowledge_handler_returns_empty_payload_when_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/v1/knowledge"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["attached"], false);
+        assert_eq!(body["knowledge_objects"].as_array().unwrap().len(), 0);
+        assert_eq!(body["decisions"].as_array().unwrap().len(), 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // P12 closed loop over the real API: post a verified receipt → it credits
+    // the shared compensation ledger and becomes a knowledge object → decide
+    // over it → adopted; the same receipt id never double-credits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn knowledge_receipt_and_decide_roundtrip() {
+        use decentraai_compute::{CompensationLedger, ContributionProfile};
+        use std::sync::Mutex as StdMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager,
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+
+        // Attach a real P12 runtime sharing a compensation ledger.
+        let memory_path = dir.path().join("agent_memory_test.sqlite");
+        let memory = Arc::new(
+            decentraai_distributed::agent_memory::MemoryStore::open(&memory_path).unwrap(),
+        );
+        let compensation = Arc::new(StdMutex::new(CompensationLedger::default()));
+        let runtime = decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
+            compensation.clone(),
+            "peer-local-test",
+            Some(memory),
+        )
+        .unwrap();
+        runtime.set_contribution_profile(
+            "peer-worker-test",
+            ContributionProfile {
+                cpu_cores: 4,
+                ram_mb: 8192,
+                vram_mb: 0,
+                online_seconds: 3600,
+                verified_requests: 10,
+                failed_requests: 1,
+            },
+        );
+        state.attach_knowledge(Arc::new(runtime));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let client = reqwest::Client::new();
+        // 1. Post a verified receipt → credits + knowledge object.
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/receipt"))
+            .json(&serde_json::json!({
+                "execution_id": "e-test-1",
+                "worker_node": "peer-worker-test",
+                "worker_agent": "a:worker",
+                "capability": "inference",
+                "duration_ms": 120,
+                "verdict": "verified",
+                "output_hash": "blake3:abc",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let receipt_body: serde_json::Value = resp.json().await.unwrap();
+        assert!(receipt_body["credits"].as_u64().unwrap() > 0);
+        assert_eq!(receipt_body["knowledge_object"], "k:receipt:e-test-1");
+
+        // 2. The knowledge view shows the object with high confidence.
+        let resp = client
+            .get(format!("http://{api}/v1/knowledge"))
+            .send()
+            .await
+            .unwrap();
+        let view: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(view["attached"], true);
+        assert_eq!(view["knowledge_objects"].as_array().unwrap().len(), 1);
+        let ko = &view["knowledge_objects"][0];
+        assert_eq!(ko["object_id"], "k:receipt:e-test-1");
+        assert!(ko["confidence"].as_f64().unwrap() >= 0.8);
+        assert_eq!(ko["confidence_label"], "high");
+        assert_eq!(
+            view["total_credits"].as_u64().unwrap(),
+            receipt_body["credits"].as_u64().unwrap()
+        );
+
+        // 3. Decide over the receipt's knowledge object → adopted.
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/decide"))
+            .json(&serde_json::json!({
+                "decision_id": "d-test-1",
+                "summary": "the model output is trustworthy",
+                "initiator_agent": "a:coord",
+                "objects": ["k:receipt:e-test-1"],
+                "policy": { "required_agents": 1, "agreement_threshold": 0.5, "require_schema": false },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let decision_body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(decision_body["verdict"], "Adopted");
+
+        // 4. Duplicate receipt id → conflict, no second credit.
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/receipt"))
+            .json(&serde_json::json!({
+                "execution_id": "e-test-1",
+                "worker_node": "peer-worker-test",
+                "worker_agent": "a:worker",
+                "capability": "inference",
+                "duration_ms": 120,
+                "verdict": "verified",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    // A failed receipt must never credit compensation nor claim confidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn knowledge_failed_receipt_never_credits() {
+        use decentraai_compute::{CompensationLedger, ContributionProfile};
+        use std::sync::Mutex as StdMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager,
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let memory_path = dir.path().join("agent_memory_failed.sqlite");
+        let memory = Arc::new(
+            decentraai_distributed::agent_memory::MemoryStore::open(&memory_path).unwrap(),
+        );
+        let compensation = Arc::new(StdMutex::new(CompensationLedger::default()));
+        let runtime = decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
+            compensation.clone(),
+            "peer-local-test",
+            Some(memory),
+        )
+        .unwrap();
+        runtime.set_contribution_profile(
+            "peer-worker-test",
+            ContributionProfile {
+                cpu_cores: 4,
+                ram_mb: 8192,
+                vram_mb: 0,
+                online_seconds: 3600,
+                verified_requests: 10,
+                failed_requests: 1,
+            },
+        );
+        state.attach_knowledge(Arc::new(runtime));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/knowledge/receipt"))
+            .json(&serde_json::json!({
+                "execution_id": "e-fail-1",
+                "worker_node": "peer-worker-test",
+                "worker_agent": "a:worker",
+                "capability": "inference",
+                "duration_ms": 95,
+                "verdict": "failed",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["credits"], 0);
+
+        let resp = client
+            .get(format!("http://{api}/v1/knowledge"))
+            .send()
+            .await
+            .unwrap();
+        let view: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(view["total_credits"], 0);
+        let ko = &view["knowledge_objects"][0];
+        assert!(ko["confidence"].as_f64().unwrap() < 0.3);
+        assert_eq!(ko["confidence_label"], "low");
     }
 
     /// Builds an ApiState with the given TTS manager attached.

@@ -2023,6 +2023,26 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(store) = agent_memory_store.clone() {
             state.attach_memory(store);
         }
+        // P12: collective knowledge & decisions runtime. It shares the
+        // authoritative compensation ledger with the compute manager, so a
+        // verified compute receipt credits the SAME earnings bookkeeping the
+        // Workers view shows. A receipt's credit always uses the worker's
+        // *measured* contribution profile (set via set_contribution_profile;
+        // unknown workers earn 0 — honest by default). Auto-seeding per-worker
+        // profiles from the compute manager's contribution tracker is a
+        // documented follow-up (the runtime is honest without it).
+        if let Some(store) = agent_memory_store.clone() {
+            match decentraai_distributed::knowledge_runtime::KnowledgeRuntime::new(
+                compute_manager.compensation_ledger(),
+                identity.peer_id().to_string(),
+                Some(store),
+            ) {
+                Ok(knowledge_runtime) => {
+                    state.attach_knowledge(Arc::new(knowledge_runtime));
+                }
+                Err(e) => warn!(error = %e, "P12 knowledge runtime failed to attach"),
+            }
+        }
         // Q2: enable consumer API keys (`dca_…`) sharing the authoritative
         // quota ledger with the compute manager, so worker credits and
         // consumer reserve/settle are one ledger.

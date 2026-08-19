@@ -40,8 +40,10 @@ pub mod advertisement;
 pub mod agent;
 pub mod capability;
 pub mod dataset;
+pub mod decision;
 pub mod delegation;
 pub mod economy;
+pub mod knowledge;
 pub mod matcher;
 pub mod memory;
 pub mod message;
@@ -49,6 +51,7 @@ pub mod policy;
 pub mod registry;
 pub mod reputation;
 pub mod retrieval;
+pub mod receipt;
 pub mod selfopt;
 pub mod talent_tree;
 pub mod task;
@@ -67,6 +70,10 @@ pub use dataset::{
     CapabilityBuild, DatasetDescriptor, DatasetError, DatasetKind, SkillDescriptor, SkillRegistry,
     build_agent_capabilities, demo_skill_registry,
 };
+pub use decision::{
+    CollectiveDecision, ConsideredObject, DecisionError, DecisionRegistry, DecisionVerdict,
+    KnowledgeVote, decide_collectively, decision_feedback_entry,
+};
 pub use delegation::{
     DelegationError, DelegationPlan, DelegationPlanner, DelegationResult, DelegationStage,
     DelegationVerdict, StageAssignment, StageResult, execute_plan,
@@ -74,6 +81,11 @@ pub use delegation::{
 pub use economy::{
     BookingRequest, BookingVerdict, CapabilityOffer, EconomyError, EconomyLedger, MAX_OFFERS,
     OfferStatus, negotiate,
+};
+pub use knowledge::{
+    Evidence, EvidenceKind, KnowledgeConfidence, KnowledgeError, KnowledgeObject, KnowledgeRegistry,
+    WEIGHT_CONSENSUS, WEIGHT_DIRECT_OBSERVATION, WEIGHT_REPUTATION, WEIGHT_SYNTHETIC,
+    WEIGHT_VERIFIED_EXECUTION, evidence_confidence,
 };
 pub use matcher::{
     AgentMatchOutcome, AgentMatchReason, AgentRequirement, match_agent, match_agent_semantic,
@@ -86,6 +98,9 @@ pub use message::{
     AgentInbox, AgentMessage, MessageKind, MessageValidationError, validate_message,
 };
 pub use policy::{ExplorationLimit, Permission, PolicyDecision, PolicyEngine, policy_engine};
+pub use receipt::{
+    ReceiptError, ReceiptRegistry, ReceiptVerdict, VerifiedComputeReceipt,
+};
 pub use registry::{AgentRegistry, AgentRegistryError};
 pub use reputation::{
     AgentReputation, DEFAULT_MIN_SAMPLES, FactorScore, ReputationFactor, ReputationStore,

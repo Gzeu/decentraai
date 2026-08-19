@@ -85,6 +85,7 @@ pub mod compute;
 pub mod config;
 pub mod embedding;
 pub mod fallback;
+pub mod knowledge_runtime;
 pub mod p2p_handler;
 pub mod queue;
 pub mod rate_limit;

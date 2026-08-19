@@ -2783,3 +2783,48 @@ loopback HTTP and re-asks with the result injected.
   asserts exactly one tool hit and the final text with the tool result.
 
 Tests: 1073 workspace tests green; clippy `-D warnings` clean.
+
+## 122. P12 — collective knowledge & decisions v1 (DONE)
+
+The first real collective-intelligence loop is wired end-to-end:
+
+```text
+KnowledgeObject → CollectiveDecision → memory feedback →
+VerifiedComputeReceipt → CompensationLedger → evidence → KnowledgeObject
+```
+
+- **Knowledge objects** (`crates/agents/src/knowledge.rs`, pure): a fact with
+  evidence references and a confidence **derived from evidence** — never
+  declared. No evidence → confidence 0.0, no matter who wrote it. Evidence
+  kinds are a closed set (verified execution 0.90, consensus 0.80, direct
+  observation 0.70, reputation 0.25 capped at one term, synthetic 0.20);
+  multiple evidence items combine `1 - ∏(1 - w)`. `KnowledgeRegistry` is
+  deterministic, duplicate ids rejected.
+- **Collective decisions** (`crates/agents/src/decision.rs`, pure): consumes
+  knowledge objects, weights each by its *derived* confidence, and delegates
+  the vote to the existing `evaluate_consensus` (ONE consensus language, P4).
+  `Adopted` / `Rejected` / `Deferred`; the adopted decision's feedback becomes
+  a new knowledge object backed by consensus evidence.
+- **Verified compute receipts** (`crates/agents/src/receipt.rs`, pure): the
+  idempotency-safe trigger for `CompensationLedger::credit` (verified work
+  only, exactly once per execution id) and the evidence half of the loop
+  (a verified receipt becomes a 0.90-confidence knowledge object).
+- **Runtime** (`crates/distributed/src/knowledge_runtime.rs`): binds the pure
+  fabric to a live node — shared compensation ledger with the compute manager
+  (a receipt credits the SAME earnings bookkeeping the Workers view shows),
+  persistent `collective.knowledge` memory scope for feedback, per-worker
+  measured contribution profiles (set at wiring, never client-suppliable —
+  unknown workers earn 0 honestly).
+- **API + dashboard**: `GET /v1/knowledge` (real state: objects + decisions +
+  receipts + balances), `POST /v1/knowledge/receipt`, `POST
+  /v1/knowledge/decide` (operator+); the v2 dashboard gained a Knowledge view
+  that renders derived confidence labels (none/low/medium/high), verdicts and
+  credits — all from `/v1/knowledge`, never mock numbers.
+
+Tests: 1101 workspace tests green (knowledge 8, decision 7, receipt 6,
+knowledge_runtime 5, API roundtrip 3); clippy `-D warnings` clean.
+
+Follow-ups (documented, not blocking): auto-seed per-worker contribution
+profiles from the compute manager's contribution tracker; ACI measurement as a
+separate observability milestone (never a feature); P2P distribution of
+knowledge objects/decisions between nodes.

@@ -228,6 +228,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <div class="nav-group">Fabric</div>
     <button data-view="agents"><span class="ico">◎</span>Agents</button>
     <button data-view="skills"><span class="ico">⚡</span>Skills</button>
+    <button data-view="knowledge"><span class="ico">✦</span>Knowledge</button>
     <button data-view="workers"><span class="ico">▤</span>Workers</button>
     <button data-view="network"><span class="ico">○</span>Network</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
@@ -298,6 +299,18 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
   <div id="advanced" class="advanced" hidden>
     <section class="view" id="view-agents"><div class="card"><h2>Collective Agents <span class="live">● Live</span></h2><div id="agents-grid" class="grid kpis-4"></div><div id="agents-list" class="stack" style="margin-top:12px"></div></div></section>
     <section class="view" id="view-skills"><div class="card"><h2>Skills <span class="live">● Live</span> · P8 Dataset/Skill</h2><div id="skills-kpis" class="grid kpis-4"></div><div class="skill-pipe" id="skill-pipe" style="margin-top:14px"></div><div id="skills-list" class="stack" style="margin-top:14px"></div></div></section>
+   <section class="view" id="view-knowledge">
+     <div class="card"><h2>Collective Knowledge <span class="live">● Live</span> · P12 Evidence Loop</h2>
+       <p class="hint">Confidence is <b>derived from evidence</b>, never declared: no evidence → 0.0, no matter who wrote it. Receipts credit the shared compensation ledger for verified work only.</p>
+       <div id="knowledge-kpis" class="grid kpis-4" style="margin-top:12px"></div>
+     </div>
+     <div class="grid split" style="margin-top:14px">
+       <div class="card"><h2>Knowledge Objects</h2><div id="knowledge-objects" class="stack"></div></div>
+       <div class="card"><h2>Collective Decisions</h2><div id="knowledge-decisions" class="stack"></div></div>
+     </div>
+     <div class="card" style="margin-top:14px"><h2>Verified Compute Receipts</h2><div id="knowledge-receipts" class="stack"></div></div>
+     <div class="card" style="margin-top:14px"><h2>Compensation Balances</h2><div id="knowledge-balances" class="stack"></div></div>
+   </section>
     <section class="view" id="view-workers"><div class="card"><h2>Workers — Distributed Compute Registry <span class="live">● Live</span></h2><div id="workers-detail"></div></div></section>
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
@@ -668,6 +681,7 @@ const loadedAdvanced = new Set();
 async function loadAdvanced(view) {
   if (view==='agents') { renderAgents(); return; }
   if (view==='skills') { renderSkills(); return; }
+  if (view==='knowledge') { renderKnowledge(); return; }
   if (view==='models') return;
   if (loadedAdvanced.has(view) || !advancedEndpoints[view]) return;
   const target = $(view);
@@ -712,6 +726,52 @@ function renderSkills() {
     ];
     $('skill-pipe').innerHTML = pipe.map((p,i) => '<div class="skill-box'+(i===2?' hot':'')+'"><h4>'+p.t+'</h4><div class="val">'+esc(p.v)+'</div></div>'+(i<pipe.length-1?'<span class="skill-arrow">↓</span>':'')).join('');
     $('skills-list').innerHTML = skills.map(s => '<div class="card"><b>'+esc(s.name||s.id)+'</b><div class="hint">status: '+esc(s.status)+' · develops: '+esc((s.develops||[]).join(', '))+'</div></div>').join('') || '<div class="empty">No skills registered.</div>';
+  })();
+}
+function renderKnowledge() {
+  // P12 collective knowledge — fetched live (not part of recurring refresh)
+  (async () => {
+    let d = null;
+    try { d = await (await fetch('/v1/knowledge',{headers:auth()})).json(); } catch (_) { $('knowledge-objects').innerHTML='<div class="empty">Knowledge view needs a valid operator token.</div>'; return; }
+    if (!d || d.attached === false) {
+      $('knowledge-kpis').innerHTML = kpi('Knowledge', '—', 'not attached');
+      $('knowledge-objects').innerHTML = '<div class="empty">The P12 knowledge runtime is not attached on this node.</div>';
+      $('knowledge-decisions').innerHTML = '';
+      $('knowledge-receipts').innerHTML = '';
+      $('knowledge-balances').innerHTML = '';
+      return;
+    }
+    const obs = d.knowledge_objects || [], decs = d.decisions || [], recs = d.receipts || [], bal = d.balances || {};
+    const high = obs.filter(o=>o.confidence_label==='high').length;
+    const adopted = decs.filter(x=>x.verdict==='Adopted').length;
+    $('knowledge-kpis').innerHTML =
+      kpi('Knowledge', obs.length, (d.memory_attached ? 'memory attached' : 'no memory')) +
+      kpi('High Conf.', high, 'evidence-backed') +
+      kpi('Decisions', decs.length, adopted+' adopted') +
+      kpi('Credits', d.total_credits ?? 0, 'compensation ledger');
+    $('knowledge-objects').innerHTML = obs.map(o => {
+      const pct = Math.round((o.confidence||0)*100);
+      const cls = o.confidence_label==='high'?'status':(o.confidence_label==='none'?'status off':'status idle');
+      return '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'+
+        '<b>'+esc(o.fact)+'</b><span class="'+cls+'" style="text-transform:none;letter-spacing:0">'+pct+'% · '+esc(o.confidence_label)+'</span></div>'+
+        '<div class="hint">'+esc(o.object_id)+' · by '+esc(o.author_agent)+' @ '+esc(o.author_node)+
+        (o.capability?' · '+esc(o.capability):'')+'</div>'+
+        (o.evidence_kinds&&o.evidence_kinds.length ? '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:5px">'+o.evidence_kinds.map(k=>'<span class="status idle" style="text-transform:none;letter-spacing:0">'+esc(k)+'</span>').join('')+'</div>' : '<div class="hint" style="margin-top:6px">declaration only — no evidence</div>')+
+        '</div>';
+    }).join('') || '<div class="empty">No knowledge objects yet. Record a verified receipt to seed the loop.</div>';
+    $('knowledge-decisions').innerHTML = decs.map(x => {
+      const st = x.verdict==='Adopted'?'status':(x.verdict==='Rejected'?'status off':'status idle');
+      return '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><b>'+esc(x.summary)+'</b><span class="'+st+'">'+esc(x.verdict)+'</span></div>'+
+        '<div class="hint">'+esc(x.decision_id)+' · confidence '+Math.round((x.aggregated_confidence||0)*100)+'% · over ['+esc((x.considered||[]).join(', '))+']</div></div>';
+    }).join('') || '<div class="empty">No collective decisions yet.</div>';
+    $('knowledge-receipts').innerHTML = recs.map(r => {
+      const st = r.verdict==='Verified'?'status':'status off';
+      return '<div class="row"><b>'+esc(r.execution_id)+'</b><span>'+esc(r.capability)+' · '+r.duration_ms+'ms · <span class="'+st+'">'+esc(r.verdict)+'</span></span></div>';
+    }).join('') || '<div class="empty">No verified compute receipts yet.</div>';
+    const balRows = Object.entries(bal);
+    $('knowledge-balances').innerHTML = balRows.length
+      ? balRows.map(([w,c]) => '<div class="row"><b>'+esc(w)+'</b><span>'+c+' credits</span></div>').join('')
+      : '<div class="empty">No compensation balances yet (verified work only).</div>';
   })();
 }
 function renderProviders() {

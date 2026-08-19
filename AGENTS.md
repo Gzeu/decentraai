@@ -297,6 +297,20 @@ plus the runtime half in `decentraai-distributed`:
   Increase/Decrease/Rebalance under hard/soft constraints).
 - **P11 — economy**: `CapabilityOffer`/`BookingRequest`/`negotiate`/
   `EconomyLedger` — non-monetary, modular.
+- **P12 — collective knowledge & decisions v1 (DONE)**: the closed evidence
+  loop `KnowledgeObject → CollectiveDecision → memory feedback →
+  VerifiedComputeReceipt → CompensationLedger → evidence → KnowledgeObject`.
+  `crates/agents` holds the pure fabric (`knowledge.rs`, `decision.rs`,
+  `receipt.rs`): knowledge confidence is **derived from evidence, never
+  declared** (no evidence → 0.0); decisions delegate the vote to the single
+  `evaluate_consensus` language; receipts are idempotent per execution id and
+  credit compensation for verified work only. `crates/distributed` holds
+  `knowledge_runtime.rs`, which shares the authoritative compensation ledger
+  with the compute manager, persists feedback into the `collective.knowledge`
+  memory scope, and seeds per-worker contribution profiles at wiring (never
+  from an HTTP body — unknown workers earn 0 honestly). API: `GET
+  /v1/knowledge` + `POST /v1/knowledge/receipt` + `POST
+  /v1/knowledge/decide` (operator+); the dashboard has a Knowledge view.
 
 **Runtime half (`decentraai-distributed`)**:
 - `AgentOrchestrator`: binds the pure fabric to the live P2P channel —
