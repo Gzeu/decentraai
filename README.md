@@ -402,6 +402,32 @@ Every installation hosts **logical agents** — not separate processes:
 
 See [`docs/COLLECTIVE_INTELLIGENCE.md`](docs/COLLECTIVE_INTELLIGENCE.md) for the full fabric specification.
 
+## 🌐 Model Fabric (P1–P10)
+
+A control plane for **cloud/API providers** (OpenRouter, OpenAI, Groq,
+Together, Fireworks) that behaves like a first-class model source alongside
+the local registry and the P2P fabric:
+
+- **Provider CRUD + credential store**: API keys live **only** in an
+  in-memory credential store; the persisted record carries a key reference,
+  never the secret. Admin routes are master-gated, every mutation is audited.
+- **Symbolic hashes + wire handles**: a connected model is addressed as
+  `prov-{24-hex}`, `provider:{id}:{model}`, or its raw upstream name.
+- **Health + circuit breaker**: provider/model health, latency, and circuit
+  states gate reachability; only cryptographic failures ever punish peers.
+- **Sharing policy**: default **OFF** — a model is private until the
+  operator explicitly enables sharing for it.
+- **Cost-aware `auto` routing**: `best_provider_model()` picks the best
+  enabled provider model (health → cost → deterministic tie-break) when
+  `model=auto` and no fabric/local model is runnable — local/fabric stays
+  first, the provider is the fallback tier.
+- **Agent Model Powers**: agents can pin a provider model per task; a
+  provider model always executes through the local proxy (never the fabric
+  routing path).
+
+Secrets stay local, prompts/outputs are never audit material, and the
+provider plane never occupies a local engine slot.
+
 ---
 
 ## 📊 Quality Gates
@@ -416,7 +442,7 @@ cargo test --workspace
 ```
 
 **Current status:**
-- ✅ **958 tests**, all green
+- ✅ **1018 tests**, all green
 - ✅ Clippy: zero warnings
 - ✅ fmt: all files formatted
 - ✅ E2E: real libp2p nodes on loopback (<20s total)
@@ -441,6 +467,7 @@ decentraai/
 │   ├── manifest/              # GGUF manifests + Merkle root
 │   ├── node-cli/              # The `decentraai` binary (CLI entry point)
 │   ├── p2p/                   # libp2p transport + reputation + scheduler
+│   ├── providers/             # Model Fabric — provider control plane (pure)
 │   ├── protocol/              # Message schemas + canonical signing
 │   ├── registry/              # Local model registry with path safety
 │   ├── runtime/               # llama-server manager + dashboard + API

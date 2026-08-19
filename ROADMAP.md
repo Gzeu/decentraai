@@ -2514,3 +2514,88 @@ docs were retrieved (`retrieved_docs`).
 
 Wiring: EmbeddingClient + RetrievalManager are created once and shared by the
 inference executor (retrieval tool) and the API (/v1/embeddings, /v1/rag).
+
+## 112. Model Fabric — provider control plane, P1–P3 (DONE, `crates/providers`)
+
+Commit `249c55a`. New workspace crate `decentraai-providers` (pure domain,
+no I/O) + `decentraai-inference-adapter` reuse:
+
+- **P1 — provider domain**: `Provider` (kind, base_url, credential_ref,
+  health, circuit), `ConnectedModel` (upstream_model, symbolic hash,
+  display_name, capabilities, context_window, pricing, budget, health,
+  circuit, usage, sharing policy default **OFF**), `ProviderKind`
+  (OpenRouter/OpenAi/Groq/Together/Fireworks), `ProviderSummary`
+  (masked credential fingerprint — never the secret or its key id).
+- **P2 — credential store**: `CredentialStore` is **in-memory only**; the
+  persisted record carries only a key reference (`dcrypt_{hex}`), never the
+  raw secret. Tested: the secret does not appear in `db/providers.json`.
+- **P3 — symbolic hash + wire handles**: `prov-` + SHA-256(provider_id +
+  upstream_model) (24 hex chars, total 29). `ModelHandle` wire form
+  `provider:{provider_id}:{model_id}`; raw upstream names are matched as
+  well. Canonical signing stays anchored in the manifest; providers carry
+  **no** signatures by design.
+
+## 113. Model Fabric — health, circuit breaker, manager, adapter (DONE)
+
+Commits `265230d`, `58ab406`, `5d3e151`. `ProviderHealth`/`ModelHealth`
+(Unknown/Healthy/Degraded/Offline/Disabled), `CircuitState`
+(Healthy/Degraded/Open/HalfOpen), `Pricing` (input/output per 1M +
+provenance), `ModelBudget`, `ModelUsage`. `ProviderManager` owns CRUD,
+persistence (tmp+sync+rename), catalog (local + fabric + provider views),
+health probes (provider-level, model-level, latency), and the credential
+store. `ModelAdapter` wraps the backend-neutral `OpenAiCompatibleBackend`
+for complete/stream/health with error classification.
+
+## 114. Model Fabric — provider plane wired into the node (DONE, commit `33fa52d`)
+
+`ApiState.providers: Option<Arc<tokio::sync::Mutex<ProviderManager>>>` +
+`attach_providers()`; admin routes (master-gated) in `providers_api.rs`:
+`POST /api/admin/providers`, `POST /api/admin/providers/{id}/test`,
+`POST /api/admin/providers/{id}/discover`, `POST /api/admin/providers/{id}/models`,
+`DELETE /api/admin/providers/{id}/models/{model_id}`,
+`POST /api/admin/providers/{id}/models/{model_id}/enable`,
+`POST /api/admin/providers/{id}/models/{model_id}/sharing`,
+`DELETE /api/admin/providers/{id}`; `GET /v1/providers` (operator_or_admin)
+returns `{ providers: [{ summary, models }] }`. Audit events:
+`provider_created`, `provider_tested`, `model_connected`, `model_deleted`,
+`model_enabled`, `sharing_updated`, `provider_deleted`.
+
+Provider-backed chat routing (`resolve_provider_model`): a request for a
+provider model (symbolic hash, handle, or upstream name) is served directly
+by the adapter — no local engine slot, no fabric worker. Buffered + SSE
+streamed, OpenAI-compatible. **Security invariant**: secrets stay in the
+in-memory credential store only; the API key never lands in code, logs,
+commits, or docs.
+
+## 115. Model Fabric — dashboard Providers view (DONE, commit `956ed85`)
+
+Dashboard v2 gains a `Providers` view (nav button ◈): live provider cards
+(kind, base_url, masked fingerprint, circuit, latency, failure count, shared
+count, connected models ENABLED/DISABLED/shared + symbolic hash + latency)
+plus a master-gated "Add provider" form. Data comes from the real
+`/v1/providers` payload; watching the page never touches the backend.
+
+## 116. Model Fabric — cost-aware auto routing + agent model powers (DONE, commits `f034afb`, `dfcc9e3`, `3fd622c`)
+
+**P7 — cost-aware auto selection**: `best_provider_model()` (pure decision)
+picks the best enabled provider model for `auto`/`__auto__`: provider+model
+enabled, neither circuit-OPEN, health rank (Healthy > Degraded > Unknown >
+Offline), cheaper total cost wins when both report pricing, deterministic
+tie-break (provider_id asc, model_id asc). `resolve_provider_model` handles
+`auto`; fabric routing keeps priority for `auto` — the provider is the
+fallback only when no fabric/local model is runnable (or when the fabric
+plane is absent entirely). Explicit provider handles still win
+unconditionally before fabric routing.
+
+**P9 — Agent Model Powers**: an agent may pin a provider model for a task
+by naming its symbolic hash, provider handle, or raw upstream name.
+`is_provider_model_ref()` detects provider refs; `InferenceAgentExecutor`
+bails with a clear error when a task requests a provider model but the node
+has no local backend (provider models require the local OpenAI-compatible
+proxy — the fabric `route_request` path has no provider knowledge).
+
+**P10 — end-to-end test**: `resolve_provider_model` with `model=auto`
+serves the connected provider model over a loopback OpenAI-compatible mock,
+pinning the resolver→adapter wiring.
+
+Tests: 1018 workspace tests green; clippy `-D warnings` clean; fmt clean.
