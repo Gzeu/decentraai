@@ -2639,6 +2639,18 @@ are never overridden by scores). All pure; the planner still emits only
 SingleWorker/BatchFanOut and no code path consults TrustTier today.
 
 Tests: 1034 workspace tests green; clippy `-D warnings` clean; fmt clean.
+
+**P1 follow-up — spec §2–§3 (`750cd6b`)**: `EngineCapabilities` extended with the
+§2.1 flags (`continuous_batching`, `speculative_decoding`, `kv_offload`,
+`prefix_cache`, `pipeline_parallel`, all serde-defaulted) + vLLM/SGLang probe
+baselines; `StrategyKind::required_capabilities()`/`meets_capabilities()`;
+`PerformanceProfile` (§2.2, all-optional metrics, missing = UNKNOWN,
+`measured_count()`/`has_core_evidence()`); `base_score()` + `NormalizedMetrics`
++ `ScoringWeights` (§3.1, spec's base formula with latency/throughput presets).
+All pure — the planner still emits only SingleWorker/BatchFanOut and no code
+path consults the new primitives yet.
+
+Tests: 1042 workspace tests green; clippy `-D warnings` clean; fmt clean.
 Remaining research phases (P2 NetworkFacts, P3 speculative, P4 prefill/decode,
 P5 cache-aware, P6 collaborative/RPC) stay **experimental** — they require live
 LAN measurements (Laptop ↔ Desktop) before the planner may select them.
