@@ -446,8 +446,8 @@ function renderStatus(s) {
     return '<div class="row"><b>'+esc(t)+'</b><span>'+esc(e.event)+(e.details?.node_name?' · '+esc(e.details.node_name):'')+'</span></div>';
   }).join('') : '<div class="empty">No recent security/ops events.</div>';
 
-  // Local tools — TTS/OCR/STT subprocess state from /status
-  const tts = s.tts || {}, ocr = s.ocr || {}, stt = s.stt || {};
+  // Local tools — TTS/OCR/STT/skills subprocess state from /status
+  const tts = s.tts || {}, ocr = s.ocr || {}, stt = s.stt || {}, skills = s.skills || {};
   const toolRow = (name, en, healthy, extra) => {
     const stateCls = en ? (healthy ? '' : ' idle') : ' idle';
     const stateTxt = en ? (healthy ? 'ONLINE' : 'STARTING') : 'OFF';
@@ -456,7 +456,8 @@ function renderStatus(s) {
   $('tools-card').innerHTML =
     toolRow('TTS', !!tts.enabled, !!tts.healthy, tts.voice || '') +
     toolRow('OCR', !!ocr.enabled, !!ocr.healthy, 'RapidOCR') +
-    toolRow('STT', !!stt.enabled, !!stt.healthy, stt.model || '');
+    toolRow('STT', !!stt.enabled, !!stt.healthy, stt.model || '') +
+    toolRow('HF Skills', !!skills.enabled, !!skills.healthy, (skills.list || []).join(', ') || '');
 
   renderTrust();
 

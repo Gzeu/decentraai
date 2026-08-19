@@ -49,8 +49,11 @@ Current state: ROADMAP.md is fully done (M0–M8). The next roadmap
   `/v1/peers` — so watching the page cannot reset the idle clock).
   `tools.rs` is the Tool Runtime: generic `ToolServer` subprocess lifecycle
   (embedded Python server → ephemeral loopback port → health probe →
-  authenticated `/v1/<tool>` proxy) shared by OCR (`/v1/ocr`, RapidOCR) and
-  STT (`/v1/stt`, faster-whisper). Missing venv/models never fails startup —
+  authenticated `/v1/<tool>` proxy) shared by OCR (`/v1/ocr`, RapidOCR),
+  STT (`/v1/stt`, faster-whisper) and HF skills (`/v1/skills/<id>`, small
+  transformers pipelines: sentiment/NER/summarize/translate ro↔en — the
+  per-skill `runtime_evidence` flag in the Skills view is true only when this
+  node actually executes the skill). Missing venv/models never fails startup —
   the node serves without the tool and logs a warning.
 - `crates/audit` — append-only JSON-lines security log
   (`logs/audit.jsonl`): peer bans, chunk verification failures,

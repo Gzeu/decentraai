@@ -45,6 +45,11 @@ pub struct NodeConfig {
     /// `/v1/stt` returns 404. Enabling requires `<data_dir>/tools/stt/venv`.
     #[serde(default)]
     pub stt: Option<SttSection>,
+    /// Local HF skills (small transformers pipelines subprocess). Absent =
+    /// skills are disabled; `/v1/skills/<id>` returns 404. Enabling requires
+    /// `<data_dir>/tools/skills/venv`.
+    #[serde(default)]
+    pub skills: Option<SkillsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,6 +418,43 @@ impl Default for SttSection {
     }
 }
 
+/// Local HF skills (small transformers pipelines — sentiment, NER, summarize,
+/// translate ro↔en). One Python subprocess hosts all enabled pipelines,
+/// exposed as `/v1/skills/<id>`. Models download on first use into
+/// `<data_dir>/tools/skills/models`. Absent section = skills off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsSection {
+    /// Enable the skills subprocess at node start. If true but the venv is
+    /// missing, the node logs a warning and serves without skills instead of
+    /// failing startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Skill ids to run: `sentiment`, `ner`, `summarize`, `translate_ro_en`,
+    /// `translate_en_ro`. Unknown ids are rejected at config time.
+    #[serde(default = "default_skills")]
+    pub list: Vec<String>,
+}
+
+fn default_skills() -> Vec<String> {
+    vec![
+        "sentiment".to_string(),
+        "ner".to_string(),
+        "summarize".to_string(),
+        "translate_ro_en".to_string(),
+        "translate_en_ro".to_string(),
+    ]
+}
+
+impl Default for SkillsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            list: default_skills(),
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -481,6 +523,25 @@ impl NodeConfig {
                 "subscription tiers require inference.api_auth_required: true (otherwise tier model allowlists and rate limits are silently disabled)"
                     .into(),
             ));
+        }
+        // HF skills: unknown ids are a config typo, never a silent no-op.
+        if let Some(skills) = &self.skills {
+            if skills.enabled {
+                const KNOWN_SKILLS: [&str; 5] = [
+                    "sentiment",
+                    "ner",
+                    "summarize",
+                    "translate_ro_en",
+                    "translate_en_ro",
+                ];
+                for id in &skills.list {
+                    if !KNOWN_SKILLS.contains(&id.as_str()) {
+                        return Err(ConfigError::Validation(format!(
+                            "skills.list contains unknown skill '{id}' (known: {KNOWN_SKILLS:?})"
+                        )));
+                    }
+                }
+            }
         }
         if self.inference.allow_remote_inference && !self.network.private_swarm {
             return Err(ConfigError::Validation(
@@ -724,6 +785,36 @@ mod tests {
         let bad = format!("{raw}\nstt:\n  enabled: true\n  modle: \"base\"\n");
         std::fs::write(file.path(), bad).unwrap();
         assert!(NodeConfig::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn skills_section_parses_and_unknown_skill_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let with_skills = format!(
+            "{raw}\nskills:\n  enabled: true\n  list: [\"sentiment\", \"ner\"]\n"
+        );
+        std::fs::write(file.path(), with_skills).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let skills = config.skills.expect("skills section parsed");
+        assert!(skills.enabled);
+        assert_eq!(skills.list, vec!["sentiment", "ner"]);
+
+        // An unknown skill id is a typo — must be rejected, never a no-op.
+        let bad = format!("{raw}\nskills:\n  enabled: true\n  list: [\"magic\"]\n");
+        std::fs::write(file.path(), bad).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown skill"),
+            "unknown skill must be rejected, got: {err}"
+        );
+
+        // Disabled skills may carry an unknown id without failing (they never run).
+        let off = format!("{raw}\nskills:\n  enabled: false\n  list: [\"magic\"]\n");
+        std::fs::write(file.path(), off).unwrap();
+        assert!(NodeConfig::load(file.path()).is_ok());
     }
 
     #[test]

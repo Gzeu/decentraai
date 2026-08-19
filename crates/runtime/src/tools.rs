@@ -284,6 +284,91 @@ impl SttManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HF Skills (small transformers pipelines — sentiment, NER, summarize, translate)
+// ---------------------------------------------------------------------------
+
+const HF_SKILL_SERVER_PY: &str = include_str!("hf_skill_server.py");
+
+/// The running HF-skills subprocess. One server hosts all enabled skills
+/// (pipelines load lazily on first call). `None` = disabled.
+pub struct HfSkillsServer {
+    server: ToolServer,
+    skills: Vec<String>,
+}
+
+impl HfSkillsServer {
+    /// Spawns and waits for `/health`. Loads no pipeline until a skill is
+    /// called, so startup stays fast even with several skills enabled.
+    pub async fn spawn(data_dir: &Path, skills: &[String]) -> Result<Self> {
+        let dir = data_dir.join("tools").join("skills");
+        let venv_python = dir.join("venv").join("bin").join("python");
+        let args = vec!["--skills".to_string(), skills.join(",")];
+        let server = ToolServer::start(
+            &dir,
+            &venv_python,
+            HF_SKILL_SERVER_PY,
+            &args,
+            "scripts/setup-skills.sh",
+        )?;
+        let port = server.port();
+        if let Err(e) = wait_until_ready("127.0.0.1", port, Duration::from_secs(120)).await {
+            let _ = server.stop().await;
+            return Err(e.context("HF skills server did not become ready"));
+        }
+        Ok(Self {
+            server,
+            skills: skills.to_vec(),
+        })
+    }
+
+    pub fn base_url(&self) -> String {
+        self.server.base_url()
+    }
+
+    pub fn skills(&self) -> &[String] {
+        &self.skills
+    }
+}
+
+/// Holds the HF-skills subprocess. `None` server = skills disabled.
+pub struct HfSkillsManager {
+    server: Option<HfSkillsServer>,
+}
+
+impl HfSkillsManager {
+    pub fn new(server: Option<HfSkillsServer>) -> Self {
+        Self { server }
+    }
+
+    pub fn disabled() -> Self {
+        Self { server: None }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.base_url())
+    }
+
+    /// Skills this node actually runs (empty when disabled).
+    pub fn skills(&self) -> Vec<String> {
+        self.server
+            .as_ref()
+            .map(|s| s.skills().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Health probe for the dashboard /status endpoint.
+    pub fn healthy(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|_| super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port()).is_ok())
+            .unwrap_or(false)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

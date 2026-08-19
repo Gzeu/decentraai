@@ -1918,6 +1918,25 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 }
             }
         }
+        // HF skills: small transformers pipelines subprocess for
+        // `/v1/skills/<id>`. Enabled only when `skills.enabled` is set AND the
+        // venv exists; missing setup logs a warning and serves without skills
+        // rather than failing startup. Pipelines load lazily on first call.
+        if let Some(skills_cfg) = config.skills.clone() {
+            if skills_cfg.enabled {
+                match decentraai_runtime::tools::HfSkillsServer::spawn(&data_dir, &skills_cfg.list).await {
+                    Ok(server) => {
+                        info!(skills = ?skills_cfg.list, "HF skills online (transformers subprocess)");
+                        state.attach_skills_tool(Arc::new(
+                            decentraai_runtime::tools::HfSkillsManager::new(Some(server)),
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "HF skills unavailable (run scripts/setup-skills.sh)");
+                    }
+                }
+            }
+        }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());
         // P3.5/P9: the API can trigger collective workflows by delegating to

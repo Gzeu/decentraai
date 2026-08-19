@@ -132,3 +132,7 @@ tiers:
 # stt:                    # speech-to-text — faster-whisper
 #   enabled: true
 #   model: "base"         # tiny | base | small | medium | large-v3
+#
+# skills:                 # local HF skills — small transformers pipelines
+#   enabled: true
+#   list: ["sentiment", "ner", "summarize", "translate_ro_en", "translate_en_ro"]

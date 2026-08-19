@@ -2728,3 +2728,29 @@ fails startup — the node serves without the tool and logs a warning.
 Tests: 1061 workspace tests green (was 1056); clippy `-D warnings` clean.
 New tests: config parse + deny-unknown-fields for both sections, status
 defaults, TTS handler untouched.
+
+## 120. Tool Runtime — HF Skills (transformers pipelines, DONE)
+
+Small CPU-friendly HuggingFace pipelines as local tools, same never-FFI
+subprocess pattern: one embedded Python server (`hf_skill_server.py`) hosts
+all enabled skills, pipelines load lazily on first call, proxied through the
+authenticated `/v1/skills/<id>` endpoint.
+
+- **Skills**: `sentiment` (distilbert SST-2), `ner` (dslim/bert-base-NER),
+  `summarize` (sshleifer/distilbart-cnn-12-6), `translate_ro_en` and
+  `translate_en_ro` (Helsinki-NLP opus-mt). Models download on first use into
+  `<data_dir>/tools/skills/models` via HF_HOME (setup script
+  `scripts/setup-skills.sh`).
+- **Config**: `[skills]` section (off by default, `deny_unknown_fields`); an
+  unknown skill id in `skills.list` is a config-time error when enabled — a
+  typo can never silently no-op. Disabled sections may keep unknown ids.
+- **runtime_evidence (P8)**: the Skills view now reports per-skill
+  `runtime_evidence: true` only when this node actually executes that skill
+  id (the HF-skills subprocess runs it); the top-level flag flips when any
+  skill runs. Declarations alone never count as evidence.
+- **Status**: `/status` reports `skills.enabled/healthy/list`; the dashboard
+  Tools card shows the HF Skills row.
+
+Tests: 1063 workspace tests green; clippy `-D warnings` clean. New tests:
+config parse + unknown-skill rejection, status defaults, `/v1/skills/<id>`
+404 when disabled.

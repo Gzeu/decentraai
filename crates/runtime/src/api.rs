@@ -326,6 +326,9 @@ pub struct ApiState {
     ocr: Arc<crate::tools::OcrManager>,
     /// Local STT (faster-whisper subprocess). `/v1/stt` when enabled.
     stt: Arc<crate::tools::SttManager>,
+    /// Local HF skills (transformers pipelines subprocess). `/v1/skills/<id>`
+    /// when enabled; drives the P8 `runtime_evidence` flag on the Skills view.
+    skills_tool: Arc<crate::tools::HfSkillsManager>,
 }
 
 impl ApiState {
@@ -382,6 +385,7 @@ impl ApiState {
             tts: Arc::new(TtsManager::disabled()),
             ocr: Arc::new(crate::tools::OcrManager::disabled()),
             stt: Arc::new(crate::tools::SttManager::disabled()),
+            skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
         }
     }
 
@@ -415,6 +419,11 @@ impl ApiState {
     /// Attaches the STT tool runtime (subprocess). Disabled by default.
     pub fn attach_stt(&mut self, stt: Arc<crate::tools::SttManager>) {
         self.stt = stt;
+    }
+
+    /// Attaches the HF-skills tool runtime (subprocess). Disabled by default.
+    pub fn attach_skills_tool(&mut self, skills: Arc<crate::tools::HfSkillsManager>) {
+        self.skills_tool = skills;
     }
 
     /// Attaches the collective-intelligence agent manager (P1) so the
@@ -4635,6 +4644,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
         .route("/v1/stt", post(stt_handler))
+        .route("/v1/skills/{skill}", post(skills_run_handler))
         .route("/v1/sessions", get(sessions_handler))
         .route("/v1/fabric", get(fabric_graph_handler))
         .route("/v1/stats", get(stats_handler))
@@ -4906,6 +4916,11 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "enabled": state.stt.enabled(),
             "healthy": state.stt.healthy(),
             "model": state.stt.model,
+        },
+        "skills": {
+            "enabled": state.skills_tool.enabled(),
+            "healthy": state.skills_tool.healthy(),
+            "list": state.skills_tool.skills(),
         },
         "tiers": state.tiers.as_ref().map(|tiers| serde_json::json!({
             "tier1": {
@@ -6015,6 +6030,101 @@ async fn stt_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
         .into_response()
 }
 
+/// POST /v1/skills/<id> — run a local HF skill (transformers pipeline proxy).
+///
+/// Body: `{"text": "..."}`. Prompts/outputs are never logged. 404 when the
+/// skill is not enabled on this node.
+async fn skills_run_handler(
+    State(state): State<ApiState>,
+    AxumPath(skill): AxumPath<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    if !state.skills_tool.enabled() || !state.skills_tool.skills().iter().any(|s| s == &skill) {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"message": format!("skill '{skill}' is not enabled on this node")}})
+                .to_string(),
+        )
+            .into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": "invalid JSON body"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let text = payload
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim())
+        .unwrap_or_default();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "text is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    if text.chars().count() > 32_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "text exceeds 32000 chars"}}).to_string(),
+        )
+            .into_response();
+    }
+    let Some(base) = state.skills_tool.base_url() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let forwarded = serde_json::json!({ "text": text });
+    let request = match state
+        .client
+        .post(format!("{base}/v1/skills/{skill}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(forwarded.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "skills backend unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "skills backend unreachable"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let status = request.status();
+    if status != StatusCode::OK {
+        return (status, request.text().await.unwrap_or_default()).into_response();
+    }
+    let json = match request.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "skills backend read failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+        .into_response()
+}
+
 /// AGENTS real state (Collective Intelligence P1): the node's local logical
 /// agents plus every remote agent discovered through signed agent
 /// advertisements. Empty structure when no agent manager is attached.
@@ -6244,6 +6354,13 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
                 Vec::new()
             };
             let status = if applicable { "available" } else { "blocked" };
+            // A skill's P8 declaration becomes runtime evidence only when this
+            // node actually executes it (the HF-skills subprocess runs the id).
+            let runtime_evidence = state
+                .skills_tool
+                .skills()
+                .iter()
+                .any(|enabled| enabled == &s.id);
             serde_json::json!({
                 "id": s.id,
                 "name": s.name,
@@ -6254,6 +6371,7 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
                 "develops": s.develops.iter().map(|k| k.label()).collect::<Vec<_>>(),
                 "unlocked": unlocked,
                 "status": status,
+                "runtime_evidence": runtime_evidence,
             })
         })
         .collect();
@@ -6302,7 +6420,10 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
             "skill_id": "code-agent",
             "unlocked": demo_unlocked,
         },
-        "runtime_evidence": false,
+        // True only when this node executes at least one skill id at runtime
+        // (the HF-skills subprocess is enabled) — declarations alone never
+        // count as evidence.
+        "runtime_evidence": !state.skills_tool.skills().is_empty(),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -10506,6 +10627,24 @@ mod tests {
         assert_eq!(body["ocr"]["healthy"], false);
         assert_eq!(body["stt"]["enabled"], false);
         assert_eq!(body["stt"]["healthy"], false);
+        assert_eq!(body["skills"]["enabled"], false);
+        assert_eq!(body["skills"]["list"].as_array().unwrap().len(), 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skills_run_handler_returns_404_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/skills/sentiment"))
+            .json(&serde_json::json!({"text": "this is great"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
         manager.lock().await.shutdown().await.unwrap();
     }
 
