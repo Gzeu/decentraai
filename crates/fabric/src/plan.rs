@@ -133,6 +133,135 @@ impl PlanCost {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Execution strategy (P1 — ExecutionStrategy foundation)
+// ---------------------------------------------------------------------------
+
+/// The *kind* of execution a logical request uses. `SingleWorker` and
+/// `BatchFanOut` are the strategies the planner produces today; the rest are
+/// gated experimental strategies from the research roadmap (see
+/// `docs/research/EXECUTION-STRATEGY-ROADMAP.md`) and are **never** emitted by
+/// the planner until an engine advertises the capability AND real measurements
+/// prove net benefit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyKind {
+    /// One worker runs the entire request end-to-end (the default).
+    SingleWorker,
+    /// Multiple workers each run independent requests from a batch.
+    BatchFanOut,
+    /// Weak worker drafts, strong worker verifies (gated experimental).
+    SpeculativeDraftVerify,
+    /// One worker does prefill, another decode (gated experimental).
+    DisaggregatedPrefillDecode,
+    /// Route/migrate based on KV/cache state (gated experimental).
+    CacheAwareRoute,
+    /// Tensor/pipeline-parallel model execution across workers (gated
+    /// experimental; llama.cpp RPC / vLLM TP/PP backends).
+    CollaborativeModel,
+}
+
+impl StrategyKind {
+    /// Whether the strategy is gated behind an experimental flag. The planner
+    /// never selects experimental strategies without explicit opt-in + evidence.
+    pub fn is_experimental(&self) -> bool {
+        matches!(
+            self,
+            Self::SpeculativeDraftVerify
+                | Self::DisaggregatedPrefillDecode
+                | Self::CacheAwareRoute
+                | Self::CollaborativeModel
+        )
+    }
+}
+
+/// Evidence provenance of an execution-strategy decision, following the
+/// research roadmap rule: no fabricated measurements — missing data is
+/// `UNKNOWN`, and experimental strategies are opt-in and clearly labelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EvidenceProvenance {
+    /// Directly observed metrics (tokens/s, latency, RTT, throughput).
+    Measured,
+    /// Derived from conservative estimators (transfer cost, dry-run).
+    Estimated,
+    /// Logical conclusions from architecture and configuration.
+    Inferred,
+    /// Gated strategies under measurement.
+    Experimental,
+    /// Missing data — never fabricated.
+    Unknown,
+}
+
+/// Why a strategy was selected over the alternatives (audit/observability).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyRationale {
+    /// Human-readable explanation of the choice.
+    pub reason: String,
+    /// Strategies considered and rejected, with the rejection reason.
+    pub rejected: Vec<RejectedStrategy>,
+}
+
+/// A strategy that was considered but not chosen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RejectedStrategy {
+    pub kind: StrategyKind,
+    pub reason: String,
+}
+
+/// One concrete execution strategy for a request. The planner attaches this to
+/// its plan so every decision carries *how* the request runs and *why*, with an
+/// honest provenance flag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStrategy {
+    pub kind: StrategyKind,
+    pub rationale: StrategyRationale,
+    pub provenance: EvidenceProvenance,
+}
+
+impl ExecutionStrategy {
+    /// The default, always-producible strategy: one worker runs everything.
+    /// The planner emits this unless it can justify something else.
+    pub fn single_worker(reason: impl Into<String>) -> Self {
+        Self {
+            kind: StrategyKind::SingleWorker,
+            rationale: StrategyRationale {
+                reason: reason.into(),
+                rejected: Vec::new(),
+            },
+            provenance: EvidenceProvenance::Inferred,
+        }
+    }
+
+    /// Whether this strategy requires multi-worker collaboration.
+    pub fn is_multi_worker(&self) -> bool {
+        !matches!(self.kind, StrategyKind::SingleWorker)
+    }
+}
+
+impl Default for ExecutionStrategy {
+    /// Conservative default so persisted decisions without a strategy field
+    /// (pre-P1) deserialize cleanly. Never claims anything beyond the baseline.
+    fn default() -> Self {
+        Self::single_worker("default (pre-P1 decision)")
+    }
+}
+
+/// Whether a worker can run a request alone (`can_run`) and whether it can
+/// safely participate in a multi-worker strategy (`can_collaborate`).
+///
+/// `can_run` reuses the existing eligibility projection (trusted + healthy +
+/// serves the model). `can_collaborate` is deliberately conservative: it only
+/// returns `true` for `BatchFanOut` today, because no engine DecentraAI runs
+/// advertises speculative / disaggregated / collaborative-model capabilities —
+/// claiming collaboration for a strategy the fabric cannot execute would be a
+/// lie (see the P1 implementation note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanRunReport {
+    pub can_run: bool,
+    pub can_collaborate: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +300,57 @@ mod tests {
         let j = serde_json::to_string(&p).unwrap();
         let back: ExecutionPlan = serde_json::from_str(&j).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn strategy_kinds_round_trip_and_experimental_flags() {
+        for (kind, experimental) in [
+            (StrategyKind::SingleWorker, false),
+            (StrategyKind::BatchFanOut, false),
+            (StrategyKind::SpeculativeDraftVerify, true),
+            (StrategyKind::DisaggregatedPrefillDecode, true),
+            (StrategyKind::CacheAwareRoute, true),
+            (StrategyKind::CollaborativeModel, true),
+        ] {
+            assert_eq!(kind.is_experimental(), experimental, "{kind:?}");
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: StrategyKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn execution_strategy_defaults_to_single_worker() {
+        let s = ExecutionStrategy::single_worker("baseline");
+        assert_eq!(s.kind, StrategyKind::SingleWorker);
+        assert_eq!(s.provenance, EvidenceProvenance::Inferred);
+        assert!(!s.is_multi_worker());
+        assert_eq!(s.rationale.reason, "baseline");
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ExecutionStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn provenance_serde_uses_screaming_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EvidenceProvenance::Measured).unwrap(),
+            "\"MEASURED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvidenceProvenance::Unknown).unwrap(),
+            "\"UNKNOWN\""
+        );
+    }
+
+    #[test]
+    fn can_run_report_round_trips() {
+        let r = CanRunReport {
+            can_run: true,
+            can_collaborate: false,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: CanRunReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
     }
 }

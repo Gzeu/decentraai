@@ -55,7 +55,10 @@ pub use network::{
     LinkMetrics, Locality, NetworkGraph, estimated_transfer_ms, prior_bandwidth_mbps,
     transfer_ms_per_mib,
 };
-pub use plan::{ExecutionPlan, ExecutionStage, PlanCost, PlanKind};
+pub use plan::{
+    CanRunReport, EvidenceProvenance, ExecutionPlan, ExecutionStage, ExecutionStrategy, PlanCost,
+    PlanKind, RejectedStrategy, StrategyKind, StrategyRationale,
+};
 pub use planner::{
     CandidateScore, ExecutionPlanner, PlanResult, PlannerConfig, PlannerRationale, RequestFacts,
     WorkerFacts,

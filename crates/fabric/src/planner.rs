@@ -19,7 +19,10 @@ use crate::engine::{EngineCapabilities, EngineKind};
 use crate::expert::{ExpertRegistry, ExpertRouter};
 use crate::kv::{ContextProfile, KVCacheState, KvPlanner};
 use crate::network::{LinkMetrics, NetworkGraph};
-use crate::plan::{ExecutionPlan, ExecutionStage, PlanKind};
+use crate::plan::{
+    CanRunReport, EvidenceProvenance, ExecutionPlan, ExecutionStage, ExecutionStrategy, PlanKind,
+    StrategyKind, StrategyRationale,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -193,6 +196,15 @@ pub struct PlanResult {
     pub estimated_ms: u32,
     /// Per-candidate score breakdown behind the decision.
     pub rationale: PlannerRationale,
+    /// The execution strategy attached to this plan (P1). Always populated:
+    /// the planner emits `SingleWorker` unless it can justify something else.
+    pub strategy: ExecutionStrategy,
+    /// CAN_RUN / CAN_COLLABORATE snapshot per worker (P1). `can_run` reuses
+    /// the eligibility projection (trusted + healthy + serves the model);
+    /// `can_collaborate` is deliberately conservative — only `BatchFanOut`
+    /// returns true today, because no engine DecentraAI runs advertises
+    /// speculative / disaggregated / collaborative-model capabilities.
+    pub can_reports: Vec<(String, CanRunReport)>,
 }
 
 impl ExecutionPlan {
@@ -308,6 +320,10 @@ impl ExecutionPlanner {
                 reasoning: append_capability_note("no eligible worker serves this model", req),
                 estimated_ms: 0,
                 rationale,
+                strategy: ExecutionStrategy::single_worker(
+                    "no eligible worker — SingleWorker baseline",
+                ),
+                can_reports: workers.iter().map(can_report).collect(),
             };
         };
 
@@ -331,11 +347,33 @@ impl ExecutionPlanner {
             ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
             capability_requirement: capability_view(req, &req.capability_claims),
         };
+        // P1: attach the execution strategy. Today the planner only ever emits
+        // a single-worker plan, so the strategy is SingleWorker with an honest
+        // provenance note. BatchFanOut (and all experimental strategies) are
+        // explicitly rejected in the rationale — they require a batch context
+        // or engine capabilities this planner cannot see, so claiming them
+        // would fabricate behavior the runtime cannot execute.
+        let strategy = ExecutionStrategy {
+            kind: StrategyKind::SingleWorker,
+            rationale: StrategyRationale {
+                reason: format!(
+                    "single worker {} serves the model; multi-worker strategies rejected without batch context or engine capability",
+                    best.peer_id
+                ),
+                rejected: vec![crate::plan::RejectedStrategy {
+                    kind: StrategyKind::BatchFanOut,
+                    reason: "no batch context for this request".into(),
+                }],
+            },
+            provenance: EvidenceProvenance::Inferred,
+        };
         PlanResult {
             reasoning: append_capability_note(&stage.1, req),
             estimated_ms: est,
             plan,
             rationale,
+            strategy,
+            can_reports: workers.iter().map(can_report).collect(),
         }
     }
 
@@ -555,6 +593,27 @@ fn append_capability_note(reasoning: &str, req: &RequestFacts) -> String {
         ),
         None => reasoning.to_string(),
     }
+}
+
+/// P1: the CAN_RUN / CAN_COLLABORATE snapshot for one worker.
+///
+/// `can_run` mirrors the planner's eligibility projection (trusted + healthy +
+/// serves the model) — a worker that passes those is able to run the request
+/// alone. `can_collaborate` is deliberately conservative: it is `false` for
+/// every worker today, because no engine DecentraAI runs advertises
+/// speculative / disaggregated / collaborative-model capabilities. The planner
+/// must never claim a worker can collaborate on a strategy the fabric cannot
+/// actually execute (see the P1 implementation note); `BatchFanOut` is the
+/// only strategy the executor can drive, and it needs a batch context the
+/// planner does not have here.
+fn can_report(f: &WorkerFacts) -> (String, CanRunReport) {
+    (
+        f.peer_id.clone(),
+        CanRunReport {
+            can_run: f.trusted && f.healthy && f.serves_model,
+            can_collaborate: false,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1173,5 +1232,90 @@ mod tests {
             EngineKind::parse("unknown-engine"),
             EngineKind::RemoteOpenAI
         );
+    }
+
+    // ---- P1: ExecutionStrategy + CAN_RUN / CAN_COLLABORATE ----
+
+    #[test]
+    fn plan_always_carries_single_worker_strategy() {
+        let ws = vec![
+            worker_facts("a", 180, 50, 10),
+            worker_facts("b", 150, 60, 20),
+        ];
+        let p = ExecutionPlanner::default().plan(&req(), &ws);
+        assert_eq!(p.strategy.kind, StrategyKind::SingleWorker);
+        assert!(!p.strategy.is_multi_worker());
+        assert_eq!(p.strategy.provenance, EvidenceProvenance::Inferred);
+        // BatchFanOut is explicitly rejected in the rationale (no batch context).
+        assert!(
+            p.strategy
+                .rationale
+                .rejected
+                .iter()
+                .any(|r| r.kind == StrategyKind::BatchFanOut),
+            "BatchFanOut must be listed as rejected without batch context"
+        );
+        // The strategy must also flow into the decision.
+        let d = crate::decision::evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(),
+            &ws,
+            false,
+            false,
+        );
+        assert_eq!(d.strategy.kind, StrategyKind::SingleWorker);
+    }
+
+    #[test]
+    fn can_run_reports_flow_into_plan_and_decision() {
+        let good = worker_facts("good", 180, 50, 10);
+        let mut bad = worker_facts("bad", 200, 20, 5);
+        bad.trusted = false; // CANNOT_RUN: untrusted
+        let ws = vec![good.clone(), bad];
+        let p = ExecutionPlanner::default().plan(&req(), &ws);
+        let report = |id: &str| {
+            p.can_reports
+                .iter()
+                .find(|(peer, _)| peer == id)
+                .map(|(_, r)| *r)
+                .expect("report present")
+        };
+        let good_r = report("good");
+        assert!(good_r.can_run, "trusted+healthy+serves => can run");
+        assert!(
+            !good_r.can_collaborate,
+            "no engine advertises collaboration today"
+        );
+        let bad_r = report("bad");
+        assert!(!bad_r.can_run, "untrusted worker cannot run alone");
+        assert!(!bad_r.can_collaborate);
+
+        // Same reports flow into the decision.
+        let d = crate::decision::evaluate(
+            &ExecutionPlanner::default(),
+            "r1",
+            &req(),
+            &ws,
+            false,
+            false,
+        );
+        let d_report = d
+            .can_reports
+            .iter()
+            .find(|(peer, _)| peer == "good")
+            .map(|(_, r)| *r)
+            .expect("decision report present");
+        assert!(d_report.can_run);
+        assert!(!d_report.can_collaborate);
+    }
+
+    #[test]
+    fn no_eligible_worker_keeps_single_worker_strategy_and_reports() {
+        let mut w = worker_facts("slow", 40, 400, 90);
+        w.serves_model = false;
+        let p = ExecutionPlanner::default().plan(&req(), &[w]);
+        assert_eq!(p.strategy.kind, StrategyKind::SingleWorker);
+        assert!(p.can_reports.iter().all(|(_, r)| !r.can_run));
     }
 }

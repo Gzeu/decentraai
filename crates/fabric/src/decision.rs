@@ -176,6 +176,14 @@ pub struct ExecutionDecision {
     /// constructions keep compiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_orchestration: Option<OrchestrationAction>,
+    /// The execution strategy attached to this decision (P1). Defaulted so
+    /// pre-P1 persisted decisions deserialize cleanly.
+    #[serde(default)]
+    pub strategy: crate::plan::ExecutionStrategy,
+    /// CAN_RUN / CAN_COLLABORATE snapshot per worker (P1). Empty for pre-P1
+    /// persisted decisions.
+    #[serde(default)]
+    pub can_reports: Vec<(String, crate::plan::CanRunReport)>,
 }
 
 /// A typed, serializable lifecycle event (event-driven observability).
@@ -431,6 +439,8 @@ pub fn evaluate(
         outcome: None,
         trace,
         last_orchestration: None,
+        strategy: plan_result.strategy.clone(),
+        can_reports: plan_result.can_reports.clone(),
     }
 }
 
