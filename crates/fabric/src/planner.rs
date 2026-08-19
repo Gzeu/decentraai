@@ -178,6 +178,87 @@ impl PlannerConfig {
     }
 }
 
+/// Normalized metrics fed to [`base_score`] (Model-Fabric Execution Spec §3.1).
+/// Values are normalized to 0.0..=1.0 by the caller; the function only applies
+/// the profile weights. All inputs must be in [0,1]; a caller that lacks a
+/// metric should pass the profile's default (0.0) rather than an invented
+/// measurement — missing data is UNKNOWN.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NormalizedMetrics {
+    pub throughput: f64,
+    pub cache_affinity: f64,
+    pub capacity_headroom: f64,
+    pub latency: f64,
+    pub failure_risk: f64,
+}
+
+/// Base composite score (spec §3.1) with configurable weights:
+///
+/// ```text
+/// score = w_throughput * throughput
+///       + w_cache     * cache_affinity
+///       + w_headroom  * capacity_headroom
+///       - w_latency   * predicted_latency
+///       - w_risk      * failure_risk
+/// ```
+///
+/// Default weights mirror the spec's base formula (0.30/0.25/0.20/0.15/0.10).
+/// Hard constraints (trust, memory, deadlines, interconnect policies) must
+/// never be overridden by scores — this function only ranks *eligible* plans.
+pub fn base_score(metrics: &NormalizedMetrics, weights: &ScoringWeights) -> f64 {
+    weights.throughput * metrics.throughput
+        + weights.cache_affinity * metrics.cache_affinity
+        + weights.capacity_headroom * metrics.capacity_headroom
+        - weights.latency * metrics.latency
+        - weights.risk * metrics.failure_risk
+}
+
+/// Weights for [`base_score`] (spec §3.1 default formula).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoringWeights {
+    pub throughput: f64,
+    pub cache_affinity: f64,
+    pub capacity_headroom: f64,
+    pub latency: f64,
+    pub risk: f64,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            throughput: 0.30,
+            cache_affinity: 0.25,
+            capacity_headroom: 0.20,
+            latency: 0.15,
+            risk: 0.10,
+        }
+    }
+}
+
+impl ScoringWeights {
+    /// Latency-sensitive variant (spec §3.2): heavy latency, low throughput.
+    pub fn latency() -> Self {
+        Self {
+            throughput: 0.10,
+            cache_affinity: 0.10,
+            capacity_headroom: 0.10,
+            latency: 0.50,
+            risk: 0.20,
+        }
+    }
+
+    /// Throughput variant (spec §3.2): heavy throughput + headroom.
+    pub fn throughput() -> Self {
+        Self {
+            throughput: 0.45,
+            cache_affinity: 0.10,
+            capacity_headroom: 0.20,
+            latency: 0.15,
+            risk: 0.10,
+        }
+    }
+}
+
 /// The per-candidate component scores that made up a planner score. Kept pure
 /// and serde-serializable so a coordinator can persist / display *why* the
 /// chosen worker won without re-running the score.
@@ -1417,5 +1498,70 @@ mod tests {
         let fast_busy = worker_facts("fast_busy", 300, 30, 95);
         let p = planner.plan(&req(), &[fast_idle, fast_busy]);
         assert_eq!(p.plan.workers(), vec!["fast_idle"]);
+    }
+
+    // ---- Model-Fabric Execution Spec §3.1: base_score ----
+
+    #[test]
+    fn base_score_ranks_plans_by_weights() {
+        let default = ScoringWeights::default();
+        let good = NormalizedMetrics {
+            throughput: 0.8,
+            cache_affinity: 0.7,
+            capacity_headroom: 0.6,
+            latency: 0.2,
+            failure_risk: 0.1,
+        };
+        let bad = NormalizedMetrics {
+            throughput: 0.2,
+            cache_affinity: 0.1,
+            capacity_headroom: 0.1,
+            latency: 0.9,
+            failure_risk: 0.8,
+        };
+        assert!(base_score(&good, &default) > base_score(&bad, &default));
+    }
+
+    #[test]
+    fn base_score_matches_spec_default_formula() {
+        // Spec §3.1: 0.30*throughput + 0.25*cache + 0.20*headroom
+        //            - 0.15*latency - 0.10*risk
+        let m = NormalizedMetrics {
+            throughput: 1.0,
+            cache_affinity: 1.0,
+            capacity_headroom: 1.0,
+            latency: 0.0,
+            failure_risk: 0.0,
+        };
+        assert!((base_score(&m, &ScoringWeights::default()) - 0.75).abs() < 1e-9);
+
+        let w = ScoringWeights::latency();
+        assert!(w.latency > w.throughput);
+        let t = ScoringWeights::throughput();
+        assert!(t.throughput > t.latency);
+    }
+
+    #[test]
+    fn base_score_rewards_low_latency_more_in_latency_profile() {
+        let latency_w = ScoringWeights::latency();
+        let through_w = ScoringWeights::throughput();
+        let fast = NormalizedMetrics {
+            throughput: 0.4,
+            cache_affinity: 0.5,
+            capacity_headroom: 0.5,
+            latency: 0.1,
+            failure_risk: 0.1,
+        };
+        let slow = NormalizedMetrics {
+            throughput: 0.9,
+            cache_affinity: 0.5,
+            capacity_headroom: 0.5,
+            latency: 0.8,
+            failure_risk: 0.1,
+        };
+        // Under latency profile the fast plan wins; under throughput profile
+        // the high-tps plan wins.
+        assert!(base_score(&fast, &latency_w) > base_score(&slow, &latency_w));
+        assert!(base_score(&slow, &through_w) > base_score(&fast, &through_w));
     }
 }

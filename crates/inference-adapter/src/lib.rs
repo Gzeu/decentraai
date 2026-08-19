@@ -70,6 +70,11 @@ pub struct EngineCapabilities {
     pub prefill_decode_separation: bool,
     pub expert_routing: bool,
     pub tensor_parallel: bool,
+    pub continuous_batching: bool,
+    pub speculative_decoding: bool,
+    pub kv_offload: bool,
+    pub prefix_cache: bool,
+    pub pipeline_parallel: bool,
 }
 
 impl EngineCapabilities {
@@ -80,6 +85,11 @@ impl EngineCapabilities {
             prefill_decode_separation: false,
             expert_routing: false,
             tensor_parallel: false,
+            continuous_batching: false,
+            speculative_decoding: false,
+            kv_offload: false,
+            prefix_cache: false,
+            pipeline_parallel: false,
         }
     }
 }
@@ -216,12 +226,22 @@ impl OpenAiCompatibleBackend {
                 kv_report: true,
                 prefill_decode_separation: true,
                 tensor_parallel: true,
+                continuous_batching: true,
+                speculative_decoding: true,
+                kv_offload: true,
+                prefix_cache: true,
+                pipeline_parallel: true,
                 ..EngineCapabilities::conservative()
             },
             EngineKind::Sglang => EngineCapabilities {
                 kv_report: true,
                 prefill_decode_separation: true,
                 tensor_parallel: true,
+                continuous_batching: true,
+                speculative_decoding: true,
+                kv_offload: true,
+                prefix_cache: true,
+                pipeline_parallel: true,
                 ..EngineCapabilities::conservative()
             },
             EngineKind::LlamaServer => EngineCapabilities {

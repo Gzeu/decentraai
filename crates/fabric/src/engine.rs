@@ -82,6 +82,7 @@ impl EngineKind {
                 prefill_decode_separation: false,
                 expert_routing: false,
                 tensor_parallel: false,
+                ..EngineCapabilities::zero_extra()
             },
             // vLLM exports live KV-cache state and a prefill/decode
             // disaggregation surface, and can attend over multiple ranks.
@@ -91,6 +92,11 @@ impl EngineKind {
                 prefill_decode_separation: true,
                 expert_routing: false,
                 tensor_parallel: true,
+                continuous_batching: true,
+                speculative_decoding: true,
+                kv_offload: true,
+                prefix_cache: true,
+                pipeline_parallel: true,
             },
             Self::Sglang => EngineCapabilities {
                 streaming: true,
@@ -98,6 +104,11 @@ impl EngineKind {
                 prefill_decode_separation: true,
                 expert_routing: false,
                 tensor_parallel: true,
+                continuous_batching: true,
+                speculative_decoding: true,
+                kv_offload: true,
+                prefix_cache: true,
+                pipeline_parallel: true,
             },
             Self::Ollama => EngineCapabilities {
                 streaming: true,
@@ -105,6 +116,7 @@ impl EngineKind {
                 prefill_decode_separation: false,
                 expert_routing: false,
                 tensor_parallel: false,
+                ..EngineCapabilities::zero_extra()
             },
             // Unknown/remote: be conservative. Safe defaults preserve
             // correctness; an endpoint that supports more is probed to opt-in.
@@ -114,6 +126,7 @@ impl EngineKind {
                 prefill_decode_separation: false,
                 expert_routing: false,
                 tensor_parallel: false,
+                ..EngineCapabilities::zero_extra()
             },
         }
     }
@@ -138,9 +151,28 @@ pub struct EngineCapabilities {
     pub prefill_decode_separation: bool,
     /// Accepts expert-level routing / selection (distributed MoE).
     pub expert_routing: bool,
-    /// Can shard one model across multiple distributed ranks (tensor /
-    /// pipeline parallelism) and serve it cooperatively.
+    /// Can shard one model across multiple distributed ranks (tensor
+    /// parallelism) and serve it cooperatively.
     pub tensor_parallel: bool,
+    /// Can batch independent requests into one forward pass (vLLM/SGLang
+    /// continuous batching). Preferred for BatchFanOut; not required.
+    #[serde(default)]
+    pub continuous_batching: bool,
+    /// Supports draft-model speculative decoding (verify engine).
+    #[serde(default)]
+    pub speculative_decoding: bool,
+    /// Can offload KV cache to a remote KV layer (LMCache etc.) or otherwise
+    /// share KV state across engines.
+    #[serde(default)]
+    pub kv_offload: bool,
+    /// Maintains a prefix cache with KV locality and hit/miss statistics that
+    /// cache-aware routing can exploit.
+    #[serde(default)]
+    pub prefix_cache: bool,
+    /// Can shard one model across pipeline stages on different ranks
+    /// (pipeline parallelism, e.g. vLLM PP).
+    #[serde(default)]
+    pub pipeline_parallel: bool,
 }
 
 impl EngineCapabilities {
@@ -152,6 +184,25 @@ impl EngineCapabilities {
             prefill_decode_separation: false,
             expert_routing: false,
             tensor_parallel: false,
+            ..Self::zero_extra()
+        }
+    }
+
+    /// Defaults for the newer Model-Fabric Execution Spec (§2.1) flags. Kept
+    /// as a separate constructor so `..EngineCapabilities::conservative()`
+    /// spread constructions stay source-compatible when the flags change.
+    fn zero_extra() -> Self {
+        Self {
+            streaming: false,
+            kv_report: false,
+            prefill_decode_separation: false,
+            expert_routing: false,
+            tensor_parallel: false,
+            continuous_batching: false,
+            speculative_decoding: false,
+            kv_offload: false,
+            prefix_cache: false,
+            pipeline_parallel: false,
         }
     }
 

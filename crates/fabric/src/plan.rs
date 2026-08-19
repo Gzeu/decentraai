@@ -194,6 +194,57 @@ impl StrategyKind {
         }
     }
 
+    /// Minimum engine capabilities required for this strategy (Model-Fabric
+    /// Execution Spec §2.1). Only the flags that are *required* are set; the
+    /// caller must AND with any worker-specific requirements (model fit, VRAM,
+    /// network) before selecting a strategy. `continuous_batching` is
+    /// preferred for BatchFanOut but not required, so it stays unset here.
+    pub fn required_capabilities(&self) -> crate::engine::EngineCapabilities {
+        use crate::engine::EngineCapabilities;
+        match self {
+            // Any engine can serve a whole request alone.
+            Self::SingleWorker => EngineCapabilities::conservative(),
+            Self::BatchFanOut => EngineCapabilities::conservative(),
+            Self::SpeculativeDraftVerify => EngineCapabilities {
+                speculative_decoding: true,
+                ..EngineCapabilities::conservative()
+            },
+            Self::DisaggregatedPrefillDecode => EngineCapabilities {
+                kv_offload: true,
+                ..EngineCapabilities::conservative()
+            },
+            Self::CacheAwareRoute => EngineCapabilities {
+                prefix_cache: true,
+                ..EngineCapabilities::conservative()
+            },
+            Self::CollaborativeModel => EngineCapabilities {
+                tensor_parallel: true,
+                pipeline_parallel: true,
+                ..EngineCapabilities::conservative()
+            },
+            // Composition of per-stage plans: every stage is checked
+            // individually, so the composite imposes no extra requirement.
+            Self::MultiModelPipeline => EngineCapabilities::conservative(),
+        }
+    }
+
+    /// Whether an engine's advertised capabilities satisfy the minimum for
+    /// this strategy (§2.1). This is a *necessary* condition, not sufficient:
+    /// model fit, trust tier, and measured evidence are checked separately.
+    pub fn meets_capabilities(&self, caps: &crate::engine::EngineCapabilities) -> bool {
+        let required = self.required_capabilities();
+        required.streaming <= caps.streaming
+            && required.kv_report <= caps.kv_report
+            && required.prefill_decode_separation <= caps.prefill_decode_separation
+            && required.expert_routing <= caps.expert_routing
+            && required.tensor_parallel <= caps.tensor_parallel
+            && required.continuous_batching <= caps.continuous_batching
+            && required.speculative_decoding <= caps.speculative_decoding
+            && required.kv_offload <= caps.kv_offload
+            && required.prefix_cache <= caps.prefix_cache
+            && required.pipeline_parallel <= caps.pipeline_parallel
+    }
+
     /// Whether the strategy is permitted within a trust tier (spec §4.2).
     /// The planner must filter candidate strategies by tier before scoring;
     /// KV/cache migration across tiers is disallowed.
@@ -300,6 +351,80 @@ impl TrustTier {
             Self::TrustedRemote => 1,
             Self::TrustedCluster => 2,
         }
+    }
+}
+
+/// Per (worker, model, engine) measured performance profile
+/// (Model-Fabric Execution Spec §2.2). Every field is optional: a missing
+/// field MUST be treated as UNKNOWN and can never justify an experimental
+/// strategy. The planner compares net benefit of an alternative strategy
+/// against a SingleWorker baseline built from these numbers, and detects N+1
+/// regressions where adding workers decreases performance.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct PerformanceProfile {
+    /// Time to first token (seconds).
+    pub ttft_ms: Option<f64>,
+    /// Inter-token latency (ms/token).
+    pub inter_token_ms: Option<f64>,
+    /// Tokens per second (decode throughput).
+    pub tokens_per_sec: Option<f64>,
+    /// Queue wait time (ms).
+    pub queue_wait_ms: Option<f64>,
+    /// Prompt processing time (ms).
+    pub prompt_processing_ms: Option<f64>,
+    /// Decode time per token (ms).
+    pub decode_ms: Option<f64>,
+    /// p50 latency (ms).
+    pub p50_ms: Option<f64>,
+    /// p95 latency (ms).
+    pub p95_ms: Option<f64>,
+    /// p99 latency (ms).
+    pub p99_ms: Option<f64>,
+    /// Error / timeout rate (0.0..=1.0).
+    pub error_rate: Option<f64>,
+    /// Prefix-cache hit rate (0.0..=1.0).
+    pub prefix_cache_hit_rate: Option<f64>,
+    /// GPU utilization (0.0..=1.0).
+    pub gpu_utilization: Option<f64>,
+    /// Memory pressure (0.0..=1.0).
+    pub memory_pressure: Option<f64>,
+    /// Optional energy/cost estimate per request (arbitrary unit).
+    pub energy_cost: Option<f64>,
+}
+
+impl PerformanceProfile {
+    /// Number of metrics actually measured. Used to decide whether evidence is
+    /// strong enough to compare strategies; missing fields are UNKNOWN and can
+    /// never justify an experimental strategy (§2.2).
+    pub fn measured_count(&self) -> usize {
+        [
+            self.ttft_ms,
+            self.inter_token_ms,
+            self.tokens_per_sec,
+            self.queue_wait_ms,
+            self.prompt_processing_ms,
+            self.decode_ms,
+            self.p50_ms,
+            self.p95_ms,
+            self.p99_ms,
+            self.error_rate,
+            self.prefix_cache_hit_rate,
+            self.gpu_utilization,
+            self.memory_pressure,
+            self.energy_cost,
+        ]
+        .iter()
+        .filter(|m| m.is_some())
+        .count()
+    }
+
+    /// Whether enough evidence exists to reason about strategy trade-offs.
+    /// Conservative threshold: at least throughput+latency+error-rate, the
+    /// three pillars the planner's net-benefit comparison needs.
+    pub fn has_core_evidence(&self) -> bool {
+        self.tokens_per_sec.is_some()
+            && (self.ttft_ms.is_some() || self.p50_ms.is_some() || self.inter_token_ms.is_some())
+            && self.error_rate.is_some()
     }
 }
 
@@ -577,5 +702,114 @@ mod tests {
         assert_eq!(json, "\"trusted_remote\"");
         let back: TrustTier = serde_json::from_str(&json).unwrap();
         assert_eq!(back, TrustTier::TrustedRemote);
+    }
+
+    // ---- Model-Fabric Execution Spec §2.1: capability requirements ----
+
+    #[test]
+    fn single_worker_requires_nothing_extra() {
+        use crate::engine::EngineCapabilities;
+        // Even a conservative engine serves a whole request alone.
+        assert!(StrategyKind::SingleWorker.meets_capabilities(&EngineCapabilities::conservative()));
+        assert!(StrategyKind::BatchFanOut.meets_capabilities(&EngineCapabilities::conservative()));
+        // But the experimental strategies require their advertised flags.
+        assert!(
+            !StrategyKind::SpeculativeDraftVerify
+                .meets_capabilities(&EngineCapabilities::conservative())
+        );
+        assert!(
+            !StrategyKind::CollaborativeModel
+                .meets_capabilities(&EngineCapabilities::conservative())
+        );
+    }
+
+    #[test]
+    fn capability_requirements_map_to_spec_flags() {
+        use crate::engine::EngineCapabilities;
+        assert!(
+            StrategyKind::SpeculativeDraftVerify.meets_capabilities(&EngineCapabilities {
+                speculative_decoding: true,
+                ..EngineCapabilities::conservative()
+            })
+        );
+        assert!(
+            StrategyKind::DisaggregatedPrefillDecode.meets_capabilities(&EngineCapabilities {
+                kv_offload: true,
+                ..EngineCapabilities::conservative()
+            })
+        );
+        assert!(
+            StrategyKind::CacheAwareRoute.meets_capabilities(&EngineCapabilities {
+                prefix_cache: true,
+                ..EngineCapabilities::conservative()
+            })
+        );
+        assert!(
+            StrategyKind::CollaborativeModel.meets_capabilities(&EngineCapabilities {
+                tensor_parallel: true,
+                pipeline_parallel: true,
+                ..EngineCapabilities::conservative()
+            })
+        );
+        // CollaborativeModel needs BOTH tensor and pipeline parallel.
+        assert!(
+            !StrategyKind::CollaborativeModel.meets_capabilities(&EngineCapabilities {
+                tensor_parallel: true,
+                ..EngineCapabilities::conservative()
+            })
+        );
+    }
+
+    #[test]
+    fn vllm_advertised_capabilities_enable_advanced_strategies() {
+        use crate::engine::EngineKind;
+        let vllm = EngineKind::Vllm.advertised_capabilities();
+        assert!(StrategyKind::SingleWorker.meets_capabilities(&vllm));
+        assert!(StrategyKind::BatchFanOut.meets_capabilities(&vllm));
+        assert!(StrategyKind::SpeculativeDraftVerify.meets_capabilities(&vllm));
+        assert!(StrategyKind::DisaggregatedPrefillDecode.meets_capabilities(&vllm));
+        assert!(StrategyKind::CacheAwareRoute.meets_capabilities(&vllm));
+        assert!(StrategyKind::CollaborativeModel.meets_capabilities(&vllm));
+        // llama-server cannot do collaborative/speculative — honest.
+        let llama = EngineKind::LlamaServer.advertised_capabilities();
+        assert!(StrategyKind::SingleWorker.meets_capabilities(&llama));
+        assert!(!StrategyKind::CollaborativeModel.meets_capabilities(&llama));
+        assert!(!StrategyKind::SpeculativeDraftVerify.meets_capabilities(&llama));
+    }
+
+    // ---- Model-Fabric Execution Spec §2.2: PerformanceProfile ----
+
+    #[test]
+    fn performance_profile_counts_measured_metrics() {
+        let empty = PerformanceProfile::default();
+        assert_eq!(empty.measured_count(), 0);
+        assert!(!empty.has_core_evidence());
+
+        let core = PerformanceProfile {
+            ttft_ms: Some(120.0),
+            tokens_per_sec: Some(18.0),
+            error_rate: Some(0.01),
+            ..Default::default()
+        };
+        assert_eq!(core.measured_count(), 3);
+        assert!(core.has_core_evidence());
+
+        // Missing error rate or throughput = UNKNOWN => no evidence.
+        let partial = PerformanceProfile {
+            ttft_ms: Some(120.0),
+            tokens_per_sec: Some(18.0),
+            ..Default::default()
+        };
+        assert!(!partial.has_core_evidence());
+    }
+
+    #[test]
+    fn performance_profile_serde_defaults_missing_fields() {
+        // Old/wire payloads with no metrics must deserialize to all-None.
+        let json = r#"{"ttft_ms": 10.0}"#;
+        let p: PerformanceProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.ttft_ms, Some(10.0));
+        assert_eq!(p.inter_token_ms, None);
+        assert_eq!(p.measured_count(), 1);
     }
 }

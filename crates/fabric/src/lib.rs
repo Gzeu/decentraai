@@ -57,10 +57,10 @@ pub use network::{
 };
 pub use plan::{
     CanRunReport, EvidenceProvenance, ExecutionMode, ExecutionPlan, ExecutionStage,
-    ExecutionStrategy, PlanCost, PlanKind, RejectedStrategy, StrategyKind, StrategyRationale,
-    TrustTier,
+    ExecutionStrategy, PerformanceProfile, PlanCost, PlanKind, RejectedStrategy, StrategyKind,
+    StrategyRationale, TrustTier,
 };
 pub use planner::{
-    CandidateScore, ExecutionPlanner, PlanResult, PlannerConfig, PlannerRationale, RequestFacts,
-    WorkerFacts,
+    CandidateScore, ExecutionPlanner, NormalizedMetrics, PlanResult, PlannerConfig,
+    PlannerRationale, RequestFacts, ScoringWeights, WorkerFacts, base_score,
 };
