@@ -48,32 +48,29 @@ node's API from the other; only the P2P port is open between them.
 - Usage: `bash scripts/upgrade-remote-node.sh [user@host]` (`REMOTE_PORT=…` to
   override the port).
 
-## Current state (2026-08-18, verified live)
+## Current state (2026-08-19, verified live)
 
-> Corrected by Pylon (source of truth), 2026-08-18. An earlier version of this
-> doc claimed the Laptop binary was outdated; that was wrong — the Laptop is on
-> a current binary and *processes* agent advertisements correctly.
+> State as of the 2026-08-19 re-validation. Both nodes are on the same HEAD,
+> both run the self-upgrade watcher, and two-node remote inference is verified
+> end-to-end from the Laptop (`validate-lan.sh` → reply `REMOTE`).
 
-- **Laptop i5: UP TO DATE (binary + repo).** The installed binary is current
-  (built 2026-08-18), runs the orchestrator/AgentRuntime/workflow endpoints and
-  the AGENTS dashboard view. `/v1/agents` on the Laptop shows the Desktop as a
-  **remote agent** (`dca-NGE65Z:generalist`, `remote: true`), which proves the
-  Laptop deserializes and verifies agent advertisements correctly.
-- **Desktop i7: UP TO DATE at `095465c` (binary rebuilt via `upgrade-node.sh`
-  with the `80829be` p2p fix).** Verified live from the Desktop after the
-  rebuild:
-  - `/v1/compute` → **2 workers**: `dca-NGE65Z` + `dca-GriBWu`, both
-    `accepts_remote_inference: true`.
-  - `/v1/agents` → **2 agents**: `dca-NGE65Z:generalist` (local) +
-    `dca-GriBWu:generalist` (`remote: true`).
-  - `/v1/fabric` → **2 nodes**: Laptop `ONLINE`, `trusted: true`, v1.0.0.
-  - `/v1/network` → connected to `12D3KooWGriBWu…`, link LAN 1000 Mbps,
-    `rtt_ms: 830`.
-  The root cause of the missing worker was the p2p advertisement bug fixed in
-  `80829be` (SignedComputeAdvertisement was swallowed in the agent branch),
-  NOT a stale binary on either side. Open item: run `scripts/validate-lan.sh`
-  from the Laptop to prove remote execution end-to-end (the Desktop cannot
-  reach the Laptop's loopback API).
+- **Laptop i5: UP TO DATE at `979acbf` + `--auto-upgrade` active.** The unit
+  file starts the node with `--auto-upgrade` (6h watcher). `/v1/compute`
+  shows 2 workers (local + Desktop, both `remote_ok: true`); `/v1/network`
+  measured `rtt_ms: 174`, `locality: Lan`, `bandwidth: 1000`.
+- **Desktop i7: UP TO DATE at `979acbf` + `--auto-upgrade` active.** SSH port
+  closed — the operator ran `git pull && bash scripts/upgrade-node.sh` on the
+  machine, which patched its unit file idempotently (see below). Verified from
+  the Laptop: trusted, `remote_ok: true`, serves
+  `Llama-3.2-1B-Instruct-Q4_K_M.gguf`, `ONLINE` in `/v1/fabric`.
+- **Auto-upgrade unit patch**: `scripts/upgrade-node.sh` now ensures the
+  systemd unit runs the node with `--auto-upgrade` + pins `WorkingDirectory`
+  to the repo checkout (idempotent; `ENABLE_AUTO_UPGRADE=0` to opt out). The
+  deploy template `deploy/decentraai-node.service` has the same two lines, so
+  fresh installs start self-upgrading out of the box.
+- Open item (no longer blocking): SSH remains closed on the Desktop, so remote
+  upgrades must go through the operator (`upgrade-node.sh` on the machine) —
+  or wait for the self-upgrade watcher, which needs no SSH.
 
 ## Two-node remote inference — VERIFIED both directions (2026-08-18)
 

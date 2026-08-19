@@ -6,6 +6,46 @@ Date: 2026-08-16. Scope: make the DecentraAI fabric rock-solid as a real
 > UPDATE (same date): the Desktop was upgraded to current HEAD and configured
 > with `allow_remote_inference: true`. Live validation results are below.
 
+> UPDATE (2026-08-19): full two-node validation re-run on the current HEAD —
+> both nodes upgraded to `979acbf`, remote inference verified end-to-end both
+> ways, dashboard/chat-streaming/execution views validated, collective memory
+> bug fixed and verified live. Details in the **2026-08-19 re-validation**
+> section below.
+
+## 2026-08-19 re-validation (current HEAD, both nodes)
+
+Hardware (unchanged): Laptop i5 `dca-GriBWu` (192.168.1.132, 30 GiB RAM,
+serves `qwen2.5-coder-7b-instruct-q4_k_m.gguf`) ↔ Desktop i7 `dca-NGE65Z`
+(192.168.1.138, 8 GiB RAM, serves `Llama-3.2-1B-Instruct-Q4_K_M.gguf`).
+
+### Verified live on the LAN (2026-08-19)
+
+1. **Both nodes on current HEAD `979acbf`** (binary + repo). The Desktop's SSH
+   port is closed (operator ran `upgrade-node.sh` locally); remote inference is
+   forced by trust + remote-only model placement, exactly as designed.
+2. **`scripts/validate-lan.sh` from the Laptop → reply `REMOTE`.** The script
+   picked a model served ONLY by the Desktop (`Llama-3.2-1B-Instruct-Q4_K_M.gguf`),
+   so routing was forced remote; the Desktop's real reply came back over P2P.
+3. **Chat streaming remote** — `POST /v1/chat/completions` with
+   `stream:true` to the Desktop's model returned token-by-token SSE deltas.
+4. **Execution view shows the P1 strategy live** — the planner records
+   `single_worker` decisions with rationale (`"single worker … serves the
+   model; multi-worker strategies rejected without batch context"`),
+   network_cost ~100_000 µs.
+5. **Network view (M19)** — live RTT probe: `rtt_ms: 174`, `locality: Lan`,
+   `bandwidth: 1000`.
+6. **Fabric view** — Desktop `ONLINE`, `trusted: true`.
+7. **Collective memory + reputation + workflows live** — see the notes below;
+   the memory-entry-id bug found and fixed this session is documented in the
+   ROADMAP §118.
+
+### Self-upgrade now active on both nodes
+
+`--auto-upgrade` (6h watcher) is enabled in the systemd unit on both nodes;
+`upgrade-node.sh` patches the unit file idempotently (`ENABLE_AUTO_UPGRADE=0`
+to opt out) — the Desktop got it on its next `git pull && upgrade-node.sh`.
+See `docs/NODE_UPGRADE.md`.
+
 ## Environment
 
 - This node: Laptop i5, node id `dca-GriBWu`, peer `12D3KooWGriBWu…`,

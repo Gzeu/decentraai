@@ -2361,9 +2361,9 @@ laptop.
   remote worker, picks a model served only by the remote node (so routing is
   forced remote), routes a real chat request to it, and reports the reply —
   proving two-node remote inference end-to-end. Exits non-zero on any failure.
-- [ ] **Blocked on Desktop**: run `git pull && bash scripts/upgrade-node.sh`
-  on the Desktop so it advertises agents + `accepts_remote_inference`, then
-  `bash scripts/validate-lan.sh` on this laptop.
+- [x] **Desktop upgraded (2026-08-19)**: `git pull && bash scripts/upgrade-node.sh`
+  on the Desktop (now at `979acbf`, advertises agents + `accepts_remote_inference`),
+  then `bash scripts/validate-lan.sh` on this laptop → reply `REMOTE`.
 
 ## 103. Two-node LAN validation VERIFIED (DONE)
 
@@ -2667,3 +2667,35 @@ and auditable.
 Remaining research phases (P3 speculative, P4 prefill/decode, P5 cache-aware,
 P6 collaborative/RPC) stay **experimental** — they require live LAN
 measurements (Laptop ↔ Desktop) before the planner may select them.
+
+## 118. Live LAN session 2026-08-19 — ops, P2 wiring, memory fix (DONE)
+
+A full two-node session on real hardware, all verified live:
+
+- **Ops — self-upgrade on schedule** (`1f0de5a`, `639398c`, `1ba6d30`):
+  `decentraai upgrade check|apply|auto` + `node --auto-upgrade`; the systemd
+  unit starts the node with `--auto-upgrade` and `WorkingDirectory` pinned to
+  the repo; `scripts/upgrade-node.sh` patches the unit idempotently
+  (`ENABLE_AUTO_UPGRADE=0` opt-out) so the Desktop got self-upgrade on its next
+  local upgrade. Both nodes verified on `--auto-upgrade` (6h watcher).
+- **P2 — NetworkFacts wired into the planner** (`b4b5602`):
+  `ExecutionPlanner::network_score` folds measured jitter/packet-loss stability
+  into the network term ONLY when measured — `(None, None)` stays neutral so
+  links that only carry RTT keep the exact pre-P2 score; a measured flaky link
+  loses up to 30% of its network score. Regression test pins the neutral case.
+- **Bug fix — collective memory stopped growing after the first workflow run**
+  (`979acbf`): `write_workflow_to_memory` derived `entry_id` from `plan_id` +
+  `task_id`, both fixed across template instantiations (`research_report` →
+  `workflow-run`), so the second run hit the `memory_entries` PRIMARY KEY and
+  its writes were swallowed by `let _ =`. Fix: fold the run timestamp into
+  every entry id. Verified live: `workflow_results` grew 6 → 11 entries on a
+  real second run. Regression test
+  `repeated_workflow_runs_each_write_memory_entries`.
+- **Live validation** (all on real LAN): `validate-lan.sh` → reply `REMOTE`
+  (forced remote to the Desktop-only model); chat streaming remote token-by-
+  token; execution view shows P1 `single_worker` decisions with rationale;
+  M19 network probe `rtt_ms: 174`; research_report workflow `verdict:
+  completed`; P6 reputation fed from real executions (3 entries, score ~0.83,
+  reasons reliability/quality/latency with sample counts).
+
+Tests: 1056 workspace tests green; clippy `-D warnings` clean.
