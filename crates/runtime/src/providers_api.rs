@@ -59,7 +59,24 @@ pub async fn providers_list_handler(State(state): State<ApiState>, headers: Head
         return ok_json(json!({ "providers": [], "error": "provider plane not attached" }));
     };
     let mgr = providers.lock().await;
-    ok_json(json!({ "providers": mgr.list_provider_summaries() }))
+    // Safe view: masked fingerprints only, plus each provider's connected
+    // models (never credentials). Serialize the models explicitly so the
+    // dashboard can render catalog rows without a second round-trip.
+    let summaries = mgr.list_provider_summaries();
+    let providers_with_models: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|s| {
+            let models = mgr
+                .provider(&s.provider_id)
+                .map(|p| p.models.clone())
+                .unwrap_or_default();
+            json!({
+                "summary": s,
+                "models": models,
+            })
+        })
+        .collect();
+    ok_json(json!({ "providers": providers_with_models }))
 }
 
 /// POST /api/admin/providers — create a provider.

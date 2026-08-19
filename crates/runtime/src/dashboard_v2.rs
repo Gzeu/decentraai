@@ -232,6 +232,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <button data-view="network"><span class="ico">○</span>Network</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
     <button data-view="models"><span class="ico">▦</span>Models</button>
+    <button data-view="providers"><span class="ico">◈</span>Providers</button>
     <div class="nav-group">Ops</div>
     <button data-view="settings"><span class="ico">⚙</span>Settings</button>
     <button data-view="diagnostics"><span class="ico">⌖</span>Diagnostics</button>
@@ -298,6 +299,22 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
     <section class="view" id="view-models"><div class="card"><h2>Models</h2><div id="models" class="list"></div></div></section>
+    <section class="view" id="view-providers">
+      <div class="card"><h2>Model Fabric — Providers <span class="live">● Live</span></h2>
+        <p class="hint">External OpenAI-compatible providers. Credentials stay in memory only — re-enter after a node restart. Sharing is OFF by default.</p>
+        <div class="stack" style="margin:12px 0">
+          <div class="row"><b>Add provider</b></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <select id="prov-kind"><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option><option value="groq">Groq</option><option value="together">Together</option><option value="fireworks">Fireworks</option><option value="generic_openai_compatible">Generic OpenAI-compatible</option></select>
+            <input id="prov-name" placeholder="name" style="flex:1;min-width:120px">
+            <input id="prov-url" placeholder="base URL (optional, defaults per kind)" style="flex:2;min-width:200px">
+            <input id="prov-key" type="password" placeholder="api key" style="flex:2;min-width:200px">
+            <button class="button primary" id="prov-add">Add provider</button>
+          </div>
+        </div>
+        <div id="providers-list" class="stack"><div class="empty">No providers configured.</div></div>
+      </div>
+    </section>
     <section class="view" id="view-settings"><div class="card"><h2>Settings</h2><pre id="settings" class="mono"></pre></div></section>
     <section class="view" id="view-diagnostics"><div class="card"><h2>Diagnostics</h2><pre id="diagnostics" class="mono"></pre></div></section>
   </div>
@@ -320,14 +337,15 @@ $('token').addEventListener('change', () => { try { localStorage.setItem(tokenKe
 let autoToken = '';
 (async () => { try { autoToken = (await (await fetch('/v1/token')).text()).trim(); } catch (_) {} })();
 
-const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',settings:'Settings',diagnostics:'Diagnostics'};
+const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',providers:'Model Fabric',settings:'Settings',diagnostics:'Diagnostics'};
 let currentView = 'overview', lastStatus = null;
 function show(view) {
   currentView = view;
   document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === 'view-'+view));
   document.querySelectorAll('[data-view]').forEach(el => el.classList.toggle('active', el.dataset.view === view));
   $('title').textContent = title[view] || view;
-  if (!['overview','chat','models'].includes(view)) loadAdvanced(view);
+  if (!['overview','chat','models','providers'].includes(view)) loadAdvanced(view);
+  if (view==='providers') renderProviders();
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => show(button.dataset.view)));
 const advanced = $('advanced');
@@ -605,6 +623,23 @@ async function refresh() {
 $('refresh').addEventListener('click', refresh);
 refresh();
 renderCapFeedback();
+// Model Fabric: add a provider through the master-gated admin endpoint.
+// The api key is sent once over the loopback API and then only ever kept in
+// the node's in-memory credential store.
+$('prov-add').addEventListener('click', async () => {
+  const kind = $('prov-kind').value, name = $('prov-name').value.trim(), url = $('prov-url').value.trim(), key = $('prov-key').value.trim();
+  if (!name || !key) { alert('Name and api key are required.'); return; }
+  const body = { kind, name };
+  if (url) body.base_url = url;
+  body.api_key = key;
+  try {
+    const r = await fetch('/api/admin/providers', { method:'POST', headers:{'Content-Type':'application/json', ...auth()}, body: JSON.stringify(body) });
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { alert('Add failed: '+(j.error?.message || r.status)); return; }
+    $('prov-name').value=''; $('prov-url').value=''; $('prov-key').value='';
+    renderProviders();
+  } catch (err) { alert('Add failed: '+err); }
+});
 // These are the only recurring requests: dashboard observation must never
 // invoke the inference proxy or reset the managed engine's idle clock.
 setInterval(refresh, 5000);
@@ -663,6 +698,44 @@ function renderSkills() {
     $('skills-list').innerHTML = skills.map(s => '<div class="card"><b>'+esc(s.name||s.id)+'</b><div class="hint">status: '+esc(s.status)+' · develops: '+esc((s.develops||[]).join(', '))+'</div></div>').join('') || '<div class="empty">No skills registered.</div>';
   })();
 }
+function renderProviders() {
+  // Model Fabric: fetch /v1/providers (operator+admin) and render the
+  // provider cards with connected models. Credentials are never exposed —
+  // only masked fingerprints from the server.
+  (async () => {
+    let d = null;
+    try { d = await (await fetch('/v1/providers',{headers:auth()})).json(); } catch (_) { $('providers-list').innerHTML = '<div class="empty">Providers view needs a valid operator token.</div>'; return; }
+    const providers = (d && d.providers) || [];
+    if (!providers.length) { $('providers-list').innerHTML = '<div class="empty">No providers configured. Add one above — the api key lives only in memory.</div>'; return; }
+    $('providers-list').innerHTML = providers.map(p => {
+      const s = p.summary || {};
+      const health = s.health || 'unknown';
+      const models = (p.models || []);
+      const modelRows = models.map(m => {
+        const shared = m.sharing && m.sharing.enabled;
+        return '<div class="row" style="align-items:flex-start"><b>'+esc(m.upstream_model)+'</b><span>'+
+          '<span class="status'+(m.enabled?'':' idle')+'">'+(m.enabled?'ENABLED':'DISABLED')+'</span> '+
+          (shared?'<span class="tag-warn">shared</span>':'')+' '+
+          '<span class="hint">'+esc((m.symbolic_hash||'') .slice(0,18))+'…</span>'+
+          (m.last_latency_ms? '<span class="hint">'+m.last_latency_ms+'ms</span>':'')+
+          '</span></div>';
+      }).join('') || '<div class="hint">No connected models.</div>';
+      return '<div class="card" style="margin-bottom:12px">'+
+        '<div style="display:flex;justify-content:space-between;align-items:center">'+
+        '<b>'+esc(s.display_name||s.provider_id)+'</b>'+
+        '<span class="status'+(health==='healthy'?'':' idle')+'">'+esc((health||'unknown').toUpperCase())+'</span></div>'+
+        '<div class="hint">'+esc(s.kind||'')+' · '+esc(s.base_url||'')+' · key '+esc(s.credential_fingerprint||'—')+'</div>'+
+        '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0">'+
+        '<div class="hint">Circuit<br><b class="mono">'+esc(s.circuit||'—')+'</b></div>'+
+        '<div class="hint">Latency<br><b class="mono">'+(s.last_latency_ms?s.last_latency_ms+'ms':'—')+'</b></div>'+
+        '<div class="hint">Failures<br><b class="mono">'+esc(s.failure_count??0)+'</b></div>'+
+        '<div class="hint">Shared models<br><b class="mono">'+esc(s.shared_model_count??0)+'</b></div></div>'+
+        '<div class="hint" style="margin-top:4px">Connected models</div>'+modelRows+
+        '</div>';
+    }).join('');
+  })();
+}
+
 function renderWorkersDetail() {
   const workers = lastCompute?.workers || [];
   $('workers-detail').innerHTML = workers.length ? workers.map(w =>
