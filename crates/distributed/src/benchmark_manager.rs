@@ -146,6 +146,7 @@ impl BenchmarkManager {
             )
             .tagged(format!("mode:{}", run.mode.tag()))
             .tagged(format!("verdict:{:?}", run.verdict))
+            .tagged(format!("latency_ms:{}", run.metrics.latency_ms))
             .tagged(format!("task:{}", task.task_id));
             if let Ok(mut ix) = evidence.index().lock() {
                 ix.add(entry);
@@ -304,7 +305,7 @@ impl BenchmarkManager {
         self.registry.clone()
     }
 
-    /// The lab's current comparison (registry + derived verdict).
+    /// The lab's current headline comparison (paired over shared tasks).
     pub fn comparison(&self) -> ModeComparison {
         self.registry
             .lock()
@@ -338,6 +339,15 @@ impl BenchmarkManager {
                 collective_beats_single: false,
                 reasoning: "registry lock poisoned".into(),
             })
+    }
+
+    /// The global (per-mode aggregate) comparison over ALL runs — secondary
+    /// data; the headline verdict is the paired one.
+    pub fn global_comparison(&self) -> ModeComparison {
+        self.registry
+            .lock()
+            .map(|r| r.global_comparison())
+            .unwrap_or_else(|_| self.comparison())
     }
 }
 
@@ -493,27 +503,31 @@ mod tests {
         let ev = Arc::new(EvidenceManager::new(None));
         // Single-mode is unreliable at startup (first 2 global calls are
         // wrong) — collective's 3 independent draws converge to the answer.
+        // Paired comparison counts *shared tasks* (same task in both modes),
+        // so the test uses 5 distinct tasks and runs each in both modes.
         let mock = MockInference::flaky(&[("Q?", "paris")], 2);
         let mgr = manager_with(mock, Some(ev));
-        let task = BenchmarkTask::new("t1", "Q?", "paris");
+        let tasks: Vec<BenchmarkTask> = (0..5)
+            .map(|i| BenchmarkTask::new(format!("t{i}"), "Q?", "paris"))
+            .collect();
 
-        // Few runs → honest "not enough".
-        for _ in 0..3 {
-            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
-            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
+        // Few shared tasks → honest "not enough".
+        for task in &tasks[..2] {
+            futures::executor::block_on(mgr.run_task(task, BenchmarkMode::Single, 1)).unwrap();
+            futures::executor::block_on(mgr.run_task(task, BenchmarkMode::Collective, 3)).unwrap();
         }
         let cmp = mgr.comparison();
         assert!(!cmp.collective_beats_single);
         assert!(cmp.reasoning.contains("not enough"));
 
-        // Reach MIN_SAMPLES with collective consistently better (5/5 vs 3/5).
-        for _ in 0..2 {
-            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
-            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
+        // Reach MIN_SAMPLES=5 shared tasks with collective consistently
+        // better: single sees the first 2 flaky calls (wrong) → 3/5 = 0.6;
+        // collective runs after warm-up → 5/5 = 1.0 → delta 0.4 ≥ margin.
+        for task in &tasks[2..] {
+            futures::executor::block_on(mgr.run_task(task, BenchmarkMode::Single, 1)).unwrap();
+            futures::executor::block_on(mgr.run_task(task, BenchmarkMode::Collective, 3)).unwrap();
         }
         let cmp = mgr.comparison();
-        // single: first 2 calls wrong → 3/5 correct = 0.6; collective: calls
-        // 3+ all right → 5/5 = 1.0 → delta 0.4 ≥ margin.
         assert!(cmp.collective_beats_single);
         assert!(cmp.reasoning.contains("collective"));
     }

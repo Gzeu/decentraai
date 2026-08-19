@@ -6573,6 +6573,7 @@ async fn bench_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
             .into_response();
     };
     let comparison = bench.comparison();
+    let global = bench.global_comparison();
     let runs = bench
         .registry()
         .lock()
@@ -6583,6 +6584,7 @@ async fn bench_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
         serde_json::json!({
             "attached": true,
             "comparison": comparison,
+            "global": global,
             "runs": runs,
         })
         .to_string(),
@@ -6620,6 +6622,12 @@ async fn bench_run_handler(
                 .into_response();
         }
     };
+    let task_id = b
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("api")
+        .to_string();
     let gold = b.get("gold").and_then(|v| v.as_str()).map(str::to_string);
     let evidence: Vec<String> = b
         .get("evidence")
@@ -6637,10 +6645,10 @@ async fn bench_run_handler(
     };
     let agents = b.get("agents").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
     let task = match gold {
-        Some(gold) => decentraai_agents::benchmark::BenchmarkTask::new("api", prompt, gold)
+        Some(gold) => decentraai_agents::benchmark::BenchmarkTask::new(task_id, prompt, gold)
             .with_evidence(evidence),
         None => {
-            let mut t = decentraai_agents::benchmark::BenchmarkTask::ungradable("api", prompt);
+            let mut t = decentraai_agents::benchmark::BenchmarkTask::ungradable(task_id, prompt);
             if !evidence.is_empty() {
                 t = t.with_evidence(evidence);
             }
@@ -11603,7 +11611,9 @@ mod tests {
         assert_eq!(body["run"]["verdict"], "correct");
         assert_eq!(body["run"]["metrics"]["tokens"], 100);
 
-        // GET /v1/bench shows the aggregate with a single run.
+        // GET /v1/bench shows the aggregate with a single run. The headline
+        // comparison is paired (shared tasks only): with a single run in
+        // single and none in collective, it honestly reports 0 shared tasks.
         let resp = client
             .get(format!("http://{api}/v1/bench"))
             .send()
@@ -11612,12 +11622,15 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["attached"], true);
         assert_eq!(body["runs"], 1);
-        assert_eq!(body["comparison"]["single"]["runs"], 1);
-        assert_eq!(body["comparison"]["single"]["graded"], 1);
+        assert_eq!(body["comparison"]["single"]["runs"], 0);
+        assert_eq!(body["comparison"]["single"]["graded"], 0);
         assert!(!body["comparison"]["collective_beats_single"].as_bool().unwrap());
-        // 1 run is below MIN_SAMPLES — honest "not enough".
+        // 0 shared tasks → honest "not enough".
         let reason = body["comparison"]["reasoning"].as_str().unwrap();
         assert!(reason.contains("not enough"));
+        // The global aggregate still shows the raw single run (secondary data).
+        assert_eq!(body["global"]["single"]["runs"], 1);
+        assert_eq!(body["global"]["single"]["graded"], 1);
         manager.lock().await.shutdown().await.unwrap();
     }
 

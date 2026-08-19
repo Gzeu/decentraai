@@ -291,6 +291,106 @@ fn by_mode(runs: &[BenchmarkRun], mode: BenchmarkMode) -> Vec<BenchmarkRun> {
     runs.iter().filter(|r| r.mode == mode).cloned().collect()
 }
 
+/// The honest headline verdict: compares single vs collective **only over
+/// tasks that were graded in BOTH modes**.
+///
+/// `compare_modes` (global) can be contaminated — if the lab ran easy tasks
+/// in collective and hard tasks in single, the aggregate would claim a
+/// collective win that never actually beat single on the same work. Paired
+/// comparison fixes that: each task contributes one graded vote per mode
+/// (its first graded run, oldest-first deterministic) and only tasks with a
+/// vote in both modes count. The same MIN_SAMPLES / MIN_MARGIN gates apply,
+/// now over *shared* tasks.
+pub fn paired_compare(all_runs: &[BenchmarkRun]) -> ModeComparison {
+    let mut single_votes: BTreeMap<String, BenchmarkVerdict> = BTreeMap::new();
+    let mut collective_votes: BTreeMap<String, BenchmarkVerdict> = BTreeMap::new();
+    for run in all_runs {
+        if run.verdict == BenchmarkVerdict::Abstained {
+            continue;
+        }
+        match run.mode {
+            BenchmarkMode::Single => {
+                single_votes.entry(run.task_id.clone()).or_insert(run.verdict);
+            }
+            BenchmarkMode::Collective => {
+                collective_votes
+                    .entry(run.task_id.clone())
+                    .or_insert(run.verdict);
+            }
+            BenchmarkMode::Rag => {}
+        }
+    }
+    let shared: Vec<&String> = single_votes
+        .keys()
+        .filter(|k| collective_votes.contains_key(*k))
+        .collect();
+    let n = shared.len();
+    let s_correct = shared
+        .iter()
+        .filter(|k| single_votes.get(k.as_str()) == Some(&BenchmarkVerdict::Correct))
+        .count();
+    let c_correct = shared
+        .iter()
+        .filter(|k| collective_votes.get(k.as_str()) == Some(&BenchmarkVerdict::Correct))
+        .count();
+    let s_acc = if n == 0 { 0.0 } else { s_correct as f64 / n as f64 };
+    let c_acc = if n == 0 { 0.0 } else { c_correct as f64 / n as f64 };
+    let delta = c_acc - s_acc;
+    let meaningful = n >= MIN_SAMPLES && delta >= MIN_MARGIN;
+    let reasoning = if meaningful {
+        format!(
+            "collective {:.0}% > single {:.0}% (+{:.0}pp) on {} shared graded tasks",
+            c_acc * 100.0,
+            s_acc * 100.0,
+            delta * 100.0,
+            n
+        )
+    } else if n < MIN_SAMPLES {
+        format!(
+            "not enough shared graded tasks yet ({}; need {} — run the same tasks in both single and collective)",
+            n, MIN_SAMPLES
+        )
+    } else {
+        format!(
+            "collective {:.0}% vs single {:.0}% on {} shared tasks — no meaningful margin (+{:.0}pp, need +{:.0}pp)",
+            c_acc * 100.0,
+            s_acc * 100.0,
+            n,
+            delta * 100.0,
+            MIN_MARGIN * 100.0
+        )
+    };
+    ModeComparison {
+        single: ModeAggregate {
+            mode: BenchmarkMode::Single,
+            runs: n,
+            graded: n,
+            accuracy: s_acc,
+            avg_tokens: 0.0,
+            avg_latency_ms: 0.0,
+        },
+        rag: ModeAggregate {
+            mode: BenchmarkMode::Rag,
+            runs: 0,
+            graded: 0,
+            accuracy: 0.0,
+            avg_tokens: 0.0,
+            avg_latency_ms: 0.0,
+        },
+        collective: ModeAggregate {
+            mode: BenchmarkMode::Collective,
+            runs: n,
+            graded: n,
+            accuracy: c_acc,
+            avg_tokens: 0.0,
+            avg_latency_ms: 0.0,
+        },
+        delta,
+        collective_beats_single: meaningful,
+        reasoning,
+    }
+}
+
 /// Deterministic in-memory registry of benchmark tasks and runs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BenchmarkRegistry {
@@ -331,8 +431,15 @@ impl BenchmarkRegistry {
         &self.runs
     }
 
-    /// The lab's current verdict over everything recorded.
+    /// The lab's headline verdict: paired over tasks graded in both single
+    /// and collective modes (contamination-free — see [`paired_compare`]).
     pub fn comparison(&self) -> ModeComparison {
+        paired_compare(&self.runs)
+    }
+
+    /// The global (per-mode aggregate) comparison over ALL runs. Useful as
+    /// secondary data, but the headline verdict must be the paired one.
+    pub fn global_comparison(&self) -> ModeComparison {
         compare_modes(&self.runs)
     }
 
@@ -441,6 +548,34 @@ mod tests {
         let cmp = tiny.comparison();
         assert!(!cmp.collective_beats_single);
         assert!(cmp.reasoning.contains("not enough"));
+    }
+
+    #[test]
+    fn paired_compare_ignores_tasks_not_shared_between_modes() {
+        // The contamination scenario: collective only saw easy tasks (all
+        // correct), single saw the same easy tasks PLUS hard ones (all wrong).
+        // Global aggregate would claim collective wins (+50pp); the paired
+        // verdict must refuse because only the 3 shared easy tasks count.
+        let mut registry = BenchmarkRegistry::new();
+        for i in 0..3 {
+            let task = format!("easy{i}");
+            let gold = Some("g");
+            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, "g", gold));
+            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, "g", gold));
+        }
+        for i in 0..3 {
+            let task = format!("hard{i}");
+            let gold = Some("g");
+            // single-only hard tasks, all wrong — must NOT count against single
+            registry.add_run(run(&format!("Ah{i}"), &task, BenchmarkMode::Single, "x", gold));
+        }
+        let cmp = registry.comparison();
+        // shared = 3 easy tasks: both 100% → no margin claim.
+        assert!(!cmp.collective_beats_single);
+        assert_eq!(cmp.single.graded, 3);
+        assert_eq!(cmp.collective.graded, 3);
+        assert!((cmp.single.accuracy - 1.0).abs() < 1e-9);
+        assert!(cmp.reasoning.contains("margin") || cmp.reasoning.contains("shared"));
     }
 
     #[test]

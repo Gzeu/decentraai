@@ -875,21 +875,27 @@ function renderBench() {
       return;
     }
     const cmp = d.comparison || {};
-    const s = cmp.single || {}, r = cmp.rag || {}, c = cmp.collective || {};
+    const g = d.global || {};
+    // Headline KPIs: paired comparison (shared tasks) — the only honest
+    // verdict. The global aggregate is secondary data.
+    const s = cmp.single || {}, c = cmp.collective || {};
+    const gs = g.single || {}, gr = g.rag || {}, gc = g.collective || {};
     const pct = v => (v && v.graded > 0) ? Math.round(v.accuracy*100)+'%' : '—';
     $('bench-kpis').innerHTML =
       kpi('Runs', d.runs ?? 0, 'total graded/ungraded') +
-      kpi('Single', pct(s), (s.runs||0)+' runs') +
-      kpi('RAG', pct(r), (r.runs||0)+' runs') +
-      kpi('Collective', pct(c), (c.runs||0)+' runs');
+      kpi('Single (shared)', pct(s), (s.runs||0)+' tasks') +
+      kpi('RAG (global)', pct(gr), (gr.runs||0)+' runs') +
+      kpi('Collective (shared)', pct(c), (c.runs||0)+' tasks');
     const verdict = cmp.collective_beats_single
       ? '<div class="row"><b>Collective beats single</b><span class="status">'+esc(cmp.reasoning||'')+'</span></div>'
       : '<div class="row"><b>No verdict yet</b><span class="status idle">'+esc(cmp.reasoning||'')+'</span></div>';
     $('bench-verdict').innerHTML = verdict;
     const rows = [
-      ['Single', s, 'mode A'],
-      ['RAG', r, 'mode B'],
-      ['Collective', c, 'mode C'],
+      ['Single (paired)', s, 'mode A · shared tasks'],
+      ['Collective (paired)', c, 'mode C · shared tasks'],
+      ['Single (global)', gs, 'mode A · all runs'],
+      ['RAG (global)', gr, 'mode B · all runs'],
+      ['Collective (global)', gc, 'mode C · all runs'],
     ].map(([name, v, tag]) =>
       '<div class="row"><b>'+name+'</b><span>'+pct(v)+' <span class="hint">('+(v?.graded||0)+' graded / '+(v?.runs||0)+' runs · '+(v?.avg_latency_ms||0)+'ms · '+(v?.avg_tokens||0)+' tok)</span></span></div>'
     ).join('');

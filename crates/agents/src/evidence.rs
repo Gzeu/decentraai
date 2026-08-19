@@ -435,6 +435,54 @@ pub fn lessons(entries: &[EvidenceEntry]) -> Vec<Lesson> {
         detail: "median of rtt_ms tags on executed plans (M19 probes)".into(),
     });
 
+    // 6. Benchmark Lab lessons: the fabric's own measured accuracy per mode,
+    //    and the median cost of one graded run. Evidence is the lab's
+    //    registry runs (kind benchmark, tags verdict:*/mode:*/task:*).
+    let bench_entries: Vec<&EvidenceEntry> = entries
+        .iter()
+        .filter(|e| e.kind == EvidenceFamily::Benchmark)
+        .collect();
+    for mode in ["single", "collective", "rag"] {
+        let mode_entries: Vec<&&EvidenceEntry> = bench_entries
+            .iter()
+            .filter(|e| tag_value(e, "mode:").as_deref() == Some(mode))
+            .collect();
+        let graded = mode_entries
+            .iter()
+            .filter(|e| {
+                tag_value(e, "verdict:").as_deref() != Some("Abstained")
+            })
+            .count();
+        let correct = mode_entries
+            .iter()
+            .filter(|e| tag_value(e, "verdict:").as_deref() == Some("Correct"))
+            .count();
+        out.push(Lesson {
+            id: format!("bench/{mode}_accuracy"),
+            label: format!("Benchmark accuracy ({mode})"),
+            value: if graded == 0 {
+                0.0
+            } else {
+                correct as f64 / graded as f64
+            },
+            sample: graded,
+            detail: "graded runs correct / graded runs (Benchmark Lab)".into(),
+        });
+    }
+    let mut latencies: Vec<f64> = bench_entries
+        .iter()
+        .filter_map(|e| tag_value(e, "latency_ms:"))
+        .filter_map(|v| v.parse::<f64>().ok())
+        .collect();
+    let median_lat = median(&mut latencies);
+    out.push(Lesson {
+        id: "bench/median_latency_ms".into(),
+        label: "Benchmark median latency (ms)".into(),
+        value: median_lat.unwrap_or(0.0),
+        sample: latencies.len(),
+        detail: "median of latency_ms tags on benchmark runs".into(),
+    });
+
     out
 }
 
@@ -541,8 +589,9 @@ mod tests {
     #[test]
     fn lessons_derive_only_from_evidence() {
         // Empty index → zero lessons with zero samples, values 0.0.
+        // 5 core lessons + 3 benchmark-mode accuracies + median latency.
         let empty = lessons(&[]);
-        assert_eq!(empty.len(), 5);
+        assert_eq!(empty.len(), 9);
         for l in &empty {
             assert_eq!(l.sample, 0);
             assert_eq!(l.value, 0.0);
@@ -574,6 +623,37 @@ mod tests {
         assert_eq!(s.total, 2);
         assert_eq!(s.recent.len(), 1);
         assert_eq!(s.recent[0].id, "exec:b"); // newest first
-        assert_eq!(s.lessons.len(), 5);
+        assert_eq!(s.lessons.len(), 9);
+    }
+
+    #[test]
+    fn benchmark_lessons_derive_accuracy_per_mode_from_tags() {
+        let mut ix = EvidenceIndex::new();
+        let bench = |id: &str, mode: &str, verdict: &str, lat: u64| {
+            EvidenceEntry::new(
+                format!("bench:{id}"),
+                EvidenceFamily::Benchmark,
+                "run".to_string(),
+                1000,
+            )
+            .tagged(format!("mode:{mode}"))
+            .tagged(format!("verdict:{verdict}"))
+            .tagged(format!("latency_ms:{lat}"))
+        };
+        ix.add(bench("1", "single", "Correct", 100));
+        ix.add(bench("2", "single", "Incorrect", 200));
+        ix.add(bench("3", "single", "Correct", 300));
+        ix.add(bench("4", "collective", "Correct", 50));
+        ix.add(bench("5", "collective", "Abstained", 60));
+        let ls = lessons(&ix.all());
+        let single = ls.iter().find(|l| l.id == "bench/single_accuracy").unwrap();
+        assert_eq!(single.sample, 3); // graded only (Abstained excluded)
+        assert!((single.value - 2.0 / 3.0).abs() < 1e-6);
+        let collective = ls.iter().find(|l| l.id == "bench/collective_accuracy").unwrap();
+        assert_eq!(collective.sample, 1);
+        assert!((collective.value - 1.0).abs() < 1e-6);
+        let med = ls.iter().find(|l| l.id == "bench/median_latency_ms").unwrap();
+        assert_eq!(med.sample, 5);
+        assert_eq!(med.value, 100.0); // median of 100,200,300,50,60
     }
 }

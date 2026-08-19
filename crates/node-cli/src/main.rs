@@ -718,8 +718,9 @@ enum BenchCommand {
     },
     /// Load a decrypted benchmark JSONL (BrowseComp-Plus format) and run up
     /// to `--limit` tasks through the node's `/v1/bench` API in the given
-    /// mode. Prints the registry comparison after the batch — the honest
-    /// verdict needs MIN_SAMPLES graded runs per mode and a MIN_MARGIN delta.
+    /// mode. With `--mode both` (default) each task runs in single AND
+    /// collective — the only honest comparison (paired over shared tasks);
+    /// the headline verdict needs MIN_SAMPLES shared tasks + MIN_MARGIN.
     Dataset {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
@@ -727,7 +728,7 @@ enum BenchCommand {
         file: PathBuf,
         #[arg(long, default_value = "5")]
         limit: usize,
-        #[arg(long, default_value = "single")]
+        #[arg(long, default_value = "both")]
         mode: String,
         #[arg(long, default_value = "3")]
         agents: usize,
@@ -3894,7 +3895,7 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
             mode,
             evidence,
         } => {
-            let mut body = serde_json::json!({ "prompt": prompt, "mode": mode });
+            let mut body = serde_json::json!({ "prompt": prompt, "mode": mode, "task_id": "cli" });
             if let Some(gold) = gold {
                 if !gold.trim().is_empty() {
                     body["gold"] = serde_json::Value::String(gold);
@@ -3951,63 +3952,76 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
             if tasks.is_empty() {
                 anyhow::bail!("no tasks loaded from {}", file.display());
             }
+            let modes: &[&str] = if mode == "both" {
+                &["single", "collective"]
+            } else {
+                &[mode.as_str()]
+            };
             println!(
-                "running {} task(s) in mode '{mode}' (agents={agents}) through {}",
+                "running {} task(s) in mode(s) {:?} (agents={agents}) through {}",
                 tasks.len(),
+                modes,
                 config.display()
             );
             let (client, base_url, token) = build_local_client(&config)?;
-            for (i, task) in tasks.iter().enumerate() {
-                let mut body = serde_json::json!({
-                    "prompt": task.prompt,
-                    "mode": mode,
-                    "agents": agents,
-                });
-                if let Some(gold) = &task.gold {
-                    body["gold"] = serde_json::Value::String(gold.clone());
-                }
-                if !task.evidence.is_empty() {
-                    body["evidence"] = serde_json::Value::Array(
-                        task.evidence
-                            .iter()
-                            .map(|s| serde_json::Value::String(s.clone()))
-                            .collect(),
-                    );
-                }
-                let mut req = client.post(format!("{base_url}/bench/run")).json(&body);
-                if let Some(t) = &token {
-                    req = req.bearer_auth(t);
-                }
-                let resp = req.send().await?;
-                let status = resp.status();
-                let j: serde_json::Value = resp.json().await?;
-                if !status.is_success() {
-                    eprintln!(
-                        "  [{}/{}] {} failed (HTTP {}): {}",
+            let mut total = 0usize;
+            for m in modes {
+                println!("  === mode {m} ===");
+                for (i, task) in tasks.iter().enumerate() {
+                    let mut body = serde_json::json!({
+                        "prompt": task.prompt,
+                        "mode": m,
+                        "agents": agents,
+                        "task_id": task.task_id,
+                    });
+                    if let Some(gold) = &task.gold {
+                        body["gold"] = serde_json::Value::String(gold.clone());
+                    }
+                    if !task.evidence.is_empty() {
+                        body["evidence"] = serde_json::Value::Array(
+                            task.evidence
+                                .iter()
+                                .map(|s| serde_json::Value::String(s.clone()))
+                                .collect(),
+                        );
+                    }
+                    let mut req = client.post(format!("{base_url}/bench/run")).json(&body);
+                    if let Some(t) = &token {
+                        req = req.bearer_auth(t);
+                    }
+                    let resp = req.send().await?;
+                    let status = resp.status();
+                    let j: serde_json::Value = resp.json().await?;
+                    if !status.is_success() {
+                        eprintln!(
+                            "  [{}/{}] {} failed (HTTP {}): {}",
+                            i + 1,
+                            tasks.len(),
+                            task.task_id,
+                            status,
+                            j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                        );
+                        continue;
+                    }
+                    total += 1;
+                    let verdict = j["run"]
+                        .get("verdict")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let latency = j["run"]["metrics"]
+                        .get("latency_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    println!(
+                        "  [{}/{}] {} -> {verdict} ({latency}ms)",
                         i + 1,
                         tasks.len(),
-                        task.task_id,
-                        status,
-                        j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                        task.task_id
                     );
-                    continue;
                 }
-                let verdict = j["run"]
-                    .get("verdict")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let latency = j["run"]["metrics"]
-                    .get("latency_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                println!(
-                    "  [{}/{}] {} -> {verdict} ({latency}ms)",
-                    i + 1,
-                    tasks.len(),
-                    task.task_id
-                );
             }
-            // After the batch, show the node's honest comparison.
+            println!("completed {total} graded run(s)");
+            // After the batch, show the node's honest comparison (paired).
             let mut req = client.get(format!("{base_url}/bench"));
             if let Some(t) = &token {
                 req = req.bearer_auth(t);
@@ -4020,7 +4034,9 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
     Ok(())
 }
 
-/// Prints the `/v1/bench` payload as a compact comparison table.
+/// Prints the `/v1/bench` payload as a compact comparison table. The
+/// headline verdict is the PAIRED comparison (tasks run in both modes);
+/// the global per-mode aggregate is shown as secondary data.
 fn print_bench_comparison(j: &serde_json::Value) {
     let runs = j.get("runs").and_then(|v| v.as_u64()).unwrap_or(0);
     println!("\nregistry runs: {runs}");
@@ -4029,8 +4045,8 @@ fn print_bench_comparison(j: &serde_json::Value) {
         return;
     }
     let cmp = &j["comparison"];
-    let pct = |mode: &str| -> String {
-        let m = &cmp[mode];
+    let global = &j["global"];
+    let pct = |m: &serde_json::Value| -> String {
         let graded = m.get("graded").and_then(|v| v.as_u64()).unwrap_or(0);
         if graded == 0 {
             "—".to_string()
@@ -4039,12 +4055,10 @@ fn print_bench_comparison(j: &serde_json::Value) {
             format!("{:.0}%", acc * 100.0)
         }
     };
-    println!(
-        "  single     : {}   rag: {}   collective: {}",
-        pct("single"),
-        pct("rag"),
-        pct("collective")
-    );
+    println!("  PAIRED (shared tasks)  : single {}   collective: {}",
+        pct(&cmp["single"]), pct(&cmp["collective"]));
+    println!("  global (all runs)      : single {}   rag: {}   collective: {}",
+        pct(&global["single"]), pct(&global["rag"]), pct(&global["collective"]));
     let verdict = cmp
         .get("collective_beats_single")
         .and_then(|v| v.as_bool())
