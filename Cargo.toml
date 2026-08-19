@@ -44,7 +44,7 @@ futures = "0.3"
 hex = "0.4"
 libp2p = { version = "0.54", features = ["macros", "mdns", "tokio", "noise", "yamux", "tcp", "request-response", "serde", "relay", "dcutr", "kad", "identify", "ping"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = "0.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
