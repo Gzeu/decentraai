@@ -89,6 +89,28 @@ else
 fi
 
 echo "==> Restarting the node service"
+# Ensure the unit file runs the node with the self-upgrade watcher
+# (--auto-upgrade) and pins WorkingDirectory to the repo checkout so the
+# watcher can pull/build. Idempotent: leaves an already-patched unit alone.
+# Opt out with ENABLE_AUTO_UPGRADE=0.
+UNIT_FILE="$HOME/.config/systemd/user/$SERVICE.service"
+if [ "${ENABLE_AUTO_UPGRADE:-1}" = "1" ] && [ -f "$UNIT_FILE" ]; then
+  if grep -q -- "--auto-upgrade" "$UNIT_FILE"; then
+    echo "  unit file already has --auto-upgrade"
+  else
+    echo "==> Enabling --auto-upgrade in $UNIT_FILE"
+    cp "$UNIT_FILE" "$UNIT_FILE.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    sed -i 's|^\(ExecStart=.*decentraai node --config [^ ]*\)$|\1 --auto-upgrade|' "$UNIT_FILE"
+    if ! grep -q "WorkingDirectory" "$UNIT_FILE"; then
+      sed -i 's|^Restart=always|WorkingDirectory=%h/decentraai\nRestart=always|' "$UNIT_FILE"
+    fi
+    systemctl --user daemon-reload
+    echo "  --auto-upgrade + WorkingDirectory enabled"
+  fi
+else
+  echo "  auto-upgrade unit patch left as-is (ENABLE_AUTO_UPGRADE=$ENABLE_AUTO_UPGRADE)"
+fi
+
 systemctl --user start "$SERVICE"
 systemctl --user is-active "$SERVICE" >/dev/null
 echo "  service active"
