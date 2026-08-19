@@ -15,6 +15,7 @@ members = [
   "crates/p2p",
   "crates/p2p-invoke",
   "crates/protocol",
+  "crates/providers",
   "crates/registry",
   "crates/runtime",
   "crates/system-probe",

@@ -687,6 +687,8 @@ pub use credential_store::CredentialStore;
 pub mod adapter;
 pub use adapter::{ModelAdapter, OpenAICompatibleProvider, ProviderAdapter};
 
+pub mod health;
+
 // ─── Tests (domain types) ─────────────────────────────────────────────
 
 #[cfg(test)]

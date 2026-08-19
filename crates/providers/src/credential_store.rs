@@ -142,8 +142,8 @@ mod credential_tests {
     #[test]
     fn credential_store_list_keys_no_secrets() {
         let mut store = CredentialStore::new();
-        let k1 = store.add("secret1");
-        let k2 = store.add("secret2");
+        let _k1 = store.add("secret1");
+        let _k2 = store.add("secret2");
         let keys = store.list_keys();
         assert_eq!(keys.len(), 2);
         let json = serde_json::to_string(&keys).unwrap();

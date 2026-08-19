@@ -270,7 +270,6 @@ mod tests {
         // request must NOT be charged the full-load estimate again — that
         // double-counts the resident weights and rejects the very model the
         // engine is running. Only the KV/context working set is marginal.
-        let cap = capability();
         // `capability()` uses context_tokens: 0 (unknown window, pre-M20): the
         // conservative 512 MiB default must still be far below a real full
         // load, proving the resident path never re-charges the weights.
