@@ -280,6 +280,9 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
       <div class="card"><h2>P2P Fabric</h2><div id="p2p-card" class="list"></div><div id="trust-card" style="margin-top:10px"></div></div>
       <div class="card"><h2>Capability Feedback</h2><div id="cap-feedback"></div></div>
     </div>
+    <div class="grid split-3">
+      <div class="card"><h2>Local Tools <span class="live">● Live</span></h2><div id="tools-card" class="list"></div></div>
+    </div>
   </section>
 
   <section class="view" id="view-chat"><article class="card"><h2>Chat with this node</h2>
@@ -442,6 +445,18 @@ function renderStatus(s) {
     const t = new Date((e.timestamp||0)*1000).toLocaleTimeString();
     return '<div class="row"><b>'+esc(t)+'</b><span>'+esc(e.event)+(e.details?.node_name?' · '+esc(e.details.node_name):'')+'</span></div>';
   }).join('') : '<div class="empty">No recent security/ops events.</div>';
+
+  // Local tools — TTS/OCR/STT subprocess state from /status
+  const tts = s.tts || {}, ocr = s.ocr || {}, stt = s.stt || {};
+  const toolRow = (name, en, healthy, extra) => {
+    const stateCls = en ? (healthy ? '' : ' idle') : ' idle';
+    const stateTxt = en ? (healthy ? 'ONLINE' : 'STARTING') : 'OFF';
+    return '<div class="row"><b>'+esc(name)+'</b><span class="status'+stateCls+'">'+stateTxt+'</span>'+(extra?'<span class="dim">'+esc(extra)+'</span>':'')+'</div>';
+  };
+  $('tools-card').innerHTML =
+    toolRow('TTS', !!tts.enabled, !!tts.healthy, tts.voice || '') +
+    toolRow('OCR', !!ocr.enabled, !!ocr.healthy, 'RapidOCR') +
+    toolRow('STT', !!stt.enabled, !!stt.healthy, stt.model || '');
 
   renderTrust();
 
