@@ -925,8 +925,10 @@ mod tests {
         // Default: no shared models.
         assert_eq!(mgr.shared_models_handles().len(), 0);
         // Enable sharing → handle appears.
-        let mut policy = SharingPolicy::default();
-        policy.enabled = true;
+        let policy = SharingPolicy {
+            enabled: true,
+            ..SharingPolicy::default()
+        };
         mgr.set_sharing(&pid, &mid, policy).unwrap();
         let handles = mgr.shared_models_handles();
         assert_eq!(handles.len(), 1);

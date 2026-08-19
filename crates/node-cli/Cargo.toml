@@ -28,6 +28,7 @@ decentraai-identity = { path = "../identity" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-manifest = { path = "../manifest" }
 decentraai-p2p = { path = "../p2p" }
+decentraai-providers = { path = "../providers" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-registry = { path = "../registry" }
 decentraai-runtime = { path = "../runtime" }

@@ -20,7 +20,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
 use futures::StreamExt;
 use rand_core::RngCore;
@@ -38,6 +38,12 @@ use crate::ServeManager;
 use crate::TtsManager;
 use crate::dashboard::{DASHBOARD_HTML, JS_TEMPLATE};
 use crate::dashboard_v2::{DASHBOARD_V2_HTML, JS_V2_TEMPLATE};
+use crate::providers_api::{
+    providers_add_model_handler, providers_create_handler, providers_delete_handler,
+    providers_delete_model_handler, providers_discover_handler, providers_list_handler,
+    providers_set_enabled_handler, providers_sharing_handler, providers_test_handler,
+    resolve_provider_model,
+};
 use crate::queue::InferenceQueue;
 
 /// Maximum audit events shown on the dashboard.
@@ -131,14 +137,14 @@ pub struct RequestStat {
 /// Response is 128+ bytes and trips clippy::result_large_err); converted
 /// into an HTTP response only at the handler boundary.
 #[derive(Debug)]
-enum GateError {
+pub(crate) enum GateError {
     Unauthorized,
     Forbidden(String),
     RateLimited(usize),
 }
 
 impl GateError {
-    fn into_response(self) -> Response {
+    pub(crate) fn into_response(self) -> Response {
         match self {
             Self::Unauthorized => unauthorized(),
             Self::Forbidden(message) => forbidden(&message),
@@ -225,7 +231,7 @@ pub struct ApiState {
     /// Lifecycle handle; activity is recorded per request.
     manager: Arc<Mutex<ServeManager>>,
     client: reqwest::Client,
-    info: DashboardInfo,
+    pub(crate) info: DashboardInfo,
     /// Root dashboard choice from `node.dashboard`. `/ui2` always remains a
     /// preview route, so an operator can switch back without losing access.
     dashboard: DashboardVersion,
@@ -306,6 +312,12 @@ pub struct ApiState {
     memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
     /// The P8 talent tree (capability graph), read-only for the dashboard.
     talent_tree: Option<Arc<decentraai_agents::TalentTree>>,
+    /// Provider control plane (Model Fabric): external OpenAI-compatible
+    /// provider registry + connected models + credential store. `None` when
+    /// the node does not run the provider manager (plain serve).
+    /// `tokio::sync::Mutex` so handlers may hold the guard across `.await`
+    /// (std `MutexGuard` is `!Send`, which breaks axum `Handler`).
+    pub(crate) providers: Option<Arc<tokio::sync::Mutex<decentraai_providers::ProviderManager>>>,
     /// Local text-to-speech (Kokoro subprocess). When enabled, `/v1/tts`
     /// synthesizes speech for the chat speak button. `TtsManager::enabled()`
     /// false = disabled; the dashboard hides the speak control.
@@ -362,6 +374,7 @@ impl ApiState {
             retrieval: None,
             memory: None,
             talent_tree: None,
+            providers: None,
             tts: Arc::new(TtsManager::disabled()),
         }
     }
@@ -435,6 +448,14 @@ impl ApiState {
     /// Attaches the talent tree (capability graph) for the dashboard.
     pub fn attach_talent_tree(&mut self, tree: Arc<decentraai_agents::TalentTree>) {
         self.talent_tree = Some(tree);
+    }
+
+    /// Attaches the provider control plane (Model Fabric).
+    pub fn attach_providers(
+        &mut self,
+        providers: Arc<tokio::sync::Mutex<decentraai_providers::ProviderManager>>,
+    ) {
+        self.providers = Some(providers);
     }
 
     /// Enables the consumer API key path (Q2): points at the consumer key
@@ -529,7 +550,7 @@ impl ApiState {
     /// no boundary to enforce, so admin stays usable single-user; subscriber
     /// tokens and unauthenticated callers are rejected. Returns a small
     /// [`GateError`] so the handler boundary turns it into the response.
-    fn require_master(&self, headers: &HeaderMap) -> Result<(), GateError> {
+    pub(crate) fn require_master(&self, headers: &HeaderMap) -> Result<(), GateError> {
         match self.classify(headers) {
             Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
             Ok(Auth::Subscriber { name, .. }) => Err(GateError::Forbidden(format!(
@@ -546,7 +567,7 @@ impl ApiState {
     /// network, execution, peers) are allowed for the master (admin), open
     /// mode (single-user), or an `operator`-role subscription token. A plain
     /// `client` token may only run inference within its tier.
-    fn require_operator_or_admin(&self, headers: &HeaderMap) -> Result<(), GateError> {
+    pub(crate) fn require_operator_or_admin(&self, headers: &HeaderMap) -> Result<(), GateError> {
         match self.classify(headers) {
             Ok(Auth::Master) | Ok(Auth::Open) => Ok(()),
             Ok(Auth::Subscriber { role, name, .. }) => {
@@ -4657,6 +4678,37 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/api/admin/contribution", get(admin_contribution_handler))
         .route("/api/admin/tier/apply", post(admin_tier_apply_handler))
+        // Model Fabric provider control plane (P5)
+        .route("/v1/providers", get(providers_list_handler))
+        .route("/api/admin/providers", post(providers_create_handler))
+        .route(
+            "/api/admin/providers/{id}/test",
+            post(providers_test_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/discover",
+            post(providers_discover_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/models",
+            post(providers_add_model_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/models/{model_id}",
+            delete(providers_delete_model_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/models/{model_id}/enable",
+            post(providers_set_enabled_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/models/{model_id}/sharing",
+            post(providers_sharing_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}",
+            delete(providers_delete_handler),
+        )
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
@@ -7770,6 +7822,14 @@ async fn proxy_with_auth(
     // backend slot (the worker has its own queue).
     let mut outgoing = outgoing;
     if is_inference && uri.path() == "/v1/chat/completions" {
+        // Model Fabric: a request for a connected provider model (symbolic
+        // hash `prov-…`, provider handle `provider:{id}:{model}`, or the raw
+        // upstream model name) is served directly by the provider adapter —
+        // no local engine slot, no fabric worker. This runs before fabric
+        // routing so a provider model never occupies the local queue.
+        if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
+            return provider_route;
+        }
         if let (Some(compute), Some(_distributed)) = (&state.compute, &state.distributed) {
             let body_val: Option<serde_json::Value> = serde_json::from_slice(&outgoing).ok();
             let model = body_val
@@ -9066,6 +9126,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), 200);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_routes_are_master_gated() {
+        // Model Fabric: the provider control plane routes are admin-only.
+        // Without a master token every provider endpoint rejects (401); with
+        // the master token the plane responds — even when no providers are
+        // attached yet (empty list), proving the routes exist and are wired.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
+        let client = reqwest::Client::new();
+
+        let denied = client
+            .get(format!("http://{api}/v1/providers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 401, "provider list must require a token");
+
+        let denied_create = client
+            .post(format!("http://{api}/api/admin/providers"))
+            .json(&serde_json::json!({ "kind": "openai", "name": "x", "base_url": "http://x", "api_key": "k" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_create.status(), 401);
+
+        let allowed = client
+            .get(format!("http://{api}/v1/providers"))
+            .header("Authorization", "Bearer secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200);
+        let body: serde_json::Value = allowed.json().await.unwrap();
+        assert_eq!(
+            body["providers"].as_array().map(|a| a.len()).unwrap_or(0),
+            0,
+            "no providers configured in this test fixture"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_plane_absent_keeps_chat_proxy_unchanged() {
+        // The provider routing hook must be a no-op when no provider plane is
+        // attached: a chat request for an unknown model still reaches the local
+        // backend (which responds 404/error from the mock), it is NOT treated
+        // as a provider call and never leaks credentials.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), Some("secret".to_string()), None).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .header("Authorization", "Bearer secret")
+            .json(&serde_json::json!({
+                "model": "provider:does-not-exist:model",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        // The local mock backend answers anything (200) — the point is the
+        // request was NOT short-circuited by a provider lookup that would
+        // 401 on missing credentials.
+        assert_ne!(resp.status(), 401);
+        assert_ne!(resp.status(), 502);
         manager.lock().await.shutdown().await.unwrap();
     }
 

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 decentraai-agents = { path = "../agents" }
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
@@ -15,7 +16,9 @@ decentraai-config = { path = "../config" }
 decentraai-distributed = { path = "../distributed" }
 decentraai-fabric = { path = "../fabric" }
 decentraai-hub = { path = "../hub" }
+decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-p2p = { path = "../p2p" }
+decentraai-providers = { path = "../providers" }
 decentraai-registry = { path = "../registry" }
 decentraai-system-probe = { path = "../system-probe" }
 decentraai-tokens = { path = "../tokens" }

@@ -13,6 +13,7 @@ pub mod api;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod mcp;
+pub mod providers_api;
 pub mod queue;
 
 use anyhow::{Context, Result, bail};

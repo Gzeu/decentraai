@@ -1830,6 +1830,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(data_dir.join("db/consumer_keys.json")),
             Some(compute_manager.quota_ledger()),
         );
+        // Model Fabric: the provider control plane persists its catalog to
+        // `db/providers.json`; credentials stay in memory only (re-entered
+        // after restart by design — see ProviderManager docs).
+        let provider_manager = Arc::new(tokio::sync::Mutex::new(
+            decentraai_providers::ProviderManager::new(&data_dir),
+        ));
+        state.attach_providers(provider_manager);
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
             Err(e) => warn!(error = %e, "dashboard failed to bind"),
