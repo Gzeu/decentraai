@@ -759,7 +759,11 @@ impl P2PNode {
                                 }
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Messages(
-                                request_response::Event::Message { peer, message },
+                                request_response::Event::Message {
+                                    peer,
+                                    message,
+                                    connection_id: _,
+                                },
                             )) => match message {
                                 request_response::Message::Request {
                                     request, channel, ..
