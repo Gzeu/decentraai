@@ -9053,8 +9053,21 @@ async fn proxy_with_auth(
                         } => {
                             remote_route = Some((worker, node_id, model_hash, model.clone()));
                         }
-                        ChatRoute::Local | ChatRoute::Unknown => {
+                        ChatRoute::Local => {
                             // Serve locally (headers added on the response).
+                        }
+                        ChatRoute::Unknown => {
+                            // Honest routing: a model that exists nowhere on the
+                            // fabric (no local file, no remote worker) must NOT
+                            // be silently served by the active local model while
+                            // pretending to be the requested one. That produced
+                            // a lying response (e.g. "gpt-9999…" answered by the
+                            // loaded model). Serve locally ONLY if the requested
+                            // model is actually known to the fabric; else return
+                            // a clear 404 instead of an impostor reply.
+                            if resolve_model_hash(&state, &model).await.is_none() {
+                                return not_served(&model);
+                            }
                         }
                     }
                 }
@@ -9445,6 +9458,22 @@ fn forbidden(message: &str) -> Response {
         .into_response()
 }
 
+/// Honest "model not served anywhere" reply. The caller asked for a model that
+/// neither this node's local engine nor any trusted remote worker advertises,
+/// so we return a clear 404 instead of silently answering with the currently
+/// loaded model while reporting the requested (nonexistent) name. This preserves
+/// the do-not-lie invariant for inference routing.
+fn not_served(model: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "{{\"error\":{{\"message\":\"model '{}' is not served by this node or any trusted remote worker\",\"type\":\"invalid_request_error\"}}}}",
+            model.replace('"', "\\\"")
+        ),
+    )
+        .into_response()
+}
+
 fn too_many_requests(limit: usize) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -9610,6 +9639,7 @@ mod tests {
     use super::*;
     use crate::{LlamaServer, RuntimeConfig};
     use decentraai_config::{TierPolicy, TiersSection};
+    use futures::FutureExt;
 
     #[test]
     fn node_info_without_compute_is_not_attached() {
@@ -15402,6 +15432,24 @@ mod tests {
             resolve_chat_route(&workers, &local, "missing.gguf"),
             ChatRoute::Unknown
         );
+    }
+
+    #[test]
+    fn not_served_returns_404_with_honest_message() {
+        // A model that exists nowhere must be rejected with a clear 404 (not a
+        // fake local passthrough pretending to serve it under the active model).
+        let resp = not_served("gpt-9999-does-not-exist");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("not served by this node"),
+            "expected honest 404 body, got: {text}"
+        );
+        assert!(text.contains("gpt-9999-does-not-exist"));
     }
 
     #[test]
