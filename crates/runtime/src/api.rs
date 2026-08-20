@@ -20,7 +20,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
 use futures::StreamExt;
 use rand_core::RngCore;
@@ -42,7 +42,7 @@ use crate::providers_api::{
     providers_add_model_handler, providers_create_handler, providers_delete_handler,
     providers_delete_model_handler, providers_discover_handler, providers_list_handler,
     providers_set_enabled_handler, providers_sharing_handler, providers_test_handler,
-    resolve_provider_model,
+    providers_update_credential_handler, resolve_provider_model,
 };
 use crate::queue::InferenceQueue;
 
@@ -5019,6 +5019,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/api/admin/providers/{id}",
             delete(providers_delete_handler),
+        )
+        .route(
+            "/api/admin/providers/{id}/credential",
+            put(providers_update_credential_handler),
         )
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)

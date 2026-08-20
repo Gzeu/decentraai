@@ -78,12 +78,37 @@ impl OpenAICompatibleProvider {
         }
     }
 
+    /// Build the URL for a provider API path. The base URL may already carry
+    /// a `/v1` suffix (defaults like `https://api.openai.com/v1` do), while
+    /// the callers pass API-relative paths like `v1/models` — joining them
+    /// naively would produce `/v1/v1/models`. Deduplicate a doubled `/v1`.
     fn auth_url(&self, base_url: &str, _api_key: &str, path: &str) -> String {
-        format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
+        Self::auth_url_impl(base_url, path)
+    }
+
+    fn auth_url_impl(base_url: &str, path: &str) -> String {
+        let base = base_url.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        let combined = format!("{base}/{path}");
+        if path.starts_with("v1/") && base.ends_with("/v1") && !combined.contains("//v1/") {
+            // base ends with /v1 and path starts with v1/ → strip one.
+            combined.replacen("/v1/v1/", "/v1/", 1)
+        } else {
+            combined
+        }
+    }
+
+    fn auth(request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        if api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(api_key)
+        }
+    }
+
+    #[cfg(test)]
+    fn auth_url_for_test(base_url: &str, path: &str) -> String {
+        Self::auth_url_impl(base_url, path)
     }
 
     fn classify_error(status: StatusCode, body: &str) -> ProviderErrorClass {
@@ -120,7 +145,7 @@ impl ProviderAdapter for OpenAICompatibleProvider {
     ) -> Result<(u64, usize), ProviderConnError> {
         let start = std::time::Instant::now();
         let url = self.auth_url(base_url, api_key, "v1/models");
-        let resp = self.client.get(&url).send().await.map_err(|e| {
+        let resp = Self::auth(self.client.get(&url), api_key).send().await.map_err(|e| {
             if e.is_timeout() {
                 ProviderConnError::Timeout(format!("connection timed out to {base_url}"))
             } else if e.is_connect() {
@@ -187,7 +212,7 @@ impl ProviderAdapter for OpenAICompatibleProvider {
         api_key: &str,
     ) -> Result<Vec<ProviderModelInfo>, ProviderConnError> {
         let url = self.auth_url(base_url, api_key, "v1/models");
-        let resp = self.client.get(&url).send().await.map_err(|e| {
+        let resp = Self::auth(self.client.get(&url), api_key).send().await.map_err(|e| {
             if e.is_timeout() {
                 ProviderConnError::Timeout(format!("discovery timed out to {base_url}"))
             } else if e.is_connect() {
@@ -355,10 +380,22 @@ fn map_backend_error(e: decentraai_inference_adapter::BackendError) -> ProviderI
         decentraai_inference_adapter::BackendError::Http { status, body } => {
             let err_class = {
                 let _st = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if status == 401 || status == 403 {
-                    ProviderErrorClass::Auth
-                } else {
-                    ProviderErrorClass::Unknown
+                match status {
+                    // 401 Unauthorized / 403 Forbidden — bad or missing key.
+                    401 | 403 => ProviderErrorClass::Auth,
+                    // 402 Payment Required — account has no funds (the real
+                    // DeepSeek "Insufficient Balance" case).
+                    402 => ProviderErrorClass::QuotaExhausted,
+                    // 429 Too Many Requests — provider rate limits.
+                    429 => ProviderErrorClass::RateLimited,
+                    // 404 — the requested upstream model does not exist.
+                    404 => ProviderErrorClass::ModelUnavailable,
+                    // 408 Request Timeout / 504 Gateway Timeout.
+                    408 | 504 => ProviderErrorClass::Timeout,
+                    // 5xx — the provider itself is failing.
+                    500..=599 => ProviderErrorClass::Upstream,
+                    // Everything else (4xx) — we cannot classify it.
+                    _ => ProviderErrorClass::Unknown,
                 }
             };
             ProviderInferError::ProviderError(err_class, body)
@@ -441,33 +478,39 @@ pub fn infer_diagnostic(err: &ProviderInferError) -> (&'static str, String) {
             "INTERNAL_ERROR",
             "Credential store temporarily unavailable".into(),
         ),
-        ProviderInferError::ProviderError(class, _) => match class {
+        ProviderInferError::ProviderError(class, body) => match class {
             ProviderErrorClass::Auth => (
                 "AUTHENTICATION_FAILED",
-                "Provider authentication failed".into(),
+                format!("Provider authentication failed: {body}"),
             ),
-            ProviderErrorClass::RateLimited => ("RATE_LIMITED", "Provider rate-limited".into()),
+            ProviderErrorClass::RateLimited => (
+                "RATE_LIMITED",
+                format!("Provider rate-limited: {body}"),
+            ),
             ProviderErrorClass::QuotaExhausted => {
-                ("QUOTA_EXHAUSTED", "Provider budget exhausted".into())
+                ("QUOTA_EXHAUSTED", format!("Provider budget exhausted: {body}"))
             }
             ProviderErrorClass::ModelUnavailable => (
                 "MODEL_UNAVAILABLE",
-                "The requested model is not available".into(),
+                format!("The requested model is not available: {body}"),
             ),
             ProviderErrorClass::Timeout => (
                 "UPSTREAM_TIMEOUT",
-                "Provider did not respond in time".into(),
+                format!("Provider did not respond in time: {body}"),
             ),
             ProviderErrorClass::Upstream => {
-                ("UPSTREAM_ERROR", "Provider server error (5xx)".into())
+                ("UPSTREAM_ERROR", format!("Provider server error (5xx): {body}"))
             }
             ProviderErrorClass::Protocol => {
-                ("PROTOCOL_ERROR", "Malformed response from provider".into())
+                ("PROTOCOL_ERROR", format!("Malformed response from provider: {body}"))
             }
             ProviderErrorClass::Policy => {
-                ("POLICY_DENIED", "Provider policy denied the request".into())
+                ("POLICY_DENIED", format!("Provider policy denied the request: {body}"))
             }
-            ProviderErrorClass::Unknown => ("UNKNOWN_ERROR", "Unexpected provider error".into()),
+            ProviderErrorClass::Unknown => (
+                "UNKNOWN_ERROR",
+                format!("Unexpected provider error: {body}"),
+            ),
         },
         ProviderInferError::Transport(msg) => ("TRANSPORT_ERROR", msg.clone()),
         ProviderInferError::Timeout => ("TIMEOUT", "Request timed out".into()),
@@ -479,5 +522,90 @@ pub fn infer_diagnostic(err: &ProviderInferError) -> (&'static str, String) {
         }
         ProviderInferError::Backend(msg) => ("BACKEND_ERROR", msg.clone()),
         ProviderInferError::Protocol(msg) => ("PROTOCOL_ERROR", msg.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_url_never_doubles_v1() {
+        // Base URLs that already carry /v1 (like the OpenAI default) must not
+        // produce /v1/v1 when the caller passes an API-relative path.
+        assert_eq!(
+            OpenAICompatibleProvider::auth_url_for_test("https://api.deepseek.com/v1", "v1/models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::auth_url_for_test("https://api.openai.com/v1", "v1/models"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            OpenAICompatibleProvider::auth_url_for_test("https://api.openai.com/v1/", "v1/models"),
+            "https://api.openai.com/v1/models"
+        );
+        // A base without /v1 stays unchanged (bare host + path).
+        assert_eq!(
+            OpenAICompatibleProvider::auth_url_for_test("https://api.deepseek.com", "v1/models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        // A non-v1 path is joined normally.
+        assert_eq!(
+            OpenAICompatibleProvider::auth_url_for_test("https://api.deepseek.com/v1", "health"),
+            "https://api.deepseek.com/v1/health"
+        );
+    }
+
+    #[test]
+    fn map_backend_error_classifies_http_status() {
+        use decentraai_inference_adapter::BackendError;
+        // 402 Payment Required → quota (DeepSeek "Insufficient Balance").
+        match map_backend_error(BackendError::Http {
+            status: 402,
+            body: "Insufficient Balance".into(),
+        }) {
+            ProviderInferError::ProviderError(ProviderErrorClass::QuotaExhausted, body) => {
+                assert_eq!(body, "Insufficient Balance")
+            }
+            other => panic!("expected quota, got {other:?}"),
+        }
+        // 401 → auth, 429 → rate limited, 404 → model unavailable,
+        // 500 → upstream, 418 → unknown.
+        assert!(matches!(
+            map_backend_error(BackendError::Http {
+                status: 401,
+                body: "x".into()
+            }),
+            ProviderInferError::ProviderError(ProviderErrorClass::Auth, _)
+        ));
+        assert!(matches!(
+            map_backend_error(BackendError::Http {
+                status: 429,
+                body: "x".into()
+            }),
+            ProviderInferError::ProviderError(ProviderErrorClass::RateLimited, _)
+        ));
+        assert!(matches!(
+            map_backend_error(BackendError::Http {
+                status: 404,
+                body: "x".into()
+            }),
+            ProviderInferError::ProviderError(ProviderErrorClass::ModelUnavailable, _)
+        ));
+        assert!(matches!(
+            map_backend_error(BackendError::Http {
+                status: 500,
+                body: "x".into()
+            }),
+            ProviderInferError::ProviderError(ProviderErrorClass::Upstream, _)
+        ));
+        assert!(matches!(
+            map_backend_error(BackendError::Http {
+                status: 418,
+                body: "x".into()
+            }),
+            ProviderInferError::ProviderError(ProviderErrorClass::Unknown, _)
+        ));
     }
 }

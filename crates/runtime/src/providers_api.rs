@@ -434,6 +434,53 @@ pub async fn providers_delete_handler(
     }
 }
 
+/// PUT /api/admin/providers/{id}/credential — re-authenticate a provider.
+/// Body: { "api_key": "..." }.
+///
+/// The CredentialStore is in-memory by design (secrets never persist), so
+/// after a node restart a persisted provider's `credential_ref` is orphaned
+/// until the operator re-supplies the key. This is that path — it swaps the
+/// secret handle in place without delete + recreate, keeps the provider's
+/// models/health/usage and never writes the key to disk.
+pub async fn providers_update_credential_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(providers) = &state.providers else {
+        return forbidden("provider plane not attached");
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return bad("invalid JSON"),
+    };
+    let api_key = req
+        .get("api_key")
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .to_string();
+    if api_key.trim().is_empty() {
+        return bad("missing api_key");
+    }
+    let mut mgr = providers.lock().await;
+    match mgr.update_credential(&provider_id, api_key) {
+        Ok(fingerprint) => {
+            record_provider_audit(
+                &state,
+                "provider_credential_updated",
+                json!({ "provider_id": provider_id }),
+            );
+            ok_json(json!({ "success": true, "provider_id": provider_id, "credential_fingerprint": fingerprint }))
+        }
+        Err(decentraai_providers::ProviderError::NotFound(_)) => not_found("provider not found"),
+        Err(e) => bad(&e.to_string()),
+    }
+}
+
 fn provider_conn_class(e: &decentraai_providers::adapter::ProviderConnError) -> &'static str {
     match e {
         decentraai_providers::adapter::ProviderConnError::InvalidCredentials(_) => "auth",
@@ -631,24 +678,55 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
 }
 
 fn provider_error_response(e: &decentraai_providers::adapter::ProviderInferError) -> Response {
+    use decentraai_providers::adapter::ProviderInferError;
+    use decentraai_providers::ProviderErrorClass;
+
     let (status, err_type, message) = match e {
-        decentraai_providers::adapter::ProviderInferError::Timeout => {
+        ProviderInferError::Timeout => {
             (StatusCode::GATEWAY_TIMEOUT, "timeout_error", e.to_string())
         }
-        decentraai_providers::adapter::ProviderInferError::PromptTooLarge
-        | decentraai_providers::adapter::ProviderInferError::OutputLimitExceeded => (
+        ProviderInferError::PromptTooLarge
+        | ProviderInferError::OutputLimitExceeded => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             e.to_string(),
         ),
-        decentraai_providers::adapter::ProviderInferError::CredentialNotFound(_)
-        | decentraai_providers::adapter::ProviderInferError::CredentialLock
-        | decentraai_providers::adapter::ProviderInferError::ProviderError(
-            decentraai_providers::ProviderErrorClass::Auth,
-            _,
-        ) => (
+        ProviderInferError::CredentialNotFound(_)
+        | ProviderInferError::CredentialLock
+        | ProviderInferError::ProviderError(ProviderErrorClass::Auth, _) => (
             StatusCode::UNAUTHORIZED,
             "authentication_error",
+            e.to_string(),
+        ),
+        // 402 Payment Required — the provider account is out of funds (e.g.
+        // DeepSeek "Insufficient Balance"). Surface it as quota, not a
+        // server error, so the UI can tell "top up the account" apart from
+        // "the provider is broken".
+        ProviderInferError::ProviderError(ProviderErrorClass::QuotaExhausted, _) => (
+            StatusCode::PAYMENT_REQUIRED,
+            "quota_exhausted",
+            e.to_string(),
+        ),
+        ProviderInferError::ProviderError(ProviderErrorClass::RateLimited, _) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited_error",
+            e.to_string(),
+        ),
+        ProviderInferError::ProviderError(ProviderErrorClass::ModelUnavailable, _) => (
+            StatusCode::BAD_REQUEST,
+            "model_unavailable",
+            e.to_string(),
+        ),
+        ProviderInferError::ProviderError(ProviderErrorClass::Upstream, _)
+        | ProviderInferError::Transport(_)
+        | ProviderInferError::Protocol(_) => (
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            e.to_string(),
+        ),
+        ProviderInferError::ProviderError(ProviderErrorClass::Policy, _) => (
+            StatusCode::FORBIDDEN,
+            "policy_denied",
             e.to_string(),
         ),
         _ => (StatusCode::BAD_GATEWAY, "server_error", e.to_string()),

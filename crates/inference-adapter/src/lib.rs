@@ -272,7 +272,17 @@ impl OpenAiCompatibleBackend {
             .as_ref()
             .and_then(|r| r())
             .unwrap_or_else(|| self.config.base_url.clone());
-        format!("{}/{}", base.trim_end_matches('/'), path)
+        let base = base.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        let combined = format!("{base}/{path}");
+        // The base may already carry a `/v1` suffix (provider defaults like
+        // https://api.openai.com/v1 do) while callers pass API-relative paths
+        // like `v1/models`; deduplicate so `/v1/v1/…` never happens.
+        if path.starts_with("v1/") && base.ends_with("/v1") && !combined.contains("//v1/") {
+            combined.replacen("/v1/v1/", "/v1/", 1)
+        } else {
+            combined
+        }
     }
     fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.config.api_key {
@@ -527,5 +537,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(b.endpoint("v1/models"), "http://127.0.0.1:4321/v1/models");
+    }
+
+    #[test]
+    fn provider_base_url_with_v1_suffix_never_doubles() {
+        // Provider defaults like https://api.deepseek.com/v1 already carry
+        // /v1; endpoint("v1/chat/completions") must not produce /v1/v1 (the
+        // DeepSeek incident: chat 404'd with an empty body because the URL
+        // doubled).
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            b.endpoint("v1/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            b.endpoint("v1/models"),
+            "https://api.deepseek.com/v1/models"
+        );
+        // A bare host (local engine) is untouched.
+        let b = OpenAiCompatibleBackend::new(BackendConfig {
+            base_url: "http://127.0.0.1:9999".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            b.endpoint("v1/chat/completions"),
+            "http://127.0.0.1:9999/v1/chat/completions"
+        );
     }
 }

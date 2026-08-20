@@ -169,6 +169,47 @@ impl ProviderManager {
         Ok(provider_id)
     }
 
+    /// Replace a provider's credential without touching the provider record.
+    /// The CredentialStore is in-memory by design (secrets never persist), so
+    /// after a node restart the persisted provider's `credential_ref` is
+    /// orphaned — the operator re-authenticates with this, never delete +
+    /// recreate. Returns the new fingerprint for the UI.
+    pub fn update_credential(
+        &mut self,
+        provider_id: &str,
+        api_key: impl Into<String>,
+    ) -> Result<String, ProviderError> {
+        let old_ref = {
+            let provider = self
+                .providers
+                .iter()
+                .find(|p| p.provider_id == provider_id)
+                .ok_or_else(|| ProviderError::NotFound(provider_id.into()))?;
+            provider.credential_ref.clone()
+        };
+        let new_ref = {
+            let mut creds = self
+                .credential_store
+                .lock()
+                .map_err(|_| ProviderError::Provider("credential store poisoned".into()))?;
+            let new_ref = creds.add(api_key);
+            creds.remove(&old_ref);
+            new_ref
+        };
+        {
+            let provider = self
+                .provider_mut(provider_id)
+                .ok_or_else(|| ProviderError::NotFound(provider_id.into()))?;
+            provider.credential_ref = new_ref.clone();
+        }
+        self.save()?;
+        Ok(self
+            .credential_store
+            .lock()
+            .map(|g| g.fingerprint(&new_ref))
+            .unwrap_or_default())
+    }
+
     /// Remove a provider (and its models + credential handle). The plaintext
     /// secret dies with the in-memory CredentialStore entry.
     pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
@@ -874,6 +915,41 @@ mod tests {
         assert!(!json.contains("sk-super-secret"));
         assert!(!json.contains("super-secret"));
         assert!(json.contains("credential_ref"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_credential_replaces_handle_in_place() {
+        let dir = test_dir();
+        let mut mgr = ProviderManager::new(&dir);
+        let pid = mgr
+            .add_provider(
+                ProviderKind::OpenAi,
+                "DeepSeek",
+                "https://api.deepseek.com/v1",
+                "sk-old",
+            )
+            .unwrap();
+        let old_ref = mgr.providers()[0].credential_ref.clone();
+        let fp = mgr.update_credential(&pid, "sk-new").unwrap();
+        assert!(!fp.is_empty());
+        // Same provider record, new handle — no delete + recreate.
+        assert_eq!(mgr.providers().len(), 1);
+        assert_ne!(mgr.providers()[0].credential_ref, old_ref);
+        // New secret is live in the store, old one is gone.
+        let store = mgr.credential_store();
+        let creds = store.lock().unwrap();
+        assert!(creds.has_key(&mgr.providers()[0].credential_ref));
+        assert!(!creds.has_key(&old_ref));
+        drop(creds);
+        // Secret never persisted.
+        let raw = fs::read_to_string(dir.join("db/providers.json")).unwrap();
+        assert!(!raw.contains("sk-new") && !raw.contains("sk-old"));
+        // Unknown provider → NotFound.
+        assert!(matches!(
+            mgr.update_credential("prov_missing", "sk-x"),
+            Err(ProviderError::NotFound(_))
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
