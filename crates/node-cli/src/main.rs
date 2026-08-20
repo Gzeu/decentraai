@@ -6063,19 +6063,26 @@ async fn spawn_network_probe(
                     continue;
                 };
                 let start = Instant::now();
-                // Best-effort: a busy worker may drop the ping; we just skip it.
+                // A request error/timeout counts as a *lost* probe (M9 P2): it
+                // contributes to the packet-loss derivation but yields no RTT.
+                // Best-effort: a busy worker may drop the ping; we just record
+                // the lost sample and keep probing.
                 if p2p_node.request(peer, bytes).await.is_ok() {
                     let rtt_us = start.elapsed().as_micros() as u64;
-                    compute_manager.record_rtt(&peer, rtt_us, 0);
+                    compute_manager.record_rtt_sample(&peer, rtt_us, 0, false);
                     let link = compute_manager.network_graph().get(&peer.to_string());
                     info!(
                         peer = %peer,
                         measured_rtt_us = rtt_us,
+                        jitter_us = ?link.jitter_us,
+                        packet_loss_percent = link.packet_loss_percent,
                         graph_rtt_us = link.rtt_us,
                         graph_locality = ?link.locality,
                         graph_peers = compute_manager.network_graph().measured_len(),
                         "M19 network probe: measured RTT recorded, planner reads via NetworkGraph"
                     );
+                } else {
+                    compute_manager.record_rtt_sample(&peer, 0, 0, true);
                 }
             }
         }

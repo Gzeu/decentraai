@@ -302,6 +302,17 @@ pub struct ComputeManager {
     /// to each peer, fed by a periodic `InferPing` probe and read by the
     /// execution planner to weight reach cost.
     network: std::sync::Mutex<decentraai_fabric::NetworkGraph>,
+    /// Bounded per-peer history of `InferPing` probe samples (M9 P2): each
+    /// entry records success/failure so the coordinator can derive honest
+    /// jitter (MAD over recent RTTs) and packet-loss rate (failure fraction)
+    /// for the planner's `NetworkFacts.` `record_rtt_sample` pushes here; the
+    /// derivation fills `LinkMetrics.jitter_us` / `packet_loss_percent`.
+    link_history: std::sync::Mutex<
+        std::collections::BTreeMap<
+            PeerId,
+            std::collections::VecDeque<crate::probe::LinkSample>,
+        >,
+    >,
     /// Coordinator-side KV-cache / session accounting (M20): which worker
     /// holds each conversation's KV prefix and the honest per-worker KV
     /// occupancy derived from real routed requests + advertised `n_ctx`.
@@ -383,6 +394,7 @@ impl ComputeManager {
                 ),
             )),
             network: std::sync::Mutex::new(decentraai_fabric::NetworkGraph::new()),
+            link_history: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
             executions_path: std::sync::Mutex::new(None),
@@ -778,16 +790,59 @@ impl ComputeManager {
 
     /// Records a measured round-trip time to `peer` (M19). Written by the
     /// periodic `InferPing` network probe; read by the execution planner for
-    /// reach-cost-aware selection.
+    /// reach-cost-aware selection. Bandwidth is optional (`0` = unmeasured).
     pub fn record_rtt(&self, peer: &PeerId, rtt_us: u64, bandwidth_mbps: u32) {
+        self.record_rtt_sample(peer, rtt_us, bandwidth_mbps, false);
+    }
+
+    /// Records one probe outcome for a peer (M9 P2). `lost=true` means the ping
+    /// errored/timed out (counts toward packet loss, contributes no RTT);
+    /// `lost=false` records a successful sample with its measured `rtt_us`.
+    ///
+    /// Keeps a bounded per-peer probe window and derives honest jitter (MAD)
+    /// and packet-loss (failure fraction), writing both into the planner-facing
+    /// [`decentraai_fabric::LinkMetrics`]. A meaningful RTT update also refreshes
+    /// the graph's raw RTT/bandwidth as before.
+    pub fn record_rtt_sample(&self, peer: &PeerId, rtt_us: u64, bandwidth_mbps: u32, lost: bool) {
+        use crate::probe::{derive_link_quality, LinkSample};
+        // 1. push the sample into the bounded per-peer window.
+        {
+            let mut history = self.link_history.lock().unwrap();
+            let window = history
+                .entry(*peer)
+                .or_default();
+            // Bound: keep at most `PROBE_WINDOW` newest samples per peer.
+            if window.len() >= crate::probe::PROBE_WINDOW {
+                window.pop_front();
+            }
+            if lost {
+                window.push_back(LinkSample::Err);
+            } else {
+                window.push_back(LinkSample::Ok(if rtt_us > 0 { rtt_us as u32 } else { 0 }));
+            }
+        }
+        // 2. update the planner-facing link metrics with derived quality.
         let mut graph = self.network.lock().unwrap();
         let prior = graph.get(&peer.to_string());
-        let measured_rtt_us = if rtt_us > 0 {
+        let measured_rtt_us = if !lost && rtt_us > 0 {
             Some(rtt_us as u32)
         } else {
             None
         };
         let link = decentraai_fabric::LinkMetrics::prior(prior.locality, measured_rtt_us);
+        // Derivations read the fresh window (a `&VecDeque<LinkSample>`).
+        let (jitter, loss) = {
+            let history = self.link_history.lock().unwrap();
+            match history.get(peer) {
+                Some(w) => derive_link_quality(w),
+                None => (None, None),
+            }
+        };
+        let link = decentraai_fabric::LinkMetrics {
+            jitter_us: jitter,
+            packet_loss_percent: loss,
+            ..link
+        };
         if bandwidth_mbps > 0 {
             let link = decentraai_fabric::LinkMetrics {
                 bandwidth_mbps,
@@ -3453,6 +3508,45 @@ mod tests {
             "offline is surfaced as a connection error"
         );
         assert_eq!(row.status, "Offline");
+    }
+
+    #[tokio::test]
+    async fn record_rtt_sample_populates_jitter_and_loss() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "c".into(), HashSet::from([worker]));
+        // A stable window of successful probes at a constant RTT → zero jitter,
+        // zero loss.
+        for _ in 0..6 {
+            manager.record_rtt_sample(&worker, 10_000, 0, false);
+        }
+        {
+            let g = manager.network_graph();
+            let link = g.get(&worker.to_string());
+            assert_eq!(
+                link.jitter_us,
+                Some(0),
+                "constant RTT window yields zero jitter"
+            );
+            assert_eq!(
+                link.packet_loss_percent,
+                Some(0.0),
+                "all-successful window yields zero loss"
+            );
+        }
+        // Now a burst of lost probes — loss rises, jitter stays from the successes.
+        for _ in 0..6 {
+            manager.record_rtt_sample(&worker, 0, 0, true);
+        }
+        {
+            let g = manager.network_graph();
+            let link = g.get(&worker.to_string());
+            let loss = link.packet_loss_percent.expect("loss measured");
+            assert!(
+                loss > 0.0 && loss <= 100.0,
+                "lost probes push packet loss > 0, got {loss}"
+            );
+        }
     }
 
     #[tokio::test]

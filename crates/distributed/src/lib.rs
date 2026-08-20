@@ -90,6 +90,7 @@ pub mod evidence_manager;
 pub mod fallback;
 pub mod knowledge_runtime;
 pub mod p2p_handler;
+pub mod probe;
 pub mod queue;
 pub mod rate_limit;
 pub mod replay;
