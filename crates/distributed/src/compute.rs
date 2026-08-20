@@ -1317,7 +1317,7 @@ impl ComputeManager {
                 peer_id: peer_str.clone(),
                 node_name: adv.node_name.clone(),
                 node_version: adv.node_version.clone(),
-                trusted: scheduler.is_trusted(&adv.peer_id),
+                trusted: scheduler.is_trusted(&adv.peer_id) || adv.peer_id == self.local_peer,
                 healthy: adv.availability.healthy(),
                 accepts_remote: adv.accepts_remote_inference || adv.peer_id == self.local_peer,
                 capability: adv.capability.clone(),
@@ -1371,7 +1371,7 @@ impl ComputeManager {
                 let cap = &adv.capability;
                 decentraai_fabric::WorkerFacts {
                     peer_id: adv.peer_id.to_string(),
-                    trusted: scheduler.is_trusted(&adv.peer_id),
+                trusted: scheduler.is_trusted(&adv.peer_id) || adv.peer_id == self.local_peer,
                     healthy: a.healthy(),
                     engine: decentraai_fabric::EngineKind::parse(&cap.engine),
                     tokens_per_second: a.tokens_per_second,
@@ -2683,6 +2683,29 @@ mod tests {
         assert!(
             f.perf_measured,
             "latency-only measurement must count as measured"
+        );
+    }
+
+    #[tokio::test]
+    async fn fabric_graph_treats_local_peer_as_trusted() {
+        // Regression (live two-node validation): the coordinator's OWN peer
+        // must appear trusted in the fabric graph (it always serves its own
+        // work — scheduler.set_local_peer exempts it), so the placement engine
+        // can select it and the dashboard does not show it as UNTRUSTED.
+        let local = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::new());
+        // The local node advertises itself.
+        manager
+            .advertise_local(snapshot(), gpu(), vec![model()], vec![], true)
+            .await;
+        let graph = manager.fabric_graph().await;
+        let local_node = graph
+            .capability
+            .get(&local.to_string())
+            .expect("local advertisement must be in the graph");
+        assert!(
+            local_node.trusted,
+            "the local peer must be treated as trusted by the fabric graph"
         );
     }
 
