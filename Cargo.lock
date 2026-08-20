@@ -1028,9 +1028,12 @@ dependencies = [
 name = "decentraai-agents"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "decentraai-compute",
  "decentraai-hub",
+ "ed25519-dalek 3.0.0",
  "libp2p",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

@@ -13,7 +13,12 @@ libp2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
 
 # Internal dependencies (both are leaves in the dependency graph)
 decentraai-compute = { path = "../compute" }
 decentraai-hub = { path = "../hub" }
+
+[dev-dependencies]
+rand_core.workspace = true

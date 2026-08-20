@@ -54,6 +54,7 @@ pub mod registry;
 pub mod reputation;
 pub mod retrieval;
 pub mod receipt;
+pub mod signed_receipt;
 pub mod selfopt;
 pub mod talent_tree;
 pub mod task;
