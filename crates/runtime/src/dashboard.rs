@@ -677,6 +677,16 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <h2>Workers (compute registry) <span class="count" id="workers-count"></span></h2>
           <div id="workers" class="worker-cards"><div class="empty">no workers yet (compute not attached)</div></div>
         </div>
+        <!-- ADAPTIVE LOAD SPLIT (UI-AXIS-2): how a request-level workload would be
+             shared across CAN_RUN workers, based on each worker's advertised
+             adaptive-contribution factor. Honest advisory (the pure
+             adaptive_load_shares distribution) rendered as one stacked bar. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Adaptive load split <span class="count" id="adaptive-split-note"></span></h2>
+          <div class="nc-bar" style="margin-top:6px"><span class="track" id="adaptive-bar" style="height:16px;display:flex;overflow:hidden;border-radius:8px"></span></div>
+          <div id="adaptive-legend" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:12px;color:var(--muted)"></div>
+          <div class="sub" style="margin-top:8px">How a request-level workload is shared across CAN_RUN workers by advertised adaptive contribution (throughput × idle headroom × thermal/battery pressure). Same pure distribution used by <code>/v1/batch</code>. Never changes scheduling — advisory.</div>
+        </div>
         <!-- RESOURCE PRESSURE (Part 17/22): honest aggregate of measured
              load across the fabric — the local node's real SystemSnapshot
              plus each worker's advertised availability. Every value is
@@ -2811,6 +2821,37 @@ function renderDevices(c){
       }).join('') + '</div></div>';
   }).join('') : '<div class="empty ic">no devices advertised</div>';
 }
+// ADAPTIVE LOAD SPLIT (UI-AXIS-2): render the pure adaptive_load_shares
+// distribution as one stacked bar. Each worker's share (normalized across
+// CAN_RUN workers) becomes a colored segment; the total always sums to ~100%.
+// Advisory only — it reflects the same distribution /v1/batch uses, never
+// instructs the planner.
+function renderAdaptiveSplit(c){
+  const bar = $('adaptive-bar'); const legend = $('adaptive-legend'); const note = $('adaptive-split-note');
+  if (!bar || !legend) return;
+  const workers = (c && c.workers) || [];
+  const withShare = workers.filter(w => w.adaptive_contribution != null);
+  if (!withShare.length) {
+    bar.innerHTML = ''; legend.innerHTML = '<span class="empty">no advertised adaptive-contribution signals yet</span>';
+    if (note) note.textContent = 'awaiting data';
+    return;
+  }
+  const total = withShare.reduce((s, w) => s + Math.max(0, w.adaptive_contribution), 0) || 1;
+  const palette = ['#2dd4bf','#f59e0b','#818cf8','#34d399','#f472b6','#a3e635','#60a5fa','#fbbf24'];
+  const segments = withShare.map((w, i) => {
+    const pct = (Math.max(0, w.adaptive_contribution) / total) * 100;
+    const col = palette[i % palette.length];
+    return { w, pct, col };
+  }).sort((a, b) => b.pct - a.pct);  // largest first, deterministic compact display
+  bar.innerHTML = segments.map(s =>
+    '<i style="width:' + s.pct + '%;background:' + s.col + '" title="' + esc(s.w.node_name || short(s.w.peer_id)) + ' — ' + Math.round(s.pct) + '%"></i>'
+  ).join('');
+  legend.innerHTML = segments.map(s =>
+    '<span style="display:flex;align-items:center;gap:6px"><i style="width:10px;height:10px;background:' + s.col + ';border-radius:3px;display:inline-block"></i>' +
+    esc(s.w.node_name || short(s.w.peer_id)) + ' · <b>' + Math.round(s.pct) + '%</b></span>'
+  ).join('');
+  if (note) note.textContent = withShare.length + ' worker(s)';
+}
 // Resource pressure (Part 17/22): honest aggregate of MEASURED load.
 // Local values come from the live SystemSnapshot in /status; worker values
 // come from each advertisement's ComputeAvailability. Bars are raw numbers,
@@ -4798,7 +4839,7 @@ async function refresh(){
   try { await renderEvidence(); } catch (e) {}
   try { await renderBench(); } catch (e) {}
   try { await renderProviders(); } catch (e) {}
-  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderDevices(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
+  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderAdaptiveSplit(c); renderDevices(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   // Populate the chat model/node selectors ONLY after /v1/compute has been
   // fetched: they need the real worker list (remote models come from
   // c.workers). Calling them earlier with c=null silently produced a selector

@@ -11153,6 +11153,10 @@ mod tests {
             "renderDevices(c)",
             "w.adaptive_contribution",
             "const inferClass = (w)",
+            "function renderAdaptiveSplit(c)",
+            "renderAdaptiveSplit(c)",
+            "id=\"adaptive-bar\"",
+            "id=\"adaptive-legend\"",
         ] {
             assert!(
                 body.contains(needle),
