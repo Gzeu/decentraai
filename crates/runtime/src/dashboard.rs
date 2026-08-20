@@ -292,6 +292,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 /* chat */
 .chat-box{display:flex;flex-direction:column;height:300px}
 #chat-history{flex:1;overflow-y:auto;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.chat-prov{display:inline-block;margin-left:8px;font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:1px 8px;vertical-align:middle}
+.chat-msg .who{font-weight:600;font-size:12px;color:var(--accent);display:inline}
 .chat-msg{max-width:85%;padding:8px 12px;border-radius:12px;font-size:13px;white-space:pre-wrap;word-break:break-word}
 .chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,rgba(34,211,238,.16),rgba(99,102,241,.16));border:1px solid rgba(34,211,238,.25)}
 .chat-msg.node{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
@@ -1493,20 +1495,22 @@ const pinnedNode = () => {
   if (v === '__auto__' || v === 'local') return '';
   return v;
 };
-const addMsg = (role, text) => {
+const addMsg = (role, text, prov) => {
   const div = document.createElement('div');
   div.className = 'chat-msg ' + role;
-  div.innerHTML = '<div class="who">' + (role === 'user' ? 'you' : 'node') + '</div><div>' + esc(text) + '</div>';
+  let who = '<div class="who">' + (role === 'user' ? 'you' : 'node') + '</div>';
+  if (prov) who += '<span class="chat-prov">' + esc(prov) + '</span>';
+  div.innerHTML = who + '<div>' + esc(text) + '</div>';
   chatbox.appendChild(div);
   chatbox.scrollTop = chatbox.scrollHeight;
   return div;
 };
 const saveHist = () => { try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-24))); } catch (e) {} };
 hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : 'user', m.content || '(empty)'));
-const readSse = async (resp) => {
+const readSse = async (resp, prov) => {
   const reader = resp.body.getReader(), dec = new TextDecoder();
   let buffer = '', text = '', tokens = null, streamError = null;
-  const msgNode = addMsg('node', '');
+  const msgNode = addMsg('node', '', prov);
   const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
   try {
     for (;;) {
@@ -1569,14 +1573,19 @@ const sendChat = async (prompt) => {
         servedEl.textContent = '';
       }
     }
+    // Per-message provenance: which node + model actually produced THIS reply.
+    const prov =
+      servedOrigin === 'remote' ? '· served by ' + (servedNode || 'remote worker')
+      : servedOrigin === 'local' ? '· served locally'
+      : '';
     let answer = '', tokens = null;
-    if (stream && r.ok && r.body) { const out = await readSse(r); answer = out.text; tokens = out.tokens; if (out.streamError) { addMsg('node', '(stream error: ' + out.streamError + ')'); } }
+    if (stream && r.ok && r.body) { const out = await readSse(r, prov); answer = out.text; tokens = out.tokens; if (out.streamError) { addMsg('node', '(stream error: ' + out.streamError + ')'); } }
     else {
       const j = await r.json();
       answer = (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || (j && j.error ? ('error: ' + (j.error.message || '')) : '');
     }
     if (controller.signal.aborted) return;
-    addMsg('node', answer || '(empty response)');
+    addMsg('node', answer || '(empty response)', prov);
     hist.push({ role: 'assistant', content: answer || '' });
     if (hist.length > 24) hist.splice(0, hist.length - 24);
     saveHist();

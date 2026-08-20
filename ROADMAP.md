@@ -3015,3 +3015,72 @@ ui2 if the main UI is good).
 Tests: 3 new (persist_model_config atomic rewrite + missing-file refusal +
 model-select endpoint auth/path-traversal/persist). 1138 workspace total
 (1135 + 3); clippy `-D warnings` clean.
+
+## 126. UI Development Plan — complete roadmap (approved) 
+
+Direction (George, 2026-08-20): keep building the app UI (dashboard v1). Four
+priority axes — **complete chat experience**, **mobile/adaptive worker monitor**,
+**admin/management**, and **general UX polish**. Rule: incremental, additive,
+never break a working view (regression tests exist for every view wiring). The
+dashboard is one embedded HTML/JS surface; views are populated from live
+endpoints only (no mock telemetry).
+
+Audit (done): UI1 already has functional renders for 22 views. Backend endpoints
+that exist but are NOT wired to the dashboard yet: `v1/rag/index`, `v1/rag/query`,
+`/v1/knowledge/decide`, `/v1/sessions` (partial), `/mcp`, `v1/models/{id}`.
+
+### UI-AXIS-1: Complete chat experience
+The chat view has streaming, stop, retry, node/model selectors, served-by badge,
+metrics and (new) New-chat. Next, add — each as a separate commit with a test:
+- **per-message provenance**: annotate each assistant message with which node +
+  model served it (from `x-decentra-*` headers), not just the latest message's
+  global badge.
+- **conversation export**: one button copies the current thread (markdown) to the
+  clipboard; purely client-side, no new endpoint.
+- **conversation sessions in the UI**: a lightweight in-page list of the last few
+  local conversations (from localStorage) with rename/delete — local only, no
+  server persistence.
+- **tool-call display**: when an agent response contains `[TOOL_CALL]` blocks,
+  render them as a collapsible "used tool" row instead of raw text.
+
+### UI-AXIS-2: Mobile / adaptive worker monitor
+Direction (stored): fabric across every device (Desktop + Laptop + Phones + Pi +
+NAS + server). Lightweight/mobile workers advertise CPU/RAM/GPU-NPU/battery/
+thermal/network/engines/availability; planner decides how much load to give each
+(adaptive load %). Build the observability side first (advisory + honest), not
+the execution split:
+- new **Devices view** (`/v1/resources` already ships RAM/CPU/GPU; add optional
+  `battery_percent`, `thermal_severity`, `network_class`, `device_class` to the
+  advertisement + resource payload) — a clean device-card grid.
+- in the **Workers view**, surface `device` badge + stress factor (load, thermal,
+  battery) next to each worker, and render the existing `adaptive_load_shares`
+  advisory split as a stacked bar (already computed in the backend).
+- **request pressure per device**: reuse `/v1/stats` + `/v1/resources` to show
+  per-device utilization trend; honest "measured" provenance.
+
+### UI-AXIS-3: Admin / management
+Extend the Security/Admin view (token create/list/revoke already wired):
+- **provider credential re-auth** in the Providers view (backend `PUT
+  /api/admin/providers/{id}/credential` already exists) — a masked "update key"
+  action with audit event shown.
+- **invite/join helper** in Settings: copy a ready invite (bootstrap multiaddr +
+  Tier-1 token) after `decentraai join`; show a checklist of the peer bootstrap.
+- **tier apply dry-run / yes** controls surfaced in the UI with an audit readout
+  (CLI flags exist; add a small admin endpoint only if needed).
+
+### UI-AXIS-4: General UX polish
+Non-functional, low-risk passes that raise quality without changing behavior:
+- consistent empty states ("no data yet") across all grids.
+- consistent badge/status color mapping; keyboard shortcut cheat-sheet.
+- responsive pass for narrow widths (worker/device grids stack).
+- a single "advanced" toggle stays as-is; dark/light CSS variables already in use —
+  add light-theme tuning only if the variables are present.
+
+### Sequencing
+1. UI-AXIS-1 (chat) — purely additive, highest daily value.
+2. UI-AXIS-4 light (empty states + small polish) — cheap, safe.
+3. UI-AXIS-2 Devices view (needs a small backend advertisement extension).
+4. UI-AXIS-3 admin (provider re-auth first; invite helper).
+
+First to land: **per-message provenance** in the chat view (UI-AXIS-1).
+Commits land one feature at a time, each with a regression test.

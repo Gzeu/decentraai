@@ -11044,6 +11044,19 @@ mod tests {
         ] {
             assert!(body.contains(needle), "dashboard must include {needle}");
         }
+        // Per-message provenance wiring: addMsg carries an origin badge and the
+        // stream reader renders it on the message being generated.
+        for needle in [
+            "const addMsg = (role, text, prov)",
+            "chat-prov",
+            "const prov =",
+            "await readSse(r, prov)",
+        ] {
+            assert!(
+                body.contains(needle),
+                "dashboard must wire per-message provenance: {needle}"
+            );
+        }
         // The controls are wired to real behavior: Stop aborts the in-flight
         // request (AbortController) and the model select is populated from the
         // live /status `available_models` payload rather than a hardcoded list.
