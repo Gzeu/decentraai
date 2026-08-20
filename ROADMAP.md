@@ -3112,3 +3112,21 @@ credits once per execution (idempotent). Foundation for P14 Compute Credits —
 nothing further (credits/market/economy/blockchain) proceeds until a node can
 cryptographically prove "I executed task Y, capability Z, produced H, at T" and
 another node verifies it independently.
+
+### P13 TWO-NODE VALIDATION — VERIFIED on real LAN hardware (commit `0b44315`)
+A `decentraai receipt sign|verify` CLI lets one node sign with its identity and
+another verify independently. Verified live on Desktop (192.168.1.138) → Laptop
+(192.168.1.132):
+- Desktop signs a real receipt with its identity → **Laptop VERIFICATION=SUCCESS**
+  (independent, exit 0), receipt decoded with `output_hash` included.
+- **Tamper** (1 byte flipped in the signed payload) → Laptop rejects (exit 1).
+- **Wrong key** (public key + signature replaced) → Laptop rejects (exit 1).
+- **Idempotency**: the same `execution_id` credits the ledger exactly once
+  (`signed_verified_receipt_applies_once` integration test: first>0, again=0).
+- Provenance/audit: the signed envelope carries the canonical bytes + signer
+  public key; the CLI is non-mutating and never touches the ledger.
+
+The strategic gate is met: one node can now cryptographically prove execution
+and another verifies it independently. **P14 Compute Credits** (synthetic,
+non-monetary, derived only from verified+signed compute) is now technically
+justified.
