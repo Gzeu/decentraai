@@ -2886,7 +2886,7 @@ Next (documented): semantic query with a real embedding backend already wired
 objects/decisions between nodes; feeding planner decisions with evidence
 lessons (e.g. success-rate-weighted worker ranking).
 
-## 124. DecentraAI Benchmark Lab — single vs RAG vs collective (DONE, commits to land)
+## 124. DecentraAI Benchmark Lab — single vs RAG vs collective (DONE)
 
 The architecture question DecentraAI exists to answer with data: **does the
 collective beat a single agent?** The lab runs real tasks through the live
@@ -2894,33 +2894,40 @@ inference executor, grades them deterministically against a gold answer, and
 feeds every run into the Evidence RAG (`EvidenceFamily::Benchmark`) so the
 fabric learns from the lab.
 
-- **`crates/agents/src/benchmark.rs`** (pure, 6 tests): `BenchmarkTask`
+- **`crates/agents/src/benchmark.rs`** (pure, 8 tests): `BenchmarkTask`
   (id, prompt, gold, evidence passages), `BenchmarkMode` (Single / Rag /
-  Collective, tags A/B/C), `BenchmarkVerdict` (Correct / Incorrect /
-  Abstained), `RunMetrics` (tokens, latency), `BenchmarkRun` (idempotent in
-  `BenchmarkRegistry`), `ModeAggregate` + `ModeComparison` with honest gates —
-  **`MIN_SAMPLES = 5` graded runs per mode and `MIN_MARGIN = 0.05` accuracy
-  delta** before `collective_beats_single` may be true; below that the verdict
-  is "not enough samples". `normalize_answer` treats any non-alphanumeric as a
-  separator ("forty-two" == "forty two"); `grade_answer` is deterministic and
-  Abstains on missing gold or empty output. Evidence is graded, never guessed.
-- **`crates/distributed/src/benchmark_manager.rs`** (runtime, 5 tests): the
+  Collective, tags A/B/C + human names), `BenchmarkVerdict` (Correct /
+  Incorrect / Abstained), `RunMetrics` (tokens, latency), `BenchmarkRun`
+  (idempotent in `BenchmarkRegistry`), `ModeAggregate` + `ModeComparison`
+  with honest gates — **`MIN_SAMPLES = 5` *shared* graded tasks and
+  `MIN_MARGIN = 0.05` accuracy delta** before `collective_beats_single` may
+  be true; below that the verdict is "not enough samples". The headline
+  `comparison()` is **paired**: only tasks graded in BOTH single and
+  collective count (first graded run per task+mode, deterministic) — a
+  global per-mode aggregate is contaminated when modes see different tasks
+  (easy in collective, hard in single can fake a collective win).
+  `global_comparison()` keeps the raw aggregate as secondary data.
+  `normalize_answer` treats any non-alphanumeric as a separator
+  ("forty-two" == "forty two"); `grade_answer` is deterministic and Abstains
+  on missing gold or empty output. Evidence is graded, never guessed.
+- **`crates/distributed/src/benchmark_manager.rs`** (runtime, 7 tests): the
   `BenchmarkInference` trait (live `InferenceBenchmarkExecutor` over the real
   executor; mocks in tests — production never fakes a generation). Single = one
   generation; RAG = one generation with the task's evidence passages injected
   into the prompt; Collective = N independent generations with a **plurality
   vote on grades** (ties → Abstained — honest, no fabricated consensus). Every
   run feeds `EvidenceFamily::Benchmark` with facts only (task, mode, verdict,
-  metrics).
-- **API**: `GET /v1/bench` (comparison + run count) and
-  `POST /v1/bench/run` (`{prompt, gold?, evidence?, mode?, agents?}` — runs a
-  task through the live executor, grades it, records the run). Operator+ only
-  (real inference tokens). 2 API tests incl. the graded roundtrip and the
-  honest "not enough samples" state.
-- **Dashboard**: Bench view (advanced block) — per-mode accuracy KPIs, the
-  honest verdict ("Collective beats single" or "No verdict yet — not enough
-  samples"), a task runner (question + optional gold + mode + RAG evidence)
-  and per-mode aggregates.
+  metrics incl. `latency_ms`).
+- **API**: `GET /v1/bench` (paired comparison + global aggregate + run count)
+  and `POST /v1/bench/run` (`{prompt, task_id?, gold?, evidence?, mode?,
+  agents?}` — runs a task through the live executor, grades it, records the
+  run). Operator+ only (real inference tokens). 2 API tests incl. the graded
+  roundtrip and the honest "not enough samples" state.
+- **Dashboard**: Bench view (advanced block) — **paired** headline KPIs
+  ("Single (shared)" / "Collective (shared)"), the honest verdict
+  ("Collective beats single" or "No verdict yet — not enough shared tasks"),
+  a task runner (question + optional gold + mode + RAG evidence) and global
+  aggregates as secondary rows.
 - **node-cli**: the lab is wired when a worker has a servable model — it
   shares the live `InferenceAgentExecutor` (local backend / distributed
   routing / tool calling) and the shared `EvidenceManager`, so lab runs
@@ -2942,9 +2949,26 @@ deduped, capped at 6 docs and truncated to 2048 chars (the corpus averages
 32K chars/doc; a budgeted retriever sees the beginning). CLI:
 `decentraai bench run --prompt … --gold … --mode single|rag|collective` and
 `decentraai bench dataset --file bench/browsecomp_plus.jsonl --limit N
---mode single|collective --agents 3`, which runs the batch through the live
-node and prints the honest comparison (no conclusion until MIN_SAMPLES +
-MIN_MARGIN).
+--mode single|collective|rag|both --agents 3`, which runs the batch through
+the live node and prints the honest paired comparison. `--mode both` (default
+for dataset batches) runs every task in single AND collective — the only
+honest way to reach the paired gate.
 
-Tests: 6 pure + 5 manager + 4 dataset + 2 API (1132 workspace total, 1115 + 17
+**First live BrowseComp-Plus data (Llama-3.2-1B, 5 shared tasks, 2026-08-20)**:
+single 0% (0/5) vs collective 20% (1/5, +20pp) — the fabric's first honest
+"collective beats single" verdict, then re-run on 3 tasks: both 0% →
+"no meaningful margin". The concrete finding so far: on deep-research
+queries the decisive factor is **retrieval, not agent count** — RAG with the
+real evidence docs graded 67% (2/3) on the same task set vs 0% without
+evidence, though each RAG run costs ~10 min on the 1B model at 2048-char
+context. More data (and larger models) is required before this is a claim.
+
+**Benchmark lessons in Evidence RAG (DONE)**: `lessons()` now derives
+`bench/single_accuracy`, `bench/collective_accuracy`, `bench/rag_accuracy`
+(graded runs correct / graded runs, Abstained excluded) and
+`bench/median_latency_ms` from `EvidenceFamily::Benchmark` entries — the
+Evidence view shows the lab's own accuracy per mode alongside the execution
+lessons. Zero benchmark evidence in, zero benchmark lessons out.
+
+Tests: 8 pure + 7 manager + 4 dataset + 2 API (1135 workspace total, 1115 + 20
 new); clippy `-D warnings` clean.

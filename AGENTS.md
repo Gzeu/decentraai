@@ -326,23 +326,33 @@ plus the runtime half in `decentraai-distributed`:
 - **Benchmark Lab (DONE)** — "does the collective beat a single agent?":
   `crates/agents/src/benchmark.rs` (pure) is the deterministic task/run
   registry (Single/RAG/Collective modes, `grade_answer` on normalized gold,
-  `Abstained` on missing gold/empty output) with honest gates — a
-  `collective_beats_single` verdict needs **MIN_SAMPLES=5 graded runs per mode
-  and a MIN_MARGIN=0.05 accuracy delta**, otherwise "not enough samples".
-  `crates/distributed/src/benchmark_manager.rs` (runtime) runs tasks through
-  the live inference executor via the `BenchmarkInference` trait (collective
-  = N generations, plurality vote on grades, ties → Abstained) and feeds every
-  run into the Evidence RAG as `EvidenceFamily::Benchmark` (facts only).
-  API: `GET /v1/bench` + `POST /v1/bench/run` (operator+; real tokens);
-  the dashboard has a Bench view. The verdict is a hypothesis about this
-  fabric on this hardware, never a universal claim.
+  `Abstained` on missing gold/empty output) with honest gates — the headline
+  `comparison()` is **paired over tasks graded in BOTH single and collective**
+  (a global per-mode aggregate is contaminated when modes see different
+  tasks), and a `collective_beats_single` verdict needs **MIN_SAMPLES=5 shared
+  graded tasks and a MIN_MARGIN=0.05 accuracy delta**, otherwise "not enough
+  samples". `crates/distributed/src/benchmark_manager.rs` (runtime) runs tasks
+  through the live inference executor via the `BenchmarkInference` trait
+  (collective = N generations, plurality vote on grades, ties → Abstained)
+  and feeds every run into the Evidence RAG as `EvidenceFamily::Benchmark`
+  (facts only). API: `GET /v1/bench` (paired + global) + `POST /v1/bench/run`
+  (operator+; real tokens); the dashboard has a Bench view with paired
+  headline KPIs. The verdict is a hypothesis about this fabric on this
+  hardware, never a universal claim.
   **Dataset adapter (F1)**: `scripts/bench-browsecomp-plus.py` downloads and
   de-obfuscates BrowseComp-Plus (MIT, fixed 100K-doc corpus, 830 reasoning
   queries) into `bench/browsecomp_plus.jsonl`; `crates/distributed/src/
   benchmark_datasets.rs` reads it into tasks (deduped/truncated evidence
   passages — the corpus averages 32K chars/doc). CLI: `decentraai bench run`
-  and `decentraai bench dataset --file … --limit N --mode … --agents N`,
-  which runs a batch through the live node and prints the honest comparison.
+  and `decentraai bench dataset --file … --limit N --mode both --agents N`
+  (both = single + collective per task, the only honest pairing), which runs
+  a batch through the live node and prints the paired comparison. First live
+  data (1B model, 5 shared tasks): single 0% vs collective 20% (+20pp,
+  honest verdict); on 3 tasks both 0% → no meaningful margin. RAG with real
+  evidence docs graded 67% vs 0% without retrieval — evidence suggests
+  retrieval, not agent count, is the decisive factor on deep-research tasks.
+  Benchmark lessons (`bench/*_accuracy`, `bench/median_latency_ms`) are
+  derived in the Evidence RAG's `lessons()`.
 
 **Runtime half (`decentraai-distributed`)**:
 - `AgentOrchestrator`: binds the pure fabric to the live P2P channel —
