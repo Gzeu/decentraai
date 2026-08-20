@@ -58,6 +58,22 @@ pub struct ComputeAvailability {
 }
 
 impl ComputeAvailability {
+    /// A healthy, idle, empty worker state (used by tests and graph builders).
+    pub fn ready() -> Self {
+        Self {
+            available_ram_mb: 0,
+            available_vram_mb: None,
+            load_percent: 0,
+            queue_depth: 0,
+            tokens_per_second: 0,
+            current_latency_ms: 0,
+            status: WorkerHealth::Ready,
+            gpu_temperature_celsius: None,
+            gpu_utilization_percent: None,
+            battery_percent: None,
+        }
+    }
+
     /// Whether the worker reports itself able to accept work.
     pub fn healthy(&self) -> bool {
         self.status.can_accept_work()

@@ -68,6 +68,10 @@ pub struct ModelRequirements {
     pub context_tokens: u32,
     pub quantization: String,
     pub parallelism: u32,
+    /// This node's own peer id, when known, so the planner can label local
+    /// execution honestly. `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_peer: Option<String>,
 }
 
 /// Network quality constraints for a placement.
@@ -169,6 +173,256 @@ pub fn plan_placement(
     }
 }
 
+/// Weights for the placement engine's composite scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PlacementWeights {
+    pub w_compute: f64,
+    pub w_network: f64,
+    pub w_trust: f64,
+    pub w_health: f64,
+    pub w_load: f64,
+    pub w_model: f64,
+    pub w_headroom: f64,
+}
+
+impl Default for PlacementWeights {
+    fn default() -> Self {
+        Self {
+            w_compute: 0.25,
+            w_network: 0.15,
+            w_trust: 0.10,
+            w_health: 0.10,
+            w_load: 0.15,
+            w_model: 0.15,
+            w_headroom: 0.10,
+        }
+    }
+}
+
+/// The pure, deterministic placement engine (Distributed Compute Fabric v2).
+///
+/// Turns a workload's requirements + the live fabric graph into an explainable
+/// [`PlacementPlan`]. Scoring folds seven dimensions:
+///
+/// ```text
+/// COMPUTE FITNESS + NETWORK FITNESS + TRUST + HEALTH +
+/// CURRENT LOAD + MODEL AVAILABILITY + RESOURCE HEADROOM
+/// ```
+///
+/// Hard gates (trust, health, remote opt-in, model availability) reject a
+/// candidate with a safe reason BEFORE any score is computed; soft dimensions
+/// only rank the remaining candidates. When no single node fits the workload
+/// and `allow_distributed` is set, the engine falls back to the compute graph's
+/// candidate groups (multi-worker / multi-GPU readiness) and records the group
+/// as the selected workers with a `distributed` strategy.
+#[derive(Debug, Clone)]
+pub struct PlacementEngine {
+    pub weights: PlacementWeights,
+    pub allow_distributed: bool,
+}
+
+impl Default for PlacementEngine {
+    fn default() -> Self {
+        Self {
+            weights: PlacementWeights::default(),
+            allow_distributed: true,
+        }
+    }
+}
+
+impl PlacementEngine {
+    /// Plans placement for `req` against the nodes in `graph`.
+    pub fn plan(
+        &self,
+        req: &ModelRequirements,
+        graph: &crate::fabric_graph::FabricGraph,
+    ) -> PlacementPlan {
+        let mut candidates = Vec::new();
+        let mut rejected = Vec::new();
+
+        for node in graph.compute.nodes().values() {
+            // Hard gates first — never score a node that must be rejected.
+            if let Some(reason) = self.reject_reason(node, req) {
+                rejected.push(RejectedCandidate {
+                    worker_id: node.peer_id.clone(),
+                    reason,
+                });
+                continue;
+            }
+            let score = self.score(node, req, graph);
+            candidates.push(PlacementCandidate {
+                worker_id: node.peer_id.clone(),
+                score,
+                compute_fitness: self.compute_fitness(node, req),
+                network_fitness: self.network_fitness(node, graph),
+                trust_fitness: if node.trusted { 1.0 } else { 0.0 },
+                health_fitness: if node.healthy { 1.0 } else { 0.0 },
+                load_fitness: self.load_fitness(node),
+                model_available: node.has_model(&req.model_id),
+                resource_headroom: self.headroom(node, req),
+                rtt_ms: node.link.as_ref().map(|l| l.rtt_us / 1000),
+                rejected_reason: None,
+            });
+        }
+
+        // Sort candidates best-first, deterministic on score ties.
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.worker_id.cmp(&b.worker_id))
+        });
+
+        // Single-worker strategy: take the best candidate. Every candidate that
+        // passed the hard gates can run this workload by itself.
+        if let Some(best) = candidates.first().cloned() {
+            return PlacementPlan {
+                model: req.clone(),
+                strategy: if req.local_peer.as_deref() == Some(best.worker_id.as_str()) {
+                    ExecutionStrategy::Local
+                } else {
+                    ExecutionStrategy::SingleWorker
+                },
+                candidates,
+                rejected,
+                selected_workers: vec![best.worker_id],
+                network_cost: best.rtt_ms.unwrap_or(0) as f64,
+                expected_resource_cost: expected_cost(req),
+                execution_mode: "single_worker".to_string(),
+            };
+        }
+
+        // No single node fits. If distributed placement is allowed, look for a
+        // candidate group (increasing size, bounded) whose combined resources
+        // satisfy the workload.
+        if self.allow_distributed {
+            let node_count = graph.compute.nodes().len();
+            for size in 2..=node_count.min(4) {
+                if let Some((group, _)) = graph.compute.candidate_groups(req, size).into_iter().next()
+                {
+                    let network_cost = graph.group_score(&group, req);
+                    return PlacementPlan {
+                        model: req.clone(),
+                        strategy: ExecutionStrategy::Distributed,
+                        candidates,
+                        rejected,
+                        selected_workers: group,
+                        network_cost,
+                        expected_resource_cost: expected_cost(req),
+                        execution_mode: "distributed".to_string(),
+                    };
+                }
+            }
+        }
+
+        // Honest empty plan: no node and no group can run this workload.
+        PlacementPlan {
+            model: req.clone(),
+            strategy: ExecutionStrategy::Distributed,
+            candidates,
+            rejected,
+            selected_workers: Vec::new(),
+            network_cost: 0.0,
+            expected_resource_cost: expected_cost(req),
+            execution_mode: "no_placement".to_string(),
+        }
+    }
+
+    /// Hard-gate rejection reason, or `None` when the node is eligible.
+    fn reject_reason(
+        &self,
+        node: &crate::fabric_graph::FabricNode,
+        req: &ModelRequirements,
+    ) -> Option<String> {
+        if !node.trusted {
+            return Some("untrusted worker".to_string());
+        }
+        if !node.healthy {
+            return Some("worker unhealthy".to_string());
+        }
+        if !node.accepts_remote {
+            return Some("does not accept remote inference".to_string());
+        }
+        if node.capability.gpu.is_none() && req.min_vram_mb > 0 {
+            return Some("no gpu".to_string());
+        }
+        if node.total_vram_mb() < req.min_vram_mb {
+            return Some(format!(
+                "insufficient vram: {} < {} MiB",
+                node.total_vram_mb(),
+                req.min_vram_mb
+            ));
+        }
+        if node.total_ram_mb() < req.min_ram_mb {
+            return Some(format!(
+                "insufficient ram: {} < {} MiB",
+                node.total_ram_mb(),
+                req.min_ram_mb
+            ));
+        }
+        if req.min_gpu_count > 1 {
+            return Some(format!(
+                "single-gpu node cannot satisfy min_gpu_count={}",
+                req.min_gpu_count
+            ));
+        }
+        None
+    }
+
+    fn score(
+        &self,
+        node: &crate::fabric_graph::FabricNode,
+        req: &ModelRequirements,
+        graph: &crate::fabric_graph::FabricGraph,
+    ) -> f64 {
+        let w = &self.weights;
+        w.w_compute * self.compute_fitness(node, req)
+            + w.w_network * self.network_fitness(node, graph)
+            + w.w_trust * if node.trusted { 1.0 } else { 0.0 }
+            + w.w_health * if node.healthy { 1.0 } else { 0.0 }
+            + w.w_load * self.load_fitness(node)
+            + w.w_model * if node.has_model(&req.model_id) { 1.0 } else { 0.0 }
+            + w.w_headroom * self.headroom(node, req)
+    }
+
+    fn compute_fitness(&self, node: &crate::fabric_graph::FabricNode, req: &ModelRequirements) -> f64 {
+        let vram = node.total_vram_mb() as f64;
+        let ram = node.total_ram_mb() as f64;
+        let need_vram = req.min_vram_mb.max(1) as f64;
+        let need_ram = req.min_ram_mb.max(1) as f64;
+        // Saturating fit: 1.0 at exactly enough, grows slowly with headroom.
+        ((vram / need_vram).min(3.0) + (ram / need_ram).min(3.0)) / 6.0
+    }
+
+    fn network_fitness(&self, node: &crate::fabric_graph::FabricNode, graph: &crate::fabric_graph::FabricGraph) -> f64 {
+        let rtt_ms = node.link.as_ref().map(|l| l.rtt_us / 1000).unwrap_or(0);
+        let reach = graph.links.get(&node.peer_id).map(|l| l.reach_cost_ms(1)).unwrap_or(0);
+        let total_ms = rtt_ms.max(reach) as f64;
+        // 1.0 at loopback, decaying toward 0 as reach grows.
+        1.0 / (1.0 + total_ms / 1000.0)
+    }
+
+    fn load_fitness(&self, node: &crate::fabric_graph::FabricNode) -> f64 {
+        let load = node.availability.load_percent as f64 / 100.0;
+        1.0 - load
+    }
+
+    fn headroom(&self, node: &crate::fabric_graph::FabricNode, req: &ModelRequirements) -> f64 {
+        let free_vram = node
+            .availability
+            .available_vram_mb
+            .unwrap_or(node.total_vram_mb());
+        let free_ram = node.availability.available_ram_mb;
+        let need_vram = req.min_vram_mb.max(1) as f64;
+        let need_ram = req.min_ram_mb.max(1) as f64;
+        ((free_vram as f64 / need_vram).min(2.0) + (free_ram as f64 / need_ram).min(2.0)) / 4.0
+    }
+}
+
+fn expected_cost(req: &ModelRequirements) -> f64 {
+    req.min_vram_mb as f64 + req.min_ram_mb as f64 + (req.context_tokens as f64) / 1000.0
+}
+
 /// Future-safe market interfaces (P14 Phase R). Kept unused/optional.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComputeOffer {
@@ -257,5 +511,149 @@ mod tests {
     fn experimental_strategies_flagged() {
         assert!(ExecutionStrategy::MultiGpu.is_experimental());
         assert!(!ExecutionStrategy::Local.is_experimental());
+    }
+
+    #[test]
+    fn placement_engine_picks_single_capable_worker() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        let mut graph = FabricGraph::new();
+        let mut node = FabricNode {
+            peer_id: "peer-a".to_string(),
+            node_name: "A".to_string(),
+            node_version: "1.0.0".to_string(),
+            trusted: true,
+            healthy: true,
+            accepts_remote: true,
+            capability: ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 64_000,
+                gpu: Some(GpuSpec {
+                    name: "t".to_string(),
+                    vram_mb: 24_000,
+                    driver: "t".to_string(),
+                }),
+                engine: "llama_server".to_string(),
+                served_models: vec![],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: crate::availability::ComputeAvailability::ready(),
+            link: None,
+        };
+        node.capability.served_models = vec![crate::capability::ServedModel {
+            model_hash: "m1".to_string(),
+            file_name: "m1.gguf".to_string(),
+            size_mb: 100,
+            est_ram_mb: 200,
+            est_vram_mb: 200,
+            context_tokens: 4096,
+        }];
+        graph.upsert(node);
+
+        let req = ModelRequirements {
+            model_id: "m1".to_string(),
+            min_gpu_count: 1,
+            min_vram_mb: 20_000,
+            min_ram_mb: 30_000,
+            context_tokens: 4096,
+            ..Default::default()
+        };
+        let engine = PlacementEngine::default();
+        let plan = engine.plan(&req, &graph);
+        assert_eq!(plan.selected_workers, vec!["peer-a".to_string()]);
+        assert!(plan.rejected.is_empty());
+    }
+
+    #[test]
+    fn placement_engine_rejects_untrusted_with_reason() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        let mut graph = FabricGraph::new();
+        let node = FabricNode {
+            peer_id: "peer-bad".to_string(),
+            node_name: "B".to_string(),
+            node_version: "1.0.0".to_string(),
+            trusted: false,
+            healthy: true,
+            accepts_remote: true,
+            capability: ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 64_000,
+                gpu: Some(GpuSpec {
+                    name: "t".to_string(),
+                    vram_mb: 24_000,
+                    driver: "t".to_string(),
+                }),
+                engine: "llama_server".to_string(),
+                served_models: vec![],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: crate::availability::ComputeAvailability::ready(),
+            link: None,
+        };
+        graph.upsert(node);
+
+        let req = ModelRequirements {
+            model_id: "m1".to_string(),
+            min_gpu_count: 1,
+            min_vram_mb: 20_000,
+            min_ram_mb: 30_000,
+            ..Default::default()
+        };
+        let engine = PlacementEngine::default();
+        let plan = engine.plan(&req, &graph);
+        assert!(plan.selected_workers.is_empty());
+        assert_eq!(plan.rejected.len(), 1);
+        assert!(plan.rejected[0].reason.contains("untrusted"));
+    }
+
+    #[test]
+    fn placement_engine_falls_back_to_distributed_group() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        let mut graph = FabricGraph::new();
+        for (peer, vram) in [("peer-a", 24_000u64), ("peer-b", 24_000u64), ("peer-c", 24_000u64)] {
+            graph.upsert(FabricNode {
+                peer_id: peer.to_string(),
+                node_name: peer.to_string(),
+                node_version: "1.0.0".to_string(),
+                trusted: true,
+                healthy: true,
+                accepts_remote: true,
+                capability: ComputeCapability {
+                    cpu_cores: 8,
+                    ram_mb: 64_000,
+                    gpu: Some(GpuSpec {
+                        name: "t".to_string(),
+                        vram_mb: vram,
+                        driver: "t".to_string(),
+                    }),
+                    engine: "llama_server".to_string(),
+                    served_models: vec![],
+                    can_provision: false,
+                    available_models: vec![],
+                },
+                availability: crate::availability::ComputeAvailability::ready(),
+                link: None,
+            });
+        }
+
+        // 70 GiB model: no single 24 GiB node fits; three combined do.
+        let req = ModelRequirements {
+            model_id: "big.gguf".to_string(),
+            min_gpu_count: 2,
+            min_vram_mb: 70_000,
+            min_ram_mb: 60_000,
+            ..Default::default()
+        };
+        let engine = PlacementEngine::default();
+        let plan = engine.plan(&req, &graph);
+        assert_eq!(plan.selected_workers.len(), 3, "three workers must be selected");
+        assert_eq!(plan.execution_mode, "distributed");
     }
 }

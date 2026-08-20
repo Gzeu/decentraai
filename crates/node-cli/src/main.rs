@@ -824,8 +824,22 @@ enum ContributionCommand {
         config: PathBuf,
         #[arg(long)]
         model: String,
-        #[arg(long, default_value = "single_worker")]
-        strategy: String,
+        #[arg(long, default_value = "0")]
+        min_vram_mb: u64,
+        #[arg(long, default_value = "0")]
+        min_ram_mb: u64,
+        #[arg(long, default_value = "1")]
+        min_gpu_count: u32,
+        #[arg(long, default_value = "4096")]
+        context_tokens: u32,
+        #[arg(long)]
+        distributed: bool,
+    },
+    /// Show the live fabric graphs (capability, compute, network) as a read-only
+    /// projection.
+    Graph {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
     },
 }
 
@@ -4314,10 +4328,18 @@ async fn contribution_command(command: ContributionCommand) -> Result<()> {
         ContributionCommand::Plan {
             config,
             model,
-            strategy,
+            min_vram_mb,
+            min_ram_mb,
+            min_gpu_count,
+            context_tokens,
+            distributed,
         } => {
             let (client, base_url, token) = build_local_client(&config)?;
-            let url = format!("{base_url}/v1/placement/plan?model_id={model}&strategy={strategy}");
+            let url = format!(
+                "{base_url}/v1/placement/plan?model_id={model}&min_vram_mb={min_vram_mb}&\
+                 min_ram_mb={min_ram_mb}&min_gpu_count={min_gpu_count}&context_tokens={context_tokens}&\
+                 distributed={distributed}"
+            );
             let mut req = client.get(url);
             if let Some(t) = &token {
                 req = req.bearer_auth(t);
@@ -4328,6 +4350,24 @@ async fn contribution_command(command: ContributionCommand) -> Result<()> {
             if !status.is_success() {
                 anyhow::bail!(
                     "placement plan failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
+        ContributionCommand::Graph { config } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.get(format!("{base_url}/v1/fabric/graphs"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "fabric graphs failed (HTTP {}): {}",
                     status,
                     j.get("error").map(|e| e.to_string()).unwrap_or_default()
                 );

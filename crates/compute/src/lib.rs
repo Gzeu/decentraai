@@ -43,6 +43,7 @@ pub mod compensation;
 pub mod contribution;
 pub mod contribution_state;
 pub mod credits;
+pub mod fabric_graph;
 pub mod loadbalance;
 pub mod matcher;
 pub mod placement;
@@ -71,7 +72,11 @@ pub use credits::{
 pub use placement::{
     ComputeDemand, ComputeOffer, ComputePrice, ComputeReservation, ComputeSettlement,
     ExecutionStrategy, ModelRequirements, NetworkConstraints, PlacementCandidate,
-    RejectedCandidate, ResourceConstraints, TrustConstraints, plan_placement,
+    PlacementEngine, PlacementWeights, RejectedCandidate, ResourceConstraints, TrustConstraints,
+    plan_placement,
+};
+pub use fabric_graph::{
+    AdvertisedCapabilities, CapabilityGraph, ComputeGraph, FabricGraph, FabricNode, LinkFacts,
 };
 pub use loadbalance::{LoadShare, adaptive_load_shares};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};

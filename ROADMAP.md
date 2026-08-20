@@ -3220,3 +3220,74 @@ removed.
   `contribution_endpoints_reflect_recorded_credits`.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [x] `cargo test --workspace` green.
+
+## 130. Distributed Compute Fabric v2 — Fabric Graphs + Placement Engine (DONE)
+
+The next layer after P14's accounting foundation: make the fabric *reason* about
+nodes as resource entities through three overlapping graphs, and turn placement
+from `find_worker()` into an explainable planner.
+
+### 130.1 Capability / Compute / Network graphs
+
+- [x] `crates/compute/src/fabric_graph.rs`:
+  - [`FabricNode`] — peer id, name, version, trust/health/remote gates,
+    capability, availability, and measured [`LinkFacts`] (RTT, bandwidth,
+    jitter, packet loss, locality).
+  - [`CapabilityGraph`] — indexes nodes by advertised capability, model hash,
+    and engine; replaces indices on update (stale claims never survive).
+  - [`ComputeGraph`] — aggregate VRAM/RAM across the fabric and
+    `candidate_groups(req, size)` for multi-node resource combination.
+  - [`FabricGraph`] — capability + compute + links; `group_score` folds
+    combined resources + network reach.
+- [x] `LinkFacts` is the pure crate's own serializable link value (the fabric's
+  full `NetworkGraph` stays in `decentraai-fabric`; the coordinator maps it).
+
+### 130.2 Placement engine
+
+- [x] `crates/compute/src/placement.rs`:
+  - [`PlacementEngine`] with [`PlacementWeights`] — composite score over
+    COMPUTE + NETWORK + TRUST + HEALTH + LOAD + MODEL AVAILABILITY + HEADROOM.
+  - Hard gates reject a candidate with a safe reason BEFORE scoring:
+    untrusted, unhealthy, no remote opt-in, no GPU, insufficient VRAM/RAM,
+    min_gpu_count > 1 on a single-GPU node.
+  - Single capable worker → `local` (when it is this node) or `single_worker`.
+  - No single fit + `allow_distributed` → searches compute-graph candidate
+    groups (size 2..=4) and returns a `distributed` plan with the group.
+  - Honest `no_placement` when nothing can run the workload.
+
+### 130.3 Integration
+
+- [x] `ComputeManager::fabric_graph()` — builds the live graph from real
+  advertisements (trust via scheduler, health via availability, remote gate,
+  links via the coordinator's measured NetworkGraph); open circuit-breakers
+  omit workers entirely (P5).
+- [x] Runtime:
+  - `GET /v1/placement/plan?model_id=..&min_vram_mb=..&min_ram_mb=..&min_gpu_count=..&context_tokens=..&distributed=..`
+    now runs the deterministic engine against the live graph (explainable
+    selected/rejected/cost/mode).
+  - `GET /v1/fabric/graphs` (operator+) exposes capability + compute + links
+    as one read-only projection.
+- [x] CLI: `decentraai contribution plan` gained `--min-vram-mb`,
+  `--min-ram-mb`, `--min-gpu-count`, `--context-tokens`, `--distributed`;
+  new `decentraai contribution graph` prints the live graphs.
+- [x] Dashboard v2: new **Graphs** view — capability/compute/network cards from
+  real state plus an interactive placement probe.
+
+### 130.4 Multi-GPU / distributed large-model readiness
+
+- [x] `ModelRequirements.min_gpu_count` gates single-GPU nodes; `ComputeGraph`
+  combines multiple nodes for workloads no single node fits; strategies
+  `Distributed` / `MultiGpu` / `TensorSharding` are represented and
+  experimental-flagged. The engine can now *plan* multi-node placement even
+  though the actual split runtime execution remains gated (honest caveat: no
+  engine advertises sharding, so distributed plans are plans, not yet executed
+  split inference).
+
+### 130.5 Quality gates
+
+- [x] `decentraai-compute` unit tests: 108 tests green (fabric graph +
+  placement engine covered).
+- [x] Runtime integration test
+  `fabric_graphs_and_placement_plan_serve_real_state`.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo test --workspace` green (1184 tests).

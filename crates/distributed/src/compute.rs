@@ -1286,6 +1286,52 @@ impl ComputeManager {
         self.scheduler.lock().await.registry().list()
     }
 
+    /// Builds the live fabric graph (Distributed Compute Fabric v2): every
+    /// advertised node wrapped as a [`FabricNode`] with real capability,
+    /// availability, trust/health/remote gates, plus the measured link facts
+    /// from the coordinator's network graph. The pure `PlacementEngine`
+    /// consumes this to produce explainable placement plans.
+    pub async fn fabric_graph(&self) -> decentraai_compute::FabricGraph {
+        let scheduler = self.scheduler.lock().await;
+        let now = std::time::Instant::now();
+        let breaker = self.breaker.lock().unwrap();
+        let mut graph = decentraai_compute::FabricGraph::new();
+
+        for adv in scheduler.registry().list() {
+            let peer_str = adv.peer_id.to_string();
+            let link = self.network.lock().unwrap().get(&peer_str);
+            let link_facts = decentraai_compute::LinkFacts {
+                rtt_us: link.rtt_us,
+                bandwidth_mbps: link.bandwidth_mbps,
+                jitter_us: link.jitter_us,
+                packet_loss_percent: link.packet_loss_percent,
+                locality: match link.locality {
+                    decentraai_fabric::network::Locality::Local => "local".to_string(),
+                    decentraai_fabric::network::Locality::SameHost => "same_host".to_string(),
+                    decentraai_fabric::network::Locality::Lan => "lan".to_string(),
+                    decentraai_fabric::network::Locality::Remote => "remote".to_string(),
+                },
+            };
+            graph.set_link(&peer_str, link_facts.clone());
+            let node = decentraai_compute::FabricNode {
+                peer_id: peer_str.clone(),
+                node_name: adv.node_name.clone(),
+                node_version: adv.node_version.clone(),
+                trusted: scheduler.is_trusted(&adv.peer_id),
+                healthy: adv.availability.healthy(),
+                accepts_remote: adv.accepts_remote_inference || adv.peer_id == self.local_peer,
+                capability: adv.capability.clone(),
+                availability: adv.availability.clone(),
+                link: Some(link_facts),
+            };
+            // P5: an open (tripped) worker is omitted from planning entirely.
+            if breaker.allow(&adv.peer_id, now) {
+                graph.upsert(node);
+            }
+        }
+        graph
+    }
+
     /// Number of workloads currently booked on `peer` (reservations held).
     pub async fn in_flight(&self, peer: &PeerId) -> usize {
         self.scheduler.lock().await.ledger().in_flight(peer)

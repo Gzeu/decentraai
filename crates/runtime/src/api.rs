@@ -4946,6 +4946,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/credits/events", get(credits_events_handler))
         .route("/v1/verified-compute/history", get(verified_compute_history_handler))
         .route("/v1/placement/plan", get(placement_plan_handler))
+        .route("/v1/fabric/graphs", get(fabric_graphs_handler))
         // P3 - Admin dashboard endpoints
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
@@ -6676,50 +6677,73 @@ async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extr
         )
             .into_response();
     };
-    // Parse minimal requirements from query params; missing values become defaults.
+    // Parse requirements from query params; missing values become defaults.
     let model_id = query
         .get("model_id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let strategy = match query.get("strategy").and_then(|v| v.as_str()) {
-        Some("single_worker") => decentraai_compute::ExecutionStrategy::SingleWorker,
-        Some("remote") => decentraai_compute::ExecutionStrategy::Remote,
-        Some("batch_fan_out") => decentraai_compute::ExecutionStrategy::BatchFanOut,
-        Some("distributed") => decentraai_compute::ExecutionStrategy::Distributed,
-        _ => decentraai_compute::ExecutionStrategy::SingleWorker,
-    };
+    let min_vram_mb = query
+        .get("min_vram_mb")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let min_ram_mb = query
+        .get("min_ram_mb")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let min_gpu_count = query
+        .get("min_gpu_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let context_tokens = query
+        .get("context_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096) as u32;
+    let allow_distributed = query
+        .get("distributed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let requirements = decentraai_compute::ModelRequirements {
         model_id: model_id.clone(),
+        min_gpu_count,
+        min_vram_mb,
+        min_ram_mb,
+        context_tokens,
+        local_peer: Some(compute.local_peer().to_string()),
         ..Default::default()
     };
-    // Build candidates from live worker advertisements. RTT is left as None
-    // here; a future pass can fold the coordinator's measured link metrics.
-    let advertisements = compute.workers().await;
-    let candidates = advertisements
-        .into_iter()
-        .map(|adv| {
-            let worker_id = adv.peer_id.to_string();
-            let score = 1.0_f64;
-            decentraai_compute::PlacementCandidate {
-                worker_id: worker_id.clone(),
-                score,
-                compute_fitness: score,
-                network_fitness: 1.0,
-                trust_fitness: 1.0,
-                health_fitness: 1.0,
-                load_fitness: 1.0,
-                model_available: true,
-                resource_headroom: score,
-                rtt_ms: None,
-                rejected_reason: None,
-            }
-        })
-        .collect();
-    let plan = decentraai_compute::plan_placement(&requirements, candidates, strategy);
+    // Build the live fabric graph and run the deterministic placement engine.
+    let graph = compute.fabric_graph().await;
+    let engine = decentraai_compute::PlacementEngine {
+        allow_distributed,
+        ..Default::default()
+    };
+    let plan = engine.plan(&requirements, &graph);
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&plan).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// V2 — Fabric graphs (read-only projection). Exposes the live capability,
+/// compute, and network graphs as one serializable payload so the dashboard's
+/// operational views and the placement explainer read the same real state.
+async fn fabric_graphs_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let graph = compute.fabric_graph().await;
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&graph).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
 }
@@ -12251,6 +12275,71 @@ mod tests {
         let events = body["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["execution_id"], "exec-1");
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // V2 — the fabric graph projection and the placement engine endpoint both
+    // serve real, explainable output when a compute manager is attached.
+    #[tokio::test]
+    async fn fabric_graphs_and_placement_plan_serve_real_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let peer = decentraai_p2p::PeerId::random();
+        let compute = Arc::new(decentraai_distributed::ComputeManager::new(
+            peer,
+            "test-node".to_string(),
+            std::collections::HashSet::new(),
+        ));
+        compute.add_trusted(peer).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            Some("master".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // /v1/fabric/graphs requires an operator token; unauthenticated -> 401.
+        let resp = client
+            .get(format!("http://{api}/v1/fabric/graphs"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+
+        // With the master token the graph projection is served.
+        let resp = client
+            .get(format!("http://{api}/v1/fabric/graphs"))
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let graph: serde_json::Value = resp.json().await.unwrap();
+        assert!(graph["capability"]["nodes"].is_object() || graph["capability"].is_object());
+        assert!(graph["compute"].is_object());
+        assert!(graph["links"].is_object());
+
+        // Placement plan is available (it is a public read-only projection).
+        let resp = client
+            .get(format!("http://{api}/v1/placement/plan?model_id=m1&min_vram_mb=100"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["model"]["model_id"] == "m1");
+        assert!(body["selected_workers"].is_array());
+        assert!(body["rejected"].is_array());
+        assert!(body["execution_mode"].is_string());
 
         manager.lock().await.shutdown().await.unwrap();
     }

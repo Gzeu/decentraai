@@ -234,6 +234,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <button data-view="contribution"><span class="ico">✚</span>Contribution</button>
     <button data-view="workers"><span class="ico">▤</span>Workers</button>
     <button data-view="network"><span class="ico">○</span>Network</button>
+    <button data-view="graphs"><span class="ico">⌗</span>Graphs</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
     <button data-view="models"><span class="ico">▦</span>Models</button>
     <button data-view="providers"><span class="ico">◈</span>Providers</button>
@@ -364,6 +365,27 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
       <div class="card" style="margin-top:14px"><h2>Verified Compute History</h2><div id="contribution-history" class="stack"></div></div>
     </section>
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
+    <section class="view" id="view-graphs">
+      <div class="card"><h2>Fabric Graphs <span class="live">● Live</span> · Capability + Compute + Network</h2>
+        <p class="hint">The three graphs that drive placement: what each node can do (capability), how resources combine (compute), and how well nodes communicate (network). Everything is derived from real advertisements and measured probes.</p>
+        <div id="graphs-kpis" class="grid kpis-4" style="margin-top:12px"></div>
+      </div>
+      <div class="grid split-3" style="margin-top:14px">
+        <div class="card"><h2>Capability Graph</h2><div id="graphs-capability" class="stack"></div></div>
+        <div class="card"><h2>Compute Graph</h2><div id="graphs-compute" class="stack"></div></div>
+        <div class="card"><h2>Network Graph</h2><div id="graphs-network" class="stack"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Placement Probe</h2>
+        <p class="hint">Ask the deterministic placement engine what it would do for a model of a given size.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <input id="graphs-model" placeholder="model_id" style="flex:1;min-width:160px">
+          <input id="graphs-vram" placeholder="min VRAM MiB (e.g. 70000)" style="flex:1;min-width:160px">
+          <input id="graphs-ram" placeholder="min RAM MiB (e.g. 60000)" style="flex:1;min-width:160px">
+          <button class="button primary" id="graphs-probe">Place</button>
+        </div>
+        <div id="graphs-plan" class="stack" style="margin-top:12px"></div>
+      </div>
+    </section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
     <section class="view" id="view-models"><div class="card"><h2>Models</h2><div id="models" class="list"></div></div></section>
     <section class="view" id="view-providers">
@@ -404,7 +426,7 @@ $('token').addEventListener('change', () => { try { localStorage.setItem(tokenKe
 let autoToken = '';
 (async () => { try { autoToken = (await (await fetch('/v1/token')).text()).trim(); } catch (_) {} })();
 
-const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',providers:'Model Fabric',contribution:'Contribution',settings:'Settings',diagnostics:'Diagnostics'};
+const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',graphs:'Fabric Graphs',execution:'Execution',models:'Models',providers:'Model Fabric',contribution:'Contribution',settings:'Settings',diagnostics:'Diagnostics'};
 let currentView = 'overview', lastStatus = null;
 function show(view) {
   currentView = view;
@@ -415,6 +437,7 @@ function show(view) {
   if (view==='providers') renderProviders();
   if (view==='bench') renderBench();
   if (view==='contribution') renderContribution();
+  if (view==='graphs') renderGraphs();
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => show(button.dataset.view)));
 const advanced = $('advanced');
@@ -982,8 +1005,66 @@ function renderContribution() {
       : '<div class="empty">No verified compute history yet.</div>';
   })();
 }
-function renderProviders() {
-  // Model Fabric: fetch /v1/providers (operator+admin) and render the
+function renderGraphs() {
+  // Fabric Graphs: capability + compute + network projections, all from real
+  // advertisements and measured probes. Placement probe runs the deterministic
+  // placement engine against the live graph.
+  (async () => {
+    let d = null;
+    try { d = await (await fetch('/v1/fabric/graphs',{headers:auth()})).json(); } catch (_) { $('graphs-kpis').innerHTML = kpi('Graphs','—','needs operator token'); return; }
+    const cap = d?.capability || {}, comp = d?.compute || {}, links = d?.links || {};
+    const nodes = cap.nodes || {};
+    const peerCount = Object.keys(nodes).length;
+    const totalVram = Object.values(nodes).reduce((s,n)=>s+(n.total_vram_mb||0),0);
+    const totalRam = Object.values(nodes).reduce((s,n)=>s+(n.total_ram_mb||0),0);
+    const linkCount = Object.keys(links).length;
+    $('graphs-kpis').innerHTML =
+      kpi('Nodes', peerCount, 'in capability graph') +
+      kpi('VRAM', fmtBytes(totalVram*1048576), 'fabric total') +
+      kpi('RAM', fmtBytes(totalRam*1048576), 'fabric total') +
+      kpi('Links', linkCount, 'measured');
+    const nodeRows = Object.values(nodes).map(n => {
+      const gpu = n.capability?.gpu ? n.capability.gpu.name+' · '+fmtBytes(n.total_vram_mb*1048576) : 'no gpu';
+      const models = (n.capability?.served_models||[]).map(m=>m.file_name||m.model_hash).join(', ') || 'none';
+      return '<div class="row"><b>'+esc(n.node_name||n.peer_id.slice(0,18))+'</b><span>'+
+        (n.trusted?'<span class="status">TRUSTED</span>':'<span class="status off">UNTRUSTED</span>')+
+        ' <span class="hint">'+esc(gpu)+' · '+esc(models)+'</span></span></div>';
+    }).join('');
+    $('graphs-capability').innerHTML = nodeRows || '<div class="empty">No nodes in the capability graph yet.</div>';
+    $('graphs-compute').innerHTML =
+      '<div class="row"><b>Combined VRAM</b><span>'+fmtBytes(totalVram*1048576)+'</span></div>' +
+      '<div class="row"><b>Combined RAM</b><span>'+fmtBytes(totalRam*1048576)+'</span></div>' +
+      '<div class="hint">The compute graph aggregates resources so a workload that no single node can run may be placed across a group (distributed strategy).</div>';
+    const linkRows = Object.entries(links).map(([peer,l]) => {
+      const rtt = l.rtt_us ? (l.rtt_us/1000)+'ms' : '—';
+      const bw = l.bandwidth_mbps ? l.bandwidth_mbps+' Mbps' : '—';
+      return '<div class="row"><b>'+esc(peer.slice(0,18))+'…</b><span>'+esc(l.locality||'lan')+' · '+rtt+' · '+bw+'</span></div>';
+    }).join('');
+    $('graphs-network').innerHTML = linkRows || '<div class="empty">No measured links yet — the network probe will fill this on the next interval.</div>';
+  })();
+}
+async function graphsProbe() {
+  const model = $('graphs-model').value.trim() || 'm';
+  const vram = $('graphs-vram').value.trim() || '0';
+  const ram = $('graphs-ram').value.trim() || '0';
+  $('graphs-plan').innerHTML = '<div class="empty">Planning…</div>';
+  try {
+    const r = await fetch('/v1/placement/plan?model_id='+encodeURIComponent(model)+'&min_vram_mb='+encodeURIComponent(vram)+'&min_ram_mb='+encodeURIComponent(ram)+'&distributed=true',{headers:auth()});
+    const d = await r.json();
+    if (!r.ok) { $('graphs-plan').innerHTML = '<div class="empty">'+esc(d.error||r.status)+'</div>'; return; }
+    const mode = d.execution_mode || 'no_placement';
+    const cls = d.selected_workers?.length ? '' : 'idle';
+    $('graphs-plan').innerHTML =
+      '<div class="row"><b>Execution mode</b><span class="status '+cls+'">'+esc(mode.toUpperCase())+'</span></div>' +
+      '<div class="row"><b>Selected workers</b><span>'+esc((d.selected_workers||[]).join(', ')||'none')+'</span></div>' +
+      '<div class="row"><b>Network cost</b><span>'+fmt(d.network_cost)+'</span></div>' +
+      '<div class="row"><b>Expected resource cost</b><span>'+fmt(d.expected_resource_cost)+'</span></div>' +
+      '<div class="hint" style="margin-top:8px">Rejected candidates (safe reasons):</div>' +
+      (d.rejected?.length ? d.rejected.map(r => '<div class="row"><b>'+esc(r.worker_id.slice(0,18))+'…</b><span>'+esc(r.reason)+'</span></div>').join('') : '<div class="empty">None — every candidate is eligible.</div>');
+  } catch (err) { $('graphs-plan').innerHTML = '<div class="empty">Probe failed: '+esc(err)+'</div>'; }
+}
+(() => { const b = $('graphs-probe'); if (b) b.addEventListener('click', graphsProbe); })();
+function renderProviders() {  // Model Fabric: fetch /v1/providers (operator+admin) and render the
   // provider cards with connected models. Credentials are never exposed —
   // only masked fingerprints from the server.
   (async () => {
