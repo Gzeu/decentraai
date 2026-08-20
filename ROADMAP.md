@@ -3130,3 +3130,93 @@ The strategic gate is met: one node can now cryptographically prove execution
 and another verifies it independently. **P14 Compute Credits** (synthetic,
 non-monetary, derived only from verified+signed compute) is now technically
 justified.
+
+## 129. P14 — Compute Contribution / Credits (DONE)
+
+Moves DecentraAI from "distributed inference with verified receipts" toward an
+"autonomous, evidence-first, network-aware distributed compute fabric with
+verified contribution accounting and a node-native operational console."
+Everything is additive; no existing ledger, protocol, or dashboard behavior was
+removed.
+
+### P14 Phase A–B — Unified Resource Contribution
+
+- [x] `crates/compute/src/resource_contribution.rs`: `ResourceContribution`,
+  `ResourceDimension`, `Provenance` (`Measured`/`Derived`/`Estimated`/`Unknown`),
+  and `ResourceContributionBuilder`. Every value preserves provenance; unknowns
+  stay unknown.
+- [x] Dimensions: `cpu_time_seconds`, `ram_bytes_seconds`, `gpu_time_seconds`,
+  `vram_bytes_seconds`, `tokens_processed`, `execution_duration_ms`,
+  `model_work_units`, `network_bytes`, `network_time_ms`,
+  `reservation_duration_ms`, plus extensible `extra` map.
+
+### P14 Phase C–D — Compute Credit Engine
+
+- [x] `crates/compute/src/credits.rs`: `CreditPolicy` (versioned, per-dimension
+  rates: CPU/RAM/GPU/VRAM/duration/tokens/network/success_bonus),
+  `CreditCalculation`, `CreditEvent` (WHO/WHAT/WHY/WHEN/RECEIPT/EXECUTION/
+  POLICY), `CreditLedger` (deterministic, append-oriented, idempotent per
+  execution, bounded events, audited).
+- [x] Default policy is conservative and evidence-first; historical events keep
+  the policy version that produced them.
+
+### P14 Phase E — Node-local Contribution State
+
+- [x] `crates/compute/src/contribution_state.rs`: `NodeContributionState` tracks
+  verified/failed executions, credits earned/consumed/balance, and projections
+  by resource, model, worker, and time range. No centralized economy.
+
+### P14 Phase F — Integration with existing contribution/compensation
+
+- [x] `ComputeManager` keeps legacy `CompensationLedger` and `QuotaLedger`
+  untouched (old behavior preserved).
+- [x] New `credits: CreditLedger` and `contribution_state: NodeContributionState`
+  added; `record_credited_contribution` now also builds a `ResourceContribution`
+  from real measured tokens/duration and credits the new ledger. Failed work
+  earns nothing; duplicates are idempotent.
+- [x] New accessors: `credit_accounts`, `credit_account`, `credit_events`,
+  `credit_policy`, `set_credit_policy`, `credit_ledger`, `contribution_state`,
+  `record_resource_contribution`.
+
+### P14 Phase G–K — Compute Graph, Network-aware Scheduling, Execution Strategies, Large-Model Readiness, Placement Plan
+
+- [x] `crates/compute/src/placement.rs`: `ExecutionStrategy`
+  (`Local`/`SingleWorker`/`Remote`/`BatchFanOut`/`Distributed` + future
+  experimental strategies flagged), `ModelRequirements`,
+  `NetworkConstraints`, `ResourceConstraints`, `TrustConstraints`,
+  `PlacementCandidate`, `RejectedCandidate`, `PlacementPlan`, and pure
+  `plan_placement` with explainable selected/rejected/cost output.
+- [x] Future-safe market interfaces defined but left unused:
+  `ComputeOffer`/`ComputeDemand`/`ComputePrice`/`ComputeReservation`/
+  `ComputeSettlement`.
+
+### P14 Phase L–M — Node Agent / Dashboard
+
+- [x] v2 dashboard (`/ui2`) adds a **Contribution** view in the rail, rendered by
+  `renderContribution()`: live KPIs from `/v1/contribution`,
+  `/v1/credits/balance`, `/v1/credits/events`, and
+  `/v1/verified-compute/history`. No mock data.
+
+### P14 Phase N–Q — APIs / Storage
+
+- [x] Runtime endpoints added:
+  - `GET /v1/contribution` — node-local contribution state.
+  - `GET /v1/credits/balance` — per-account credit balances + policy.
+  - `GET /v1/credits/events` — bounded credit-event audit trail.
+  - `GET /v1/verified-compute/history` — recent verified execution history.
+  - `GET /v1/placement/plan?model_id=...&strategy=...` — explainable placement plan.
+- [x] CLI: `decentraai contribution {state,credits,events,history,plan}`.
+
+### P14 Phase S — Documentation
+
+- [x] This ROADMAP section records the P14 architecture, the contribution/
+  credit model, the evidence chain, and the read-only projection APIs.
+
+### P14 Quality gates
+
+- [x] `decentraai-compute` unit tests: 100 tests green (including new modules).
+- [x] Runtime integration tests:
+  `contribution_endpoints_return_service_unavailable_when_not_attached` and
+  `contribution_endpoints_reflect_recorded_credits`.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo test --workspace` green.

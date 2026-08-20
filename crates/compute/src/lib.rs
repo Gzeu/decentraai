@@ -41,12 +41,16 @@ pub mod availability;
 pub mod capability;
 pub mod compensation;
 pub mod contribution;
+pub mod contribution_state;
+pub mod credits;
 pub mod loadbalance;
 pub mod matcher;
+pub mod placement;
 pub mod quota;
 pub mod registry;
 pub mod requirements;
 pub mod reservation;
+pub mod resource_contribution;
 pub mod scheduler;
 
 #[cfg(test)]
@@ -59,6 +63,16 @@ pub use compensation::{
     total_attempts,
 };
 pub use contribution::{ContributionProfile, contribution_score, suggest_tier};
+pub use contribution_state::{ModelContribution, NodeContributionState, TimeRangeContribution, WorkerContribution};
+pub use credits::{
+    CreditAccount, CreditCalculation, CreditEvent, CreditLedger, CreditPolicy,
+    CreditPolicyDimension, ResourceSummary,
+};
+pub use placement::{
+    ComputeDemand, ComputeOffer, ComputePrice, ComputeReservation, ComputeSettlement,
+    ExecutionStrategy, ModelRequirements, NetworkConstraints, PlacementCandidate,
+    RejectedCandidate, ResourceConstraints, TrustConstraints, plan_placement,
+};
 pub use loadbalance::{LoadShare, adaptive_load_shares};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};
 pub use quota::{
@@ -66,6 +80,7 @@ pub use quota::{
     QuotaReservation,
 };
 pub use registry::ComputeRegistry;
+pub use resource_contribution::{Provenance, ResourceContribution, ResourceContributionBuilder, ResourceDimension};
 pub use requirements::WorkloadRequirements;
 pub use reservation::{Admission, AdmitReason, ReservationLedger, ResourceReservation};
 pub use scheduler::{ComputeScheduler, Placement};

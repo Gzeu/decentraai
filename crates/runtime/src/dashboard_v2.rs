@@ -231,6 +231,7 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
     <button data-view="knowledge"><span class="ico">✦</span>Knowledge</button>
     <button data-view="evidence"><span class="ico">✎</span>Evidence</button>
     <button data-view="bench"><span class="ico">⚗</span>Bench</button>
+    <button data-view="contribution"><span class="ico">✚</span>Contribution</button>
     <button data-view="workers"><span class="ico">▤</span>Workers</button>
     <button data-view="network"><span class="ico">○</span>Network</button>
     <button data-view="execution"><span class="ico">⇄</span>Execution</button>
@@ -350,6 +351,18 @@ input[type=password],select{padding:7px 10px;color:var(--ink);background:rgba(3,
       </div>
       <div class="card" style="margin-top:14px"><h2>Recent Runs</h2><div id="bench-runs" class="stack"></div></div>
     </section>
+    <section class="view" id="view-contribution">
+      <div class="card"><h2>Contribution · Verified Compute Credits <span class="live">● Live</span></h2>
+        <p class="hint">P14 Compute Contribution / Credits — synthetic, non-monetary, evidence-first. Credits are derived only from verified resource contributions (receipt-backed executions). No verified work, no credits.</p>
+        <div id="contribution-kpis" class="grid kpis-4" style="margin-top:12px"></div>
+      </div>
+      <div class="grid split" style="margin-top:14px">
+        <div class="card"><h2>Credit Balances</h2><div id="contribution-balances" class="stack"></div></div>
+        <div class="card"><h2>Contribution State</h2><div id="contribution-state" class="stack"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Recent Credit Events</h2><div id="contribution-events" class="stack"></div></div>
+      <div class="card" style="margin-top:14px"><h2>Verified Compute History</h2><div id="contribution-history" class="stack"></div></div>
+    </section>
     <section class="view" id="view-network"><div class="card"><h2>Network</h2><pre id="network" class="mono"></pre></div></section>
     <section class="view" id="view-execution"><div class="card"><h2>Execution — Planner Decisions</h2><pre id="execution" class="mono"></pre></div></section>
     <section class="view" id="view-models"><div class="card"><h2>Models</h2><div id="models" class="list"></div></div></section>
@@ -391,7 +404,7 @@ $('token').addEventListener('change', () => { try { localStorage.setItem(tokenKe
 let autoToken = '';
 (async () => { try { autoToken = (await (await fetch('/v1/token')).text()).trim(); } catch (_) {} })();
 
-const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',providers:'Model Fabric',settings:'Settings',diagnostics:'Diagnostics'};
+const title = {overview:'EXECUTION FABRIC',chat:'Chat',agents:'Collective Agents',skills:'Skills',workers:'Workers',network:'Network',execution:'Execution',models:'Models',providers:'Model Fabric',contribution:'Contribution',settings:'Settings',diagnostics:'Diagnostics'};
 let currentView = 'overview', lastStatus = null;
 function show(view) {
   currentView = view;
@@ -401,6 +414,7 @@ function show(view) {
   if (!['overview','chat','models','providers'].includes(view)) loadAdvanced(view);
   if (view==='providers') renderProviders();
   if (view==='bench') renderBench();
+  if (view==='contribution') renderContribution();
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => show(button.dataset.view)));
 const advanced = $('advanced');
@@ -928,6 +942,45 @@ async function benchRun() {
       '<div class="hint" style="margin-top:6px">'+esc((run.output||'').slice(0,400))+'</div>';
     renderBench();
   } catch (err) { $('bench-result').innerHTML = '<div class="empty">Run needs a valid operator token: '+esc(err)+'</div>'; }
+}
+function renderContribution() {
+  (async () => {
+    let state = null, bal = null, events = null, hist = null;
+    try { state = await (await fetch('/v1/contribution',{headers:auth()})).json(); } catch (_) {}
+    try { bal = await (await fetch('/v1/credits/balance',{headers:auth()})).json(); } catch (_) {}
+    try { events = await (await fetch('/v1/credits/events',{headers:auth()})).json(); } catch (_) {}
+    try { hist = await (await fetch('/v1/verified-compute/history',{headers:auth()})).json(); } catch (_) {}
+    if (!state && !bal) {
+      $('contribution-kpis').innerHTML = kpi('Credits', '—', 'compute manager not attached');
+      return;
+    }
+    const total = bal?.total_balance ?? 0;
+    const verified = state?.verified_executions ?? 0;
+    const failed = state?.failed_executions ?? 0;
+    $('contribution-kpis').innerHTML =
+      kpi('Balance', total, 'credits') +
+      kpi('Verified', verified, 'executions') +
+      kpi('Failed', failed, 'executions') +
+      kpi('Models', Object.keys(state?.by_model||{}).length, 'contributed');
+    const accounts = bal?.accounts || {};
+    const rows = Object.entries(accounts);
+    $('contribution-balances').innerHTML = rows.length
+      ? rows.map(([a,c]) => '<div class="row"><b>'+esc(a.slice(0,24))+'…</b><span>'+esc(c.balance)+' <span class="hint">earned '+c.earned+'</span></span></div>').join('')
+      : '<div class="empty">No credit accounts yet — verified work earns credits.</div>';
+    $('contribution-state').innerHTML =
+      '<div class="row"><b>Verified executions</b><span>'+esc(verified)+'</span></div>' +
+      '<div class="row"><b>Failed executions</b><span>'+esc(failed)+'</span></div>' +
+      '<div class="row"><b>Total earned</b><span>'+esc(state?.total_credits_earned ?? 0)+'</span></div>' +
+      '<div class="row"><b>Consumed</b><span>'+esc(state?.total_credits_consumed ?? 0)+'</span></div>';
+    const evs = (events?.events || []).slice(0, 20);
+    $('contribution-events').innerHTML = evs.length
+      ? evs.map(e => '<div class="row"><b>'+esc(e.execution_id)+'</b><span>'+e.amount+' credits · v'+e.policy_version+' · '+esc(e.account.slice(0,20))+'…</span></div>').join('')
+      : '<div class="empty">No credit events yet.</div>';
+    const h = (hist?.history || []).slice(0, 20);
+    $('contribution-history').innerHTML = h.length
+      ? h.map(r => '<div class="row"><b>'+esc(r.request_id || r.execution_id || '—')+'</b><span>'+esc(r.worker || 'local')+' · '+(r.succeeded?'ok':'fail')+'</span></div>').join('')
+      : '<div class="empty">No verified compute history yet.</div>';
+  })();
 }
 function renderProviders() {
   // Model Fabric: fetch /v1/providers (operator+admin) and render the

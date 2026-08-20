@@ -4940,6 +4940,12 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
         .route("/v1/batch", post(batch_handler))
+        // P14 - Compute contribution / credits (read-only projections)
+        .route("/v1/contribution", get(contribution_state_handler))
+        .route("/v1/credits/balance", get(credits_balance_handler))
+        .route("/v1/credits/events", get(credits_events_handler))
+        .route("/v1/verified-compute/history", get(verified_compute_history_handler))
+        .route("/v1/placement/plan", get(placement_plan_handler))
         // P3 - Admin dashboard endpoints
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
@@ -6575,6 +6581,147 @@ async fn knowledge_receipt_handler(
         )
             .into_response(),
     }
+}
+
+/// P14 — Node-local contribution state (read-only projection). Returns
+/// verified/failed execution counts, credit balances, and per-resource,
+/// per-model, per-worker, and per-time-range aggregates derived from real
+/// execution evidence.
+async fn contribution_state_handler(State(state): State<ApiState>) -> Response {
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let state = compute.contribution_state();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+/// P14 — Credit balances (read-only). Returns per-account earned/consumed/
+/// balance from the receipt-backed credit ledger.
+async fn credits_balance_handler(State(state): State<ApiState>) -> Response {
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let accounts = compute.credit_accounts();
+    let total = accounts.values().map(|a| a.balance).sum::<u64>();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "accounts": accounts,
+            "total_balance": total,
+            "policy": compute.credit_policy(),
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// P14 — Recent credit events (read-only). Bounded audit trail of who earned
+/// what, from which receipt/execution, under which policy version.
+async fn credits_events_handler(State(state): State<ApiState>) -> Response {
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let events = compute.credit_events();
+    let events: Vec<&decentraai_compute::CreditEvent> = events.iter().collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"events": events}).to_string(),
+    )
+        .into_response()
+}
+
+/// P14 — Verified compute history (read-only). Mirrors the recent execution
+/// trail already kept by the compute manager, surfaced as a stable projection
+/// for dashboards and agents.
+async fn verified_compute_history_handler(State(state): State<ApiState>) -> Response {
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let history = compute.executions();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"history": history}).to_string(),
+    )
+        .into_response()
+}
+
+/// P14 — Placement plan (read-only, explainable). Given model requirements and
+/// a strategy hint, returns candidate workers, rejected candidates with safe
+/// reasons, selected workers, and expected resource/network cost.
+async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extract::Query<serde_json::Map<String, serde_json::Value>>) -> Response {
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    // Parse minimal requirements from query params; missing values become defaults.
+    let model_id = query
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let strategy = match query.get("strategy").and_then(|v| v.as_str()) {
+        Some("single_worker") => decentraai_compute::ExecutionStrategy::SingleWorker,
+        Some("remote") => decentraai_compute::ExecutionStrategy::Remote,
+        Some("batch_fan_out") => decentraai_compute::ExecutionStrategy::BatchFanOut,
+        Some("distributed") => decentraai_compute::ExecutionStrategy::Distributed,
+        _ => decentraai_compute::ExecutionStrategy::SingleWorker,
+    };
+    let requirements = decentraai_compute::ModelRequirements {
+        model_id: model_id.clone(),
+        ..Default::default()
+    };
+    // Build candidates from live worker advertisements. RTT is left as None
+    // here; a future pass can fold the coordinator's measured link metrics.
+    let advertisements = compute.workers().await;
+    let candidates = advertisements
+        .into_iter()
+        .map(|adv| {
+            let worker_id = adv.peer_id.to_string();
+            let score = 1.0_f64;
+            decentraai_compute::PlacementCandidate {
+                worker_id: worker_id.clone(),
+                score,
+                compute_fitness: score,
+                network_fitness: 1.0,
+                trust_fitness: 1.0,
+                health_fitness: 1.0,
+                load_fitness: 1.0,
+                model_available: true,
+                resource_headroom: score,
+                rtt_ms: None,
+                rejected_reason: None,
+            }
+        })
+        .collect();
+    let plan = decentraai_compute::plan_placement(&requirements, candidates, strategy);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&plan).unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
 }
 
 /// P12 run a collective decision over knowledge objects (operator+).
@@ -12015,6 +12162,96 @@ mod tests {
         // The global aggregate still shows the raw single run (secondary data).
         assert_eq!(body["global"]["single"]["runs"], 1);
         assert_eq!(body["global"]["single"]["graded"], 1);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // P14 — Compute Contribution / Credits endpoints return a graceful
+    // service-unavailable payload when no compute manager is attached.
+    #[tokio::test]
+    async fn contribution_endpoints_return_service_unavailable_when_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let client = reqwest::Client::new();
+        for path in [
+            "/v1/contribution",
+            "/v1/credits/balance",
+            "/v1/credits/events",
+            "/v1/verified-compute/history",
+        ] {
+            let resp = client.get(format!("http://{api}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["error"].as_str().unwrap().contains("compute manager"));
+        }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    // P14 — After recording a verified contribution, the credit ledger and
+    // node-local state are surfaced by the read-only API endpoints.
+    #[tokio::test]
+    async fn contribution_endpoints_reflect_recorded_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let peer = decentraai_p2p::PeerId::random();
+        let compute = Arc::new(decentraai_distributed::ComputeManager::new(
+            peer,
+            "test-node".to_string(),
+            std::collections::HashSet::new(),
+        ));
+        compute.add_trusted(peer).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute.clone()),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        // Record one verified execution.
+        compute.record_credited_contribution(&peer, "exec-1", true, Some(100), Some(500));
+        let client = reqwest::Client::new();
+
+        // Contribution state reflects the execution.
+        let resp = client
+            .get(format!("http://{api}/v1/contribution"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["verified_executions"], 1);
+        assert_eq!(body["failed_executions"], 0);
+        assert!(body["total_credits_earned"].as_u64().unwrap() > 0);
+
+        // Credit balance is non-zero for the worker account.
+        let resp = client
+            .get(format!("http://{api}/v1/credits/balance"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["total_balance"].as_u64().unwrap() > 0);
+        let accounts = body["accounts"].as_object().unwrap();
+        assert!(accounts.contains_key(&peer.to_string()));
+
+        // Credit events list the execution.
+        let resp = client
+            .get(format!("http://{api}/v1/credits/events"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["execution_id"], "exec-1");
+
         manager.lock().await.shutdown().await.unwrap();
     }
 

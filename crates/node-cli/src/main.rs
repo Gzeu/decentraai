@@ -133,6 +133,12 @@ enum Command {
         #[command(subcommand)]
         command: BenchCommand,
     },
+    /// P14 — Compute Contribution / Credits: inspect node-local verified
+    /// contribution state, credit balances/events, and placement plans.
+    Contribution {
+        #[command(subcommand)]
+        command: ContributionCommand,
+    },
 }
 #[derive(Debug, Subcommand)]
 enum UpgradeCommand {
@@ -789,6 +795,40 @@ enum BenchCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ContributionCommand {
+    /// Show the node-local contribution state: verified/failed executions,
+    /// credits earned/consumed, and breakdowns by resource/model/worker.
+    State {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Show credit balances from the receipt-backed credit ledger.
+    Credits {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Show recent credit events (provenance).
+    Events {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Show verified compute history (recent executions).
+    History {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+    },
+    /// Explain a placement plan for a model (read-only).
+    Plan {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "single_worker")]
+        strategy: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -863,6 +903,7 @@ async fn main() -> Result<()> {
         Command::Join(args) => join(args).await,
         Command::Upgrade(args) => upgrade_command(args).await,
         Command::Bench { command } => bench_command(command).await,
+        Command::Contribution { command } => contribution_command(command).await,
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -4188,6 +4229,110 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
             let resp = req.send().await?;
             let j: serde_json::Value = resp.json().await?;
             print_bench_comparison(&j);
+        }
+    }
+    Ok(())
+}
+
+/// P14 — Compute Contribution / Credits CLI: read-only inspection of the
+/// node-local verified contribution state, credit balances/events, and
+/// placement plans.
+async fn contribution_command(command: ContributionCommand) -> Result<()> {
+    match command {
+        ContributionCommand::State { config } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.get(format!("{base_url}/v1/contribution"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "contribution state failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
+        ContributionCommand::Credits { config } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.get(format!("{base_url}/v1/credits/balance"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "credit balance failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
+        ContributionCommand::Events { config } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.get(format!("{base_url}/v1/credits/events"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "credit events failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
+        ContributionCommand::History { config } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let mut req = client.get(format!("{base_url}/v1/verified-compute/history"));
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "verified compute history failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
+        ContributionCommand::Plan {
+            config,
+            model,
+            strategy,
+        } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let url = format!("{base_url}/v1/placement/plan?model_id={model}&strategy={strategy}");
+            let mut req = client.get(url);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "placement plan failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
         }
     }
     Ok(())

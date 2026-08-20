@@ -363,6 +363,14 @@ pub struct ComputeManager {
     /// `decentraai_compute::compensation` docs). `Arc`-shared so the runtime's
     /// consumer path can read the SAME authoritative ledger.
     compensation: std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>>,
+    /// P14 — Compute credit engine: a richer, receipt-backed ledger of synthetic
+    /// credits derived from verified resource contributions. Coexists with the
+    /// legacy compensation and quota ledgers; new dashboards and APIs read this
+    /// layer while old behavior remains intact.
+    credits: std::sync::Arc<std::sync::Mutex<decentraai_compute::CreditLedger>>,
+    /// P14 — Node-local contribution state: lifetime, per-model, per-worker, and
+    /// per-resource projections derived from real execution evidence.
+    contribution_state: std::sync::Mutex<decentraai_compute::NodeContributionState>,
 }
 
 impl ComputeManager {
@@ -411,6 +419,14 @@ impl ComputeManager {
                     decentraai_compute::RewardPolicy::default(),
                 ),
             )),
+            credits: std::sync::Arc::new(std::sync::Mutex::new(
+                decentraai_compute::CreditLedger::new(
+                    decentraai_compute::CreditPolicy::default(),
+                ),
+            )),
+            contribution_state: std::sync::Mutex::new(
+                decentraai_compute::NodeContributionState::default(),
+            ),
         }
     }
 
@@ -634,6 +650,39 @@ impl ComputeManager {
                 c.credit(&worker_account, request_id, &profile);
             }
         }
+        // P14: credit the new receipt-backed credit ledger with the same real
+        // measurements. The new ledger is idempotent on (receipt_id, execution_id)
+        // so using request_id for both guarantees no double-crediting across
+        // replay. This is additive: the legacy compensation and quota ledgers
+        // above keep working exactly as before.
+        if verified {
+            use decentraai_compute::{ResourceContributionBuilder, ResourceDimension};
+            let rc = ResourceContributionBuilder::new(request_id, peer.to_string())
+                .capability("inference")
+                .success(true)
+                .dimension(ResourceDimension::new(
+                    "tokens_processed",
+                    tokens_used.map(f64::from).unwrap_or(0.0),
+                    "tokens",
+                ))
+                .dimension(ResourceDimension::new(
+                    "execution_duration_ms",
+                    processing_time_ms.map(f64::from).unwrap_or(0.0),
+                    "ms",
+                ))
+                .build();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let mut credits = self.credits.lock().unwrap();
+            let amount = credits.credit(&peer.to_string(), &rc, request_id, now);
+            drop(credits);
+            if amount > 0 {
+                let mut state = self.contribution_state.lock().unwrap();
+                state.record_execution(&rc, amount);
+            }
+        }
         true
     }
 
@@ -738,6 +787,69 @@ impl ComputeManager {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::CompensationLedger>> {
         self.compensation.clone()
+    }
+
+    // ---- P14 Credit Ledger ----
+
+    /// Snapshot of the credit ledger's per-account balances (P14, read-only).
+    pub fn credit_accounts(
+        &self,
+    ) -> std::collections::BTreeMap<String, decentraai_compute::CreditAccount> {
+        self.credits.lock().unwrap().accounts()
+    }
+
+    /// Balance of one account's P14 credits (read-only).
+    pub fn credit_account(&self, account: &str) -> Option<decentraai_compute::CreditAccount> {
+        self.credits.lock().unwrap().account(account)
+    }
+
+    /// The P14 credit ledger's audit trail (provenance). Read-only.
+    pub fn credit_events(&self) -> std::collections::VecDeque<decentraai_compute::CreditEvent> {
+        self.credits.lock().unwrap().events().clone()
+    }
+
+    /// Replaces the active P14 credit policy. Historical events keep the
+    /// policy/version that produced them.
+    pub fn set_credit_policy(&self, policy: decentraai_compute::CreditPolicy) {
+        self.credits.lock().unwrap().set_policy(policy);
+    }
+
+    /// The active P14 credit policy (read-only).
+    pub fn credit_policy(&self) -> decentraai_compute::CreditPolicy {
+        self.credits.lock().unwrap().policy().clone()
+    }
+
+    /// Shared handle to the authoritative P14 credit ledger.
+    pub fn credit_ledger(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<decentraai_compute::CreditLedger>> {
+        self.credits.clone()
+    }
+
+    /// P14 node-local contribution state (lifetime, per-model, per-worker,
+    /// per-resource projections). Read-only.
+    pub fn contribution_state(&self) -> decentraai_compute::NodeContributionState {
+        self.contribution_state.lock().unwrap().clone()
+    }
+
+    /// Record a resource contribution directly. Used by callers that already
+    /// have a full [`ResourceContribution`] (e.g. verified receipts). Returns
+    /// the credits earned (0 for duplicates or failed work).
+    pub fn record_resource_contribution(
+        &self,
+        rc: &decentraai_compute::ResourceContribution,
+        receipt_id: &str,
+        created_at_ms: u64,
+    ) -> u64 {
+        let account = rc.worker_node.clone();
+        let mut credits = self.credits.lock().unwrap();
+        let amount = credits.credit(&account, rc, receipt_id, created_at_ms);
+        drop(credits);
+        if amount > 0 {
+            let mut state = self.contribution_state.lock().unwrap();
+            state.record_execution(rc, amount);
+        }
+        amount
     }
 
     /// Records a retryable routing failure for `peer` (P5), possibly tripping
