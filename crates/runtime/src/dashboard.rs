@@ -294,6 +294,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 #chat-history{flex:1;overflow-y:auto;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
 .chat-prov{display:inline-block;margin-left:8px;font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:1px 8px;vertical-align:middle}
 .chat-msg .who{font-weight:600;font-size:12px;color:var(--accent);display:inline}
+.tool-call{border:1px solid var(--line);border-radius:8px;margin:6px 0;padding:4px 8px;background:var(--bg-2)}
+.tool-call summary{cursor:pointer;font-size:12px;color:var(--muted)}
+.tool-call pre{margin:6px 0 2px;font-size:11px;white-space:pre-wrap;word-break:break-word}
 .chat-msg{max-width:85%;padding:8px 12px;border-radius:12px;font-size:13px;white-space:pre-wrap;word-break:break-word}
 .chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,rgba(34,211,238,.16),rgba(99,102,241,.16));border:1px solid rgba(34,211,238,.25)}
 .chat-msg.node{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
@@ -1521,12 +1524,31 @@ const pinnedNode = () => {
   if (v === '__auto__' || v === 'local') return '';
   return v;
 };
+// Render an assistant message, surfacing `[TOOL_CALL]{json}[/TOOL_CALL]` blocks
+// as a compact collapsible tool row instead of raw fence text. Everything that
+// is not a tool block is shown verbatim. Pure string → HTML builder (escapes).
+const renderMsgText = (raw) => {
+  const out = [];
+  let rest = String(raw || '');
+  const re = /\[TOOL_CALL\]([\s\S]*?)\[\/TOOL_CALL\]/g;
+  let last = 0, m, i = 0;
+  while ((m = re.exec(rest)) !== null) {
+    if (m.index > last) out.push(esc(rest.slice(last, m.index)));
+    let name = 'tool', args = '…';
+    try { const o = JSON.parse(m[1]); name = o.name || name; args = JSON.stringify(o.arguments || {}); } catch (e) {}
+    out.push('<details class="tool-call"><summary>🔧 used tool · <code>' + esc(name) + '</code></summary><pre>' + esc(args) + '</pre></details>');
+    last = re.lastIndex; i++;
+  }
+  if (last < rest.length) out.push(esc(rest.slice(last)));
+  if (!out.length) return esc(raw);
+  return out.join('\n');
+};
 const addMsg = (role, text, prov) => {
   const div = document.createElement('div');
   div.className = 'chat-msg ' + role;
   let who = '<div class="who">' + (role === 'user' ? 'you' : 'node') + '</div>';
   if (prov) who += '<span class="chat-prov">' + esc(prov) + '</span>';
-  div.innerHTML = who + '<div>' + esc(text) + '</div>';
+  div.innerHTML = who + '<div>' + (role === 'user' ? esc(text) : renderMsgText(text)) + '</div>';
   chatbox.appendChild(div);
   chatbox.scrollTop = chatbox.scrollHeight;
   return div;
@@ -1560,6 +1582,9 @@ const readSse = async (resp, prov) => {
     }
   } catch (e) { streamError = 'stream interrupted: ' + e; }
   finally { reader.releaseLock(); }
+  // Render tool-call blocks on the final, complete text (during streaming we
+  // kept the plain text for smooth incremental output).
+  bodyEl.innerHTML = renderMsgText(text);
   return { text, tokens, streamError };
 };
 const chatStatus = $('chat-status'), chatStopBtn = $('chat-stop'), chatRetryBtn = $('chat-retry'), chatSendBtn = $('chat-send');

@@ -11058,6 +11058,20 @@ mod tests {
             body.contains("openSession(id); saveSessions(); syncSessionPicker()"),
             "New chat must persist + resync after opening a session"
         );
+        // Tool-call display: [TOOL_CALL] blocks render as a collapsible row, and
+        // the streamed final body re-renders with that transform. We assert the
+        // stable wiring markers (the details/summary builder + the final innerHTML
+        // re-render) rather than the exact regex body, which is implementation detail.
+        for needle in [
+            "const renderMsgText = (raw)",
+            "<details class=\"tool-call\">",
+            "bodyEl.innerHTML = renderMsgText(text)",
+        ] {
+            assert!(
+                body.contains(needle),
+                "dashboard must wire tool-call display: {needle}"
+            );
+        }
         // Export wiring: builds markdown from the in-memory history and copies
         // it, with a same-page execCommand fallback for non-secure contexts.
         for needle in [
