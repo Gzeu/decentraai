@@ -514,6 +514,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <button id="chat-send" class="primary">Send</button>
             <button id="chat-stop" class="danger" style="display:none">Stop</button>
             <button id="chat-retry" disabled>Retry</button>
+            <button id="chat-new" title="Clear this conversation (keeps settings)" style="margin-left:6px">New chat</button>
           </div>
           <div class="chat-controls" style="margin-top:8px">
             <select id="chat-node" title="Node to serve chat (fabric)" style="min-width:150px"></select>
@@ -1611,6 +1612,19 @@ chatStopBtn.addEventListener('click', () => { if (currentController) currentCont
 chatRetryBtn.addEventListener('click', () => { if (currentController || !lastUserPrompt) return; sendChat(lastUserPrompt); });
 setStreamingUI(false);
 chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSendBtn.click(); } });
+// "New chat": clear the conversation (history is kept in-memory + localStorage).
+// Resets lastUserPrompt so Retry is disabled, clears the rendered messages and
+// the served-origin badge, but preserves the node/model/stream selections.
+$('chat-new').addEventListener('click', () => {
+  if (currentController) return;               // don't wipe a reply mid-stream
+  hist = []; lastUserPrompt = null;
+  try { localStorage.removeItem(HIST_KEY); } catch (e) {}
+  chatbox.innerHTML = '<div class="chat-msg node"><div class="who">node</div>Ask the node something. Streamed from the fabric route path.</div>';
+  const servedEl = $('chat-served'); if (servedEl) servedEl.textContent = '';
+  const m = $('chat-metrics'); if (m) m.innerHTML = '';
+  chatStatus.textContent = 'ready';
+  setStreamingUI(false);
+});
 
 // ---- worker trust actions (master-gated) -----------------------------------
 const workerAct = async (action, peerId) => {

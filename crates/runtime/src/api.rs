@@ -11039,6 +11039,8 @@ mod tests {
             "<select id=\"chat-model\"",
             "id=\"chat-stop\"",
             "id=\"chat-retry\"",
+            "id=\"chat-new\"",
+            "localStorage.removeItem(HIST_KEY)",
         ] {
             assert!(body.contains(needle), "dashboard must include {needle}");
         }
