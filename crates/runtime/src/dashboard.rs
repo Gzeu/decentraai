@@ -517,6 +517,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <button id="chat-stop" class="danger" style="display:none">Stop</button>
             <button id="chat-retry" disabled>Retry</button>
             <button id="chat-new" title="Clear this conversation (keeps settings)" style="margin-left:6px">New chat</button>
+            <button id="chat-export" title="Copy this conversation as markdown">Export</button>
           </div>
           <div class="chat-controls" style="margin-top:8px">
             <select id="chat-node" title="Node to serve chat (fabric)" style="min-width:150px"></select>
@@ -1633,6 +1634,34 @@ $('chat-new').addEventListener('click', () => {
   const m = $('chat-metrics'); if (m) m.innerHTML = '';
   chatStatus.textContent = 'ready';
   setStreamingUI(false);
+});
+// "Export": copy the current conversation as markdown. Purely client-side —
+// reads the in-memory `hist` (what's actually shown), never touches the backend.
+$('chat-export').addEventListener('click', async () => {
+  if (!hist.length) { chatStatus.textContent = 'nothing to export'; return; }
+  const q = $('chat-input');
+  const activeSel = (currentModel() || activeModel || '');
+  const lines = ['# DecentraAI chat', '', 'Model: ' + activeSel, ''];
+  for (const m of hist) {
+    const w = m.role === 'user' ? '**You**' : '**Assistant**';
+    const c = (m.content || '').trim() ? m.content : '(empty response)';
+    lines.push(w, '', c, '');
+  }
+  const md = lines.join('\n');
+  try {
+    await navigator.clipboard.writeText(md);
+    chatStatus.textContent = 'copied';
+  } catch (e) {
+    // Clipboard API can be unavailable (non-secure context). Fall back to a
+    // temporary textarea + execCommand.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = md; document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      chatStatus.textContent = ok ? 'copied (fallback)' : 'copy failed';
+    } catch (e2) { chatStatus.textContent = 'copy failed'; }
+  }
 });
 
 // ---- worker trust actions (master-gated) -----------------------------------

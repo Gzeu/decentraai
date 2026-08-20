@@ -11041,8 +11041,21 @@ mod tests {
             "id=\"chat-retry\"",
             "id=\"chat-new\"",
             "localStorage.removeItem(HIST_KEY)",
+            "id=\"chat-export\"",
         ] {
             assert!(body.contains(needle), "dashboard must include {needle}");
+        }
+        // Export wiring: builds markdown from the in-memory history and copies
+        // it, with a same-page execCommand fallback for non-secure contexts.
+        for needle in [
+            "const md = lines.join('\\n')",
+            "navigator.clipboard.writeText(md)",
+            "document.execCommand('copy')",
+        ] {
+            assert!(
+                body.contains(needle),
+                "dashboard must wire conversation export: {needle}"
+            );
         }
         // Per-message provenance wiring: addMsg carries an origin badge and the
         // stream reader renders it on the message being generated.
