@@ -526,6 +526,12 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
             <span class="chat-status" id="chat-status">ready</span>
             <span id="chat-served"></span>
           </div>
+          <div class="chat-controls" style="margin-top:6px;align-items:center">
+            <label for="chat-session" style="font-size:12px;color:var(--muted)">session</label>
+            <select id="chat-session" title="Conversation session (local only)" style="min-width:150px"></select>
+            <button id="chat-rename" title="Rename this session" style="font-size:12px">Rename</button>
+            <button id="chat-del" title="Delete this session" class="danger" style="font-size:12px">Delete</button>
+          </div>
           <div class="chat-metrics" id="chat-metrics" style="margin-top:8px;display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)"></div>
         </div>
       </div>
@@ -1476,9 +1482,28 @@ $('share').innerHTML = "__SHARE__";
 const activeModel = "__MODEL__";
 
 // ---- chat (quick chat; Open WebUI is the primary Chat) ----------------------
-const HIST_KEY = 'decentraai.chat.history';
+const SESS_KEY = 'decentraai.chat.sessions';
+// Multi-session chat: `sessions` maps an id -> {name, messages, ts}; `hist` is
+// an alias for the currently open session's messages so the existing send/export
+// code keeps working unchanged. New/rename/delete manage the map.
+const uid = () => 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+let sessions = {};
+try { sessions = JSON.parse(localStorage.getItem(SESS_KEY)) || {}; } catch (e) {}
+let currentSessionId = null;
 let hist = [];
-try { hist = JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch (e) {}
+const openSession = (id) => {
+  currentSessionId = id;
+  hist = sessions[id] ? sessions[id].messages : (hist = []);
+  return hist;
+};
+if (!Object.keys(sessions).length) {
+  const id = uid(); sessions[id] = { name: 'Chat 1', messages: [], ts: Date.now() };
+  openSession(id);
+} else {
+  currentSessionId = Object.keys(sessions)[0];
+  openSession(currentSessionId);
+}
+const saveSessions = () => { try { localStorage.setItem(SESS_KEY, JSON.stringify(sessions)); } catch (e) {} };
 const chatbox = $('chat-history'), chatModel = $('chat-model'), chatNode = $('chat-node'), chatInput = $('chat-input');
 // `__auto__` = fabric-wide best-model picker; `remote:<node>:<file>` = an
 // explicit remote worker's model (sendChat turns it into worker_hint).
@@ -1506,7 +1531,7 @@ const addMsg = (role, text, prov) => {
   chatbox.scrollTop = chatbox.scrollHeight;
   return div;
 };
-const saveHist = () => { try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-24))); } catch (e) {} };
+const saveHist = () => { if (currentSessionId && sessions[currentSessionId]) { sessions[currentSessionId].messages = hist; sessions[currentSessionId].ts = Date.now(); saveSessions(); } };
 hist.forEach(m => addMsg(m.role === 'assistant' ? 'node' : 'user', m.content || '(empty)'));
 const readSse = async (resp, prov) => {
   const reader = resp.body.getReader(), dec = new TextDecoder();
@@ -1622,19 +1647,33 @@ chatStopBtn.addEventListener('click', () => { if (currentController) currentCont
 chatRetryBtn.addEventListener('click', () => { if (currentController || !lastUserPrompt) return; sendChat(lastUserPrompt); });
 setStreamingUI(false);
 chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSendBtn.click(); } });
-// "New chat": clear the conversation (history is kept in-memory + localStorage).
-// Resets lastUserPrompt so Retry is disabled, clears the rendered messages and
-// the served-origin badge, but preserves the node/model/stream selections.
+// "New chat": open a fresh session (keeps settings). Saves the previous one in
+// the sessions list so it can be reopened; resets in-memory messages and the
+// served-origin badge; preserves the node/model/stream selections.
 $('chat-new').addEventListener('click', () => {
-  if (currentController) return;               // don't wipe a reply mid-stream
-  hist = []; lastUserPrompt = null;
-  try { localStorage.removeItem(HIST_KEY); } catch (e) {}
+  if (currentController) return;               // don't wipe output mid-stream
+  lastUserPrompt = null;
+  const id = uid();
+  const n = Object.keys(sessions).length + 1;
+  sessions[id] = { name: 'Chat ' + n, messages: [], ts: Date.now() };
+  openSession(id); saveSessions(); syncSessionPicker();
   chatbox.innerHTML = '<div class="chat-msg node"><div class="who">node</div>Ask the node something. Streamed from the fabric route path.</div>';
   const servedEl = $('chat-served'); if (servedEl) servedEl.textContent = '';
   const m = $('chat-metrics'); if (m) m.innerHTML = '';
   chatStatus.textContent = 'ready';
   setStreamingUI(false);
 });
+// Render the session dropdown options; keeps the active one selected. Called
+// on load, on new/save/rename/delete and after switching.
+const syncSessionPicker = () => {
+  const sel = $('chat-session'); if (!sel) return;
+  const before = sel.value;
+  sel.innerHTML = Object.keys(sessions)
+    .sort((a, b) => (sessions[b].ts || 0) - (sessions[a].ts || 0))
+    .map(id => { const s = sessions[id] || {}; return '<option value="' + id + '">' + esc(s.name || 'Chat') + '</option>'; })
+    .join('');
+  sel.value = before || currentSessionId;
+};
 // "Export": copy the current conversation as markdown. Purely client-side —
 // reads the in-memory `hist` (what's actually shown), never touches the backend.
 $('chat-export').addEventListener('click', async () => {
@@ -1663,6 +1702,52 @@ $('chat-export').addEventListener('click', async () => {
     } catch (e2) { chatStatus.textContent = 'copy failed'; }
   }
 });
+
+// ---- conversation sessions ---------------------------------------------------
+// Switch to an existing session: save the current one's messages, load the
+// target's, redraw the box. Guard: never destroy a reply mid-stream.
+$('chat-session').addEventListener('change', () => {
+  if (currentController) return;
+  const target = $('chat-session').value;
+  if (!target || target === currentSessionId || !sessions[target]) return;
+  if (currentSessionId && sessions[currentSessionId]) {
+    sessions[currentSessionId].messages = hist;
+    sessions[currentSessionId].ts = Date.now();
+  }
+  openSession(target);
+  chatbox.innerHTML = '<div class="chat-msg node"><div class="who">node</div>Ask the node something. Streamed from the fabric route path.</div>';
+  (hist || []).forEach(m => addMsg(m.role === 'assistant' ? 'node' : 'user', m.content || '(empty)'));
+  const servedEl = $('chat-served'); if (servedEl) servedEl.textContent = '';
+  const mm = $('chat-metrics'); if (mm) mm.innerHTML = '';
+  chatStatus.textContent = 'ready';
+  setStreamingUI(false);
+});
+// Rename the active session (prompt for a new name; empty keeps the current).
+$('chat-rename').addEventListener('click', () => {
+  if (!currentSessionId || !sessions[currentSessionId]) return;
+  const cur = sessions[currentSessionId].name || 'Chat';
+  const name = (prompt('Session name:', cur) || '').trim();
+  if (!name || name === cur) return;
+  sessions[currentSessionId].name = name; saveSessions(); syncSessionPicker();
+});
+// Delete the active session; auto-switch to the most recently used remaining, or
+// create a fresh one if it was the last.
+$('chat-del').addEventListener('click', () => {
+  if (currentController || !currentSessionId) return;
+  delete sessions[currentSessionId];
+  const ids = Object.keys(sessions);
+  if (!ids.length) {
+    const id = uid(); sessions[id] = { name: 'Chat 1', messages: [], ts: Date.now() }; ids.push(id);
+  }
+  currentSessionId = null; openSession(ids[0]); saveSessions(); syncSessionPicker();
+  chatbox.innerHTML = '<div class="chat-msg node"><div class="who">node</div>Ask the node something. Streamed from the fabric route path.</div>';
+  (hist || []).forEach(m => addMsg(m.role === 'assistant' ? 'node' : 'user', m.content || '(empty)'));
+  const servedEl = $('chat-served'); if (servedEl) servedEl.textContent = '';
+  const mm = $('chat-metrics'); if (mm) mm.innerHTML = '';
+  chatStatus.textContent = 'ready';
+  setStreamingUI(false);
+});
+syncSessionPicker();
 
 // ---- worker trust actions (master-gated) -----------------------------------
 const workerAct = async (action, peerId) => {

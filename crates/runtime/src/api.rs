@@ -11040,11 +11040,24 @@ mod tests {
             "id=\"chat-stop\"",
             "id=\"chat-retry\"",
             "id=\"chat-new\"",
-            "localStorage.removeItem(HIST_KEY)",
-            "id=\"chat-export\"",
+            "const SESS_KEY = 'decentraai.chat.sessions'",
+            "id=\"chat-session\"",
+            "id=\"chat-rename\"",
+            "id=\"chat-del\"",
+            "syncSessionPicker()",
         ] {
             assert!(body.contains(needle), "dashboard must include {needle}");
         }
+        // Multi-session model: history is sliced per session, New chat opens a
+        // fresh session, and the picker is synced after every mutation.
+        assert!(
+            body.contains("sessions[id] = { name: 'Chat '"),
+            "New chat must open a fresh named session"
+        );
+        assert!(
+            body.contains("openSession(id); saveSessions(); syncSessionPicker()"),
+            "New chat must persist + resync after opening a session"
+        );
         // Export wiring: builds markdown from the in-memory history and copies
         // it, with a same-page execCommand fallback for non-secure contexts.
         for needle in [
