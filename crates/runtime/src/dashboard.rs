@@ -620,6 +620,10 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
             (<code>decentraai trust add --peer &lt;peer-id&gt;</code>) and it will appear here
             when advertising.
           </p>
+          <div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button id="copy-multiaddr" title="Copy this node's reachable P2P multiaddr (use it with `decentraai invite --addr` / manual join)">Copy reachable multiaddr</button>
+            <code id="multiaddr-copy-status" class="mono" style="font-size:12px;color:var(--muted)"></code>
+          </div>
         </div>
       </section>
 
@@ -1798,6 +1802,25 @@ $('chat-del').addEventListener('click', () => {
   setStreamingUI(false);
 });
 syncSessionPicker();
+
+// ---- invite/join helper (UI-AXIS-3, LOW) ------------------------------------
+// Copy this node's real reachable P2P multiaddr so the operator can form the
+// `decentraai invite --addr <multiaddr>` command / manual join target. Uses the
+// live local address from /v1/network (honest, never a placeholder).
+const copyMultiaddrBtn = $('copy-multiaddr');
+if (copyMultiaddrBtn) copyMultiaddrBtn.addEventListener('click', async () => {
+  const addr = (stageData && stageData.localAddr) || '';
+  const statusEl = $('multiaddr-copy-status');
+  if (!addr) {
+    if (statusEl) statusEl.textContent = 'no reachable multiaddr known yet — refresh (network must be up)';
+    return;
+  }
+  let ok = false;
+  try { await navigator.clipboard.writeText(addr); ok = true; } catch (e) {
+    try { const ta = document.createElement('textarea'); ta.value = addr; document.body.appendChild(ta); ta.select(); ok = document.execCommand('copy'); document.body.removeChild(ta); } catch (e2) {}
+  }
+  if (statusEl) statusEl.textContent = ok ? ('copied ' + addr) : 'copy failed';
+});
 
 // ---- worker trust actions (master-gated) -----------------------------------
 const workerAct = async (action, peerId) => {

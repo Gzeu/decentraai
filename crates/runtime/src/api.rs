@@ -11160,6 +11160,8 @@ mod tests {
             "updateProviderCredential",
             "async function updateProviderCredential(btn)",
             "/providers/' + encodeURIComponent(pid) + '/credential'",
+            "id=\"copy-multiaddr\"",
+            "stageData && stageData.localAddr",
         ] {
             assert!(
                 body.contains(needle),
