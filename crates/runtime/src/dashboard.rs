@@ -345,7 +345,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pal-item .d{margin-left:auto;font-size:11px;color:var(--faint)}
 .pal-empty{padding:20px;color:var(--faint);text-align:center;font-size:13px}
 kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px solid var(--line-2);border-radius:5px;padding:1px 6px;color:var(--muted)}
-.empty{color:var(--faint);font-size:12.5px;padding:10px 4px}
+.empty{color:var(--faint);font-size:12.5px;padding:10px 4px;text-align:left}
+.empty.ic{font-style:normal;letter-spacing:.2px}
+.empty.ic::before{content:"∅ ";color:var(--faint);opacity:.8}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:900px){.two-col{grid-template-columns:1fr}.layout{grid-template-columns:64px minmax(0,1fr)}.rail{padding:14px 8px}.brand-name,.brand-sub,.rail-label,.nav-item span:not(.ic),.rail-live span:last-child{display:none}.rail-live{justify-content:center}.fabric-stage{height:360px}.ds-row{flex-direction:column}.ds-step{border-left:1px solid var(--line);border-radius:0}.ds-step:first-child{border-radius:10px 10px 0 0}.ds-step:last-child{border-radius:0 0 10px 10px}.card{overflow-x:auto;-webkit-overflow-scrolling:touch}}
 </style>
@@ -497,7 +499,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 
       <div class="card" style="margin-top:14px">
         <h2>Recent inference calls</h2>
-        <div id="recent-chart" class="empty" style="margin-bottom:8px">no throughput data yet</div>
+        <div id="recent-chart" class="empty ic" style="margin-bottom:8px">no throughput data yet</div>
         <table><thead><tr><th>Time</th><th>Endpoint</th><th class="num">Prompt tok</th><th class="num">Gen tok</th><th class="num">ms</th><th class="num">tok/s</th></tr></thead>
         <tbody id="recent"><tr><td colspan="6" class="empty">no inference calls yet</td></tr></tbody></table>
       </div>

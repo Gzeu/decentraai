@@ -11121,6 +11121,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn dashboard_uses_consistent_empty_state_styling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{api}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        // UI-AXIS-4 light: empty states share one style token. The `.empty`
+        // class exists, an optional `.ic` variant prefixes a faint "∅" glyph for
+        // top-level empty blocks, and the key throughput card uses it.
+        for needle in [".empty{color", ".empty.ic::before", "class=\"empty ic\""] {
+            assert!(
+                body.contains(needle),
+                "dashboard must have consistent empty-state styling: {needle}"
+            );
+        }
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn dashboard_chat_has_fabric_origin_indicator_and_remote_models() {
         let dir = tempfile::tempdir().unwrap();
         let (api, manager) = start_stateful_api(dir.path(), None, None).await;
