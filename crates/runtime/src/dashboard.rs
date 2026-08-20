@@ -386,6 +386,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
     <button class="nav-item" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
+    <button class="nav-item" data-view="devices"><span class="ic">⌂</span><span>Devices</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
     <button class="nav-item" data-view="providers"><span class="ic">◈</span><span>Providers</span></button>
@@ -722,6 +723,18 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <tbody id="quota-accounts"><tr><td colspan="5" class="empty">no quota ledger yet</td></tr></tbody></table>
           <div style="margin-top:10px"><b style="font-size:12px">Recent quota events <span class="muted">provenance · policy v</span></b>
           <div id="quota-events" class="muted" style="font-size:12px;margin-top:4px">—</div></div>
+        </div>
+      </section>
+
+      <!-- DEVICES (UI-AXIS-2): fabric viewed as physical devices — every
+           worker grouped by device class, each card showing honest measured
+           signals (load, RAM, battery, GPU thermal/util, adaptive contribution)
+           straight from /v1/compute. No mock telemetry. -->
+      <section class="view" id="view-devices">
+        <div class="card">
+          <h2>Devices <span class="count" id="devices-count"></span></h2>
+          <div class="sub" style="margin-top:6px">Fabric as physical hardware — device class is derived from the node's real capability (GPU/RAM/cores); load, battery, GPU thermal and adaptive share are measured values it advertises.</div>
+          <div id="devices" class="worker-cards"><div class="empty ic">no devices yet</div></div>
         </div>
       </section>
 
@@ -1421,8 +1434,8 @@ const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'a
 const isAdmin = !!token;
 
 // ---- navigation ------------------------------------------------------------
-const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','talents','workers','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','talents','workers','devices','network','models','observability','recovery','diag','security','settings'];
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', devices:'Devices', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   current = view;
@@ -2741,6 +2754,62 @@ function renderWorkers(c){
     '<td><span class="badge '+(r.suggested_tier===3?'ok':r.suggested_tier===2?'warn':'faint')+'">T'+r.suggested_tier+'</span></td><td class="num">'+r.reward_tokens+'</td><td class="num">'+r.compensation_earned+'</td></tr>'
   ).join('');
   $('contributions').innerHTML = crel || '<tr><td colspan="10" class="empty">no contribution ledger yet</td></tr>';
+}
+// DEVICES (UI-AXIS-2): the fabric read as physical hardware. Workers group by
+// device class (derived from the node's real capability), and each device card
+// shows honest measured signals from its advertisement: load, free RAM, battery,
+// GPU thermal/utilization, adaptive-contribution state. bars are raw numbers.
+function renderDevices(c){
+  const workers = (c && c.workers) || [];
+  const localPeer = (c && c.local_peer) || 'local';
+  // Device class is not part of the /v1/compute payload, so derive it honestly
+  // from the real measured signals each worker advertises: a battery => laptop/
+  // mobile, a GPU >= some cores/RAM => desktop/server, otherwise edge. This is
+  // an inference over real telemetry, never a fabricated value.
+  const inferClass = (w) => {
+    if (w.device_class) return w.device_class;
+    const hasBattery = w.battery_percent != null;
+    const hasGpu = (w.gpu && (w.gpu.temperature_celsius != null || w.gpu.utilization_percent != null));
+    const ramGb = (w.available_ram_mb || 0) / 1024;
+    if (hasBattery) return ramGb >= 16 ? 'laptop' : 'mobile';
+    if (hasGpu && ramGb >= 32) return 'server';
+    if (hasGpu) return 'desktop';
+    if (ramGb >= 8) return 'laptop';
+    return 'edge';
+  };
+  workers.forEach(w => { w._dclass = inferClass(w); });
+  const order = ['server','desktop','laptop','mobile','edge'];
+  const groups = {};
+  workers.forEach(w => { const k = w._dclass || 'edge'; (groups[k] = groups[k] || []).push(w); });
+  const keys = Object.keys(groups).sort((a,b) => (order.indexOf(a)<0?99:order.indexOf(a)) - (order.indexOf(b)<0?99:order.indexOf(b)));
+  const share = (pct) => pct == null ? '—' : '<span class="badge '+(pct<30?'ok':pct<70?'warn':'bad')+'">' + Math.round(pct*100) + '%</span>';
+  const ram = (mb) => mb ? fmtMB(mb) + ' free' : '—';
+  $('devices-count').textContent = workers.length + ' device(s)';
+  $('devices').innerHTML = keys.length ? keys.map(k => {
+    const list = groups[k];
+    return '<div class="card sub" style="margin-bottom:10px">'+
+      '<div class="wc-meta"><span style="font-weight:700;text-transform:uppercase;font-size:12px;color:var(--accent)">' + esc(k) + '</span>' +
+      '<span>'+ list.length + ' device' + (list.length>1?'s':'') + '</span></div>'+
+      '<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-top:8px">'+
+      list.map(w => {
+        const g = w.gpu || {};
+        const stress = [
+          w.load_percent > 80 ? ['load',(w.load_percent||0)+'%'] : null,
+          (w.battery_percent != null && w.battery_percent < 25) ? ['battery',w.battery_percent+'%'] : null,
+          (g.temperature_celsius != null && g.temperature_celsius > 80) ? ['thermal',g.temperature_celsius+'°C'] : null,
+        ].filter(Boolean);
+        const stressBadges = stress.length ? stress.map(s => '<span class="badge bad">'+s[0]+' '+s[1]+'</span>').join(' ') : '<span class="badge ok">nominal</span>';
+        return '<div style="border:1px solid var(--line);border-radius:10px;padding:10px">'+
+          '<div class="wc-meta"><b>'+esc(w.node_name || short(w.peer_id))+'</b> <span class="badge '+(w.trusted?'ok':'warn')+'">'+(w.trusted?'trusted':'untrusted')+'</span></div>'+
+          '<div class="wc-meta"><span><b>load</b> '+(w.load_percent!=null?w.load_percent+'%':'—')+'</span>'+
+          '<span><b>RAM</b> '+ram(w.available_ram_mb)+'</span>'+
+          '<span><b>battery</b> '+(w.battery_percent!=null?w.battery_percent+'%':'—')+'</span></div>'+
+          '<div class="wc-meta"><span><b>GPU</b> '+((g.temperature_celsius!=null?g.temperature_celsius+'°C':'—'))+' · '+((g.utilization_percent!=null?g.utilization_percent+'%':'—'))+'</span>'+
+          '<span><b>engine</b> <code>'+esc(w.engine||'—')+'</code></span></div>'+
+          '<div class="wc-meta"><span><b>adaptive share</b> '+share(w.adaptive_contribution)+'</span>'+stressBadges+'</div>'+
+        '</div>';
+      }).join('') + '</div></div>';
+  }).join('') : '<div class="empty ic">no devices advertised</div>';
 }
 // Resource pressure (Part 17/22): honest aggregate of MEASURED load.
 // Local values come from the live SystemSnapshot in /status; worker values
@@ -4729,7 +4798,7 @@ async function refresh(){
   try { await renderEvidence(); } catch (e) {}
   try { await renderBench(); } catch (e) {}
   try { await renderProviders(); } catch (e) {}
-  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
+  try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderDevices(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   // Populate the chat model/node selectors ONLY after /v1/compute has been
   // fetched: they need the real worker list (remote models come from
   // c.workers). Calling them earlier with c=null silently produced a selector

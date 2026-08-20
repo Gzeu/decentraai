@@ -7775,6 +7775,8 @@ fn fabric_graph_aggregate(
                 "capacity": w.availability.capacity_state(),
                 "adaptive_contribution": w.availability.adaptive_contribution_factor(),
                 "battery_percent": w.availability.battery_percent,
+                "load_percent": w.availability.load_percent,
+                "available_ram_mb": w.availability.available_ram_mb,
                 "engine": w.capability.engine,
                 "health": format!("{:?}", w.availability.status),
                 "served_models": served,
@@ -11139,6 +11141,22 @@ mod tests {
             assert!(
                 body.contains(needle),
                 "dashboard must have consistent empty-state styling: {needle}"
+            );
+        }
+        // UI-AXIS-2 Devices view: the section, nav toggle and renderer all exist,
+        // and the compute worker payload exposes the raw load/RAM signals the
+        // device cards read.
+        for needle in [
+            "id=\"view-devices\"",
+            "data-view=\"devices\"",
+            "function renderDevices(c)",
+            "renderDevices(c)",
+            "w.adaptive_contribution",
+            "const inferClass = (w)",
+        ] {
+            assert!(
+                body.contains(needle),
+                "dashboard must wire the Devices view: {needle}"
             );
         }
         manager.lock().await.shutdown().await.unwrap();
