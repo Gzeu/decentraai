@@ -144,7 +144,7 @@ impl BenchmarkManager {
                 ),
                 run.created_at_ms,
             )
-            .tagged(format!("mode:{}", run.mode.tag()))
+            .tagged(format!("mode:{}", run.mode.name()))
             .tagged(format!("verdict:{:?}", run.verdict))
             .tagged(format!("latency_ms:{}", run.metrics.latency_ms))
             .tagged(format!("task:{}", task.task_id));

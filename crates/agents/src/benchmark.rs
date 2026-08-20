@@ -46,6 +46,15 @@ impl BenchmarkMode {
             Self::Collective => "C",
         }
     }
+
+    /// Human-readable mode name used in evidence tags and lessons.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Rag => "rag",
+            Self::Collective => "collective",
+        }
+    }
 }
 
 /// One benchmark task: a prompt + an optional gold answer + optional evidence
