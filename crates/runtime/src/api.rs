@@ -4421,6 +4421,156 @@ fn persist_resource_config(path: &std::path::Path, req: &serde_json::Value) -> b
     std::fs::rename(&tmp, path).is_ok()
 }
 
+/// Master-gated model selector: picks the GGUF file this node serves.
+/// Persists `node.model` in the node config (atomic, survives restarts) and —
+/// when a local engine with a restart spec is running — swaps the model and
+/// respawns llama-server live. Remote-backend / no-engine nodes get the
+/// persistence only, with an honest `respawned: false`.
+async fn admin_model_select_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let name = match req.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return forbidden("missing model name"),
+    };
+    // Path safety: the model must be a plain file name inside models/ — never
+    // accept separators or absolute paths (same rule as the registry).
+    let file_name = std::path::Path::new(name)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    if file_name.is_empty() || file_name != name {
+        return forbidden("model name must be a plain file name (no path separators)");
+    }
+    let models_dir = state.info.repo_root.join("models");
+    let model_path = models_dir.join(file_name);
+    if !model_path.is_file() {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "success": false,
+                "error": format!("model '{}' not found in {}", file_name, models_dir.display()),
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+    // Persist node.model atomically in the node config.
+    let config_path = state.info.repo_root.join("node.yaml");
+    let persisted = if config_path.exists() {
+        persist_model_config(&config_path, file_name)
+    } else {
+        false
+    };
+    // Live respawn when a local engine with a restart spec is attached.
+    let mut respawned = false;
+    let note;
+    {
+        let mut manager = state.manager.lock().await;
+        if manager.set_restart_model(model_path.clone()) {
+            // Swap the model: stop the current engine, then let the M24
+            // supervisor respawn it from the updated restart spec.
+            let _ = manager.shutdown().await;
+            match manager.ensure_healthy().await {
+                Ok(true) => {
+                    respawned = true;
+                    note = if persisted {
+                        "model saved to node.yaml and llama-server respawned with it".to_string()
+                    } else {
+                        "llama-server respawned live (node.yaml not writable — restart needed to persist)".to_string()
+                    };
+                }
+                Ok(false) => {
+                    note = "model saved; engine respawn failed — check logs and restart the node".to_string();
+                }
+                Err(e) => {
+                    note = format!(
+                        "model saved; engine respawn error: {e:.200} — restart the node"
+                    );
+                }
+            }
+        } else {
+            note = if persisted {
+                "model saved to node.yaml — restart the node to serve it".to_string()
+            } else {
+                "no local engine / node.yaml not writable — restart the node after editing node.yaml manually".to_string()
+            };
+        }
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "model_selected",
+        serde_json::json!({ "model": file_name, "persisted": persisted, "respawned": respawned }),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "success": true,
+            "model": file_name,
+            "persisted": persisted,
+            "respawned": respawned,
+            "note": note,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Atomically rewrites the `model:` line under the `node:` block in the node
+/// config. Returns false when the file is missing or the write failed.
+fn persist_model_config(path: &std::path::Path, model_name: &str) -> bool {
+    use std::io::Write;
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut wrote = false;
+    let mut in_node_block = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if in_node_block {
+            // Leaving the node block: a line at indent 0 that is not a comment.
+            if indent == 0 && !trimmed.is_empty() && !trimmed.starts_with('#') {
+                in_node_block = false;
+            } else if let Some(rest) = trimmed.strip_prefix("model:") {
+                let value = rest.trim();
+                let _ = value;
+                out.push(format!("{}{}model: \"{}\"", &line[..indent], "", model_name));
+                wrote = true;
+                continue;
+            }
+        } else if trimmed.starts_with("node:") && trimmed.len() == "node:".len() {
+            in_node_block = true;
+        }
+        out.push(line.to_string());
+    }
+    if !wrote {
+        return false;
+    }
+    let content = out.join("\n");
+    let tmp = path.with_extension("yaml.tmp");
+    let mut f = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if f.write_all(content.as_bytes()).is_err() || f.sync_all().is_err() {
+        return false;
+    }
+    drop(f);
+    std::fs::rename(&tmp, path).is_ok()
+}
+
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
 /// admin endpoints. `peer_id` must be a valid base58 PeerId.
 fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> {
@@ -4761,6 +4911,7 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/api/admin/contribution", get(admin_contribution_handler))
         .route("/api/admin/tier/apply", post(admin_tier_apply_handler))
+        .route("/api/admin/model/select", post(admin_model_select_handler))
         // Model Fabric provider control plane (P5)
         .route("/v1/providers", get(providers_list_handler))
         .route("/api/admin/providers", post(providers_create_handler))
@@ -15782,5 +15933,102 @@ mod tests {
             "master-gated resources endpoint must be reachable, got {}",
             ok.status()
         );
+    }
+
+    #[test]
+    fn persist_model_config_rewrites_node_model_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.yaml");
+        std::fs::write(
+            &path,
+            "node:\n  name: test\n  model: \"old.gguf\"\n  dashboard: v1\ninference:\n  max_context_tokens: 4096\n",
+        )
+        .unwrap();
+        assert!(persist_model_config(&path, "DeepSeek.gguf"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("model: \"DeepSeek.gguf\""), "{after}");
+        assert!(!after.contains("old.gguf"), "{after}");
+        assert!(after.contains("max_context_tokens: 4096"), "{after}");
+        // The temp file is renamed away — no .yaml.tmp left behind.
+        assert!(!path.with_extension("yaml.tmp").exists());
+    }
+
+    #[test]
+    fn persist_model_config_refuses_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.yaml");
+        // Missing file -> false, never panics.
+        assert!(!persist_model_config(&path, "DeepSeek.gguf"));
+        // Existing file without a `node:` block -> false (nothing written).
+        std::fs::write(&path, "inference:\n  max_context_tokens: 4096\n").unwrap();
+        assert!(!persist_model_config(&path, "DeepSeek.gguf"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "inference:\n  max_context_tokens: 4096\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_select_endpoint_is_master_gated_and_rejects_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(dir.path().join("models/Llama.gguf"), b"fake").unwrap();
+        std::fs::write(
+            dir.path().join("node.yaml"),
+            "node:\n  model: \"Llama.gguf\"\n",
+        )
+        .unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+
+        // Unauthenticated -> 401.
+        let unauth = client
+            .post(format!("http://{api}/api/admin/model/select"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "name": "Llama.gguf" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        // Path traversal -> 400 (the name must be a plain file name).
+        let bad = client
+            .post(format!("http://{api}/api/admin/model/select"))
+            .header("Authorization", "Bearer master-token")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "name": "../secret.gguf" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 403, "path traversal must be rejected");
+
+        // Missing model file -> 404.
+        let missing = client
+            .post(format!("http://{api}/api/admin/model/select"))
+            .header("Authorization", "Bearer master-token")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "name": "nope.gguf" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+
+        // Valid model, persisted -> 200 + persisted:true. The temp test node
+        // has no restart spec so respawned stays false — honest persistence.
+        let ok = client
+            .post(format!("http://{api}/api/admin/model/select"))
+            .header("Authorization", "Bearer master-token")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "name": "Llama.gguf" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let body: serde_json::Value = ok.json().await.unwrap();
+        assert_eq!(body["success"], true);
+        assert_eq!(body["persisted"], true);
+        assert_eq!(body["respawned"], false);
+        let after = std::fs::read_to_string(dir.path().join("node.yaml")).unwrap();
+        assert!(after.contains("model: \"Llama.gguf\""), "{after}");
     }
 }

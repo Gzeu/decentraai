@@ -415,6 +415,19 @@ impl ServeManager {
         self.restart_config = Some(config);
     }
 
+    /// Swaps the model in the restart spec (model selector). Returns `false`
+    /// when there is no restart spec (e.g. remote-backend node) — the caller
+    /// then knows a live respawn is not possible and only persistence applies.
+    pub fn set_restart_model(&mut self, model_path: PathBuf) -> bool {
+        match &mut self.restart_config {
+            Some(cfg) => {
+                cfg.model_path = model_path;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Marks the model as actively serving; resets the idle clock.
     pub fn note_activity(&mut self) {
         self.last_activity = Instant::now();

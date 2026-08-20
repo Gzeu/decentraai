@@ -372,12 +372,16 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <div class="rail-label">Mesh</div>
     <button class="nav-item" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
     <button class="nav-item" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
+    <button class="nav-item" data-view="knowledge"><span class="ic">✦</span><span>Knowledge</span></button>
+    <button class="nav-item" data-view="evidence"><span class="ic">✎</span><span>Evidence</span></button>
+    <button class="nav-item" data-view="bench"><span class="ic">⚗</span><span>Bench</span></button>
     <button class="nav-item" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
     <button class="nav-item" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
     <button class="nav-item" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
     <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
     <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
     <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
+    <button class="nav-item" data-view="providers"><span class="ic">◈</span><span>Providers</span></button>
 
     <div class="rail-label">Ops</div>
     <button class="nav-item" data-view="observability"><span class="ic">◔</span><span>Observability</span></button>
@@ -785,6 +789,82 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         </div>
       </section>
 
+      <!-- KNOWLEDGE (P12): the closed evidence loop — knowledge confidence is
+           derived from evidence, never declared. From /v1/knowledge. -->
+      <section class="view" id="view-knowledge">
+        <div class="grid cols-4" id="knowledge-kpis"></div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div class="card">
+            <h2>Knowledge objects <span class="count">confidence from evidence</span></h2>
+            <div id="knowledge-objects" class="worker-cards"><div class="empty">loading…</div></div>
+          </div>
+          <div class="card">
+            <h2>Collective decisions</h2>
+            <div id="knowledge-decisions" class="worker-cards"><div class="empty">loading…</div></div>
+          </div>
+        </div>
+        <div class="grid cols-2" style="margin-top:14px">
+          <div class="card">
+            <h2>Verified compute receipts <span class="count">compensation for verified work</span></h2>
+            <div id="knowledge-receipts" class="worker-cards"><div class="empty">loading…</div></div>
+          </div>
+          <div class="card">
+            <h2>Compensation balances</h2>
+            <div id="knowledge-balances" class="worker-cards"><div class="empty">loading…</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- EVIDENCE (P12 RAG): "what have we learned?" — deterministic index
+           over five evidence families. Lessons derived from real evidence;
+           zero evidence in, zero lessons out. From /v1/evidence. -->
+      <section class="view" id="view-evidence">
+        <div class="grid cols-4" id="evidence-kpis"></div>
+        <div class="card" style="margin-top:14px">
+          <h2>Query the evidence index</h2>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="evidence-query" class="mono" placeholder="what have we learned about … ?" style="flex:1;min-width:240px;padding:6px 8px;font-size:12px">
+            <button class="btn small" onclick="evidenceAsk()">query</button>
+          </div>
+          <div id="evidence-hits" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+        </div>
+        <div class="card" style="margin-top:14px"><h2>Lessons learned <span class="count">derived from real evidence</span></h2><div id="evidence-lessons" class="worker-cards"></div></div>
+        <div class="card" style="margin-top:14px"><h2>Recent evidence</h2><div id="evidence-recent" class="worker-cards"></div></div>
+      </section>
+
+      <!-- BENCH (Benchmark Lab): single vs RAG vs collective from real graded
+           runs. Paired verdict over shared tasks; honest "not enough samples"
+           state. From /v1/bench. -->
+      <section class="view" id="view-bench">
+        <div class="grid cols-4" id="bench-kpis"></div>
+        <div class="card" style="margin-top:14px"><h2>Verdict <span class="count">paired · shared tasks</span></h2><div id="bench-verdict" class="worker-cards"></div></div>
+        <div class="card" style="margin-top:14px">
+          <h2>Run a task <span class="count">real tokens · operator</span></h2>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input id="bench-prompt" class="mono" placeholder="question" style="flex:1;min-width:240px;padding:6px 8px;font-size:12px">
+            <input id="bench-gold" class="mono" placeholder="gold answer (optional)" style="min-width:160px;padding:6px 8px;font-size:12px">
+            <select id="bench-mode" class="mono" style="font-size:11px;padding:4px 4px">
+              <option value="single">single</option>
+              <option value="rag">rag (evidence)</option>
+              <option value="collective">collective (3 agents)</option>
+            </select>
+            <input id="bench-evidence" class="mono" placeholder="evidence passages (comma separated, rag only)" style="min-width:220px;padding:6px 8px;font-size:12px">
+            <button class="btn small" onclick="benchRun()">run</button>
+          </div>
+          <div id="bench-result" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+        </div>
+        <div class="card" style="margin-top:14px"><h2>Per-mode aggregates</h2><div id="bench-runs" class="worker-cards"></div></div>
+      </section>
+
+      <!-- PROVIDERS (P5): Model Fabric provider control plane. Credentials are
+           never exposed — only masked fingerprints. From /v1/providers. -->
+      <section class="view" id="view-providers">
+        <div class="card">
+          <h2>Model providers <span class="count">credentials stay in memory</span></h2>
+          <div id="providers-list" class="worker-cards"><div class="empty">loading…</div></div>
+        </div>
+      </section>
+
       <!-- MEMORY (P5 collective memory): scopes + entries written by verified
            workflows into the persistent MemoryStore. Real state from
            /v1/memory — prompts/outputs are operator-viewable by design here. -->
@@ -923,6 +1003,15 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <table><thead><tr><th>Model</th><th>Engine</th><th class="num">Context</th><th class="num">RAM</th><th class="num">VRAM</th><th>Active</th></tr></thead>
           <tbody id="models"><tr><td colspan="6" class="empty">no served models advertised</td></tr></tbody></table>
           <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="models-status"></div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>Active model <span class="count">what this node serves right now</span></h2>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <select id="active-model" class="mono" style="flex:1;min-width:240px;padding:6px 8px;font-size:12px"></select>
+            <button class="btn small primary" onclick="selectActiveModel()">Serve this model</button>
+            <span class="mono" style="font-size:10.5px;color:var(--faint)">admin · persists node.model + respawns the engine live</span>
+          </div>
+          <div id="model-select-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
         </div>
         <div class="card" style="margin-top:14px">
           <h2>Local registry</h2>
@@ -4222,6 +4311,197 @@ async function loadCapOverview(){
   } catch (e) { con.innerHTML = '<span class="badge warn">capability overview failed</span>'; }
 }
 
+// ---- Knowledge (P12) ------------------------------------------------------
+async function renderKnowledge(){
+  let d = null;
+  try { d = await (await fetch('/v1/knowledge', { headers })).json(); } catch (_) { $('knowledge-objects').innerHTML='<div class="empty">Knowledge view needs a valid operator token.</div>'; return; }
+  if (!d || d.attached === false) {
+    $('knowledge-kpis').innerHTML = '<div class="card"><h2>Knowledge</h2><div class="value">—</div></div>';
+    $('knowledge-objects').innerHTML = '<div class="empty">The P12 knowledge runtime is not attached on this node.</div>';
+    $('knowledge-decisions').innerHTML = ''; $('knowledge-receipts').innerHTML = ''; $('knowledge-balances').innerHTML = '';
+    return;
+  }
+  const obs = d.knowledge_objects || [], decs = d.decisions || [], recs = d.receipts || [], bal = d.balances || {};
+  const high = obs.filter(o=>o.confidence_label==='high').length;
+  const adopted = decs.filter(x=>x.verdict==='Adopted').length;
+  const kpi = (label, value, sub) => '<div class="card"><div class="label">'+esc(label)+'</div><div class="value">'+esc(value)+'</div><div class="sub">'+esc(sub||'')+'</div></div>';
+  $('knowledge-kpis').innerHTML =
+    kpi('Knowledge', obs.length, d.memory_attached ? 'memory attached' : 'no memory') +
+    kpi('High Conf.', high, 'evidence-backed') +
+    kpi('Decisions', decs.length, adopted+' adopted') +
+    kpi('Credits', d.total_credits ?? 0, 'compensation ledger');
+  $('knowledge-objects').innerHTML = obs.map(o => {
+    const pct = Math.round((o.confidence||0)*100);
+    const cls = o.confidence_label==='high'?'badge ok':(o.confidence_label==='none'?'badge warn':'badge faint');
+    return '<div class="worker-card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'+
+      '<b>'+esc(o.fact)+'</b><span class="'+cls+'">'+pct+'% · '+esc(o.confidence_label)+'</span></div>'+
+      '<div class="muted" style="font-size:11px">'+esc(o.object_id)+' · by '+esc(o.author_agent)+' @ '+esc(o.author_node)+
+      (o.capability?' · '+esc(o.capability):'')+'</div>'+
+      (o.evidence_kinds&&o.evidence_kinds.length ? '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:5px">'+o.evidence_kinds.map(k=>'<span class="badge faint">'+esc(k)+'</span>').join('')+'</div>' : '<div class="muted" style="font-size:11px;margin-top:6px">declaration only — no evidence</div>')+
+      '</div>';
+  }).join('') || '<div class="empty">No knowledge objects yet. Record a verified receipt to seed the loop.</div>';
+  $('knowledge-decisions').innerHTML = decs.map(x => {
+    const st = x.verdict==='Adopted'?'badge ok':(x.verdict==='Rejected'?'badge warn':'badge faint');
+    return '<div class="worker-card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><b>'+esc(x.summary)+'</b><span class="'+st+'">'+esc(x.verdict)+'</span></div>'+
+      '<div class="muted" style="font-size:11px">'+esc(x.decision_id)+' · confidence '+Math.round((x.aggregated_confidence||0)*100)+'% · over ['+esc((x.considered||[]).join(', '))+']</div></div>';
+  }).join('') || '<div class="empty">No collective decisions yet.</div>';
+  $('knowledge-receipts').innerHTML = recs.map(r => {
+    const st = r.verdict==='Verified'?'badge ok':'badge warn';
+    return '<div class="worker-card"><b>'+esc(r.execution_id)+'</b><div class="muted" style="font-size:11px;margin-top:4px">'+esc(r.capability)+' · '+r.duration_ms+'ms · <span class="'+st+'">'+esc(r.verdict)+'</span> · '+(r.credits||0)+' credits</div></div>';
+  }).join('') || '<div class="empty">No verified compute receipts yet.</div>';
+  const balRows = Object.entries(bal);
+  $('knowledge-balances').innerHTML = balRows.length
+    ? balRows.map(([w,c]) => '<div class="worker-card"><b>'+esc(w)+'</b><div class="muted" style="font-size:11px;margin-top:4px">'+c+' credits</div></div>').join('')
+    : '<div class="empty">No compensation balances yet (verified work only).</div>';
+}
+
+// ---- Evidence (P12 RAG) ---------------------------------------------------
+async function renderEvidence(){
+  let d = null;
+  try { d = await (await fetch('/v1/evidence', { headers })).json(); } catch (_) { $('evidence-recent').innerHTML='<div class="empty">Evidence view needs a valid operator token.</div>'; return; }
+  if (!d || d.attached === false) {
+    $('evidence-kpis').innerHTML = '<div class="card"><h2>Evidence</h2><div class="value">—</div></div>';
+    $('evidence-lessons').innerHTML = '<div class="empty">The evidence runtime is not attached on this node.</div>';
+    $('evidence-recent').innerHTML = '';
+    return;
+  }
+  const counts = d.counts || {}, lessons = d.lessons || [], recent = d.recent || [];
+  const total = d.total ?? 0;
+  const kpi = (label, value, sub) => '<div class="card"><div class="label">'+esc(label)+'</div><div class="value">'+esc(value)+'</div><div class="sub">'+esc(sub||'')+'</div></div>';
+  $('evidence-kpis').innerHTML =
+    kpi('Evidence', total, 'indexed entries') +
+    kpi('Executions', counts.execution ?? 0, 'plans') +
+    kpi('Receipts', counts.receipt ?? 0, 'verified work') +
+    kpi('Decisions', counts.consensus ?? 0, 'collective');
+  $('evidence-lessons').innerHTML = lessons.map(l => {
+    const pct = l.sample > 0 ? Math.round(l.value*100)+'%' : '—';
+    return '<div class="worker-card"><b>'+esc(l.label)+'</b><div class="muted" style="font-size:11px;margin-top:4px">'+pct+' <span class="hint">('+l.sample+' samples · '+esc(l.detail)+')</span></div></div>';
+  }).join('') || '<div class="empty">No evidence yet — the fabric has not learned anything.</div>';
+  $('evidence-recent').innerHTML = recent.map(e =>
+    '<div class="worker-card"><b>'+esc(e.id)+'</b><div class="muted" style="font-size:11px;margin-top:4px"><span class="badge faint">'+esc(e.kind)+'</span> '+esc(e.text)+'</div></div>'
+  ).join('') || '<div class="empty">No evidence indexed yet.</div>';
+}
+async function evidenceAsk(){
+  const q = $('evidence-query').value.trim();
+  $('evidence-hits').innerHTML = '';
+  if (!q) return;
+  try {
+    const r = await fetch('/v1/evidence/query',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},headers),body:JSON.stringify({text:q,k:10})});
+    const d = await r.json();
+    const hits = d.hits || [];
+    $('evidence-hits').innerHTML = hits.length
+      ? hits.map(h => '<div class="worker-card"><b>'+esc(h.id)+'</b><div class="muted" style="font-size:11px;margin-top:4px"><span class="badge faint">'+esc(h.mode)+' · '+Math.round((h.score||0)*100)+'%</span> '+esc(h.text)+'</div></div>').join('')
+      : '<div class="empty">No evidence matches — the honest answer is "nothing learned yet".</div>';
+  } catch (_) { $('evidence-hits').innerHTML = '<div class="empty">Query needs a valid operator token.</div>'; }
+}
+
+// ---- Bench (Benchmark Lab) ------------------------------------------------
+async function renderBench(){
+  let d = null;
+  try { d = await (await fetch('/v1/bench', { headers })).json(); } catch (_) { $('bench-kpis').innerHTML = '<div class="empty">Bench view needs a valid operator token.</div>'; return; }
+  if (!d || d.attached === false) {
+    $('bench-kpis').innerHTML = '<div class="card"><h2>Bench</h2><div class="value">—</div></div>';
+    $('bench-verdict').innerHTML = '<div class="empty">The benchmark runtime is not attached on this node (needs a servable model + operator token).</div>';
+    $('bench-runs').innerHTML = '';
+    return;
+  }
+  const cmp = d.comparison || {};
+  const g = d.global || {};
+  const s = cmp.single || {}, c = cmp.collective || {};
+  const gs = g.single || {}, gr = g.rag || {}, gc = g.collective || {};
+  const pct = v => (v && v.graded > 0) ? Math.round(v.accuracy*100)+'%' : '—';
+  const kpi = (label, value, sub) => '<div class="card"><div class="label">'+esc(label)+'</div><div class="value">'+esc(value)+'</div><div class="sub">'+esc(sub||'')+'</div></div>';
+  $('bench-kpis').innerHTML =
+    kpi('Runs', d.runs ?? 0, 'total graded/ungraded') +
+    kpi('Single (shared)', pct(s), (s.runs||0)+' tasks') +
+    kpi('RAG (global)', pct(gr), (gr.runs||0)+' runs') +
+    kpi('Collective (shared)', pct(c), (c.runs||0)+' tasks');
+  const verdict = cmp.collective_beats_single
+    ? '<div class="worker-card"><b>Collective beats single</b><div class="muted" style="font-size:11px;margin-top:4px">'+esc(cmp.reasoning||'')+'</div></div>'
+    : '<div class="worker-card"><b>No verdict yet</b><div class="muted" style="font-size:11px;margin-top:4px">'+esc(cmp.reasoning||'')+'</div></div>';
+  $('bench-verdict').innerHTML = verdict;
+  const rows = [
+    ['Single (paired)', s, 'mode A · shared tasks'],
+    ['Collective (paired)', c, 'mode C · shared tasks'],
+    ['Single (global)', gs, 'mode A · all runs'],
+    ['RAG (global)', gr, 'mode B · all runs'],
+    ['Collective (global)', gc, 'mode C · all runs'],
+  ].map(([name, v, tag]) =>
+    '<div class="worker-card"><b>'+esc(name)+'</b><div class="muted" style="font-size:11px;margin-top:4px">'+pct(v)+' <span class="hint">('+(v?.graded||0)+' graded / '+(v?.runs||0)+' runs · '+(v?.avg_latency_ms||0)+'ms · '+(v?.avg_tokens||0)+' tok)</span></div></div>'
+  ).join('');
+  $('bench-runs').innerHTML = rows;
+}
+async function benchRun(){
+  const prompt = $('bench-prompt').value.trim();
+  const gold = $('bench-gold').value.trim();
+  const mode = $('bench-mode').value;
+  const evidence = $('bench-evidence').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if (!prompt) { alert('Question is required.'); return; }
+  $('bench-result').innerHTML = '<div class="empty">Running through the live executor… (collective runs N agents — may take a while)</div>';
+  const body = { prompt, mode };
+  if (gold) body.gold = gold;
+  if (evidence.length) body.evidence = evidence;
+  if (mode === 'collective') body.agents = 3;
+  try {
+    const r = await fetch('/v1/bench/run',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},headers),body:JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) { $('bench-result').innerHTML = '<div class="empty">Run failed: '+esc(d.error || r.status)+'</div>'; return; }
+    const run = d.run || {};
+    const v = run.verdict || 'ABSTAINED';
+    $('bench-result').innerHTML =
+      '<div class="worker-card"><b>'+esc(v)+'</b><div class="muted" style="font-size:11px;margin-top:4px">'+(run.metrics ? run.metrics.latency_ms+'ms · '+run.metrics.tokens+' tokens' : '')+'</div></div>'+
+      '<div class="muted" style="font-size:11px;margin-top:6px">'+esc((run.output||'').slice(0,400))+'</div>';
+    renderBench();
+  } catch (err) { $('bench-result').innerHTML = '<div class="empty">Run needs a valid operator token: '+esc(err)+'</div>'; }
+}
+
+// ---- Providers (P5 Model Fabric) ------------------------------------------
+async function renderProviders(){
+  let d = null;
+  try { d = await (await fetch('/v1/providers', { headers })).json(); } catch (_) { $('providers-list').innerHTML = '<div class="empty">Providers view needs a valid operator token.</div>'; return; }
+  const providers = (d && d.providers) || [];
+  if (!providers.length) { $('providers-list').innerHTML = '<div class="empty">No providers configured. Credentials live only in memory — never stored.</div>'; return; }
+  $('providers-list').innerHTML = providers.map(p => {
+    const s = p.summary || {};
+    const models = p.models || [];
+    return '<div class="worker-card"><b>'+esc(s.name || s.provider_id || 'provider')+'</b>'+
+      '<div class="muted" style="font-size:11px;margin-top:4px">'+esc(s.kind || '')+' · '+esc(s.base_url || '')+(s.fingerprint ? ' · '+esc(s.fingerprint) : '')+'</div>'+
+      '<div class="muted" style="font-size:11px;margin-top:4px">models: '+esc(models.map(m => m.id || m.name || m).join(', ') || '—')+'</div></div>';
+  }).join('');
+}
+
+// ---- Active model selector (admin) ---------------------------------------
+async function populateActiveModel(s){
+  const sel = $('active-model');
+  if (!sel) return;
+  const current = (s && s.model) || '';
+  const names = new Set();
+  ((s && s.available_models) || []).forEach(m => { if (m && m.name) names.add(m.name); });
+  if (current && !names.has(current)) names.add(current);
+  sel.innerHTML = '';
+  names.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name; opt.textContent = name + (name === current ? '  (active)' : '');
+    if (name === current) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  if (!names.size) { const opt = document.createElement('option'); opt.value=''; opt.textContent='no local models'; sel.appendChild(opt); }
+}
+async function selectActiveModel(){
+  const sel = $('active-model');
+  const name = sel && sel.value;
+  if (!name) return;
+  const status = $('model-select-status');
+  status.innerHTML = '<span class="badge faint">selecting…</span>';
+  try {
+    const r = await fetch('/api/admin/model/select',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},headers),body:JSON.stringify({name})});
+    const d = await r.json();
+    if (!r.ok) { status.innerHTML = '<span class="badge warn">'+esc(d.error || r.status)+'</span>'; return; }
+    status.innerHTML = '<span class="badge ok">'+(d.respawned ? 'respawned live' : 'persisted')+'</span> <span class="hint">'+esc(d.note||'')+'</span>';
+    setTimeout(() => { refresh(); }, 800);
+  } catch (err) { status.innerHTML = '<span class="badge warn">'+esc(err)+'</span>'; }
+}
+
 async function refresh(){
   let s = null, c = null, n = null, x = null;
   try { s = await (await fetch('/status')).json(); } catch (e) {}
@@ -4281,6 +4561,10 @@ async function refresh(){
   try { const mem = await (await fetch('/v1/memory', { headers })).json(); renderMemory(mem); } catch (e) {}
   try { const rep = await (await fetch('/v1/reputation', { headers })).json(); renderReputation(rep); } catch (e) {}
   try { const tt = await (await fetch('/v1/talent-tree', { headers })).json(); renderTalentTree(tt); } catch (e) {}
+  try { await renderKnowledge(); } catch (e) {}
+  try { await renderEvidence(); } catch (e) {}
+  try { await renderBench(); } catch (e) {}
+  try { await renderProviders(); } catch (e) {}
   try { c = await (await fetch('/v1/compute', { headers })).json(); renderWorkers(c); renderPressure(s, c); renderObservability(s, c); renderRecovery(s, c, null); renderModels(s, c); renderQuota(c); } catch (e) {}
   // Populate the chat model/node selectors ONLY after /v1/compute has been
   // fetched: they need the real worker list (remote models come from
@@ -4302,6 +4586,7 @@ async function refresh(){
   // Security view must load on page load / refresh too (not only after a token
   // action); guarded by the API returning 401 -> "master token required".
   renderSecurity();
+  if (s) populateActiveModel(s);
 }
 setStageVisible(true);
 // Build the chat model selector once, from real data only:
@@ -4379,6 +4664,7 @@ Object.assign(window, {
   hubPullVariant, hubSearch, hubToggleCompare, loadVariantFit, openGenEdit,
   openResEdit, previewDecision, removeModel, revokeConsumerKey,
   runCollectiveWorkflow, show, useModelOption, variantCompare,
+  benchRun, evidenceAsk, selectActiveModel,
 });
 refresh(); setInterval(refresh, 3000);
 "##;

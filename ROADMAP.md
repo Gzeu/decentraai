@@ -2972,3 +2972,46 @@ lessons. Zero benchmark evidence in, zero benchmark lessons out.
 
 Tests: 8 pure + 7 manager + 4 dataset + 2 API (1135 workspace total, 1115 + 20
 new); clippy `-D warnings` clean.
+
+## 125. Dashboard completeness — model selector + Knowledge/Evidence/Bench/Providers in the main UI (DONE)
+
+The one user-facing UI (embedded dashboard at `/`) is the product's control
+plane; until now several real backends existed but had no main-UI surface
+(they were only reachable in the `/ui2` preview or via API/CLI). This
+milestone makes every implemented capability **visible and operational** in
+the main dashboard, per the agreed workflow (main UI first, then polish in
+ui2 if the main UI is good).
+
+- **Active model selector (admin, live)**: `POST /api/admin/model/select`
+  (master-gated) picks the GGUF this node serves. The model name is validated
+  as a plain file name inside `models/` (path-traversal rejected), persisted
+  atomically as `node.model` in `node.yaml` (`persist_model_config`, same
+  tmp+sync+rename pattern as resources), audited (`model_selected`), and —
+  when a local engine with an M24 restart spec is attached — **respawns
+  llama-server live** with the new model (`ServeManager::set_restart_model` +
+  `ensure_healthy`). The Models view has a dropdown of the real local models
+  + "Serve this model" button; the response reports `persisted` /
+  `respawned` honestly. Verified live: switching to qwen2.5-coder-7b
+  respawned the engine in place.
+  - **DeepSeek note (honest)**: a pulled `DeepSeek-V4-Flash-DSpark-support`
+    model is **share-able** (indexed, advertised, pullable by peers) but not
+    servable locally yet — it is a DSpark *spec/draft* sidecar (81 tensors,
+    architecture `deepseek4-dspark`) and the local llama.cpp build lacks the
+    DSpark spec support commit (`9cd719af2`). The selector reports the
+    honest `respawned: false` + note instead of pretending success.
+- **Knowledge view (P12)**: collective knowledge objects with evidence-backed
+  confidence, decisions, verified compute receipts and compensation balances
+  from `/v1/knowledge` — previously ui2-only.
+- **Evidence view (P12 RAG)**: evidence KPIs, derived lessons ("zero evidence
+  in, zero lessons out"), recent entries and a live query box against
+  `/v1/evidence` + `/v1/evidence/query` — previously ui2-only.
+- **Bench view (Benchmark Lab)**: paired verdict (shared tasks), per-mode
+  aggregates (paired + global) and a real task runner (single/rag/collective)
+  from `/v1/bench` + `/v1/bench/run` — previously ui2-only.
+- **Providers view (P5)**: Model Fabric providers with masked fingerprints and
+  connected models from `/v1/providers` (credentials never leave memory) —
+  previously ui2-only.
+
+Tests: 3 new (persist_model_config atomic rewrite + missing-file refusal +
+model-select endpoint auth/path-traversal/persist). 1138 workspace total
+(1135 + 3); clippy `-D warnings` clean.
