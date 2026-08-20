@@ -66,8 +66,8 @@ pub use compensation::{
 pub use contribution::{ContributionProfile, contribution_score, suggest_tier};
 pub use contribution_state::{ModelContribution, NodeContributionState, TimeRangeContribution, WorkerContribution};
 pub use credits::{
-    CreditAccount, CreditCalculation, CreditEvent, CreditLedger, CreditPolicy,
-    CreditPolicyDimension, ResourceSummary,
+    CreditAccount, CreditCalculation, CreditEvent, CreditLedger, CreditLedgerSnapshot,
+    CreditPolicy, CreditPolicyDimension, ResourceSummary,
 };
 pub use placement::{
     ComputeDemand, ComputeOffer, ComputePrice, ComputeReservation, ComputeSettlement,

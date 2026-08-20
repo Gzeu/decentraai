@@ -841,6 +841,14 @@ enum ContributionCommand {
         #[arg(long, default_value = "configs/node.example.yaml")]
         config: PathBuf,
     },
+    /// Show the evidence chain for one execution (P14 Phase P): execution
+    /// record → credit event → worker balance, each hop id-linked.
+    EvidenceChain {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        execution_id: String,
+    },
 }
 
 #[tokio::main]
@@ -4374,6 +4382,28 @@ async fn contribution_command(command: ContributionCommand) -> Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&j)?);
         }
+        ContributionCommand::EvidenceChain {
+            config,
+            execution_id,
+        } => {
+            let (client, base_url, token) = build_local_client(&config)?;
+            let url = format!("{base_url}/v1/evidence-chain?execution_id={execution_id}");
+            let mut req = client.get(url);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "evidence chain failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
+        }
     }
     Ok(())
 }
@@ -5928,6 +5958,12 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Part 17/22: persistent execution history (db/executions.jsonl) — the
     // coordinator replays past executions on restart instead of losing them.
     compute_manager.set_executions_path(Some(data_dir.join("db/executions.jsonl")));
+    // P14 Phase Q: persistent credit ledger + node-local contribution state
+    // (db/credits.json, db/contribution.json) — balances, idempotency and
+    // lifetime projections survive node restarts (storage separation:
+    // HOT state in memory, HISTORY on disk).
+    compute_manager.set_credits_path(Some(data_dir.join("db/credits.json")));
+    compute_manager.set_contribution_path(Some(data_dir.join("db/contribution.json")));
     // Coordinator-side policy: when the node permits on-demand provisioning,
     // the scheduler may route workloads to workers that will fetch the model
     // instead of only to workers that already serve it (M14).

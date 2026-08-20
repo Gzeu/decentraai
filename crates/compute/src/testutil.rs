@@ -28,11 +28,7 @@ pub(crate) fn test_advertisement(
         capability: ComputeCapability {
             cpu_cores: 8,
             ram_mb: 16 * 1024,
-            gpu: Some(GpuSpec {
-                name: "RTX 4090".into(),
-                vram_mb: 24 * 1024,
-                driver: "565".into(),
-            }),
+            gpu: Some(GpuSpec::simple("RTX 4090", 24 * 1024, "565")),
             engine: "llama_server".into(),
             served_models: vec![ServedModel {
                 model_hash: "abc".into(),

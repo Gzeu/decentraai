@@ -247,6 +247,17 @@ pub struct CreditLedger {
     policy: CreditPolicy,
 }
 
+/// Serializable snapshot of the full ledger state (P14 Phase Q storage).
+/// Restoring it reproduces balances, idempotency, events and policy exactly, so
+/// a restarted node never double-credits a replayed execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditLedgerSnapshot {
+    pub accounts: BTreeMap<String, CreditAccount>,
+    pub applied: HashSet<String>,
+    pub events: VecDeque<CreditEvent>,
+    pub policy: CreditPolicy,
+}
+
 const MAX_EVENTS: usize = 4096;
 
 impl CreditLedger {
@@ -331,6 +342,26 @@ impl CreditLedger {
 
     pub fn events(&self) -> &VecDeque<CreditEvent> {
         &self.events
+    }
+
+    /// Full snapshot for persistence (atomic tmp+sync+rename on the caller
+    /// side). The snapshot is the single source of truth for restart recovery.
+    pub fn snapshot(&self) -> CreditLedgerSnapshot {
+        CreditLedgerSnapshot {
+            accounts: self.accounts.clone(),
+            applied: self.applied.clone(),
+            events: self.events.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+
+    /// Replaces the entire ledger state from a snapshot. Used at startup to
+    /// recover balances/idempotency/events/policy exactly as they were.
+    pub fn restore(&mut self, snap: CreditLedgerSnapshot) {
+        self.accounts = snap.accounts;
+        self.applied = snap.applied;
+        self.events = snap.events;
+        self.policy = snap.policy;
     }
 }
 

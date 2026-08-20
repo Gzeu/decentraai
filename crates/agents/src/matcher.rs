@@ -210,11 +210,7 @@ mod tests {
             capability: decentraai_compute::ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 32 * 1024,
-                gpu: Some(GpuSpec {
-                    name: "gpu".into(),
-                    vram_mb: 24 * 1024,
-                    driver: "d".into(),
-                }),
+                gpu: Some(GpuSpec::simple("gpu", 24 * 1024, "d")),
                 engine: "llama_server".into(),
                 served_models: vec![ServedModel {
                     model_hash: "abc".into(),

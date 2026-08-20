@@ -76,10 +76,19 @@ pub struct FabricNode {
 }
 
 impl FabricNode {
-    /// Total VRAM across all GPUs advertised by the node (MiB). Today one GPU
-    /// per node; future multi-GPU advertisements will sum here.
+    /// Total VRAM across all GPUs advertised by the node (MiB). Multi-GPU
+    /// advertisements sum every GPU's VRAM.
     pub fn total_vram_mb(&self) -> u64 {
-        self.capability.gpu.as_ref().map(|g| g.vram_mb).unwrap_or(0)
+        self.capability
+            .gpu
+            .as_ref()
+            .map(|g| g.total_vram_mb())
+            .unwrap_or(0)
+    }
+
+    /// Number of GPUs advertised by the node (`0` when GPU-less).
+    pub fn gpu_count(&self) -> u32 {
+        self.capability.gpu.as_ref().map(|g| g.count.max(1)).unwrap_or(0)
     }
 
     /// Total RAM advertised by the node (MiB).
@@ -378,11 +387,7 @@ mod tests {
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb,
-                gpu: Some(GpuSpec {
-                    name: "test".to_string(),
-                    vram_mb,
-                    driver: "test".to_string(),
-                }),
+                gpu: Some(GpuSpec::simple("test", vram_mb, "test")),
                 engine: "llama_server".to_string(),
                 served_models: vec![],
                 can_provision: false,

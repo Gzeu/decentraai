@@ -201,11 +201,7 @@ pub fn build_advertisement(
 ) -> ComputeAdvertisement {
     let (gpu_spec, free_vram_mib, gpu_temp, gpu_util) = match &gpu {
         GpuProbeStatus::Nvidia(info) => (
-            Some(GpuSpec {
-                name: info.name.clone(),
-                vram_mb: info.total_vram_mib * MIB / MIB,
-                driver: "nvidia".into(),
-            }),
+            Some(GpuSpec::simple(&info.name, info.total_vram_mib * MIB / MIB, "nvidia")),
             Some(info.free_vram_mib),
             Some(info.temperature_celsius),
             Some(info.utilization_percent),
@@ -258,6 +254,25 @@ pub fn short_node_id(peer: &PeerId) -> String {
     let body = s.strip_prefix("12D3KooW").unwrap_or(&s);
     let head = &body[..body.len().min(6)];
     format!("dca-{head}")
+}
+
+/// Atomically writes a serde-serializable value as JSON to `path`
+/// (tmp + sync + rename), matching the repo's persistence invariant. Best-effort
+/// by design; callers log failures without breaking the accounting flow.
+fn atomic_write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(value)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Coordinator-side compute manager.
@@ -327,6 +342,15 @@ pub struct ComputeManager {
     /// replays it back into `recent_executions` on startup. `None` keeps
     /// execution history in-memory only (default).
     executions_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Optional JSON snapshot path (`db/credits.json`) for the P14 credit
+    /// ledger. When set, every credit persists the full ledger snapshot
+    /// (accounts + idempotency + events + policy) atomically, so a restarted
+    /// node never double-credits a replayed execution and balances survive.
+    credits_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Optional JSON snapshot path (`db/contribution.json`) for the node-local
+    /// contribution state. When set, every recorded execution persists the
+    /// lifetime/per-model/per-worker projections atomically.
+    contribution_path: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Bounded, newest-first full autonomous execution decisions (M23 Full
     /// Autonomy): candidates, constraints, score, selected worker, KV affinity,
     /// engine capability, expected mode, fallback and lifecycle trace — the
@@ -406,6 +430,8 @@ impl ComputeManager {
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
             executions_path: std::sync::Mutex::new(None),
+            credits_path: std::sync::Mutex::new(None),
+            contribution_path: std::sync::Mutex::new(None),
             recent_decisions: std::sync::Mutex::new(VecDeque::new()),
             signing_key: None,
             breaker: std::sync::Mutex::new(crate::breaker::CircuitBreaker::new(
@@ -487,6 +513,84 @@ impl ComputeManager {
         *slot = path.clone();
         if let Some(p) = path {
             self.replay_execution_history(&p);
+        }
+    }
+
+    /// Enables persistent credit-ledger snapshots (P14 Phase Q). `path` is the
+    /// JSON file (`db/credits.json`); on set, any existing snapshot is loaded
+    /// into the ledger so balances/idempotency survive restarts.
+    pub fn set_credits_path(&self, path: Option<std::path::PathBuf>) {
+        let mut slot = self.credits_path.lock().unwrap();
+        *slot = path.clone();
+        if let Some(p) = &path {
+            self.replay_credits(p);
+        }
+    }
+
+    /// Enables persistent contribution-state snapshots (P14 Phase Q). `path` is
+    /// the JSON file (`db/contribution.json`); on set, any existing snapshot is
+    /// loaded into the node-local state.
+    pub fn set_contribution_path(&self, path: Option<std::path::PathBuf>) {
+        let mut slot = self.contribution_path.lock().unwrap();
+        *slot = path.clone();
+        if let Some(p) = &path {
+            self.replay_contribution(p);
+        }
+    }
+
+    /// Loads `db/credits.json` into the credit ledger (best-effort; a missing
+    /// or corrupt file only logs).
+    fn replay_credits(&self, path: &std::path::Path) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return; // fresh install: no snapshot yet
+        };
+        match serde_json::from_str::<decentraai_compute::CreditLedgerSnapshot>(&contents) {
+            Ok(snap) => {
+                let mut ledger = self.credits.lock().unwrap();
+                ledger.restore(snap);
+            }
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "corrupt credit snapshot; starting fresh"),
+        }
+    }
+
+    /// Loads `db/contribution.json` into the node-local contribution state.
+    fn replay_contribution(&self, path: &std::path::Path) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return;
+        };
+        match serde_json::from_str::<decentraai_compute::NodeContributionState>(&contents) {
+            Ok(state) => {
+                let mut slot = self.contribution_state.lock().unwrap();
+                *slot = state;
+            }
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "corrupt contribution snapshot; starting fresh"),
+        }
+    }
+
+    /// Persists the credit ledger snapshot atomically (tmp + sync + rename).
+    /// Best-effort: a write failure never breaks the accounting flow.
+    fn persist_credits(&self) {
+        let path = self.credits_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let snap = {
+            let ledger = self.credits.lock().unwrap();
+            ledger.snapshot()
+        };
+        if let Err(e) = atomic_write_json(&path, &snap) {
+            tracing::warn!(error = %e, path = %path.display(), "failed to persist credit ledger");
+        }
+    }
+
+    /// Persists the node-local contribution state atomically.
+    fn persist_contribution(&self) {
+        let path = self.contribution_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let state = {
+            let slot = self.contribution_state.lock().unwrap();
+            slot.clone()
+        };
+        if let Err(e) = atomic_write_json(&path, &state) {
+            tracing::warn!(error = %e, path = %path.display(), "failed to persist contribution state");
         }
     }
 
@@ -681,6 +785,11 @@ impl ComputeManager {
             if amount > 0 {
                 let mut state = self.contribution_state.lock().unwrap();
                 state.record_execution(&rc, amount);
+                drop(state);
+                // Persist only when real work was credited (hot path is cheap:
+                // atomic rename per verified completion).
+                self.persist_credits();
+                self.persist_contribution();
             }
         }
         true
@@ -848,6 +957,9 @@ impl ComputeManager {
         if amount > 0 {
             let mut state = self.contribution_state.lock().unwrap();
             state.record_execution(rc, amount);
+            drop(state);
+            self.persist_credits();
+            self.persist_contribution();
         }
         amount
     }
@@ -1150,6 +1262,43 @@ impl ComputeManager {
             .rev()
             .cloned()
             .collect()
+    }
+
+    /// Builds the evidence chain for one execution (P14 Phase P): the
+    /// execution record (decision → placement → reservation → worker → model →
+    /// outcome → measured usage) linked to its credit event (receipt →
+    /// contribution → credits) and the worker's resulting balance. Every hop
+    /// carries a stable id (`request_id` / `execution_id` / account), so an
+    /// operator can always answer "what did execution X produce, and why".
+    pub fn evidence_chain(&self, execution_id: &str) -> Option<EvidenceChain> {
+        let execution = self
+            .recent_executions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.request_id == execution_id)
+            .cloned();
+        let credit_event = self
+            .credits
+            .lock()
+            .unwrap()
+            .events()
+            .iter()
+            .find(|e| e.execution_id == execution_id)
+            .cloned();
+        let worker_balance = credit_event
+            .as_ref()
+            .and_then(|ev| self.credit_account(&ev.account));
+        if execution.is_none() && credit_event.is_none() {
+            return None;
+        }
+        Some(EvidenceChain {
+            execution_id: execution_id.to_string(),
+            execution,
+            credit_event,
+            worker_balance,
+            chain_complete: true,
+        })
     }
 
     /// Snapshot of the newest-full autonomous execution decisions (M23 Full
@@ -1942,11 +2091,7 @@ impl ComputeManager {
 /// Convenience: derive a `GpuSpec` and free-VRAM from a `GpuSnapshot`.
 pub fn gpu_from_snapshot(info: &GpuSnapshot) -> (Option<GpuSpec>, Option<u64>) {
     (
-        Some(GpuSpec {
-            name: info.name.clone(),
-            vram_mb: info.total_vram_mib,
-            driver: "nvidia".into(),
-        }),
+        Some(GpuSpec::simple(&info.name, info.total_vram_mib, "nvidia")),
         Some(info.free_vram_mib),
     )
 }
@@ -2431,6 +2576,19 @@ impl ComputeManager {
     }
 }
 
+/// The evidence chain for one execution (P14 Phase P): execution record +
+/// credit event + resulting worker balance, each hop linked by a stable id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EvidenceChain {
+    pub execution_id: String,
+    pub execution: Option<ExecutedPlan>,
+    pub credit_event: Option<decentraai_compute::CreditEvent>,
+    pub worker_balance: Option<decentraai_compute::CreditAccount>,
+    /// True when both the execution record and its credit event exist (the
+    /// full chain from task → execution → receipt → credits is present).
+    pub chain_complete: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2707,6 +2865,121 @@ mod tests {
             local_node.trusted,
             "the local peer must be treated as trusted by the fabric graph"
         );
+    }
+
+    #[tokio::test]
+    async fn credit_ledger_and_contribution_persist_across_restart() {
+        // P14 Phase Q (storage separation): after recording a verified
+        // execution with credits_path + contribution_path set, a NEW manager
+        // replaying the same db/ files restores the exact balance, the
+        // idempotency set (a replayed execution must not double-credit), and
+        // the lifetime contribution projections.
+        let dir = tempfile::tempdir().unwrap();
+        let credits_path = dir.path().join("db/credits.json");
+        let contribution_path = dir.path().join("db/contribution.json");
+
+        let worker = peer();
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_credits_path(Some(credits_path.clone()));
+        manager.set_contribution_path(Some(contribution_path.clone()));
+        manager.record_credited_contribution(&worker, "exec-persist", true, Some(50), Some(250));
+        let balance_before = manager.credit_account(&worker.to_string()).unwrap().balance;
+        assert!(balance_before > 0, "verified work must earn credits");
+
+        // A new manager over the same files recovers the state.
+        let restarted = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        restarted.set_credits_path(Some(credits_path.clone()));
+        restarted.set_contribution_path(Some(contribution_path.clone()));
+        let balance_after = restarted
+            .credit_account(&worker.to_string())
+            .map(|a| a.balance)
+            .unwrap_or(0);
+        assert_eq!(
+            balance_after, balance_before,
+            "restart must restore the exact credit balance"
+        );
+        let state = restarted.contribution_state();
+        assert_eq!(state.verified_executions, 1);
+        assert_eq!(state.balance, balance_before);
+
+        // Idempotency survives: replaying the same execution on the restarted
+        // manager must NOT credit again (the ledger's persisted idempotency
+        // set blocks it even though the in-memory dedup ring is fresh).
+        restarted.record_credited_contribution(&worker, "exec-persist", true, Some(50), Some(250));
+        assert_eq!(
+            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            balance_before,
+            "balance must not grow on replay"
+        );
+        assert_eq!(
+            restarted.contribution_state().verified_executions,
+            1,
+            "replayed execution must not be re-recorded in the state"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_chain_links_execution_to_credit_event() {
+        // P14 Phase P: for one execution_id the chain exposes the execution
+        // record (placement/worker/model/outcome/usage) AND its credit event
+        // (receipt/contribution/credits) AND the worker's resulting balance —
+        // each hop id-linked, so an operator can explain any balance.
+        let dir = tempfile::tempdir().unwrap();
+        let credits_path = dir.path().join("db/credits.json");
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_credits_path(Some(credits_path.clone()));
+
+        let worker = peer();
+        manager.record_credited_contribution(&worker, "exec-chain", true, Some(30), Some(100));
+        // Record the executed plan for the same request id (as the router does).
+        let stage = decentraai_fabric::ExecutionStage {
+            stage_id: "s1".to_string(),
+            worker: worker.to_string(),
+            model_hash: "m1".to_string(),
+            engine: decentraai_fabric::EngineKind::LlamaServer,
+            est_ram_mb: 1024,
+            est_vram_mb: 0,
+        };
+        let plan = decentraai_fabric::ExecutionPlan::single("m1", stage);
+        let placement = Placement {
+            worker,
+            reservation: ResourceReservation {
+                reservation_id: uuid::Uuid::new_v4(),
+                worker,
+                est_ram_mb: 1024,
+                est_vram_mb: 0,
+                created_at: std::time::Instant::now(),
+                ttl: std::time::Duration::from_secs(60),
+            },
+            confidence: 0.9,
+        };
+        manager.record_execution(
+            "exec-chain",
+            &plan,
+            &placement,
+            None,
+            "succeeded",
+            ExecutionAttribution {
+                tokens_used: Some(30),
+                processing_time_ms: Some(100),
+                attempt: 0,
+            },
+        );
+
+        let chain = manager.evidence_chain("exec-chain").expect("chain must exist");
+        assert!(chain.chain_complete, "execution + credit event both present");
+        let exec = chain.execution.expect("execution record present");
+        assert_eq!(exec.request_id, "exec-chain");
+        assert_eq!(exec.outcome, "succeeded");
+        assert_eq!(exec.tokens_used, Some(30));
+        let credit = chain.credit_event.expect("credit event present");
+        assert_eq!(credit.execution_id, "exec-chain");
+        assert!(credit.amount > 0);
+        let balance = chain.worker_balance.expect("worker balance present");
+        assert_eq!(balance.balance, credit.amount);
+
+        // Unknown id: no chain.
+        assert!(manager.evidence_chain("nope").is_none());
     }
 
     #[tokio::test]

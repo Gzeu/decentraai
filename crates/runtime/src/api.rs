@@ -4947,6 +4947,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/verified-compute/history", get(verified_compute_history_handler))
         .route("/v1/placement/plan", get(placement_plan_handler))
         .route("/v1/fabric/graphs", get(fabric_graphs_handler))
+        .route("/v1/evidence-chain", get(evidence_chain_handler))
         // P3 - Admin dashboard endpoints
         .route("/api/admin/token/list", get(admin_token_list_handler))
         .route("/api/admin/token/create", post(admin_token_create_handler))
@@ -6728,6 +6729,48 @@ async fn fabric_graphs_handler(State(state): State<ApiState>, headers: HeaderMap
         serde_json::to_string(&graph).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
+}
+
+/// P14 Phase P — Evidence chain for one execution (read-only). Links the
+/// execution record (decision → placement → reservation → worker → model →
+/// outcome → measured usage) to its credit event (receipt → contribution →
+/// credits) and the worker's resulting balance. Each hop carries a stable id.
+async fn evidence_chain_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let execution_id = query.0.get("execution_id").cloned().unwrap_or_default();
+    if execution_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "execution_id is required"}).to_string(),
+        )
+            .into_response();
+    }
+    match compute.evidence_chain(&execution_id) {
+        Some(chain) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&chain).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("no evidence for execution {execution_id}")})
+                .to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// P12 run a collective decision over knowledge objects (operator+).
@@ -13064,11 +13107,7 @@ mod tests {
             cpu_cores: cores,
             ram_mb,
             gpu: if gpu {
-                Some(decentraai_compute::GpuSpec {
-                    name: "gpu".into(),
-                    vram_mb: 8192,
-                    driver: "x".into(),
-                })
+                Some(decentraai_compute::GpuSpec::simple("gpu", 8192, "x"))
             } else {
                 None
             },
@@ -13964,11 +14003,7 @@ mod tests {
                 cpu_cores: 4,
                 ram_mb: 16384,
                 gpu: if est_vram > 0 {
-                    Some(decentraai_distributed::compute::GpuSpec {
-                        name: "gpu".into(),
-                        vram_mb: est_vram + 1024,
-                        driver: "x".into(),
-                    })
+                    Some(decentraai_distributed::compute::GpuSpec::simple("gpu", est_vram + 1024, "x"))
                 } else {
                     None
                 },

@@ -4,12 +4,55 @@ use serde::{Deserialize, Serialize};
 
 /// GPU hardware specification. A worker without a GPU advertises `None`
 /// and is a CPU-only node.
+///
+/// Multi-GPU readiness (P14 Phase J): a node may advertise more than one
+/// GPU and its compute class/capability, so the placement engine can reason
+/// about "can this node hold a model that needs N GPUs". All new fields are
+/// `#[serde(default)]` — older advertisements without them deserialize safely
+/// as a single GPU of unknown class.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuSpec {
     pub name: String,
-    /// Total VRAM in MiB.
+    /// Total VRAM in MiB (per GPU when `count > 1`).
     pub vram_mb: u64,
     pub driver: String,
+    /// Number of GPUs of this specification on the node. `1` = single GPU.
+    #[serde(default = "default_gpu_count")]
+    pub count: u32,
+    /// CUDA/compute capability (e.g. 8.6), when the driver reports it.
+    /// `None` = unknown — never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_capability: Option<f64>,
+    /// Coarse GPU class: `"consumer"`, `"prosumer"`, `"datacenter"`,
+    /// `"integrated"` — derived from real driver/name data where possible,
+    /// `None` = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_class: Option<String>,
+}
+
+fn default_gpu_count() -> u32 {
+    1
+}
+
+impl GpuSpec {
+    /// A single-GPU spec with unknown class/compute capability (the common
+    /// legacy shape). New multi-GPU fields default: count=1, class None,
+    /// compute capability None.
+    pub fn simple(name: &str, vram_mb: u64, driver: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            vram_mb,
+            driver: driver.to_string(),
+            count: 1,
+            compute_capability: None,
+            gpu_class: None,
+        }
+    }
+
+    /// Total VRAM across all GPUs of this specification (MiB).
+    pub fn total_vram_mb(&self) -> u64 {
+        self.vram_mb.saturating_mul(u64::from(self.count.max(1)))
+    }
 }
 
 /// A model the node can execute, with its estimated memory footprint.
@@ -171,11 +214,7 @@ mod tests {
         ComputeCapability {
             cpu_cores: 8,
             ram_mb: 16 * 1024,
-            gpu: Some(GpuSpec {
-                name: "RTX 4090".into(),
-                vram_mb: 24 * 1024,
-                driver: "565".into(),
-            }),
+            gpu: Some(GpuSpec::simple("RTX 4090", 24 * 1024, "565")),
             engine: "llama_server".into(),
             served_models: vec![ServedModel {
                 model_hash: "abc".into(),

@@ -346,6 +346,13 @@ impl PlacementEngine {
         if node.capability.gpu.is_none() && req.min_vram_mb > 0 {
             return Some("no gpu".to_string());
         }
+        if node.gpu_count() < req.min_gpu_count {
+            return Some(format!(
+                "insufficient gpu count: {} < {}",
+                node.gpu_count(),
+                req.min_gpu_count
+            ));
+        }
         if node.total_vram_mb() < req.min_vram_mb {
             return Some(format!(
                 "insufficient vram: {} < {} MiB",
@@ -358,12 +365,6 @@ impl PlacementEngine {
                 "insufficient ram: {} < {} MiB",
                 node.total_ram_mb(),
                 req.min_ram_mb
-            ));
-        }
-        if req.min_gpu_count > 1 {
-            return Some(format!(
-                "single-gpu node cannot satisfy min_gpu_count={}",
-                req.min_gpu_count
             ));
         }
         None
@@ -529,11 +530,7 @@ mod tests {
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 64_000,
-                gpu: Some(GpuSpec {
-                    name: "t".to_string(),
-                    vram_mb: 24_000,
-                    driver: "t".to_string(),
-                }),
+                gpu: Some(GpuSpec::simple("t", 24_000, "t")),
                 engine: "llama_server".to_string(),
                 served_models: vec![],
                 can_provision: false,
@@ -582,11 +579,7 @@ mod tests {
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 64_000,
-                gpu: Some(GpuSpec {
-                    name: "t".to_string(),
-                    vram_mb: 24_000,
-                    driver: "t".to_string(),
-                }),
+                gpu: Some(GpuSpec::simple("t", 24_000, "t")),
                 engine: "llama_server".to_string(),
                 served_models: vec![],
                 can_provision: false,
@@ -612,8 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_engine_falls_back_to_distributed_group() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
+    fn placement_engine_falls_back_to_distributed_group() {        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
 
         let mut graph = FabricGraph::new();
@@ -628,11 +620,7 @@ mod tests {
                 capability: ComputeCapability {
                     cpu_cores: 8,
                     ram_mb: 64_000,
-                    gpu: Some(GpuSpec {
-                        name: "t".to_string(),
-                        vram_mb: vram,
-                        driver: "t".to_string(),
-                    }),
+                    gpu: Some(GpuSpec::simple("t", vram, "t")),
                     engine: "llama_server".to_string(),
                     served_models: vec![],
                     can_provision: false,
@@ -655,5 +643,96 @@ mod tests {
         let plan = engine.plan(&req, &graph);
         assert_eq!(plan.selected_workers.len(), 3, "three workers must be selected");
         assert_eq!(plan.execution_mode, "distributed");
+    }
+
+    #[test]
+    fn multi_gpu_node_satisfies_min_gpu_count() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        let mut graph = FabricGraph::new();
+        let mut gpu = GpuSpec::simple("A6000", 48_000, "nvidia");
+        gpu.count = 2;
+        gpu.gpu_class = Some("datacenter".to_string());
+        graph.upsert(FabricNode {
+            peer_id: "peer-dual".to_string(),
+            node_name: "dual".to_string(),
+            node_version: "1.0.0".to_string(),
+            trusted: true,
+            healthy: true,
+            accepts_remote: true,
+            capability: ComputeCapability {
+                cpu_cores: 16,
+                ram_mb: 128_000,
+                gpu: Some(gpu.clone()),
+                engine: "llama_server".to_string(),
+                served_models: vec![],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: crate::availability::ComputeAvailability::ready(),
+            link: None,
+        });
+
+        // A 70 GiB model needing 2 GPUs fits on the dual-GPU node.
+        let req = ModelRequirements {
+            model_id: "big.gguf".to_string(),
+            min_gpu_count: 2,
+            min_vram_mb: 70_000,
+            min_ram_mb: 60_000,
+            ..Default::default()
+        };
+        let engine = PlacementEngine::default();
+        let plan = engine.plan(&req, &graph);
+        assert!(
+            plan.selected_workers == vec!["peer-dual".to_string()],
+            "unexpected plan: selected={:?} rejected={:?}",
+            plan.selected_workers,
+            plan.rejected
+        );
+        assert_eq!(plan.execution_mode, "single_worker");
+        assert!(plan.rejected.is_empty());
+        // Total VRAM counts both GPUs.
+        assert_eq!(gpu.total_vram_mb(), 96_000);
+    }
+
+    #[test]
+    fn single_gpu_node_rejected_for_min_gpu_count_2() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        let mut graph = FabricGraph::new();
+        graph.upsert(FabricNode {
+            peer_id: "peer-single".to_string(),
+            node_name: "single".to_string(),
+            node_version: "1.0.0".to_string(),
+            trusted: true,
+            healthy: true,
+            accepts_remote: true,
+            capability: ComputeCapability {
+                cpu_cores: 8,
+                ram_mb: 64_000,
+                gpu: Some(GpuSpec::simple("RTX", 24_000, "x")),
+                engine: "llama_server".to_string(),
+                served_models: vec![],
+                can_provision: false,
+                available_models: vec![],
+            },
+            availability: crate::availability::ComputeAvailability::ready(),
+            link: None,
+        });
+
+        let req = ModelRequirements {
+            model_id: "big.gguf".to_string(),
+            min_gpu_count: 2,
+            min_vram_mb: 40_000,
+            min_ram_mb: 30_000,
+            ..Default::default()
+        };
+        let engine = PlacementEngine::default();
+        let plan = engine.plan(&req, &graph);
+        assert!(plan.selected_workers.is_empty());
+        assert_eq!(plan.rejected.len(), 1);
+        assert!(plan.rejected[0].reason.contains("gpu count"));
     }
 }

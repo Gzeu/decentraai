@@ -3291,3 +3291,48 @@ from `find_worker()` into an explainable planner.
   `fabric_graphs_and_placement_plan_serve_real_state`.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [x] `cargo test --workspace` green (1184 tests).
+
+## 131. Distributed Compute Fabric v2 — Multi-GPU + Storage + Evidence Chain (DONE)
+
+Continues the V2 push: multi-GPU capability modeling (large-model readiness),
+persistent credit/contribution storage (hot/evidence/history separation), and
+the queryable evidence chain (P14 Phase J/Q/P).
+
+### 131.1 Multi-GPU capability modeling
+
+- [x] `GpuSpec` gains `count` (default 1), `compute_capability: Option<f64>`,
+  `gpu_class: Option<String>` — all `#[serde(default)]` so older advertisements
+  deserialize safely. `GpuSpec::total_vram_mb()` multiplies count × per-GPU VRAM.
+- [x] `FabricNode::gpu_count()`; `FabricNode::total_vram_mb()` sums all GPUs.
+- [x] `PlacementEngine::reject_reason` now checks `node.gpu_count() <
+  min_gpu_count` with an honest "insufficient gpu count" reason (replacing the
+  old hard-coded "single-gpu node" gate that ignored the node's real GPUs).
+- [x] Tests: `multi_gpu_node_satisfies_min_gpu_count`,
+  `single_gpu_node_rejected_for_min_gpu_count_2`.
+
+### 131.2 Storage separation — persistent credits + contribution
+
+- [x] `CreditLedgerSnapshot` (accounts + idempotency + events + policy) with
+  `snapshot()`/`restore()` — a restarted node never double-credits a replayed
+  execution and balances survive.
+- [x] `ComputeManager::set_credits_path(db/credits.json)` /
+  `set_contribution_path(db/contribution.json)` — replay on set, atomic
+  tmp+sync+rename persist on every credited execution (best-effort, never
+  breaks the flow).
+- [x] Wired in `decentraai node` startup.
+- [x] Test: `credit_ledger_and_contribution_persist_across_restart`.
+
+### 131.3 Evidence chain (queryable)
+
+- [x] `ComputeManager::evidence_chain(execution_id)` → `EvidenceChain`:
+  execution record (decision → placement → reservation → worker → model →
+  outcome → measured usage) linked to its credit event (receipt → contribution
+  → credits) and the worker's resulting balance; every hop id-linked.
+- [x] `GET /v1/evidence-chain?execution_id=...` (operator+) and
+  `decentraai contribution evidence-chain --execution-id ...`.
+- [x] Test: `evidence_chain_links_execution_to_credit_event`.
+
+### 131.4 Quality gates
+
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo test --workspace` green (47 suites).
