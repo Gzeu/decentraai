@@ -232,6 +232,11 @@ pub struct ApiState {
     manager: Arc<Mutex<ServeManager>>,
     client: reqwest::Client,
     pub(crate) info: DashboardInfo,
+    /// Live name of the model this node actually serves. `info.model_name` is
+    /// the model requested at startup (immutable); the admin model selector
+    /// respawns the engine live, so every surface that must reflect the
+    /// *current* model (status, dashboard, metrics, skills) reads this.
+    active_model: Arc<tokio::sync::RwLock<String>>,
     /// Root dashboard choice from `node.dashboard`. `/ui2` always remains a
     /// preview route, so an operator can switch back without losing access.
     dashboard: DashboardVersion,
@@ -367,6 +372,7 @@ impl ApiState {
                 .unwrap_or_default(),
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
+            active_model: Arc::new(tokio::sync::RwLock::new(info.model_name.clone())),
             info,
             dashboard: DashboardVersion::V1,
             token_store_path,
@@ -4485,6 +4491,7 @@ async fn admin_model_select_handler(
             match manager.ensure_healthy().await {
                 Ok(true) => {
                     respawned = true;
+                    *state.active_model.write().await = file_name.to_string();
                     note = if persisted {
                         "model saved to node.yaml and llama-server respawned with it".to_string()
                     } else {
@@ -4514,6 +4521,9 @@ async fn admin_model_select_handler(
                             let _ = manager.shutdown().await;
                             let _ = manager.set_restart_model(prev_path);
                             let ok = manager.ensure_healthy().await.unwrap_or(false);
+                            if restored && ok {
+                                *state.active_model.write().await = prev_name.clone();
+                            }
                             note = if restored && ok {
                                 format!(
                                     "model '{file_name}' failed to load — rolled back to '{prev_name}' and the engine is serving again"
@@ -5123,7 +5133,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
     let failed = state.requests_failed.load(Ordering::SeqCst);
     let stats = inference_stats(&recent, served, failed, waiting.len());
     let body = serde_json::json!({
-        "model": state.info.model_name,
+        "model": state.active_model.read().await.clone(),
         "model_size_bytes": state.info.model_size_bytes,
         "model_loaded": loaded,
         "uptime_secs": state.started_at.elapsed().as_secs(),
@@ -5331,7 +5341,7 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
     // stacks can consume them without understanding DecentraAI internals.
     // Safe metadata only: model id, operation, token/latency aggregates — never
     // prompts or outputs.
-    let genai_model = state.info.model_name.clone();
+    let genai_model = state.active_model.read().await.clone();
     let genai_provider = "decentraai";
     body.push_str(
         "# HELP gen_ai.server.request.count Number of inference requests served (OTel GenAI).\n",
@@ -5814,7 +5824,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         None => 0,
     };
     let status = serde_json::json!({
-        "model": state.info.model_name,
+        "model": state.active_model.read().await.clone(),
         "model_loaded": loaded,
         "backend_url": backend,
         "serving": serving.is_some(),
@@ -7171,7 +7181,7 @@ async fn skills_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
         "datasets": datasets,
         "skills": skills,
         "model": {
-            "name": state.info.model_name,
+            "name": state.active_model.read().await.clone(),
             "base_capabilities": local_base_kinds.iter().map(|k| k.label()).collect::<Vec<_>>(),
             "applicable_skills": local_build.unlocked.len(),
             "unlocked": local_unlocked,
@@ -9477,15 +9487,29 @@ fn html_escape(value: &str) -> String {
 }
 
 fn dashboard_js(state: &ApiState, share: &str) -> String {
+    // The active model can change live via the admin selector; reflect it in
+    // the served JS (the chat dropdown + active-model option). try_read keeps
+    // this sync helper non-blocking; fall back to the startup model on a rare
+    // concurrent write.
+    let active = state
+        .active_model
+        .try_read()
+        .map(|m| m.clone())
+        .unwrap_or_else(|_| state.info.model_name.clone());
     JS_TEMPLATE
         .replace("__SHARE__", &share.replace('"', "\\\""))
-        .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
+        .replace("__MODEL__", &active.replace('"', "\\\""))
 }
 
 fn dashboard_v2_js(state: &ApiState, share: &str) -> String {
+    let active = state
+        .active_model
+        .try_read()
+        .map(|m| m.clone())
+        .unwrap_or_else(|_| state.info.model_name.clone());
     JS_V2_TEMPLATE
         .replace("__SHARE__", &share.replace('"', "\\\""))
-        .replace("__MODEL__", &state.info.model_name.replace('"', "\\\""))
+        .replace("__MODEL__", &active.replace('"', "\\\""))
 }
 
 /// Real node + engine info derived from the local compute advertisement when a
@@ -12911,6 +12935,60 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["name"], "extra.gguf");
         assert!(models[0]["size_bytes"].as_u64().unwrap() > 0);
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_reflects_active_model_after_live_swap() {
+        // Regression: the admin model selector respawns llama-server live, but
+        // /status read `info.model_name` (the model requested at startup,
+        // immutable) — after a successful swap the dashboard kept showing the
+        // old model while the engine served the new one. The live truth lives
+        // in `active_model`; status must read it.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("old.gguf"), b"fake").unwrap();
+        std::fs::write(models_dir.join("new.gguf"), b"fake").unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let handle = state.clone();
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status["model"], "test-model.gguf",
+            "startup model reported"
+        );
+        // Simulate a successful live swap: the engine now serves "new.gguf".
+        // The selector handler writes active_model exactly like this.
+        *handle.active_model.write().await = "new.gguf".to_string();
+        let status: serde_json::Value = reqwest::get(format!("http://{api}/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status["model"], "new.gguf",
+            "status must report the active model after a live swap"
+        );
         manager.lock().await.shutdown().await.unwrap();
     }
 
