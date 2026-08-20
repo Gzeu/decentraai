@@ -11157,6 +11157,9 @@ mod tests {
             "renderAdaptiveSplit(c)",
             "id=\"adaptive-bar\"",
             "id=\"adaptive-legend\"",
+            "updateProviderCredential",
+            "async function updateProviderCredential(btn)",
+            "/providers/' + encodeURIComponent(pid) + '/credential'",
         ] {
             assert!(
                 body.contains(needle),

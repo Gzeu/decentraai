@@ -4738,11 +4738,35 @@ async function renderProviders(){
   $('providers-list').innerHTML = providers.map(p => {
     const s = p.summary || {};
     const models = p.models || [];
+    const pid = s.provider_id || p.provider_id || '';
+    const action = (isAdmin && pid)
+      ? '<button data-p="'+esc(pid)+'" onclick="updateProviderCredential(this)" title="Replace this provider\'s API key (credential lives only in memory)">Update key</button>'
+      : '';
     return '<div class="worker-card"><b>'+esc(s.name || s.provider_id || 'provider')+'</b>'+
       '<div class="muted" style="font-size:11px;margin-top:4px">'+esc(s.kind || '')+' · '+esc(s.base_url || '')+(s.fingerprint ? ' · '+esc(s.fingerprint) : '')+'</div>'+
-      '<div class="muted" style="font-size:11px;margin-top:4px">models: '+esc(models.map(m => m.id || m.name || m).join(', ') || '—')+'</div></div>';
+      '<div class="muted" style="font-size:11px;margin-top:4px">models: '+esc(models.map(m => m.id || m.name || m).join(', ') || '—')+'</div>'+
+      (action ? '<div class="wc-actions">'+action+'</div>' : '')+'</div>';
   }).join('');
 }
+// Provide re-auth (UI-AXIS-3): PUT /api/admin/providers/{id}/credential swaps the
+// in-memory API key handle for an existing provider. The backend keeps the
+// provider's models/health and never writes the key to disk.
+async function updateProviderCredential(btn){
+  if (!btn) return;
+  const pid = (btn.dataset && btn.dataset.p) || '';
+  if (!pid) return;
+  const key = (prompt('New API key for this provider (replaces the in-memory credential):') || '').trim();
+  if (!key) return;
+  const status = makeMaybeEl(btn, 'status');
+  try {
+    const r = await fetch('/api/admin/providers/' + encodeURIComponent(pid) + '/credential', { method: 'PUT', headers: Object.assign({ 'Content-Type': 'application/json' }, headers), body: JSON.stringify({ api_key: key }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { toast((d.error && d.error.message) || 'credential update failed (' + r.status + ')', true); return; }
+    toast('credential updated — fingerprint ' + (d.credential_fingerprint || ''), false);
+    setTimeout(() => renderProviders(), 500);
+  } catch (err) { toast('credential update failed: ' + err, true); }
+}
+function makeMaybeEl(btn, name){ let el = btn.parentElement.querySelector('[data-st="'+name+'"]'); if (!el) { el = document.createElement('span'); el.setAttribute('data-st', name); btn.after(el); } return el; }
 
 // ---- Active model selector (admin) ---------------------------------------
 async function populateActiveModel(s){
