@@ -6669,7 +6669,7 @@ async fn verified_compute_history_handler(State(state): State<ApiState>) -> Resp
 /// P14 — Placement plan (read-only, explainable). Given model requirements and
 /// a strategy hint, returns candidate workers, rejected candidates with safe
 /// reasons, selected workers, and expected resource/network cost.
-async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extract::Query<serde_json::Map<String, serde_json::Value>>) -> Response {
+async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6678,31 +6678,13 @@ async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extr
             .into_response();
     };
     // Parse requirements from query params; missing values become defaults.
-    let model_id = query
-        .get("model_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let min_vram_mb = query
-        .get("min_vram_mb")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let min_ram_mb = query
-        .get("min_ram_mb")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let min_gpu_count = query
-        .get("min_gpu_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-    let context_tokens = query
-        .get("context_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4096) as u32;
-    let allow_distributed = query
-        .get("distributed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let q = query.0;
+    let model_id = q.get("model_id").cloned().unwrap_or_default();
+    let min_vram_mb = q.get("min_vram_mb").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min_ram_mb = q.get("min_ram_mb").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min_gpu_count = q.get("min_gpu_count").and_then(|s| s.parse().ok()).unwrap_or(1u32);
+    let context_tokens = q.get("context_tokens").and_then(|s| s.parse().ok()).unwrap_or(4096u32);
+    let allow_distributed = q.get("distributed").map(|s| s == "true" || s == "1").unwrap_or(true);
     let requirements = decentraai_compute::ModelRequirements {
         model_id: model_id.clone(),
         min_gpu_count,
@@ -12340,6 +12322,23 @@ mod tests {
         assert!(body["selected_workers"].is_array());
         assert!(body["rejected"].is_array());
         assert!(body["execution_mode"].is_string());
+
+        // Regression: query params must be parsed as numbers (axum decodes
+        // query values as strings; as_u64() on a string silently returned the
+        // default and the planner ignored min_vram_mb). The echoed model
+        // requirements must carry the requested values, not defaults.
+        let resp = client
+            .get(format!(
+                "http://{api}/v1/placement/plan?model_id=big&min_vram_mb=70000&min_ram_mb=60000&min_gpu_count=2&distributed=true"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["model"]["min_vram_mb"], 70000);
+        assert_eq!(body["model"]["min_ram_mb"], 60000);
+        assert_eq!(body["model"]["min_gpu_count"], 2);
 
         manager.lock().await.shutdown().await.unwrap();
     }
