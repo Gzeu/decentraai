@@ -3091,3 +3091,24 @@ Non-functional, low-risk passes that raise quality without changing behavior:
 
 First to land: **per-message provenance** in the chat view (UI-AXIS-1).
 Commits land one feature at a time, each with a regression test.
+
+## 127. M9 P2 — real jitter / packet-loss / stability (DONE, commit `d873865`)
+The NetworkGraph measured RTT only; jitter/packet-loss/stability were struct
+fields that never got populated. A pure probe module now keeps a bounded
+per-peer window of `InferPing` outcomes and derives honest jitter (MAD over
+recent successful RTTs) + packet-loss (failure fraction). The periodic probe
+sends a 'lost' sample on ping error/timeout. `LinkMetrics.jitter_us` and
+`packet_loss_percent` are populated live so the planner's `stability()` uses
+measured network quality. 8 unit tests + integration test. `record_rtt()` kept
+as a 3-arg compatibility wrapper.
+
+## 128. P13 — Signed Compute Receipt (DONE, commit `d2cc381`)
+"Verified" compute is now cryptographic, not just ledger-trust. A
+SignedComputeReceipt wraps the plain receipt with an Ed25519 signature over its
+canonical bytes, made by the worker's node identity. Any node verifies
+independently; a bit-flip fails. The BLAKE3 output_hash lives in the signed
+bytes. Acceptance met: sign→verify ok, tamper fails, output_hash signed, ledger
+credits once per execution (idempotent). Foundation for P14 Compute Credits —
+nothing further (credits/market/economy/blockchain) proceeds until a node can
+cryptographically prove "I executed task Y, capability Z, produced H, at T" and
+another node verifies it independently.
