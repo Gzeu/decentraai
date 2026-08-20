@@ -4620,10 +4620,12 @@ const populateChatModels = (s, c, force) => {
   auto.value = '__auto__';
   auto.textContent = 'Auto (best available)';
   chatModel.appendChild(auto);
-  // Local models only when the filter is auto or local.
+  // Local models only when the filter is auto or local. The local engine
+  // serves exactly ONE model (the active one); listing the whole registry
+  // here would offer files that cannot be served and the proxy would
+  // silently answer with the active model — a lie (DeepSeek incident).
   if (filter === '__auto__' || filter === 'local') {
     const names = new Set([activeModel]);
-    ((s && s.available_models) || []).forEach(m => { if (m && m.name) names.add(m.name); });
     if (names.size) {
       const og = document.createElement('optgroup'); og.label = 'Local models';
       names.forEach(name => { const opt = document.createElement('option'); opt.value = name; opt.textContent = name; og.appendChild(opt); });

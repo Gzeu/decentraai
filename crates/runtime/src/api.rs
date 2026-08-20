@@ -4464,8 +4464,10 @@ async fn admin_model_select_handler(
         )
             .into_response();
     }
-    // Persist node.model atomically in the node config.
+    // Persist node.model atomically in the node config. Remember the previous
+    // model so a failed respawn can roll back to a known-good engine.
     let config_path = state.info.repo_root.join("node.yaml");
+    let previous_model = read_node_model(&config_path);
     let persisted = if config_path.exists() {
         persist_model_config(&config_path, file_name)
     } else {
@@ -4490,7 +4492,42 @@ async fn admin_model_select_handler(
                     };
                 }
                 Ok(false) => {
-                    note = "model saved; engine respawn failed — check logs and restart the node".to_string();
+                    // Rollback: the new model failed to load (wrong arch,
+                    // corrupt file, too slow to be ready). Restore the
+                    // previous model in node.yaml and respawn with it so the
+                    // node is never left without an engine.
+                    let rollback = previous_model
+                        .as_deref()
+                        .filter(|prev| prev != &file_name)
+                        .map(|prev| {
+                            let path = state.info.repo_root.join("models").join(prev);
+                            if path.is_file() {
+                                (prev.to_string(), path)
+                            } else {
+                                (String::new(), PathBuf::new())
+                            }
+                        })
+                        .filter(|(p, _)| !p.is_empty());
+                    match rollback {
+                        Some((prev_name, prev_path)) => {
+                            let restored = persist_model_config(&config_path, &prev_name);
+                            let _ = manager.shutdown().await;
+                            let _ = manager.set_restart_model(prev_path);
+                            let ok = manager.ensure_healthy().await.unwrap_or(false);
+                            note = if restored && ok {
+                                format!(
+                                    "model '{file_name}' failed to load — rolled back to '{prev_name}' and the engine is serving again"
+                                )
+                            } else {
+                                format!(
+                                    "model '{file_name}' failed to load; rollback to '{prev_name}' attempted (persisted={restored}, engine={ok}) — check logs"
+                                )
+                            };
+                        }
+                        None => {
+                            note = "model saved; engine respawn failed — no previous model to roll back to; check logs and restart the node".to_string();
+                        }
+                    }
                 }
                 Err(e) => {
                     note = format!(
@@ -4569,6 +4606,36 @@ fn persist_model_config(path: &std::path::Path, model_name: &str) -> bool {
     }
     drop(f);
     std::fs::rename(&tmp, path).is_ok()
+}
+
+/// Reads the `model:` value under the `node:` block in the node config —
+/// the model that was active before a model-select swap, used for rollback.
+/// Returns `None` when the file is missing, has no `node:` block, or has no
+/// model line.
+fn read_node_model(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_node_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if in_node_block {
+            if let Some(rest) = trimmed.strip_prefix("model:") {
+                let value = rest.trim().trim_matches('"').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+            // A non-empty, non-comment line at a smaller indent ends the block.
+            if !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !line.starts_with(char::is_whitespace)
+            {
+                break;
+            }
+        } else if trimmed.starts_with("node:") && trimmed.len() == "node:".len() {
+            in_node_block = true;
+        }
+    }
+    None
 }
 
 /// Shared body-parsing + peer-id extraction for the worker trust / revoke
@@ -11021,11 +11088,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dashboard_v2_local_selector_handles_available_models_objects() {
-        // V2 (/ui2) regression: the local chat model selector rendered
-        // `available_models` objects directly (`esc(m)` → "[object Object]"),
-        // hiding every local model. It must extract `m.name` and accept plain
-        // strings as well (the same shape V1 already handles).
+    async fn dashboard_v2_local_selector_shows_only_the_active_model() {
+        // V2 (/ui2) chat model selector: the local engine serves exactly ONE
+        // model, so the local option must be the ACTIVE model (`s.model`) —
+        // never the whole registry. Listing the registry offered files that
+        // cannot be served and the proxy silently answered with the active
+        // model (the DeepSeek incident: "DeepSeek" replied but qwen served).
         let dir = tempfile::tempdir().unwrap();
         let (api, manager) = start_stateful_api(dir.path(), None, None).await;
         let body = reqwest::Client::new()
@@ -11041,12 +11109,12 @@ mod tests {
             "ui2 must serve the v2 dashboard"
         );
         for needle in [
-            "m.name",
-            "(typeof m === 'string') ? m : (m && m.name) || ''",
+            "const active = (s && s.model) || (s && s.node && s.node.model) || '';",
+            "  (local)</option>",
         ] {
             assert!(
                 body.contains(needle),
-                "v2 chat local selector must extract the model name from objects, missing {needle}"
+                "v2 chat local selector must show only the active model, missing {needle}"
             );
         }
         manager.lock().await.shutdown().await.unwrap();
@@ -16030,5 +16098,26 @@ mod tests {
         assert_eq!(body["respawned"], false);
         let after = std::fs::read_to_string(dir.path().join("node.yaml")).unwrap();
         assert!(after.contains("model: \"Llama.gguf\""), "{after}");
+    }
+
+    #[test]
+    fn read_node_model_returns_previous_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.yaml");
+        // Missing file -> None.
+        assert!(read_node_model(&path).is_none());
+        // No `node:` block -> None.
+        std::fs::write(&path, "inference:\n  max_context_tokens: 4096\n").unwrap();
+        assert!(read_node_model(&path).is_none());
+        // Normal node block -> the model value (quotes stripped).
+        std::fs::write(
+            &path,
+            "node:\n  name: test\n  model: \"old.gguf\"\n  dashboard: v1\n",
+        )
+        .unwrap();
+        assert_eq!(read_node_model(&path).as_deref(), Some("old.gguf"));
+        // Unquoted value also parses.
+        std::fs::write(&path, "node:\n  model: old.gguf\n").unwrap();
+        assert_eq!(read_node_model(&path).as_deref(), Some("old.gguf"));
     }
 }

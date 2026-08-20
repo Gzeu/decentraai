@@ -519,10 +519,13 @@ function renderStatus(s) {
   // Note: /status available_models are objects {name,size_bytes} (registry),
   // so the local options must render `m.name`, never the raw object.
   const select = $('chat-model'), chosen = select.value;
-  let modelHtml = '<option value="">Current model</option>'+(s.available_models || []).map(m => {
-    const name = (typeof m === 'string') ? m : (m && m.name) || '';
-    return name ? '<option value="'+esc(name)+'">'+esc(name)+'</option>' : '';
-  }).join('');
+  // Local option = the ACTIVE model only. The local engine serves exactly
+  // one model; listing the whole registry (available_models) offers files
+  // that cannot be served and the proxy would silently answer with the
+  // active model — a lie (DeepSeek incident). `s.model` is the active name.
+  const active = (s && s.model) || (s && s.node && s.node.model) || '';
+  let modelHtml = '<option value="">Current model</option>'
+    + (active ? '<option value="'+esc(active)+'">'+esc(active)+'  (local)</option>' : '');
   const remote = [];
   (lastCompute?.workers || []).forEach(w => {
     if (w && w.peer_id === lastCompute?.local_peer) return;
