@@ -3016,7 +3016,14 @@ Tests: 3 new (persist_model_config atomic rewrite + missing-file refusal +
 model-select endpoint auth/path-traversal/persist). 1138 workspace total
 (1135 + 3); clippy `-D warnings` clean.
 
-## 126. UI Development Plan — complete roadmap (approved) 
+## 126. UI Development Plan — complete roadmap (approved)
+
+> **STATUS (2026-08-20): ALL FOUR AXES LANDED.** Every feature below is committed,
+> pushed and verified live on LAN (Laptop+Desktop). Commits: 4 chat experience,
+> empty-state polish, Devices view + adaptive-split bar, provider re-auth,
+> invite/join helper.
+
+ — complete roadmap (approved) 
 
 Direction (George, 2026-08-20): keep building the app UI (dashboard v1). Four
 priority axes — **complete chat experience**, **mobile/adaptive worker monitor**,
