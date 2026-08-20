@@ -1078,6 +1078,7 @@ dependencies = [
  "decentraai-tokens",
  "libp2p",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

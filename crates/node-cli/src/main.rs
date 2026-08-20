@@ -88,6 +88,14 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// P13 — signed verified compute receipts: cryptographically sign a
+    /// verified compute receipt with this node's identity, or verify a signed
+    /// receipt independently. Read-only / non-mutating; the raw signing primitives
+    /// are those any fabric node uses (same Ed25519 identity as libp2p peer id).
+    Receipt {
+        #[command(subcommand)]
+        command: ReceiptCommand,
+    },
     /// Run the full node as a background daemon — LAN/P2P discovery, model
     /// serving and the dashboard all at once, the way the desktop app / systemd
     /// service drives it. Detects and provisions a model automatically; the
@@ -599,6 +607,52 @@ enum AgentCommand {
     },
 }
 
+/// P13 — signed compute receipt subcommands.
+#[derive(Debug, Subcommand)]
+enum ReceiptCommand {
+    /// Build + cryptographically sign a peeked VerifiedComputeReceipt with this
+    /// node's Ed25519 identity. Prints the canonical receipt bytes, the signer
+    /// public key and the signature as JSON — the artifact a peer can verify.
+    /// Non-mutating; never touches the ledger.
+    Sign {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        /// Execution id (idempotency key).
+        #[arg(long)]
+        execution_id: String,
+        /// Worker node id (peer id / node id) that executed.
+        #[arg(long)]
+        worker_node: String,
+        /// Capability exercised (e.g. `inference`).
+        #[arg(long, default_value = "inference")]
+        capability: String,
+        /// Duration in ms.
+        #[arg(long, default_value = "0")]
+        duration_ms: u64,
+        /// BLAKE3 output hash (hex) that this receipt attests.
+        #[arg(long)]
+        output_hash: Option<String>,
+    },
+    /// Verify a signed receipt independently: loads the SignedComputeReceipt
+    /// JSON, checks the Ed25519 signature against the embedded public key and
+    /// the canonical bytes. Exit 0 = valid, non-zero + message = invalid (tampered
+    /// / wrong key / missing fields). Non-mutating.
+    Verify {
+        /// Path to a signed-receipt JSON file produced by `receipt sign`.
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+/// P13 — signed receipt marshalled across nodes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CliSignedReceipt {
+    version: u16,
+    receipt_bytes: Vec<u8>,
+    signer_public_key: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+}
+
 /// `decentraai agent skill` subcommands.
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
@@ -800,6 +854,7 @@ async fn main() -> Result<()> {
         Command::Tier { command } => tier_command(command),
         Command::ConsumerKey { command } => consumer_key_command(command),
         Command::Agent { command } => agent_command(command).await,
+        Command::Receipt { command } => Ok(receipt_command(command)?),
         Command::Rag { command } => rag_command(command).await,
         Command::Memory { command } => memory_command(command).await,
         Command::Node(args) => node_start(args).await,
@@ -3490,6 +3545,110 @@ fn invite(args: InviteArgs) -> Result<()> {
 /// credential (`runtime/invite.token`, 0600), and verifies the multiaddr is
 /// actually reachable before declaring success. Ongoing peer discovery is
 /// handled by the node's normal mDNS/discovery path.
+/// P13 — build + sign, or independently verify, a verified-compute receipt.
+fn receipt_command(command: ReceiptCommand) -> Result<()> {
+    use decentraai_agents::receipt::{ReceiptVerdict, VerifiedComputeReceipt};
+    use decentraai_agents::signed_receipt::{
+        canonicalize_receipt, sign_receipt, verify_receipt_signature, SignedComputeReceipt,
+    };
+    use decentraai_config::NodeConfig;
+    use decentraai_identity::Identity;
+
+    match command {
+        ReceiptCommand::Sign {
+            config,
+            execution_id,
+            worker_node,
+            capability,
+            duration_ms,
+            output_hash,
+        } => {
+            let cfg = NodeConfig::load(&config)
+                .with_context(|| format!("loading {}", config.display()))?;
+            let data_dir = expand_tilde(&cfg.node.data_dir);
+            let identity_path = data_dir.join("identity/key.pem");
+            let identity = Identity::load(&identity_path).with_context(|| {
+                format!(
+                    "no identity at {} — run 'decentraai init' or 'decentraai setup' first",
+                    identity_path.display()
+                )
+            })?;
+
+            let receipt = VerifiedComputeReceipt::new(
+                execution_id,
+                worker_node,
+                "agent",
+                capability,
+                duration_ms,
+                ReceiptVerdict::Verified,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            );
+            let receipt = match output_hash {
+                Some(h) => receipt.with_output_hash(h),
+                None => receipt,
+            };
+
+            let canonical = canonicalize_receipt(&receipt);
+            let signed = sign_receipt(&identity.signing_key_bytes(), &canonical);
+            // Exit 0 also prints a machine-readable signed envelope so the
+            // operator can pipe it straight into `receipt verify`.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&CliSignedReceipt {
+                    version: signed.version,
+                    receipt_bytes: signed.receipt_bytes,
+                    signer_public_key: signed.signer_public_key.map(|k| k.to_vec()),
+                    signature: signed.signature.clone(),
+                })?
+            );
+            eprintln!(
+                "signed receipt for execution {} — signer pub key {}",
+                {
+                    // We do NOT print secrets. The derivation is public.
+                    let signing = identity.signing_key_bytes();
+                    let _ = signing;
+                    "0x…".to_string()
+                },
+                hex(signed.signer_public_key.unwrap_or([0u8; 32]))
+            );
+            Ok(())
+        }
+        ReceiptCommand::Verify { file } => {
+            let raw = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let cli: CliSignedReceipt = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing signed receipt from {}", file.display()))?;
+            let signed = SignedComputeReceipt {
+                version: cli.version,
+                receipt_bytes: cli.receipt_bytes,
+                signer_public_key: cli.signer_public_key.map(|k| {
+                    let mut arr = [0u8; 32];
+                    if k.len() == 32 {
+                        arr.copy_from_slice(&k);
+                    }
+                    arr
+                }),
+                signature: cli.signature,
+            };
+            verify_receipt_signature(&signed).map_err(|e| anyhow::anyhow!(e))?;
+            println!("VERIFICATION = SUCCESS");
+            println!(
+                "receipt_bytes = {}",
+                String::from_utf8_lossy(&signed.receipt_bytes)
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Lowercase-hex helper for a byte array (display only, public key).
+fn hex(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Handler for `decentraai upgrade check|apply|auto`.
 async fn upgrade_command(args: UpgradeArgs) -> Result<()> {
     use std::time::Duration;
