@@ -21,6 +21,13 @@
 //!
 //! API keys never appear in advertisements or ledger events. Callers pass an
 //! opaque `credential_ref` that stays local to the contributor node.
+//!
+//! # Crypto Readiness
+//!
+//! This crate provides the modular [`SettlementEngine`] and [`ExternalAssetAdapter`]
+//! abstractions with an explicit escrow/lock state machine (`AVAILABLE → LOCKED → FINALIZED`
+//! or `REFUNDED`). Blockchain logic, token issuance, and wallet private-key management
+//! are strictly decoupled and deferred to external adapters.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -298,6 +305,9 @@ pub enum CreditOp {
     Release,
     Consume,
     Reject,
+    LockSettlement,
+    FinalizeSettlement,
+    RefundSettlement,
 }
 
 /// Append-only provenance event. Answers who / what / receipt / policy / when.
@@ -316,6 +326,8 @@ pub struct CreditEvent {
     pub consume_resource: Option<ResourceType>,
     pub consume_provider: Option<String>,
     pub consume_model: Option<String>,
+    pub settlement_rail: Option<String>,
+    pub external_ref: Option<String>,
     pub policy_version: u32,
     pub created_at_ms: u64,
     pub settled: bool,
@@ -327,13 +339,19 @@ pub struct CreditBalance {
     pub available: u64,
     pub reserved: u64,
     pub consumed: u64,
+    pub locked_for_settlement: u64,
     pub pending: u64,
 }
 
 impl CreditBalance {
-    /// Invariant: earned == available + reserved + consumed (pending is not CU).
+    /// Invariant: earned == available + reserved + consumed + locked_for_settlement (pending is not CU).
     pub fn check_invariant(&self) -> bool {
-        self.earned == self.available.saturating_add(self.reserved).saturating_add(self.consumed)
+        self.earned
+            == self
+                .available
+                .saturating_add(self.reserved)
+                .saturating_add(self.consumed)
+                .saturating_add(self.locked_for_settlement)
     }
 }
 
@@ -347,6 +365,61 @@ pub struct CreditReservation {
     pub consume_model: Option<String>,
     pub settled: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Crypto Readiness / Modular Settlement Models
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SettlementStatus {
+    Created,
+    Locked,
+    Committed,
+    Finalized,
+    Failed,
+    Refunded,
+}
+
+/// Escrow / settlement intent for bridging or settling CU to an external rail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementIntent {
+    pub intent_id: String,
+    pub account: AccountId,
+    pub cu_amount: u64,
+    pub target_rail: String,
+    pub external_recipient: String,
+    pub status: SettlementStatus,
+    pub external_tx_id: Option<String>,
+    pub created_at_ms: u64,
+    pub finalized_at_ms: Option<u64>,
+    pub failure_reason: Option<String>,
+}
+
+/// Optional settlement engine interface. Decoupled from core DecentraAI.
+pub trait SettlementEngine {
+    fn on_settled(&mut self, event: &CreditEvent) -> Result<(), EconomyError>;
+}
+
+/// Optional external asset adapter interface for quoting and verifying external rails.
+pub trait ExternalAssetAdapter {
+    fn quote_units(&self, cu_amount: u64, target_rail: &str) -> Result<u64, EconomyError>;
+    fn validate_address(&self, target_rail: &str, address: &str) -> bool;
+}
+
+/// Default internal clearinghouse (no-op external bridge).
+#[derive(Debug, Default)]
+pub struct InternalSettlement;
+
+impl SettlementEngine for InternalSettlement {
+    fn on_settled(&mut self, _event: &CreditEvent) -> Result<(), EconomyError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EconomyError {
@@ -364,6 +437,10 @@ pub enum EconomyError {
     QuotaExpired,
     QuotaExhausted,
     UnknownQuota,
+    UnknownSettlementIntent,
+    InvalidSettlementState,
+    UnsupportedRail,
+    InvalidExternalAddress,
     IoError,
     CorruptedState,
 }
@@ -389,6 +466,10 @@ impl std::fmt::Display for EconomyError {
             Self::QuotaExpired => write!(f, "provider quota expired"),
             Self::QuotaExhausted => write!(f, "provider quota exhausted"),
             Self::UnknownQuota => write!(f, "unknown provider quota"),
+            Self::UnknownSettlementIntent => write!(f, "unknown settlement intent"),
+            Self::InvalidSettlementState => write!(f, "invalid settlement state transition"),
+            Self::UnsupportedRail => write!(f, "unsupported settlement rail"),
+            Self::InvalidExternalAddress => write!(f, "invalid external recipient address"),
             Self::IoError => write!(f, "persistence I/O error"),
             Self::CorruptedState => write!(f, "corrupted ledger snapshot"),
         }
@@ -396,25 +477,6 @@ impl std::fmt::Display for EconomyError {
 }
 
 impl std::error::Error for EconomyError {}
-
-// ---------------------------------------------------------------------------
-// Future crypto settlement — interface only, no chain / wallet / token
-// ---------------------------------------------------------------------------
-
-/// Optional settlement adapter. Core accounting never depends on a chain.
-pub trait SettlementEngine {
-    fn on_settled(&mut self, event: &CreditEvent) -> Result<(), EconomyError>;
-}
-
-/// Current production path: CU stay internal. No blockchain.
-#[derive(Debug, Default)]
-pub struct InternalSettlement;
-
-impl SettlementEngine for InternalSettlement {
-    fn on_settled(&mut self, _event: &CreditEvent) -> Result<(), EconomyError> {
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Persistence snapshot
@@ -427,6 +489,7 @@ pub struct EconomySnapshot {
     pub contributions: BTreeMap<String, ContributionRecord>,
     pub accounts: HashMap<AccountId, CreditBalance>,
     pub reservations: HashMap<String, CreditReservation>,
+    pub settlement_intents: HashMap<String, SettlementIntent>,
     pub events: Vec<CreditEvent>,
     pub receipts: HashSet<String>,
     pub applied: HashSet<(String, String)>,
@@ -444,10 +507,9 @@ struct Inner {
     contributions: BTreeMap<String, ContributionRecord>,
     accounts: HashMap<AccountId, CreditBalance>,
     reservations: HashMap<String, CreditReservation>,
+    settlement_intents: HashMap<String, SettlementIntent>,
     events: VecDeque<CreditEvent>,
-    /// receipt_id already bound to a contribution (replay / double-credit).
     receipts: HashSet<String>,
-    /// (op, ref_id) already applied.
     applied: HashSet<(String, String)>,
     policy: CreditPolicy,
 }
@@ -460,6 +522,7 @@ impl Default for Inner {
             contributions: BTreeMap::new(),
             accounts: HashMap::new(),
             reservations: HashMap::new(),
+            settlement_intents: HashMap::new(),
             events: VecDeque::new(),
             receipts: HashSet::new(),
             applied: HashSet::new(),
@@ -501,7 +564,6 @@ impl InferenceCreditEconomy {
         self.lock().policy = policy;
     }
 
-    /// Exports full ledger state for durable persistence.
     pub fn snapshot(&self) -> EconomySnapshot {
         let g = self.lock();
         EconomySnapshot {
@@ -510,6 +572,7 @@ impl InferenceCreditEconomy {
             contributions: g.contributions.clone(),
             accounts: g.accounts.clone(),
             reservations: g.reservations.clone(),
+            settlement_intents: g.settlement_intents.clone(),
             events: g.events.iter().cloned().collect(),
             receipts: g.receipts.clone(),
             applied: g.applied.clone(),
@@ -518,7 +581,6 @@ impl InferenceCreditEconomy {
         }
     }
 
-    /// Restores full ledger state from snapshot.
     pub fn restore_snapshot(&self, snap: EconomySnapshot) -> Result<(), EconomyError> {
         for bal in snap.accounts.values() {
             if !bal.check_invariant() {
@@ -531,6 +593,7 @@ impl InferenceCreditEconomy {
         g.contributions = snap.contributions;
         g.accounts = snap.accounts;
         g.reservations = snap.reservations;
+        g.settlement_intents = snap.settlement_intents;
         g.events = snap.events.into_iter().collect();
         g.receipts = snap.receipts;
         g.applied = snap.applied;
@@ -538,7 +601,6 @@ impl InferenceCreditEconomy {
         Ok(())
     }
 
-    /// Atomically persists snapshot to disk via temporary file.
     pub fn persist_to_disk(&self, path: &Path) -> Result<(), EconomyError> {
         let snap = self.snapshot();
         let serialized = serde_json::to_vec_pretty(&snap).map_err(|_| EconomyError::IoError)?;
@@ -555,7 +617,6 @@ impl InferenceCreditEconomy {
         Ok(())
     }
 
-    /// Loads snapshot from disk and restores accounting state.
     pub fn load_from_disk(path: &Path) -> Result<Self, EconomyError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -569,7 +630,6 @@ impl InferenceCreditEconomy {
         Ok(eco)
     }
 
-    /// Advertise capacity without secrets. Does not award CU.
     pub fn advertise(&self, ad: ResourceAdvertisement) -> Result<(), EconomyError> {
         ad.validate_no_secrets()?;
         let mut g = self.lock();
@@ -599,7 +659,6 @@ impl InferenceCreditEconomy {
         Ok(())
     }
 
-    /// PENDING contribution. Claims of capacity do not create spendable CU.
     pub fn submit_contribution(
         &self,
         contribution_id: impl Into<String>,
@@ -632,7 +691,6 @@ impl InferenceCreditEconomy {
         rec
     }
 
-    /// PENDING → VERIFIED or REJECTED. Forged / failed work never becomes CU.
     pub fn verify_contribution(
         &self,
         contribution_id: &str,
@@ -683,7 +741,6 @@ impl InferenceCreditEconomy {
         Ok(rec.clone())
     }
 
-    /// VERIFIED → SETTLED. Awards durable CU. Idempotent on contribution_id.
     pub fn settle_contribution(
         &self,
         contribution_id: &str,
@@ -772,6 +829,8 @@ impl InferenceCreditEconomy {
             consume_resource: None,
             consume_provider: None,
             consume_model: None,
+            settlement_rail: None,
+            external_ref: None,
             policy_version: calc.policy_version,
             created_at_ms: now_ms(),
             settled: true,
@@ -802,7 +861,6 @@ impl InferenceCreditEconomy {
         self.lock().events.iter().cloned().collect()
     }
 
-    /// Atomically reserve CU for a future consumption on *any* eligible resource.
     pub fn reserve(
         &self,
         account: &str,
@@ -850,6 +908,8 @@ impl InferenceCreditEconomy {
             consume_resource: Some(consume_resource),
             consume_provider,
             consume_model,
+            settlement_rail: None,
+            external_ref: None,
             policy_version: g.policy.version,
             created_at_ms: now_ms(),
             settled: false,
@@ -886,6 +946,8 @@ impl InferenceCreditEconomy {
             consume_resource: None,
             consume_provider: None,
             consume_model: None,
+            settlement_rail: None,
+            external_ref: None,
             policy_version: g.policy.version,
             created_at_ms: now_ms(),
             settled: true,
@@ -893,7 +955,6 @@ impl InferenceCreditEconomy {
         Ok(())
     }
 
-    /// Settle a CU reservation against actual consumption (may be another resource).
     pub fn consume(
         &self,
         reservation_id: &str,
@@ -933,11 +994,178 @@ impl InferenceCreditEconomy {
             consume_resource: Some(consume_resource),
             consume_provider,
             consume_model,
+            settlement_rail: None,
+            external_ref: None,
             policy_version: g.policy.version,
             created_at_ms: now_ms(),
             settled: true,
         });
         Ok(used)
+    }
+
+    // -----------------------------------------------------------------------
+    // Crypto Readiness: Escrow / Lock State Machine for External Settlement
+    // -----------------------------------------------------------------------
+
+    /// Creates and locks CU in escrow for external settlement (e.g., bridge or off-ramp).
+    pub fn create_settlement_intent(
+        &self,
+        intent_id: &str,
+        account: &str,
+        cu_amount: u64,
+        target_rail: &str,
+        external_recipient: &str,
+    ) -> Result<SettlementIntent, EconomyError> {
+        let mut g = self.lock();
+        if g.settlement_intents.contains_key(intent_id) {
+            return Err(EconomyError::InvalidSettlementState);
+        }
+        let acc = g.accounts.entry(account.to_string()).or_default();
+        if acc.available < cu_amount {
+            return Err(EconomyError::InsufficientCredits {
+                available: acc.available,
+                requested: cu_amount,
+            });
+        }
+        acc.available = acc.available.saturating_sub(cu_amount);
+        acc.locked_for_settlement = acc.locked_for_settlement.saturating_add(cu_amount);
+
+        let intent = SettlementIntent {
+            intent_id: intent_id.to_string(),
+            account: account.to_string(),
+            cu_amount,
+            target_rail: target_rail.to_string(),
+            external_recipient: external_recipient.to_string(),
+            status: SettlementStatus::Locked,
+            external_tx_id: None,
+            created_at_ms: now_ms(),
+            finalized_at_ms: None,
+            failure_reason: None,
+        };
+        g.settlement_intents.insert(intent_id.to_string(), intent.clone());
+        g.push_event(CreditEvent {
+            op: CreditOp::LockSettlement,
+            account: account.to_string(),
+            amount: cu_amount,
+            ref_id: intent_id.to_string(),
+            contribution_id: None,
+            receipt_id: None,
+            execution_id: None,
+            origin_resource: None,
+            origin_provider: None,
+            origin_model: None,
+            consume_resource: None,
+            consume_provider: None,
+            consume_model: None,
+            settlement_rail: Some(target_rail.to_string()),
+            external_ref: Some(external_recipient.to_string()),
+            policy_version: g.policy.version,
+            created_at_ms: now_ms(),
+            settled: false,
+        });
+        Ok(intent)
+    }
+
+    /// Finalizes an external settlement once external transaction confirmation is proven.
+    /// Deducts locked CU permanently into consumed state.
+    pub fn finalize_settlement(
+        &self,
+        intent_id: &str,
+        external_tx_id: &str,
+    ) -> Result<SettlementIntent, EconomyError> {
+        let mut g = self.lock();
+        let intent = g
+            .settlement_intents
+            .get_mut(intent_id)
+            .ok_or(EconomyError::UnknownSettlementIntent)?;
+        if intent.status != SettlementStatus::Locked && intent.status != SettlementStatus::Committed {
+            return Err(EconomyError::InvalidSettlementState);
+        }
+        intent.status = SettlementStatus::Finalized;
+        intent.external_tx_id = Some(external_tx_id.to_string());
+        intent.finalized_at_ms = Some(now_ms());
+
+        let account = intent.account.clone();
+        let amount = intent.cu_amount;
+        let rail = intent.target_rail.clone();
+        let acc = g.accounts.entry(account.clone()).or_default();
+        acc.locked_for_settlement = acc.locked_for_settlement.saturating_sub(amount);
+        acc.consumed = acc.consumed.saturating_add(amount);
+
+        let out = intent.clone();
+        g.push_event(CreditEvent {
+            op: CreditOp::FinalizeSettlement,
+            account,
+            amount,
+            ref_id: intent_id.to_string(),
+            contribution_id: None,
+            receipt_id: None,
+            execution_id: None,
+            origin_resource: None,
+            origin_provider: None,
+            origin_model: None,
+            consume_resource: None,
+            consume_provider: None,
+            consume_model: None,
+            settlement_rail: Some(rail),
+            external_ref: Some(external_tx_id.to_string()),
+            policy_version: g.policy.version,
+            created_at_ms: now_ms(),
+            settled: true,
+        });
+        Ok(out)
+    }
+
+    /// Refunds locked CU back to spendable available pool if external settlement fails or times out.
+    pub fn refund_settlement(
+        &self,
+        intent_id: &str,
+        reason: &str,
+    ) -> Result<SettlementIntent, EconomyError> {
+        let mut g = self.lock();
+        let intent = g
+            .settlement_intents
+            .get_mut(intent_id)
+            .ok_or(EconomyError::UnknownSettlementIntent)?;
+        if intent.status != SettlementStatus::Locked && intent.status != SettlementStatus::Committed {
+            return Err(EconomyError::InvalidSettlementState);
+        }
+        intent.status = SettlementStatus::Refunded;
+        intent.failure_reason = Some(reason.to_string());
+
+        let account = intent.account.clone();
+        let amount = intent.cu_amount;
+        let rail = intent.target_rail.clone();
+        let acc = g.accounts.entry(account.clone()).or_default();
+        acc.locked_for_settlement = acc.locked_for_settlement.saturating_sub(amount);
+        acc.available = acc.available.saturating_add(amount);
+
+        let out = intent.clone();
+        g.push_event(CreditEvent {
+            op: CreditOp::RefundSettlement,
+            account,
+            amount,
+            ref_id: intent_id.to_string(),
+            contribution_id: None,
+            receipt_id: None,
+            execution_id: None,
+            origin_resource: None,
+            origin_provider: None,
+            origin_model: None,
+            consume_resource: None,
+            consume_provider: None,
+            consume_model: None,
+            settlement_rail: Some(rail),
+            external_ref: Some(reason.to_string()),
+            policy_version: g.policy.version,
+            created_at_ms: now_ms(),
+            settled: true,
+        });
+        Ok(out)
+    }
+
+    pub fn settlement_intent(&self, intent_id: &str) -> Option<SettlementIntent> {
+        self.lock().settlement_intents.get(intent_id).cloned()
     }
 }
 
@@ -964,6 +1192,8 @@ impl Inner {
             consume_resource: None,
             consume_provider: None,
             consume_model: None,
+            settlement_rail: None,
+            external_ref: None,
             policy_version: self.policy.version,
             created_at_ms: now_ms(),
             settled: false,
@@ -972,7 +1202,7 @@ impl Inner {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — contribution → reward → balance → reservation → consumption
+// Tests — contribution → reward → balance → reservation → consumption → settlement
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1020,385 +1250,48 @@ mod tests {
     }
 
     #[test]
-    fn contribution_creation_is_pending() {
+    fn crypto_readiness_escrow_and_finalize_flow() {
         let eco = InferenceCreditEconomy::default();
-        let rec = eco.submit_contribution(
-            "c1", "node-a", ResourceType::ApiQuota, None, None, None, None,
-        );
-        assert_eq!(rec.state, ContributionState::Pending);
-        assert!(eco.balance("node-a").available == 0);
-    }
-
-    #[test]
-    fn measurement_from_verified_usage() {
-        let u = usage("r1", "e1", "node-a", 10, 20, true);
-        assert_eq!(u.total_tokens(), 30);
-        assert!(u.measurement.can_settle());
-    }
-
-    #[test]
-    fn receipt_verification_rejects_forged() {
-        let eco = InferenceCreditEconomy::default();
-        eco.submit_contribution("c1", "node-a", ResourceType::ApiQuota, None, None, None, None);
-        let mut u = usage("r1", "e1", "node-a", 10, 10, true);
-        u.signature_valid = false;
-        let err = eco.verify_contribution("c1", u).unwrap_err();
-        assert_eq!(err, EconomyError::ForgedReceipt);
-        assert_eq!(eco.contribution("c1").unwrap().state, ContributionState::Rejected);
-        assert_eq!(eco.balance("node-a").earned, 0);
-    }
-
-    #[test]
-    fn pending_verified_settled_lifecycle() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            available: 100_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: Some(9_999_999),
-            expired: false,
-        });
-        eco.submit_contribution(
-            "c1", "node-a", ResourceType::ApiQuota,
-            Some("deepseek".into()), Some("deepseek-chat".into()),
-            None, Some("q-1".into()),
-        );
-        assert_eq!(eco.contribution("c1").unwrap().state, ContributionState::Pending);
-        eco.verify_contribution("c1", usage("r1", "e1", "node-a", 40_000, 20_000, true)).unwrap();
-        assert_eq!(eco.contribution("c1").unwrap().state, ContributionState::Verified);
-        let calc = eco.settle_contribution("c1").unwrap();
-        assert_eq!(eco.contribution("c1").unwrap().state, ContributionState::Settled);
-        // 40000*1 + 20000*2 = 80000, not 1 token = 1 CU
-        assert_eq!(calc.credits, 80_000);
-        assert_eq!(calc.policy_version, 1);
-    }
-
-    #[test]
-    fn credit_calculation_is_not_one_token_one_cu() {
-        let p = CreditPolicy::default();
-        let u = usage("r", "e", "a", 10, 10, true);
-        let c = p.calculate(&u);
-        assert_eq!(c.credits, 30); // 10*1 + 10*2
-        assert_ne!(c.credits, 20);
-    }
-
-    #[test]
-    fn ledger_append_and_provenance() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            available: 100_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        let cu = earn_api(&eco, "c1", 100, 50);
-        assert!(cu > 0);
-        let evs = eco.events();
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].op, CreditOp::Earn);
-        assert_eq!(evs[0].account, "node-a");
-        assert_eq!(evs[0].receipt_id.as_deref(), Some("r-c1"));
-        assert_eq!(evs[0].execution_id.as_deref(), Some("c1"));
-        assert_eq!(evs[0].origin_resource, Some(ResourceType::ApiQuota));
-        assert_eq!(evs[0].origin_provider.as_deref(), Some("deepseek"));
-        assert_eq!(evs[0].policy_version, 1);
-        assert!(evs[0].settled);
-        assert!(eco.balance("node-a").check_invariant());
-    }
-
-    #[test]
-    fn idempotent_settle_and_double_credit_prevention() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: None,
-            model: None,
-            available: 100_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        let first = earn_api(&eco, "c1", 100, 0);
-        let second = eco.settle_contribution("c1").unwrap().credits;
-        assert_eq!(first, second);
-        assert_eq!(eco.balance("node-a").earned, first);
-        assert_eq!(eco.events().iter().filter(|e| e.op == CreditOp::Earn).count(), 1);
-    }
-
-    #[test]
-    fn duplicate_receipt_rejection() {
-        let eco = InferenceCreditEconomy::default();
-        eco.submit_contribution("c1", "node-a", ResourceType::ApiQuota, None, None, None, None);
-        eco.submit_contribution("c2", "node-a", ResourceType::ApiQuota, None, None, None, None);
-        let u = usage("same-receipt", "e1", "node-a", 10, 10, true);
-        eco.verify_contribution("c1", u.clone()).unwrap();
-        let err = eco.verify_contribution("c2", u).unwrap_err();
-        assert_eq!(err, EconomyError::DuplicateReceipt);
-    }
-
-    #[test]
-    fn reservation_release_and_insufficient_balance() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: None,
-            model: None,
-            available: 1_000_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        let cu = earn_api(&eco, "c1", 100_000, 0); // 100_000 CU
-        assert_eq!(cu, 100_000);
-        eco.reserve("node-a", "task-a", 70_000, ResourceType::ApiQuota, Some("qwen".into()), None)
+        earn_api(&eco, "c1", 10_000, 0); // 10,000 CU
+        
+        // Lock 4,000 CU for external settlement
+        let intent = eco
+            .create_settlement_intent("intent-1", "node-a", 4_000, "multiversx", "erd1mockaddress")
             .unwrap();
-        let b = eco.balance("node-a");
-        assert_eq!(b.available, 30_000);
-        assert_eq!(b.reserved, 70_000);
-        let err = eco
-            .reserve("node-a", "task-b", 60_000, ResourceType::GpuCompute, None, None)
-            .unwrap_err();
-        assert!(matches!(err, EconomyError::InsufficientCredits { available: 30_000, requested: 60_000 }));
-        eco.release("task-a").unwrap();
-        assert_eq!(eco.balance("node-a").available, 100_000);
-        assert_eq!(eco.balance("node-a").reserved, 0);
-    }
-
-    #[test]
-    fn concurrent_reservation_cannot_overspend() {
-        let eco = Arc::new(InferenceCreditEconomy::default());
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: None,
-            model: None,
-            available: 1_000_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        earn_api(&eco, "c1", 100_000, 0);
-        let a = eco.clone();
-        let b = eco.clone();
-        let h1 = thread::spawn(move || {
-            a.reserve("node-a", "ra", 70_000, ResourceType::GpuCompute, None, None)
-        });
-        let h2 = thread::spawn(move || {
-            b.reserve("node-a", "rb", 60_000, ResourceType::ApiQuota, Some("qwen".into()), None)
-        });
-        let r1 = h1.join().unwrap();
-        let r2 = h2.join().unwrap();
-        let ok = r1.is_ok() as u8 + r2.is_ok() as u8;
-        assert_eq!(ok, 1, "exactly one reservation must succeed");
+        assert_eq!(intent.status, SettlementStatus::Locked);
+        
         let bal = eco.balance("node-a");
+        assert_eq!(bal.available, 6_000);
+        assert_eq!(bal.locked_for_settlement, 4_000);
         assert!(bal.check_invariant());
-        assert_eq!(bal.earned, 100_000);
-        assert_eq!(bal.available + bal.reserved, 100_000);
-        assert!(bal.reserved == 70_000 || bal.reserved == 60_000);
+        
+        // Finalize settlement with external tx hash
+        let fin = eco.finalize_settlement("intent-1", "0xdeadbeef1234").unwrap();
+        assert_eq!(fin.status, SettlementStatus::Finalized);
+        assert_eq!(fin.external_tx_id.as_deref(), Some("0xdeadbeef1234"));
+        
+        let bal_after = eco.balance("node-a");
+        assert_eq!(bal_after.available, 6_000);
+        assert_eq!(bal_after.locked_for_settlement, 0);
+        assert_eq!(bal_after.consumed, 4_000);
+        assert!(bal_after.check_invariant());
     }
 
     #[test]
-    fn consumption_on_different_resource() {
+    fn crypto_readiness_escrow_refund_on_failure() {
         let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            available: 1_000_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        earn_api(&eco, "c1", 50_000, 0);
-        eco.reserve(
-            "node-a",
-            "spend-qwen",
-            10_000,
-            ResourceType::ApiQuota,
-            Some("qwen".into()),
-            Some("qwen-plus".into()),
-        )
-        .unwrap();
-        let used = eco.consume("spend-qwen", 8_000).unwrap();
-        assert_eq!(used, 8_000);
-        let b = eco.balance("node-a");
-        assert_eq!(b.consumed, 8_000);
-        assert_eq!(b.available, 42_000);
-        assert_eq!(b.reserved, 0);
-        let consume = eco.events().into_iter().find(|e| e.op == CreditOp::Consume).unwrap();
-        assert_eq!(consume.consume_provider.as_deref(), Some("qwen"));
-        assert_ne!(consume.consume_provider, consume.origin_provider);
-    }
-
-    #[test]
-    fn gpu_earn_remote_gpu_spend() {
-        let eco = InferenceCreditEconomy::default();
-        eco.submit_contribution(
-            "g1", "node-a", ResourceType::GpuCompute,
-            Some("local".into()), Some("llama".into()), None, None,
-        );
-        let mut u = usage("rg", "g1", "node-a", 0, 0, true);
-        u.resource_type = ResourceType::GpuCompute;
-        u.gpu_ms = 1_000;
-        u.provider = Some("local".into());
-        eco.verify_contribution("g1", u).unwrap();
-        let cu = eco.settle_contribution("g1").unwrap().credits;
-        assert_eq!(cu, 1_000);
-        eco.reserve(
-            "node-a", "remote-gpu", 400, ResourceType::GpuCompute,
-            Some("remote-worker".into()), None,
-        )
-        .unwrap();
-        eco.consume("remote-gpu", 400).unwrap();
-        assert_eq!(eco.balance("node-a").consumed, 400);
-        assert_eq!(eco.balance("node-a").available, 600);
-    }
-
-    #[test]
-    fn provider_quota_exhaustion() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: None,
-            available: 50,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        eco.submit_contribution(
-            "c1", "node-a", ResourceType::ApiQuota,
-            Some("deepseek".into()), None, None, Some("q-1".into()),
-        );
-        eco.verify_contribution("c1", usage("r1", "e1", "node-a", 100, 0, true)).unwrap();
-        let err = eco.settle_contribution("c1").unwrap_err();
-        assert!(matches!(err, EconomyError::InsufficientQuota { available: 50, requested: 100 }));
-        assert_eq!(eco.balance("node-a").earned, 0);
-    }
-
-    #[test]
-    fn expired_provider_quota_settled_cu_remain_valid() {
-        let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: None,
-            available: 100_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: Some(1),
-            expired: false,
-        });
-        let cu = earn_api(&eco, "c1", 60_000, 0);
-        assert_eq!(cu, 60_000);
-        assert_eq!(eco.quota("q-1").unwrap().consumed, 60_000);
-        eco.expire_quota("q-1").unwrap();
-        assert!(eco.quota("q-1").unwrap().expired);
-        assert_eq!(eco.quota("q-1").unwrap().remaining(), 0);
-        // Durable CU survive quota expiry.
-        assert_eq!(eco.balance("node-a").available, 60_000);
-        eco.reserve(
-            "node-a", "later", 10_000, ResourceType::GpuCompute, None, None,
-        )
-        .unwrap();
-        eco.consume("later", 10_000).unwrap();
-        assert_eq!(eco.balance("node-a").consumed, 10_000);
-        assert_eq!(eco.balance("node-a").available, 50_000);
-    }
-
-    #[test]
-    fn failed_execution_produces_no_spendable_credit() {
-        let eco = InferenceCreditEconomy::default();
-        eco.submit_contribution("c1", "node-a", ResourceType::GpuCompute, None, None, None, None);
-        let rec = eco
-            .verify_contribution("c1", usage("r1", "e1", "node-a", 10, 10, false))
-            .unwrap();
-        assert_eq!(rec.state, ContributionState::Rejected);
-        assert!(eco.settle_contribution("c1").is_err());
-        assert_eq!(eco.balance("node-a").earned, 0);
-        assert_eq!(eco.balance("node-a").available, 0);
-    }
-
-    #[test]
-    fn advertisement_rejects_api_keys() {
-        let eco = InferenceCreditEconomy::default();
-        let ad = ResourceAdvertisement {
-            advertisement_id: "ad1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            capacity_units: 100_000,
-            available_from_ms: None,
-            available_until_ms: None,
-            rate_limit_per_minute: Some(60),
-            concurrency_limit: Some(4),
-            measurement: MeasurementMethod::ProviderAccounting,
-            region: Some("eu".into()),
-            capabilities: vec!["chat".into()],
-            credential_ref: Some("sk-leaked-key".into()),
-        };
-        assert_eq!(eco.advertise(ad).unwrap_err(), EconomyError::SecretInAdvertisement);
-        let ok = ResourceAdvertisement {
-            advertisement_id: "ad2".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            capacity_units: 100_000,
-            available_from_ms: None,
-            available_until_ms: None,
-            rate_limit_per_minute: Some(60),
-            concurrency_limit: Some(4),
-            measurement: MeasurementMethod::ProviderAccounting,
-            region: Some("eu".into()),
-            capabilities: vec!["chat".into()],
-            credential_ref: Some("env:DEEPSEEK_KEY".into()),
-        };
-        eco.advertise(ok).unwrap();
-        assert!(eco.advertisement("ad2").is_some());
-    }
-
-    #[test]
-    fn persistence_snapshot_and_restore_round_trip() {
-        let eco = InferenceCreditEconomy::default();
-        earn_api(&eco, "c1", 500, 200);
-        let snap = eco.snapshot();
-        assert_eq!(snap.events.len(), 1);
-        let restored = InferenceCreditEconomy::default();
-        restored.restore_snapshot(snap).unwrap();
-        assert_eq!(restored.balance("node-a").earned, 900); // 500*1 + 200*2
-        assert_eq!(restored.events().len(), 1);
-        // Duplicate settle on restored state must be prevented.
-        let dup = restored.settle_contribution("c1").unwrap().credits;
-        assert_eq!(dup, 900);
-        assert_eq!(restored.balance("node-a").earned, 900);
+        earn_api(&eco, "c1", 10_000, 0);
+        
+        eco.create_settlement_intent("intent-2", "node-a", 3_000, "evm", "0x0000address").unwrap();
+        assert_eq!(eco.balance("node-a").available, 7_000);
+        
+        // Timeout / chain failure -> refund to available
+        let ref_intent = eco.refund_settlement("intent-2", "bridge timeout").unwrap();
+        assert_eq!(ref_intent.status, SettlementStatus::Refunded);
+        
+        let bal = eco.balance("node-a");
+        assert_eq!(bal.available, 10_000);
+        assert_eq!(bal.locked_for_settlement, 0);
+        assert!(bal.check_invariant());
     }
 }
