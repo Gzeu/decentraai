@@ -22,6 +22,13 @@
 //! The economic object is verified contribution, not provider quota.
 //! Quota may expire; settled CU remain and may be spent on another resource.
 
+pub mod provider_bridge;
+
+pub use provider_bridge::{
+    ConnectedProviderModel, CredentialVault, ProviderCreditBridge, ProviderExecutionOutcome,
+    ProviderKind,
+};
+
 use decentraai_credit_economy::{
     AccountId, ContributionState, CreditBalance, CreditPolicy, EconomyError,
     InferenceCreditEconomy, MeasurementMethod, ProviderQuota, ResourceAdvertisement,
