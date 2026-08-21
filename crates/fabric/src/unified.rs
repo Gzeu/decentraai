@@ -173,6 +173,143 @@ pub struct UnifiedSelection {
     pub selected_worker: Option<String>,
 }
 
+/// One compared field of a shadow decision. Never collapsed into a single
+/// boolean: each aspect of the decision is classified independently, exactly
+/// as the shape of the selection allows an operator to see WHERE and WHY the
+/// unified selector differs from the authoritative legacy planner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowField {
+    pub field: String,
+    /// `"match"` when equal, `"diff"` when the selector chose differently,
+    /// `"not_comparable"` when the input lacks data to make a fair call.
+    pub verdict: String,
+    pub legacy: String,
+    pub unified: String,
+}
+
+/// The structured, observe-only diff between the authoritative legacy planner's
+/// decision and the parallel UnifiedSelector decision for the SAME request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowDiff {
+    pub request_id: String,
+    pub model_hash: String,
+    pub is_continuation: bool,
+    /// Per-field comparison (eligible / rejected / ranking / selected /
+    /// provenance / reservation).
+    pub fields: Vec<ShadowField>,
+    /// True only when every comparable field matches.
+    pub agreement: bool,
+    /// Legacy planner's selected worker (the authoritative one).
+    pub legacy_worker: Option<String>,
+    /// Unified selector's selected worker (observe-only).
+    pub unified_worker: Option<String>,
+    /// Wall-clock microseconds the unified selector took to decide (latency
+    /// overhead of the shadow run).
+    pub unified_latency_us: u32,
+}
+
+/// Pure, deterministic comparison of a legacy selection trace against the
+/// unified selector's trace for the same request. Fail-closed by construction:
+/// it only READS traces and returns a structure — it can never influence the
+/// authoritative path that produced `legacy`.
+pub fn shadow_compare(
+    request_id: &str,
+    legacy: &SelectionTrace,
+    unified: &SelectionTrace,
+    latency_us: u32,
+) -> ShadowDiff {
+    let mut fields = Vec::new();
+
+    // Eligible set (sorted peer ids).
+    let mut le_el: Vec<String> = legacy.ranked.iter().map(|c| c.peer_id.clone()).collect();
+    le_el.sort();
+    let mut u_el: Vec<String> = unified.ranked.iter().map(|c| c.peer_id.clone()).collect();
+    u_el.sort();
+    fields.push(ShadowField {
+        field: "eligible".into(),
+        verdict: if le_el == u_el { "match" } else { "diff" }.into(),
+        legacy: le_el.join(","),
+        unified: u_el.join(","),
+    });
+
+    // Rejection reasons, normalized into "peer(reasons)" strings.
+    let mut le_rej: Vec<String> = legacy
+        .rejected
+        .iter()
+        .map(|r| format!("{}({})", r.peer_id, r.reasons.join("|")))
+        .collect();
+    le_rej.sort();
+    let mut u_rej: Vec<String> = unified
+        .rejected
+        .iter()
+        .map(|r| format!("{}({})", r.peer_id, r.reasons.join("|")))
+        .collect();
+    u_rej.sort();
+    fields.push(ShadowField {
+        field: "rejected".into(),
+        verdict: if le_rej == u_rej { "match" } else { "diff" }.into(),
+        legacy: le_rej.join(","),
+        unified: u_rej.join(","),
+    });
+
+    // Ranking order (peer ids score-desc / PeerId-asc).
+    let le_rank: Vec<String> = legacy.ranked.iter().map(|c| c.peer_id.clone()).collect();
+    let u_rank: Vec<String> = unified.ranked.iter().map(|c| c.peer_id.clone()).collect();
+    fields.push(ShadowField {
+        field: "ranking".into(),
+        verdict: if le_rank == u_rank { "match" } else { "diff" }.into(),
+        legacy: le_rank.join(","),
+        unified: u_rank.join(","),
+    });
+
+    // Selected worker.
+    fields.push(ShadowField {
+        field: "selected".into(),
+        verdict: if legacy.selected_worker == unified.selected_worker {
+            "match"
+        } else {
+            "diff"
+        }
+        .into(),
+        legacy: legacy.selected_worker.clone().unwrap_or_default(),
+        unified: unified.selected_worker.clone().unwrap_or_default(),
+    });
+
+    // Scoring provenance of the chosen worker (perf_measured marker).
+    let le_prov = legacy.ranked.first().map(|c| c.perf_measured).unwrap_or(false);
+    let u_prov = unified.ranked.first().map(|c| c.perf_measured).unwrap_or(false);
+    fields.push(ShadowField {
+        field: "provenance".into(),
+        verdict: if le_prov == u_prov { "match" } else { "diff" }.into(),
+        legacy: le_prov.to_string(),
+        unified: u_prov.to_string(),
+    });
+
+    // Reservation / actual worker. The unified selector is observe-only and
+    // never reserves, so this is always NOT-COMPARABLE here (recorded,
+    // not fabricated) — reservation stays coordinator-side.
+    fields.push(ShadowField {
+        field: "reservation".into(),
+        verdict: "not_comparable".into(),
+        legacy: legacy.reserved_worker.clone().unwrap_or_default(),
+        unified: unified.reserved_worker.clone().unwrap_or_default(),
+    });
+
+    let agreement = fields
+        .iter()
+        .all(|f| f.verdict == "match" || f.verdict == "not_comparable");
+    ShadowDiff {
+        request_id: request_id.to_string(),
+        model_hash: legacy.model_hash.clone(),
+        is_continuation: legacy.is_continuation,
+        fields,
+        agreement,
+        legacy_worker: legacy.selected_worker.clone(),
+        unified_worker: unified.selected_worker.clone(),
+        unified_latency_us: latency_us,
+    }
+}
+
 /// A golden decision: a request + worker corpus plus the `SelectionTrace` the
 /// CURRENT live selector (`ExecutionPlanner`) produced for it. This is the
 /// ground truth the unified selector must reproduce.
@@ -809,6 +946,69 @@ mod tests {
         // And the replayed case still proves equivalence.
         let report = GoldenSuite::run(&[back], &UnifiedSelector::default());
         assert!(report.equivalent, "{:?}", report.divergences);
+    }
+
+    #[test]
+    fn shadow_compare_produces_structured_classification() {
+        // Issue #30 Phase 3: the shadow diff is structured (per-field verdicts),
+        // agreement means ALL COMPARABLE fields match (not-comparable fields
+        // like reservation are excluded, never treated as a mismatch), and the
+        // reservation field is always not-comparable because the shadow never
+        // reserves.
+        // A divergent unified trace: different selected worker + ranking.
+        let legacy = SelectionTrace {
+            request_id: "r1".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec!["a".into(), "b".into()],
+            rejected: vec![],
+            ranked: vec![candidate("a"), candidate("b")],
+            selected_worker: Some("a".into()),
+            reserved_worker: None,
+            reservation_id: None,
+            outcome: String::new(),
+            attempt: 0,
+        };
+        let unified = SelectionTrace {
+            ranked: vec![candidate("b"), candidate("a")],
+            selected_worker: Some("b".into()),
+            ..legacy.clone()
+        };
+        let diff = shadow_compare("r1", &legacy, &unified, 17);
+        assert!(!diff.agreement, "ranking+selected differ -> no agreement");
+        assert_eq!(diff.unified_latency_us, 17);
+        let ranking = diff.fields.iter().find(|f| f.field == "ranking").unwrap();
+        assert_eq!(ranking.verdict, "diff");
+        let selected = diff.fields.iter().find(|f| f.field == "selected").unwrap();
+        assert_eq!(selected.verdict, "diff");
+        // Eligible + rejected + provenance stay MATCH (not compared to nothing).
+        assert_eq!(diff.fields.iter().find(|f| f.field == "eligible").unwrap().verdict, "match");
+        assert_eq!(diff.fields.iter().find(|f| f.field == "rejected").unwrap().verdict, "match");
+        // Reservation is always NOT-COMPARABLE, never a mismatch.
+        assert_eq!(diff.fields.iter().find(|f| f.field == "reservation").unwrap().verdict, "not_comparable");
+
+        // Identical decisions -> agreement=true (with reservation nc).
+        let same = shadow_compare("r1", &legacy, &legacy, 3);
+        assert!(same.agreement, "identical decisions agree (reservation excluded)");
+        assert_eq!(same.fields.iter().filter(|f| f.verdict == "match").count(), 5);
+    }
+
+    fn candidate(id: &str) -> CandidateScore {
+        CandidateScore {
+            peer_id: id.to_string(),
+            total: 0.9,
+            tps: 0.8,
+            latency: 0.9,
+            load: 0.9,
+            queue: 1.0,
+            headroom: 1.0,
+            net: 0.8,
+            kv: 0.0,
+            locality: 0.0,
+            perf_measured: true,
+        }
     }
 
     #[test]

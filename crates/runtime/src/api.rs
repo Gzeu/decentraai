@@ -4916,6 +4916,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/shadow", post(shadow_handler))
         .route("/v1/golden-capture", get(golden_capture_handler))
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
@@ -6024,6 +6025,13 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
             "totals": report.totals,
             "sessions": session_count,
             "executions": executions,
+            // UnifiedSelector shadow mode (Issue #30 Phase 3): observe-only
+            // metrics + records. Never affects the authoritative path.
+            "shadow": {
+                "enabled": compute.shadow_enabled(),
+                "metrics": compute.shadow_metrics(),
+                "records": compute.shadow_records().into_iter().take(64).collect::<Vec<_>>(),
+            },
         });
     }
     (
@@ -6031,6 +6039,51 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
+}
+
+/// POST /v1/shadow — toggle UnifiedSelector shadow mode (Issue #30 Phase 3).
+/// Body: `{"enabled": true|false}`. Observe-only: toggling changes shadow
+/// observation, never routing/reservation/worker selection. Operator/admin.
+async fn shadow_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let body: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "invalid JSON body"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    match body.get("enabled").and_then(|v| v.as_bool()) {
+        Some(enabled) => {
+            compute.set_shadow_enabled(enabled);
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"enabled": enabled, "shadow_mode": "observe-only"}).to_string(),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "'enabled' (bool) is required"}).to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /v1/tts — synthesize speech for the dashboard chat speak button.

@@ -67,5 +67,6 @@ pub use planner::{
     WorkerFacts, base_score,
 };
 pub use unified::{
-    Divergence, GoldenCase, GoldenReport, GoldenSuite, UnifiedSelection, UnifiedSelector,
+    Divergence, GoldenCase, GoldenReport, GoldenSuite, ShadowDiff, ShadowField,
+    UnifiedSelection, UnifiedSelector, shadow_compare,
 };
