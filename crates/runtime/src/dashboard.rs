@@ -377,6 +377,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button onclick="doLogin()">Unlock dashboard</button>
     <div class="login-error" id="login-error">Invalid token — try again</div>
     <div class="login-hint">💡 <b>Master token</b> gives full access to all views.<br>🔑 <b>dca_ key</b> only allows Chat (no admin/monitoring).</div>
+    <a href="#" id="login-cancel" style="display:none;color:var(--faint);font-size:11px">cancel — keep the current token</a>
   </div>
 </div>
 <div class="layout">
@@ -439,6 +440,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
         <span class="node-pill" id="node-pill" title="This node"><span class="mono" id="node-pill-name">node</span></span>
         <span class="live-pill"><span class="dot off" id="live-dot"></span><span id="live-text">connecting…</span></span>
         <button id="palette-open" title="Command palette (Ctrl+K)">⌘K</button>
+        <button id="logout-btn" title="Clear the stored token and return to the login screen">change token</button>
       </div>
     </div>
 
@@ -1507,6 +1509,24 @@ document.addEventListener('DOMContentLoaded', () => {
   const inp = $('login-token');
   if (inp) inp.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 });
+// ---- logout / change token ----
+// The token is read once at page load; without this escape hatch a stale or
+// wrong token in localStorage leaves the user stuck in a 401 loop forever.
+function openLoginOverlay(){
+  $('login-overlay').classList.remove('hidden');
+  const inp = $('login-token'); if (inp) { inp.value = ''; inp.focus(); }
+  // A cancel link only makes sense when there is still a working session behind the overlay.
+  const c = $('login-cancel'); if (c) c.style.display = token ? 'block' : 'none';
+}
+$('logout-btn').addEventListener('click', () => {
+  try { localStorage.removeItem('dai_token'); } catch (e) {}
+  location.reload();
+});
+const loginCancelLink = $('login-cancel');
+if (loginCancelLink) loginCancelLink.addEventListener('click', (e) => {
+  e.preventDefault();
+  $('login-overlay').classList.add('hidden');
+});
 // ---- auth end ----
 
 // ---- navigation ------------------------------------------------------------
@@ -1701,6 +1721,15 @@ const sendChat = async (prompt) => {
     if (!workerHint && sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
     const body = JSON.stringify({ model: currentModel(), messages: hist, stream, ...(workerHint ? { worker_hint: workerHint } : {}) });
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
+    // A 401 here means the stored token is wrong for THIS node (or missing).
+    // Surface it immediately with the fix, instead of a bare API error string.
+    if (r.status === 401) {
+      addMsg('node', 'error: missing or invalid API token — use "change token" (top right) and paste the master token or dca_ key for THIS node.');
+      chatStatus.textContent = 'unauthorized';
+      toast('invalid or missing token', true);
+      openLoginOverlay();
+      return;
+    }
     const servedEl = $('chat-served');
     let servedOrigin = '', servedNode = '';
     if (servedEl) {
