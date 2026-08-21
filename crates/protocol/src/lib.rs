@@ -69,6 +69,12 @@ pub struct ManifestAnnouncement {
     pub manifest: Manifest,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
     pub signature: Option<Vec<u8>>,
+    /// Ed25519 public key of the announcing node, when signed. Absent on
+    /// legacy/unsigned announcements. The receiver verifies that this key maps
+    /// to the connected libp2p peer (anti-spoof) AND that the signature is
+    /// valid over the manifest's canonical bytes before trusting the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -157,12 +163,19 @@ pub fn manifest_response_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
     })
 }
 
-/// Serialize a manifest announcement carrying the given manifest.
-pub fn announcement_bytes(manifest: &Manifest, signature: Option<Vec<u8>>) -> Result<Vec<u8>> {
+/// Serialize a manifest announcement carrying the given manifest and, when
+/// provided, the signer's Ed25519 public key (the signature signs the
+/// manifest's canonical bytes, see [`sign_manifest`]).
+pub fn announcement_bytes(
+    manifest: &Manifest,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<[u8; 32]>,
+) -> Result<Vec<u8>> {
     serialize_message(&ManifestAnnouncement {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         manifest: manifest.clone(),
         signature,
+        signer_public_key,
     })
 }
 
@@ -207,6 +220,37 @@ pub fn verify_manifest_signature(
 ) -> Result<()> {
     let bytes = canonical_manifest_bytes(manifest);
     decentraai_identity::verify_signature(key, &bytes, sig)
+}
+
+/// Verifies a signed manifest announcement against the connected peer
+/// (anti-spoof, mirroring `verify_signed_compute_advertisement`).
+///
+/// Requires a signature AND a signer public key that maps to the connected
+/// libp2p peer, and an Ed25519 signature valid over the manifest's canonical
+/// bytes. An unsigned announcement returns `Ok(false)` (legacy peer) so the
+/// caller can apply its own policy (e.g. `require_signed_announcements`).
+pub fn verify_manifest_announcement(
+    announcement: &ManifestAnnouncement,
+    connected_peer: &PeerId,
+) -> Result<bool> {
+    let (Some(sig_bytes), Some(pk_bytes)) = (
+        announcement.signature.as_deref(),
+        announcement.signer_public_key,
+    ) else {
+        return Ok(false); // unsigned announcement: caller policy decides
+    };
+    let pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk_bytes)
+        .context("invalid signer public key")?;
+    let signer = PeerId::from_public_key(&libp2p::identity::PublicKey::from(pubkey));
+    if &signer != connected_peer {
+        anyhow::bail!(
+            "manifest signer {signer} does not match the announcing peer {connected_peer}"
+        );
+    }
+    let key = VerifyingKey::from_bytes(&pk_bytes).context("invalid ed25519 public key")?;
+    let sig = Signature::from_slice(sig_bytes).context("invalid signature")?;
+    verify_manifest_signature(&key, &announcement.manifest, &sig)?;
+    Ok(true)
 }
 
 /// Canonical bytes for signing an [`InferRequest`] (P1).
@@ -420,6 +464,7 @@ mod tests {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
             signature: Some(vec![1, 2, 3]),
+            signer_public_key: None,
         };
         let serialized = serialize_message(&announcement).unwrap();
         let deserialized: ManifestAnnouncement =
@@ -521,6 +566,7 @@ mod tests {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
             signature: None,
+            signer_public_key: None,
         };
         let mut serialized = serialize_message(&announcement).unwrap();
         // Inject unknown field
@@ -570,6 +616,7 @@ mod tests {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
             signature: None,
+            signer_public_key: None,
         };
         let serialized_no_sig = serialize_message(&announcement).unwrap();
 
@@ -577,6 +624,7 @@ mod tests {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             manifest: create_test_manifest(),
             signature: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            signer_public_key: None,
         };
         let serialized_with_sig = serialize_message(&announcement_with_sig).unwrap();
 
@@ -630,7 +678,7 @@ mod tests {
         let parsed: ManifestResponse = deserialize_message(&response, 1024 * 1024).unwrap();
         assert_eq!(parsed.manifest.model_id, "test-model-id");
 
-        let announcement = announcement_bytes(&manifest, None).unwrap();
+        let announcement = announcement_bytes(&manifest, None, None).unwrap();
         let parsed: ManifestAnnouncement = deserialize_message(&announcement, 1024 * 1024).unwrap();
         assert_eq!(parsed.manifest.file_name, "test.gguf");
         assert_eq!(parsed.signature, None);
@@ -771,6 +819,68 @@ mod tests {
         // Tamper with the serialized payload after signing.
         signed.advertisement = serde_json::to_vec(&["vram_999"]).unwrap();
         assert!(verify_signed_compute_advertisement(&signed, &peer).is_err());
+    }
+
+    // ---- Manifest announcement trust gate (review, security) ----
+
+    fn signed_announcement(identity: &Identity, manifest: &Manifest) -> ManifestAnnouncement {
+        let signature = sign_manifest(identity, manifest);
+        ManifestAnnouncement {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            manifest: manifest.clone(),
+            signature: Some(signature.to_bytes().to_vec()),
+            signer_public_key: Some(identity.public_key().to_bytes()),
+        }
+    }
+
+    #[test]
+    fn manifest_announcement_verifies_for_the_announcing_peer() {
+        let identity = Identity::generate();
+        let announcement = signed_announcement(&identity, &create_test_manifest());
+        assert!(
+            verify_manifest_announcement(&announcement, &peer_of(&identity)).unwrap(),
+            "a signed announcement from the connected peer must verify"
+        );
+    }
+
+    #[test]
+    fn manifest_announcement_rejects_a_spoofed_peer() {
+        // Anti-spoof: the signer public key must map to the connected peer.
+        // A signed announcement presented as coming from a DIFFERENT peer
+        // must be rejected before any consumer trusts the model.
+        let identity = Identity::generate();
+        let other = Identity::generate();
+        let announcement = signed_announcement(&identity, &create_test_manifest());
+        let err = verify_manifest_announcement(&announcement, &peer_of(&other)).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn manifest_announcement_rejects_tampered_manifest() {
+        let identity = Identity::generate();
+        let mut announcement = signed_announcement(&identity, &create_test_manifest());
+        announcement.manifest.chunk_hashes[0] = blake3::hash(b"tampered").to_hex().to_string();
+        assert!(
+            verify_manifest_announcement(&announcement, &peer_of(&identity)).is_err(),
+            "tampering the manifest after signing must fail verification"
+        );
+    }
+
+    #[test]
+    fn unsigned_manifest_announcement_returns_false() {
+        // Unsigned announcements are not rejected — the caller applies its
+        // policy (require_signed_announcements) on the Ok(false) result.
+        let identity = Identity::generate();
+        let announcement = ManifestAnnouncement {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            manifest: create_test_manifest(),
+            signature: None,
+            signer_public_key: None,
+        };
+        assert!(
+            !verify_manifest_announcement(&announcement, &peer_of(&identity)).unwrap(),
+            "unsigned announcements must forward signed_ok=false"
+        );
     }
 
     // ---- Collective Intelligence P1: signed agent advertisements ----

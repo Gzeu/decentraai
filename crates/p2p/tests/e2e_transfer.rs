@@ -567,14 +567,14 @@ async fn manifest_announcement_fires_callback() {
 
     let (server, mut client) = node_pair(None).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    client.set_on_manifest_announcement(move |peer, m| {
-        let _ = tx.send((peer, m.file_name));
+    client.set_on_manifest_announcement(move |peer, m, signed_ok| {
+        let _ = tx.send((peer, m.file_name, signed_ok));
     });
 
     // The dial needs a moment to settle before the server sees the client
     // as connected; broadcast only reaches connected peers. Re-announce
     // until the callback fires.
-    let payload = announcement_bytes(&manifest, None).unwrap();
+    let payload = announcement_bytes(&manifest, None, None).unwrap();
     let mut seen = None;
     for _ in 0..50 {
         server.announce(payload.clone());
@@ -584,9 +584,10 @@ async fn manifest_announcement_fires_callback() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let (peer, name) = seen.expect("announcement callback must fire");
+    let (peer, name, signed_ok) = seen.expect("announcement callback must fire");
     assert_eq!(peer, server.local_peer_id());
     assert_eq!(name, "model.gguf");
+    assert!(!signed_ok, "unsigned announcement must forward signed_ok=false");
 }
 
 #[tokio::test]
@@ -632,7 +633,7 @@ async fn announced_model_auto_downloads_and_verifies() {
     let client_handle = client.clone();
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_for_cb = started.clone();
-    client.set_on_manifest_announcement(move |peer, m| {
+    client.set_on_manifest_announcement(move |peer, m, _signed_ok| {
         // Only the first delivery spawns a download; re-announcements while
         // the connection settles must not start duplicate transfers.
         if started_for_cb.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -652,7 +653,7 @@ async fn announced_model_auto_downloads_and_verifies() {
     });
 
     // Re-announce until the connection settles and the first callback fires.
-    let payload = announcement_bytes(&manifest, None).unwrap();
+    let payload = announcement_bytes(&manifest, None, None).unwrap();
     for _ in 0..50 {
         if started.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -671,5 +672,48 @@ async fn announced_model_auto_downloads_and_verifies() {
         std::fs::read(&outcome).unwrap(),
         data,
         "the announced model must match its source byte-for-byte"
+    );
+}
+
+#[tokio::test]
+async fn forged_manifest_announcement_is_dropped() {
+    // Trust gate (review, security): an announcement signed by a key that
+    // does NOT map to the connected peer is a spoof and must be dropped by
+    // the swarm layer — the consumer callback never fires for it. The
+    // positive path (a valid signed announcement reaching the consumer with
+    // signed_ok=true) is covered by the protocol unit tests
+    // (manifest_announcement_verifies_for_the_announcing_peer).
+    let dir = TempDir::new().unwrap();
+    let source_path = dir.path().join("model.gguf");
+    std::fs::write(&source_path, test_bytes(64)).unwrap();
+    let manifest = scan(&source_path).unwrap();
+
+    let (server, mut client) = node_pair(None).await;
+
+    // Sign with an identity that is NOT the server's libp2p key: a forged
+    // announcement claiming to come from the connected peer.
+    let forger = Identity::generate();
+    let forged_sig = decentraai_protocol::sign_manifest(&forger, &manifest);
+    let forged_payload = announcement_bytes(
+        &manifest,
+        Some(forged_sig.to_bytes().to_vec()),
+        Some(forger.public_key().to_bytes()),
+    )
+    .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    client.set_on_manifest_announcement(move |_peer, m, signed_ok| {
+        let _ = tx.send((m.file_name, signed_ok));
+    });
+
+    // Announce the forged payload repeatedly; the callback must NEVER fire
+    // for it (the swarm drops the forged announcement before consumers).
+    for _ in 0..10 {
+        server.announce(forged_payload.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "a forged manifest announcement must not reach the consumer"
     );
 }

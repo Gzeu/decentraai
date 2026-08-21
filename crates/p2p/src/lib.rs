@@ -371,9 +371,15 @@ type InferHandler =
 type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
 
 /// Handler for inbound manifest announcements, called with the announcing
-/// peer and the announced manifest. MUST be non-blocking: the swarm event
-/// loop invokes it inline, so downloads belong in a spawned task.
-type ManifestAnnouncementHandler = Arc<dyn Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync>;
+/// peer, the announced manifest, and whether the announcement carried a
+/// VALID signature from that peer (`true`) or was unsigned/invalid
+/// (`false` — the caller applies its own policy, e.g.
+/// `require_signed_announcements`). A forged signature is never forwarded:
+/// the swarm layer rejects it before invoking the callback.
+/// MUST be non-blocking: the swarm event loop invokes it inline, so
+/// downloads belong in a spawned task.
+type ManifestAnnouncementHandler =
+    Arc<dyn Fn(PeerId, decentraai_manifest::Manifest, bool) + Send + Sync>;
 
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
@@ -429,12 +435,15 @@ impl P2PNode {
         *guard = Some(std::sync::Arc::new(callback));
     }
 
-    /// Sets a callback for inbound manifest announcements (peer, manifest).
-    /// The callback is invoked inline by the swarm task and MUST NOT block;
-    /// spawn a background task to download the announced model.
+    /// Sets a callback for inbound manifest announcements (peer, manifest,
+    /// signed_ok). `signed_ok` is true only when the announcement carried a
+    /// valid signature from the announcing peer; forged signatures are
+    /// dropped before this callback. The callback is invoked inline by the
+    /// swarm task and MUST NOT block; spawn a background task to download
+    /// the announced model.
     pub fn set_on_manifest_announcement<F>(&mut self, callback: F)
     where
-        F: Fn(PeerId, decentraai_manifest::Manifest) + Send + Sync + 'static,
+        F: Fn(PeerId, decentraai_manifest::Manifest, bool) + Send + Sync + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_manifest.lock());
         *guard = Some(std::sync::Arc::new(callback));
@@ -777,12 +786,38 @@ impl P2PNode {
                                             model = %announcement.manifest.file_name,
                                             "received manifest announcement"
                                         );
+                                        // Trust gate: a signed announcement must
+                                        // verify (anti-spoof + Ed25519 over the
+                                        // canonical manifest) or it is dropped
+                                        // before any consumer sees it. Unsigned
+                                        // announcements are forwarded with
+                                        // signed_ok=false so the caller applies
+                                        // require_signed_announcements.
+                                        let signed_ok = match decentraai_protocol::verify_manifest_announcement(
+                                            &announcement,
+                                            &peer,
+                                        ) {
+                                            Ok(true) => true,
+                                            Ok(false) => false,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    %peer,
+                                                    model = %announcement.manifest.file_name,
+                                                    error = %e,
+                                                    "rejected forged manifest announcement"
+                                                );
+                                                // A forged signature is dropped here; the
+                                                // peer's reputation is handled by the
+                                                // transfer layer on chunk verification.
+                                                continue;
+                                            }
+                                        };
                                         // Announcements are fire-and-forget but a handler may
                                         // want to act (e.g. auto-download). The callback must
                                         // not block the event loop; it spawns its own task.
                                         let guard = on_manifest_clone.lock().await;
                                         if let Some(cb) = &*guard {
-                                            cb(peer, announcement.manifest);
+                                            cb(peer, announcement.manifest, signed_ok);
                                         }
                                         continue;
                                     }

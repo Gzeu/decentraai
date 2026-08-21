@@ -2712,6 +2712,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
             let payload = decentraai_protocol::announcement_bytes(
                 &manifest,
                 Some(signature.to_bytes().to_vec()),
+                Some(identity.public_key().to_bytes()),
             )?;
             node.announce(payload);
             announced += 1;
@@ -2726,11 +2727,12 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
     let (ann_tx, ann_rx) = tokio::sync::mpsc::unbounded_channel();
     {
         let tx = ann_tx.clone();
-        node.set_on_manifest_announcement(move |peer, manifest| {
-            let _ = tx.send((peer, manifest));
+        node.set_on_manifest_announcement(move |peer, manifest, signed_ok| {
+            let _ = tx.send((peer, manifest, signed_ok));
         });
     }
     let share_mode = config.sharing.mode;
+    let require_signed = config.security.require_signed_announcements;
     let max_concurrent = config.sharing.max_concurrent_downloads as usize;
     let max_invalid_chunks = config.security.max_invalid_chunks_per_peer;
     let ban_duration = Duration::from_secs(u64::from(config.security.ban_duration_minutes) * 60);
@@ -2742,6 +2744,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
             identity_path: identity_path.clone(),
             registry_path,
             share_mode,
+            require_signed_announcements: require_signed,
             max_invalid_chunks,
             ban_duration,
         },
@@ -2772,6 +2775,11 @@ struct ShareWorkerConfig {
     identity_path: PathBuf,
     registry_path: PathBuf,
     share_mode: decentraai_config::ShareMode,
+    /// Trust gate (review, security): when true, an announced model is
+    /// auto-downloaded ONLY if the announcement carried a valid signature
+    /// from the announcing peer. This closes the hole where a LAN peer could
+    /// push arbitrary bytes into models/ via ShareMode::Auto + mDNS.
+    require_signed_announcements: bool,
     max_invalid_chunks: u8,
     ban_duration: Duration,
 }
@@ -2785,6 +2793,7 @@ async fn run_share_worker(
     mut ann_rx: tokio::sync::mpsc::UnboundedReceiver<(
         decentraai_p2p::PeerId,
         decentraai_manifest::Manifest,
+        bool,
     )>,
     node: decentraai_p2p::P2PNode,
     cfg: ShareWorkerConfig,
@@ -2800,6 +2809,7 @@ async fn run_share_worker(
         identity_path,
         registry_path,
         share_mode,
+        require_signed_announcements,
         max_invalid_chunks,
         ban_duration,
     } = cfg;
@@ -2820,12 +2830,24 @@ async fn run_share_worker(
     // per-peer headroom guard for bursts of announcements.
     let semaphore = tokio::sync::Semaphore::new(max_concurrent);
 
-    while let Some((peer, manifest)) = ann_rx.recv().await {
+    while let Some((peer, manifest, signed_ok)) = ann_rx.recv().await {
         if in_flight.contains(&manifest.model_id) {
             continue;
         }
         if models_dir.join(&manifest.file_name).exists() {
             info!(model = %manifest.file_name, "already present; skipping auto-download");
+            continue;
+        }
+        // Trust gate: when require_signed_announcements is set (default in
+        // node.example.yaml), an unsigned or invalid announcement is never
+        // auto-downloaded. The swarm layer already dropped forged signatures;
+        // this covers unsigned peers (legacy / mDNS strangers).
+        if require_signed_announcements && !signed_ok {
+            warn!(
+                peer = %peer,
+                model = %manifest.file_name,
+                "skipping unsigned manifest announcement (require_signed_announcements=true)"
+            );
             continue;
         }
         let proceed = match share_mode {
@@ -2870,6 +2892,7 @@ async fn run_share_worker(
                     if let Ok(payload) = decentraai_protocol::announcement_bytes(
                         &manifest,
                         Some(signature.to_bytes().to_vec()),
+                        Some(identity.public_key().to_bytes()),
                     ) {
                         node.announce(payload);
                         info!(model = %manifest.file_name, "re-announced");
