@@ -19,6 +19,34 @@ The VPS Node is the first always-online public DecentraAI node. Its primary role
 
 The VPS is **not** expected to provide heavy LLM inference. Large models remain on capable worker hardware (for example, a home desktop/GPU node).
 
+## 1a. Deployment target (concrete)
+
+This profile is written against a concrete, verified target (the host provisioned for
+the first official node), but the criteria below are the *selection contract* any
+replacement host must satisfy — not a one-off description.
+
+| Dimension | Required | Verified target |
+|---|---|---|
+| OS | Ubuntu Server 24.04 LTS (or current LTS), clean install | Ubuntu 24.04.4 LTS (`vmi3524028`) |
+| CPU | ≥ 4 vCPU, x86-64 | 6× AMD EPYC 2.0 GHz |
+| RAM | ≥ 8 GiB | 11 GiB |
+| Disk | ≥ 40 GiB free, local/block (not ephemeral) | 193 GiB / `/dev/sda1` (2% used at provision) |
+| GPU | **optional**; not required for the control-plane role | none (QEMU virtio VGA only) |
+| Network | stable public IPv4; IPv6 strongly preferred if provider offers prefixes | public IPv4 (169.58.x.x, IBM SoftLayer) |
+| Provider firewall | supported and mirrored to `ufw` | yes |
+
+Resource sizing is deliberate: this host is a **control-plane / bootstrap / coordinator /
+registry / evidence-anchor**, *not* an "AI server". Inference here is limited to at most a
+small model running as an ordinary worker; the CPU/RAM headroom is for steady operation,
+P2P message volume, ledger I/O and buffering, not for concurrent large-model generation.
+
+**Resource selection criteria for any replacement host:**
+- adequate for: P2P connection fan-in, registry/heartbeat volume, evidence/ledger JSON
+  persistence, reverse-proxy buffering, one small local worker;
+- NOT sized or priced for heavy GPU inference (keep that on home/LAN worker hardware);
+- a GPU is only justified if the host will deliberately serve a model; otherwise it is
+  cost that buys nothing for the control-plane role.
+
 ## 2. Threat-model change
 
 LAN operation is trust-explicit and link-local. A VPS is internet-reachable and therefore must assume:
@@ -91,6 +119,49 @@ The existing invite / admission flow remains the authority for onboarding. Do no
 
 Private identity material must remain readable only by the service account.
 
+## 4a. Service exposure matrix
+
+Three distinct network planes are never conflated. Each service belongs to exactly one
+plane; a service's plane determines whether it may be reachable from the public Internet.
+
+| Plane | Reachability | Services |
+|---|---|---|
+| **Public application** | Internet → `443/tcp` only, TLS-terminated at Caddy | OpenAI-compatible chat API, dashboard (authn) |
+| **P2P** | Internet → selected libp2p listener port(s) only | peer dial/accept, bootstrap/rendezvous, remote inference traffic |
+| **Administration / internal** | localhost + private admin network only (never public) | application API `127.0.0.1:8080`, SSH (separate, key-only), databases, metrics collectors, Prometheus/Grafana if any, emergency admin API |
+
+Explicit **public / private / loopback** matrix:
+
+| Service | Bind | Public | Private LAN/net | Loopback |
+|---|---|---|---|---|
+| DecentraAI application API | `127.0.0.1:8080` | ✗ | via SSH tunnel/Caddy only | ✓ |
+| Caddy (TLS proxy) | `0.0.0.0:443` | ✓ | ✓ | ✓ |
+| libp2p P2P listener | configured WAN port | ✓ (selected port) | ✓ | ✓ |
+| SSH | provider-restricted | ✗ (key-only, source-restricted) | ✓ | ✓ |
+| SQLite/Postgres | local | ✗ | ✗ | ✓ |
+| Metrics (if used) | `127.0.0.1` | ✗ | admin net only | ✓ |
+| Prometheus / Grafana | admin net | ✗ | admin net only | ✗ |
+| llama-server / vLLM | `127.0.0.1` (executor) | ✗ | ✗ | ✓ |
+| Emergency admin API | `127.0.0.1` | ✗ | ✗ | ✓ |
+
+Rule: **anything that is not explicitly in the *public* column of this matrix is firewalled
+closed by default.** Exposing a service means changing this matrix deliberately, not opening a
+port ad hoc.
+
+## 4b. HTTP vs P2P vs SSH — identity separation
+
+Three different trust domains are involved and must never be interchangeable:
+
+1. **HTTP application auth** (Bearer token) — authorizes *API callers* (a human/operator or a
+   dashboard session). It says nothing about *peer* trust.
+2. **WAN node identity** (Ed25519 keypair → PeerId + signed traffic) — authorizes *peers* to
+   participate in the trusted fabric. It is independent of HTTP tokens.
+3. **SSH admin** (key-only) — control of the host itself. Highest privilege.
+
+A compromised token must not grant fabric peer trust. A compromised peer identity must not
+grant HTTP admin. A dial on the P2P port must never touch the HTTP API surface (separate
+processes/ports, cross-boundary validation at the application layer only).
+
 ## 5. Firewall and exposed ports
 
 The host firewall should implement a default-deny inbound policy.
@@ -124,6 +195,48 @@ Home nodes should initiate outbound connectivity to the VPS. The architecture sh
 The existing node identity and invite/bootstrap mechanism should carry the VPS bootstrap multiaddress and peer ID.
 
 The VPS must not become a centralized inference dependency: if a worker is temporarily unavailable, the network should degrade according to existing admission/scheduling semantics rather than treating the VPS as a mandatory inference proxy.
+
+## 6a. IPv6 and NAT / WAN treatment
+
+**IPv4 / NAT:** home nodes behind CGNAT or NAT dial **out** to the VPS public IPv4. The VPS
+must not require inbound port forwarding at the home site to admit a worker. The VPS's stable
+public IPv4 + PeerId is the bootstrap target carried in the invite/join material. The P2P
+listener advertises its real, reachable external address (a single public IPv4 is sufficient;
+do NOT advertise RFC1918 or the internal NIC address as the dialable address).
+
+**IPv6:** if the provider assigns a stable IPv6 prefix, enable it and advertise the reachable
+global address in addition to IPv4 — it removes NAT hairpin/carrier-NAT latency and gives a
+cleaner dial path for IPv6-capable peers. Rules:
+- advertise only globally reachable addresses (no link-local `fe80::`, no ULA `fc00::/7`);
+- the provider/cloud firewall must open the same P2P port over IPv6 as over IPv4;
+- Caddy should listen `:443` for both stacks (Caddy handles dual-stack TLS);
+- if the provider does not give IPv6, that is acceptable — the fabric is IPv4-first, IPv6-optional.
+
+**Dial reliability:** prefer outbound dials from home → VPS for the steady state. Treat the VPS
+as the rendezvous: it is contacted, it does not need to cold-dial home NAT'd workers. Keep the
+P2P listener's messages bounded (existing size caps) — a public listener is a flood surface.
+
+## 6b. Threat model and failure modes (concrete)
+
+Accepted threat model for the public node, beyond LAN:
+
+| Threat | Concrete failure mode | Primary mitigation |
+|---|---|---|
+| Port/credential probing | scans on 443/P2P/22 | firewall default-deny; fail2ban on SSH; only required ports open |
+| API abuse / token theft | hostile requests through Caddy | Bearer auth; Caddy TLS+limits; tier rate limits; rotation |
+| Malformed/oversized requests | parse/memory pressure | request body caps; size caps; bounded queues |
+| Connection floods | fd/memory exhaustion | connection limits at proxy; bounded accept; resource limits |
+| Malicious/malformed peer | bad messages / crypto failures | per-chunk verify; signed messages; reputation (only crypto penalties); quarantine |
+| Untrusted/compromised peer seeking admission | fraudulent worker/advertisement | explicit trust/invite flow; zero-trust default; reputation 0 |
+| Disk exhaustion | logs/history/ledger fill disk | retention bounds; disk usage alert; bounded rings |
+| Restart/crash attempts | availability loss | systemd restart w/ backoff; health probes; supervisor |
+| Private-key/credential theft | identity takeover | mode-0600 keys, service account, encrypted backup, not in git |
+| DoS on a single home worker | availability caveat | VPS is rendezvous only, not mandatory inference path |
+
+Acceptable degradation: if the VPS is down, home nodes can still complete *already-trusted*
+work among themselves over their existing links; admission/bootstrap of new peers waits for the
+rendezvous. The VPS must never become a single point of authority for *execution* — routing and
+inference decision-making stay distributed per the existing architecture.
 
 ## 7. Universal Node reuse
 
@@ -244,6 +357,49 @@ Private keys require encrypted/off-host backup handling and must not be committe
 
 A backup is considered valid only after restoration has been tested.
 
+## 13a. Backup + restore: demonstrated procedure
+
+Backup is a *procedure with a verification step*, not a config flag. The VPS is an
+always-online persistence anchor, so this is tested on a schedule, not assumed.
+
+**What is backed up (atomic, consistent snapshot):**
+
+- `config.*` — node configuration;
+- identity key material (`identity/key.pem`) — **encrypted, off-host only**, never in the
+  same tarball as non-secret state, never in Git;
+- registry state (`db/registry.json`, `db/registry.bak` etc.);
+- evidence/credit/accounting files (`db/*.json`, `db/*.jsonl`) where enabled;
+- migration/version metadata (the exact commit/hash and binary version in use).
+
+**Procedure (reference commands; adapt to the actual data dir):**
+
+```bash
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+# 1. freeze live writes by taking files while the node is healthy (copy, not tar -z from a
+#    hot dir, to avoid torn writes); prefer the node's own atomic snapshot files.
+nice tar -C "$DATA_DIR" -cf /var/backups/decentraai/state-${STAMP}.tar \
+    config.yaml db/ tools/ 2>/dev/null
+# 2. secret material separately, encrypted (age/gpg), off-host:
+age -e -r "$RECIPIENT" identity/key.pem > /var/backups/decentraai-secret/key-${STAMP}.age
+# 3. ship both to a DIFFERENT host/site (never only local to the VPS):
+rsync -a /var/backups/decentraai/ "$BACKUP_HOST:/backups/decentraai/state/"
+rsync -a /var/backups/decentraai-secret/ "$BACKUP_HOST:/backups/decentraai/secret/"
+```
+
+**Restoration verification (the only thing that makes a backup valid):**
+
+On a disposable host (or in the staging profile), restore the tarball + decrypted key into a
+fresh data dir, start a node with a *fresh* advertise/identity override, and assert:
+
+- node starts and the registry/evidence/credits load (`load_execution_history`, `restore`
+  paths report success);
+- `db/` balances and idempotency sets round-trip (no double-credit on replay);
+- a P2P dial to the production coordinator succeeds with the restored identity/PeerId.
+
+Run this restoration drill at least once before going public and on a schedule (e.g. weekly)
+thereafter. Log the drill result. A backup that has never been restored is considered untested
+and NOT valid for release.
+
 ## 14. Upgrade and rollback
 
 Production upgrades must be incremental and reversible.
@@ -271,6 +427,31 @@ current version
 Keep the previous known-good binary available until the new deployment passes its verification window.
 
 Use the existing `upgrade-node.sh` discipline rather than ad-hoc binary replacement.
+
+## 14a. Automated verification gate (upgrade/rollback)
+
+An upgrade is not complete until an automated gate PASSES *and* is recorded. The gate is the
+same scripted sequence used at first provision, now run against the new binary:
+
+1. **Pre-flight snapshot:** record current peer count, worker count, `/status` health, shadow
+   metrics, disk, `git` HEAD, binary checksum.
+2. **Backup persistent state** (§13a) — mandatory before installing.
+3. **Install + restart** the new binary; wait for the service to reach `active` and pass its
+   health probe.
+4. **Automated verification checks** (each asserts a numeric/state threshold, not just "ran"):
+   - API: `GET /status` returns `200` and `attached` true;
+   - P2P: peer count ≥ pre-flight (bootstrap re-establishes); coordinator sees ≥ 1 verified peer;
+   - routing/inference: one remote + one local inference round-trips successfully (the exact
+     smoke path used on LAN);
+   - registry/evidence: `load_*`/`restore` logs report success (no replay corruption);
+   - observability: shadow metrics endpoint responds, UnifiedSelector still observe-only;
+   - disk/MEM: usage within pre-flight ± threshold (no unbounded growth).
+5. **PASS** → promote new binary, archive the previous binary with its checksum for rollback.
+6. **FAIL** (any check) → **automatically** `systemctl restart` with the previous binary, re-run
+   the gate; a second failure pages on-call. Log the outcome and the exact failing check.
+
+The gate script must be idempotent and exit non-zero on any failing assertion so CI/CD can block.
+Manual "I think it's fine" is not an upgrade result.
 
 ## 15. Observability
 
@@ -313,6 +494,29 @@ The test must demonstrate:
 
 The load test is a release gate, not an optional benchmark.
 
+**Concrete thresholds the gate asserts (tune to the actual host, but assert numbers):**
+
+- **Rate limit engagement:** sustained request rate breaks the configured per-tier window and
+  `429` (or the configured limit response) is returned; the node's request counter does not
+  mean unbounded acceptance.
+- **Queue bound:** under over-subscription the queue length stays ≤ configured cap; requests
+  beyond it are rejected/shed, not buffered without limit; memory stays flat.
+- **RAM reserve gate:** with a simulated low-RAM worker, admission refuses (the reserve is a
+  hard floor, not a soft warning).
+- **Malformed/oversized:** > cap body and truncated/malformed requests are rejected with a
+  `4xx`; no panic, no crash, no state corruption.
+- **Persistence integrity:** run the load, then verify `db/` globals + evidence/ledger still
+  load and idempotency is intact (no duplicate credit after the churn).
+- **Shadow isolation:** run load with shadow enabled; assert `errors==0`,
+  `invocations>0`, and the authoritative routing result is byte-identical to shadow-off
+  (shadow can not influence routing under load).
+- **Recovery:** `systemctl restart` during/after load → service returns to healthy within the
+  configured backoff; previous worker/peer links re-establish; verified peers survive.
+- **Rollback:** an intentionally defective binary is detected by the gate and rolled back
+  automatically with the previous binary, returning the node to a healthy state.
+
+Pass = every assertion above. Any failure blocks public release.
+
 ## 17. Security release gates
 
 The VPS Node is not production-ready until all of the following are true:
@@ -338,10 +542,13 @@ The VPS Node is not production-ready until all of the following are true:
 This profile does **not** authorize:
 
 - direct public application binding;
+- treating the VPS as an "AI server" for heavy inference (it is control-plane and an ordinary
+  small-model worker at most);
 - replacing the Universal Node with a new server architecture;
 - exposing llama-server/vLLM directly to the Internet;
 - automatic trust of unknown WAN peers;
-- making UnifiedSelector authoritative;
+- making UnifiedSelector authoritative (it stays **observe-only** even while the VPS is
+  public — promotion is a separate reviewed decision);
 - implementing worker-side KV cache identity;
 - introducing crypto/token payments;
 - opening databases, Redis, Prometheus, or Grafana publicly;
@@ -381,19 +588,44 @@ This profile does **not** authorize:
              GPU / large model          CPU / small model
 ```
 
+## 19a. First-worker bootstrap procedure (concrete)
+
+The first node is the VPS bootstrap/coordinator. The first *controlled worker* is onboarded
+with the invite/join flow — the authority for admission — never by auto-trust:
+
+1. On the VPS, confirm identity is provisioned (`decentraai init` / node identity path) and
+   the PeerId is known; confirm bootstrap P2P listener is up on the advertised public address.
+2. On the home worker, generate/keep its own identity; obtain the VPS bootstrap multiaddr +
+   PeerId from the operator (this is the **invite material**, not a raw IP allowlist).
+3. From the worker, `decentraai join <bootstrap+peerid>` (or the equivalent existing invite
+   command) → worker dials OUT to the VPS. No inbound port forwarding at home.
+4. On the VPS coordinator, **explicitly trust** the worker's PeerId (the existing
+   trust/admission primitive). Confirm the worker advertises its served model.
+5. Verify end-to-end: from the VPS operator API, route a remote inference to the worker; the
+   coordinator's selection trace records `selected == reserved == worker` (or the honest
+   local-exclusion distinction), outcome `succeeded`.
+6. Confirm the worker accrued real measured presence/contribution and reputation > 0 from a
+   verified completion (never from a network-only observation).
+7. Record the worker's identity + model in the registry/evidence anchor; it is now an
+   operating peer. Only the coordinator's explicit trust keeps it admissible thereafter.
+
+Do not skip step 4 (explicit trust). An untrusted WAN worker stays reputation-0 and is
+rejected (`UntrustedWorker`) even if it dials correctly.
+
 ## 20. Deployment sequence after this profile
 
 The profile is documentation only. The eventual deployment should proceed as a separate reviewed effort:
 
-1. select VPS resources/provider;
-2. provision a clean supported Linux LTS host;
-3. apply firewall and OS hardening;
-4. install the existing DecentraAI node using the Universal Node path;
-5. configure loopback API + reverse proxy TLS;
-6. configure VPS identity/bootstrap role;
-7. connect one controlled remote worker;
-8. verify admission, P2P, routing, inference and observability;
-9. run load/failure gates;
-10. only then open public client access.
+1. select VPS resources/provider (satisfying §1a selection criteria);
+   2. provision a clean supported Linux LTS host;
+   3. apply firewall and OS hardening (§5, §11, §12);
+   4. install the existing DecentraAI node using the Universal Node path;
+   5. configure loopback API + reverse proxy TLS (§3);
+   6. configure VPS identity/bootstrap role (§6);
+   7. on-board the first controlled worker via the invite/trust flow (§19a);
+   8. verify admission, P2P, routing, inference and observability;
+   9. run the load/failure gate with the numeric thresholds (§16);
+   10. only then open public client access — and only after §17 security gates all pass.
 
-No step above changes the current `main` branch or promotes UnifiedSelector to authoritative routing.
+Each step is its own reviewed, reversible stage with a recorded outcome. No step above
+changes the current `main` branch or promotes UnifiedSelector to authoritative routing.
