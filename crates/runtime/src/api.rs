@@ -9626,7 +9626,8 @@ async fn route_remote_chat(
                 }
                 decentraai_distributed::InferErrorCode::Timeout
                 | decentraai_distributed::InferErrorCode::Capacity
-                | decentraai_distributed::InferErrorCode::Transport => (
+                | decentraai_distributed::InferErrorCode::Transport
+                | decentraai_distributed::InferErrorCode::RetryableWorker => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "remote worker unavailable".to_string(),
                 ),

@@ -191,6 +191,11 @@ pub enum InferErrorCode {
     Engine,
     /// The request was cancelled by the requester.
     Cancelled,
+    /// The worker answered `InferFailed { retryable: true }` — it refused
+    /// BEFORE executing and explicitly asked for a safe retry. Unlike
+    /// `AllWorkersFailed`, re-sending is idempotency-safe (no generation
+    /// happened).
+    RetryableWorker,
     /// The failure did not map to a known category.
     Unknown,
 }
@@ -211,6 +216,7 @@ impl InferErrorCode {
             InferErrorCode::Capacity => "capacity",
             InferErrorCode::Engine => "engine",
             InferErrorCode::Cancelled => "cancelled",
+            InferErrorCode::RetryableWorker => "retryable_worker",
             InferErrorCode::Unknown => "unknown",
         }
     }

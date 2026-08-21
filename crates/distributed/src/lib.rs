@@ -212,6 +212,14 @@ mod error {
         #[error("All workers failed for request {0}")]
         AllWorkersFailed(String),
 
+        /// The worker answered `InferFailed { retryable: true }` — it did NOT
+        /// execute the request (a pre-execution refusal, e.g. model not
+        /// loaded yet) and explicitly asked for a safe retry. Unlike
+        /// `AllWorkersFailed` (outcome unknown), re-sending to another worker
+        /// is idempotency-safe because no generation happened.
+        #[error("Worker reported a retryable failure: {0}")]
+        WorkerRetryable(String),
+
         #[error("Request timeout after {0}ms")]
         RequestTimeout(u64),
 
@@ -247,7 +255,15 @@ mod error {
         /// outcomes; clients wanting a fresh generation send a new
         /// `request_id`/nonce.
         pub fn is_retryable(&self) -> bool {
-            matches!(self, DistributedError::P2PError(_))
+            matches!(
+                self,
+                // A connection that never completed is safe to retry.
+                DistributedError::P2PError(_)
+                    // The worker explicitly refused BEFORE executing and asked
+                    // for a safe retry (InferFailed.retryable=true) — no
+                    // generation happened, so re-sending is idempotency-safe.
+                    | DistributedError::WorkerRetryable(_)
+            )
         }
 
         /// Stable machine-readable classification of this failure (M10
@@ -258,6 +274,7 @@ mod error {
             match self {
                 DistributedError::NoWorkersAvailable(_) => InferErrorCode::NoWorkers,
                 DistributedError::AllWorkersFailed(_) => InferErrorCode::AllWorkersFailed,
+                DistributedError::WorkerRetryable(_) => InferErrorCode::RetryableWorker,
                 DistributedError::RequestTimeout(_) => InferErrorCode::Timeout,
                 DistributedError::WorkerRejected(_, _) => InferErrorCode::Rejected,
                 DistributedError::P2PError(_) => InferErrorCode::Transport,
@@ -1068,9 +1085,11 @@ impl DistributedInference {
         self.sign_request(&mut request);
         // Capability-aware compute path: pick a worker that serves the model
         // and has RAM/VRAM headroom, and hold a reservation for the duration.
-        // If the selected worker fails (offline, rejection, timeout), fall
-        // through to the legacy announcement-based router instead of failing
-        // the request.
+        // When the compute path cannot even build requirements for the model
+        // (no registry data), fall through to the legacy announcement-based
+        // router. If the compute path DID attempt the request, its own retry
+        // budget + is_retryable() policy is authoritative — a legacy re-send
+        // would violate at-most-once (see the boundary after the loop).
         if let Some(compute) = &self.compute_manager {
             if let Some(req) = compute.requirements_for(&request.model_hash).await {
                 let prompt_tokens = prompt_token_estimate(&request.prompt);
@@ -1308,7 +1327,27 @@ impl DistributedInference {
                     );
                     break;
                 }
-                drop(last_error);
+                // At-most-once boundary (review finding): a fall-through to
+                // the legacy announcement router is a FINAL re-send. It is
+                // safe only when the last compute failure provably executed
+                // nothing (retryable transport / worker retryable refusal).
+                // Ambiguous outcomes — RequestTimeout (the worker MAY have
+                // generated while the response was lost), definitive
+                // rejections, no workers — must abort: re-sending would
+                // duplicate non-idempotent work and bypass is_retryable().
+                if let Some(err) = last_error {
+                    if !err.is_retryable() {
+                        tracing::warn!(
+                            error = %err,
+                            "compute path exhausted with ambiguous outcome; aborting (no legacy re-send)"
+                        );
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        error = %err,
+                        "compute path exhausted with retryable failure; final legacy fallback"
+                    );
+                }
             }
         }
 
@@ -2276,6 +2315,17 @@ mod tests {
         assert!(!DistributedError::NoWorkersAvailable("m".into()).is_retryable());
         assert!(!DistributedError::UntrustedWorker("w".into()).is_retryable());
         assert!(!DistributedError::AllWorkersFailed("w failed".into()).is_retryable());
+        // The worker's EXPLICIT retryable signal (InferFailed.retryable=true,
+        // refused before executing) is idempotency-safe to re-send.
+        assert!(DistributedError::WorkerRetryable("model not loaded yet".into()).is_retryable());
+    }
+
+    #[test]
+    fn worker_retryable_maps_to_stable_code() {
+        use decentraai_protocol::InferErrorCode as Code;
+        let e = DistributedError::WorkerRetryable("model not loaded yet".into());
+        assert_eq!(e.code(), Code::RetryableWorker);
+        assert_eq!(e.code().code(), "retryable_worker");
     }
 
     #[test]

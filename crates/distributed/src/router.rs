@@ -267,10 +267,20 @@ impl RequestRouter {
                 InferMessage::InferResponse(resp) => {
                     final_response = Some(resp);
                 }
-                InferMessage::InferFailed { error, .. } => {
+                InferMessage::InferFailed {
+                    error,
+                    retryable,
+                    ..
+                } => {
                     tracker.remove(&request.request_id).await;
                     self.decrement_pending().await;
                     self.increment_failed().await;
+                    // Honor the worker's explicit retryable signal: a refusal
+                    // BEFORE execution (e.g. model not loaded yet) is safe to
+                    // re-send; AllWorkersFailed (outcome unknown) is not.
+                    if retryable {
+                        return Err(DistributedError::WorkerRetryable(error));
+                    }
                     return Err(DistributedError::AllWorkersFailed(error));
                 }
                 _ => {}
@@ -294,10 +304,17 @@ impl RequestRouter {
                         InferMessage::InferResponse(resp) => {
                             final_response = Some(resp);
                         }
-                        InferMessage::InferFailed { error, .. } => {
+                        InferMessage::InferFailed {
+                            error,
+                            retryable,
+                            ..
+                        } => {
                             tracker.remove(&request.request_id).await;
                             self.decrement_pending().await;
                             self.increment_failed().await;
+                            if retryable {
+                                return Err(DistributedError::WorkerRetryable(error));
+                            }
                             return Err(DistributedError::AllWorkersFailed(error));
                         }
                         _ => {}
