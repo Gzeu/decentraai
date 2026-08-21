@@ -1,0 +1,10 @@
+[package]
+name = "decentraai-credit-economy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Experimental optional inference credit economy (research/inference-credit-economy). Not wired into production paths."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
