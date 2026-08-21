@@ -216,6 +216,19 @@ cleaner dial path for IPv6-capable peers. Rules:
 as the rendezvous: it is contacted, it does not need to cold-dial home NAT'd workers. Keep the
 P2P listener's messages bounded (existing size caps) — a public listener is a flood surface.
 
+**Fixed P2P port (critical deployment requirement):** the VPS must use a **fixed, stable P2P port**
+configured in the node's P2P listener address. A dynamic port (which libp2p chooses by default
+when no explicit port is given) causes the VPS to become unreachable after every restart — home
+workers' bootstrap addresses hard-code the old port and cannot discover the new one without
+manual reconfiguration. The P2P address in `bootstrap_peers` must remain valid across restarts.
+
+**Phase 4 deployment finding:** `private_swarm=true` does NOT block the P2P compute-advertisement
+path — a trusted WAN peer's `ComputeAdvertisement` is accepted by the coordinator's scheduler
+registry regardless of the `private_swarm` flag (the flag gates LAN discovery, not P2P message
+exchanges). The only gate for scheduler eligibility is `self.trusted.contains(&adv.peer_id)`.
+This means the VPS coordinator can accept advertisements from trusted remote workers without
+disabling `private_swarm`.
+
 ## 6b. Threat model and failure modes (concrete)
 
 Accepted threat model for the public node, beyond LAN:
