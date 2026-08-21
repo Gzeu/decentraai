@@ -4,22 +4,22 @@
 //! specifically for `research/inference-credit-economy`.
 //!
 //! Features:
-//! - Local `CredentialVault` manager with masked fingerprints (`sk-...4a9f`).
-//! - "Share Model" toggle & Smart Sharing Strategy configurator (Drain Burst, Balanced Drip, Free-Tier Only).
+//! - "I'm not working today, share my subscription capacity" one-click toggle.
+//! - Dynamic output-driven CU earning (get CU proportional to actual output generated).
+//! - Auto-handling of rolling hourly limits (Claude/ChatGPT) and daily reset (DeepSeek/Groq).
+//! - Zero-config auto-pause on 429 throttling.
 //! - Live CU balances (Available / Earned / Spent / Locked).
-//! - Provenance feed & verified compute receipt inspector.
-//! - Test Chat Gateway sandbox (OpenAI / OpenCode compatible).
 
 pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DecentraAI — Inference Credit Economy Dashboard</title>
+  <title>DecentraAI — Inference Credit Economy Console</title>
   <style>
     :root {
-      --bg: #0b0f19;
-      --card: #151c2e;
+      --bg: #090d16;
+      --card: #131a2b;
       --card-border: rgba(255, 255, 255, 0.08);
       --accent: #3b82f6;
       --accent-glow: rgba(59, 130, 246, 0.25);
@@ -57,6 +57,20 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       letter-spacing: 0.5px;
     }
     .brand-title { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+    
+    .hero-banner {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(139, 92, 246, 0.12));
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 14px;
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+    }
+    .hero-text h2 { font-size: 18px; font-weight: 800; color: #fff; margin-bottom: 4px; }
+    .hero-text p { font-size: 13px; color: var(--text-muted); }
+
     .kpi-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -100,44 +114,44 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     }
     .panel-title { font-size: 16px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
 
-    .provider-list { display: flex; flex-direction: column; gap: 12px; }
+    .provider-list { display: flex; flex-direction: column; gap: 14px; }
     .provider-card {
       background: rgba(255, 255, 255, 0.02);
       border: 1px solid var(--card-border);
       border-radius: 10px;
-      padding: 16px;
+      padding: 18px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
     }
-    .provider-info { display: flex; flex-direction: column; gap: 4px; }
+    .provider-info { display: flex; flex-direction: column; gap: 6px; }
     .provider-name { font-weight: 700; font-size: 15px; color: #fff; display: flex; align-items: center; gap: 8px; }
     .badge {
       font-size: 11px;
-      padding: 2px 8px;
+      padding: 3px 8px;
       border-radius: 6px;
       font-weight: 700;
       text-transform: uppercase;
     }
-    .badge-drain { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .badge-balanced { background: rgba(59, 130, 246, 0.15); color: var(--accent); border: 1px solid rgba(59, 130, 246, 0.3); }
-    .badge-free { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-active { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-throttled { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .badge-dayoff { background: rgba(139, 92, 246, 0.15); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.3); }
     .provider-meta { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
 
     .switch {
       position: relative;
       display: inline-block;
-      width: 44px;
-      height: 24px;
+      width: 46px;
+      height: 26px;
     }
     .switch input { opacity: 0; width: 0; height: 0; }
     .slider {
       position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-      background-color: #374151; transition: .2s; border-radius: 24px;
+      background-color: #374151; transition: .2s; border-radius: 26px;
     }
     .slider:before {
-      position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px;
+      position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px;
       background-color: white; transition: .2s; border-radius: 50%;
     }
     input:checked + .slider { background-color: var(--success); }
@@ -148,7 +162,7 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       color: white;
       border: none;
       border-radius: 8px;
-      padding: 8px 16px;
+      padding: 9px 16px;
       font-weight: 600;
       font-size: 13px;
       cursor: pointer;
@@ -161,11 +175,11 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     .btn-secondary { background: rgba(255, 255, 255, 0.08); color: var(--text); }
     .btn-secondary:hover { background: rgba(255, 255, 255, 0.12); }
 
-    .feed { display: flex; flex-direction: column; gap: 8px; max-height: 400px; overflow-y: auto; }
+    .feed { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow-y: auto; }
     .feed-item {
       background: rgba(255, 255, 255, 0.02);
       border-left: 3px solid var(--accent);
-      padding: 10px 14px;
+      padding: 12px 14px;
       border-radius: 4px 8px 8px 4px;
       font-size: 12px;
       display: flex;
@@ -179,58 +193,65 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <header>
       <div class="brand">
         <span class="brand-badge">RESEARCH TRACK</span>
-        <h1 class="brand-title">Inference Credit Economy — Operational Console</h1>
+        <h1 class="brand-title">DecentraAI · Inference Credit Economy</h1>
       </div>
       <div>
-        <button class="btn" onclick="openConnectModal()">+ Connect Provider API</button>
+        <button class="btn" onclick="openConnectModal()">+ Connect Subscription / API</button>
       </div>
     </header>
+
+    <div class="hero-banner">
+      <div class="hero-text">
+        <h2>🌴 Day-Off Mode & Output-Driven Settlement Active</h2>
+        <p>You don't need to calculate token limits. When you're not working, turn sharing ON: your node serves requests for others, and you earn durable CU proportional to the exact completion tokens generated. Auto-pauses on provider hourly rate limits.</p>
+      </div>
+      <button class="btn" style="background: #8b5cf6;" onclick="toggleAllDayOff()">Toggle All to Day-Off Mode</button>
+    </div>
 
     <div class="kpi-grid">
       <div class="kpi-card">
         <span class="kpi-label">Available Balance</span>
-        <span class="kpi-value" id="kpi-available">320,450 CU</span>
-        <span class="kpi-sub">Ready to spend on any network resource</span>
+        <span class="kpi-value" id="kpi-available">458,200 CU</span>
+        <span class="kpi-sub">Reusable on any AI model or remote GPU</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-label">Lifetime Earned</span>
-        <span class="kpi-value" style="color: var(--success)" id="kpi-earned">580,000 CU</span>
-        <span class="kpi-sub">From 24 verified contributions</span>
+        <span class="kpi-label">Output Tokens Generated</span>
+        <span class="kpi-value" style="color: var(--success)" id="kpi-output">312,400 tokens</span>
+        <span class="kpi-sub">Actual measured completions served</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-label">Active Sharing Rate</span>
-        <span class="kpi-value" style="color: var(--warning)" id="kpi-rate">12,400 CU/h</span>
-        <span class="kpi-sub">3 models actively offered to P2P</span>
+        <span class="kpi-label">Active Earning Velocity</span>
+        <span class="kpi-value" style="color: var(--warning)" id="kpi-rate">18,600 CU/h</span>
+        <span class="kpi-sub">3 models currently taking P2P tasks</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-label">Escrow / Locked</span>
-        <span class="kpi-value" style="color: #8b5cf6" id="kpi-locked">0 CU</span>
-        <span class="kpi-sub">Crypto-readiness clearinghouse</span>
+        <span class="kpi-label">Durable vs Quota Invariant</span>
+        <span class="kpi-value" style="color: #60a5fa">100% PERSISTENT</span>
+        <span class="kpi-sub">CU survive daily/monthly provider resets</span>
       </div>
     </div>
 
     <div class="main-grid">
       <div class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">Connected Providers & Smart Sharing Strategies</h2>
-          <span style="font-size: 12px; color: var(--text-muted)">Secrets stay local; raw keys never enter P2P</span>
+          <h2 class="panel-title">Your AI Subscriptions & Connected Models</h2>
+          <span style="font-size: 12px; color: var(--text-muted)">API keys stay local in CredentialVault</span>
         </div>
 
         <div class="provider-list" id="provider-list">
           <div class="provider-card">
             <div class="provider-info">
               <div class="provider-name">
-                OpenRouter · Claude 3.5 Sonnet
-                <span class="badge badge-drain">⚡ DRAIN BURST</span>
+                Anthropic · Claude 3.5 Sonnet (Pro / Team Sub)
+                <span class="badge badge-dayoff">🌴 DAY-OFF DRAIN</span>
               </div>
               <div class="provider-meta">
-                Key: sk-...4a9f · Quota remaining: 420,000 / 500,000 tokens · Resets in 6h 12m
+                Key: sk-...4a9f · Mode: Rolling 5-Hour limit · Served today: 142k tokens (+284k CU) · Auto-cooldown on 429
               </div>
             </div>
             <div style="display: flex; align-items: center; gap: 12px;">
-              <button class="btn btn-secondary" onclick="configureStrategy('openrouter-claude')">Strategy</button>
               <label class="switch">
-                <input type="checkbox" checked onchange="toggleShare('openrouter-claude', this.checked)">
+                <input type="checkbox" checked onchange="toggleModelShare('claude', this.checked)">
                 <span class="slider"></span>
               </label>
             </div>
@@ -239,17 +260,16 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <div class="provider-card">
             <div class="provider-info">
               <div class="provider-name">
-                DeepSeek · DeepSeek R1
-                <span class="badge badge-balanced">⚖ BALANCED 70%</span>
+                DeepSeek · DeepSeek R1 (Tier 1 API)
+                <span class="badge badge-active">⚡ ACTIVE SHARING</span>
               </div>
               <div class="provider-meta">
-                Key: sk-...991a · Quota remaining: 1,800,000 tokens · Reserve: 50,000 personal
+                Key: sk-...81f2 · Mode: Daily reset at 00:00 UTC · Served: 85k output tokens (+170k CU)
               </div>
             </div>
             <div style="display: flex; align-items: center; gap: 12px;">
-              <button class="btn btn-secondary" onclick="configureStrategy('deepseek-r1')">Strategy</button>
               <label class="switch">
-                <input type="checkbox" checked onchange="toggleShare('deepseek-r1', this.checked)">
+                <input type="checkbox" checked onchange="toggleModelShare('deepseek', this.checked)">
                 <span class="slider"></span>
               </label>
             </div>
@@ -258,17 +278,16 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <div class="provider-card">
             <div class="provider-info">
               <div class="provider-name">
-                Local GPU (vLLM) · Llama 3.3 70B (AWQ)
-                <span class="badge badge-free">🎮 ZERO API COST</span>
+                OpenRouter · Free Models Cascade (Llama 3.3 / Gemini Flash)
+                <span class="badge" style="background: rgba(16,185,129,0.15); color: var(--success)">🆓 100% FREE TIER</span>
               </div>
               <div class="provider-meta">
-                RTX 4090 24GB · Idle monetization active (00:00 - 08:00 UTC)
+                Zero $ cost · Auto-swaps between free models if throttled · Served: 34k tokens
               </div>
             </div>
             <div style="display: flex; align-items: center; gap: 12px;">
-              <button class="btn btn-secondary" onclick="configureStrategy('local-llama')">Strategy</button>
               <label class="switch">
-                <input type="checkbox" checked onchange="toggleShare('local-llama', this.checked)">
+                <input type="checkbox" checked onchange="toggleModelShare('openrouter-free', this.checked)">
                 <span class="slider"></span>
               </label>
             </div>
@@ -278,27 +297,27 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
       <div class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">Live Provenance & Receipt Audit</h2>
+          <h2 class="panel-title">Live Output Settlement & Receipts</h2>
         </div>
         <div class="feed" id="audit-feed">
           <div class="feed-item">
             <div>
-              <strong>+4,000 CU</strong> · Claude 3.5 Sonnet<br>
-              <span style="color: var(--text-muted); font-family: var(--font-mono)">P13 sig: 8a4f...91bc · Consumer: peer-7a1b</span>
+              <strong>+3,600 CU</strong> · Claude 3.5 Sonnet (1,800 out tokens)<br>
+              <span style="color: var(--text-muted); font-family: var(--font-mono)">P13 sig: ed25519:7a4f... · Consumer: peer-8b1c</span>
             </div>
-            <span style="color: var(--success); font-weight: 700;">SETTLED</span>
+            <span style="color: var(--success); font-weight: 700;">OUTPUT SETTLED</span>
           </div>
           <div class="feed-item">
             <div>
-              <strong>+12,500 CU</strong> · DeepSeek R1<br>
-              <span style="color: var(--text-muted); font-family: var(--font-mono)">P13 sig: 3b11...e420 · Consumer: peer-9f0c</span>
+              <strong>+8,400 CU</strong> · DeepSeek R1 (4,200 out tokens)<br>
+              <span style="color: var(--text-muted); font-family: var(--font-mono)">P13 sig: ed25519:1d9c... · Consumer: peer-3f90</span>
             </div>
-            <span style="color: var(--success); font-weight: 700;">SETTLED</span>
+            <span style="color: var(--success); font-weight: 700;">OUTPUT SETTLED</span>
           </div>
           <div class="feed-item" style="border-left-color: #8b5cf6;">
             <div>
-              <strong>-8,000 CU</strong> · Consumed Qwen-Max<br>
-              <span style="color: var(--text-muted); font-family: var(--font-mono)">Cross-resource execution on remote worker</span>
+              <strong>-5,000 CU</strong> · Spent on Remote GPU (Qwen 72B)<br>
+              <span style="color: var(--text-muted); font-family: var(--font-mono)">Cross-resource execution on remote node</span>
             </div>
             <span style="color: #8b5cf6; font-weight: 700;">CONSUMED</span>
           </div>
@@ -309,13 +328,13 @@ pub const DEDICATED_ECONOMY_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
   <script>
     function openConnectModal() {
-      alert("Connect Provider Wizard: supports OpenRouter, Anthropic, DeepSeek, OpenAI, Ollama, and local vLLM. Keys are stored strictly in local CredentialVault.");
+      alert("Connect Subscription: Choose Anthropic, OpenRouter, DeepSeek, OpenAI, Groq or Ollama. Keys are stored locally in CredentialVault.");
     }
-    function configureStrategy(modelId) {
-      alert("Strategy Configurator for " + modelId + ":\n- ⚡ Drain Until Renewal (burst before reset)\n- ⚖ Balanced Drip (metered share with personal reserve)\n- 🆓 Selective Free-Tier Only (zero cost)\n- 🎮 Idle GPU Monetization");
+    function toggleAllDayOff() {
+      alert("All connected subscription models set to Day-Off Mode: maximum sharing speed, auto-pause on 429.");
     }
-    function toggleShare(modelId, enabled) {
-      console.log("Toggled share for " + modelId + ": " + enabled);
+    function toggleModelShare(modelId, enabled) {
+      console.log("Model " + modelId + " share toggled: " + enabled);
     }
   </script>
 </body>

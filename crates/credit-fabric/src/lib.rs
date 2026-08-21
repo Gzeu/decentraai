@@ -1,5 +1,6 @@
 pub mod provider_bridge;
 pub mod strategies;
+pub mod subscription_capacity;
 pub mod ui;
 
 pub use provider_bridge::{
@@ -7,6 +8,9 @@ pub use provider_bridge::{
     ProviderKind, SharingCompliance,
 };
 pub use strategies::SmartSharingStrategy;
+pub use subscription_capacity::{
+    ModelLiveCapacityTracker, SubscriptionType, UserSharingIntent,
+};
 pub use ui::DEDICATED_ECONOMY_DASHBOARD_HTML;
 
 use decentraai_credit_economy::{
