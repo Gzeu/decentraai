@@ -1597,7 +1597,7 @@ const readSse = async (resp, prov) => {
   const reader = resp.body.getReader(), dec = new TextDecoder();
   let buffer = '', text = '', tokens = null, streamError = null;
   const msgNode = addMsg('node', '', prov);
-  const bodyEl = msgNode.querySelector(':scope > div:nth-child(2)');
+  const bodyEl = msgNode.lastElementChild;
   try {
     for (;;) {
       const { done, value } = await reader.read();
