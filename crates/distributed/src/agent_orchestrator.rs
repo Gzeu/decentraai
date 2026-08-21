@@ -22,9 +22,9 @@
 
 use anyhow::{Context, Result, bail};
 use decentraai_agents::{
-    AgentMessage, AgentTask, DelegationPlan, DelegationPlanner, DelegationStage, DelegationVerdict,
-    MessageKind, ReputationFactor, ReputationStore, ReputationUpdate, StageResult,
-    TaskVerification, WorkflowOutcome, match_agent_semantic,
+    AgentMessage, AgentRequirement, AgentTask, DelegationPlan, DelegationPlanner,
+    DelegationStage, DelegationVerdict, MessageKind, ReputationFactor, ReputationStore,
+    ReputationUpdate, StageResult, TaskVerification, WorkflowOutcome, match_agent_semantic,
 };
 use libp2p::PeerId;
 use serde_json::Value;
@@ -35,6 +35,14 @@ use std::time::{Duration, Instant};
 use crate::agent_memory::MemoryStore;
 use crate::agent_messenger::AgentMessenger;
 use crate::agents::{AgentManager, AgentView};
+
+/// Optional physical-execution gate for executor selection (review wiring).
+/// When set, `select_executor` requires BOTH the semantic match AND this gate
+/// (e.g. the unified `match_agent`: semantic + agent model allowlist + compute
+/// physical gate against the hosting node's advertisement). `None` keeps the
+/// legacy semantic-only selection (honest: physical gate unknown).
+pub type ExecutionGate =
+    dyn Fn(&AgentView, &AgentRequirement) -> bool + Send + Sync;
 
 /// A stage executor chosen by the orchestrator (agent id + hosting peer).
 #[derive(Debug, Clone)]
@@ -56,6 +64,9 @@ pub struct AgentOrchestrator {
     /// workflow outcomes are written into it (scope `workflow_results`),
     /// so completed work becomes collective knowledge the node can reuse.
     memory_store: Option<Arc<MemoryStore>>,
+    /// Optional physical-execution gate (unified matcher wiring). When set,
+    /// executor selection requires the semantic match AND this gate.
+    execution_gate: Option<Arc<ExecutionGate>>,
     /// Max time to wait for a delegated stage's Reply.
     delegate_timeout: Duration,
 }
@@ -74,8 +85,19 @@ impl AgentOrchestrator {
             local_peer,
             reputation: Arc::new(Mutex::new(ReputationStore::new())),
             memory_store: None,
+            execution_gate: None,
             delegate_timeout: Duration::from_secs(60),
         }
+    }
+
+    /// Attaches the physical-execution gate (unified matcher wiring). When
+    /// set, `select_executor` requires BOTH the semantic match AND this gate
+    /// to select an executor. The caller (node-cli) supplies a closure that
+    /// runs the full `match_agent` (semantic + model allowlist + compute
+    /// physical gate) against the hosting node's live advertisement.
+    pub fn with_execution_gate(&mut self, gate: Arc<ExecutionGate>) -> &mut Self {
+        self.execution_gate = Some(gate);
+        self
     }
 
     /// Attaches a shared reputation store so selection ranks real history.
@@ -123,6 +145,10 @@ impl AgentOrchestrator {
     /// with NO capability requirements (e.g. a synthesis stage) is eligible on
     /// any agent — the orchestrator never invents an executor, but it also
     /// does not block unconstrained stages on a capability match.
+    ///
+    /// When an execution gate is attached, candidates must ALSO pass it (the
+    /// unified matcher: semantic + agent model allowlist + compute physical
+    /// gate against the hosting node's advertisement) — review wiring.
     pub fn select_executor(&self, stage: &DelegationStage) -> Option<StageExecutor> {
         let reputation = self.reputation.lock().unwrap();
         let cap_label = stage
@@ -131,14 +157,26 @@ impl AgentOrchestrator {
             .first()
             .map(|r| r.capability.label().to_string())
             .unwrap_or_default();
+        // Build the unified requirement (semantic + optional physical
+        // workload) so the execution gate can run the full match_agent.
+        let requirement = AgentRequirement {
+            semantic: stage.task.required_capabilities.clone(),
+            workload: stage.task.required_workload.as_ref().map(|w| w.to_compute()),
+        };
         let mut candidates: Vec<(bool /*local*/, f32 /*score*/, String, PeerId)> = self
             .agents
             .view()
             .into_iter()
             .filter(|v| {
-                stage.task.required_capabilities.is_empty()
-                    || match_agent_semantic(&v.record, &stage.task.required_capabilities)
-                        .is_satisfied()
+                let semantic_ok = requirement.semantic.is_empty()
+                    || match_agent_semantic(&v.record, &requirement.semantic).is_satisfied();
+                if !semantic_ok {
+                    return false;
+                }
+                match &self.execution_gate {
+                    Some(gate) => gate(v, &requirement),
+                    None => true,
+                }
             })
             .map(|v| {
                 let local = !v.remote;
@@ -761,5 +799,71 @@ mod tests {
             ids.iter().collect::<std::collections::HashSet<_>>().len(),
             "entry ids must be unique within a run"
         );
+    }
+
+    #[test]
+    fn execution_gate_filters_physically_ineligible_local_agents() {
+        // Review wiring: with an execution gate attached, an agent that passes
+        // the SEMANTIC match but fails the PHYSICAL gate must NOT be selected.
+        // Without the gate (legacy), the same agent IS selected.
+        use decentraai_agents::{AgentRecord, ROLE_SPECIALIST};
+        use decentraai_agents::task::AgentWorkloadRequirement;
+        use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
+        use decentraai_hub::requirements::{CapabilityRequirement, EvidenceLevel};
+
+        let local = PeerId::random();
+        let manager = Arc::new(AgentManager::new(local, "node".into()));
+        let mut record = AgentRecord::new("a:1", "ocr-agent", ROLE_SPECIALIST);
+        record.semantic_capabilities = vec![CapabilityClaim {
+            capability: CapabilityKind::Ocr,
+            provenance: Provenance::Verified,
+        }];
+        manager.register_local(record);
+
+        let messenger = Arc::new(AgentMessenger::uninitialized());
+        let mut orch = AgentOrchestrator::new(messenger, manager, local);
+
+        let stage = DelegationStage::new(
+            "s1",
+            AgentTask {
+                task_id: "t1".into(),
+                parent_id: None,
+                required_capabilities: vec![CapabilityRequirement {
+                    capability: CapabilityKind::Ocr,
+                    evidence: EvidenceLevel::Verified,
+                }],
+                required_workload: Some(AgentWorkloadRequirement {
+                    model_hash: "big.gguf".into(),
+                    est_ram_mb: 100_000,
+                    est_vram_mb: 0,
+                    max_tokens: 10,
+                    stream: false,
+                    priority: 128,
+                    required_capability: None,
+                }),
+                input_schema: None,
+                output_schema: None,
+                budget_max_tokens: 0,
+                verification: TaskVerification::None,
+                priority: 128,
+            },
+        );
+
+        // Legacy behavior: semantic-only selection picks the agent.
+        assert!(
+            orch.select_executor(&stage).is_some(),
+            "semantic-only selection must pick the capable agent"
+        );
+
+        // With a rejecting execution gate: no executor (physical gate wins).
+        orch.with_execution_gate(Arc::new(|_v, _r| false));
+        assert!(
+            orch.select_executor(&stage).is_none(),
+            "the execution gate must filter a physically ineligible agent"
+        );
+
+        // A permissive gate keeps the agent (gate is an AND, not a replacement).
+        orch.with_execution_gate(Arc::new(|_v, _r| true));
+        assert!(orch.select_executor(&stage).is_some());
     }
 }

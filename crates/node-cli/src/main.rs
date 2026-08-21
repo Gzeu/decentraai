@@ -1931,6 +1931,49 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     if let Some(store) = &agent_memory_store {
         agent_orchestrator.with_memory_store(store.clone());
     }
+    // Review wiring: executor selection now applies the UNIFIED matcher
+    // (semantic + agent model allowlist + compute physical gate) for LOCAL
+    // agents, where the node's real advertisement is available synchronously.
+    // Remote agents keep the semantic match (their physical gate is UNKNOWN
+    // without a sync advertisement handle — honest, never a fabricated block).
+    {
+        let gate_compute = compute_manager.clone();
+        let gate_peer = local_peer_id;
+        let gate: Arc<decentraai_distributed::agent_orchestrator::ExecutionGate> = Arc::new(
+            move |view: &decentraai_distributed::agents::AgentView,
+                  req: &decentraai_agents::AgentRequirement| {
+                if view.remote {
+                    // Physical gate unknown for remote agents: the semantic
+                    // gate already passed; do not block on UNKNOWN.
+                    return true;
+                }
+                let Some(adv) = gate_compute.last_local_advertisement_sync() else {
+                    return true; // no advertisement yet — UNKNOWN, not a block
+                };
+                let matcher = decentraai_compute::CapabilityMatcher::default();
+                // A fresh reservation ledger for the gate: the capability
+                // check reads headroom; the real scheduler books reservations
+                // at execution time.
+                let ledger = decentraai_compute::ReservationLedger::new(
+                    std::time::Duration::from_secs(60),
+                    4,
+                );
+                matches!(
+                    decentraai_agents::match_agent(
+                        &view.record,
+                        &adv,
+                        req,
+                        &matcher,
+                        &ledger,
+                        true,
+                        Some(&gate_peer),
+                    ),
+                    decentraai_agents::AgentMatchOutcome::Eligible
+                )
+            },
+        );
+        agent_orchestrator.with_execution_gate(gate);
+    }
     // Larger models (e.g. 7B on CPU) generate slower than the 60s default; a
     // per-stage reply can take minutes. Keep the timeout generous so a real
     // collective workflow completes instead of timing out mid-stage.
