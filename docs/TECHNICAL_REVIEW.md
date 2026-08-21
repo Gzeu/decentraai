@@ -229,7 +229,7 @@ se pierde la restart.
 | `hub` download (cel mai sensibil I/O) fără teste I/O reale | Medie | ⏳ OPEN — ROADMAP §132.4 |
 | **Injecție de modele neautentificate** (semnătură de manifest neverificată + `ShareMode::Auto` fără trust) | **Critică** | ✅ FIXED `79d9156` — `ManifestAnnouncement` poartă `signer_public_key`; swarm-ul verifică anti-spoof (pk → peer conectat) + Ed25519 peste manifest; forjat e drop-uit înainte de consumatori; `require_signed_announcements` (era dead config) e acum aplicat în `run_share_worker` (`ShareMode::Auto` descarcă doar semnate când e setat); test unit + E2E forged-drop |
 | Carantină → bitmap stale → artefact permanent nedescărcabil; carantină și pe erori de rețea | **Critică** | ✅ FIXED `b0b386e` — `quarantine_staging` mută acum și `.done` (bitmap-ul), deci retry-ul pornește curat; carantina se declanșează doar pe eșec crypto, nu pe erori de rețea; 2 teste de regresie |
-| Codec 96 MiB per frame inbound înainte de cap-ul de 1 MiB (DoS) | Înaltă | ⏳ OPEN |
+| Codec 96 MiB per frame inbound înainte de cap-ul de 1 MiB (DoS) | Înaltă | ✅ FIXED `b70971d` — codec direcțional: `max_request_bytes` = cap control (1 MiB), `max_response_bytes` = cap chunk; un frame de 90 MiB ca REQUEST e respins la codec înainte de alocare; test `codec_request_cap_is_control_sized_response_cap_is_chunk_sized` |
 | Matcher-ul unificat (`match_agent`) ne-wired în delegare | Înaltă | ⏳ OPEN |
 | PolicyEngine (P7) zero apelanți | Înaltă | ⏳ OPEN |
 | Trei selectori + fallback legacy care ocolește `is_retryable()` + `SessionAccount` fără TTL | Înaltă | ⏳ OPEN |
