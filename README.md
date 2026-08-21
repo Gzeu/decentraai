@@ -544,6 +544,7 @@ nohup ./target/release/decentraai node start >> /tmp/decentraai.log 2>&1 &
 - [`docs/DISTRIBUTED_INFERENCE.md`](docs/DISTRIBUTED_INFERENCE.md) — P2P execution details
 - [`docs/DECENTRAAI_PRODUCT_STATUS.md`](docs/DECENTRAAI_PRODUCT_STATUS.md) — Current product status
 - [`docs/MONITORING_ARCHITECTURE.md`](docs/MONITORING_ARCHITECTURE.md) — Observability design
+- [`docs/TECHNICAL_REVIEW.md`](docs/TECHNICAL_REVIEW.md) — Full architecture review + fix-status tracker (raw agent reports in `docs/review/`)
 
 ---
 
