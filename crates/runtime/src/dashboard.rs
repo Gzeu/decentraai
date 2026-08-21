@@ -372,11 +372,11 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 <div id="login-overlay">
   <div id="login-box">
     <h1>DecentraAI</h1>
-    <p>Enter your API key or master token to access the dashboard</p>
-    <input type="password" id="login-token" placeholder="dca_... or master token" autocomplete="off">
+    <p>Enter your master token or API key</p>
+    <input type="password" id="login-token" placeholder="master token or dca_..." autocomplete="off">
     <button onclick="doLogin()">Unlock dashboard</button>
     <div class="login-error" id="login-error">Invalid token — try again</div>
-    <div class="login-hint">Need a key? Contact your node operator.</div>
+    <div class="login-hint">💡 <b>Master token</b> gives full access to all views.<br>🔑 <b>dca_ key</b> only allows Chat (no admin/monitoring).</div>
   </div>
 </div>
 <div class="layout">
@@ -1478,20 +1478,27 @@ function toast(msg, bad=false){ const t=document.createElement('div'); t.classNa
 
 // ---- auth ------------------------------------------------------------------
 let token = '';
+let isMaster = false;
+
 const storedToken = localStorage.getItem('dai_token');
 if (storedToken) {
   token = storedToken;
+  isMaster = !token.startsWith('dca_');
   $('login-overlay').classList.add('hidden');
 }
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
-const isAdmin = !!token;
+const isAdmin = isMaster;
+
+// If logged in with a consumer key (not master), only the Chat view works.
+// Show a notice and restrict navigation to chat + a read-only overview.
+const isConsumerOnly = !!token && !isMaster;
 
 // ---- login overlay ----
 function doLogin(){
   const input = $('login-token');
   const err = $('login-error');
   const val = input.value.trim();
-  if (!val) { err.style.display = 'block'; return; }
+  if (!val) { err.style.display = 'block'; err.textContent = 'Enter a token first'; return; }
   localStorage.setItem('dai_token', val);
   location.reload();
 }
@@ -1507,6 +1514,8 @@ const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skil
 const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', devices:'Devices', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
+  // Consumer keys can only access Chat
+  if (isConsumerOnly && view !== 'chat') { show('chat'); return; }
   current = view;
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
   document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === view));
@@ -4971,6 +4980,12 @@ async function refresh(){
     renderDiag(s, null, null);
     renderObservability(s, null);
     renderRecovery(s, null, null);
+  }
+  if (isConsumerOnly) {
+    // Consumer keys can only access the Chat view
+    show('chat');
+    $('overview').innerHTML = '<div class="card"><h2>Consumer key mode</h2><p style="color:var(--faint);line-height:1.8">Your <code>dca_…</code> key is valid for inference via the API.<br><br>To access the full dashboard (workers, network, monitoring, admin):<br>• Use the <b>master token</b> from the node operator.<br><br>👉 <a href="/v1/chat/completions" target="_blank">Try the API</a> · <a href="/v1/models" target="_blank">View models</a></p></div>';
+    return;
   }
   try { const p = await (await fetch('/v1/peers', { headers })).json(); renderPeers(p); } catch (e) {}
   try { const ag = await (await fetch('/v1/agents', { headers })).json(); renderAgents(ag); } catch (e) {}
