@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Status: Production](https://img.shields.io/badge/status-production-green)](CHANGELOG.md)
-[![Tests: 958+](https://img.shields.io/badge/tests-958+-success)](#quality-gates)
+[![Tests: 1190](https://img.shields.io/badge/tests-1190-success)](#quality-gates)
 [![LAN Verified](https://img.shields.io/badge/verified-LAN__desktop__↔__laptop-brightgreen)](#verified-today)
 
 > **DecentraAI is a distributed execution fabric** — not a marketplace, cloud platform, token economy, or centralized server. Trusted peers on a LAN discover each other, exchange cryptographically verified model artifacts, and serve real-time inference through a unified node that combines P2P networking, semantic retrieval, collective intelligence, and a live web dashboard.

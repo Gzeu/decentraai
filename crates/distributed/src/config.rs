@@ -82,6 +82,42 @@ impl InferenceConfig {
         Self::default()
     }
 
+    /// Builds the distributed-inference tuning from the operator's validated
+    /// YAML (`InferenceSection`). Every knob is optional in YAML; `None`
+    /// keeps the [`Default`] value, so existing configs are byte-for-byte
+    /// unchanged. This closes the dead-config gap: previously the runtime
+    /// always built `InferenceConfig::default()` and no distributed knob was
+    /// operator-settable (max_retries was hard-coded at 3).
+    pub fn from_section(section: &decentraai_config::InferenceSection) -> Self {
+        let base = Self::default();
+        Self {
+            announcement_interval_ms: section
+                .announcement_interval_ms
+                .unwrap_or(base.announcement_interval_ms),
+            discovery_interval_ms: section
+                .discovery_interval_ms
+                .unwrap_or(base.discovery_interval_ms),
+            stale_worker_timeout_ms: section
+                .stale_worker_timeout_ms
+                .unwrap_or(base.stale_worker_timeout_ms),
+            max_retries: section.max_retries.unwrap_or(base.max_retries),
+            retry_backoff_ms: section
+                .retry_backoff_ms
+                .unwrap_or(base.retry_backoff_ms),
+            request_timeout_ms: u64::from(section.request_timeout_seconds)
+                .saturating_mul(1000)
+                .max(1),
+            max_queue_depth: section.max_queue_depth.unwrap_or(base.max_queue_depth),
+            min_available_capacity: section
+                .min_available_capacity
+                .unwrap_or(base.min_available_capacity),
+            enable_load_balancing: base.enable_load_balancing,
+            use_reputation: base.use_reputation,
+            base_reputation_reward: base.base_reputation_reward,
+            base_reputation_penalty: base.base_reputation_penalty,
+        }
+    }
+
     /// Sets the announcement interval
     pub fn with_announcement_interval(mut self, interval_ms: u64) -> Self {
         self.announcement_interval_ms = interval_ms;
@@ -268,6 +304,56 @@ mod tests {
         assert_eq!(config.max_queue_depth, 10);
         assert!((config.min_available_capacity - 0.1).abs() < f32::EPSILON);
         assert!(config.enable_load_balancing);
+    }
+
+    #[test]
+    fn from_section_respects_operator_yaml_and_defaults() {
+        // Consolidation regression: the distributed-fabric knobs must come
+        // from the operator's validated YAML, not hard-coded defaults.
+        // `None` YAML values keep the defaults (existing configs unchanged).
+        let mut section = decentraai_config::InferenceSection {
+            enabled: decentraai_config::InferenceMode::Auto,
+            runtime: decentraai_config::InferenceRuntime::LlamaServer,
+            bind_address: "127.0.0.1".to_string(),
+            api_auth_required: true,
+            allow_remote_inference: true,
+            max_concurrent_requests: 1,
+            max_context_tokens: 4096,
+            max_generated_tokens: 1024,
+            request_timeout_seconds: 180,
+            queue_max_requests: 20,
+            idle_model_unload_minutes: 15,
+            api_port: 8080,
+            generation: Default::default(),
+            engine: None,
+            backend_url: None,
+            embeddings_backend_url: None,
+            max_retries: Some(7),
+            retry_backoff_ms: Some(250),
+            announcement_interval_ms: Some(2_000),
+            discovery_interval_ms: None,
+            stale_worker_timeout_ms: None,
+            max_queue_depth: None,
+            min_available_capacity: None,
+        };
+        let cfg = InferenceConfig::from_section(&section);
+        assert_eq!(cfg.max_retries, 7, "operator max_retries must win");
+        assert_eq!(cfg.retry_backoff_ms, 250);
+        assert_eq!(cfg.announcement_interval_ms, 2_000);
+        assert_eq!(cfg.request_timeout_ms, 180_000, "YAML seconds -> ms");
+        // Unset knobs keep defaults (no silent behavior change).
+        assert_eq!(cfg.discovery_interval_ms, 5_000);
+        assert_eq!(cfg.max_queue_depth, 10);
+
+        // A section with no distributed knobs is byte-for-byte the default.
+        section.max_retries = None;
+        section.retry_backoff_ms = None;
+        section.announcement_interval_ms = None;
+        let cfg = InferenceConfig::from_section(&section);
+        let base = InferenceConfig::default();
+        assert_eq!(cfg.max_retries, base.max_retries);
+        assert_eq!(cfg.retry_backoff_ms, base.retry_backoff_ms);
+        assert_eq!(cfg.announcement_interval_ms, base.announcement_interval_ms);
     }
 
     #[test]

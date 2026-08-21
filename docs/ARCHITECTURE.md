@@ -50,20 +50,32 @@ DISCOVERED → MANIFEST_PENDING → MANIFEST_VERIFIED → DOWNLOADING
 
 Terminal or exceptional states: `QUARANTINED`, `CORRUPTED`, `EVICTED`.
 
-### Initial module boundaries
+### Actual module boundaries (workspace crates)
 ```text
-crates/config             configuration and schema validation
+crates/config             typed YAML config with strict validation
 crates/identity           Ed25519 keys and peer identity
 crates/system-probe       CPU, RAM, GPU, VRAM, disk, network probing
-crates/policy-engine      profile calculation and resource governor
+crates/compute            pure compute-sharing domain (capability, scheduler,
+                          reservations, contribution, credits, placement, graphs)
 crates/protocol           message schemas, versioning, validation
 crates/p2p                libp2p, mDNS, private bootstrap, transport
 crates/manifest           canonical manifest, signature, Merkle verification
-crates/chunk-store        staging, verified cache, quarantine, atomic writes
-crates/transfer-engine    scheduling, resume, retries, peer selection
-crates/registry           local model and transfer state
-crates/inference-runtime  runtime supervisor and llama-server adapter
-crates/inference-router   request queue, streaming, auth, cancellation
-crates/reputation         local observations and temporary bans
-crates/api                localhost HTTP/WebSocket API
+crates/registry           local model registry with path safety
+crates/fabric             pure execution planner (network graph, KV, expert routing)
+crates/distributed        compute manager, router, worker, agents, knowledge
+crates/runtime            llama-server process manager, API, dashboard, tools, TTS
+crates/agents             pure collective-intelligence fabric (agents, memory,
+                          verification, policy, knowledge, evidence, benchmark)
+crates/hub                HuggingFace Hub catalog + verified download
+crates/inference-adapter  engine HTTP client adapter
+crates/providers          external OpenAI-compatible provider plane
+crates/tokens             subscription tokens + tiers
+crates/audit              append-only security log
+crates/discovery          pairing codes
+crates/node-cli           the `decentraai` / `decentraai-worker` binaries
 ```
+
+> Note: earlier drafts named crates `policy-engine`, `chunk-store`,
+> `transfer-engine`, `inference-runtime`, `inference-router`, `reputation`,
+> and `api`. Those responsibilities live inside the crates above — no such
+> standalone crates exist in this workspace.

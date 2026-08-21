@@ -1,19 +1,19 @@
 [package]
 name = "decentraai-inference-adapter"
 version.workspace = true
-edition = "2021"
-license = "MIT"
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 async-stream = "0.3"
-async-trait = "0.1"
+async-trait.workspace = true
 bytes = "1"
 futures-util = "0.3"
 reqwest.workspace = true
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "1"
-tokio = { version = "1", features = ["time"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 httpmock = "0.7"

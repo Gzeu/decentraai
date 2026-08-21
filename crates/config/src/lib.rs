@@ -236,6 +236,32 @@ pub struct InferenceSection {
     /// set, the node exposes `/v1/embeddings` for the RAG retrieval path.
     #[serde(default)]
     pub embeddings_backend_url: Option<String>,
+    /// Distributed-fabric tuning (P14 consolidation). Each knob is OPTIONAL:
+    /// `None` falls back to `decentraai_distributed::InferenceConfig::default`
+    /// (the previous hard-coded behavior), so existing configs are unchanged.
+    /// These were previously dead — the runtime always built
+    /// `InferenceConfig::default()` regardless of the operator YAML.
+    /// Maximum retry attempts for a routed request.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Backoff (ms) between retry attempts.
+    #[serde(default)]
+    pub retry_backoff_ms: Option<u64>,
+    /// Worker announcement broadcast interval (ms).
+    #[serde(default)]
+    pub announcement_interval_ms: Option<u64>,
+    /// Stale-worker check interval (ms).
+    #[serde(default)]
+    pub discovery_interval_ms: Option<u64>,
+    /// Heartbeat gap after which a worker is stale/offline (ms).
+    #[serde(default)]
+    pub stale_worker_timeout_ms: Option<u64>,
+    /// Max queue depth per worker before it is considered overloaded.
+    #[serde(default)]
+    pub max_queue_depth: Option<u32>,
+    /// Min available capacity (0..1) for a worker to be eligible.
+    #[serde(default)]
+    pub min_available_capacity: Option<f32>,
 }
 
 /// Generation defaults injected into inference requests that do not

@@ -1166,7 +1166,6 @@ dependencies = [
 name = "decentraai-fabric"
 version = "1.0.0"
 dependencies = [
- "anyhow",
  "decentraai-compute",
  "serde",
  "serde_json",
@@ -1214,7 +1213,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -1304,7 +1303,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
- "tokio",
 ]
 
 [[package]]

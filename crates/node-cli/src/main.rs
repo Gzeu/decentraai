@@ -1623,7 +1623,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
 
     let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
         local_peer_id,
-        InferenceConfig::default(),
+        InferenceConfig::from_section(&config.inference),
     ));
     let mut compute_manager = Arc::new(decentraai_distributed::ComputeManager::new(
         local_peer_id,
@@ -1749,7 +1749,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
 
     let mut distributed = DistributedInference::new(
         p2p_node,
-        InferenceConfig::default(),
+        InferenceConfig::from_section(&config.inference),
         Some(worker_manager.clone()),
         Some(tracker.clone()),
     )?;
@@ -5890,7 +5890,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // Create worker manager with the libp2p peer_id
     let worker_manager = Arc::new(decentraai_distributed::WorkerManager::new(
         local_peer_id,
-        decentraai_distributed::InferenceConfig::default(),
+        decentraai_distributed::InferenceConfig::from_section(&config.inference),
     ));
 
     // Compute sharing (M11–M13): the coordinator trusts peers it has paired
@@ -6003,7 +6003,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
 
     // Create distributed inference coordinator with the shared worker manager
-    let distributed_config = InferenceConfig::default();
+    let distributed_config = InferenceConfig::from_section(&config.inference);
     let mut distributed = DistributedInference::new(
         p2p_node,
         distributed_config,

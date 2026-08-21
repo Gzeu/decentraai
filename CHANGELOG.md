@@ -1,10 +1,7 @@
-# Changelog
+## [Unreleased] — P14/V2: verified compute fabric (consolidation)
 
-All notable changes to DecentraAI. Adheres loosely to
-[Keep a Changelog](https://keepachangelog.com/). The workspace ships as a
-single version (`1.0.0`) shared by every crate.
+### Multi-node fabric identity
 
-## [Unreleased] — Multi-node fabric identity
 
 ### Custom node names + compact node IDs (fabric identity)
 - **The node's identity IS its ID**: a fresh node's default name is its own
@@ -25,7 +22,8 @@ single version (`1.0.0`) shared by every crate.
   deterministic `short_node_id` (`dca-xxxxxx`, stable per key, well spread
   across distinct peers), new dashboard needles for `node_id`/`nodeIdOf`.
 
-## [Unreleased] — Multi-node fabric identity
+### Multi-node fabric identity
+
 
 ### Multi-node fabric experience (real Desktop ↔ Laptop identity)
 - **`allow_remote_inference` is now real, not dead config**: the setting is
@@ -62,7 +60,8 @@ single version (`1.0.0`) shared by every crate.
   `/v1/network`; the page still never mutates state except on explicit
   intent.
 
-## [Unreleased] — Living Fabric UI
+### Living Fabric UI
+
 
 ### Living Fabric (Overview redesign, "DecentraAI = a living distributed AI fabric")
 - The Overview is no longer primarily a grid of statistics: the primary
@@ -95,7 +94,8 @@ single version (`1.0.0`) shared by every crate.
   endpoints; a chat POST or admin action happens exclusively on explicit
   user intent.
 
-## [Unreleased] — Command Deck UI
+### Command Deck UI
+
 
 ### Command Deck (embedded control plane, rewritten)
 - The embedded dashboard is rewritten as a full **Command Deck** in a new
@@ -135,7 +135,8 @@ single version (`1.0.0`) shared by every crate.
   called `evaluate` with five arguments after the planner parameter was
   added; now passes `&ExecutionPlanner::default()`.
 
-## [Unreleased] — M23 Increment B (decision core into the live fabric)
+### M23 Increment B (decision core into the live fabric)
+
 
 ### M23 Full Autonomy, Increment B (live decision + lifecycle observability)
 - `decentraai-fabric::decision` is now wired into the actual coordinator path,
@@ -161,6 +162,7 @@ single version (`1.0.0`) shared by every crate.
   proactive rebalancing (true M23 Full Autonomy) remain not-claimed.
 - Full honest status (what is operational vs foundation): see
   [`docs/autonomous-execution.md`](docs/autonomous-execution.md).
+
 
 ## [1.0.0] - Initial production release
 

@@ -16,7 +16,6 @@ sha2.workspace = true
 reqwest.workspace = true
 http = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["time"] }
 chrono = { workspace = true }
 futures-util = "0.3"
 

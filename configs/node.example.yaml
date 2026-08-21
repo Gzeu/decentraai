@@ -54,6 +54,17 @@ inference:
   queue_max_requests: 20
   idle_model_unload_minutes: 15
   api_port: 8080
+  # Distributed-fabric tuning (all OPTIONAL; unset = built-in defaults, so
+  # existing configs are unchanged). These wire into the distributed router:
+  #   max_retries              retry attempts for a routed request (default 3)
+  #   retry_backoff_ms         backoff between retries (default 1000)
+  #   announcement_interval_ms worker advertisement interval (default 10000)
+  #   discovery_interval_ms    stale-worker check interval (default 5000)
+  #   stale_worker_timeout_ms  heartbeat gap before offline (default 30000)
+  #   max_queue_depth          per-worker queue before overloaded (default 10)
+  #   min_available_capacity   min 0..1 capacity for eligibility (default 0.1)
+  max_retries: 3
+  retry_backoff_ms: 1000
   # M22 (multi-engine, opt-in and best-effort — NOT production-verified).
   # `engine` is the engine-kind string advertised for this node's workers;
   # wire values: llama-server, vllm, sglang, ollama, openai-compatible.

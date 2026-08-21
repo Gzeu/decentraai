@@ -119,7 +119,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Test suite baseline: 106+ tests, all green. E2E tests in
+Test suite baseline: 1190 workspace tests, all green (this number drifts; the gate is `cargo test --workspace` + clippy `-D warnings`). E2E tests in
 `crates/p2p/tests/e2e_transfer.rs` spin up real libp2p nodes on
 loopback — keep them fast (<20s total) and deterministic (retry loops
 only for connection settling, never for logic).

@@ -1,16 +1,457 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "DecentraAI Node Configuration",
+  "description": "Validated operator YAML for a DecentraAI node (crates/config). Mirrors the Rust NodeConfig structs; unknown fields are rejected by serde(deny_unknown_fields), and this schema documents the real shape instead of the previous empty stub.",
   "type": "object",
-  "required": ["node", "network", "storage", "resources", "inference", "privacy", "security"],
+  "required": [
+    "node",
+    "network",
+    "storage",
+    "resources",
+    "inference",
+    "privacy",
+    "security"
+  ],
   "additionalProperties": false,
   "properties": {
-    "node": {"type": "object"},
-    "network": {"type": "object"},
-    "storage": {"type": "object"},
-    "resources": {"type": "object"},
-    "inference": {"type": "object"},
-    "privacy": {"type": "object"},
-    "security": {"type": "object"}
+    "node": {
+      "type": "object",
+      "required": [
+        "name",
+        "mode",
+        "data_dir"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "conservative",
+            "balanced",
+            "contributor",
+            "dedicated"
+          ]
+        },
+        "data_dir": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "dashboard": {
+          "enum": [
+            "v1",
+            "v2"
+          ]
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "private_swarm",
+        "lan_discovery",
+        "dht_enabled",
+        "relay_enabled",
+        "bootstrap_peers",
+        "max_connections",
+        "max_message_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "private_swarm": {
+          "type": "boolean"
+        },
+        "lan_discovery": {
+          "type": "boolean"
+        },
+        "dht_enabled": {
+          "type": "boolean"
+        },
+        "relay_enabled": {
+          "type": "boolean"
+        },
+        "bootstrap_peers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_message_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "chunk_size_mb",
+        "hash_algorithm",
+        "max_cache_gb",
+        "min_free_disk_gb",
+        "verify_full_file_after_assembly",
+        "allow_unsigned_models",
+        "auto_seed_verified_models"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "chunk_size_mb": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hash_algorithm": {
+          "type": "string",
+          "enum": [
+            "blake3"
+          ]
+        },
+        "max_cache_gb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_free_disk_gb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verify_full_file_after_assembly": {
+          "type": "boolean"
+        },
+        "allow_unsigned_models": {
+          "type": "boolean"
+        },
+        "auto_seed_verified_models": {
+          "type": "boolean"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "required": [
+        "cpu_max_percent",
+        "reserve_cpu_cores",
+        "memory_max_percent",
+        "reserve_ram_mb",
+        "gpu_enabled",
+        "gpu_max_vram_percent",
+        "reserve_vram_mb",
+        "stop_gpu_temperature_celsius",
+        "max_upload_mbps",
+        "max_download_mbps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cpu_max_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "reserve_cpu_cores": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_max_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "reserve_ram_mb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gpu_enabled": {
+          "enum": [
+            "auto",
+            "required",
+            "off"
+          ]
+        },
+        "gpu_max_vram_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "reserve_vram_mb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stop_gpu_temperature_celsius": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_upload_mbps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_download_mbps": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "inference": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "runtime",
+        "bind_address",
+        "api_auth_required",
+        "allow_remote_inference",
+        "max_concurrent_requests",
+        "max_context_tokens",
+        "max_generated_tokens",
+        "request_timeout_seconds",
+        "queue_max_requests",
+        "idle_model_unload_minutes",
+        "api_port"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ]
+        },
+        "runtime": {
+          "enum": [
+            "llama_server",
+            "vllm",
+            "sglang",
+            "ollama",
+            "remote_open_ai"
+          ]
+        },
+        "bind_address": {
+          "type": "string"
+        },
+        "api_auth_required": {
+          "type": "boolean"
+        },
+        "allow_remote_inference": {
+          "type": "boolean"
+        },
+        "max_concurrent_requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_generated_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "request_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "queue_max_requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "idle_model_unload_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "api_port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "engine": {
+          "type": "string"
+        },
+        "backend_url": {
+          "type": "string"
+        },
+        "embeddings_backend_url": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "temperature": {
+              "type": "number"
+            },
+            "top_p": {
+              "type": "number"
+            },
+            "top_k": {
+              "type": "integer"
+            },
+            "repeat_penalty": {
+              "type": "number"
+            },
+            "system_prompt": {
+              "type": "string"
+            }
+          }
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retry_backoff_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "announcement_interval_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "discovery_interval_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stale_worker_timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_queue_depth": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_available_capacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "required": [
+        "log_prompts",
+        "log_outputs",
+        "publish_exact_hardware",
+        "telemetry_opt_in"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "log_prompts": {
+          "type": "boolean"
+        },
+        "log_outputs": {
+          "type": "boolean"
+        },
+        "publish_exact_hardware": {
+          "type": "boolean"
+        },
+        "telemetry_opt_in": {
+          "type": "boolean"
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "required": [
+        "trust_mode",
+        "require_signed_announcements",
+        "require_request_signatures",
+        "ban_duration_minutes",
+        "max_invalid_chunks_per_peer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "trust_mode": {
+          "enum": [
+            "private",
+            "open"
+          ]
+        },
+        "require_signed_announcements": {
+          "type": "boolean"
+        },
+        "require_request_signatures": {
+          "type": "boolean"
+        },
+        "ban_duration_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_invalid_chunks_per_peer": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "sharing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "auto",
+            "ask",
+            "off"
+          ]
+        },
+        "max_concurrent_downloads": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provision_models_on_demand": {
+          "type": "boolean"
+        }
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tier1": {
+          "$ref": "#/$defs/tierPolicy"
+        },
+        "tier2": {
+          "$ref": "#/$defs/tierPolicy"
+        },
+        "tier3": {
+          "$ref": "#/$defs/tierPolicy"
+        }
+      }
+    },
+    "tts": {
+      "type": "object"
+    },
+    "ocr": {
+      "type": "object"
+    },
+    "stt": {
+      "type": "object"
+    },
+    "skills": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "tierPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rate_limit_per_minute": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "rate_limit_per_minute"
+      ]
+    }
   }
 }

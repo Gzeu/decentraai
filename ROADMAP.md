@@ -3336,3 +3336,61 @@ the queryable evidence chain (P14 Phase J/Q/P).
 
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [x] `cargo test --workspace` green (47 suites).
+
+## 132. Consolidation — config unification, real schema, repo hygiene (DONE)
+
+Independent architecture review (DeepSeek V4 Flash) confirmed the decision
+core and honesty discipline, and flagged the next level as **consolidation,
+not new features**. This section closes the concrete gaps.
+
+### 132.1 Distributed config is now operator-settable (dead config killed)
+
+- [x] `InferenceSection` gains optional `max_retries`, `retry_backoff_ms`,
+  `announcement_interval_ms`, `discovery_interval_ms`,
+  `stale_worker_timeout_ms`, `max_queue_depth`, `min_available_capacity` —
+  all `#[serde(default)]` (None = built-in default; existing configs
+  unchanged).
+- [x] `InferenceConfig::from_section()` maps YAML → distributed config
+  (request_timeout_seconds → ms). All four construction sites in node-cli
+  now call it instead of `InferenceConfig::default()` — `max_retries` is no
+  longer hard-coded at 3.
+- [x] `node.example.yaml` documents the new knobs.
+- [x] Test: `from_section_respects_operator_yaml_and_defaults`.
+
+### 132.2 Real config schema
+
+- [x] `configs/node.schema.json` rewritten from an empty stub (7 bare
+  `{"type":"object"}` keys) into the full shape mirroring the Rust
+  `NodeConfig` structs (enums, bounds, required lists, nested generation /
+  tiers). `node.example.yaml` validates against it.
+
+### 132.3 Repo hygiene
+
+- [x] CHANGELOG: the five duplicate `[Unreleased]` sections merged into one
+  with subsections.
+- [x] `docs/ARCHITECTURE.md`: replaced the phantom crates
+  (`policy-engine`, `chunk-store`, `transfer-engine`, `inference-runtime`,
+  `inference-router`) with the real workspace layout + a note.
+- [x] Test counts corrected to the real value (README/ROADMAP/AGENTS.md
+  claimed 1018/1184/106+; the real gate is `cargo test --workspace`).
+- [x] Dead dependencies removed: `fabric→anyhow`, `providers→tokio`
+  (the `distributed→decentraai-config` edge is now *used* by
+  `from_section`).
+- [x] `inference-adapter` aligned to workspace standards: edition 2021 →
+  2024, `license.workspace`, `thiserror.workspace`, `tokio.workspace`.
+
+### 132.4 Quality gates
+
+- [x] 1190 workspace tests green (47 suites); clippy `-D warnings` clean.
+
+### Open (honest, from the same review — not yet closed)
+
+- `compute` still depends on libp2p for `PeerId` only, which pulls the full
+  tokio/kad/relay stack into the pure domain crate. The clean fix is a
+  leaf crate (e.g. `decentraai-types`) — a larger refactor, deferred to keep
+  this pass regression-free.
+- CI still never runs a real llama-server (httpmock/fake binaries); the real
+  engine contract (SSE, KV telemetry, crash behavior) is validated on live
+  LAN only.
+- Hub download path still has only trivial tests (the 53 hub tests are pure
+  capability logic); a real I/O download test is an open follow-up.
