@@ -1,0 +1,11 @@
+==== REAL-TRACE EQUIVALENCE REPORT (Issue #30 Phase 2) ====
+corpus cases: 95
+  full-fidelity replays: 81
+  structure-only (not-comparable): 14
+  continuation / KV-locality cases: 5
+--- divergence classification ---
+  genuine-regression: 0
+  expected-semantic (reserved!=selected, by design): 0
+  not-comparable (missing link graph -> 'net' term unreproducible): 14
+scoring provenance agreement (perf_measured of chosen worker): 81/81 agreed, 0 disagreed
+==================================================
