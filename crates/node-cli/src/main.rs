@@ -1742,7 +1742,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             max_connections: config.network.max_connections,
         },
     )?;
-    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/32937").await?;
     // Re-point the agent messenger at the real, handler-bearing P2P node so
     // both outbound Delegates and inbound Replies ride the connected peer.
     agent_messenger.set_transport(p2p_node.clone());
@@ -2761,7 +2761,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
         handler,
     )?;
-    let bound = node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    let bound = node.listen("/ip4/0.0.0.0/tcp/32937").await?;
 
     // Announce every model we serve, signed with the node identity.
     let mut announced = 0usize;
@@ -6084,7 +6084,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         Some(Arc::new(chained_handler)),
     )?;
 
-    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/0").await?;
+    let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/32937").await?;
 
     // Create distributed inference coordinator with the shared worker manager
     let distributed_config = InferenceConfig::from_section(&config.inference);
