@@ -9543,6 +9543,19 @@ fn remote_chat_prompt(messages: &[serde_json::Value]) -> String {
     parts.join("\n\n")
 }
 
+/// Extracts the caller's `session_id` from a remote chat body, if any.
+///
+/// Pure and deterministic (repo convention: decisions separated from I/O).
+/// Honesty rules: missing field, non-string value, and empty string all yield
+/// `None` — such requests keep the exact pre-Phase-1 behavior (cold routing,
+/// no KV residency recorded), never an invented session identity.
+fn remote_session_id(body: &serde_json::Value) -> Option<String> {
+    body.get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Routes a chat inference request over the fabric to a trusted remote worker
 /// (M18+). Emits an OpenAI-compatible response — SSE when the caller asked for
 /// streaming, JSON otherwise — tagged with `X-Decentra-Origin: remote` plus
@@ -9599,6 +9612,15 @@ async fn route_remote_chat(
     // same way the CLI does, so slow-but-healthy workers are not cut off
     // mid-stream (which previously surfaced as "Error in input stream").
     let mut request = request;
+    // Remote KV locality (Issue #30 Phase 1): thread the caller's session_id
+    // into the distributed request so M20 continuation affinity and
+    // coordinator-side KV accounting apply on the remote chat path too —
+    // follow-ups steer back to the worker holding the session's KV prefix
+    // instead of routing cold every turn. Requests WITHOUT a session keep the
+    // exact previous behavior (no residency recorded, cold routing).
+    if let Some(sid) = remote_session_id(&body) {
+        request = request.with_session(sid);
+    }
     // Inference on CPU is slow (a Mistral-7B response can take >30s per few
     // tokens). The protocol default timeout is 30s — far too tight for a
     // real chat turn. Match the CLI's explicit 120s so slow-but-healthy
@@ -9776,6 +9798,63 @@ fn forbidden(message: &str) -> Response {
 /// so we return a clear 404 instead of silently answering with the currently
 /// loaded model while reporting the requested (nonexistent) name. This preserves
 /// the do-not-lie invariant for inference routing.
+#[cfg(test)]
+mod remote_kv_locality_tests {
+    use super::remote_session_id;
+    use std::str::FromStr;
+
+    #[test]
+    fn session_id_extraction_covers_all_body_shapes() {
+        // Missing field -> None (pre-Phase-1 behavior preserved).
+        let body: serde_json::Value = serde_json::json!({"model": "m", "messages": []});
+        assert_eq!(remote_session_id(&body), None);
+        // Non-string values are never coerced into an invented identity.
+        let body: serde_json::Value = serde_json::json!({"session_id": 42});
+        assert_eq!(remote_session_id(&body), None);
+        let body: serde_json::Value = serde_json::json!({"session_id": null});
+        assert_eq!(remote_session_id(&body), None);
+        // Empty string == no session (matches the local proxy path's filter).
+        let body: serde_json::Value = serde_json::json!({"session_id": ""});
+        assert_eq!(remote_session_id(&body), None);
+        // Valid session id passes through verbatim.
+        let body: serde_json::Value = serde_json::json!({"session_id": "sess-abc-123"});
+        assert_eq!(remote_session_id(&body), Some("sess-abc-123".to_string()));
+    }
+
+    #[test]
+    fn threaded_session_reaches_infer_request_and_preserves_no_session_behavior() {
+        // The exact construction route_remote_chat performs, with and without
+        // a session: the distributed request must carry the caller's
+        // session_id so M20 continuation affinity + KV accounting engage on
+        // the remote path; a session-less request must stay session-free.
+        use decentraai_distributed::InferRequest;
+        let base = || {
+            InferRequest::new("hash".into(), "prompt".into(), 16)
+                .with_sender(
+                    decentraai_p2p::PeerId::from_str(
+                        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+                    )
+                    .unwrap(),
+                )
+                .with_streaming(false)
+        };
+        // With session: body -> helper -> with_session.
+        let body: serde_json::Value = serde_json::json!({"session_id": "kv-sess-1"});
+        let mut request = base();
+        if let Some(sid) = remote_session_id(&body) {
+            request = request.with_session(sid);
+        }
+        assert_eq!(request.session_id.as_deref(), Some("kv-sess-1"));
+        // Without session: unchanged behavior.
+        let body: serde_json::Value = serde_json::json!({"messages": []});
+        let mut request = base();
+        if let Some(sid) = remote_session_id(&body) {
+            request = request.with_session(sid);
+        }
+        assert_eq!(request.session_id, None);
+    }
+}
+
 fn not_served(model: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
