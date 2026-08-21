@@ -198,6 +198,11 @@ async fn fetch_verified_or_quarantine(
 ) -> Result<Vec<u8>> {
     let mut last_err = anyhow::anyhow!("no providers available");
     let mut last_provider = providers[start % providers.len()];
+    // A chunk is only quarantined on a CRYPTOGRAPHIC verification failure.
+    // Pure network errors are transport failures (provider unreachable) —
+    // quarantining on those contradicts the module docs and permanently
+    // poisons the artifact for a retryable outage.
+    let mut saw_crypto_failure = false;
     for attempt in 0..providers.len() {
         let provider = providers[(start + attempt) % providers.len()];
         last_provider = provider;
@@ -208,6 +213,7 @@ async fn fetch_verified_or_quarantine(
                     return Ok(data);
                 }
                 Err(e) => {
+                    saw_crypto_failure = true;
                     reputation.record_failure(&provider);
                     audit_security_event(
                         data_dir,
@@ -233,11 +239,20 @@ async fn fetch_verified_or_quarantine(
             }
         }
     }
-    quarantine_staging(data_dir, manifest, &last_provider, &last_err.to_string());
+    if saw_crypto_failure {
+        quarantine_staging(data_dir, manifest, &last_provider, &last_err.to_string());
+    }
     Err(last_err)
 }
 
 /// Moves the staging artifact into `quarantine/` and records why.
+///
+/// The FULL staging state is moved — both the `.part` bytes and the `.done`
+/// resume bitmap — so a retry starts from a clean slate. Leaving the bitmap
+/// behind was a permanent-corruption bug: a retried download would honor the
+/// stale "verified" marks, skip chunks, and fail the final hash forever until
+/// the bitmap was deleted manually.
+///
 /// Best-effort: a quarantine failure is logged, never fatal.
 fn quarantine_staging(data_dir: &Path, manifest: &Manifest, peer: &PeerId, reason: &str) {
     let result = (|| -> Result<()> {
@@ -250,6 +265,17 @@ fn quarantine_staging(data_dir: &Path, manifest: &Manifest, peer: &PeerId, reaso
             std::fs::rename(
                 &staging,
                 quarantine_dir.join(format!("{}.part", manifest.model_id)),
+            )?;
+        }
+        // Move the resume bitmap too: a quarantined artifact must not leave
+        // stale "verified" marks behind for a future retry.
+        let bitmap = data_dir
+            .join("staging")
+            .join(format!("{}.done", manifest.model_id));
+        if bitmap.exists() {
+            std::fs::rename(
+                &bitmap,
+                quarantine_dir.join(format!("{}.done", manifest.model_id)),
             )?;
         }
         let metadata = serde_json::json!({
@@ -546,5 +572,69 @@ mod tests {
             "model-7b-q4_k_m.gguf",
         );
         assert!(validate_manifest(&ok).is_ok());
+    }
+
+    #[test]
+    fn quarantine_moves_bitmap_so_retry_starts_fresh() {
+        // Regression (review, data plane): quarantine_staging used to move
+        // only the `.part` and leave the `.done` resume bitmap behind. A retry
+        // would then honor the stale "verified" marks, skip chunks, and fail
+        // the final hash forever. The bitmap must move with the artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let m = manifest_with("quar-test", "m.gguf");
+        let part = staging.join(format!("{}.part", m.model_id));
+        let bitmap = staging.join(format!("{}.done", m.model_id));
+        std::fs::write(&part, b"partial bytes").unwrap();
+        // Bitmap marks chunk 0 as verified (stale after quarantine).
+        std::fs::write(&bitmap, [1u8]).unwrap();
+
+        quarantine_staging(
+            dir.path(),
+            &m,
+            &PeerId::random(),
+            "chunk verification failed",
+        );
+
+        // Both files moved out of staging.
+        assert!(!part.exists(), "staging .part must be moved away");
+        assert!(!bitmap.exists(), "staging .done must be moved away");
+        let quarantine = dir.path().join("quarantine");
+        assert!(quarantine.join(format!("{}.part", m.model_id)).exists());
+        assert!(
+            quarantine.join(format!("{}.done", m.model_id)).exists(),
+            "the resume bitmap must be quarantined with the artifact"
+        );
+        // Metadata recorded.
+        assert!(quarantine.join(format!("{}.quarantine.json", m.model_id)).exists());
+
+        // A retry prepares a fresh staging state: empty bitmap (no stale marks).
+        let (_part, _bitmap, done) = prepare_staging(dir.path(), &m).unwrap();
+        assert!(
+            done.iter().all(|d| !*d),
+            "a quarantined artifact must retry from a clean bitmap"
+        );
+    }
+
+    #[test]
+    fn quarantine_moves_only_existing_files() {
+        // A network-only failure path never calls quarantine_staging, but the
+        // function must be safe when only a bitmap exists (no .part yet).
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let m = manifest_with("quar-only-bitmap", "m.gguf");
+        std::fs::write(
+            staging.join(format!("{}.done", m.model_id)),
+            [0u8, 1u8],
+        )
+        .unwrap();
+        quarantine_staging(dir.path(), &m, &PeerId::random(), "test");
+        let quarantine = dir.path().join("quarantine");
+        assert!(
+            quarantine.join(format!("{}.done", m.model_id)).exists(),
+            "bitmap-only quarantine must still move the bitmap"
+        );
     }
 }
