@@ -350,9 +350,35 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
 .empty.ic::before{content:"∅ ";color:var(--faint);opacity:.8}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:900px){.two-col{grid-template-columns:1fr}.layout{grid-template-columns:64px minmax(0,1fr)}.rail{padding:14px 8px}.brand-name,.brand-sub,.rail-label,.nav-item span:not(.ic),.rail-live span:last-child{display:none}.rail-live{justify-content:center}.fabric-stage{height:360px}.ds-row{flex-direction:column}.ds-step{border-left:1px solid var(--line);border-radius:0}.ds-step:first-child{border-radius:10px 10px 0 0}.ds-step:last-child{border-radius:0 0 10px 10px}.card{overflow-x:auto;-webkit-overflow-scrolling:touch}}
+
+/* ---- LOGIN OVERLAY ---- */
+#login-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:var(--bg);backdrop-filter:blur(4px)}
+#login-box{background:var(--bg-2);border:1px solid var(--line);border-radius:16px;padding:40px;max-width:400px;width:90%;text-align:center}
+#login-box h1{font-size:22px;margin:0 0 6px 0;color:var(--text)}
+#login-box p{font-size:13px;color:var(--faint);margin:0 0 20px 0}
+#login-box input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font:var(--mono);font-size:13px;box-sizing:border-box;outline:none}
+#login-box input:focus{border-color:var(--accent)}
+#login-box button{margin-top:12px;width:100%;padding:12px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+#login-box button:hover{opacity:.9}
+#login-box .login-error{font-size:12px;color:var(--warn);margin-top:10px;display:none}
+#login-box .login-hint{font-size:11px;color:var(--faint);margin-top:14px;line-height:1.5}
+#login-overlay.hidden{display:none}
+.nav-item.advanced{display:none}
+.showing-advanced .nav-item.advanced{display:flex}
 </style>
 </head>
 <body>
+<!-- LOGIN SCREEN -->
+<div id="login-overlay">
+  <div id="login-box">
+    <h1>DecentraAI</h1>
+    <p>Enter your API key or master token to access the dashboard</p>
+    <input type="password" id="login-token" placeholder="dca_... or master token" autocomplete="off">
+    <button onclick="doLogin()">Unlock dashboard</button>
+    <div class="login-error" id="login-error">Invalid token — try again</div>
+    <div class="login-hint">Need a key? Contact your node operator.</div>
+  </div>
+</div>
 <div class="layout">
   <!-- ======================= RAIL ======================= -->
   <aside class="rail">
@@ -371,33 +397,33 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item" data-view="overview"><span class="ic">◉</span><span>Overview</span></button>
     <button class="nav-item" data-view="chat"><span class="ic">✎</span><span>Chat</span></button>
 
-    <div class="rail-label">Fabric</div>
-    <button class="nav-item" data-view="fabric"><span class="ic">◈</span><span>Topology</span></button>
-    <button class="nav-item" data-view="decisions"><span class="ic">✦</span><span>Decisions</span></button>
-    <button class="nav-item" data-view="execution"><span class="ic">⇄</span><span>Execution</span></button>
+    <div class="rail-label advanced">Fabric</div>
+    <button class="nav-item advanced" data-view="fabric"><span class="ic">◈</span><span>Topology</span></button>
+    <button class="nav-item advanced" data-view="decisions"><span class="ic">✦</span><span>Decisions</span></button>
+    <button class="nav-item advanced" data-view="execution"><span class="ic">⇄</span><span>Execution</span></button>
 
-    <div class="rail-label">Mesh</div>
-    <button class="nav-item" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
-    <button class="nav-item" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
-    <button class="nav-item" data-view="knowledge"><span class="ic">✦</span><span>Knowledge</span></button>
-    <button class="nav-item" data-view="evidence"><span class="ic">✎</span><span>Evidence</span></button>
-    <button class="nav-item" data-view="bench"><span class="ic">⚗</span><span>Bench</span></button>
-    <button class="nav-item" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
-    <button class="nav-item" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
-    <button class="nav-item" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
-    <button class="nav-item" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
-    <button class="nav-item" data-view="devices"><span class="ic">⌂</span><span>Devices</span></button>
-    <button class="nav-item" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
-    <button class="nav-item" data-view="models"><span class="ic">▦</span><span>Models</span></button>
-    <button class="nav-item" data-view="providers"><span class="ic">◈</span><span>Providers</span></button>
+    <div class="rail-label advanced">Mesh</div>
+    <button class="nav-item advanced" data-view="agents"><span class="ic">☺</span><span>Agents</span></button>
+    <button class="nav-item advanced" data-view="skills"><span class="ic">⚡</span><span>Skills</span></button>
+    <button class="nav-item advanced" data-view="knowledge"><span class="ic">✦</span><span>Knowledge</span></button>
+    <button class="nav-item advanced" data-view="evidence"><span class="ic">✎</span><span>Evidence</span></button>
+    <button class="nav-item advanced" data-view="bench"><span class="ic">⚗</span><span>Bench</span></button>
+    <button class="nav-item advanced" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
+    <button class="nav-item advanced" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
+    <button class="nav-item advanced" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
+    <button class="nav-item advanced" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
+    <button class="nav-item advanced" data-view="devices"><span class="ic">⌂</span><span>Devices</span></button>
+    <button class="nav-item advanced" data-view="network"><span class="ic">⬡</span><span>Network</span></button>
+    <button class="nav-item advanced" data-view="models"><span class="ic">▦</span><span>Models</span></button>
+    <button class="nav-item advanced" data-view="providers"><span class="ic">◈</span><span>Providers</span></button>
 
-    <div class="rail-label">Ops</div>
-    <button class="nav-item" data-view="observability"><span class="ic">◔</span><span>Observability</span></button>
-    <button class="nav-item" data-view="recovery"><span class="ic">↻</span><span>Recovery</span></button>
-    <button class="nav-item" data-view="diag"><span class="ic">✚</span><span>Diag</span></button>
-    <button class="nav-item" data-view="security"><span class="ic">⚿</span><span>Security</span></button>
-    <button class="nav-item" data-view="settings"><span class="ic">⚙</span><span>Settings</span></button>
-    <button class="nav-item" onclick="location.href='/admin'" title="Master-gated admin console (tokens, consumer keys, trust)"><span class="ic">🛡</span><span>Admin</span></button>
+    <div class="rail-label advanced">Ops</div>
+    <button class="nav-item advanced" data-view="observability"><span class="ic">◔</span><span>Observability</span></button>
+    <button class="nav-item advanced" data-view="recovery"><span class="ic">↻</span><span>Recovery</span></button>
+    <button class="nav-item advanced" data-view="diag"><span class="ic">✚</span><span>Diag</span></button>
+    <button class="nav-item advanced" data-view="security"><span class="ic">⚿</span><span>Security</span></button>
+    <button class="nav-item advanced" data-view="settings"><span class="ic">⚙</span><span>Settings</span></button>
+    <button class="nav-item advanced" onclick="location.href='/admin'" title="Master-gated admin console (tokens, consumer keys, trust)"><span class="ic">🛡</span><span>Admin</span></button>
 
     <div class="rail-foot">
       <button id="adv-toggle" title="Show or hide the advanced fabric views">Show advanced</button>
@@ -1452,9 +1478,29 @@ function toast(msg, bad=false){ const t=document.createElement('div'); t.classNa
 
 // ---- auth ------------------------------------------------------------------
 let token = '';
-try { token = await (await fetch('/v1/token')).text(); } catch (e) {}
+const storedToken = localStorage.getItem('dai_token');
+if (storedToken) {
+  token = storedToken;
+  $('login-overlay').classList.add('hidden');
+}
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
 const isAdmin = !!token;
+
+// ---- login overlay ----
+function doLogin(){
+  const input = $('login-token');
+  const err = $('login-error');
+  const val = input.value.trim();
+  if (!val) { err.style.display = 'block'; return; }
+  localStorage.setItem('dai_token', val);
+  location.reload();
+}
+// Press Enter to login
+document.addEventListener('DOMContentLoaded', () => {
+  const inp = $('login-token');
+  if (inp) inp.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+});
+// ---- auth end ----
 
 // ---- navigation ------------------------------------------------------------
 const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','talents','workers','devices','network','models','observability','recovery','diag','security','settings'];
@@ -1478,6 +1524,7 @@ const advBtn = $('adv-toggle');
 const setAdv = show => {
   advEl.hidden = !show;
   advBtn.textContent = show ? 'Hide advanced' : 'Show advanced';
+  document.querySelector('.rail').classList.toggle('showing-advanced', show);
 };
 setAdv((localStorage.getItem('decentraai.advanced') || '0') === '1');
 advBtn.addEventListener('click', () => {
