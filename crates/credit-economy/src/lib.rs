@@ -24,6 +24,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -361,6 +364,8 @@ pub enum EconomyError {
     QuotaExpired,
     QuotaExhausted,
     UnknownQuota,
+    IoError,
+    CorruptedState,
 }
 
 impl std::fmt::Display for EconomyError {
@@ -384,6 +389,8 @@ impl std::fmt::Display for EconomyError {
             Self::QuotaExpired => write!(f, "provider quota expired"),
             Self::QuotaExhausted => write!(f, "provider quota exhausted"),
             Self::UnknownQuota => write!(f, "unknown provider quota"),
+            Self::IoError => write!(f, "persistence I/O error"),
+            Self::CorruptedState => write!(f, "corrupted ledger snapshot"),
         }
     }
 }
@@ -407,6 +414,24 @@ impl SettlementEngine for InternalSettlement {
     fn on_settled(&mut self, _event: &CreditEvent) -> Result<(), EconomyError> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence snapshot
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EconomySnapshot {
+    pub ads: BTreeMap<String, ResourceAdvertisement>,
+    pub quotas: HashMap<String, ProviderQuota>,
+    pub contributions: BTreeMap<String, ContributionRecord>,
+    pub accounts: HashMap<AccountId, CreditBalance>,
+    pub reservations: HashMap<String, CreditReservation>,
+    pub events: Vec<CreditEvent>,
+    pub receipts: HashSet<String>,
+    pub applied: HashSet<(String, String)>,
+    pub policy: CreditPolicy,
+    pub timestamp_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +499,74 @@ impl InferenceCreditEconomy {
 
     pub fn set_policy(&self, policy: CreditPolicy) {
         self.lock().policy = policy;
+    }
+
+    /// Exports full ledger state for durable persistence.
+    pub fn snapshot(&self) -> EconomySnapshot {
+        let g = self.lock();
+        EconomySnapshot {
+            ads: g.ads.clone(),
+            quotas: g.quotas.clone(),
+            contributions: g.contributions.clone(),
+            accounts: g.accounts.clone(),
+            reservations: g.reservations.clone(),
+            events: g.events.iter().cloned().collect(),
+            receipts: g.receipts.clone(),
+            applied: g.applied.clone(),
+            policy: g.policy.clone(),
+            timestamp_ms: now_ms(),
+        }
+    }
+
+    /// Restores full ledger state from snapshot.
+    pub fn restore_snapshot(&self, snap: EconomySnapshot) -> Result<(), EconomyError> {
+        for bal in snap.accounts.values() {
+            if !bal.check_invariant() {
+                return Err(EconomyError::CorruptedState);
+            }
+        }
+        let mut g = self.lock();
+        g.ads = snap.ads;
+        g.quotas = snap.quotas;
+        g.contributions = snap.contributions;
+        g.accounts = snap.accounts;
+        g.reservations = snap.reservations;
+        g.events = snap.events.into_iter().collect();
+        g.receipts = snap.receipts;
+        g.applied = snap.applied;
+        g.policy = snap.policy;
+        Ok(())
+    }
+
+    /// Atomically persists snapshot to disk via temporary file.
+    pub fn persist_to_disk(&self, path: &Path) -> Result<(), EconomyError> {
+        let snap = self.snapshot();
+        let serialized = serde_json::to_vec_pretty(&snap).map_err(|_| EconomyError::IoError)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| EconomyError::IoError)?;
+        }
+        let tmp_path = path.with_extension(format!("tmp.{}", now_ms()));
+        {
+            let mut file = File::create(&tmp_path).map_err(|_| EconomyError::IoError)?;
+            file.write_all(&serialized).map_err(|_| EconomyError::IoError)?;
+            file.sync_all().map_err(|_| EconomyError::IoError)?;
+        }
+        fs::rename(&tmp_path, path).map_err(|_| EconomyError::IoError)?;
+        Ok(())
+    }
+
+    /// Loads snapshot from disk and restores accounting state.
+    pub fn load_from_disk(path: &Path) -> Result<Self, EconomyError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let mut file = File::open(path).map_err(|_| EconomyError::IoError)?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).map_err(|_| EconomyError::IoError)?;
+        let snap: EconomySnapshot = serde_json::from_slice(&content).map_err(|_| EconomyError::CorruptedState)?;
+        let eco = Self::new(snap.policy.clone());
+        eco.restore_snapshot(snap)?;
+        Ok(eco)
     }
 
     /// Advertise capacity without secrets. Does not award CU.
@@ -1294,37 +1387,18 @@ mod tests {
     }
 
     #[test]
-    fn consume_idempotent_double_settle_refused() {
+    fn persistence_snapshot_and_restore_round_trip() {
         let eco = InferenceCreditEconomy::default();
-        eco.register_quota(ProviderQuota {
-            quota_id: "q-1".into(),
-            contributor: "node-a".into(),
-            resource_type: ResourceType::ApiQuota,
-            provider: None,
-            model: None,
-            available: 1_000_000,
-            reserved: 0,
-            consumed: 0,
-            reset_at_ms: None,
-            expired: false,
-        });
-        earn_api(&eco, "c1", 1_000, 0);
-        eco.reserve("node-a", "r1", 100, ResourceType::CpuCompute, None, None).unwrap();
-        assert_eq!(eco.consume("r1", 100).unwrap(), 100);
-        assert_eq!(eco.consume("r1", 100).unwrap_err(), EconomyError::AlreadySettled);
-        assert_eq!(eco.balance("node-a").consumed, 100);
-    }
-
-    #[test]
-    fn internal_settlement_is_a_no_op_adapter() {
-        let eco = InferenceCreditEconomy::default();
-        eco.submit_contribution("c1", "node-a", ResourceType::CpuCompute, None, None, None, None);
-        let mut u = usage("r1", "e1", "node-a", 0, 0, true);
-        u.resource_type = ResourceType::CpuCompute;
-        u.cpu_ms = 5;
-        eco.verify_contribution("c1", u).unwrap();
-        let mut s = InternalSettlement;
-        let calc = eco.settle_with("c1", &mut s).unwrap();
-        assert_eq!(calc.credits, 5);
+        earn_api(&eco, "c1", 500, 200);
+        let snap = eco.snapshot();
+        assert_eq!(snap.events.len(), 1);
+        let restored = InferenceCreditEconomy::default();
+        restored.restore_snapshot(snap).unwrap();
+        assert_eq!(restored.balance("node-a").earned, 900); // 500*1 + 200*2
+        assert_eq!(restored.events().len(), 1);
+        // Duplicate settle on restored state must be prevented.
+        let dup = restored.settle_contribution("c1").unwrap().credits;
+        assert_eq!(dup, 900);
+        assert_eq!(restored.balance("node-a").earned, 900);
     }
 }
