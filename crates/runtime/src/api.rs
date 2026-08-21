@@ -7807,9 +7807,19 @@ async fn execution_handler(State(state): State<ApiState>, headers: HeaderMap) ->
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
-    let mut body = serde_json::json!({ "attached": false, "executions": [], "decisions": [] });
+    let mut body = serde_json::json!({
+        "attached": false,
+        "executions": [],
+        "decisions": [],
+        "selection_traces": []
+    });
     if let Some(compute) = &state.compute {
         body["executions"] = serde_json::json!(compute.executions());
+        // Decision trace (observe-only): the deterministic request → candidates
+        // → rejection reasons → scoring → selected → reservation → outcome
+        // record. Golden-test substrate for comparing selectors. Safe operational
+        // metadata only — never chain-of-thought or request content.
+        body["selection_traces"] = serde_json::json!(compute.selection_traces());
         // M23 Full Autonomy: surface the explainable autonomous execution
         // decisions (candidates, constraints, score, selected worker, KV
         // affinity, engine capability, expected mode, reservation/plan/outcome
@@ -13437,6 +13447,10 @@ mod tests {
         assert_eq!(exec["attached"], false);
         assert!(exec["executions"].is_array());
         assert!(exec["decisions"].is_array());
+        assert!(
+            exec["selection_traces"].is_array(),
+            "decision traces must be surfaced by /v1/execution"
+        );
 
         manager.lock().await.shutdown().await.unwrap();
     }

@@ -302,6 +302,17 @@ pub struct CapabilityRequirementView {
     pub evidence: String,
 }
 
+/// Why a candidate worker was filtered out of the eligible set, for the
+/// decision trace. Purely observational — recording a rejection never changes
+/// the (identical) eligibility computation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RejectedCandidate {
+    pub peer_id: String,
+    /// Stable, ordered reasons (e.g. `"untrusted"`, `"unhealthy"`,
+    /// `"does_not_serve_model"`). Empty = this worker WAS eligible.
+    pub reasons: Vec<String>,
+}
+
 /// Observability of a planning decision: the chosen worker's component scores
 /// and the margin over the runner-up.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,6 +325,11 @@ pub struct PlannerRationale {
     pub runner_up_delta: Option<f32>,
     /// All eligible candidates ranked (score desc, PeerId asc).
     pub ranked: Vec<CandidateScore>,
+    /// Every candidate worker that was filtered out, with the stable reasons
+    /// it was rejected for. Purely additive observability (decision trace);
+    /// the eligibility computation is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedCandidate>,
     /// Capability-requirement verdict for this request, when one was requested.
     /// `None` when the request carried no capability requirement. Honest: never
     /// claims satisfied without real evidence.
@@ -339,6 +355,83 @@ pub struct PlanResult {
     /// returns true today, because no engine DecentraAI runs advertises
     /// speculative / disaggregated / collaborative-model capabilities.
     pub can_reports: Vec<(String, CanRunReport)>,
+}
+
+/// Deterministic, observe-only record of one worker-selection decision (the
+/// "decision trace"). Captures the full lifecycle of a routing decision:
+///
+/// ```text
+/// request → candidates → filters → rejection reasons → scoring
+///         → selected worker → reservation → outcome
+/// ```
+///
+/// The **decision half** (request, candidates, rejected, ranked, selected
+/// worker) is produced by the planner; the **runtime half** (reserved worker,
+/// reservation id, outcome, attempt) is completed by the coordinator after it
+/// reserves and executes. No chain-of-thought and no unnecessary data: every
+/// field is a real, stable input or output. Deterministic — the same fabric
+/// state and request yield the same trace, which is the substrate for golden
+/// tests that compare selectors (legacy vs unified) later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectionTrace {
+    pub request_id: String,
+    pub model_hash: String,
+    pub is_continuation: bool,
+    pub prefix_worker: Option<String>,
+    pub priority: u8,
+    /// Every candidate worker considered (eligible or not), PeerId asc.
+    pub candidates: Vec<String>,
+    /// Filtered-out candidates with their stable rejection reasons.
+    pub rejected: Vec<RejectedCandidate>,
+    /// Eligible candidates ranked (score desc, PeerId asc) with component scores.
+    pub ranked: Vec<CandidateScore>,
+    /// The worker the planner selected, if any were eligible.
+    pub selected_worker: Option<String>,
+    /// The worker actually reserved (after local-node exclusion + scheduler
+    /// fallback), if any. Completed by the coordinator.
+    pub reserved_worker: Option<String>,
+    /// Reservation id held for this request. Completed by the coordinator.
+    pub reservation_id: Option<String>,
+    /// Outcome: `"succeeded"` / `"failed"` / `"in_flight"` / `"no_worker"`.
+    /// Completed by the coordinator.
+    pub outcome: String,
+    /// Retry attempt that produced this outcome (0 = first placement).
+    pub attempt: u32,
+}
+
+impl SelectionTrace {
+    /// Builds the **decision half** of the trace from a plan result and the
+    /// request facts. The runtime half (`reserved_worker`, `reservation_id`,
+    /// `outcome`, `attempt`) is left unset for the coordinator to complete.
+    /// Pure and deterministic — a pure function of `req` and `result`.
+    pub fn decision_half(request_id: &str, req: &RequestFacts, result: &PlanResult) -> Self {
+        // Full candidate set (eligible or not) = rejected peers + ranked peers,
+        // deduplicated and sorted PeerId asc for determinism.
+        let mut candidates: Vec<String> = result
+            .rationale
+            .rejected
+            .iter()
+            .map(|r| r.peer_id.clone())
+            .chain(result.rationale.ranked.iter().map(|c| c.peer_id.clone()))
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        Self {
+            request_id: request_id.to_string(),
+            model_hash: req.model_hash.clone(),
+            is_continuation: req.context.is_continuation,
+            prefix_worker: req.context.prefix_resident_on.clone(),
+            priority: req.priority,
+            candidates,
+            rejected: result.rationale.rejected.clone(),
+            ranked: result.rationale.ranked.clone(),
+            selected_worker: result.rationale.chosen_worker.clone(),
+            reserved_worker: None,
+            reservation_id: None,
+            outcome: String::new(),
+            attempt: 0,
+        }
+    }
 }
 
 impl ExecutionPlan {
@@ -390,10 +483,32 @@ impl ExecutionPlanner {
             .map(|f| (f.peer_id.clone(), f.clone()))
             .collect();
 
-        let eligible: Vec<&WorkerFacts> = workers
-            .iter()
-            .filter(|f| f.trusted && f.healthy && f.serves_model)
-            .collect();
+        // Eligibility projection + decision-trace rejection reasons. The
+        // eligibility set is EXACTLY `trusted && healthy && serves_model`
+        // (unchanged); we additionally record, per excluded candidate, the
+        // stable reason(s) it was rejected for. Observe-only.
+        let mut eligible: Vec<&WorkerFacts> = Vec::new();
+        let mut rejected: Vec<RejectedCandidate> = Vec::new();
+        for f in workers {
+            let mut reasons = Vec::new();
+            if !f.trusted {
+                reasons.push("untrusted".to_string());
+            }
+            if !f.healthy {
+                reasons.push("unhealthy".to_string());
+            }
+            if !f.serves_model {
+                reasons.push("does_not_serve_model".to_string());
+            }
+            if reasons.is_empty() {
+                eligible.push(f);
+            } else {
+                rejected.push(RejectedCandidate {
+                    peer_id: f.peer_id.clone(),
+                    reasons,
+                });
+            }
+        }
 
         // KV-aware hint narrows the field for continuation / long context.
         let kv_hint = KvPlanner.route(
@@ -435,6 +550,7 @@ impl ExecutionPlanner {
                 chosen: None,
                 runner_up_delta: None,
                 ranked: Vec::new(),
+                rejected: rejected.clone(),
                 capability_requirement: capability_view(req, &req.capability_claims),
             };
             return PlanResult {
@@ -479,6 +595,7 @@ impl ExecutionPlanner {
                 None
             },
             ranked: ranked.iter().map(|(cs, _)| cs.clone()).collect(),
+            rejected: rejected.clone(),
             capability_requirement: capability_view(req, &req.capability_claims),
         };
         // P1: attach the execution strategy. Today the planner only ever emits
@@ -1145,6 +1262,78 @@ mod tests {
         assert!(p.rationale.chosen_worker.is_none());
         assert!(p.rationale.chosen.is_none());
         assert!(p.rationale.ranked.is_empty());
+    }
+
+    #[test]
+    fn rejected_candidates_record_stable_reasons_without_changing_eligibility() {
+        // Decision-trace observability: workers filtered out of the eligible
+        // set must be recorded with their stable reasons, and the eligibility
+        // projection must be identical to before (trusted && healthy &&
+        // serves_model).
+        let mut untrusted = worker_facts("untrusted", 200, 20, 5);
+        untrusted.trusted = false;
+        let mut unhealthy = worker_facts("unhealthy", 200, 20, 5);
+        unhealthy.healthy = false;
+        let mut no_model = worker_facts("no_model", 200, 20, 5);
+        no_model.serves_model = false;
+        let ok = worker_facts("ok", 180, 50, 10);
+
+        let p = ExecutionPlanner::default().plan(&req(), &[untrusted, unhealthy, no_model, ok]);
+        // Only "ok" is eligible and selected.
+        assert_eq!(p.plan.workers(), vec!["ok"]);
+        assert_eq!(p.rationale.ranked.len(), 1);
+        assert_eq!(p.rationale.ranked[0].peer_id, "ok");
+
+        // The three filtered workers are recorded with their reasons.
+        let reasons = |id: &str| {
+            p.rationale
+                .rejected
+                .iter()
+                .find(|r| r.peer_id == id)
+                .map(|r| r.reasons.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(reasons("untrusted"), vec!["untrusted"]);
+        assert_eq!(reasons("unhealthy"), vec!["unhealthy"]);
+        assert_eq!(reasons("no_model"), vec!["does_not_serve_model"]);
+        assert_eq!(reasons("ok"), Vec::<String>::new());
+        // Deterministic order: rejected is built in candidate order.
+        assert_eq!(p.rationale.rejected.len(), 3);
+    }
+
+    #[test]
+    fn selection_trace_decision_half_is_deterministic_and_complete() {
+        // The decision half of the trace must be a pure, deterministic function
+        // of (request, plan) and must capture candidates + rejection reasons +
+        // ranked scoring + selected worker, leaving the runtime half unset.
+        let mut untrusted = worker_facts("untrusted", 200, 20, 5);
+        untrusted.trusted = false;
+        let ws = vec![
+            untrusted,
+            worker_facts("a", 180, 50, 10),
+            worker_facts("b", 150, 60, 20),
+        ];
+        let p = ExecutionPlanner::default().plan(&req(), &ws);
+        let t1 = SelectionTrace::decision_half("req-1", &req(), &p);
+        let t2 = SelectionTrace::decision_half("req-1", &req(), &p);
+        // Deterministic: identical inputs -> identical trace.
+        assert_eq!(t1, t2);
+        // Candidates = rejected + ranked, sorted.
+        assert_eq!(t1.candidates, vec!["a", "b", "untrusted"]);
+        assert_eq!(t1.rejected.len(), 1);
+        assert_eq!(t1.rejected[0].peer_id, "untrusted");
+        assert_eq!(t1.rejected[0].reasons, vec!["untrusted"]);
+        assert_eq!(t1.ranked.len(), 2);
+        assert_eq!(t1.selected_worker.as_deref(), Some("a"));
+        // Runtime half left unset for the coordinator.
+        assert_eq!(t1.reserved_worker, None);
+        assert_eq!(t1.reservation_id, None);
+        assert_eq!(t1.outcome, "");
+        assert_eq!(t1.attempt, 0);
+        // Serde round-trip (golden-test substrate).
+        let json = serde_json::to_string(&t1).unwrap();
+        let back: SelectionTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t1);
     }
 
     #[test]

@@ -336,6 +336,11 @@ pub struct ComputeManager {
     /// decisions + placements + outcomes surfaced by the dashboard EXECUTION
     /// view. `None` until `record_execution` is called.
     recent_executions: std::sync::Mutex<VecDeque<ExecutedPlan>>,
+    /// Bounded ring of completed deterministic `SelectionTrace`s (decision
+    /// trace: request → candidates → rejection reasons → scoring → selected →
+    /// reservation → outcome). The golden-test substrate for comparing
+    /// selectors; observe-only, never affects routing.
+    recent_traces: std::sync::Mutex<VecDeque<decentraai_fabric::SelectionTrace>>,
     /// Optional append-only JSON-lines history file (`db/executions.jsonl`).
     /// When set, every `record_execution` appends a best-effort line so the
     /// fabric keeps execution history across restarts; `load_execution_history`
@@ -429,6 +434,7 @@ impl ComputeManager {
             link_history: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
+            recent_traces: std::sync::Mutex::new(VecDeque::new()),
             executions_path: std::sync::Mutex::new(None),
             credits_path: std::sync::Mutex::new(None),
             contribution_path: std::sync::Mutex::new(None),
@@ -1282,6 +1288,29 @@ impl ComputeManager {
             .collect()
     }
 
+    /// Records a completed deterministic selection trace (observe-only). Bounded
+    /// to the most recent 128 traces so the buffer cannot grow unbounded.
+    pub fn record_selection_trace(&self, trace: decentraai_fabric::SelectionTrace) {
+        const MAX_TRACES: usize = 128;
+        let mut ring = self.recent_traces.lock().unwrap();
+        ring.push_back(trace);
+        while ring.len() > MAX_TRACES {
+            ring.pop_front();
+        }
+    }
+
+    /// Snapshot of recent selection traces, newest-first. Deterministic and
+    /// serde-friendly — the substrate for comparing selector decisions.
+    pub fn selection_traces(&self) -> Vec<decentraai_fabric::SelectionTrace> {
+        self.recent_traces
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
     /// Builds the evidence chain for one execution (P14 Phase P): the
     /// execution record (decision → placement → reservation → worker → model →
     /// outcome → measured usage) linked to its credit event (receipt →
@@ -1601,7 +1630,11 @@ impl ComputeManager {
         prompt_tokens: u32,
         session_id: Option<&str>,
         priority: u8,
-    ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
+    ) -> Option<(
+        decentraai_fabric::ExecutionPlan,
+        Placement,
+        decentraai_fabric::SelectionTrace,
+    )> {
         let facts = self.fabric_facts(&req.model_hash).await;
         if facts.is_empty() {
             return None;
@@ -1667,6 +1700,10 @@ impl ComputeManager {
         let result = planner.plan(&rfacts, &facts);
         let workers = result.plan.workers();
         let first = workers.first()?;
+        // Decision-trace (observe-only): the deterministic decision half of the
+        // selection. request_id is filled by the caller (route_request_inner)
+        // when it completes the trace with the reservation + outcome.
+        let decision_trace = decentraai_fabric::SelectionTrace::decision_half("", &rfacts, &result);
 
         // M20 observability: surface the KV-aware inputs that shaped the
         // planner decision — continuation affinity and every eligible worker's
@@ -1701,7 +1738,7 @@ impl ComputeManager {
         // coordinator never schedules a remote request onto itself via P2P.
         let peer: libp2p::PeerId = match first.parse() {
             Ok(p) if p != self.local_peer => p,
-            _ => return self.select_pub_remote(req).await.map(|p| (result.plan, p)),
+            _ => return self.select_pub_remote(req).await.map(|p| (result.plan, p, decision_trace)),
         };
 
         let placement = self
@@ -1710,9 +1747,9 @@ impl ComputeManager {
             .await
             .reserve_worker(&peer, req, Instant::now());
         match placement {
-            Some(p) => Some((result.plan, p)),
+            Some(p) => Some((result.plan, p, decision_trace)),
             // Planner's top worker is full/unreservable → scheduler fallback.
-            None => self.select_pub_remote(req).await.map(|p| (result.plan, p)),
+            None => self.select_pub_remote(req).await.map(|p| (result.plan, p, decision_trace)),
         }
     }
 
@@ -1735,7 +1772,11 @@ impl ComputeManager {
         prompt_tokens: u32,
         session_id: Option<&str>,
         priority: u8,
-    ) -> Option<(decentraai_fabric::ExecutionPlan, Placement)> {
+    ) -> Option<(
+        decentraai_fabric::ExecutionPlan,
+        Placement,
+        decentraai_fabric::SelectionTrace,
+    )> {
         // The coordinator never schedules a remote request onto itself.
         if preferred == &self.local_peer {
             return self
@@ -1772,7 +1813,30 @@ impl ComputeManager {
             }),
             fallback_orders: Vec::new(),
         };
-        Some((plan, placement))
+        // Decision-trace for the pinned path: the decision is "use the
+        // explicitly preferred worker", which bypasses the planner's scoring
+        // by design — so the trace records the pin honestly (no ranked
+        // scoring, single candidate). request_id filled by the caller.
+        let trace = decentraai_fabric::SelectionTrace {
+            request_id: String::new(),
+            model_hash: req.model_hash.clone(),
+            is_continuation: session_id
+                .and_then(|s| self.session_residency(s))
+                .is_some(),
+            prefix_worker: session_id
+                .and_then(|s| self.session_residency(s))
+                .map(|w| w.to_string()),
+            priority,
+            candidates: vec![preferred.to_string()],
+            rejected: Vec::new(),
+            ranked: Vec::new(),
+            selected_worker: Some(preferred.to_string()),
+            reserved_worker: None,
+            reservation_id: None,
+            outcome: String::new(),
+            attempt: 0,
+        };
+        Some((plan, placement, trace))
     }
 
     /// DRY-RUN planning preview: builds the same `ExecutionPlan` the
@@ -3206,7 +3270,7 @@ mod tests {
         manager.record_rtt(&worker, 2_000, 1_000);
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        let (plan, placement) = manager
+        let (plan, placement, _trace) = manager
             .plan_and_reserve(&req, 200, None, 0)
             .await
             .expect("fabric planner finds the worker");
@@ -3224,6 +3288,117 @@ mod tests {
             0,
             "release frees the booking"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_and_reserve_returns_deterministic_selection_trace() {
+        // The decision half of the trace must be returned alongside the plan +
+        // placement, must be deterministic (same inputs -> same trace), and
+        // must capture candidates + rejection reasons + ranked scoring +
+        // selected worker, with the runtime half left for the caller to fill.
+        let local = peer();
+        let worker = peer();
+        let untrusted = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let adv = build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+        // An untrusted candidate (never trusted) must be recorded as rejected.
+        let u_adv = build_advertisement(
+            untrusted,
+            "untrusted",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            false, // trusted = false
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(u_adv).await;
+
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (_, _, trace) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
+        // Deterministic: re-planning the same request yields an identical trace.
+        let (_, _, trace2) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
+        assert_eq!(trace, trace2, "decision trace must be deterministic");
+
+        // The untrusted worker is recorded with a stable rejection reason.
+        assert!(
+            trace
+                .rejected
+                .iter()
+                .any(|r| r.peer_id == untrusted.to_string() && r.reasons == vec!["untrusted"]),
+            "untrusted worker must be recorded as rejected: {:?}",
+            trace.rejected
+        );
+        // The trusted worker is selected and scored.
+        assert_eq!(trace.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        assert_eq!(trace.ranked.len(), 1);
+        assert_eq!(trace.ranked[0].peer_id, worker.to_string());
+        // Runtime half left unset for the caller.
+        assert_eq!(trace.reserved_worker, None);
+        assert_eq!(trace.reservation_id, None);
+        assert_eq!(trace.outcome, "");
+    }
+
+    #[tokio::test]
+    async fn record_selection_trace_round_trips_and_is_bounded() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        let adv = build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        );
+        manager.process_advertisement(adv).await;
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (_, _, mut trace) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
+        // Complete the runtime half as route_request_inner does.
+        trace.request_id = "req-1".into();
+        trace.reserved_worker = Some(worker.to_string());
+        trace.reservation_id = Some("res-1".into());
+        trace.outcome = "succeeded".into();
+        trace.attempt = 0;
+        manager.record_selection_trace(trace.clone());
+
+        let traces = manager.selection_traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0], trace);
+        assert_eq!(traces[0].request_id, "req-1");
+        assert_eq!(traces[0].outcome, "succeeded");
+        // Serde round-trip (golden-test substrate).
+        let json = serde_json::to_string(&traces[0]).unwrap();
+        let back: decentraai_fabric::SelectionTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, traces[0]);
     }
 
     #[tokio::test]
@@ -3254,7 +3429,7 @@ mod tests {
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
 
         // Pin to `a` — it is eligible, so it is reserved.
-        let (plan, placement) = manager
+        let (plan, placement, _trace) = manager
             .plan_and_reserve_on(&a, &req, 200, None, 0)
             .await
             .expect("preferred worker is eligible");
@@ -3289,7 +3464,7 @@ mod tests {
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
 
         // Preferred == local peer -> never pinned; falls back to the remote.
-        let (_, placement) = manager
+        let (_, placement, _trace) = manager
             .plan_and_reserve_on(&local, &req, 200, None, 0)
             .await
             .expect("falls back to an eligible worker");
@@ -3344,7 +3519,7 @@ mod tests {
         manager.record_rtt(&compatible, 2_000, 1_000);
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
 
-        let (_, placement) = manager
+        let (_, placement, _trace) = manager
             .plan_and_reserve_on(&incompatible, &req, 200, None, 0)
             .await
             .expect("falls back to an eligible worker");
@@ -3511,7 +3686,7 @@ mod tests {
             .plan_and_reserve(&req, 100, Some("s1"), 0)
             .await
             .expect("workers eligible");
-        let (plan_cold, placement_cold) = cold;
+        let (plan_cold, placement_cold, _trace_cold) = cold;
         assert_eq!(plan_cold.stage_count(), 1);
 
         // Account the session as resident on that worker (real tokens_used).
@@ -3610,7 +3785,7 @@ mod tests {
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
         // Unknown session -> not a continuation; must still route to the
         // (only) eligible worker deterministically.
-        let (plan, placement) = manager
+        let (plan, placement, _trace) = manager
             .plan_and_reserve(&req, 100, Some("never-seen"), 0)
             .await
             .expect("routes");
@@ -4056,7 +4231,7 @@ mod tests {
         manager.record_rtt(&worker, 50_000, 1000); // 50ms RTT
 
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        let (plan, placement) = manager
+        let (plan, placement, _trace) = manager
             .plan_and_reserve(&req, 100, None, 0)
             .await
             .expect("plan");
@@ -4156,7 +4331,7 @@ mod tests {
             ))
             .await;
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        let (plan, placement) = manager
+        let (plan, placement, _trace) = manager
             .plan_and_reserve(&req, 100, None, 0)
             .await
             .expect("plan");

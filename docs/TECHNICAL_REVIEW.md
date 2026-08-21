@@ -309,6 +309,15 @@ health probe) într-un singur loc.
 sesiuni cu TTL; `RequestFacts` construit o singură dată; ~1.500 de linii de
 scaffolding mort șters.
 
+> **Groundwork landed (2026-08-21):** înainte de a unifica selectorii, a fost
+> adăugat stratul de observabilitate cerut de abordarea golden-test —
+> `SelectionTrace` determinist (`request → candidates → rejection reasons →
+> scoring → selected → reservation → outcome`) + `RejectedCandidate` cu motive
+> stabile în `PlannerRationale`, instrumentat observe-only (eligibilitatea
+> rămâne identică), expus prin `/v1/execution.selection_traces` și dashboard
+> EXECUTION. Substratul pentru a compara deciziile legacy vs unified fără a
+> schimba comportamentul de routing.
+
 Apoi: **protocolul ca contract versionat** (deny_unknown_fields pe tot planul
 de inferență, câmp de versiune pe `InferRequest`, registry de scheme),
 **reputația unificată și persistată**, **persistența conversațiilor**.

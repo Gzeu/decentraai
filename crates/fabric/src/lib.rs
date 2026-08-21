@@ -62,5 +62,6 @@ pub use plan::{
 };
 pub use planner::{
     CandidateScore, ExecutionPlanner, NormalizedMetrics, PlanResult, PlannerConfig,
-    PlannerRationale, RequestFacts, ScoringWeights, WorkerFacts, base_score,
+    PlannerRationale, RejectedCandidate, RequestFacts, ScoringWeights, SelectionTrace,
+    WorkerFacts, base_score,
 };

@@ -663,6 +663,15 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
           <tbody id="remote-exec"><tr><td colspan="5" class="empty">no remote executions yet</td></tr></tbody></table>
           <p class="mono" style="font-size:11px;color:var(--faint);margin-top:6px">Only executions routed to a worker other than this node. Fields the worker did not report render as &mdash;.</p>
         </div>
+        <!-- SELECTION DECISION TRACE: the deterministic request → candidates →
+             rejection reasons → scoring → selected → reservation → outcome
+             record. Observe-only: it never affects routing. Renders the "why
+             worker X over Y" answer from the real trace, including which
+             candidates were filtered out and for what reason. -->
+        <div class="card" style="margin-top:14px">
+          <h2>Selection decision trace <span class="count">deterministic · why X over Y</span></h2>
+          <div id="selection-traces"><div class="loading"><span class="spinner"></span>no selection traces yet — appears once a request is routed</div></div>
+        </div>
         <!-- SESSIONS (KV locality): real coordinator-tracked KV/session
              residency from /v1/sessions — which worker holds each
              conversation's KV prefix (and why continuations are steered
@@ -2964,6 +2973,33 @@ function renderExecutions(x){
   $('execution').innerHTML = rows || '<tr><td colspan="10" class="empty">no executions yet</td></tr>';
   $('exec-count').textContent = (x && x.executions || []).length;
   renderExecTrace(x);
+  renderSelectionTraces(x);
+}
+// Selection decision trace: the deterministic request → candidates → rejection
+// reasons → scoring → selected → reservation → outcome record. Renders the
+// "why worker X over Y" answer from the real trace. Observe-only — it never
+// affects routing. Every value comes from /v1/execution's selection_traces.
+function renderSelectionTraces(x){
+  const el = $('selection-traces');
+  if (!el) return;
+  const tr = (x && x.selection_traces || []) || [];
+  if (!tr.length) { el.innerHTML = '<div class="loading"><span class="spinner"></span>no selection traces yet — appears once a request is routed</div>'; return; }
+  const cards = tr.slice(0, 8).map(t => {
+    const rejected = (t.rejected || []).map(r =>
+      '<span class="badge faint" title="'+esc(r.reasons.join(', '))+'">'+short(r.peer_id, 8)+' ✕ '+esc(r.reasons.join(', '))+'</span>'
+    ).join(' ') || '<span class="badge faint">none filtered</span>';
+    const ranked = (t.ranked || []).map(c =>
+      '<span class="badge accent" title="tps '+c.tps.toFixed(2)+' · lat '+c.latency.toFixed(2)+' · load '+c.load.toFixed(2)+' · queue '+c.queue.toFixed(2)+' · headroom '+c.headroom.toFixed(2)+' · net '+c.net.toFixed(2)+' · kv '+c.kv.toFixed(2)+' · locality '+c.locality.toFixed(2)+'">'+short(c.peer_id, 8)+' '+c.total.toFixed(2)+'</span>'
+    ).join(' → ') || '<span class="badge faint">no eligible worker</span>';
+    return '<div class="xt-step" style="margin-bottom:8px;padding:8px;border:1px solid var(--line);border-radius:8px">'+
+      '<div style="font-size:11px;color:var(--faint)"><code>'+esc(t.request_id || '—')+'</code> · '+(t.is_continuation?'continuation':'cold')+' · priority '+t.priority+'</div>'+
+      '<div style="margin-top:4px"><b>candidates</b> '+(t.candidates||[]).map(c=>short(c,8)).join(' · ')+'</div>'+
+      '<div style="margin-top:4px"><b>rejected</b> '+rejected+'</div>'+
+      '<div style="margin-top:4px"><b>scoring</b> '+ranked+'</div>'+
+      '<div style="margin-top:4px"><b>selected</b> <code>'+short(t.selected_worker||'—',10)+'</code> → <b>reserved</b> <code>'+short(t.reserved_worker||'—',10)+'</code> · '+outcomeBadge(t.outcome||'—')+'</div>'+
+    '</div>';
+  }).join('');
+  el.innerHTML = cards;
 }
 // P1 execution trace: a visual phase timeline for the most recent execution.
 // Each phase's state is derived from the REAL record (outcome determines the

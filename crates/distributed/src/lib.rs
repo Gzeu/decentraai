@@ -1147,9 +1147,15 @@ impl DistributedInference {
                             )
                             .await
                     };
-                    let Some((plan, placement)) = planned else {
+                    let Some((plan, placement, mut trace)) = planned else {
                         break;
                     };
+                    // Complete the decision trace's runtime half (observe-only):
+                    // the actual reserved worker + reservation + outcome.
+                    trace.request_id = request.request_id.to_string();
+                    trace.reserved_worker = Some(placement.worker.to_string());
+                    trace.reservation_id = Some(placement.reservation.reservation_id.to_string());
+                    trace.attempt = attempt;
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -1198,6 +1204,15 @@ impl DistributedInference {
                             attempt,
                         },
                     );
+                    // Decision trace: complete the outcome and persist the full
+                    // request → candidates → rejection → scoring → selected →
+                    // reservation → outcome record (observe-only, deterministic).
+                    trace.outcome = if result.is_ok() {
+                        "succeeded".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    compute.record_selection_trace(trace);
                     // M23 Full Autonomy: correlate the recorded autonomous
                     // decision with this reservation/plan/outcome and append
                     // the Reserved → Executing → Completed/Failed → Released
@@ -1424,7 +1439,7 @@ impl DistributedInference {
                         request.stream,
                     )
                     .await;
-                if let Some((plan, placement)) = match preferred {
+                if let Some((plan, placement, mut trace)) = match preferred {
                     Some(p) => {
                         compute
                             .plan_and_reserve_on(
@@ -1447,6 +1462,11 @@ impl DistributedInference {
                             .await
                     }
                 } {
+                    // Complete the decision trace's runtime half (observe-only).
+                    trace.request_id = request.request_id.to_string();
+                    trace.reserved_worker = Some(placement.worker.to_string());
+                    trace.reservation_id = Some(placement.reservation.reservation_id.to_string());
+                    trace.attempt = 0;
                     let task_placement = TaskPlacement {
                         selected_worker: placement.worker,
                         estimated_wait_ms: 10,
@@ -1500,6 +1520,14 @@ impl DistributedInference {
                             attempt: 0,
                         },
                     );
+                    // Decision trace: complete the outcome and persist the full
+                    // record (observe-only, deterministic).
+                    trace.outcome = if result.is_ok() {
+                        "succeeded".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    compute.record_selection_trace(trace);
                     // M23 Full Autonomy: correlate the recorded autonomous
                     // decision with this reservation/plan/outcome and append
                     // the Reserved → Executing → Completed/Failed → Released
