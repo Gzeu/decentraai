@@ -4916,6 +4916,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/golden-capture", get(golden_capture_handler))
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
         .route("/v1/stt", post(stt_handler))
@@ -7864,6 +7865,88 @@ async fn sessions_handler(State(state): State<ApiState>, headers: HeaderMap) -> 
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
+}
+
+/// `GET /v1/golden-capture?model_hash=…&request_id=…&prompt_tokens=…&session_id=…&priority=…`
+///
+/// Observe-only DRY-RUN (trace-collection phase): captures the REAL
+/// `RequestFacts` + `WorkerFacts` this coordinator would plan for, plus the
+/// golden `SelectionTrace` the live planner produces for them — WITHOUT
+/// reserving any worker, sending any request, or mutating any state. The
+/// replayable substrate (`GoldenCase`, serde/JSONL) for the offline
+/// Legacy-vs-UnifiedSelector equivalence review.
+///
+/// Never wired into routing; purely additive observability. Operator/admin
+/// gated like every other operational view.
+async fn golden_capture_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let model_hash = query.get("model_hash").cloned().unwrap_or_default();
+    if model_hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "model_hash is required"}).to_string(),
+        )
+            .into_response();
+    }
+    let request_id = query
+        .get("request_id")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "gc-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            )
+        });
+    let prompt_tokens: u32 = query
+        .get("prompt_tokens")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let session_id = query.get("session_id").filter(|s| !s.is_empty()).cloned();
+    let priority: u8 = query
+        .get("priority")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    match compute
+        .capture_golden_case(
+            &request_id,
+            &model_hash,
+            prompt_tokens,
+            session_id.as_deref(),
+            priority,
+        )
+        .await
+    {
+        Some(case) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&case).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        // Honest 404: no worker advertises the model — nothing to capture.
+        None => (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("no eligible worker serves {model_hash}")})
+                .to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// Classify a node's device class from its REAL advertised capability
@@ -13450,6 +13533,69 @@ mod tests {
         assert!(
             exec["selection_traces"].is_array(),
             "decision traces must be surfaced by /v1/execution"
+        );
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn golden_capture_endpoint_gates_and_honest_404() {
+        // Trace-collection phase, observe-only endpoint: auth-gated like every
+        // operational view; 400 without model_hash; honest 404 when no worker
+        // advertises the model (empty fabric) — never a fabricated capture.
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let peer = decentraai_p2p::PeerId::from_str(
+            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+        )
+        .unwrap();
+        let compute = std::sync::Arc::new(decentraai_distributed::ComputeManager::new(
+            peer,
+            "golden-capture-test".into(),
+            std::collections::HashSet::new(),
+        ));
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // 400: model_hash is required.
+        let resp = client
+            .get(format!("http://{api}/v1/golden-capture"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // 404: honest "no eligible worker" on an empty fabric — never a
+        // fabricated capture.
+        let resp = client
+            .get(format!(
+                "http://{api}/v1/golden-capture?model_hash=nonexistent-model"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no eligible worker"),
+            "honest 404 body: {body}"
         );
 
         manager.lock().await.shutdown().await.unwrap();
