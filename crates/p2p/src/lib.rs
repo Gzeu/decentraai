@@ -484,7 +484,14 @@ impl P2PNode {
         let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .context("creating mDNS behaviour")?;
         let codec = FrameCodec {
-            max_frame_bytes: max_chunk_message_bytes.max(max_message_bytes),
+            // Directional caps (review, security): inbound REQUESTS from peers
+            // are all control-plane messages (manifest/catalog/chunk/infer/
+            // announcement) and must stay under the 1 MiB control cap — a peer
+            // cannot force us to allocate a 90 MiB frame that deserialization
+            // would then reject. Inbound RESPONSES may legitimately carry chunk
+            // data (we asked for it), so they get the larger chunk cap.
+            max_request_bytes: max_message_bytes,
+            max_response_bytes: max_chunk_message_bytes.max(max_message_bytes),
         };
         // Parse bootstrap peers up front (so a typo'd multiaddr is a loud
         // warning, not a silent hole in discovery), and remember them to dial
@@ -1094,7 +1101,10 @@ struct NodeBehaviour {
 
 #[derive(Debug, Clone)]
 struct FrameCodec {
-    max_frame_bytes: usize,
+    /// Inbound request cap (control plane — small).
+    max_request_bytes: usize,
+    /// Inbound response cap (may carry chunk data — large).
+    max_response_bytes: usize,
 }
 
 #[async_trait]
@@ -1107,7 +1117,7 @@ impl request_response::Codec for FrameCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, self.max_frame_bytes).await
+        read_frame(io, self.max_request_bytes).await
     }
 
     async fn read_response<T>(
@@ -1118,7 +1128,7 @@ impl request_response::Codec for FrameCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, self.max_frame_bytes).await
+        read_frame(io, self.max_response_bytes).await
     }
 
     async fn write_request<T>(
@@ -1220,9 +1230,44 @@ mod tests {
         // The size gate passed (failure, if any, would be JSON parse, not size).
     }
 
+    #[tokio::test]
+    async fn codec_request_cap_is_control_sized_response_cap_is_chunk_sized() {
+        // Directional caps (review, security): an inbound REQUEST from a peer
+        // is always control-plane, so a peer must not be able to force us to
+        // allocate a 90 MiB frame that deserialization would then reject. The
+        // request cap stays at the 1 MiB control cap; the response cap (which
+        // may legitimately carry chunk data we asked for) stays large.
+        let mut codec = FrameCodec {
+            max_request_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            max_response_bytes: DEFAULT_MAX_CHUNK_MESSAGE_BYTES.max(DEFAULT_MAX_MESSAGE_BYTES),
+        };
+        let protocol = StreamProtocol::new("/decentraai/message/1");
+
+        // A chunk-sized frame (>1 MiB, <= chunk cap) as an inbound REQUEST
+        // must be rejected at the codec — no 90 MiB allocation reaches
+        // deserialization.
+        let mut big_frame = Vec::new();
+        let big_payload = vec![0u8; DEFAULT_MAX_MESSAGE_BYTES + 1];
+        write_frame(&mut big_frame, &big_payload).await.unwrap();
+        let mut slice = big_frame.as_slice();
+        assert!(
+            request_response::Codec::read_request(&mut codec, &protocol, &mut slice)
+                .await
+                .is_err(),
+            "a chunk-sized inbound request must be rejected at the codec"
+        );
+
+        // The same frame as an inbound RESPONSE is accepted at the codec
+        // (the chunk data plane is legitimately large).
+        let mut slice = big_frame.as_slice();
+        let read = request_response::Codec::read_response(&mut codec, &protocol, &mut slice)
+            .await
+            .unwrap();
+        assert_eq!(read.len(), DEFAULT_MAX_MESSAGE_BYTES + 1);
+    }
+
     #[test]
-    fn parse_bootstrap_peer_lan_and_public() {
-        // A LAN peer with trailing /p2p/<PeerId>.
+    fn parse_bootstrap_peer_lan_and_public() {        // A LAN peer with trailing /p2p/<PeerId>.
         let (peer, addr) = parse_bootstrap_peer(
             "/ip4/192.168.1.129/tcp/41873/p2p/12D3KooWNGE65ZF4rCdLx7DVcna8zp4AcR3RiWgpdR49sixmvkRs",
         )
