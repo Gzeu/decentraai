@@ -1255,6 +1255,16 @@ impl DistributedInference {
                             Some(resp.tokens_used),
                             Some(resp.processing_time_ms),
                         );
+                        // Verified-compute-economy: strict "no credit without
+                        // evidence" path. Credits ONLY when a valid SelectionTrace
+                        // exists (recorded above) — proving the worker was eligible
+                        // and the reservation succeeded. Idempotent on request_id.
+                        compute.record_evidence_credit(
+                            &request.request_id.to_string(),
+                            &placement.worker,
+                            resp.tokens_used,
+                            resp.processing_time_ms,
+                        );
                     }
                     // P5: feed the per-worker circuit breaker — a success
                     // resets the run; only a retryable failure counts toward
@@ -1568,6 +1578,16 @@ impl DistributedInference {
                             true,
                             Some(resp.tokens_used),
                             Some(resp.processing_time_ms),
+                        );
+                        // Verified-compute-economy: strict "no credit without
+                        // evidence" path (streaming). Credits ONLY when a valid
+                        // SelectionTrace exists — proving the worker was eligible
+                        // and the reservation succeeded. Idempotent on request_id.
+                        compute.record_evidence_credit(
+                            &request.request_id.to_string(),
+                            &placement.worker,
+                            resp.tokens_used,
+                            resp.processing_time_ms,
                         );
                     }
                     // P5: feed the per-worker circuit breaker (streaming path).
