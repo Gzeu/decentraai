@@ -4466,7 +4466,8 @@ async function loadConsumerKeys(){
       const q = k.account_quota || {};
       return '<tr><td><code>'+esc(k.key_id)+'</code></td><td>'+esc(k.account)+'</td><td class="num">'+k.quota_ceiling+'</td><td class="num">'+k.rate_limit_per_minute+'/min</td>'+
         '<td class="num">'+k.requests+' req · '+k.tokens_generated+' tok</td><td>'+status+'</td>'+
-        '<td>'+(k.revoked ? '' : '<button class="danger" data-id="'+esc(k.key_id)+'" onclick="revokeConsumerKey(event)">Revoke</button>')+'</td></tr>';
+        '<td>'+(k.revoked ? '' : '<button class="danger" data-id="'+esc(k.key_id)+'" onclick="revokeConsumerKey(event)">Revoke</button>')+
+        ' <button class="ghost" data-account="'+esc(k.account)+'" onclick="grantConsumerKeyQuota(event)">Grant quota</button></td></tr>';
     }).join('') || '<tr><td colspan="7" class="empty">no consumer API keys</td></tr>';
   } catch (e) {
     $('ck-list').innerHTML = '<tr><td colspan="7" class="empty">master token required (admin endpoints are gated)</td></tr>';
@@ -4493,6 +4494,18 @@ async function createConsumerKey(){
 function copyConsumerToken(){
   const el = document.getElementById('ck-new-token');
   if (el && el.textContent) navigator.clipboard.writeText(el.textContent).then(() => toast('consumer key copied'));
+}
+async function grantConsumerKeyQuota(ev){
+  const account = ev.target.dataset.account;
+  const amount = prompt('Grant quota units to ' + short(account, 20) + ':', '10000');
+  if (!amount || !parseInt(amount, 10)) return;
+  try {
+    const r = await fetch('/api/admin/quota/grant', { method: 'POST', headers: Object.assign({}, headers, { 'Content-Type': 'application/json' }), body: JSON.stringify({ account, amount: parseInt(amount, 10) }) });
+    const d = await r.json();
+    if (!r.ok) { toast((d.error && d.error.message) || 'grant failed', true); return; }
+    toast('granted ' + amount + ' quota to ' + short(account, 20));
+    loadConsumerKeys();
+  } catch (e) { toast('grant failed: ' + e, true); }
 }
 // ---- Tier suggestions (contribution -> tier, master-gated) ----
 async function loadTierSuggest(){

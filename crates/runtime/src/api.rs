@@ -4967,6 +4967,11 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/admin/consumer-key/list",
             get(admin_consumer_key_list_handler),
         )
+        // Q2b - Quota management (master-gated; grant quota to consumer accounts)
+        .route(
+            "/api/admin/quota/grant",
+            post(admin_quota_grant_handler),
+        )
         // P3/M10 - Worker trust + audit events (master-gated control plane)
         .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
         .route(
@@ -6086,7 +6091,49 @@ async fn shadow_handler(
     }
 }
 
-/// POST /v1/tts — synthesize speech for the dashboard chat speak button.
+/// POST /api/admin/quota/grant — pre-credit quota to a consumer account.
+/// Master token only. Body: `{"account": "...", "amount": 10000}`.
+/// Credits the account directly (idempotent on ref_id via the ledger).
+async fn admin_quota_grant_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(ledger) = &state.quota_ledger else {
+        return forbidden("quota ledger is not attached");
+    };
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return forbidden("invalid JSON"),
+    };
+    let account = match req.get("account").and_then(|v| v.as_str()) {
+        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ => return forbidden("missing account"),
+    };
+    let amount = req
+        .get("amount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if amount == 0 {
+        return forbidden("amount must be > 0");
+    }
+    let ref_id = format!("admin-grant-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0));
+    let mut l = ledger.lock().unwrap();
+    let credited = l.credit(&account, &ref_id, Some(amount as u32), None);
+    drop(l);
+    tracing::info!(account, amount, credited, "admin granted quota to consumer account");
+    (
+        StatusCode::OK,
+        serde_json::json!({"account": account, "amount": amount, "credited": credited}).to_string(),
+    )
+        .into_response()
+}
 /// Body: `{"text": "...", "voice": "ro_RO-raluca-high"?, "speed": 1.0?}`. Returns a
 /// 16-bit mono 24 kHz WAV when TTS is enabled. Auth: any valid token
 /// (same gate as inference) plus the tier rate limit — voice synthesis burns
