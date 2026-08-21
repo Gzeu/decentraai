@@ -1982,6 +1982,64 @@ impl ComputeManager {
         Some((result.plan, worker, result.estimated_ms))
     }
 
+    /// Captures a durable golden case from the LIVE fabric state (observe-only
+    /// dry-run): the real `RequestFacts` + `WorkerFacts` this coordinator would
+    /// plan for, plus the golden `SelectionTrace` the live planner produced.
+    /// Read-only; never reserves or mutates state.
+    ///
+    /// This is the bridge between synthetic golden tests (which prove
+    /// properties) and production behavior: cases captured here come from REAL
+    /// advertisements → REAL `WorkerFacts` → the live planner. The unified
+    /// selector must reproduce them (`GoldenSuite`).
+    pub async fn capture_golden_case(
+        &self,
+        request_id: &str,
+        model_hash: &str,
+        prompt_tokens: u32,
+        session_id: Option<&str>,
+        priority: u8,
+    ) -> Option<decentraai_fabric::GoldenCase> {
+        let req = self.requirements_for(model_hash).await?;
+        let facts = self.fabric_facts(model_hash).await;
+        if facts.is_empty() {
+            return None;
+        }
+        let (is_continuation, prefix_resident_on) = match session_id {
+            Some(sid) => match self.session_residency(sid) {
+                Some(w) => (true, Some(w.to_string())),
+                None => (false, None),
+            },
+            None => (false, None),
+        };
+        let rfacts = decentraai_fabric::RequestFacts {
+            model_hash: req.model_hash.clone(),
+            est_ram_mb: req.est_ram_mb,
+            est_vram_mb: req.est_vram_mb,
+            context: decentraai_fabric::ContextProfile {
+                prompt_tokens,
+                max_output_tokens: req.max_tokens,
+                is_continuation,
+                prefix_resident_on,
+            },
+            transfer_mib: 0,
+            local_peer: Some(self.local_peer.to_string()),
+            priority,
+            required_capability: req.required_capability.clone(),
+            capability_claims: self.capability_claims_for_model(model_hash),
+        };
+        let planner = decentraai_fabric::ExecutionPlanner {
+            network: self.network.lock().unwrap().clone(),
+            allow_multi_stage: true,
+            ..Default::default()
+        };
+        Some(decentraai_fabric::GoldenCase::capture(
+            request_id,
+            &rfacts,
+            &facts,
+            &planner,
+        ))
+    }
+
     /// The scheduler's best placement that is NOT this coordinator
     /// (a routed request must never be sent to the local node over P2P).
     async fn select_pub_remote(&self, req: &WorkloadRequirements) -> Option<Placement> {
@@ -3679,6 +3737,81 @@ mod tests {
         assert_eq!(trace.reserved_worker, None);
         assert_eq!(trace.reservation_id, None);
         assert_eq!(trace.outcome, "");
+    }
+
+    #[tokio::test]
+    async fn capture_golden_case_from_real_fabric_state_is_reproduced_by_unified_selector() {
+        // Stage 3, real-trace capture: golden cases captured from the LIVE
+        // fabric state (real advertisements -> real WorkerFacts -> live
+        // planner) must be reproduced by the UnifiedSelector. Synthetic corpus
+        // proves properties; this proves the unified model covers production
+        // behavior.
+        let local = peer();
+        let worker = peer();
+        let untrusted = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        )).await;
+        // An untrusted candidate with better nominal perf: must be rejected by
+        // BOTH selectors (gate equivalence on real state).
+        manager.process_advertisement(build_advertisement(
+            untrusted,
+            "untrusted-fast",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            false,
+            0,
+            LivePerf::default(),
+        )).await;
+        manager.record_rtt(&worker, 2_000, 1_000);
+
+        let case = manager
+            .capture_golden_case("golden-real-1", "abc", 200, None, 0)
+            .await
+            .expect("real fabric state must yield a golden case");
+
+        // The golden trace reflects the real gates: untrusted rejected.
+        assert!(
+            case.golden
+                .rejected
+                .iter()
+                .any(|r| r.peer_id == untrusted.to_string()),
+            "untrusted worker must be in the golden rejections"
+        );
+        assert_eq!(
+            case.golden.selected_worker.as_deref(),
+            Some(worker.to_string().as_str())
+        );
+
+        // The unified selector must reproduce it — and the JSONL round trip
+        // (durable capture) must replay to the same verdict. The unified
+        // selector mirrors the coordinator's live network graph so
+        // network-sensitive scoring is comparable.
+        let line = case.to_json_line().unwrap();
+        let replayed = decentraai_fabric::GoldenCase::from_json_line(&line).unwrap();
+        let unified = decentraai_fabric::UnifiedSelector {
+            network: manager.network_graph(),
+            ..decentraai_fabric::UnifiedSelector::default()
+        };
+        let report = decentraai_fabric::GoldenSuite::run(&[replayed], &unified);
+        assert!(
+            report.equivalent,
+            "unified selector must reproduce the REAL golden decision: {:?}",
+            report.divergences
+        );
     }
 
     #[tokio::test]

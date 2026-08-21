@@ -38,6 +38,7 @@ pub mod kv;
 pub mod network;
 pub mod plan;
 pub mod planner;
+pub mod unified;
 
 pub use advisory::{
     FanOutAdvisory, ReplanDecision, fan_out_candidacy, rebalance_advisory, replan_decision,
@@ -64,4 +65,7 @@ pub use planner::{
     CandidateScore, ExecutionPlanner, NormalizedMetrics, PlanResult, PlannerConfig,
     PlannerRationale, RejectedCandidate, RequestFacts, ScoringWeights, SelectionTrace,
     WorkerFacts, base_score,
+};
+pub use unified::{
+    Divergence, GoldenCase, GoldenReport, GoldenSuite, UnifiedSelection, UnifiedSelector,
 };

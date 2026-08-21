@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A candidate worker the planner can place stages on.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable so a `GoldenCase` (request + workers + golden
+/// `SelectionTrace`) can be persisted and replayed anywhere — the durable
+/// golden-decision substrate for the unified-selector equivalence proof.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerFacts {
     pub peer_id: String,
     pub trusted: bool,
@@ -60,7 +64,9 @@ pub struct WorkerFacts {
 }
 
 /// The request facts the planner plans for.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable (see `WorkerFacts`) for durable `GoldenCase`s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestFacts {
     pub model_hash: String,
     pub est_ram_mb: u64,
@@ -672,80 +678,14 @@ impl ExecutionPlanner {
         cache_locality_worker: Option<&str>,
         cfg: &PlannerConfig,
     ) -> CandidateScore {
-        let tps_score = (f.tokens_per_second as f32 / 200.0).clamp(0.0, 1.0);
-        let latency_score = 1.0 - (f.latency_ms as f32 / 1000.0).clamp(0.0, 1.0);
-        let load_score = 1.0 - (f.load_percent as f32 / 100.0);
-        let queue_score = (1.0 - f.queue_depth as f32 / 10.0).clamp(0.0, 1.0);
-        // Priority-aware: urgent requests (priority > 0) amplify the value of a
-        // fast, unqueued worker, biasing selection toward the best available
-        // compute. At priority 0 the factor is exactly 1.0, so default behavior
-        // is unchanged.
-        let priority_on = (f32::from(req.priority) / 255.0).clamp(0.0, 1.0);
-        let priority_boost = 1.0 + 0.5 * priority_on;
-        let headroom = if req.est_ram_mb > 0 {
-            (f.available_ram_mb as f64 / req.est_ram_mb as f64).min(1.0) as f32
-        } else {
-            1.0
-        };
-        // Network: prefer workers that are cheaper to reach.
-        let link = self.network.get(&f.peer_id);
-        let net_score = self.network_score(&link);
-        // KV: boost workers with headroom when the request is KV-hungry.
-        let kv_score = if prefer_kv_headroom {
-            match f.kv.headroom_tokens() {
-                Some(h) if h >= req.context.total_slots() => 0.2,
-                _ => 0.0,
-            }
-        } else {
-            0.0
-        };
-        // KV locality (M20): for a continuation whose prefix is resident on a
-        // specific worker, steer back to that worker — a cold prefill on
-        // another worker would re-ingest the whole prefix. Only the prefix
-        // host scores here; every other worker gets 0.
-        let locality_score = match cache_locality_worker {
-            Some(host) if host == f.peer_id => 1.0,
-            _ => 0.0,
-        };
-
-        let total = (cfg.w_tps * tps_score as f64
-            + cfg.w_latency * (latency_score * priority_boost) as f64
-            + cfg.w_load * load_score as f64
-            + cfg.w_queue * (queue_score * priority_boost) as f64
-            + cfg.w_headroom * headroom as f64
-            + cfg.w_net * net_score as f64
-            + cfg.w_kv * kv_score as f64
-            + cfg.w_locality * locality_score as f64) as f32;
-
-        CandidateScore {
-            peer_id: f.peer_id.clone(),
-            total,
-            tps: tps_score,
-            latency: latency_score,
-            load: load_score,
-            queue: queue_score,
-            headroom,
-            net: net_score,
-            kv: kv_score,
-            locality: locality_score,
-            perf_measured: f.perf_measured,
-        }
-    }
-
-    fn network_score(&self, link: &LinkMetrics) -> f32 {
-        let rtt_ms = link.rtt_us / 1000;
-        let rtt_score = (1.0 - (rtt_ms as f32 / 200.0)).clamp(0.0, 1.0);
-        let base = rtt_score * 0.7 + (if link.bandwidth_mbps >= 100 { 0.3 } else { 0.1 });
-        // P2 NetworkFacts: fold jitter/packet-loss stability into the network
-        // score ONLY when measured. (None, None) is neutral (1.0) so links
-        // that only carry RTT keep the exact pre-P2 score; a measured bad
-        // link loses up to 30% of its network score, so a flaky link loses to
-        // a clean one at equal RTT/bandwidth.
-        let stability_factor = match (link.jitter_us, link.packet_loss_percent) {
-            (None, None) => 1.0,
-            _ => 0.7 + 0.3 * link.stability() as f32,
-        };
-        base * stability_factor
+        score_candidate(
+            &self.network,
+            cfg,
+            f,
+            req,
+            prefer_kv_headroom,
+            cache_locality_worker,
+        )
     }
 
     /// Builds deterministic fallback worker orders (ranked, minus already used).
@@ -762,6 +702,85 @@ impl ExecutionPlanner {
         }
         orders
     }
+}
+
+/// Shared, pure worker-scoring primitive — the single source of truth for the
+/// composite score formula. Used by BOTH the live `ExecutionPlanner` and the
+/// `UnifiedSelector`, so the two can never diverge on scoring (no float
+/// drift). Deterministic: a pure function of its inputs.
+pub(crate) fn score_candidate(
+    network: &NetworkGraph,
+    cfg: &PlannerConfig,
+    f: &WorkerFacts,
+    req: &RequestFacts,
+    prefer_kv_headroom: bool,
+    cache_locality_worker: Option<&str>,
+) -> CandidateScore {
+    let tps_score = (f.tokens_per_second as f32 / 200.0).clamp(0.0, 1.0);
+    let latency_score = 1.0 - (f.latency_ms as f32 / 1000.0).clamp(0.0, 1.0);
+    let load_score = 1.0 - (f.load_percent as f32 / 100.0);
+    let queue_score = (1.0 - f.queue_depth as f32 / 10.0).clamp(0.0, 1.0);
+    // Priority-aware: urgent requests (priority > 0) amplify the value of a
+    // fast, unqueued worker. At priority 0 the factor is exactly 1.0.
+    let priority_on = (f32::from(req.priority) / 255.0).clamp(0.0, 1.0);
+    let priority_boost = 1.0 + 0.5 * priority_on;
+    let headroom = if req.est_ram_mb > 0 {
+        (f.available_ram_mb as f64 / req.est_ram_mb as f64).min(1.0) as f32
+    } else {
+        1.0
+    };
+    let link = network.get(&f.peer_id);
+    let net_score = network_score(&link);
+    let kv_score = if prefer_kv_headroom {
+        match f.kv.headroom_tokens() {
+            Some(h) if h >= req.context.total_slots() => 0.2,
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let locality_score = match cache_locality_worker {
+        Some(host) if host == f.peer_id => 1.0,
+        _ => 0.0,
+    };
+
+    let total = (cfg.w_tps * tps_score as f64
+        + cfg.w_latency * (latency_score * priority_boost) as f64
+        + cfg.w_load * load_score as f64
+        + cfg.w_queue * (queue_score * priority_boost) as f64
+        + cfg.w_headroom * headroom as f64
+        + cfg.w_net * net_score as f64
+        + cfg.w_kv * kv_score as f64
+        + cfg.w_locality * locality_score as f64) as f32;
+
+    CandidateScore {
+        peer_id: f.peer_id.clone(),
+        total,
+        tps: tps_score,
+        latency: latency_score,
+        load: load_score,
+        queue: queue_score,
+        headroom,
+        net: net_score,
+        kv: kv_score,
+        locality: locality_score,
+        perf_measured: f.perf_measured,
+    }
+}
+
+/// Shared, pure network-score primitive (M19 + P2 stability). Deterministic.
+pub(crate) fn network_score(link: &LinkMetrics) -> f32 {
+    let rtt_ms = link.rtt_us / 1000;
+    let rtt_score = (1.0 - (rtt_ms as f32 / 200.0)).clamp(0.0, 1.0);
+    let base = rtt_score * 0.7 + (if link.bandwidth_mbps >= 100 { 0.3 } else { 0.1 });
+    // Fold jitter/packet-loss stability into the network score ONLY when
+    // measured. (None, None) is neutral (1.0); a measured bad link loses up to
+    // 30% of its network score.
+    let stability_factor = match (link.jitter_us, link.packet_loss_percent) {
+        (None, None) => 1.0,
+        _ => 0.7 + 0.3 * link.stability() as f32,
+    };
+    base * stability_factor
 }
 
 /// Resolves a capability requirement against a caller-supplied set of real
@@ -1057,14 +1076,13 @@ mod tests {
     fn p2_network_score_is_neutral_when_jitter_loss_unmeasured() {
         // Regression: a link with only RTT (the live M19 case) must keep the
         // exact pre-P2 network score — (None, None) is neutral, not a penalty.
-        let planner = ExecutionPlanner::default();
         let plain = LinkMetrics::prior(crate::network::Locality::Lan, Some(1_000));
         let clean = LinkMetrics {
             jitter_us: Some(0),
             packet_loss_percent: Some(0.0),
             ..plain
         };
-        assert_eq!(planner.network_score(&plain), planner.network_score(&clean));
+        assert_eq!(network_score(&plain), network_score(&clean));
         // And a measured flaky link scores strictly below the neutral one.
         let flaky = LinkMetrics {
             jitter_us: Some(40_000),
@@ -1072,7 +1090,7 @@ mod tests {
             ..plain
         };
         assert!(
-            planner.network_score(&flaky) < planner.network_score(&plain),
+            network_score(&flaky) < network_score(&plain),
             "flaky link must lose to a plain link at equal RTT"
         );
     }
