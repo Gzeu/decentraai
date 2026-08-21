@@ -1880,6 +1880,24 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 let ex = ex.clone();
                 async move { ex.execute(&task, &inputs).await }
             });
+            // P7 policy gate wiring (review): the agent's declared policy is
+            // enforced before any delegated task executes — model allowlist
+            // (check_model) + working state. An agent with an empty allowlist
+            // may use any node-served model; a denied task is answered with a
+            // policy error, never executed.
+            let policy_record = agent.clone();
+            agent_runtime.with_policy_gate(move |task| {
+                let policy = decentraai_agents::policy_engine();
+                if let Some(wl) = &task.required_workload {
+                    match policy.check_model(&policy_record, &wl.model_hash) {
+                        decentraai_agents::PolicyDecision::Allow => {}
+                        decentraai_agents::PolicyDecision::Deny { reason } => {
+                            return Err(reason);
+                        }
+                    }
+                }
+                Ok(())
+            });
             tokio::spawn(async move { agent_runtime.run_forever().await });
         }
         info!(

@@ -48,6 +48,13 @@ pub type AgentExecutor = dyn Fn(
     + Send
     + Sync;
 
+/// Optional policy gate (P7 wiring): called with the delegated task BEFORE
+/// the executor runs. Returning `Err(reason)` refuses the task (the delegate
+/// is answered with a policy error, never executed). The caller supplies a
+/// closure over the agent's `AgentRecord` + `PolicyEngine` so
+/// "Agent Power ≠ Permission" is enforced on the real execution path.
+pub type AgentPolicyGate = dyn Fn(&AgentTask) -> Result<(), String> + Send + Sync;
+
 /// The outcome of processing one delegated message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutedMessage {
@@ -65,6 +72,8 @@ pub struct AgentRuntime {
     agent_id: String,
     messenger: Arc<AgentMessenger>,
     executor: Option<Arc<AgentExecutor>>,
+    /// Optional P7 policy gate checked before every Delegate executes.
+    policy_gate: Option<Arc<AgentPolicyGate>>,
     poll_interval: Duration,
 }
 
@@ -75,8 +84,20 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             messenger,
             executor: None,
+            policy_gate: None,
             poll_interval: Duration::from_millis(50),
         }
+    }
+
+    /// Attaches the policy gate (P7). When set, every Delegate is checked
+    /// before execution; a denied task is answered with a policy error and
+    /// the executor is never invoked.
+    pub fn with_policy_gate<F>(&mut self, gate: F) -> &mut Self
+    where
+        F: Fn(&AgentTask) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.policy_gate = Some(Arc::new(gate));
+        self
     }
 
     /// Attaches the executor that actually performs the work.
@@ -121,6 +142,34 @@ impl AgentRuntime {
         };
         let task = AgentTask::new(&task_id);
         let inputs = msg.payload.unwrap_or(serde_json::Value::Null);
+        // P7 policy gate: the agent's declared policy is enforced BEFORE any
+        // execution ("Agent Power ≠ Permission"). A denied task is answered
+        // with a policy error and the executor is never invoked.
+        if let Some(gate) = &self.policy_gate {
+            if let Err(reason) = gate(&task) {
+                tracing::warn!(agent = %self.agent_id, task = %task_id, reason = %reason, "delegate denied by policy");
+                let reply = AgentMessage::new(
+                    format!("reply-{task_id}"),
+                    self.agent_id(),
+                    "orchestrator",
+                    MessageKind::Reply,
+                )
+                .with_task(&task_id)
+                .with_payload(serde_json::json!({ "error": format!("policy denied: {reason}") }))
+                .with_created_at_ms(now_ms());
+                let reply_peer: libp2p::PeerId = msg
+                    .from_peer
+                    .as_deref()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("delegate from '{}' has no reply peer", msg.from_agent)
+                    })?;
+                self.messenger.send(reply_peer, reply).await.with_context(|| {
+                    format!("sending policy-denial reply for '{task_id}'")
+                })?;
+                return Ok(Some(ExecutedMessage::Replied { task_id }));
+            }
+        }
         // Where to reply: the delegating peer recorded by the orchestrator.
         let reply_peer: libp2p::PeerId = msg
             .from_peer
@@ -543,6 +592,69 @@ mod tests {
         assert!(!runtime.can_execute());
         runtime.with_executor(|_t, _i| async move { Ok(serde_json::Value::Null) });
         assert!(runtime.can_execute());
+    }
+
+    #[tokio::test]
+    async fn policy_gate_denies_before_executor_runs() {
+        // P7 wiring regression: a policy gate that denies a task must prevent
+        // the executor from running and answer the delegate with a policy
+        // error. "Agent Power ≠ Permission" is enforced on the real path.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // A messenger with a REAL transport so the policy-denial reply can be
+        // self-delivered (no libp2p self-dial needed).
+        let identity = Identity::generate();
+        let node = P2PNode::new(
+            &identity,
+            decentraai_p2p::DEFAULT_MAX_MESSAGE_BYTES,
+            decentraai_p2p::DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap();
+        let local = node.local_peer_id();
+        let messenger = Arc::new(AgentMessenger::new(node));
+
+        let mut runtime = AgentRuntime::new("a:1", messenger.clone());
+        let executed = StdArc::new(AtomicBool::new(false));
+        {
+            let executed = executed.clone();
+            runtime.with_executor(move |_t, _i| {
+                let executed = executed.clone();
+                async move {
+                    executed.store(true, Ordering::SeqCst);
+                    Ok(serde_json::Value::Null)
+                }
+            });
+        }
+        // Gate denies everything (e.g. model not in the agent's allowlist).
+        runtime.with_policy_gate(|_task| Err("model 'x' is not in the agent's allowlist".into()));
+
+        messenger.push_inbound(
+            AgentMessage::new("m", "orch", "a:1", MessageKind::Delegate)
+                .with_from_peer(local.to_string()),
+        );
+        let result = runtime.process_one().await.unwrap();
+        assert_eq!(
+            result,
+            Some(ExecutedMessage::Replied { task_id: "untracked".to_string() }),
+            "a policy-denied delegate is answered, not executed"
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "the executor must never run for a policy-denied task"
+        );
+        // The orchestrator received a policy error reply (self-delivered).
+        let reply = messenger.pop("orchestrator").unwrap();
+        assert_eq!(reply.kind, MessageKind::Reply);
+        assert!(
+            reply
+                .payload
+                .unwrap_or_default()
+                .to_string()
+                .contains("policy denied"),
+            "the reply must carry the policy reason"
+        );
     }
 
     // ---- InferenceAgentExecutor: input → request (pure, no network) ----
