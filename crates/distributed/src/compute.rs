@@ -801,6 +801,84 @@ impl ComputeManager {
         true
     }
 
+    /// Verified-compute-economy credit primitive: credits a worker ONLY when a
+    /// valid `SelectionTrace` (evidence of eligibility) exists for the
+    /// execution. Returns the credits earned, or `0` when the trace is
+    /// absent/invalid — **no implicit fallback, no default credit**. The
+    /// underlying ledger is idempotent on `request_id` (ref_id), so replay,
+    /// restart and duplicate executions never double-credit.
+    ///
+    /// This is the strict "no credit without evidence" path: a credit is only
+    /// valid when the execution can demonstrate WHY it was eligible (trusted,
+    /// healthy, serves the model, selected by the planner). It is additive —
+    /// the legacy `record_credited_contribution` path is unchanged.
+    pub fn record_evidence_credit(
+        &self,
+        request_id: &str,
+        peer: &PeerId,
+        tokens_used: u32,
+        processing_time_ms: u32,
+    ) -> u64 {
+        // Evidence gate: no valid SelectionTrace for this execution -> zero
+        // credit. The trace must show an eligible, planner-selected worker.
+        let trace = self
+            .recent_traces
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.request_id == request_id)
+            .cloned();
+        let Some(trace) = trace else {
+            tracing::warn!(request_id, peer = %peer.to_string(), "credit refused: no selection trace (evidence) for execution");
+            return 0;
+        };
+        if trace.selected_worker.is_none() || trace.ranked.is_empty() {
+            tracing::warn!(request_id, "credit refused: selection trace has no eligible worker");
+            return 0;
+        }
+        // The credited worker must be the one the trace selected/reserved.
+        if trace
+            .reserved_worker
+            .as_deref()
+            .map(|w| w != peer.to_string())
+            .unwrap_or(true)
+        {
+            tracing::warn!(request_id, "credit refused: worker not the reserved worker in the trace");
+            return 0;
+        }
+        // Idempotent credit (ref_id = request_id) — replay/duplicate returns 0.
+        use decentraai_compute::{ResourceContributionBuilder, ResourceDimension};
+        let rc = ResourceContributionBuilder::new(request_id, peer.to_string())
+            .capability("inference")
+            .success(true)
+            .dimension(ResourceDimension::new(
+                "tokens_processed",
+                f64::from(tokens_used),
+                "tokens",
+            ))
+            .dimension(ResourceDimension::new(
+                "execution_duration_ms",
+                f64::from(processing_time_ms),
+                "ms",
+            ))
+            .build();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut credits = self.credits.lock().unwrap();
+        let amount = credits.credit(&peer.to_string(), &rc, request_id, now);
+        drop(credits);
+        if amount > 0 {
+            let mut state = self.contribution_state.lock().unwrap();
+            state.record_execution(&rc, amount);
+            drop(state);
+            self.persist_credits();
+            self.persist_contribution();
+        }
+        amount
+    }
+
     /// Snapshot of the real measured contribution that has earned credit
     /// (deduped). Read-only, for observability.
     pub fn measured_contribution(&self) -> MeasuredContribution {
@@ -1336,6 +1414,16 @@ impl ComputeManager {
         let worker_balance = credit_event
             .as_ref()
             .and_then(|ev| self.credit_account(&ev.account));
+        // The SelectionTrace (decision trace) for this execution — the
+        // evidence of WHY it was eligible (candidates, rejection reasons,
+        // scoring, selected worker). Observe-only; never affects routing.
+        let selection_trace = self
+            .recent_traces
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.request_id == execution_id)
+            .cloned();
         if execution.is_none() && credit_event.is_none() {
             return None;
         }
@@ -1344,6 +1432,7 @@ impl ComputeManager {
             execution,
             credit_event,
             worker_balance,
+            selection_trace,
             chain_complete: true,
         })
     }
@@ -2676,6 +2765,10 @@ pub struct EvidenceChain {
     pub execution: Option<ExecutedPlan>,
     pub credit_event: Option<decentraai_compute::CreditEvent>,
     pub worker_balance: Option<decentraai_compute::CreditAccount>,
+    /// The deterministic decision trace (SelectionTrace) for this execution —
+    /// evidence of WHY it was eligible (candidates, rejection reasons, scoring,
+    /// selected worker). `None` when no trace was recorded for the execution.
+    pub selection_trace: Option<decentraai_fabric::SelectionTrace>,
     /// True when both the execution record and its credit event exist (the
     /// full chain from task → execution → receipt → credits is present).
     pub chain_complete: bool,
@@ -3072,6 +3165,235 @@ mod tests {
 
         // Unknown id: no chain.
         assert!(manager.evidence_chain("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn evidence_chain_includes_selection_trace() {
+        // Stage 2 delta: the evidence chain must carry the deterministic
+        // SelectionTrace for the execution, so an operator can demonstrate WHY
+        // the execution was eligible (candidates, rejection reasons, scoring,
+        // selected worker) — not just that a worker got credits.
+        let dir = tempfile::tempdir().unwrap();
+        let credits_path = dir.path().join("db/credits.json");
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_credits_path(Some(credits_path.clone()));
+
+        let worker = peer();
+        // Record a SelectionTrace for this execution (as route_request_inner does).
+        let trace = decentraai_fabric::SelectionTrace {
+            request_id: "exec-trace".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec![worker.to_string()],
+            rejected: vec![],
+            ranked: vec![decentraai_fabric::CandidateScore {
+                peer_id: worker.to_string(),
+                total: 0.9,
+                tps: 0.8,
+                latency: 0.9,
+                load: 0.9,
+                queue: 1.0,
+                headroom: 1.0,
+                net: 0.8,
+                kv: 0.0,
+                locality: 0.0,
+                perf_measured: true,
+            }],
+            selected_worker: Some(worker.to_string()),
+            reserved_worker: Some(worker.to_string()),
+            reservation_id: Some("res-1".into()),
+            outcome: "succeeded".into(),
+            attempt: 0,
+        };
+        manager.record_selection_trace(trace.clone());
+        manager.record_credited_contribution(&worker, "exec-trace", true, Some(30), Some(100));
+
+        let chain = manager.evidence_chain("exec-trace").expect("chain must exist");
+        assert!(chain.chain_complete);
+        let chain_trace = chain
+            .selection_trace
+            .expect("selection trace must be linked into the chain");
+        assert_eq!(chain_trace, trace);
+        assert_eq!(chain_trace.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        assert_eq!(chain_trace.ranked.len(), 1);
+        // The chain links execution -> selection trace -> credit event.
+        let credit = chain.credit_event.expect("credit event present");
+        assert_eq!(credit.execution_id, "exec-trace");
+        assert!(credit.amount > 0);
+    }
+
+    #[tokio::test]
+    async fn record_evidence_credit_requires_valid_trace() {
+        // Stage 2 rule: "no credit without evidence". A credit is only valid
+        // when a valid SelectionTrace (evidence of eligibility) exists for the
+        // execution. Absent/invalid trace -> zero credit, no implicit fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let credits_path = dir.path().join("db/credits.json");
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_credits_path(Some(credits_path.clone()));
+
+        let worker = peer();
+        // No trace at all -> zero credit.
+        assert_eq!(
+            manager.record_evidence_credit("no-trace", &worker, 30, 100),
+            0,
+            "credit without evidence must be refused"
+        );
+        assert!(manager.credit_account(&worker.to_string()).is_none());
+
+        // Invalid trace (no eligible worker selected) -> zero credit.
+        let invalid = decentraai_fabric::SelectionTrace {
+            request_id: "invalid".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec![],
+            rejected: vec![],
+            ranked: vec![],
+            selected_worker: None,
+            reserved_worker: None,
+            reservation_id: None,
+            outcome: "succeeded".into(),
+            attempt: 0,
+        };
+        manager.record_selection_trace(invalid);
+        assert_eq!(
+            manager.record_evidence_credit("invalid", &worker, 30, 100),
+            0,
+            "invalid trace must not credit"
+        );
+
+        // Valid trace (eligible, reserved worker) -> credit.
+        let valid = decentraai_fabric::SelectionTrace {
+            request_id: "valid".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec![worker.to_string()],
+            rejected: vec![],
+            ranked: vec![decentraai_fabric::CandidateScore {
+                peer_id: worker.to_string(),
+                total: 0.9,
+                tps: 0.8,
+                latency: 0.9,
+                load: 0.9,
+                queue: 1.0,
+                headroom: 1.0,
+                net: 0.8,
+                kv: 0.0,
+                locality: 0.0,
+                perf_measured: true,
+            }],
+            selected_worker: Some(worker.to_string()),
+            reserved_worker: Some(worker.to_string()),
+            reservation_id: Some("res-2".into()),
+            outcome: "succeeded".into(),
+            attempt: 0,
+        };
+        manager.record_selection_trace(valid);
+        let amount = manager.record_evidence_credit("valid", &worker, 30, 100);
+        assert!(amount > 0, "valid evidence-backed credit must earn credits");
+        assert_eq!(
+            manager.credit_account(&worker.to_string()).unwrap().balance,
+            amount
+        );
+    }
+
+    #[tokio::test]
+    async fn record_evidence_credit_is_idempotent_and_survives_restart() {
+        // Stage 2 rule: idempotency everywhere. Duplicate execution, replay
+        // and restart must never double-credit the evidence-backed ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let credits_path = dir.path().join("db/credits.json");
+        let manager = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        manager.set_credits_path(Some(credits_path.clone()));
+
+        let worker = peer();
+        let trace = decentraai_fabric::SelectionTrace {
+            request_id: "exec-idem".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec![worker.to_string()],
+            rejected: vec![],
+            ranked: vec![decentraai_fabric::CandidateScore {
+                peer_id: worker.to_string(),
+                total: 0.9,
+                tps: 0.8,
+                latency: 0.9,
+                load: 0.9,
+                queue: 1.0,
+                headroom: 1.0,
+                net: 0.8,
+                kv: 0.0,
+                locality: 0.0,
+                perf_measured: true,
+            }],
+            selected_worker: Some(worker.to_string()),
+            reserved_worker: Some(worker.to_string()),
+            reservation_id: Some("res-3".into()),
+            outcome: "succeeded".into(),
+            attempt: 0,
+        };
+        manager.record_selection_trace(trace);
+        let first = manager.record_evidence_credit("exec-idem", &worker, 30, 100);
+        assert!(first > 0);
+        let balance = manager.credit_account(&worker.to_string()).unwrap().balance;
+
+        // Duplicate execution (same ref_id) -> no double credit.
+        let dup = manager.record_evidence_credit("exec-idem", &worker, 30, 100);
+        assert_eq!(dup, 0, "duplicate execution must not credit again");
+        assert_eq!(manager.credit_account(&worker.to_string()).unwrap().balance, balance);
+
+        // Restart over the same file -> balance restored, replay does not grow it.
+        let restarted = ComputeManager::new(peer(), "c".into(), HashSet::new());
+        restarted.set_credits_path(Some(credits_path.clone()));
+        assert_eq!(
+            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            balance,
+            "restart must restore the exact balance"
+        );
+        // Replay the same execution on the fresh manager (trace re-recorded) ->
+        // the persisted idempotency set blocks a second credit.
+        restarted.record_selection_trace(decentraai_fabric::SelectionTrace {
+            request_id: "exec-idem".into(),
+            model_hash: "m1".into(),
+            is_continuation: false,
+            prefix_worker: None,
+            priority: 0,
+            candidates: vec![worker.to_string()],
+            rejected: vec![],
+            ranked: vec![decentraai_fabric::CandidateScore {
+                peer_id: worker.to_string(),
+                total: 0.9,
+                tps: 0.8,
+                latency: 0.9,
+                load: 0.9,
+                queue: 1.0,
+                headroom: 1.0,
+                net: 0.8,
+                kv: 0.0,
+                locality: 0.0,
+                perf_measured: true,
+            }],
+            selected_worker: Some(worker.to_string()),
+            reserved_worker: Some(worker.to_string()),
+            reservation_id: Some("res-3".into()),
+            outcome: "succeeded".into(),
+            attempt: 0,
+        });
+        let replayed = restarted.record_evidence_credit("exec-idem", &worker, 30, 100);
+        assert_eq!(replayed, 0, "replayed execution after restart must not credit again");
+        assert_eq!(
+            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            balance,
+            "balance must not grow on replay after restart"
+        );
     }
 
     #[tokio::test]
