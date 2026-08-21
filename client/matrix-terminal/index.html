@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#030507">
+  <title>DecentraAI · Matrix Terminal</title>
+  <style>
+    :root{--bg:#030507;--panel:rgba(6,10,13,.76);--panel2:rgba(10,15,18,.86);--line:rgba(73,255,173,.18);--line2:rgba(73,255,173,.34);--green:#49ffad;--green2:#9dffd1;--cyan:#57e7ff;--text:#e7fff3;--muted:#6f8d80;--danger:#ff6687;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;--sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    *{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}body{font-family:var(--sans);overflow-x:hidden}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.12;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.02) 1px,transparent 1px);background-size:4px 4px,4px 4px;mix-blend-mode:screen}
+    .rain{position:fixed;inset:0;overflow:hidden;pointer-events:none;opacity:.16;filter:blur(.2px)}
+    .rain span{position:absolute;top:-30vh;color:var(--green);font:600 13px/1 var(--mono);writing-mode:vertical-rl;text-orientation:mixed;animation:fall linear infinite;white-space:nowrap;text-shadow:0 0 8px rgba(73,255,173,.4)}
+    @keyframes fall{to{transform:translateY(140vh)}}
+    .shell{position:relative;min-height:100vh;display:grid;place-items:center;padding:28px}
+    .client{width:min(1260px,100%);min-height:min(840px,calc(100vh - 56px));display:grid;grid-template-rows:auto 1fr auto;border:1px solid var(--line2);border-radius:24px;background:linear-gradient(180deg,rgba(4,8,10,.84),rgba(2,5,7,.92));box-shadow:0 0 0 1px rgba(87,231,255,.04),0 32px 90px rgba(0,0,0,.58),0 0 60px rgba(73,255,173,.06);backdrop-filter:blur(18px);overflow:hidden}
+    .top{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:16px 20px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(73,255,173,.055),transparent)}
+    .brand{display:flex;align-items:center;gap:12px}.glyph{width:34px;height:34px;border-radius:10px;border:1px solid var(--line2);display:grid;place-items:center;color:var(--green);font:800 18px var(--mono);box-shadow:0 0 18px rgba(73,255,173,.16),inset 0 0 16px rgba(73,255,173,.05)}
+    .brand h1{margin:0;font-size:14px;letter-spacing:.16em;text-transform:uppercase}.brand p{margin:2px 0 0;color:var(--muted);font:11px var(--mono)}
+    .status{display:flex;align-items:center;gap:9px;color:var(--muted);font:11px var(--mono);letter-spacing:.08em;text-transform:uppercase}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.status-dot.on{background:var(--green);box-shadow:0 0 12px var(--green);animation:pulse 1.8s infinite}.status-dot.bad{background:var(--danger);box-shadow:0 0 12px rgba(255,102,135,.55)}@keyframes pulse{50%{opacity:.42}}
+    .stage{position:relative;display:grid;grid-template-rows:auto 1fr auto;min-height:0}
+    .console{padding:16px 20px 0;display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.route{font:11px var(--mono);color:var(--muted)}.route b{color:var(--green2);font-weight:500}.commands{display:flex;gap:8px;flex-wrap:wrap}.commands button,.ghost{border:1px solid var(--line);background:rgba(5,10,12,.7);color:var(--muted);border-radius:10px;padding:6px 9px;font:11px var(--mono);cursor:pointer}.commands button:hover,.ghost:hover{border-color:var(--line2);color:var(--green2)}
+    .terminal{margin:14px 20px 0;min-height:0;overflow:auto;padding:20px;border:1px solid var(--line);border-radius:18px;background:radial-gradient(1000px 380px at 50% 0,rgba(73,255,173,.035),transparent 60%),linear-gradient(180deg,rgba(4,9,11,.76),rgba(1,4,5,.9));font:13px/1.7 var(--mono);scroll-behavior:smooth}
+    .line{white-space:pre-wrap;word-break:break-word}.line.system{color:var(--muted)}.line.info{color:var(--cyan)}.line.user{color:var(--green2)}.line.assistant{color:var(--text)}.line.tool{color:#d1ffd9;padding-left:12px;border-left:2px solid rgba(73,255,173,.25);margin:5px 0}.line.err{color:var(--danger)}
+    .meta{color:var(--muted);font-size:10px}.cursor{display:inline-block;width:8px;height:15px;background:var(--green);vertical-align:-2px;margin-left:2px;box-shadow:0 0 10px rgba(73,255,173,.4);animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}
+    .composer{padding:14px 20px 18px;display:grid;grid-template-columns:1fr auto;gap:10px;border-top:1px solid var(--line);background:rgba(3,7,9,.66)}
+    .prompt{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:14px;background:rgba(2,6,8,.8);padding:10px 13px;box-shadow:inset 0 0 22px rgba(73,255,173,.02)}.prompt span{color:var(--green);font:13px var(--mono)}
+    textarea{width:100%;min-height:46px;max-height:180px;resize:vertical;border:0;outline:0;background:transparent;color:var(--text);font:13px/1.5 var(--mono)}textarea::placeholder{color:#53675e}
+    .send{border:1px solid var(--line2);background:linear-gradient(135deg,rgba(73,255,173,.2),rgba(87,231,255,.11));color:var(--green2);padding:0 18px;border-radius:14px;font:600 12px var(--mono);letter-spacing:.08em;text-transform:uppercase;cursor:pointer}.send:hover{box-shadow:0 0 20px rgba(73,255,173,.16)}.send:disabled{opacity:.4;cursor:not-allowed}
+    .footer{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:9px 20px;border-top:1px solid rgba(73,255,173,.09);color:var(--muted);font:10px var(--mono)}.footer .key{color:var(--green2)}
+    .modal{position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:rgba(0,0,0,.72);backdrop-filter:blur(12px);z-index:5}.modal.hidden{display:none}.login{width:min(560px,100%);border:1px solid var(--line2);border-radius:22px;background:linear-gradient(180deg,rgba(8,15,17,.96),rgba(3,7,9,.98));box-shadow:0 40px 120px rgba(0,0,0,.72),0 0 50px rgba(73,255,173,.06);padding:28px}.login h2{margin:0;font-size:18px;letter-spacing:.14em;text-transform:uppercase}.login p{color:var(--muted);font-size:12px;line-height:1.7;margin:10px 0 22px}.login label{display:block;color:var(--green2);font:11px var(--mono);margin-bottom:8px}.field{display:flex;gap:8px}.field input{flex:1;min-width:0;border:1px solid var(--line);background:rgba(1,4,5,.85);color:var(--text);border-radius:12px;padding:12px;font:13px var(--mono);outline:0}.field input:focus{border-color:var(--line2);box-shadow:0 0 0 3px rgba(73,255,173,.06)}.login button{border:1px solid var(--line2);background:rgba(73,255,173,.12);color:var(--green2);border-radius:12px;padding:0 18px;font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.1em;cursor:pointer}.login .tiny{margin-top:14px;color:#506157;font:10px/1.6 var(--mono)}.error{color:var(--danger);font:11px var(--mono);min-height:17px;margin-top:10px}
+    .pulse-ring{position:absolute;width:180px;height:180px;border:1px solid rgba(73,255,173,.06);border-radius:50%;left:50%;top:45%;transform:translate(-50%,-50%);box-shadow:0 0 90px rgba(73,255,173,.025);pointer-events:none}.pulse-ring:before,.pulse-ring:after{content:"";position:absolute;inset:15%;border:1px dashed rgba(87,231,255,.06);border-radius:50%;animation:spin 18s linear infinite}.pulse-ring:after{inset:30%;animation-duration:11s;animation-direction:reverse}@keyframes spin{to{transform:rotate(360deg)}}
+    @media (max-width:900px){.shell{padding:10px}.client{min-height:calc(100vh - 20px);border-radius:16px}.top{padding:14px}.console{padding:12px 14px}.terminal{margin:10px 14px 0;padding:14px}.composer{padding:10px 14px 14px;grid-template-columns:1fr}.send{height:48px}.footer{padding:8px 14px;flex-wrap:wrap}.status{display:none}}
+    @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;scroll-behavior:auto!important}}
+  </style>
+</head>
+<body>
+  <div class="rain" aria-hidden="true"></div>
+  <div class="shell">
+    <main class="client" aria-label="DecentraAI Matrix Terminal">
+      <header class="top">
+        <div class="brand"><div class="glyph">D</div><div><h1>DecentraAI</h1><p>matrix terminal · agent interface</p></div></div>
+        <div class="status"><span class="status-dot" id="statusDot"></span><span id="statusText">AUTH REQUIRED</span></div>
+      </header>
+      <section class="stage">
+        <div class="console"><div class="route">endpoint <b id="endpointLabel"></b><br>mode <b>OpenAI-compatible · SSE</b></div><div class="commands"><button type="button" id="clearBtn">/clear</button><button type="button" id="statusBtn">/status</button><button type="button" id="logoutBtn">/logout</button></div></div>
+        <div class="pulse-ring" aria-hidden="true"></div>
+        <div class="terminal" id="terminal" aria-live="polite"></div>
+        <form class="composer" id="composer"><div class="prompt"><span>&gt;</span><textarea id="input" autocomplete="off" placeholder="Speak to the DecentraAI agent…" aria-label="Message"></textarea></div><button class="send" id="sendBtn" type="submit">Transmit</button></form>
+      </section>
+      <footer class="footer"><span>session <span class="key" id="sessionLabel">offline</span></span><span>tool calls <span class="key" id="toolCount">0</span></span><span>model <span class="key" id="modelLabel">auto</span></span></footer>
+    </main>
+  </div>
+
+  <div class="modal" id="loginModal">
+    <form class="login" id="loginForm">
+      <h2>Enter the fabric</h2>
+      <p>Authenticate with a DecentraAI consumer key. The key stays in memory for this browser session and is never written to localStorage, sessionStorage, or cookies.</p>
+      <label for="apiKey">CONSUMER API KEY</label>
+      <div class="field"><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="dsk_…" required><button type="submit">Connect</button></div>
+      <div class="error" id="loginError" role="alert"></div>
+      <div class="tiny">Target: <span id="loginEndpoint"></span><br>For production, use HTTPS and the configured DecentraAI public API host.</div>
+    </form>
+  </div>
+
+  <script>
+    const CONFIG = {
+      apiBase: new URLSearchParams(location.search).get('api') || 'http://169.58.213.145/v1',
+      model: new URLSearchParams(location.search).get('model') || '',
+    };
+
+    const state = { key:null, messages:[], model:CONFIG.model||'auto', tools:0, busy:false };
+    const $ = id => document.getElementById(id);
+    $('endpointLabel').textContent = CONFIG.apiBase;
+    $('loginEndpoint').textContent = CONFIG.apiBase;
+
+    function add(text, cls='system') {
+      const row = document.createElement('div'); row.className = `line ${cls}`; row.textContent = text; $('terminal').appendChild(row); $('terminal').scrollTop=$('terminal').scrollHeight; return row;
+    }
+    function boot(){
+      add('DECENTRAAI // MATRIX CLIENT','info');
+      add('distributed intelligence terminal','system');
+      add('type /help for local commands','system');
+      add('');
+    }
+    function setStatus(on, text, bad=false){$('statusDot').className='status-dot'+(on?' on':bad?' bad':'');$('statusText').textContent=text;}
+    function setAuthenticated(key){state.key=key;$('loginModal').classList.add('hidden');$('sessionLabel').textContent='authenticated';setStatus(true,'CONNECTED');add('[auth] consumer key accepted','info');add('[link] agent channel established','system');}
+    function logout(){state.key=null;state.messages=[];$('terminal').innerHTML='';$('sessionLabel').textContent='offline';$('modelLabel').textContent='auto';setStatus(false,'AUTH REQUIRED');$('loginModal').classList.remove('hidden');$('apiKey').value='';boot();$('apiKey').focus()}
+    function localCommand(v){
+      if(v==='/clear'){ $('terminal').innerHTML=''; return true }
+      if(v==='/logout'){logout();return true}
+      if(v==='/help'){add('/clear   clear terminal','info');add('/status  show connection status','info');add('/logout  end session','info');add('Anything else is sent to the DecentraAI agent.','system');return true}
+      if(v==='/status'){add(`[status] ${state.key?'connected':'offline'} · model=${state.model} · tools=${state.tools}`,'info');return true}
+      return false;
+    }
+    function extractDelta(obj){
+      const c=obj?.choices?.[0]?.delta;
+      if(typeof c?.content==='string') return c.content;
+      return '';
+    }
+    function addTool(toolName,args){state.tools++;$('toolCount').textContent=String(state.tools);add(`[tool] ${toolName} ${args||'{}'}`,'tool')}
+    async function discoverModel(){
+      if(CONFIG.model) {$('modelLabel').textContent=CONFIG.model;state.model=CONFIG.model;return}
+      try{const r=await fetch(CONFIG.apiBase+'/models',{headers:{Authorization:`Bearer ${state.key}`}});if(!r.ok)throw new Error(`models ${r.status}`);const j=await r.json();const id=j?.data?.[0]?.id;if(id){state.model=id;$('modelLabel').textContent=id;}}
+      catch{state.model='auto';$('modelLabel').textContent='auto'}
+    }
+    async function sendMessage(text){
+      if(!state.key||state.busy)return;
+      state.busy=true;$('sendBtn').disabled=true;
+      add(`you> ${text}`,'user');state.messages.push({role:'user',content:text});
+      const row=add('agent> ','assistant');const cursor=document.createElement('span');cursor.className='cursor';row.appendChild(cursor);
+      try{
+        const body={model:state.model||CONFIG.model||'default',messages:state.messages,stream:true,tools:[{type:'function',function:{name:'get_weather',description:'Get current weather for a location',parameters:{type:'object',properties:{location:{type:'string'}},required:['location']}}}]};
+        const res=await fetch(CONFIG.apiBase+'/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${state.key}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+        if(res.status===401){add('[auth] rejected by API','err');logout();return}
+        if(!res.ok){const t=await res.text();throw new Error(`HTTP ${res.status}: ${t.slice(0,240)}`)}
+        const reader=res.body.getReader();const dec=new TextDecoder();let buf='';let answer='';let toolName='';let toolArgs='';
+        while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(/\n\n/);buf=parts.pop()||'';for(const part of parts){for(const line of part.split('\n')){if(!line.startsWith('data:'))continue;const payload=line.slice(5).trim();if(!payload||payload==='[DONE]')continue;let obj;try{obj=JSON.parse(payload)}catch{continue}
+          const delta=obj?.choices?.[0]?.delta||{};
+          if(delta.tool_calls){for(const tc of delta.tool_calls){const fn=tc?.function;if(fn?.name)toolName+=fn.name;if(typeof fn?.arguments==='string')toolArgs+=fn.arguments;}}
+          const d=extractDelta(obj);if(d){answer+=d;cursor.remove();row.appendChild(document.createTextNode(d));row.appendChild(cursor);}
+        }}}
+        cursor.remove();
+        if(toolName){addTool(toolName,toolArgs);add('[tool] execution delegated to client-integrated agent loop','system')}
+        state.messages.push({role:'assistant',content:answer||null});
+      }catch(err){cursor.remove();add(`[error] ${err.message}`,'err')}
+      finally{state.busy=false;$('sendBtn').disabled=false;$('input').focus()}
+    }
+
+    $('loginForm').addEventListener('submit',async e=>{e.preventDefault();$('loginError').textContent='';const key=$('apiKey').value.trim();if(!key.startsWith('dsk_')){$('loginError').textContent='Expected a DecentraAI consumer key starting with dsk_.';return}setAuthenticated(key);await discoverModel();$('input').focus()});
+    $('composer').addEventListener('submit',e=>{e.preventDefault();const v=$('input').value.trim();if(!v)return;$('input').value='';if(localCommand(v)){return}sendMessage(v)});
+    $('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}});
+    $('clearBtn').addEventListener('click',()=>localCommand('/clear'));$('statusBtn').addEventListener('click',()=>localCommand('/status'));$('logoutBtn').addEventListener('click',()=>localCommand('/logout'));
+
+    function buildRain(){const box=document.querySelector('.rain');const chars='01アイウエオカキクケコサシスセソABCDEFGHIJKLMNOPQRSTUVWXYZ';for(let i=0;i<34;i++){const s=document.createElement('span');s.textContent=Array.from({length:Math.floor(14+Math.random()*28)},()=>chars[Math.floor(Math.random()*chars.length)]).join('');s.style.left=(Math.random()*100)+'%';s.style.animationDuration=(9+Math.random()*18)+'s';s.style.animationDelay=(-Math.random()*18)+'s';s.style.opacity=(.35+Math.random()*.65).toFixed(2);box.appendChild(s)}}
+    buildRain();boot();setStatus(false,'AUTH REQUIRED');$('apiKey').focus();
+  </script>
+</body>
+</html>
