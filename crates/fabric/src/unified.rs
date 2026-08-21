@@ -186,11 +186,21 @@ pub struct GoldenCase {
     pub req: RequestFacts,
     pub workers: Vec<WorkerFacts>,
     pub golden: SelectionTrace,
+    /// The coordinator's live link graph at capture time. REQUIRED for a
+    /// faithful replay: the `net` score component is computed from it, so a
+    /// replay without the graph would produce ARTIFACT divergences (different
+    /// totals → different ranking) that say nothing about selector equivalence.
+    /// Cases captured before this field existed replay structure-only (the
+    /// runner marks ranking/selected as not-comparable for them).
+    #[serde(default)]
+    pub network: NetworkGraph,
 }
 
 impl GoldenCase {
     /// Captures the golden decision from the live `ExecutionPlanner` for a
     /// scenario. This is the source of truth for the equivalence proof.
+    /// Carries the planner's link graph so the replay can reproduce the `net`
+    /// score component exactly.
     pub fn capture(
         request_id: &str,
         req: &RequestFacts,
@@ -204,6 +214,7 @@ impl GoldenCase {
             req: req.clone(),
             workers: workers.to_vec(),
             golden,
+            network: planner.network.clone(),
         }
     }
 
