@@ -5938,6 +5938,15 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
 /// page is already served to anyone who can reach the port, so the token
 /// adds no secrecy here — it exists to stop *other local processes* from
 /// calling the API silently, not to hide it from the local browser.
+/// Serves the node's master token to ANY local caller.
+///
+/// Deliberate decision (documented, review finding): the embedded dashboards
+/// (v1/v2) bootstrap their Authorization header from `/v1/token` so they work
+/// out-of-the-box without the operator typing the token. This is safe ONLY
+/// because the API is bound to loopback by config validation (public binds
+/// are rejected) — the token never leaves the host. Do NOT widen this
+/// endpoint's trust model without first introducing a proper
+/// operator-authenticated bootstrap flow.
 async fn token_handler(State(state): State<ApiState>) -> Response {
     match &state.auth_token {
         Some(token) => token.to_string().into_response(),
@@ -6589,7 +6598,10 @@ async fn knowledge_receipt_handler(
 /// verified/failed execution counts, credit balances, and per-resource,
 /// per-model, per-worker, and per-time-range aggregates derived from real
 /// execution evidence.
-async fn contribution_state_handler(State(state): State<ApiState>) -> Response {
+async fn contribution_state_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6607,7 +6619,10 @@ async fn contribution_state_handler(State(state): State<ApiState>) -> Response {
 
 /// P14 — Credit balances (read-only). Returns per-account earned/consumed/
 /// balance from the receipt-backed credit ledger.
-async fn credits_balance_handler(State(state): State<ApiState>) -> Response {
+async fn credits_balance_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6631,7 +6646,10 @@ async fn credits_balance_handler(State(state): State<ApiState>) -> Response {
 
 /// P14 — Recent credit events (read-only). Bounded audit trail of who earned
 /// what, from which receipt/execution, under which policy version.
-async fn credits_events_handler(State(state): State<ApiState>) -> Response {
+async fn credits_events_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6651,7 +6669,10 @@ async fn credits_events_handler(State(state): State<ApiState>) -> Response {
 /// P14 — Verified compute history (read-only). Mirrors the recent execution
 /// trail already kept by the compute manager, surfaced as a stable projection
 /// for dashboards and agents.
-async fn verified_compute_history_handler(State(state): State<ApiState>) -> Response {
+async fn verified_compute_history_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -12352,6 +12373,22 @@ mod tests {
         assert!(graph["capability"]["nodes"].is_object() || graph["capability"].is_object());
         assert!(graph["compute"].is_object());
         assert!(graph["links"].is_object());
+
+        // The four P14 read-only endpoints must also require an operator token
+        // (they were previously unauthenticated — review finding).
+        for path in [
+            "/v1/contribution",
+            "/v1/credits/balance",
+            "/v1/credits/events",
+            "/v1/verified-compute/history",
+        ] {
+            let resp = client
+                .get(format!("http://{api}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_client_error(), "{path} must require auth");
+        }
 
         // Placement plan is available (it is a public read-only projection).
         let resp = client
