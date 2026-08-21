@@ -38,6 +38,7 @@ use crate::planner::{
     CandidateScore, ExecutionPlanner, PlannerConfig, RejectedCandidate, RequestFacts,
     SelectionTrace, WorkerFacts, score_candidate,
 };
+use serde::{Deserialize, Serialize};
 
 /// A single, consolidated worker selector. Reproduces the live fabric
 /// planner's selection path (eligibility gates + scoring + ranking + selected
@@ -175,7 +176,11 @@ pub struct UnifiedSelection {
 /// A golden decision: a request + worker corpus plus the `SelectionTrace` the
 /// CURRENT live selector (`ExecutionPlanner`) produced for it. This is the
 /// ground truth the unified selector must reproduce.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable: golden cases can be persisted (`db/golden-cases.jsonl`)
+/// and replayed anywhere — synthetic corpus proves properties; cases captured
+/// from real fabric state prove the model covers production behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoldenCase {
     pub request_id: String,
     pub req: RequestFacts,
@@ -185,7 +190,7 @@ pub struct GoldenCase {
 
 impl GoldenCase {
     /// Captures the golden decision from the live `ExecutionPlanner` for a
-    /// scenario. This is the the source of truth for the equivalence proof.
+    /// scenario. This is the source of truth for the equivalence proof.
     pub fn capture(
         request_id: &str,
         req: &RequestFacts,
@@ -200,6 +205,16 @@ impl GoldenCase {
             workers: workers.to_vec(),
             golden,
         }
+    }
+
+    /// Serializes the case to one JSON line (durable golden corpus format).
+    pub fn to_json_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+
+    /// Parses one JSON line back into a `GoldenCase` (replay).
+    pub fn from_json_line(line: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(line)
     }
 }
 
@@ -425,6 +440,364 @@ mod tests {
         );
         assert_eq!(report.divergences.len(), 0);
         assert_eq!(report.cases, scenarios.len());
+    }
+
+    #[test]
+    fn golden_suite_full_synthetic_matrix() {
+        // The full synthetic matrix: every gate, every tie-break, every
+        // boundary. The unified selector must reproduce the live planner on
+        // EVERY case — same eligible set, same rejection reasons, same
+        // ranking, same selected worker.
+        use crate::network::{LinkMetrics, Locality};
+
+        let planner = ExecutionPlanner::default();
+        let unified = UnifiedSelector::default();
+
+        // Capacity exactly at the limit: available RAM == est_ram_mb.
+        let mut at_limit = worker_facts("at_limit", 150, 60, 20);
+        at_limit.available_ram_mb = 512; // == req.est_ram_mb
+        // Capacity just under: available RAM < est_ram_mb (headroom < 1).
+        let mut under = worker_facts("under", 150, 60, 20);
+        under.available_ram_mb = 256;
+
+        // All-equal scores: identical perf/load/queue/RAM -> ranking must be
+        // decided by the PeerId asc tie-break, deterministically.
+        let equal_a = worker_facts("zzz-equal", 150, 60, 20);
+        let equal_b = worker_facts("aaa-equal", 150, 60, 20);
+        let equal_c = worker_facts("mmm-equal", 150, 60, 20);
+
+        // Multi-gate failure: one candidate failing ALL gates at once.
+        let mut multi_fail = worker_facts("multi", 200, 20, 5);
+        multi_fail.trusted = false;
+        multi_fail.healthy = false;
+        multi_fail.serves_model = false;
+
+        let scenarios: Vec<(&str, RequestFacts, Vec<WorkerFacts>)> = vec![
+            // 0 eligible workers (all filtered).
+            ("zero_eligible", req(), vec![{
+                let mut w = worker_facts("x", 200, 20, 5);
+                w.serves_model = false;
+                w
+            }]),
+            // 0 candidates at all.
+            ("no_candidates", req(), vec![]),
+            // Single candidate.
+            ("single", req(), vec![worker_facts("only", 150, 60, 20)]),
+            // Equal scores -> PeerId asc tie-break.
+            ("peerid_tiebreak", req(), vec![equal_a, equal_b, equal_c]),
+            // Trust gate.
+            ("trust_gate", req(), vec![{
+                let mut w = worker_facts("untrusted", 200, 20, 5);
+                w.trusted = false;
+                w
+            }, worker_facts("trusted", 150, 60, 20)]),
+            // Health gate.
+            ("health_gate", req(), vec![{
+                let mut w = worker_facts("sick", 200, 20, 5);
+                w.healthy = false;
+                w
+            }, worker_facts("healthy", 150, 60, 20)]),
+            // Model gate.
+            ("model_gate", req(), vec![{
+                let mut w = worker_facts("other_model", 200, 20, 5);
+                w.serves_model = false;
+                w
+            }, worker_facts("serves", 150, 60, 20)]),
+            // KV hit: prefix resident on a specific worker.
+            ("kv_hit", {
+                let mut r = req();
+                r.context.is_continuation = true;
+                r.context.prefix_resident_on = Some("kvhost".into());
+                r
+            }, vec![
+                worker_facts("fast", 180, 50, 10),
+                {
+                    let mut w = worker_facts("kvhost", 150, 80, 20);
+                    w.kv = KVCacheState::Partial { used: 100, capacity: 4096 };
+                    w
+                },
+            ]),
+            // KV miss: continuation whose prefix host is NOT among candidates
+            // (stale hint) — must degrade to plain scoring, deterministically.
+            ("kv_miss_stale_hint", {
+                let mut r = req();
+                r.context.is_continuation = true;
+                r.context.prefix_resident_on = Some("gone".into());
+                r
+            }, vec![
+                worker_facts("fast", 180, 50, 10),
+                worker_facts("slow", 40, 400, 90),
+            ]),
+            // Network reachability: equal perf, different link cost.
+            ("network_reach", req(), vec![
+                worker_facts("far", 150, 40, 10),
+                worker_facts("near", 150, 40, 10),
+            ]),
+            // Priority: urgent request amplifies latency/queue terms.
+            ("priority_high", {
+                let mut r = req();
+                r.priority = 255;
+                r
+            }, vec![
+                worker_facts("fast", 180, 50, 10),
+                worker_facts("slow", 40, 400, 90),
+            ]),
+            // Capacity exactly at the limit (headroom == 1.0).
+            ("capacity_at_limit", req(), vec![at_limit]),
+            // Capacity under the request (headroom < 1.0, still eligible —
+            // capacity is a score term, not a gate, at this layer).
+            ("capacity_under", req(), vec![under, {
+                let mut roomy = worker_facts("roomy", 150, 60, 20);
+                roomy.available_ram_mb = 8192;
+                roomy
+            }]),
+            // Multi-gate failure: one candidate fails ALL gates simultaneously.
+            ("multi_gate_failure", req(), vec![multi_fail, worker_facts("ok", 150, 60, 20)]),
+            // Combination: trust + KV + priority together.
+            ("combo_trust_kv_priority", {
+                let mut r = req();
+                r.context.is_continuation = true;
+                r.context.prefix_resident_on = Some("kvhost".into());
+                r.priority = 128;
+                r
+            }, vec![
+                {
+                    let mut w = worker_facts("untrusted", 200, 20, 5);
+                    w.trusted = false;
+                    w
+                },
+                {
+                    let mut w = worker_facts("kvhost", 150, 80, 20);
+                    w.kv = KVCacheState::Partial { used: 50, capacity: 4096 };
+                    w
+                },
+                worker_facts("plain", 170, 55, 15),
+            ]),
+        ];
+
+        // The network_reach case needs link state; capture it with a planner
+        // that knows the links, and run the unified selector on the same.
+        let mut network = NetworkGraph::new();
+        network.set("far", LinkMetrics::prior(Locality::Remote, Some(80_000)));
+        network.set("near", LinkMetrics::prior(Locality::Lan, Some(2_000)));
+        let net_planner = ExecutionPlanner {
+            network: network.clone(),
+            ..ExecutionPlanner::default()
+        };
+        let net_unified = UnifiedSelector {
+            network: network.clone(),
+            ..UnifiedSelector::default()
+        };
+
+        let cases: Vec<GoldenCase> = scenarios
+            .iter()
+            .map(|(id, r, ws)| {
+                if *id == "network_reach" {
+                    GoldenCase::capture(id, r, ws, &net_planner)
+                } else {
+                    GoldenCase::capture(id, r, ws, &planner)
+                }
+            })
+            .collect();
+
+        // Run every case against the selector matching its network state.
+        let mut all_equivalent = true;
+        let mut divergences = Vec::new();
+        for case in &cases {
+            let u = if case.request_id == "network_reach" {
+                &net_unified
+            } else {
+                &unified
+            };
+            let report = GoldenSuite::run(std::slice::from_ref(case), u);
+            all_equivalent &= report.equivalent;
+            divergences.extend(report.divergences);
+        }
+        assert!(
+            all_equivalent,
+            "unified selector must reproduce every golden decision: {divergences:?}"
+        );
+        assert_eq!(cases.len(), scenarios.len());
+    }
+
+    #[test]
+    fn golden_suite_edge_cases() {
+        // Edge cases around the selection boundary.
+        let planner = ExecutionPlanner::default();
+        let unified = UnifiedSelector::default();
+
+        // 1. All scores equal AND all candidates rejected -> no selection.
+        let mut r1 = worker_facts("r1", 150, 60, 20);
+        r1.healthy = false;
+        let case = GoldenCase::capture("all_rejected", &req(), &[r1], &planner);
+        assert_eq!(case.golden.selected_worker, None);
+        let report = GoldenSuite::run(std::slice::from_ref(&case), &unified);
+        assert!(report.equivalent, "{:?}", report.divergences);
+
+        // 2. Local vs remote: the planner itself has no local exclusion (the
+        // coordinator excludes the local peer AFTER planning), so the unified
+        // selector must behave identically — both rank the local peer like any
+        // other candidate. The exclusion stays in the coordinator layer.
+        let case = GoldenCase::capture(
+            "local_peer_ranked_normally",
+            &req(),
+            &[worker_facts("local-self", 200, 20, 5), worker_facts("remote", 150, 60, 20)],
+            &planner,
+        );
+        assert_eq!(case.golden.selected_worker.as_deref(), Some("local-self"));
+        let report = GoldenSuite::run(std::slice::from_ref(&case), &unified);
+        assert!(report.equivalent, "{:?}", report.divergences);
+
+        // 3. KV hint to a worker that is no longer a candidate (stale hint):
+        // the hint must be inert — no crash, no phantom selection, plain
+        // scoring decides deterministically.
+        let mut stale = req();
+        stale.context.is_continuation = true;
+        stale.context.prefix_resident_on = Some("vanished".into());
+        let case = GoldenCase::capture(
+            "stale_kv_hint",
+            &stale,
+            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &planner,
+        );
+        assert_eq!(case.golden.selected_worker.as_deref(), Some("a"));
+        let report = GoldenSuite::run(std::slice::from_ref(&case), &unified);
+        assert!(report.equivalent, "{:?}", report.divergences);
+
+        // 4. Worker becoming ineligible between evaluation and reservation is
+        // a RESERVATION-layer concern (reserve_worker re-validates gates); the
+        // selection layer must stay deterministic on its inputs. Pin that the
+        // selection for a candidate set is stable across repeated evaluation.
+        let ws = vec![worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)];
+        let c1 = GoldenCase::capture("stability", &req(), &ws, &planner);
+        let c2 = GoldenCase::capture("stability", &req(), &ws, &planner);
+        assert_eq!(c1.golden, c2.golden, "selection must be stable across evaluations");
+    }
+
+    #[test]
+    fn golden_suite_is_deterministic() {
+        // Same input + same state -> EXACTLY the same
+        // eligible_set -> rejection reasons -> ranking -> selected worker,
+        // across repeated runs of BOTH the live planner and the unified
+        // selector.
+        let planner = ExecutionPlanner::default();
+        let unified = UnifiedSelector::default();
+        let ws = vec![
+            worker_facts("a", 180, 50, 10),
+            {
+                let mut w = worker_facts("b", 150, 60, 20);
+                w.trusted = false;
+                w
+            },
+            worker_facts("c", 120, 80, 30),
+        ];
+
+        for _ in 0..25 {
+            let golden = GoldenCase::capture("det", &req(), &ws, &planner);
+            let sel = unified.select(&req(), &ws);
+            // Live planner determinism.
+            let again = GoldenCase::capture("det", &req(), &ws, &planner);
+            assert_eq!(golden.golden, again.golden, "live planner must be deterministic");
+            // Unified selector determinism.
+            let sel_again = unified.select(&req(), &ws);
+            assert_eq!(sel.trace, sel_again.trace, "unified selector must be deterministic");
+            // And the two must agree.
+            let report = GoldenSuite::run(std::slice::from_ref(&golden), &unified);
+            assert!(report.equivalent, "{:?}", report.divergences);
+        }
+    }
+
+    #[test]
+    fn golden_suite_property_fuzz() {
+        // Controlled property generation (seeded LCG — deterministic, no new
+        // dependencies): random worker pools over the full gate/score space.
+        // The unified selector must reproduce the live planner's decision on
+        // EVERY generated case. This finds gate/score combinations the manual
+        // corpus does not cover.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                // Numerical Recipes constants.
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        let mut rng = Lcg(0x000D_ECE5_2026_0821); // fixed seed: reproducible suite
+        let planner = ExecutionPlanner::default();
+        let unified = UnifiedSelector::default();
+
+        let mut cases = Vec::new();
+        for case_no in 0..200 {
+            let pool = 1 + rng.below(6) as usize; // 1..=6 candidates
+            let mut workers = Vec::with_capacity(pool);
+            for i in 0..pool {
+                let mut w = worker_facts(&format!("w{i}-{case_no}"), 0, 0, 0);
+                w.tokens_per_second = rng.below(250) as u32; // 0..=249
+                w.latency_ms = rng.below(1200) as u32; // 0..=1199
+                w.load_percent = rng.below(101) as u8; // 0..=100
+                w.queue_depth = rng.below(12) as u32; // 0..=11
+                w.available_ram_mb = rng.below(16_384); // 0..=16383
+                w.trusted = rng.below(10) < 8; // 80% trusted
+                w.healthy = rng.below(10) < 8; // 80% healthy
+                w.serves_model = rng.below(10) < 7; // 70% serves
+                workers.push(w);
+            }
+            let mut r = req();
+            r.priority = rng.below(256) as u8;
+            if rng.below(3) == 0 {
+                // One third of the cases are continuations with a (possibly
+                // stale) prefix host among the first candidates.
+                r.context.is_continuation = true;
+                let idx = rng.below(workers.len() as u64 + 1) as usize;
+                r.context.prefix_resident_on = Some(format!("w{idx}-{case_no}"));
+            }
+            cases.push(GoldenCase::capture(&format!("fuzz-{case_no}"), &r, &workers, &planner));
+        }
+
+        let report = GoldenSuite::run(&cases, &unified);
+        assert!(
+            report.equivalent,
+            "property fuzz found divergences ({} of {} cases): {:?}",
+            report.divergences.len(),
+            cases.len(),
+            &report.divergences[..report.divergences.len().min(5)]
+        );
+        assert_eq!(report.cases, 200);
+    }
+
+    #[test]
+    fn golden_cases_round_trip_jsonl() {
+        // Durable golden corpus: a captured case survives a JSONL round trip
+        // byte-for-byte at the semantic level, so cases captured from real
+        // fabric state can be persisted and replayed anywhere.
+        let planner = ExecutionPlanner::default();
+        let ws = vec![
+            worker_facts("a", 180, 50, 10),
+            {
+                let mut w = worker_facts("b", 150, 60, 20);
+                w.trusted = false;
+                w
+            },
+        ];
+        let case = GoldenCase::capture("rt", &req(), &ws, &planner);
+
+        let line = case.to_json_line().unwrap();
+        let back = GoldenCase::from_json_line(&line).unwrap();
+        assert_eq!(back.request_id, case.request_id);
+        assert_eq!(back.req, case.req);
+        assert_eq!(back.workers, case.workers);
+        assert_eq!(back.golden, case.golden);
+
+        // And the replayed case still proves equivalence.
+        let report = GoldenSuite::run(&[back], &UnifiedSelector::default());
+        assert!(report.equivalent, "{:?}", report.divergences);
     }
 
     #[test]

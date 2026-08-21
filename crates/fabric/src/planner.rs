@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A candidate worker the planner can place stages on.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable so a `GoldenCase` (request + workers + golden
+/// `SelectionTrace`) can be persisted and replayed anywhere — the durable
+/// golden-decision substrate for the unified-selector equivalence proof.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerFacts {
     pub peer_id: String,
     pub trusted: bool,
@@ -60,7 +64,9 @@ pub struct WorkerFacts {
 }
 
 /// The request facts the planner plans for.
-#[derive(Debug, Clone)]
+///
+/// Serde-serializable (see `WorkerFacts`) for durable `GoldenCase`s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestFacts {
     pub model_hash: String,
     pub est_ram_mb: u64,
