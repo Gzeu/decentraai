@@ -4,202 +4,88 @@
 
 Implement the contribution-credit system incrementally on `research/inference-credit-economy` while preserving `main`.
 
-## Phase 0 — Research / contract freeze
+## Phase 0 — Research / contract freeze — DONE
 
-- Review `inference-credit-economy.md` with maintainers.
-- Inventory exact existing DecentraAI types for discovery, resource advertisements, reservations, execution, usage, and signed receipts.
-- Identify the minimum extension points; avoid duplicated resource/scheduler abstractions.
-- Freeze canonical terminology: `Contribution`, `Usage`, `Receipt`, `CreditEvent`, `Reservation`, `Settlement`, `CU`.
+Inspected live primitives (P13 receipts, P14 `CreditLedger`, `QuotaLedger` reserve/settle, `ReservationLedger`, compensation, capability ads, runtime `/v1/chat/completions`).
 
-Exit criteria:
+Frozen terms: `Contribution`, `Usage`, `Receipt`, `CreditEvent`, `Reservation`, `Settlement`, `CU`.
 
-- no unresolved ownership ambiguity for each ledger event
-- explicit source-of-truth identified for usage and balances
-- main branch remains untouched
+Source of truth: usage = existing signed receipt / provider accounting; balances = experimental `InferenceCreditEconomy` (not P14 ledger).
 
-## Phase 1 — Ledger core
+## Phase 1 — Ledger core — DONE (experimental crate)
 
-Implement:
+Landed in `crates/credit-economy`:
 
-- `CreditAmount` fixed-precision type
-- `CreditAccount`
-- `CreditEvent`
+- integer CU + `CreditBalance`
+- append-only `CreditEvent`
 - `CreditReservation`
-- append-only ledger interface
-- idempotency / unique source event rules
-- balance reconciliation
+- idempotency (receipt / contribution / reservation ids)
+- mutex-protected concurrent reserve
 
-Tests:
+Tests in `crates/credit-economy/src/lib.rs`:
 
-- earn
-- spend
-- reserve
-- release
-- settle
-- duplicate event
+- earn / spend / reserve / release / settle
+- duplicate event / receipt
 - concurrent reservations
 - insufficient balance
-- crash/retry recovery
-
-## Phase 2 — Contribution verification
-
-Implement:
-
-- `ResourceContribution`
-- contribution lifecycle: pending → verified → settled/rejected
-- receipt-to-contribution mapping
-- quota reconciliation
-- policy version pinning
-- contributor provenance
-
-Tests:
-
-- valid signed receipt
-- invalid signature
-- replay
-- mismatched reservation
-- usage > advertised quota
-- missing provider confirmation
-
-## Phase 3 — Policy engine
-
-Implement a deterministic, operator-settable `CreditPolicy`.
-
-Inputs:
-
-- resource type
-- provider/model
-- measured usage
-- reliability/quality policy where applicable
-- policy version
-
-Outputs:
-
-- contribution CU
-- consumer cost CU
-
-Never use floating-point balances for authoritative accounting.
-
-## Phase 4 — Scheduler integration
-
-Add credit-aware scheduling as an opt-in layer:
+- failed execution → no CU
 
 ```text
-request
-  ↓
-estimate
-  ↓
-credit reservation
-  ↓
-resource reservation
-  ↓
-execution
-  ↓
-receipt
-  ↓
-settlement
+cargo test --manifest-path crates/credit-economy/Cargo.toml
 ```
 
-Failure behavior:
+## Phase 2 — Contribution verification — DONE (crate-local)
 
-- task rejected before execution → release reservation
-- provider failure → release/refund according to policy
-- partial usage → settle actual usage and release remainder
-- ambiguous outcome → hold reservation until reconciled
+- `ResourceAdvertisement` without secrets
+- `ProviderQuota` (temporary, expirable)
+- PENDING → VERIFIED → SETTLED / REJECTED
+- quota exhaustion refuses settlement
+- expired quota leaves settled CU spendable
+- policy version pinned on events
 
-## Phase 5 — API resource providers
+Not yet: live P13 verifier call inside `ComputeManager`.
 
-Add a generic provider adapter for API quota.
+## Phase 3 — Policy engine — DONE (v1)
 
-Requirements:
+`CreditPolicy` (`ice-v1`): integer weights for input/output tokens, GPU ms, CPU ms, storage, bandwidth. Replaceable via `set_policy`. Not 1 token = 1 CU.
 
-- encrypted/local credential storage
-- no secrets in advertisements
-- provider-specific rate-limit handling
-- quota reset time
-- usage capture
-- optional provider accounting verification
-- automatic stop when quota is exhausted
+Later: reliability, quality, scarcity modifiers.
 
-Initial adapters should be proof-of-concept only and must pass provider ToS/acceptable-use review before production sharing.
+## Phase 4 — Scheduler integration — NOT STARTED
 
-## Phase 6 — OpenCode integration
+Opt-in only. Do not change default `ComputeScheduler` / `route_request` until an explicit flag exists.
 
-Expose an OpenAI-compatible gateway:
+## Phase 5 — API resource providers — NOT STARTED
 
-- `/v1/models`
-- `/v1/chat/completions`
-- streaming
-- usage reporting
+Local credential store + provider adapters. Keys stay on the contributor node.
 
-The gateway should be provider-neutral and route according to resource availability and CU budget.
+## Phase 6 — OpenCode integration — NOT STARTED
 
-## Phase 7 — Cross-resource economy
+Runtime already has `/v1/chat/completions`. Credit check middleware must be opt-in and not coupled to OpenCode.
 
-Demonstrate:
+## Phase 7 — Cross-resource economy — DONE (unit)
 
-```text
-API contribution → CU
-GPU contribution → CU
-CU → API consumption
-CU → GPU consumption
-```
+Crate tests prove:
 
-Add resource-policy compatibility checks so a client cannot spend CU on disallowed resource classes.
+- DeepSeek API earn → Qwen API consume
+- local GPU earn → remote GPU consume
 
-## Phase 8 — Reputation / anti-abuse
+## Phase 8 — Reputation / anti-abuse — PARTIAL
 
-Add:
+Landed: forged receipt reject, duplicate receipt, overspend, secret-in-ad reject, mutex races.
 
-- node reliability score
-- receipt rejection rate
-- timeout rate
-- dispute history
-- contribution caps
-- per-identity rate limits
-- anti-self-dealing rules
-- optional redundant verification for high-value work
+Not landed: Sybil cost, anti-self-dealing, redundant verification.
 
-Reputation must influence scheduling/rewards only through explicit policy; it must not mutate the authoritative ledger directly.
+## Phase 9 — Crypto adapter — INTERFACE ONLY
 
-## Phase 9 — Crypto adapter
+`SettlementEngine` + `InternalSettlement`. No wallet, no chain SDK.
 
-Only after internal accounting is stable:
+## Phase 10 — Production hardening — NOT STARTED
 
-- `SettlementEngine` trait/interface
-- `InternalSettlement`
-- `CryptoSettlementAdapter` mock
-- CU lock/unlock state machine
-- transaction correlation IDs
-- external confirmation / failure / retry semantics
+Workspace membership, persistence, metrics, property tests, security review.
 
-No wallet implementation or chain SDK belongs in DecentraAI core until a specific chain and settlement model are selected.
+## Success scenario (crate-level)
 
-## Phase 10 — Production hardening
+Covered by `expired_provider_quota_settled_cu_remain_valid`, `reservation_release_and_insufficient_balance`, `concurrent_reservation_cannot_overspend`, `consumption_on_different_resource`.
 
-- property-based tests
-- load tests
-- concurrency tests
-- database/replay recovery tests
-- ledger audit tooling
-- metrics and tracing
-- documentation
-- migration tooling
-- security review
-
-## Success scenario
-
-A single end-to-end acceptance test should eventually prove the original use case:
-
-1. Node A has 100,000 temporary API quota.
-2. Node A advertises it without exposing its API key.
-3. Nodes B/C consume 60,000 of the quota.
-4. Provider/resource usage is verified.
-5. Node A receives the configured amount of settled CU.
-6. The provider's original daily quota later expires/resets.
-7. Node A's CU remains valid.
-8. Node A spends some CU days later on a different eligible provider/resource.
-9. Replaying the receipts does not change balances.
-10. Concurrent spending cannot overspend the account.
-
-This scenario is the canonical functional proof of the economic layer.
+End-to-end on a live two-node fabric is **not** claimed.
