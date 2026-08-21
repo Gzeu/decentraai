@@ -39,7 +39,17 @@ pub struct SessionKv {
     pub tokens_used: u32,
     /// The worker's context capacity for this model (`n_ctx`), `0` if unknown.
     pub capacity: u32,
+    /// Monotonic wall-clock ms of the last `record` for this session. Drives
+    /// TTL expiry so a long-idle session stops inflating `worker_kv_used` and
+    /// stops steering routing to a worker that may have dropped its KV.
+    pub last_updated_ms: u64,
 }
+
+/// Default TTL for a tracked session: how long a session's KV residency is
+/// trusted after its last routed request. Beyond this the coordinator treats
+/// the session as cold (residency unknown), so routing never assumes a stale
+/// prefix is still resident on a worker.
+pub const SESSION_TTL_MS: u64 = 30 * 60 * 1000; // 30 minutes
 
 /// Coordinator-side, synchronous account of session->worker residency.
 #[derive(Debug, Default)]
@@ -54,7 +64,8 @@ impl SessionAccount {
 
     /// Records (or refreshes) where a session's KV prefix lives after a
     /// routed request completed. `tokens_used` is the real input+output
-    /// tokens reported by the worker for this request.
+    /// tokens reported by the worker for this request. `now_ms` is the
+    /// caller's wall-clock ms and refreshes the session's TTL.
     pub fn record(
         &mut self,
         session_id: &str,
@@ -62,6 +73,7 @@ impl SessionAccount {
         model_hash: &str,
         tokens_used: u32,
         capacity: u32,
+        now_ms: u64,
     ) {
         self.by_session.insert(
             session_id.to_string(),
@@ -70,8 +82,19 @@ impl SessionAccount {
                 model_hash: model_hash.to_string(),
                 tokens_used,
                 capacity,
+                last_updated_ms: now_ms,
             },
         );
+    }
+
+    /// Drops every session whose last update is older than `ttl_ms` relative
+    /// to `now_ms`. Returns the number of sessions removed. Call this before
+    /// any read that must not be steered by stale residency.
+    pub fn expire(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
+        let before = self.by_session.len();
+        self.by_session
+            .retain(|_, s| now_ms.saturating_sub(s.last_updated_ms) <= ttl_ms);
+        before - self.by_session.len()
     }
 
     /// Whether a session is known and resident on a worker.
@@ -148,7 +171,7 @@ mod tests {
     #[test]
     fn records_and_looks_up_residency() {
         let mut acc = SessionAccount::new();
-        acc.record("s1", peer_a(), "m1", 512, 2048);
+        acc.record("s1", peer_a(), "m1", 512, 2048, 1_000);
         assert_eq!(acc.residency("s1"), Some(peer_a()));
         assert_eq!(acc.lookup("s1").unwrap().tokens_used, 512);
         assert_eq!(acc.residency("unknown"), None);
@@ -157,9 +180,9 @@ mod tests {
     #[test]
     fn derives_per_worker_kv_used_sums_sessions() {
         let mut acc = SessionAccount::new();
-        acc.record("s1", peer_a(), "m1", 300, 2048);
-        acc.record("s2", peer_a(), "m1", 200, 2048);
-        acc.record("s3", peer_b(), "m1", 900, 2048);
+        acc.record("s1", peer_a(), "m1", 300, 2048, 1_000);
+        acc.record("s2", peer_a(), "m1", 200, 2048, 1_000);
+        acc.record("s3", peer_b(), "m1", 900, 2048, 1_000);
         let (used, cap) = acc.worker_kv_used(&peer_a(), "m1").unwrap();
         assert_eq!(used, 500);
         assert_eq!(cap, 2048);
@@ -170,17 +193,50 @@ mod tests {
     #[test]
     fn no_capacity_means_unbounded() {
         let mut acc = SessionAccount::new();
-        acc.record("s1", peer_a(), "m1", 500, 0);
+        acc.record("s1", peer_a(), "m1", 500, 0, 1_000);
         assert_eq!(acc.worker_kv_used(&peer_a(), "m1"), None);
     }
 
     #[test]
     fn dropping_a_worker_clears_its_sessions() {
         let mut acc = SessionAccount::new();
-        acc.record("s1", peer_a(), "m1", 100, 1024);
-        acc.record("s2", peer_b(), "m1", 100, 1024);
+        acc.record("s1", peer_a(), "m1", 100, 1024, 1_000);
+        acc.record("s2", peer_b(), "m1", 100, 1024, 1_000);
         assert_eq!(acc.drop_worker(&peer_a()), 1);
         assert_eq!(acc.residency("s1"), None);
         assert_eq!(acc.residency("s2"), Some(peer_b()));
+    }
+
+    #[test]
+    fn expire_removes_only_stale_sessions() {
+        let mut acc = SessionAccount::new();
+        // s1 updated at t=0, s2 refreshed at t=5000.
+        acc.record("s1", peer_a(), "m1", 100, 1024, 0);
+        acc.record("s2", peer_b(), "m1", 200, 1024, 5_000);
+        // TTL 10s; now=10_000 -> s1 (age 10s) is at the boundary (kept),
+        // s2 (age 5s) kept.
+        assert_eq!(acc.expire(10_000, 10_000), 0);
+        assert_eq!(acc.len(), 2);
+        // now=10_001 -> s1 (age 10_001ms) exceeds the 10s TTL and is dropped.
+        assert_eq!(acc.expire(10_001, 10_000), 1);
+        assert_eq!(acc.residency("s1"), None);
+        assert_eq!(acc.residency("s2"), Some(peer_b()));
+        // Refreshing a session resets its age so it survives a later expiry.
+        acc.record("s1", peer_a(), "m1", 100, 1024, 20_000);
+        // s2 (last update 5_000) is stale at 25_000; s1 (refreshed to 20_000) survives.
+        assert_eq!(acc.expire(25_000, 10_000), 1);
+        assert_eq!(acc.residency("s1"), Some(peer_a()));
+        assert_eq!(acc.residency("s2"), None);
+    }
+
+    #[test]
+    fn expired_session_no_longer_counts_toward_kv_used() {
+        let mut acc = SessionAccount::new();
+        acc.record("s1", peer_a(), "m1", 800, 1024, 0);
+        acc.record("s2", peer_a(), "m1", 200, 1024, 5_000);
+        assert_eq!(acc.worker_kv_used(&peer_a(), "m1").unwrap().0, 1000);
+        // s1 (age 10_001ms) expires; s2 (age 5_001ms) survives -> only 200.
+        acc.expire(10_001, 10_000);
+        assert_eq!(acc.worker_kv_used(&peer_a(), "m1").unwrap().0, 200);
     }
 }

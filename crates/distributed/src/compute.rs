@@ -1112,13 +1112,28 @@ impl ComputeManager {
             model_hash,
             tokens_used,
             capacity,
+            now_ms(),
         );
     }
 
     /// The worker holding a session's KV prefix, if any (M20 continuation
     /// affinity). `None` for unknown/stale sessions → deterministic fallback.
     pub fn session_residency(&self, session_id: &str) -> Option<PeerId> {
+        self.expire_sessions();
         self.sessions.lock().unwrap().residency(session_id)
+    }
+
+    /// Drops sessions whose TTL has elapsed so stale residency never steers
+    /// routing and stale KV occupancy never inflates `worker_kv_used`.
+    fn expire_sessions(&self) {
+        let removed = self
+            .sessions
+            .lock()
+            .unwrap()
+            .expire(now_ms(), crate::session::SESSION_TTL_MS);
+        if removed > 0 {
+            tracing::debug!(removed, "expired stale KV sessions (TTL)");
+        }
     }
 
     /// Derives the honest KV-cache state the planner should use for `worker`
@@ -1131,6 +1146,7 @@ impl ComputeManager {
         model_hash: &str,
     ) -> decentraai_fabric::KVCacheState {
         use decentraai_fabric::KVCacheState;
+        self.expire_sessions();
         let used = self
             .sessions
             .lock()
@@ -1161,6 +1177,7 @@ impl ComputeManager {
 
     /// Number of coordinator-tracked sessions (observability).
     pub fn session_count(&self) -> usize {
+        self.expire_sessions();
         self.sessions.lock().unwrap().len()
     }
 
@@ -1168,6 +1185,7 @@ impl ComputeManager {
     /// worker residency + model + accounted tokens + capacity. Real state,
     /// never fabricated; serde-friendly for the dashboard/API.
     pub fn sessions(&self) -> serde_json::Value {
+        self.expire_sessions();
         let snap = self.sessions.lock().unwrap().snapshot();
         serde_json::json!({
             "sessions_active": snap.len(),
@@ -2305,9 +2323,19 @@ pub struct ExecutedPlan {
 /// excluded from the aggregation they would feed — never treated as zero.
 ///
 /// Returns a serde-friendly object. Pure; no I/O.
+/// Monotonic wall-clock ms, shared by the coordinator's TTL-based session
+/// expiry. Kept as a free fn (not a clock dependency) so `SessionAccount`
+/// itself stays pure and deterministic for tests.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn execution_statistics(history: &[ExecutedPlan]) -> serde_json::Value {
-    let total = history.len();
-    let succeeded = history.iter().filter(|p| p.outcome == "succeeded").count();
+    let total = history.len();    let succeeded = history.iter().filter(|p| p.outcome == "succeeded").count();
     let failed = history.iter().filter(|p| p.outcome == "failed").count();
 
     // Measured throughput (tokens/sec) and latency (ms) — only from records
