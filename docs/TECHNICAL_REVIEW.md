@@ -235,7 +235,7 @@ se pierde la restart.
 | Trei selectori + fallback legacy care ocolește `is_retryable()` + `SessionAccount` fără TTL | Înaltă | ⏳ OPEN |
 | God-module: api.rs 16,7k / compute.rs 4,6k / main.rs 7,3k / 2 dashboard-uri | Înaltă | ⏳ OPEN |
 | `ApiState` 19 `Option<Arc>` + `attach_*` fără fațadă | Medie | ⏳ OPEN |
-| `/v1/token` dă master token-ul oricui; 4 endpoint-uri P14 neautentificate | Înaltă (loopback-trust) | ⏳ OPEN |
+| `/v1/token` dă master token-ul oricui; 4 endpoint-uri P14 neautentificate | Înaltă (loopback-trust) | ✅ FIXED `b7c8ecd` — cele 4 endpoint-uri P14 (`/v1/contribution`, `/v1/credits/balance`, `/v1/credits/events`, `/v1/verified-compute/history`) cer acum `require_operator_or_admin` (coerent cu `/v1/fabric/graphs`); `/v1/token` rămâne deliberat deschis DOAR pe loopback (bootstrap token al dashboard-ului) — decizie documentată în cod + test de regresie 401 pe cele 4 |
 | 177 `unwrap()` + 27 `.expect()` + 3 `unreachable!` în producție; poison inconsistent | Medie | ⏳ OPEN |
 | Subprocese: SIGKILL-only, fără reap, fără supervisor pentru tool-uri, stderr null | Medie | ⏳ OPEN |
 | Probe de health blocante în `/status` | Medie | ⏳ OPEN |
