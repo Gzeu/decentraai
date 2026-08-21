@@ -4916,6 +4916,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
         .route("/v1/execution", get(execution_handler))
+        .route("/v1/shadow", post(shadow_handler))
+        .route("/v1/golden-capture", get(golden_capture_handler))
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
         .route("/v1/stt", post(stt_handler))
@@ -6023,6 +6025,13 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
             "totals": report.totals,
             "sessions": session_count,
             "executions": executions,
+            // UnifiedSelector shadow mode (Issue #30 Phase 3): observe-only
+            // metrics + records. Never affects the authoritative path.
+            "shadow": {
+                "enabled": compute.shadow_enabled(),
+                "metrics": compute.shadow_metrics(),
+                "records": compute.shadow_records().into_iter().take(64).collect::<Vec<_>>(),
+            },
         });
     }
     (
@@ -6030,6 +6039,51 @@ async fn compute_handler(State(state): State<ApiState>, headers: HeaderMap) -> R
         serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
+}
+
+/// POST /v1/shadow — toggle UnifiedSelector shadow mode (Issue #30 Phase 3).
+/// Body: `{"enabled": true|false}`. Observe-only: toggling changes shadow
+/// observation, never routing/reservation/worker selection. Operator/admin.
+async fn shadow_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let body: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "invalid JSON body"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    match body.get("enabled").and_then(|v| v.as_bool()) {
+        Some(enabled) => {
+            compute.set_shadow_enabled(enabled);
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"enabled": enabled, "shadow_mode": "observe-only"}).to_string(),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "'enabled' (bool) is required"}).to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /v1/tts — synthesize speech for the dashboard chat speak button.
@@ -7866,6 +7920,88 @@ async fn sessions_handler(State(state): State<ApiState>, headers: HeaderMap) -> 
         .into_response()
 }
 
+/// `GET /v1/golden-capture?model_hash=…&request_id=…&prompt_tokens=…&session_id=…&priority=…`
+///
+/// Observe-only DRY-RUN (trace-collection phase): captures the REAL
+/// `RequestFacts` + `WorkerFacts` this coordinator would plan for, plus the
+/// golden `SelectionTrace` the live planner produces for them — WITHOUT
+/// reserving any worker, sending any request, or mutating any state. The
+/// replayable substrate (`GoldenCase`, serde/JSONL) for the offline
+/// Legacy-vs-UnifiedSelector equivalence review.
+///
+/// Never wired into routing; purely additive observability. Operator/admin
+/// gated like every other operational view.
+async fn golden_capture_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(compute) = &state.compute else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "compute manager not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let model_hash = query.get("model_hash").cloned().unwrap_or_default();
+    if model_hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "model_hash is required"}).to_string(),
+        )
+            .into_response();
+    }
+    let request_id = query
+        .get("request_id")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "gc-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            )
+        });
+    let prompt_tokens: u32 = query
+        .get("prompt_tokens")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let session_id = query.get("session_id").filter(|s| !s.is_empty()).cloned();
+    let priority: u8 = query
+        .get("priority")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    match compute
+        .capture_golden_case(
+            &request_id,
+            &model_hash,
+            prompt_tokens,
+            session_id.as_deref(),
+            priority,
+        )
+        .await
+    {
+        Some(case) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&case).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        // Honest 404: no worker advertises the model — nothing to capture.
+        None => (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("no eligible worker serves {model_hash}")})
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
 /// Classify a node's device class from its REAL advertised capability
 /// (cpu_cores, ram_mb, GPU presence). This is an INFERRED classification for the
 /// Digital Twin / mobile-worker direction — it never changes scheduling or
@@ -9460,6 +9596,19 @@ fn remote_chat_prompt(messages: &[serde_json::Value]) -> String {
     parts.join("\n\n")
 }
 
+/// Extracts the caller's `session_id` from a remote chat body, if any.
+///
+/// Pure and deterministic (repo convention: decisions separated from I/O).
+/// Honesty rules: missing field, non-string value, and empty string all yield
+/// `None` — such requests keep the exact pre-Phase-1 behavior (cold routing,
+/// no KV residency recorded), never an invented session identity.
+fn remote_session_id(body: &serde_json::Value) -> Option<String> {
+    body.get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Routes a chat inference request over the fabric to a trusted remote worker
 /// (M18+). Emits an OpenAI-compatible response — SSE when the caller asked for
 /// streaming, JSON otherwise — tagged with `X-Decentra-Origin: remote` plus
@@ -9516,6 +9665,15 @@ async fn route_remote_chat(
     // same way the CLI does, so slow-but-healthy workers are not cut off
     // mid-stream (which previously surfaced as "Error in input stream").
     let mut request = request;
+    // Remote KV locality (Issue #30 Phase 1): thread the caller's session_id
+    // into the distributed request so M20 continuation affinity and
+    // coordinator-side KV accounting apply on the remote chat path too —
+    // follow-ups steer back to the worker holding the session's KV prefix
+    // instead of routing cold every turn. Requests WITHOUT a session keep the
+    // exact previous behavior (no residency recorded, cold routing).
+    if let Some(sid) = remote_session_id(&body) {
+        request = request.with_session(sid);
+    }
     // Inference on CPU is slow (a Mistral-7B response can take >30s per few
     // tokens). The protocol default timeout is 30s — far too tight for a
     // real chat turn. Match the CLI's explicit 120s so slow-but-healthy
@@ -9693,6 +9851,63 @@ fn forbidden(message: &str) -> Response {
 /// so we return a clear 404 instead of silently answering with the currently
 /// loaded model while reporting the requested (nonexistent) name. This preserves
 /// the do-not-lie invariant for inference routing.
+#[cfg(test)]
+mod remote_kv_locality_tests {
+    use super::remote_session_id;
+    use std::str::FromStr;
+
+    #[test]
+    fn session_id_extraction_covers_all_body_shapes() {
+        // Missing field -> None (pre-Phase-1 behavior preserved).
+        let body: serde_json::Value = serde_json::json!({"model": "m", "messages": []});
+        assert_eq!(remote_session_id(&body), None);
+        // Non-string values are never coerced into an invented identity.
+        let body: serde_json::Value = serde_json::json!({"session_id": 42});
+        assert_eq!(remote_session_id(&body), None);
+        let body: serde_json::Value = serde_json::json!({"session_id": null});
+        assert_eq!(remote_session_id(&body), None);
+        // Empty string == no session (matches the local proxy path's filter).
+        let body: serde_json::Value = serde_json::json!({"session_id": ""});
+        assert_eq!(remote_session_id(&body), None);
+        // Valid session id passes through verbatim.
+        let body: serde_json::Value = serde_json::json!({"session_id": "sess-abc-123"});
+        assert_eq!(remote_session_id(&body), Some("sess-abc-123".to_string()));
+    }
+
+    #[test]
+    fn threaded_session_reaches_infer_request_and_preserves_no_session_behavior() {
+        // The exact construction route_remote_chat performs, with and without
+        // a session: the distributed request must carry the caller's
+        // session_id so M20 continuation affinity + KV accounting engage on
+        // the remote path; a session-less request must stay session-free.
+        use decentraai_distributed::InferRequest;
+        let base = || {
+            InferRequest::new("hash".into(), "prompt".into(), 16)
+                .with_sender(
+                    decentraai_p2p::PeerId::from_str(
+                        "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+                    )
+                    .unwrap(),
+                )
+                .with_streaming(false)
+        };
+        // With session: body -> helper -> with_session.
+        let body: serde_json::Value = serde_json::json!({"session_id": "kv-sess-1"});
+        let mut request = base();
+        if let Some(sid) = remote_session_id(&body) {
+            request = request.with_session(sid);
+        }
+        assert_eq!(request.session_id.as_deref(), Some("kv-sess-1"));
+        // Without session: unchanged behavior.
+        let body: serde_json::Value = serde_json::json!({"messages": []});
+        let mut request = base();
+        if let Some(sid) = remote_session_id(&body) {
+            request = request.with_session(sid);
+        }
+        assert_eq!(request.session_id, None);
+    }
+}
+
 fn not_served(model: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -13450,6 +13665,69 @@ mod tests {
         assert!(
             exec["selection_traces"].is_array(),
             "decision traces must be surfaced by /v1/execution"
+        );
+
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn golden_capture_endpoint_gates_and_honest_404() {
+        // Trace-collection phase, observe-only endpoint: auth-gated like every
+        // operational view; 400 without model_hash; honest 404 when no worker
+        // advertises the model (empty fabric) — never a fabricated capture.
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let peer = decentraai_p2p::PeerId::from_str(
+            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+        )
+        .unwrap();
+        let compute = std::sync::Arc::new(decentraai_distributed::ComputeManager::new(
+            peer,
+            "golden-capture-test".into(),
+            std::collections::HashSet::new(),
+        ));
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            Some(compute),
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // 400: model_hash is required.
+        let resp = client
+            .get(format!("http://{api}/v1/golden-capture"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // 404: honest "no eligible worker" on an empty fabric — never a
+        // fabricated capture.
+        let resp = client
+            .get(format!(
+                "http://{api}/v1/golden-capture?model_hash=nonexistent-model"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no eligible worker"),
+            "honest 404 body: {body}"
         );
 
         manager.lock().await.shutdown().await.unwrap();

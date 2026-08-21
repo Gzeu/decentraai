@@ -341,6 +341,16 @@ pub struct ComputeManager {
     /// reservation → outcome). The golden-test substrate for comparing
     /// selectors; observe-only, never affects routing.
     recent_traces: std::sync::Mutex<VecDeque<decentraai_fabric::SelectionTrace>>,
+    /// UnifiedSelector shadow mode (Issue #30 Phase 3): observe-only parallel
+    /// execution. When enabled, every authoritative `plan_and_reserve` decision
+    /// also runs the UnifiedSelector on the SAME request context and records a
+    /// structured `ShadowDiff`. The shadow NEVER touches routing/reservation/
+    /// worker selection — it only reads and records. Disabled by default.
+    shadow_enabled: std::sync::atomic::AtomicBool,
+    /// Bounded ring of recent shadow comparisons (observe-only).
+    shadow_records: std::sync::Mutex<VecDeque<decentraai_fabric::ShadowDiff>>,
+    /// Shadow metrics (observe-only): counts are real, never fabricated.
+    shadow_metrics: std::sync::Mutex<ShadowMetrics>,
     /// Optional append-only JSON-lines history file (`db/executions.jsonl`).
     /// When set, every `record_execution` appends a best-effort line so the
     /// fabric keeps execution history across restarts; `load_execution_history`
@@ -435,6 +445,9 @@ impl ComputeManager {
             sessions: std::sync::Mutex::new(crate::session::SessionAccount::new()),
             recent_executions: std::sync::Mutex::new(VecDeque::new()),
             recent_traces: std::sync::Mutex::new(VecDeque::new()),
+            shadow_enabled: std::sync::atomic::AtomicBool::new(false),
+            shadow_records: std::sync::Mutex::new(VecDeque::new()),
+            shadow_metrics: std::sync::Mutex::new(ShadowMetrics::default()),
             executions_path: std::sync::Mutex::new(None),
             credits_path: std::sync::Mutex::new(None),
             contribution_path: std::sync::Mutex::new(None),
@@ -1389,6 +1402,104 @@ impl ComputeManager {
             .collect()
     }
 
+    // ---- UnifiedSelector shadow mode (Issue #30 Phase 3) ----------------
+    // Observe-only by construction: `run_shadow` only READS the same
+    // RequestFacts + WorkerFacts the authoritative planner used, runs the
+    // UnifiedSelector on them, and records a structured ShadowDiff + metrics.
+    // It returns `()` and can never influence routing, reservation, worker
+    // selection or externally visible inference behavior. Errors fail closed:
+    // a shadow panic/error is swallowed (counted) and the authoritative path
+    // proceeds untouched.
+
+    /// Enables/disables shadow mode. Disabled by default; disableable at any
+    /// time via configuration.
+    pub fn set_shadow_enabled(&self, enabled: bool) {
+        self.shadow_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn shadow_enabled(&self) -> bool {
+        self.shadow_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs the UnifiedSelector in parallel on the SAME request context the
+    /// authoritative legacy planner just used, comparing the two decisions.
+    /// Fail-closed: any error here is counted and swallowed; the caller's
+    /// authoritative decision/trace is never touched. Called only by
+    /// `plan_and_reserve*` when shadow mode is enabled.
+    pub fn run_shadow(
+        &self,
+        request_id: &str,
+        rfacts: &decentraai_fabric::RequestFacts,
+        facts: &[decentraai_fabric::WorkerFacts],
+        legacy: &decentraai_fabric::SelectionTrace,
+    ) {
+        if !self.shadow_enabled() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let unified = decentraai_fabric::UnifiedSelector {
+            network: self.network.lock().unwrap().clone(),
+            ..Default::default()
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unified.select(rfacts, facts)
+        }));
+        let latency_us = t0.elapsed().as_micros() as u32;
+        match result {
+            Ok(sel) => {
+                let diff = decentraai_fabric::shadow_compare(
+                    request_id,
+                    legacy,
+                    &sel.trace,
+                    latency_us,
+                );
+                self.record_shadow(diff);
+            }
+            Err(_) => {
+                // Fail-closed: log + count, never propagate.
+                tracing::warn!(request_id, "unified-selector shadow run panicked; authoritative path unaffected");
+                let mut m = self.shadow_metrics.lock().unwrap();
+                m.invocations += 1;
+                m.errors += 1;
+                m.latency_us_sum = m.latency_us_sum.saturating_add(u64::from(latency_us));
+            }
+        }
+    }
+
+    fn record_shadow(&self, diff: decentraai_fabric::ShadowDiff) {
+        const MAX_SHADOW: usize = 128;
+        let mut m = self.shadow_metrics.lock().unwrap();
+        m.invocations += 1;
+        m.latency_us_sum = m.latency_us_sum.saturating_add(u64::from(diff.unified_latency_us));
+        if diff.agreement {
+            m.agreements += 1;
+        } else {
+            m.diffs += 1;
+        }
+        drop(m);
+        let mut ring = self.shadow_records.lock().unwrap();
+        ring.push_back(diff);
+        while ring.len() > MAX_SHADOW {
+            ring.pop_front();
+        }
+    }
+
+    /// Snapshot of recent shadow comparisons, newest-first.
+    pub fn shadow_records(&self) -> Vec<decentraai_fabric::ShadowDiff> {
+        self.shadow_records
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    /// Current shadow metrics.
+    pub fn shadow_metrics(&self) -> ShadowMetrics {
+        self.shadow_metrics.lock().unwrap().clone()
+    }
+
     /// Builds the evidence chain for one execution (P14 Phase P): the
     /// execution record (decision → placement → reservation → worker → model →
     /// outcome → measured usage) linked to its credit event (receipt →
@@ -1793,6 +1904,10 @@ impl ComputeManager {
         // selection. request_id is filled by the caller (route_request_inner)
         // when it completes the trace with the reservation + outcome.
         let decision_trace = decentraai_fabric::SelectionTrace::decision_half("", &rfacts, &result);
+        // UnifiedSelector shadow mode (Issue #30 Phase 3): observe-only parallel
+        // decision on the SAME request context. Fail-closed — the authoritative
+        // `result`/`decision_trace` above are never touched.
+        self.run_shadow("", &rfacts, &facts, &decision_trace);
 
         // M20 observability: surface the KV-aware inputs that shaped the
         // planner decision — continuation affinity and every eligible worker's
@@ -2477,6 +2592,21 @@ pub struct TotalsSnapshot {
     pub requests_completed: u64,
     pub requests_failed: u64,
     pub tokens_total: u64,
+}
+
+/// Observe-only metrics for UnifiedSelector shadow mode (Issue #30 Phase 3).
+/// Every counter reflects real shadow invocations; `latency_us_sum`/`count`
+/// support measuring the decision overhead of the shadow run. Never affects
+/// the authoritative path.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ShadowMetrics {
+    pub invocations: u64,
+    pub errors: u64,
+    pub agreements: u64,
+    pub diffs: u64,
+    /// Sum of the unified selector's decision latency in microseconds across
+    /// shadow invocations (for a mean-overheads diagnostic).
+    pub latency_us_sum: u64,
 }
 
 /// A recorded execution decision + its outcome, surfaced by the dashboard's
@@ -3737,6 +3867,147 @@ mod tests {
         assert_eq!(trace.reserved_worker, None);
         assert_eq!(trace.reservation_id, None);
         assert_eq!(trace.outcome, "");
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_is_observe_only_and_cannot_influence_authoritative_path() {
+        // Issue #30 Phase 3 invariant: with shadow enabled, the authoritative
+        // plan_and_reserve MUST return the identical (plan, placement, trace)
+        // as with shadow disabled. Shadow only adds records + metrics.
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        )).await;
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+
+        // Shadow OFF: baseline authoritative decision.
+        let (plan_off, placement_off, trace_off) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan, shadow off");
+        let (workers_off, worker_id_off, stages_off) = (
+            plan_off.workers(),
+            placement_off.worker,
+            plan_off.stage_count(),
+        );
+        manager.release(placement_off.reservation.reservation_id).await;
+        assert_eq!(manager.shadow_metrics().invocations, 0, "shadow off -> no invocations");
+
+        // Shadow ON: MUST produce an identical authoritative SELECTION. (The
+        // plan_id itself is a per-call Uuid::new_v4() — unique by design, so we
+        // compare the selection-relevant surface, not the id.)
+        manager.set_shadow_enabled(true);
+        let (plan_on, placement_on, trace_on) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan, shadow on");
+        assert_eq!(
+            plan_on.workers(),
+            workers_off,
+            "shadow must not change worker selection"
+        );
+        assert_eq!(placement_on.worker, worker_id_off, "shadow must not change reservation");
+        assert_eq!(plan_on.stage_count(), stages_off);
+        // The decision trace must be identical too.
+        assert_eq!(trace_on, trace_off, "shadow must not alter the decision trace");
+        let _ = trace_on;
+        manager.release(placement_on.reservation.reservation_id).await;
+
+        // Shadow DID record a real invocation + agreement (observe-only).
+        let m = manager.shadow_metrics();
+        assert_eq!(m.invocations, 1, "shadow on -> 1 invocation recorded");
+        assert_eq!(m.errors, 0, "no shadow errors on a healthy fabric");
+        assert_eq!(m.agreements, 1, "unified selector must agree on the real fabric");
+        let recs = manager.shadow_records();
+        assert_eq!(recs.len(), 1, "one shadow record");
+        assert!(recs[0].agreement, "shadow diff agrees");
+        // Reservation is recorded NOT-COMPARABLE (shadow never reserves).
+        let res = recs[0].fields.iter().find(|f| f.field == "reservation").unwrap();
+        assert_eq!(res.verdict, "not_comparable");
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_is_disableable_and_fails_closed_cleanly() {
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        )).await;
+        manager.set_shadow_enabled(true);
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (_plan, placement, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        assert_eq!(manager.shadow_metrics().invocations, 1);
+        manager.release(placement.reservation.reservation_id).await;
+
+        // Disable -> no further shadow invocations, but the authoritative path
+        // still works (and metric counters are frozen, not reset).
+        manager.set_shadow_enabled(false);
+        let (_p2, placement2, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        assert_eq!(
+            manager.shadow_metrics().invocations,
+            1,
+            "disabled shadow -> no new invocations (counters frozen, not reset)"
+        );
+        manager.release(placement2.reservation.reservation_id).await;
+        assert!(!manager.shadow_enabled());
+    }
+
+    #[tokio::test]
+    async fn shadow_records_are_bounded_and_report_structured_diff() {
+        // The shadow diff is structured (per-field verdicts, never a single
+        // boolean collapsed figure) and the record ring is bounded.
+        let local = peer();
+        let worker = peer();
+        let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
+        manager.process_advertisement(build_advertisement(
+            worker,
+            "gpu-rig",
+            ENGINE_LLAMA_SERVER,
+            snapshot(),
+            gpu(),
+            vec![model()],
+            false,
+            true,
+            0,
+            LivePerf::default(),
+        )).await;
+        manager.set_shadow_enabled(true);
+        let req = WorkloadRequirements::new("abc".into(), 256, 3072);
+        let (_, placement, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        manager.release(placement.reservation.reservation_id).await;
+        let recs = manager.shadow_records();
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        // Structured fields: each aspect compared independently.
+        let fields: Vec<&str> = r.fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec!["eligible", "rejected", "ranking", "selected", "provenance", "reservation"]
+        );
+        // On a single trusted worker these all match except reservation (nc).
+        assert!(r.fields.iter().filter(|f| f.verdict == "match").count() >= 5);
+        assert_eq!(r.fields.iter().find(|f| f.field == "reservation").unwrap().verdict, "not_comparable");
     }
 
     #[tokio::test]
