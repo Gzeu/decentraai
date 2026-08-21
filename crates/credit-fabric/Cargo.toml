@@ -1,0 +1,11 @@
+[package]
+name = "decentraai-credit-fabric"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Experimental mutual-credit fabric over decentraai-credit-economy. Research only."
+
+[dependencies]
+decentraai-credit-economy = { path = "../credit-economy" }
+serde = { version = "1", features = ["derive"] }
