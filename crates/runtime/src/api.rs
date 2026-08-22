@@ -67,7 +67,16 @@ const MAX_OUTPUT_TOKENS: u64 = 8192;
 /// HTTP request timeout to the managed llama-server backend, matching the
 /// distributed `BackendConfig` default so a hung engine releases its slot
 /// instead of holding the queue forever.
-const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Overridable for slow-CPU nodes whose prefill on large agent prompts
+/// legitimately exceeds 5 minutes (e.g. OpenClaw ~11.5k-token prompts on a
+/// 6-vCPU VPS): set DECENTRAAI_BACKEND_TIMEOUT_SECS in the service env.
+const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(
+    std::env::var("DECENTRAAI_BACKEND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(300),
+);
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
 type UsageCounters = Arc<StdMutex<HashMap<String, (u64, u64, u64)>>>;
