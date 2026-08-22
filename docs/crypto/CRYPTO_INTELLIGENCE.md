@@ -23,34 +23,28 @@ Crypto Intelligence lets DecentraAI combine:
 - deterministic risk controls;
 - specialized agents;
 - distributed compute and memory;
-- auditable evidence;
-- reproducible research and backtests.
+- auditable evidence.
 
 The goal is **decision support and controlled research**, not an assumption of profitability.
 
 The domain must remain capability-first: models are workers/capabilities, not authorities.
 
-### 1.1 Design objective
+### 1.1 Design inspiration from existing Gzeu repositories
 
-Crypto is the first serious domain used to prove that the generic fabric can coordinate:
+The domain pack deliberately reuses patterns already explored in the user's other repositories, while keeping DecentraAI's core generic.
 
-```text
-DATA
-  ↓
-CAPABILITIES
-  ↓
-SPECIALIZED AGENTS
-  ↓
-SIGNAL FUSION
-  ↓
-RISK POLICY
-  ↓
-EVIDENCE
-  ↓
-DECISION SUPPORT
-```
+Relevant sources inspected:
 
-A successful implementation must improve **capability coverage, evidence quality, latency, or research quality**, not merely add more models.
+| Repository | Pattern worth importing into the domain pack |
+|---|---|
+| `Gzeu/CryptoTraderPro` | live market dashboard, Binance WebSocket singleton, watchlists/alerts, portfolio P&L, SMA backtest, technical indicators, CryptoPanic/news integration |
+| `Gzeu/crypto-mcp-assistant` | multi-timeframe analysis, RSI/MACD/Bollinger/EMA/SMA, sentiment + Fear & Greed, position sizing, stop-loss/take-profit, drawdown controls, paper trading, MCP integration |
+| `Gzeu/profesorXtrader` | multi-source realtime feeds, statistical price aggregation, outlier detection, cross-chain monitoring, arbitrage opportunity scoring, latency/reliability metrics |
+| `Gzeu/binance-crypto-dashboard` | spot/futures/margin portfolio state, signed Binance requests, caching/retry, margin/liquidation context, secure server-side key handling |
+| `Gzeu/blockchain-intelligence-suite` | whale tracking, anomaly detection, DeFi/liquidity intelligence, market microstructure, portfolio optimization, smart-contract risk, cross-chain flow and security analytics |
+| `Gzeu/mvx-onchain-proof` | provenance / proof-oriented thinking for on-chain evidence and verified claims |
+
+These repositories are **reference implementations/pattern sources**, not trusted runtime authorities. Any capability imported into DecentraAI must pass the same validation, evidence, benchmark and security gates as native DecentraAI functionality.
 
 ---
 
@@ -66,9 +60,7 @@ A model may propose:
 - a forecast;
 - a confidence estimate;
 - a capability requirement;
-- a task decomposition;
-- a candidate strategy;
-- a candidate execution plan.
+- a task decomposition.
 
 A model may never directly:
 
@@ -78,9 +70,7 @@ A model may never directly:
 - alter trust/reputation;
 - issue credentials;
 - override resource reservations;
-- fabricate market state;
-- invent fills;
-- turn an unverified signal into a verified fact.
+- fabricate market state.
 
 ### 2.2 Evidence before conclusion
 
@@ -98,20 +88,9 @@ Every market input and derived signal must carry an observation timestamp. A sig
 
 Backtests and benchmarks must never use future information, future revisions, future candles, future news labels or future-derived normalization parameters.
 
-### 2.6 Abstention is a capability
+### 2.6 Strategy is not truth
 
-A healthy crypto intelligence system must be able to say:
-
-```text
-NO_TRADE
-INSUFFICIENT_DATA
-STALE_DATA
-HIGH_LATENCY
-CONFLICTING_SIGNALS
-RISK_REJECTED
-```
-
-without being pressured to produce a directional answer.
+A named strategy is a **hypothesis template**, not a guarantee. Every strategy must be evaluated against deterministic baselines, transaction costs and regime changes.
 
 ---
 
@@ -122,62 +101,32 @@ without being pressured to produce a directional answer.
                                 |
                         Crypto Domain Pack
                                 |
-          +---------------------+----------------------+
-          |                     |                      |
-     MARKET AGENT          NEWS AGENT           ONCHAIN AGENT
-          |                     |                      |
-      price / TA          sentiment / events       flows / whales
-          |                     |                      |
-          +---------------------+----------------------+
+        +-----------------------+-----------------------+
+        |                       |                       |
+   MARKET AGENT            NEWS AGENT            ONCHAIN AGENT
+        |                       |                       |
+   price / TA             sentiment / events       flows / whales
+        |                       |                       |
+        +-----------------------+-----------------------+
                                 |
-                        SIGNAL NORMALIZATION
+                         SIGNAL FUSION LAYER
                                 |
-                       SIGNAL FUSION LAYER
+                  +-------------+-------------+
+                  |                           |
+           Regime / Data Quality       Evidence Graph
+                  |                           |
+                  +-------------+-------------+
                                 |
-                      Evidence + timestamps
+                           RISK ANALYZER
                                 |
-                    REGIME / QUALITY ANALYZER
+                    Deterministic decision policy
                                 |
-                          RISK ANALYZER
-                                |
-                     Deterministic policy
-                                |
-        +------------+-----------+------------+----------------+
-        |            |                        |                |
- LONG_CANDIDATE  SHORT_CANDIDATE           NEUTRAL          NO_TRADE
-                                |
-                         INS UFFICIENT_DATA
+        +----------------+----------------+----------------+
+        |                |                |                |
+ LONG_CANDIDATE     SHORT_CANDIDATE    NEUTRAL      NO_TRADE / INSUFFICIENT_DATA
 ```
 
 A later controlled-execution stage may exist, but it remains outside the model layer and behind explicit policy.
-
-### 3.1 Domain lifecycle
-
-Every crypto request should move through:
-
-```text
-REQUEST
-  ↓
-SNAPSHOT
-  ↓
-DATA QUALITY
-  ↓
-CAPABILITY PLAN
-  ↓
-AGENT DECOMPOSITION
-  ↓
-SIGNALS
-  ↓
-FUSION
-  ↓
-RISK
-  ↓
-EVIDENCE
-  ↓
-CLASSIFICATION
-```
-
-The orchestration layer must never silently skip a required stage.
 
 ---
 
@@ -192,18 +141,21 @@ The crypto pack should expose capabilities rather than hard-code individual mode
 - `time_series_forecasting`
 - `volatility_estimation`
 - `orderbook_analysis`
-- `liquidity_analysis`
+- `multi_source_price_aggregation`
+- `outlier_detection`
 - `market_regime_detection`
 
 ### Intelligence capabilities
 
 - `crypto_sentiment`
-- `financial_sentiment`
+- `fear_greed_analysis`
 - `event_extraction`
 - `onchain_analysis`
 - `whale_flow_analysis`
-- `flow_anomaly_detection`
+- `depeg_detection`
+- `liquidity_analysis`
 - `signal_fusion`
+- `anomaly_detection`
 
 ### Portfolio/risk capabilities
 
@@ -211,17 +163,30 @@ The crypto pack should expose capabilities rather than hard-code individual mode
 - `position_sizing`
 - `portfolio_analysis`
 - `exposure_check`
-- `drawdown_analysis`
-- `scenario_analysis`
+- `drawdown_monitoring`
+- `liquidation_risk`
+- `slippage_estimation`
+- `fee_estimation`
+
+### DeFi / cross-chain capabilities
+
+- `defi_protocol_analysis`
+- `tvl_analysis`
+- `yield_analysis`
+- `impermanent_loss_analysis`
+- `cross_chain_flow`
+- `bridge_risk`
+- `arbitrage_detection`
+- `gas_cost_analysis`
 
 ### Research capabilities
 
 - `crypto_research`
 - `backtesting`
+- `walk_forward_evaluation`
 - `benchmarking`
 - `evidence_review`
-- `strategy_validation`
-- `data_quality_review`
+- `strategy_diagnostics`
 
 Capability names must remain aligned with the existing DecentraAI capability registry/taxonomy. The domain pack must not create a second capability vocabulary.
 
@@ -255,62 +220,33 @@ Download counts, parameter count and model popularity are **discovery signals on
 - quality on the intended crypto task;
 - calibration;
 - robustness to stale/noisy inputs;
-- license compatibility;
-- reproducibility with the chosen runtime.
+- license compatibility.
 
 The actual node resource envelope is authoritative.
-
-### 5.1 Model registry requirements
-
-Every selected model should be recorded with:
-
-```text
-model_id
-model_version
-runtime
-quantization
-artifact_size
-hardware_profile
-task/capability
-benchmark_commit
-quality_score
-latency_p50
-latency_p95
-throughput
-license
-status
-```
-
-A model without a reproducible benchmark record remains a candidate.
 
 ---
 
 ## 6. Data contract
 
-The crypto domain must have a canonical snapshot boundary.
+### 6.1 Market snapshot
 
-A **market snapshot** is a versioned, immutable set of inputs used by one analysis request or benchmark run.
+Every analysis run begins from a versioned `MarketSnapshot` concept containing:
 
-Conceptual structure:
-
-```json
-{
-  "snapshot_id": "...",
-  "asset_set": ["BTCUSDT", "ETHUSDT"],
-  "observed_at": "2026-08-23T00:00:00Z",
-  "market_source_ids": ["..."],
-  "news_source_ids": ["..."],
-  "onchain_source_ids": ["..."],
-  "normalization_version": "...",
-  "timezone": "UTC"
-}
+```text
+snapshot_id
+observed_at
+assets
+prices
+ohlcv
+orderbook_summary
+funding/open_interest (when available)
+source_versions
+latency/freshness
 ```
 
-The snapshot ID becomes the root reference for evidence and replay.
+A snapshot must be immutable once used for evaluation. Re-fetching live data must create a new snapshot rather than mutate the prior one.
 
----
-
-## 7. Signal contract
+### 6.2 Signal contract
 
 All crypto signals should normalize to a common structure before fusion.
 
@@ -319,11 +255,10 @@ Conceptual schema:
 ```json
 {
   "signal_id": "...",
-  "snapshot_id": "...",
   "asset": "BTCUSDT",
   "observed_at": "2026-08-23T00:00:00Z",
   "source": "market|news|onchain|model|indicator",
-  "kind": "sentiment|forecast|breakout|flow|trend|risk|regime",
+  "kind": "sentiment|forecast|breakout|flow|trend|risk|arbitrage",
   "direction": "bullish|bearish|neutral",
   "score": 0.0,
   "confidence": 0.0,
@@ -337,23 +272,21 @@ Conceptual schema:
 
 Implementation may use a Rust-native schema rather than this JSON representation. The JSON is a contract illustration, not an instruction to expose unvalidated arbitrary JSON.
 
-### 7.1 Signal validation
+### 6.3 Data quality state
 
-Reject signals when:
+Each source/snapshot should be classified as one of:
 
-- timestamp is missing or implausible;
-- score/confidence is outside configured bounds;
-- direction is unknown;
-- asset is not recognized;
-- model metadata is missing where required;
-- evidence reference cannot be resolved;
-- freshness exceeds the strategy's maximum age;
-- source provenance is incomplete;
-- the signal was generated after the decision cutoff.
+- `HEALTHY`
+- `STALE`
+- `PARTIAL`
+- `DEGRADED`
+- `INVALID`
+
+A strategy may define a maximum acceptable quality state. `INVALID` must never be consumed as production evidence.
 
 ---
 
-## 8. Data normalization and provenance
+## 7. Data normalization and provenance
 
 Raw external sources must not be passed blindly to models.
 
@@ -367,32 +300,12 @@ The ingestion layer should:
 6. preserve original observation time;
 7. classify source type;
 8. attach provenance/evidence references;
-9. version transformations;
-10. record data-quality results.
+9. record transport latency;
+10. retain enough metadata to replay the feature construction path.
 
 ### Social/news feeds
 
-Do not assume `CryptoBERT` understands an unprocessed Telegram/Twitter stream.
-
-Normalize posts/messages first:
-
-```text
-raw item
-  ↓
-deduplicate
-  ↓
-language/source classification
-  ↓
-spam/bot filtering
-  ↓
-timestamp alignment
-  ↓
-entity/asset extraction
-  ↓
-sentiment/event inference
-  ↓
-time-bucket aggregation
-```
+Do not assume `CryptoBERT` understands an unprocessed Telegram/Twitter stream. Normalize posts/messages first, remove duplicates and bot-like spam where possible, then aggregate into time-bucketed features.
 
 ### Market data
 
@@ -404,61 +317,63 @@ At minimum retain:
 - volatility;
 - funding/open interest where available;
 - source timestamp;
-- sequence/order identifier where the source provides one.
+- receive timestamp.
 
 ### On-chain
 
 Keep source, chain, wallet/entity classification method and observation timestamp. A whale label should never be treated as ground truth without provenance.
 
-### Data quality states
+---
 
-Every input stream should be classifiable as:
+## 8. Deterministic analytics layer
 
-```text
-HEALTHY
-STALE
-PARTIAL
-DEGRADED
-INVALID
-```
+The model layer should be complemented by deterministic analytics already represented across the user's existing trading projects.
 
-The planner may refuse to use `INVALID` data and should expose the reason.
+Recommended baseline indicators:
+
+- RSI;
+- MACD;
+- SMA/EMA;
+- Bollinger Bands;
+- support/resistance;
+- volume and volume anomalies;
+- ATR / volatility;
+- trend strength;
+- order-book imbalance;
+- funding/open-interest deltas;
+- spread and liquidity metrics.
+
+### Why this matters
+
+A model prediction should be a **signal**, not the entire analysis. A simple baseline can sometimes outperform a complex model after fees and slippage. Therefore every model signal should be benchmarkable against deterministic baselines.
 
 ---
 
-## 9. Feature and indicator layer
+## 9. Multi-source price intelligence
 
-Deterministic features must remain separate from model outputs.
+The `profesorXtrader` pattern of combining Binance/CoinGecko/MultiversX feeds suggests a reusable capability: **multi-source price aggregation**.
 
-Examples:
-
-- returns;
-- realized volatility;
-- ATR;
-- RSI;
-- MACD;
-- moving averages;
-- momentum;
-- volume anomalies;
-- spread;
-- order-book imbalance;
-- funding rates;
-- open interest;
-- liquidation intensity;
-- cross-asset correlation;
-- market breadth where available.
-
-Each derived feature needs:
+Recommended flow:
 
 ```text
-feature_name
-formula_version
-input_snapshot_id
-computed_at
-parameters
+Source A ──┐
+Source B ──┼──> normalize -> outlier filter -> aggregate -> confidence
+Source C ──┘
 ```
 
-This makes the feature layer reproducible.
+Useful fields:
+
+- source count;
+- median price;
+- VWAP where applicable;
+- inter-source spread;
+- outlier count;
+- source reliability;
+- latency by source.
+
+A price with one source and high spread should carry less confidence than a converged multi-source price.
+
+Do not use an aggregated price if the source disagreement exceeds the configured market/asset tolerance.
 
 ---
 
@@ -485,8 +400,7 @@ Key failure modes:
 - duplicated stories;
 - sentiment lag;
 - false breakouts;
-- low-liquidity moves;
-- coordinated manipulation.
+- low-liquidity moves.
 
 ### 10.2 Macro & Trend
 
@@ -498,8 +412,6 @@ time-series forecast
 macro/event signals
       +
 volatility regime
-      +
-cross-asset context
       -> multi-day trend analysis
 ```
 
@@ -508,8 +420,7 @@ Key failure modes:
 - event surprise;
 - regime change;
 - forecast uncertainty ignored;
-- correlated signals counted as independent evidence;
-- macro information arriving after market repricing.
+- correlated signals counted as independent evidence.
 
 ### 10.3 Scalping / Whale Alert
 
@@ -528,25 +439,77 @@ strict latency/risk gates
 
 This is the most latency-sensitive strategy and should be the **last** to approach controlled execution.
 
-### 10.4 Portfolio / Regime Strategy
+### 10.4 Multi-timeframe confirmation
 
-A fourth strategy should be evaluated:
+The `crypto-mcp-assistant` pattern of 1m/5m/15m/1h/4h/1d analysis should become a reusable strategy primitive:
 
 ```text
-market regime
-      +
-portfolio exposure
-      +
-asset correlation
-      +
-volatility
-      +
-drawdown
-      ->
-reduce / maintain / rebalance candidate
+micro timeframe
+    ↓
+short timeframe
+    ↓
+trend timeframe
+    ↓
+higher-timeframe regime
 ```
 
-This is intentionally slower and risk-centric.
+A lower-timeframe signal should not automatically override a higher-timeframe conflict. The strategy definition must specify which horizons are confirming vs vetoing.
+
+### 10.5 Price + sentiment consensus
+
+Use explicit disagreement handling:
+
+```text
+price bullish + sentiment bullish  -> stronger candidate
+price bullish + sentiment neutral  -> ordinary candidate
+price bullish + sentiment bearish  -> reduce confidence / NO_TRADE
+```
+
+Do not double-count multiple models trained on the same news source.
+
+### 10.6 Cross-market / cross-chain arbitrage research
+
+Inspired by the cross-chain monitoring patterns in `profesorXtrader`, model an opportunity as:
+
+```text
+buy venue
+sell venue
+raw spread
+fees
+estimated gas/bridge cost
+slippage
+latency
+execution risk
+net edge
+```
+
+A raw price difference is **not** an arbitrage opportunity until all costs and timing constraints are satisfied.
+
+### 10.7 Liquidity-aware momentum
+
+Combine price movement with:
+
+- volume;
+- spread;
+- order-book depth;
+- estimated market impact;
+- funding/open interest.
+
+A strong move on thin liquidity should be classified differently from the same move on deep liquidity.
+
+### 10.8 Regime-aware strategy selection
+
+Possible regimes:
+
+- `TREND_UP`
+- `TREND_DOWN`
+- `RANGE`
+- `HIGH_VOLATILITY`
+- `LOW_LIQUIDITY`
+- `EVENT_DRIVEN`
+- `UNCERTAIN`
+
+The active strategy must declare which regimes it expects. The system should prefer `NO_TRADE` when the current regime is outside its validated operating envelope.
 
 ---
 
@@ -563,128 +526,33 @@ The fusion layer should account for:
 - missing data;
 - regime compatibility;
 - disagreement;
-- calibration;
-- historical failure modes.
+- market liquidity;
+- latency.
 
 Conceptual decision:
 
 ```text
 candidate = fuse(signals)
 
-if data_quality_fail:
+if data_invalid:
     INSUFFICIENT_DATA
 elif risk_fail:
     NO_TRADE
+elif stale_or_latency_too_high:
+    NO_TRADE
+elif insufficient_evidence:
+    INSUFFICIENT_DATA
 elif conflicting_signals:
     NEUTRAL / NO_TRADE
-elif expected_cost > expected_benefit:
-    NO_TRADE
 else:
     LONG_CANDIDATE or SHORT_CANDIDATE
 ```
 
 The exact fusion formula must be deterministic, versioned and benchmarked.
 
-### 11.1 Correlated evidence
-
-Two models consuming the same underlying news should not count as two independent confirmations.
-
-Evidence should carry a `source_family` or equivalent correlation grouping.
-
 ---
 
-## 12. Regime detection
-
-A crypto intelligence system should explicitly recognize regime changes.
-
-Candidate regimes:
-
-```text
-TREND_BULL
-TREND_BEAR
-RANGE
-HIGH_VOLATILITY
-LOW_VOLATILITY
-LIQUIDITY_STRESS
-EVENT_DRIVEN
-UNKNOWN
-```
-
-Regime changes should reduce confidence in models validated only on a different regime.
-
----
-
-## 13. Distributed execution model
-
-Crypto workloads are capability-oriented rather than model-oriented.
-
-Example:
-
-```text
-VPS
-  - lightweight sentiment
-  - financial sentiment
-  - on-chain preprocessing
-  - data adapters
-
-Laptop
-  - short-horizon forecasting
-
-Desktop
-  - larger forecasting model
-  - portfolio/risk analysis
-```
-
-A single logical request may be decomposed across workers through:
-
-**Fabric Intelligence → deterministic planner → DFCP → Sharing is Caring**
-
-The requester must not need to know which physical node owns the capability.
-
-### Local-vs-distributed rule
-
-Distributed execution is preferred only when measured/estimated benefit exceeds coordination cost.
-
-Consider:
-
-```text
-benefit =
-    compute_gain
-  + capability_gain
-  + cache/locality_gain
-  + parallelism_gain
-
-cost =
-    network_latency
-  + serialization
-  + transfer
-  + coordination
-  + failure_risk
-```
-
-If `benefit <= cost`, stay local.
-
-### 13.1 Autonomous pressure integration
-
-Once M15 is available:
-
-```text
-pressure
-  ↓
-Fabric Intelligence proposal
-  ↓
-deterministic planner
-  ↓
-DFCP
-  ↓
-capability worker
-```
-
-The crypto domain must never bypass the general pressure/planner architecture.
-
----
-
-## 14. Agent organization
+## 12. Agent organization
 
 Recommended logical agents:
 
@@ -696,30 +564,49 @@ Recommended logical agents:
 - `portfolio-agent` — portfolio-level synthesis.
 - `crypto-qa` — adversarial review for leakage, false positives and overfitting.
 - `researcher` — source-grounded research and model evaluation.
-
-Optional specialists:
-
-- `data-quality-agent` — freshness/provenance/data integrity.
-- `backtest-agent` — reproducible backtest runs and statistical diagnostics.
-- `regime-agent` — regime classification and transition monitoring.
-- `model-evaluator` — resource/quality benchmarking and calibration.
-- `execution-policy-agent` — proposes execution parameters but never bypasses deterministic policy.
+- `data-quality-agent` — freshness, provenance and feed integrity.
+- `regime-agent` — market-state classification.
+- `model-evaluator` — benchmark and calibration diagnostics.
+- `backtest-agent` — reproducible historical evaluation.
 
 All agents follow the existing Agent Operating System contract:
 
-**identity → role → skills → scopes → memory scope → approval gates → evidence**
+**identity → role → skills → scopes → memory scope → approval gates → evidence**.
 
 Agent role is independent from model identity. A role may switch models/providers while preserving its operating contract.
 
 ---
 
-## 15. Evidence-first output
+## 13. Agent debate / adversarial review
+
+For higher-value analyses, allow independent agents to produce separate views before fusion:
+
+```text
+Market Agent ----\
+News Agent -------+--> Debate/Review --> Risk Agent --> deterministic policy
+Onchain Agent ----/
+```
+
+The review stage should explicitly surface:
+
+- disagreement;
+- missing evidence;
+- contradictory timeframes;
+- stale data;
+- overfitting concerns;
+- assumptions that are not observed facts.
+
+The debate output is evidence for a decision, not authority over the deterministic policy layer.
+
+---
+
+## 14. Evidence-first output
 
 Every analysis should preserve:
 
 ```text
 request_id
-snapshot_id
+market_snapshot_id
 market_snapshot_timestamp
 source_ids
 model_ids + versions
@@ -727,13 +614,11 @@ model runtime
 input feature summary
 signal outputs
 indicator outputs
-regime
 risk checks
 final classification
 confidence
 reason codes
 evidence references
-decision policy version
 ```
 
 The final response must distinguish:
@@ -745,11 +630,9 @@ The final response must distinguish:
 - **decision classification** — policy output;
 - **next check** — what additional evidence would reduce uncertainty.
 
-No answer should hide uncertainty behind a single confidence number.
-
 ---
 
-## 16. Decision classes
+## 15. Decision classes
 
 Preferred output classes:
 
@@ -769,10 +652,34 @@ Optional diagnostic tags:
 - `EVENT_RISK`
 - `MISSING_MARKET_DATA`
 - `UNVERIFIED_ONCHAIN_SIGNAL`
-- `REGIME_UNCERTAIN`
-- `DATA_DEGRADED`
+- `SOURCE_DISAGREEMENT`
+- `CORRELATED_EVIDENCE`
+- `OUTLIER_FILTERED`
 
 These tags explain **why** a signal was rejected without turning the model into an authority.
+
+---
+
+## 16. Portfolio and risk intelligence
+
+The domain should separate **signal generation** from **portfolio decisioning**.
+
+Portfolio-aware inputs should include:
+
+- current exposure;
+- unrealized P&L;
+- realized P&L;
+- available balance;
+- margin usage;
+- leverage;
+- liquidation distance;
+- correlated asset exposure;
+- open orders;
+- drawdown state.
+
+The `binance-crypto-dashboard` pattern of monitoring spot/futures/margin state should be treated as a portfolio-observation reference. Any future execution integration must remain server-side and credential-scoped.
+
+Position sizing should be deterministic and based on explicit risk parameters, not model confidence alone.
 
 ---
 
@@ -793,10 +700,7 @@ Before any live order pathway exists, it must have deterministic controls for at
 - market-liquidity checks;
 - exchange/API availability;
 - duplicate-order protection;
-- explicit user/agent authorization;
-- maximum order frequency;
-- kill switch / trading halt;
-- circuit breakers for abnormal market conditions.
+- explicit user/agent authorization.
 
 No LLM may:
 
@@ -821,9 +725,6 @@ strategy_version
 code_commit
 model_versions
 dataset/version
-feature_version
-signal_fusion_version
-risk_policy_version
 train_window
 validation_window
 test_window
@@ -842,9 +743,17 @@ random seeds where applicable
 - no future normalization statistics;
 - no post-event revisions unless the test explicitly models them;
 - signal timestamp must precede simulated decision time;
-- execution price must respect simulated latency/slippage;
-- model selection must not use the held-out test window;
-- hyperparameters must be frozen before final evaluation.
+- execution price must respect simulated latency/slippage.
+
+### Evaluation modes
+
+- single split baseline;
+- walk-forward evaluation;
+- regime-separated evaluation;
+- stress period evaluation;
+- ablation (remove one signal family at a time);
+- model-vs-baseline comparison;
+- single-node-vs-collective comparison.
 
 ### Metrics
 
@@ -852,7 +761,7 @@ At minimum:
 
 - return;
 - volatility;
-- maximum drawdown;
+- max drawdown;
 - Sharpe/Sortino where meaningful;
 - hit rate;
 - average win/loss;
@@ -860,73 +769,65 @@ At minimum:
 - fees/slippage impact;
 - exposure;
 - tail loss;
-- calibration of confidence;
-- trade count;
-- time-in-market.
+- calibration of confidence.
 
-Compare against deterministic baselines such as buy-and-hold or simple technical rules.
-
-A model only wins if it beats the baseline under the **same** data, costs and evaluation window.
+Compare against deterministic baselines such as buy-and-hold or simple technical rules. A model only wins if it beats the baseline under the **same** data, costs and evaluation window.
 
 ---
 
-## 19. Walk-forward evaluation
+## 19. Distributed execution model
 
-For any strategy intended beyond experimentation, prefer:
+Crypto workloads are capability-oriented rather than model-oriented.
+
+Example:
 
 ```text
-train → validate → test
-       ↓
-roll forward
-       ↓
-train → validate → test
-       ↓
-repeat
+VPS
+  - lightweight sentiment
+  - financial sentiment
+  - on-chain preprocessing
+  - data adapters
+
+Laptop
+  - short-horizon forecasting
+
+Desktop
+  - larger forecasting model
+  - portfolio/risk analysis
 ```
 
-Aggregate out-of-sample results across windows.
+A single logical request may be decomposed across workers through:
 
-Do not choose the best window and report only that result.
+**Fabric Intelligence → deterministic planner → DFCP → Sharing is Caring**.
 
----
+The requester must not need to know which physical node owns the capability.
 
-## 20. Benchmark: single vs collective
+### Local-vs-distributed rule
 
-The most important DecentraAI experiment is:
+Distributed execution is preferred only when measured/estimated benefit exceeds coordination cost.
+
+Consider:
 
 ```text
-SINGLE NODE
-    vs
-COLLECTIVE FABRIC
+benefit =
+    compute_gain
+  + capability_gain
+  + cache/locality_gain
+  + data_availability_gain
+
+cost =
+    network_latency
+  + serialization
+  + transfer
+  + coordination
+  + failure_risk
 ```
 
-Hold constant:
-
-- task;
-- data snapshot;
-- strategy;
-- model versions;
-- decision policy;
-- evaluation window.
-
-Measure:
-
-- quality;
-- p50/p95 latency;
-- throughput;
-- CPU/RAM/GPU utilization;
-- network transfer;
-- coordination overhead;
-- failure rate;
-- compute contribution;
-- evidence completeness;
-- capability coverage.
-
-The collective path is successful only when measured quality/performance or capability coverage improves enough to justify coordination overhead.
+If `benefit <= cost`, stay local.
 
 ---
 
-## 21. Distributed memory for crypto
+## 20. Memory and research journal
 
 Crypto research is well suited to evidence-linked memory.
 
@@ -941,8 +842,7 @@ backtest-result
 news-event
 onchain-event
 risk-lesson
-model-benchmark
-data-quality-incident
+model-evaluation
 ```
 
 These belong in Agent OS / Obsidian memory with:
@@ -956,23 +856,11 @@ These belong in Agent OS / Obsidian memory with:
 
 Shared knowledge must pass through the existing Memory Keeper rules. Private agent memory must remain isolated.
 
-### 21.1 Memory should distinguish
-
-```text
-FACT
-OBSERVATION
-MODEL_OUTPUT
-LESSON
-HYPOTHESIS
-DECISION
-FAILED_EXPERIMENT
-```
-
-A failed strategy must remain retrievable so the colony does not rediscover the same mistake.
+A strategy memory entry must never silently become a production rule. Promotion from experiment/lesson to validated strategy requires a documented benchmark and approval path.
 
 ---
 
-## 22. Data and credential boundary
+## 21. Credential boundary
 
 Exchange credentials/API keys must never be stored in Obsidian memory, model prompts or signal records.
 
@@ -987,72 +875,67 @@ The actual secret lives in the protected runtime environment.
 
 Any future exchange integration must use scoped credentials with the minimum permissions required for the operation.
 
-Recommended first integration posture:
+---
 
-```text
-market-data read-only
-news read-only
-on-chain read-only
-account read-only
-```
+## 22. Repository-derived strategy backlog
 
-Order permissions should remain disabled until the controlled execution milestone is explicitly approved.
+These are candidates to extract from the user's existing projects and redesign as generic DecentraAI capabilities.
+
+### Tier A — high-value foundations
+
+1. **Multi-source price aggregator** — from `profesorXtrader`: normalize Binance/CoinGecko/chain feeds, measure spread/outliers, produce confidence.
+2. **Multi-timeframe analyzer** — from `crypto-mcp-assistant`: reconcile 1m/5m/15m/1h/4h/1d signals under an explicit hierarchy.
+3. **Technical baseline suite** — RSI/MACD/Bollinger/SMA/EMA/support-resistance/volume.
+4. **Portfolio risk observer** — from `binance-crypto-dashboard`: spot/futures/margin state, exposure, margin/liquidation context.
+5. **Paper-trading mode** — from `crypto-mcp-assistant`: safe research path before any controlled execution.
+6. **Backtest/equity curve** — from `CryptoTraderPro`: deterministic baseline strategy with explicit fees/slippage.
+
+### Tier B — intelligence expansion
+
+7. **Whale flow engine** — from `blockchain-intelligence-suite`: large-flow detection with provenance rather than raw labels.
+8. **Anomaly detection** — statistical + ML outlier detection.
+9. **Liquidity and market-impact analysis** — spread, order-book depth, estimated slippage.
+10. **DeFi intelligence** — TVL, pool depth, yield, impermanent loss, protocol risk.
+11. **Cross-chain arbitrage research** — raw spread minus fees/gas/slippage/latency/bridge risk.
+12. **Event intelligence** — macro/news/event timeline linked to market snapshots.
+
+### Tier C — advanced intelligence
+
+13. **Regime-aware strategy router**.
+14. **Signal correlation / evidence independence analysis**.
+15. **Agent debate and adversarial review**.
+16. **Walk-forward model champion/challenger evaluation**.
+17. **Collective crypto research across the DecentraAI fabric**.
+18. **Evidence-linked strategy memory**.
+
+### Priority rule
+
+Do not implement these as one monolithic trading engine. Each becomes a capability/agent task that can be benchmarked, routed and independently trusted.
 
 ---
 
-## 23. Research quality gates
+## 23. Benchmark matrix
 
-Before a model or strategy can move from candidate to validated:
+Each candidate capability should be scored on:
 
-```text
-DATA QUALITY
-   ↓
-REPRODUCIBILITY
-   ↓
-OUT-OF-SAMPLE PERFORMANCE
-   ↓
-CALIBRATION
-   ↓
-ROBUSTNESS
-   ↓
-RESOURCE COST
-   ↓
-COLLECTIVE BENEFIT
-```
+| Dimension | Measurement |
+|---|---|
+| Quality | task-specific accuracy / ranking / calibration |
+| Freshness | observation-to-decision age |
+| Latency | p50/p95/p99 |
+| Resource cost | CPU/RAM/VRAM |
+| Stability | error/reconnect/retry rate |
+| Coverage | assets/timeframes/chains |
+| Provenance | % outputs with complete evidence |
+| Robustness | performance under stale/noisy data |
+| Cost | external/API/compute cost |
+| Fabric benefit | improvement vs single-node |
 
-A strong backtest with poor reproducibility is not production-ready.
-
-A high-performing model that requires excessive resources should not automatically win.
-
-A smaller model that delivers better quality/cost may be preferred.
+A capability cannot become the default merely because it is the most accurate offline. It must satisfy the actual production constraints of the node/fabric.
 
 ---
 
-## 24. Crypto capability lifecycle
-
-Every capability should move through:
-
-```text
-DISCOVERED
-   ↓
-CANDIDATE
-   ↓
-BENCHMARKED
-   ↓
-VALIDATED
-   ↓
-ENABLED
-   ↓
-MONITORED
-   ↓
-DEPRECATED
-```
-
-Each transition should be recorded in evidence and model/strategy documentation.
-
----
-
-## 25. Roadmap
+## 24. Roadmap
 
 ### Crypto-1 — Domain pack specification
 
@@ -1070,7 +953,7 @@ Benchmark small CPU-friendly models on the actual DecentraAI nodes. Select per-c
 
 ### Crypto-4 — Signal and fusion layer
 
-Implement normalized signal schemas, freshness checks, provenance, regime handling and deterministic fusion.
+Implement normalized signal schemas, freshness checks, provenance and deterministic fusion.
 
 ### Crypto-5 — Crypto Agent Team
 
@@ -1080,55 +963,47 @@ Instantiate market/news/on-chain/risk/portfolio/QA agents under Agent OS and con
 
 Run crypto workflows across multiple nodes through Fabric Intelligence, PlacementEngine and DFCP/Sharing is Caring.
 
-### Crypto-7 — Walk-forward backtest lab
+### Crypto-7 — Backtest lab
 
-Reproducible backtests with strict train/validation/test separation, fees, slippage, latency and baseline comparison.
+Compare deterministic baselines, model strategies, ablations and collective strategies with no leakage and realistic costs.
 
 ### Crypto-8 — Controlled execution research
 
-Only after the evidence, risk and authorization layers are proven.
+Only after evidence, risk, credential, paper-trading and authorization gates are proven. Start read-only/testnet before any live trading pathway.
 
-### Crypto-9 — Agent-facing Crypto Gateway
+### Crypto-9 — Agent Gateway / MCP
 
-Expose validated crypto capabilities through the existing OpenAI-compatible API and MCP gateway with scoped credentials and quotas.
+Expose selected crypto capabilities to authorized external agents through scoped DecentraAI identity, MCP and OpenAI-compatible interfaces.
 
 ---
 
-## 26. Non-goals
+## 25. Non-goals
 
 - Turning the DecentraAI core into a crypto-only system.
 - Assuming a small model is automatically profitable.
 - Treating social sentiment as ground truth.
 - Treating model forecasts as guaranteed predictions.
 - Building a crypto marketplace before the analysis layer is validated.
-- Allowing a model to become the execution authority.
-- Reporting backtests without explicit costs, latency and leakage controls.
-- Mixing private agent memory with shared collective knowledge without policy.
+- Allowing model output to bypass deterministic policy.
+- Treating repository-derived strategies as proven trading systems without fresh validation.
 
 ---
 
-## 27. Definition of done
+## 26. Definition of Done
 
-Crypto Intelligence v1 is not complete because models load.
+Crypto Intelligence v1 is not complete because models run.
 
-It is complete when one logical crypto analysis can:
+It is complete when:
 
-1. create a reproducible market snapshot;
-2. discover required capabilities across the fabric;
-3. select locally or distribute according to measured benefit;
-4. obtain normalized, timestamped signals;
-5. preserve provenance and evidence;
-6. fuse signals deterministically;
-7. apply deterministic risk gates;
-8. produce an explainable classification;
-9. store useful lessons in agent memory;
-10. replay the analysis from the recorded evidence;
-11. compare single-node vs collective execution honestly.
-
-The final objective is not “a trading bot”.
-
-It is:
-
-> **A verifiable Crypto Intelligence domain running on a cooperative AI fabric.**
-
-The same architecture should remain reusable for future domains such as document intelligence, security intelligence, research intelligence, industrial intelligence and other specialized agent workloads.
+1. data sources are timestamped and provenance-aware;
+2. market snapshots are replayable;
+3. deterministic indicators exist as baselines;
+4. at least one small model is benchmarked per required capability;
+5. signal fusion is deterministic and versioned;
+6. stale/noisy/conflicting data can produce `NO_TRADE`;
+7. evidence links every material conclusion to inputs;
+8. single-node and collective modes are measured honestly;
+9. agent memory distinguishes experiment from validated strategy;
+10. no credential is exposed to memory/model output;
+11. paper trading/backtesting exists before live execution;
+12. any execution path remains behind explicit policy and authorization.
