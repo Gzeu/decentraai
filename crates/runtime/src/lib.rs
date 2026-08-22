@@ -10,6 +10,7 @@
 //! rejections are written to the audit log (M6).
 
 pub mod api;
+pub mod intel_assist;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod mcp;

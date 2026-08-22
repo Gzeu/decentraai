@@ -7,6 +7,7 @@ use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use libp2p::PeerId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod dfcp;
 pub mod infer_protocol;
 
 pub use infer_protocol::{

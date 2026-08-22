@@ -390,6 +390,27 @@ type CancelHandler = Arc<dyn Fn(uuid::Uuid) + Send + Sync>;
 type ManifestAnnouncementHandler =
     Arc<dyn Fn(PeerId, decentraai_manifest::Manifest, bool) + Send + Sync>;
 
+/// DFCP ("Sharing is Caring") inbound dispatch. The swarm layer only
+/// transports and bounds-checks; ALL domain logic (owner limits,
+/// reservation conflicts, capability execution) lives in the callback —
+/// deterministic Rust, never model output.
+///
+/// `Reserve`/`Assign` expect a synchronous reply (the bytes are sent back
+/// on the same request/response channel): reserve answers with the lease
+/// confirmation or an error marker; assign answers with a small ACK while
+/// the actual work completes asynchronously.
+/// `Result`/`Release` are fire-and-forget notifications.
+#[derive(Debug)]
+pub enum DfcInbound {
+    Reserve(decentraai_protocol::dfcp::ResourceReserve),
+    Assign(decentraai_protocol::dfcp::AssistTaskAssign),
+    Release(decentraai_protocol::dfcp::ResourceRelease),
+    /// Result of OUR outbound assignment: the worker called us back.
+    Result(decentraai_protocol::dfcp::AssistTaskResult),
+}
+
+type DfcHandler = Arc<dyn Fn(PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync>;
+
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
 
@@ -398,6 +419,12 @@ type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
 pub struct P2PNode {
     commands: mpsc::UnboundedSender<Command>,
     peer_id: PeerId,
+    /// Pending assist results: assignment id → completion channel. The
+    /// requester parks a receiver here before sending TASK_ASSIGN and the
+    /// swarm loop completes it when the worker calls back with RESULT.
+    pending_assists: std::sync::Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+    /// DFCP dispatch slot (Sharing is Caring). Registered by the runtime.
+    on_dfcp: SharedHandler<DfcHandler>,
     /// Optional callback invoked for inbound InferRequest messages. Stored
     /// here so callers can register a handler after the node is created.
     on_infer: SharedHandler<InferHandler>,
@@ -623,6 +650,15 @@ impl P2PNode {
         // Shared on_infer callback storage for runtime registration
         let on_infer: SharedHandler<InferHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_infer_clone = on_infer.clone();
+        // DFCP dispatch + pending assist results for the swarm loop.
+        let empty_dfcp: DfcHandler = Arc::new(|_, _| None);
+        let on_dfcp_loop: SharedHandler<DfcHandler> =
+            Arc::new(tokio::sync::Mutex::new(Some(empty_dfcp)));
+        let on_dfcp_clone = on_dfcp_loop.clone();
+        let pending_assists: std::sync::Arc<
+            std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending_assists_clone = std::sync::Arc::clone(&pending_assists);
         let on_cancel: SharedHandler<CancelHandler> = Arc::new(tokio::sync::Mutex::new(None));
         let on_cancel_clone = on_cancel.clone();
         let on_manifest: SharedHandler<ManifestAnnouncementHandler> =
@@ -915,6 +951,108 @@ impl P2PNode {
                                         }
                                         // else fallthrough to normal handler
                                     }
+                                    // DFCP ("Sharing is Caring"): bounded negotiation
+                                    // messages. Reserve/Assign get a synchronous
+                                    // reply through the same channel; Result
+                                    // completes a parked oneshot on the requester;
+                                    // Release is fire-and-forget.
+                                    if let Ok(reserve) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::ResourceReserve>(
+                                        &request,
+                                        decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
+                                    ) {
+                                        let guard = on_dfcp_clone.lock().await;
+                                        let reply = if let Some(cb) = &*guard {
+                                            cb(peer, DfcInbound::Reserve(reserve))
+                                        } else {
+                                            None
+                                        };
+                                        let bytes = reply.unwrap_or_else(|| {
+                                            serde_json::to_vec(&serde_json::json!({
+                                                "error": "assist sharing not enabled"
+                                            }))
+                                            .unwrap_or_default()
+                                        });
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, bytes)
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send dfcp reserve response");
+                                        }
+                                        continue;
+                                    }
+                                    if let Ok(assign) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::AssistTaskAssign>(
+                                        &request,
+                                        decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
+                                    ) {
+                                        info!(%peer, assignment = %assign.assignment_id, "received assist task assign");
+                                        let guard = on_dfcp_clone.lock().await;
+                                        let reply = if let Some(cb) = &*guard {
+                                            cb(peer, DfcInbound::Assign(assign))
+                                        } else {
+                                            None
+                                        };
+                                        let ack = reply.unwrap_or_else(|| {
+                                            serde_json::to_vec(&serde_json::json!({
+                                                "accepted": false,
+                                                "error": "assist execution unavailable"
+                                            }))
+                                            .unwrap_or_default()
+                                        });
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, ack)
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send dfcp assign ack");
+                                        }
+                                        continue;
+                                    }
+                                    if let Ok(result) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::AssistTaskResult>(
+                                        &request,
+                                        decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
+                                    ) {
+                                        info!(%peer, assignment = %result.assignment_id, success = result.success, "received assist task result");
+                                        let tx = pending_assists_clone
+                                            .lock()
+                                            .expect("pending assists mutex")
+                                            .remove(result.assignment_id.as_str());
+                                        if let Some(tx) = tx {
+                                            let _ = tx.send(serde_json::to_vec(&result).unwrap_or_default());
+                                        } else {
+                                            debug!(%peer, "assist result for unknown waiter");
+                                        }
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(
+                                                channel,
+                                                serde_json::to_vec(&serde_json::json!({"received": true}))
+                                                    .unwrap_or_default(),
+                                            )
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send dfcp result ack");
+                                        }
+                                        continue;
+                                    }
+                                    if let Ok(release) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::ResourceRelease>(
+                                        &request,
+                                        decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
+                                    ) {
+                                        let guard = on_dfcp_clone.lock().await;
+                                        if let Some(cb) = &*guard {
+                                            cb(peer, DfcInbound::Release(release));
+                                        }
+                                        let _ = swarm.behaviour_mut().messages.send_response(
+                                            channel,
+                                            serde_json::to_vec(&serde_json::json!({"released": true}))
+                                                .unwrap_or_default(),
+                                        );
+                                        continue;
+                                    }
                                     // Check for InferCancel (single request id in the message, no
                                     // request/response payload semantics)
                                     if let Ok(decentraai_protocol::InferMessage::InferCancel {
@@ -1063,10 +1201,36 @@ impl P2PNode {
         Ok(Self {
             commands,
             peer_id,
+            pending_assists,
+            on_dfcp: on_dfcp_loop,
             on_infer,
             on_cancel,
             on_manifest,
         })
+    }
+
+    /// Parks a one-shot receiver for an assist RESULT. Call BEFORE sending
+    /// TASK_ASSIGN so the callback cannot race the registration.
+    pub fn register_assist_wait(
+        &self,
+        assignment_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_assists
+            .lock()
+            .expect("pending assists mutex")
+            .insert(assignment_id.to_string(), tx);
+        rx
+    }
+
+    /// Sets the DFCP dispatch callback (owner limits, reservations, assist
+    /// execution). See [`DfcInbound`] for the per-message contract.
+    pub fn set_on_dfcp<F>(&mut self, callback: F)
+    where
+        F: Fn(PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_dfcp.lock());
+        *guard = Some(std::sync::Arc::new(callback));
     }
 
     pub fn local_peer_id(&self) -> PeerId {

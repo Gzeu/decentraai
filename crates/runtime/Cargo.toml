@@ -12,6 +12,9 @@ chrono.workspace = true
 decentraai-agents = { path = "../agents" }
 # Fabric Intelligence: the reasoning layer between a task and the planner.
 decentraai-fabric-intelligence = { path = "../fabric-intelligence" }
+# DFCP messages (Sharing is Caring resource negotiation).
+decentraai-protocol = { path = "../protocol" }
+libp2p.workspace = true
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
