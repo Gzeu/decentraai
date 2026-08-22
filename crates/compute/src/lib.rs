@@ -48,6 +48,7 @@ pub mod fabric_graph;
 pub mod loadbalance;
 pub mod matcher;
 pub mod placement;
+pub mod pressure;
 pub mod quota;
 pub mod registry;
 pub mod requirements;

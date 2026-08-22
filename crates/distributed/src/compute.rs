@@ -1719,6 +1719,15 @@ impl ComputeManager {
                 capability: adv.capability.clone(),
                 availability: adv.availability.clone(),
                 link: Some(link_facts),
+                // M15 fairness input: SIGNED net balance from the real
+                // credit ledger (earned − consumed). Zero when unknown.
+                contribution_balance: {
+                    let ledger = self.credits.lock().unwrap();
+                    match ledger.account(&peer_str) {
+                        Some(acc) => acc.earned as i64 - acc.consumed as i64,
+                        None => 0,
+                    }
+                },
             };
             // P5: an open (tripped) worker is omitted from planning entirely.
             if breaker.allow(&adv.peer_id, now) {
@@ -1726,6 +1735,11 @@ impl ComputeManager {
             }
         }
         graph
+    }
+
+    /// Live performance snapshot of THIS node's engine (M15 pressure input).
+    pub fn perf_snapshot(&self) -> LivePerf {
+        self.metrics.snapshot()
     }
 
     /// Number of workloads currently booked on `peer` (reservations held).

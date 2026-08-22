@@ -73,6 +73,13 @@ pub struct FabricNode {
     /// Network link from the coordinator to this node (if measured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkFacts>,
+    /// Contribution balance from the credit ledger: contributed − consumed.
+    /// Positive = net giver. Populated by the coordinator when building the
+    /// graph; absent on older advertisements → 0 (never penalized).
+    /// FAIRNESS BIAS ONLY: saturated to ±0.15 of the placement score
+    /// downstream — never an authority over gates or capacity fit.
+    #[serde(default)]
+    pub contribution_balance: i64,
 }
 
 impl FabricNode {
@@ -395,6 +402,7 @@ mod tests {
             },
             availability: crate::availability::ComputeAvailability::ready(),
             link: None,
+            contribution_balance: 0,
         }
     }
 
