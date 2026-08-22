@@ -199,7 +199,12 @@ pub struct QuotaEvent {
 ///
 /// Wrap this behind a `Mutex` (never `await` under the lock). All operations
 /// are pure, idempotent by `ref_id`, and audited.
-#[derive(Debug, Default)]
+///
+/// The ledger is plain data by design: [`Serialize`]/[`Deserialize`] plus
+/// [`save_atomic`](QuotaLedger::save_atomic) let the host process persist it
+/// across restarts. Balances that only lived in memory meant every node
+/// reboot silently zeroed operator-granted consumer credit.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct QuotaLedger {
     /// Per-account balances.
     accounts: HashMap<AccountId, QuotaAccount>,
@@ -212,6 +217,9 @@ pub struct QuotaLedger {
     events: std::collections::VecDeque<QuotaEvent>,
     /// The active contribution→quota policy.
     policy: ContributionPolicy,
+    /// Set on every mutation; persistence layers use it to skip no-op writes.
+    #[serde(skip)]
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 /// The max number of audit events retained in memory (bounded provenance).
@@ -329,17 +337,22 @@ impl QuotaLedger {
     ///
     /// Moves exactly `used` (clamped to the reserved amount, never more than
     /// reserved) from `reserved` to `consumed`, and releases the unused
-    /// remainder back to `available`. Idempotent: settling the same
-    /// `reservation_id` twice returns `AlreadySettled` on the second call (it
-    /// does NOT re-move any balance). `used` may be 0 for a zero-output
-    /// completion (the reservation is fully released).
+    /// remainder back to `available`. A settled reservation is finalized and
+    /// removed: a later settle or release of the same id reports
+    /// [`QuotaError::UnknownReservation`] instead of silently re-reading stale
+    /// state, so per-request reservation ids can never be re-used to consume
+    /// without accounting. `used` may be 0 for a zero-output completion (the
+    /// reservation is fully released).
     ///
     /// Returns the amount actually consumed (≤ the reserved amount).
     pub fn settle(&mut self, reservation_id: &str, used: u64) -> Result<u64, QuotaError> {
-        let Some(res) = self.reservations.get_mut(reservation_id) else {
+        let Some(mut res) = self.reservations.remove(reservation_id) else {
             return Err(QuotaError::UnknownReservation);
         };
         if res.settled {
+            // Defensive: cannot happen while settled entries are removed on
+            // settle, but never resurrect state from a tombstone.
+            self.reservations.insert(reservation_id.to_string(), res);
             return Err(QuotaError::AlreadySettled);
         }
         res.settled = true;
@@ -396,6 +409,43 @@ impl QuotaLedger {
             ref_id: ref_id.to_string(),
             policy_version: self.policy.version,
         });
+        self.dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns and clears the mutation flag. Persistence layers poll this to
+    /// skip rewriting an unchanged ledger.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes a crash-safe snapshot (tmp file + rename) of the whole ledger.
+    pub fn save_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads a previously saved snapshot; `None` when absent or corrupt
+    /// (callers then start from a fresh ledger — never fail the node for it).
+    pub fn load_snapshot(path: &std::path::Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice(bytes.as_slice()).ok()
+    }
+
+    /// Adopts another ledger's balances/reservations/history wholesale
+    /// (used at boot to restore a saved snapshot into the live instance).
+    pub fn restore(&mut self, other: QuotaLedger) {
+        self.accounts = other.accounts;
+        self.reservations = other.reservations;
+        self.applied = other.applied;
+        self.events = other.events;
+        self.policy = other.policy;
     }
 }
 
@@ -536,11 +586,29 @@ mod tests {
         l.credit(&acct, "exec-0", Some(1000), None);
         let res = l.reserve(&acct, "res-1", 200).unwrap();
         l.settle(&res.reservation_id, 170).unwrap();
+        // A settled reservation is finalized and removed: a second settle of
+        // the same id must NOT re-read stale state or re-move any balance.
         let err = l.settle(&res.reservation_id, 170).unwrap_err();
-        assert!(matches!(err, QuotaError::AlreadySettled));
+        assert!(matches!(err, QuotaError::UnknownReservation));
         // No double-move of balance.
         let acc = l.account(&acct).unwrap();
         assert_eq!(acc.consumed, 170);
+    }
+
+    #[test]
+    fn settled_reservation_cannot_be_reused_to_skip_accounting() {
+        // Regression: a shared reservation id used to let every later request
+        // ride the already-settled entry for free. Finalization must close
+        // that hole — a fresh request gets a fresh id and reserves afresh.
+        let mut l = ledger();
+        let acct = "peer-a".to_string();
+        l.credit(&acct, "exec-0", Some(1000), None);
+        let res = l.reserve(&acct, "req-1", 200).unwrap();
+        assert_eq!(l.settle(&res.reservation_id, 40).unwrap(), 40);
+        let err = l.settle(&res.reservation_id, 999).unwrap_err();
+        assert!(matches!(err, QuotaError::UnknownReservation));
+        let acc = l.account(&acct).unwrap();
+        assert_eq!(acc.consumed, 40);
     }
 
     #[test]

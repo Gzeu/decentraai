@@ -11,8 +11,8 @@ description = "Compute-sharing domain: worker capabilities, availability, resour
 [dependencies]
 libp2p.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true

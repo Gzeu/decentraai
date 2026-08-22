@@ -387,7 +387,17 @@ impl DistributedInference {
             config,
             logs_dir: None,
             signing_key: None,
-            outbound_nonce: std::sync::atomic::AtomicU64::new(0),
+            // Nonces MUST NOT restart from 0: a coordinator reboot would
+            // re-issue nonces the workers' replay guards still remember,
+            // rejecting every outbound request as a replay until both sides
+            // restarted. Seeding from wall-clock epoch keeps new nonces
+            // strictly ahead of anything previously seen across restarts.
+            outbound_nonce: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1),
+            ),
         })
     }
 

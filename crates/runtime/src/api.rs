@@ -9332,7 +9332,13 @@ async fn proxy_with_auth(
             if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
                 return e.into_response();
             }
-            match state.reserve_consumer_quota(account, key_id, &uri.to_string(), *quota_ceiling) {
+            // Per-request reservation id: a URI-derived id is shared by every
+            // request to the same endpoint, which (with the ledger's settled
+            // entries kept around) let later requests ride the first one's
+            // reservation and consume without any accounting. Unique per
+            // request => each request reserves and settles on its own.
+            let request_tag = format!("{}:{:?}", uri, std::time::Instant::now());
+            match state.reserve_consumer_quota(account, key_id, &request_tag, *quota_ceiling) {
                 Some(guard) => Some(guard),
                 // A classified consumer key with no spendable quota is denied.
                 // (None also means "no ledger attached", but a consumer key can

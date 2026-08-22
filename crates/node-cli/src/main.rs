@@ -1652,6 +1652,38 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         .set_allow_provisioning(config.sharing.provision_models_on_demand)
         .await;
 
+    // ---- Quota ledger persistence (db/quota_ledger.json) ----
+    // The ledger is authoritative for consumer credit + worker earnings; a
+    // purely in-memory copy meant every node restart silently zeroed
+    // operator-granted balances. Restore any previous snapshot, then keep an
+    // atomic snapshot on disk shortly after every mutation.
+    let quota_snapshot_path = data_dir.join("db/quota_ledger.json");
+    {
+        let ledger = compute_manager.quota_ledger();
+        if let Some(saved) = decentraai_compute::QuotaLedger::load_snapshot(&quota_snapshot_path) {
+            let mut guard = ledger.lock().expect("quota ledger mutex poisoned");
+            guard.restore(saved);
+            tracing::info!("restored quota ledger from {}", quota_snapshot_path.display());
+        }
+    }
+    {
+        let ledger = compute_manager.quota_ledger();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                // Brief sync lock, no await while held (Q2 rule).
+                if let Ok(l) = ledger.lock() {
+                    if l.take_dirty() {
+                        if let Err(e) = l.save_atomic(&quota_snapshot_path) {
+                            tracing::warn!(error = %e, "failed to persist quota ledger");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ---- Collective Intelligence P1: this node's logical agents ----
     // Agents are logical execution contexts hosted by the node (NOT extra
     // processes): identity + capabilities + policies, advertised to the
