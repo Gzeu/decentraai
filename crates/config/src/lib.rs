@@ -153,6 +153,10 @@ pub struct SharingSection {
     /// through the verified-transfer pipeline (M14). The worker advertises
     /// `can_provision` only when this is set.
     pub provision_models_on_demand: bool,
+    /// Compute Assist resource sharing (M14/M15 "Sharing is Caring").
+    /// Absent = assist disabled; the node shares nothing by default.
+    #[serde(default)]
+    pub assist: Option<AssistSharingSection>,
 }
 
 impl Default for SharingSection {
@@ -161,7 +165,104 @@ impl Default for SharingSection {
             mode: ShareMode::Auto,
             max_concurrent_downloads: 2,
             provision_models_on_demand: true,
+            // Compute Assist sharing is OPT-IN and conservative by default:
+            // a node that never configures it shares NOTHING, exactly as
+            // before the feature existed.
+            assist: None,
         }
+    }
+}
+
+/// Owner-controlled limits for Compute Assist resource sharing ("Sharing is
+/// Caring", M14/M15 milestone 1). The node owner is AUTHORITATIVE: a remote
+/// peer can never consume resources outside these limits, no matter what its
+/// request asks for. Absent section = assist disabled entirely.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssistSharingSection {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Maximum share of THIS node's CPU cores offered to assist workloads
+    /// (percent of total cores, 1–100).
+    #[serde(default = "default_assist_cpu_percent")]
+    pub cpu_max_percent: u8,
+    /// Maximum RAM (MiB) offered to assist workloads.
+    #[serde(default = "default_assist_ram_mb")]
+    pub ram_max_mb: u64,
+    /// Hard lease ceiling in seconds — every lease is clamped to this and
+    /// expires regardless of peer behavior.
+    #[serde(default = "default_assist_lease_secs")]
+    pub max_lease_seconds: u64,
+    /// Capabilities this node is willing to assist with (hub taxonomy names).
+    /// Empty list = ALL capabilities within the other limits.
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    /// Peer ids allowed to REQUEST assistance from this node. Empty = any
+    /// TRUSTED peer (trust is still required on top of this list).
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
+}
+
+fn default_assist_cpu_percent() -> u8 {
+    40
+}
+fn default_assist_ram_mb() -> u64 {
+    2048
+}
+fn default_assist_lease_secs() -> u64 {
+    120
+}
+
+impl AssistSharingSection {
+    /// Boot-time cross-field validation.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.cpu_max_percent) {
+            return Err(format!(
+                "sharing.assist.cpu_max_percent must be within [1,100], got {}",
+                self.cpu_max_percent
+            ));
+        }
+        if self.ram_max_mb == 0 {
+            return Err("sharing.assist.ram_max_mb must be > 0".into());
+        }
+        if self.max_lease_seconds == 0 {
+            return Err("sharing.assist.max_lease_seconds must be > 0".into());
+        }
+        Ok(())
+    }
+
+    /// Deterministic clamp of an incoming request against owner limits.
+    /// Returns `None` when the capability or peer is not allowed at all.
+    pub fn admit(
+        &self,
+        capability: &str,
+        requesting_peer: &str,
+        trusted: bool,
+        requested_cpu: u16,
+        requested_ram_mb: u64,
+    ) -> Option<(u16, u64)> {
+        if !self.enabled || !trusted {
+            return None;
+        }
+        if !self.allowed_peers.is_empty()
+            && !self.allowed_peers.iter().any(|p| p == requesting_peer)
+        {
+            return None;
+        }
+        if !self.allowed_capabilities.is_empty()
+            && !self.allowed_capabilities.iter().any(|c| c == capability)
+        {
+            return None;
+        }
+        Some((requested_cpu.min(self.cpu_cap_cores()), requested_ram_mb.min(self.ram_max_mb)))
+    }
+
+    /// Cores this node may offer, derived from cpu_max_percent.
+    pub fn cpu_cap_cores(&self) -> u16 {
+        let total = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        ((total * u64::from(self.cpu_max_percent)) / 100).max(1) as u16
     }
 }
 

@@ -37,6 +37,7 @@
 //! | ComputeScheduler | [`scheduler::ComputeScheduler`] | Which node executes it? |
 //! | ComputeRegistry | [`registry::ComputeRegistry`] | Who is on the network, and are they still alive? |
 
+pub mod assist;
 pub mod availability;
 pub mod capability;
 pub mod compensation;

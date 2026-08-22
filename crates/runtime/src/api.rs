@@ -5011,6 +5011,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/intel/plan", post(intel_plan_handler))
         .route("/v1/intel/status", get(intel_status_handler))
+        .route("/v1/intel/assist", post(intel_assist_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
@@ -7393,6 +7394,116 @@ async fn agents_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
 /// Runs a collective workflow by delegating stages to the node's agents
 /// (P9). Body: `{ "prompt": string, "template": "research_report" (default) }`.
 /// Returns the workflow outcome (verdict + per-stage results + final output).
+/// POST /v1/intel/assist — Sharing is Caring: offload one capability task
+/// to a capable mesh worker through the DFCP negotiation, with evidence
+/// recorded and contribution credit awarded to the executing worker.
+///
+/// Body: {"capability":"embeddings","cpu_cores":2,"ram_mb":512,
+///        "payload":{"input":"text to embed"},"lease_seconds":60}
+async fn intel_assist_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(p2p) = state.p2p.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "p2p not attached"})),
+        )
+            .into_response();
+    };
+    // Fabric Intelligence is part of the assist path (pressure analysis);
+    // its absence disables the endpoint like every other intel route.
+    if state.intel.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "fabric intelligence is disabled"})),
+        )
+            .into_response();
+    }
+
+    let capability = body
+        .0
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("embeddings")
+        .to_string();
+    let cpu_cores = body.0.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
+    let ram_mb = body.0.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(512);
+    let lease_seconds = body
+        .0
+        .get("lease_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60);
+    let payload_value = body.0.get("payload").cloned().unwrap_or_default();
+    let Ok(task_payload) = serde_json::to_vec(&payload_value) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "payload must be JSON-serializable"})),
+        )
+            .into_response();
+    };
+
+    let peers = p2p.connected_peers().await;
+    if peers.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "no connected workers to assist"})),
+        )
+            .into_response();
+    }
+
+    let request = decentraai_compute::assist::AssistRequest {
+        capability: capability.clone(),
+        cpu_cores,
+        ram_mb,
+    };
+    let started = std::time::Instant::now();
+    let (success, result_payload, explanation) = crate::intel_assist::run_assist_request(
+        &p2p,
+        peers,
+        request,
+        task_payload,
+        lease_seconds,
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    // Evidence + contribution credit for the EXECUTING worker: recorded only
+    // on success, through the existing ledger path.
+    if success {
+        if let Some(cm) = &state.compute {
+            let peer_str = explanation
+                .strip_prefix("assisted by ")
+                .unwrap_or("unknown");
+            if let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() {
+                cm.record_credited_contribution(
+                    &peer_id,
+                    &format!("assist-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)),
+                    true,
+                    None,
+                    Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX)),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "success": success,
+            "explanation": explanation,
+            "elapsed_ms": elapsed_ms,
+            "result": serde_json::from_slice::<serde_json::Value>(&result_payload)
+                .unwrap_or(serde_json::Value::Null),
+        })),
+    )
+        .into_response()
+}
+
 /// POST /v1/intel/plan — Fabric Intelligence analysis of one task.
 ///
 /// Flow: policy-selected provider proposes a JSON plan → STRICT parse →

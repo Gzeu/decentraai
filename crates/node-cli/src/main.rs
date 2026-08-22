@@ -2274,6 +2274,50 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
+        // Sharing is Caring (M14/M15 M1): answer DFCP assist requests under
+        // owner limits when configured; disabled by default.
+        if let Some(assist_cfg) = config.sharing.assist.as_ref() {
+            if assist_cfg.enabled {
+                let worker_state = std::sync::Arc::new(
+                    decentraai_runtime::intel_assist::AssistWorkerState::new(
+                        std::sync::Arc::new(assist_cfg.clone()),
+                        backend_url.clone(),
+                        vec![], // empty = any TRUSTED peer may request
+                    ),
+                );
+                let p2p_for_worker = distributed.p2p_node().clone();
+                let sender_p2p = p2p_for_worker.clone();
+                let send_to_peer: decentraai_runtime::intel_assist::PeerSender =
+                    std::sync::Arc::new(move |peer, bytes| {
+                        let p2p = sender_p2p.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = p2p.request(peer, bytes).await {
+                                tracing::warn!(%peer, error = %e, "assist result delivery failed");
+                            }
+                        });
+                    });
+                let mut p2p_mut = p2p_for_worker.clone();
+                p2p_mut.set_on_dfcp(
+                    decentraai_runtime::intel_assist::attach_dfcp_worker(
+                        std::sync::Arc::clone(&worker_state),
+                        send_to_peer,
+                    ),
+                );
+                // Keep the live engine URL fresh for assist execution.
+                {
+                    let ws = worker_state.clone();
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let url = manager.lock().await.base_url().unwrap_or_default();
+                            ws.update_backend_url(&url);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                    });
+                }
+                let _ = p2p_mut;
+            }
+        }
         // TTS: Kokoro subprocess for the chat speak button. Enabled only when
         // `tts.enabled` is set AND the venv/model files exist; a missing setup
         // logs a warning and serves without voice rather than failing startup.
