@@ -7,6 +7,24 @@ model serving + dashboard, all one process):
    `decentraai node`.
 2. **Container** — `deploy/Dockerfile` + `deploy/docker-compose.yml`.
 
+## Public VPS coordinator (Caddy + env)
+
+For a public bootstrap/coordinator node behind a reverse proxy:
+
+- `deploy/Caddyfile.vps` — hardened allowlist proxy: ONLY the landing page
+  and the OpenAI-compatible inference surface (`/v1/chat/completions`,
+  `/v1/models`, `/v1/embeddings`) reach the node; every control-plane
+  endpoint (`/v1/token`, `/api/admin/*`, `/status`, `/v1/*` views) answers
+  404 at the proxy. The full dashboard stays SSH-tunnel-only.
+- `deploy/decentraai-vps.env.example` — systemd environment for slow-CPU
+  public nodes: `DECENTRAAI_BACKEND_TIMEOUT_SECS=1800`, which since
+  commit `7e849a9` raises the ONE shared inference budget across the
+  backend HTTP client, P2P request/response and remote route timeouts.
+
+Both files exist because these live changes were once applied directly on
+the VPS and would have been lost on a reinstall. Install commands are in
+the file headers.
+
 ## Container (Docker)
 
 ```bash

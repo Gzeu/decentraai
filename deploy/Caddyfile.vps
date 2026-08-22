@@ -1,0 +1,40 @@
+# DecentraAI — Caddy reverse proxy for a PUBLIC VPS coordinator/bootstrap node.
+#
+# Threat model: the node API binds loopback ONLY (config validation rejects
+# public binds), but this proxy makes remote callers arrive from 127.0.0.1.
+# The allowlist below is therefore the ONLY thing standing between the
+# internet and control-plane endpoints that were designed for localhost use:
+#   /v1/token          — serves the MASTER token to "local" callers (the
+#                        handler also refuses X-Forwarded-* with 404, but do
+#                        not rely on one layer alone)
+#   /api/admin/*       — token create/revoke, worker trust, settings
+#   /status, /v1/compute, /v1/network, /v1/execution, /v1/peers
+#                      — operational views, operator/master-gated in Rust,
+#                        but pointless to expose and extra surface
+#
+# Public surface = inference API only. The full dashboard is reachable via
+# SSH tunnel: ssh -L 8080:127.0.0.1:8080 <user>@<vps> → http://localhost:8080
+#
+# Install on the VPS:
+#   sudo cp deploy/Caddyfile.vps /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+# Verify: curl -sk https://<ip>/v1/token        → expect 404
+#         curl -sk https://<ip>/v1/models       → expect 401 (auth required)
+
+https://169.58.213.145 {
+	tls internal
+
+	# Allowlist: landing page (chat shell) + OpenAI-compatible inference.
+	@public path / /v1/chat/completions /v1/models /v1/embeddings
+
+	handle @public {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# Everything else: answer 404 without confirming existence.
+	respond 404
+}
+
+http://169.58.213.145 {
+	redir https://169.58.213.145{uri} permanent
+}
