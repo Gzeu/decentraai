@@ -1065,6 +1065,7 @@ dependencies = [
  "decentraai-config",
  "decentraai-discovery",
  "decentraai-distributed",
+ "decentraai-fabric-intelligence",
  "decentraai-hub",
  "decentraai-identity",
  "decentraai-inference-adapter",
@@ -1171,6 +1172,18 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "decentraai-fabric-intelligence"
+version = "1.0.0"
+dependencies = [
+ "decentraai-config",
+ "decentraai-hub",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1330,6 +1343,7 @@ dependencies = [
  "decentraai-config",
  "decentraai-distributed",
  "decentraai-fabric",
+ "decentraai-fabric-intelligence",
  "decentraai-hub",
  "decentraai-inference-adapter",
  "decentraai-p2p",

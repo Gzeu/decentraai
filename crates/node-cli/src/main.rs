@@ -88,6 +88,12 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Fabric Intelligence: status, provider list and a live planning test
+    /// against the configured local/external intelligence source.
+    Intel {
+        #[command(subcommand)]
+        command: IntelCommand,
+    },
     /// P13 — signed verified compute receipts: cryptographically sign a
     /// verified compute receipt with this node's identity, or verify a signed
     /// receipt independently. Read-only / non-mutating; the raw signing primitives
@@ -916,6 +922,7 @@ async fn main() -> Result<()> {
         Command::Tier { command } => tier_command(command),
         Command::ConsumerKey { command } => consumer_key_command(command),
         Command::Agent { command } => agent_command(command).await,
+        Command::Intel { command } => intel_command(command).await,
         Command::Receipt { command } => Ok(receipt_command(command)?),
         Command::Rag { command } => rag_command(command).await,
         Command::Memory { command } => memory_command(command).await,
@@ -2240,7 +2247,30 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(compute_manager.clone()),
             Some(distributed.p2p_node().clone()),
         );
-        state.set_dashboard(config.node.dashboard);
+                state.set_dashboard(config.node.dashboard);
+        // Fabric Intelligence: reasoning layer between a task and the
+        // deterministic planner. Opt-in via config; disabled/absent = no-op.
+        if let Some(intel_cfg) = config.fabric_intelligence.as_ref() {
+            if intel_cfg.enabled {
+                state.attach_intel(std::sync::Arc::new(
+                    decentraai_fabric_intelligence::FabricIntelligence::from_config(
+                        intel_cfg
+                    ),
+                ));
+            }
+        }
+        // Fabric Intelligence: reasoning layer between a task and the
+        // deterministic planner. Opt-in via config; disabled/absent = no-op.
+        if let Some(intel_cfg) = config.fabric_intelligence.as_ref() {
+            if intel_cfg.enabled {
+                state.attach_intel(std::sync::Arc::new(
+                    decentraai_fabric_intelligence::FabricIntelligence::from_config(
+                        intel_cfg
+                    ),
+                ));
+            }
+        }
+
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         state.attach_distributed(distributed.clone().into());
@@ -4141,6 +4171,119 @@ fn consumer_key_command(command: ConsumerKeyCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `decentraai intel` subcommands (Fabric Intelligence). Status and provider
+/// listing are config-driven (offline); `test` calls the LIVE node API so it
+/// exercises the exact path a request would take.
+#[derive(Debug, Subcommand)]
+enum IntelCommand {
+    /// Show the Fabric Intelligence section of the given config (offline,
+    /// no node required). Secrets are NEVER printed — only the env NAME.
+    Status {
+        #[arg(long, default_value = "~/.decentraai/node.yaml")]
+        config: PathBuf,
+    },
+    /// List the configured intelligence providers with availability.
+    Providers {
+        #[arg(long, default_value = "~/.decentraai/node.yaml")]
+        config: PathBuf,
+    },
+    /// Send a test task to the live node's /v1/intel/plan endpoint.
+    Test {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        api: String,
+        #[arg(long)]
+        token: Option<String>,
+        /// The task to analyze (e.g. "compare these three PDFs").
+        #[arg(short = 'm', long)]
+        task: String,
+    },
+}
+
+async fn intel_command(command: IntelCommand) -> Result<()> {
+    match command {
+        IntelCommand::Status { config } => {
+            let path = expand_tilde(config.to_string_lossy().as_ref());
+            let cfg = decentraai_config::NodeConfig::load(&path)
+                .map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
+            match &cfg.fabric_intelligence {
+                None => println!("fabric intelligence: disabled (no config section)"),
+                Some(fi) => {
+                    println!("fabric intelligence:");
+                    println!("  enabled:         {}", fi.enabled);
+                    println!("  policy:          {:?}", fi.policy);
+                    println!("  min_confidence:  {}", fi.min_confidence);
+                    println!(
+                        "  local_model:     {}",
+                        fi.local_model.as_deref().unwrap_or("(node default)")
+                    );
+                    match &fi.external {
+                        Some(ext) => {
+                            println!("  external:        {} @ {}", ext.model, ext.base_url);
+                            println!("  api key env:     {}", ext.api_key_env);
+                        }
+                        None => println!("  external:        not configured"),
+                    }
+                    println!(
+                        "  max_artifact_bytes: {} (hard cap {})",
+                        fi.max_artifact_bytes,
+                        decentraai_config::MAX_FABRIC_ARTIFACT_BYTES
+                    );
+                }
+            }
+            Ok(())
+        }
+        IntelCommand::Providers { config } => {
+            let path = expand_tilde(config.to_string_lossy().as_ref());
+            let cfg = decentraai_config::NodeConfig::load(&path)
+                .map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
+            println!("intelligence providers:");
+            println!(
+                "  local llama.cpp backend — available when the node is serving"
+            );
+            if let Some(ext) = cfg
+                .fabric_intelligence
+                .as_ref()
+                .and_then(|f| f.external.as_ref())
+            {
+                let keyed = std::env::var(&ext.api_key_env)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false);
+                println!(
+                    "  external {} @ {} — key env {}: {}",
+                    ext.model,
+                    ext.base_url,
+                    ext.api_key_env,
+                    if keyed { "SET" } else { "UNSET" }
+                );
+            } else {
+                println!("  external — not configured");
+            }
+            Ok(())
+        }
+        IntelCommand::Test { api, token, task } => {
+            let url = format!("{api}/v1/intel/plan");
+            let client = reqwest::Client::new();
+            let mut req = client.post(&url).json(&serde_json::json!({ "task": task }));
+            if let Some(t) = token.as_deref().filter(|t| !t.is_empty()) {
+                req = req.bearer_auth(t);
+            }
+            let res = req.send().await.map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            println!("POST {url} → HTTP {status}");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+            if status.is_success() {
+                Ok(())
+            } else {
+                anyhow::bail!("intel plan failed with HTTP {status}")
+            }
+        }
+    }
 }
 
 /// `decentraai agent` subcommands (Collective Intelligence P1).
