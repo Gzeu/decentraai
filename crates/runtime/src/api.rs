@@ -318,6 +318,10 @@ pub struct ApiState {
     /// dashboard so WORKERS/NETWORK/EXECUTION views render real state only.
     /// `None` when running without a compute manager (e.g. plain serve).
     compute: Option<Arc<decentraai_distributed::ComputeManager>>,
+    /// Fabric Intelligence (the reasoning layer between a task and the
+    /// deterministic planner). `None` when disabled in config — the node
+    /// behaves exactly as before the feature existed.
+    intel: Option<Arc<decentraai_fabric_intelligence::FabricIntelligence>>,
     /// The live P2P node, for the NETWORK view (connected peers).
     p2p: Option<decentraai_p2p::P2PNode>,
     /// Fabric inference coordinator (M18+). When attached, the proxy can
@@ -428,6 +432,7 @@ impl ApiState {
             token_usage: Arc::new(StdMutex::new(HashMap::new())),
             compute,
             p2p,
+            intel: None,
             distributed: None,
             agents: None,
             orchestrator: None,
@@ -498,6 +503,67 @@ impl ApiState {
     ) {
         self.orchestrator = Some(orchestrator);
     }
+
+    /// Attaches the Fabric Intelligence layer (built from config in the node
+    /// daemon). Absent = `/v1/intel/*` answer 404 and the node behaves as if
+    /// the feature did not exist.
+    pub fn attach_intel(
+        &mut self,
+        intel: Arc<decentraai_fabric_intelligence::FabricIntelligence>,
+    ) {
+        self.intel = Some(intel);
+    }
+
+/// Fabric Intelligence: capability inventory the deterministic fabric can
+/// currently vouch for. Assembled ONLY from attached, real sources — never
+/// invented:
+///   * the local LLM backend (any served GGUF genuinely provides chat /
+///     generation / reasoning / coding / structured output / summarization);
+///   * the embeddings + retrieval managers when configured (RAG path);
+///   * the skill registry's declared capabilities when attached;
+///   * local agents' semantic claims when an agent manager is attached.
+pub async fn intel_available_capabilities(&self) -> Vec<decentraai_hub::capability::CapabilityKind> {
+    use decentraai_hub::capability::CapabilityKind;
+    let mut out = vec![
+        // The managed llama-server backend is an LLM; these are honest.
+        CapabilityKind::Chat,
+        CapabilityKind::TextGeneration,
+        CapabilityKind::Reasoning,
+        CapabilityKind::Coding,
+        CapabilityKind::StructuredOutput,
+        CapabilityKind::Summarization,
+        CapabilityKind::Translation,
+    ];
+    if self.embedding.is_some() {
+        out.push(CapabilityKind::Embeddings);
+    }
+    if self.retrieval.is_some() {
+        out.push(CapabilityKind::Retrieval);
+    }
+    // Skill registry claims: every registered skill DEVELOPS capabilities
+    // (OCR/STT/TTS/translation/…) — declared evidence, never invented.
+    if let Some(skills) = &self.skills {
+        for skill in skills.as_ref().skills() {
+            for cap in &skill.develops {
+                if !out.contains(cap) {
+                    out.push(*cap);
+                }
+            }
+        }
+    }
+    // Local agents' semantic claims (signed advertisements, mesh-wide).
+    if let Some(agents) = &self.agents {
+        for record in agents.local_agents() {
+            for claim in &record.semantic_capabilities {
+                if !out.contains(&claim.capability) {
+                    out.push(claim.capability);
+                }
+            }
+        }
+    }
+    out
+}
+
 
     /// Attaches the P8 dataset/skill registry (read-only) for the dashboard.
     pub fn attach_skills(&mut self, skills: Arc<decentraai_agents::SkillRegistry>) {
@@ -4943,6 +5009,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/agents", get(agents_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
+        .route("/v1/intel/plan", post(intel_plan_handler))
+        .route("/v1/intel/status", get(intel_status_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
@@ -7325,6 +7393,100 @@ async fn agents_handler(State(state): State<ApiState>, headers: HeaderMap) -> Re
 /// Runs a collective workflow by delegating stages to the node's agents
 /// (P9). Body: `{ "prompt": string, "template": "research_report" (default) }`.
 /// Returns the workflow outcome (verdict + per-stage results + final output).
+/// POST /v1/intel/plan — Fabric Intelligence analysis of one task.
+///
+/// Flow: policy-selected provider proposes a JSON plan → STRICT parse →
+/// deterministic validation against the mesh's real capability set. The
+/// response marks the plan as a PROPOSAL (`executable` flag) — execution is
+/// still decided by the planner/reservations, never by this layer.
+async fn intel_plan_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(intel) = state.intel.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "fabric intelligence is disabled (no config section)"
+            })),
+        )
+            .into_response();
+    };
+    let task = body
+        .0
+        .get("task")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let Some(task) = task else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "field `task` must be a non-empty string"})),
+        )
+            .into_response();
+    };
+
+    // Live backend URL (same pattern as the chat proxy): engine respawns
+    // change the ephemeral port, so the intelligence provider must target
+    // whatever the manager currently runs.
+    let backend_url = {
+        let manager = state.manager.lock().await;
+        manager
+            .base_url()
+            .unwrap_or_else(|| state.backend_url.clone())
+    };
+    let outcome = intel.plan(task, &backend_url).await;
+    let plan = outcome.plan.clone();
+    let available = state.intel_available_capabilities().await;
+    let validation = plan
+        .as_ref()
+        .map(|p| {
+            decentraai_fabric_intelligence::validation::validate_against_fabric(p, &available)
+        });
+
+    let body = serde_json::json!({
+        "proposal": true,
+        "note": "plan is advisory; the deterministic planner remains authoritative",
+        "plan": plan,
+        "validation": validation,
+        "available_capabilities": available.iter().map(|c| c.label()).collect::<Vec<_>>(),
+        "attempts": outcome.attempts.iter().map(|(k, ok, ms)| serde_json::json!({
+            "provider": k.as_str(), "parsed_ok": ok, "latency_ms": ms
+        })).collect::<Vec<_>>(),
+        "error": outcome.error,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// GET /v1/intel/status — non-sensitive layer status for dashboard/CLI.
+async fn intel_status_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(intel) = state.intel.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"enabled": false})),
+        )
+            .into_response();
+    };
+    let (generated, valid, rejected, external_calls) = intel.telemetry().totals();
+    let mut body = intel.describe();
+    body["totals"] = serde_json::json!({
+        "plans_generated": generated,
+        "plans_valid": valid,
+        "plans_rejected": rejected,
+        "external_calls": external_calls,
+    });
+    body["providers"] =
+        serde_json::to_value(intel.telemetry().scores()).unwrap_or_else(|_| serde_json::json!([]));
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
 async fn agents_orchestrate_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,

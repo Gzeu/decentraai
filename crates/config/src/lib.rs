@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -41,6 +41,10 @@ pub struct NodeConfig {
     /// `/v1/ocr` returns 404. Enabling requires `<data_dir>/tools/ocr/venv`.
     #[serde(default)]
     pub ocr: Option<OcrSection>,
+    /// Fabric Intelligence (the reasoning layer between a task and the
+    /// deterministic planner). Absent = disabled; `/v1/intel/*` returns 404.
+    #[serde(default)]
+    pub fabric_intelligence: Option<FabricIntelligenceSection>,
     /// Local STT (faster-whisper subprocess). Absent = STT is disabled;
     /// `/v1/stt` returns 404. Enabling requires `<data_dir>/tools/stt/venv`.
     #[serde(default)]
@@ -414,6 +418,135 @@ impl Default for OcrSection {
     }
 }
 
+/// Fabric Intelligence policy: how the intelligence layer chooses between
+/// the local backend and an external OpenAI-compatible provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FabricIntelligencePolicy {
+    /// Local backend first; external only as an allowed fallback when the
+    /// local attempt fails. DEFAULT — user content stays on-node.
+    #[default]
+    LocalFirst,
+    /// External first; local only as fallback.
+    ExternalFirst,
+    /// Never call an external provider (air-gapped deployments).
+    LocalOnly,
+    /// Always external; local never consulted.
+    ExternalOnly,
+    /// Whichever succeeds first, tried in local→external order.
+    Fallback,
+}
+
+/// External OpenAI-compatible provider settings. The API key is NEVER a
+/// config field: it is read from the environment variable named by
+/// `api_key_env` at call time, so nothing secret persists in YAML, backups
+/// or `/status` output.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FabricIntelExternalSection {
+    pub base_url: String,
+    pub api_key_env: String,
+    pub model: String,
+}
+
+/// Fabric Intelligence configuration. Absent section = disabled; the node
+/// behaves exactly as before this feature existed.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FabricIntelligenceSection {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub policy: FabricIntelligencePolicy,
+    /// Plans with confidence below this are treated as low-quality: under
+    /// `local_first` they may trigger the external fallback (if configured).
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f32,
+    /// Preferred local intelligence model name (advisory — the node's served
+    /// model answers if it differs; the node owns its engine).
+    #[serde(default)]
+    pub local_model: Option<String>,
+    /// External provider; optional even when the section itself is enabled.
+    #[serde(default)]
+    pub external: Option<FabricIntelExternalSection>,
+    /// Auto-provisioning artifact ceiling for intelligence-recommended
+    /// models. Hard cap is [`MAX_FABRIC_ARTIFACT_BYTES`] (2 GiB); config may
+    /// only LOWER it.
+    #[serde(default = "default_max_artifact_bytes")]
+    pub max_artifact_bytes: u64,
+}
+
+fn default_false() -> bool {
+    false
+}
+fn default_min_confidence() -> f32 {
+    0.5
+}
+fn default_max_artifact_bytes() -> u64 {
+    crate::MAX_FABRIC_ARTIFACT_BYTES
+}
+
+/// The absolute ceiling any `max_artifact_bytes` may take (2 GiB). Enforced
+/// in validation, not just convention.
+pub const MAX_FABRIC_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+impl Default for FabricIntelligenceSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policy: FabricIntelligencePolicy::LocalFirst,
+            min_confidence: default_min_confidence(),
+            local_model: None,
+            external: None,
+            max_artifact_bytes: MAX_FABRIC_ARTIFACT_BYTES,
+        }
+    }
+}
+
+impl FabricIntelligenceSection {
+    /// Cross-field validation at load time, so a broken intel config fails
+    /// at boot instead of on the first request.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(0.0..=1.0).contains(&self.min_confidence) {
+            return Err(format!(
+                "fabric_intelligence.min_confidence must be within [0,1], got {}",
+                self.min_confidence
+            ));
+        }
+        // An EXTERNAL-ONLY policy with no external endpoint can never answer:
+        // fail at boot, not silently per request.
+        if self.policy == FabricIntelligencePolicy::ExternalOnly && self.external.is_none() {
+            return Err(
+                "fabric_intelligence.policy=external_only requires an external section"
+                    .to_string(),
+            );
+        }
+        if let Some(ext) = &self.external {
+            if ext.base_url.trim().is_empty()
+                || ext.api_key_env.trim().is_empty()
+                || ext.model.trim().is_empty()
+            {
+                return Err(
+                    "fabric_intelligence.external requires non-empty base_url, api_key_env and model"
+                        .to_string(),
+                );
+            }
+        }
+        if self.max_artifact_bytes > MAX_FABRIC_ARTIFACT_BYTES {
+            return Err(format!(
+                "fabric_intelligence.max_artifact_bytes exceeds the hard limit of {MAX_FABRIC_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        if self.max_artifact_bytes == 0 {
+            return Err("fabric_intelligence.max_artifact_bytes must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Local speech-to-text (STT). Drives a faster-whisper (CTranslate2) Python
 /// subprocess — external engine, never FFI — exposed as `/v1/stt`. Models
 /// download on first use (or are pre-placed in `<data_dir>/tools/stt/models`
@@ -494,6 +627,9 @@ impl NodeConfig {
             return Err(ConfigError::Validation(
                 "node.name must not be empty".into(),
             ));
+        }
+        if let Some(intel) = &self.fabric_intelligence {
+            intel.validate().map_err(ConfigError::Validation)?;
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(
@@ -661,6 +797,8 @@ mod tests {
         let yaml = r#"
 node:
   name: t
+  mode: balanced
+  data_dir: /tmp/decentraai-test
 network:
   private_swarm: true
 storage:
@@ -1029,6 +1167,84 @@ security:
         let config = NodeConfig::load(file.path()).unwrap();
         assert_eq!(config.sharing.mode, ShareMode::Auto);
         assert!(config.sharing.provision_models_on_demand);
+    }
+
+    /// Fabric Intelligence is OPT-IN: a config without the section loads
+    /// fine and the layer stays disabled (backward compatibility).
+    #[test]
+    fn missing_fabric_intelligence_section_means_disabled() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(
+            config.fabric_intelligence.is_none(),
+            "example yaml must not silently enable the feature"
+        );
+    }
+
+    #[test]
+    fn fabric_intelligence_section_parses_with_external() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                "{raw}\nfabric_intelligence:\n  enabled: true\n  policy: local_first\n  min_confidence: 0.6\n  local_model: qwen3-0.6b\n  external:\n    base_url: https://api.openai.com/v1\n    api_key_env: OPENAI_API_KEY\n    model: gpt-4o-mini\n"
+            ),
+        )
+        .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let intel = config.fabric_intelligence.expect("section present");
+        assert!(intel.enabled);
+        assert_eq!(
+            intel.policy,
+            FabricIntelligencePolicy::LocalFirst,
+            "local_first must be the default posture"
+        );
+        assert_eq!(intel.min_confidence, 0.6);
+        let ext = intel.external.as_ref().expect("external present");
+        assert_eq!(ext.api_key_env, "OPENAI_API_KEY");
+        // The external section carries only the ENV NAME — never a key value.
+        assert!(!ext.api_key_env.to_lowercase().contains("sk-"));
+    }
+
+    #[test]
+    fn fabric_intelligence_rejects_artifact_limit_above_hard_cap() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        std::fs::write(
+            file.path(),
+            format!("{raw}\nfabric_intelligence:\n  enabled: true\n  max_artifact_bytes: 9999999999\n"),
+        )
+        .unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("hard limit"),
+            "oversized artifact ceiling must fail validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fabric_intelligence_rejects_external_only_without_endpoint() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        std::fs::write(
+            file.path(),
+            format!("{raw}\nfabric_intelligence:\n  enabled: true\n  policy: external_only\n"),
+        )
+        .unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("external_only"),
+            "external-only without endpoint must fail at boot, got: {err}"
+        );
     }
 
     #[test]

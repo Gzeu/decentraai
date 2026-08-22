@@ -54,6 +54,43 @@ pub enum CapabilityKind {
 }
 
 impl CapabilityKind {
+    /// Every capability in the taxonomy, in its snake_case wire form.
+    ///
+    /// The Fabric Intelligence layer hands this list to the planning model as
+    /// the ONLY allowed vocabulary, so a hallucinated capability name can be
+    /// rejected deterministically before any fabric validation runs. Kept
+    /// here (not in the intelligence crate) so the taxonomy has ONE source
+    /// of truth: adding a variant to the enum without extending this list
+    /// fails the `all_names_covers_every_variant` test.
+    pub const ALL_NAMES: &[&'static str] = &[
+        "chat",
+        "text_generation",
+        "reasoning",
+        "coding",
+        "agents",
+        "tool_calling",
+        "function_calling",
+        "structured_output",
+        "vision",
+        "multimodal",
+        "ocr",
+        "document_understanding",
+        "embeddings",
+        "reranking",
+        "retrieval",
+        "speech_to_text",
+        "text_to_speech",
+        "audio",
+        "translation",
+        "summarization",
+        "classification",
+        "image_generation",
+        "video",
+        "local",
+        "small_models",
+        "experimental",
+    ];
+
     /// Short human label for chips/badges.
     pub fn label(&self) -> &'static str {
         match self {
@@ -91,8 +128,7 @@ impl std::str::FromStr for CapabilityKind {
     type Err = ();
     /// Parse a capability from its snake_case serialized form (e.g. `ocr`,
     /// `text_generation`, `tool_calling`). Unknown strings error.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {        Ok(match s {
             "chat" => CapabilityKind::Chat,
             "text_generation" => CapabilityKind::TextGeneration,
             "reasoning" => CapabilityKind::Reasoning,
@@ -417,6 +453,25 @@ mod tests {
 
     fn tags(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The Fabric Intelligence layer uses ALL_NAMES as the planning model's
+    /// only allowed vocabulary. This test pins it to the enum: adding a
+    /// CapabilityKind variant without extending ALL_NAMES must fail here,
+    /// otherwise the intelligence layer could never propose the new
+    /// capability.
+    #[test]
+    fn all_names_covers_every_variant() {
+        for name in CapabilityKind::ALL_NAMES {
+            let parsed: CapabilityKind = name.parse().expect("ALL_NAMES entry must parse");
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap(),
+                serde_json::json!(name),
+                "wire form drift between ALL_NAMES and serde rename"
+            );
+        }
+        // And nothing extra: every variant appears exactly once in the list.
+        assert_eq!(CapabilityKind::ALL_NAMES.len(), 26);
     }
 
     #[test]

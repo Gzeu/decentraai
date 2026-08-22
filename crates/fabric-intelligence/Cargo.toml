@@ -1,0 +1,24 @@
+[package]
+name = "decentraai-fabric-intelligence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# The intelligence plan speaks the EXISTING hub capability taxonomy — the one
+# source of capability vocabulary in the project (26 kinds, snake_case wire
+# format). Introducing a second taxonomy here would duplicate the agents'
+# semantic language.
+decentraai-hub = { path = "../hub" }
+# The local provider targets the node's managed llama-server and MUST use the
+# same shared inference budget as every other layer (7e849a9) — a tighter
+# intelligence timeout would cut healthy slow-prefill planning runs.
+decentraai-config = { path = "../config" }
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
