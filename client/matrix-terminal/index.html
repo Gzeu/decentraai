@@ -48,7 +48,7 @@
         <div class="terminal" id="terminal" aria-live="polite"></div>
         <form class="composer" id="composer"><div class="prompt"><span>&gt;</span><textarea id="input" autocomplete="off" placeholder="Speak to the DecentraAI agent…" aria-label="Message"></textarea></div><button class="send" id="sendBtn" type="submit">Transmit</button></form>
       </section>
-      <footer class="footer"><span>session <span class="key" id="sessionLabel">offline</span></span><span>tool calls <span class="key" id="toolCount">0</span></span><span>model <span class="key" id="modelLabel">auto</span></span></footer>
+      <footer class="footer"><span>session <span class="key" id="sessionLabel">offline</span></span><span>history <span class="key" id="histCount">0</span></span><span>model <span class="key" id="modelLabel">auto</span></span></footer>
     </main>
   </div>
 
@@ -57,7 +57,7 @@
       <h2>Enter the fabric</h2>
       <p>Authenticate with a DecentraAI consumer key. The key stays in memory for this browser session and is never written to localStorage, sessionStorage, or cookies.</p>
       <label for="apiKey">CONSUMER API KEY</label>
-      <div class="field"><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="dsk_…" required><button type="submit">Connect</button></div>
+      <div class="field"><input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="dca_… / dsk_…" required><button type="submit">Connect</button></div>
       <div class="error" id="loginError" role="alert"></div>
       <div class="tiny">Target: <span id="loginEndpoint"></span><br>For production, use HTTPS and the configured DecentraAI public API host.</div>
     </form>
@@ -65,11 +65,15 @@
 
   <script>
     const CONFIG = {
-      apiBase: new URLSearchParams(location.search).get('api') || 'http://169.58.213.145/v1',
+      // Same-origin by default: serve this file FROM the node (or a proxy in
+      // front of it) and it just works — zero hardcoded IPs, zero CORS. To
+      // target another node explicitly, use ?api=https://host/v1 or edit
+      // config.json next to this file.
+      apiBase: new URLSearchParams(location.search).get('api') || 'v1',
       model: new URLSearchParams(location.search).get('model') || '',
     };
 
-    const state = { key:null, messages:[], model:CONFIG.model||'auto', tools:0, busy:false };
+    const state = { key:null, messages:[], model:CONFIG.model||'auto', tools:0, busy:false, abort:null };
     const $ = id => document.getElementById(id);
     $('endpointLabel').textContent = CONFIG.apiBase;
     $('loginEndpoint').textContent = CONFIG.apiBase;
@@ -85,12 +89,13 @@
     }
     function setStatus(on, text, bad=false){$('statusDot').className='status-dot'+(on?' on':bad?' bad':'');$('statusText').textContent=text;}
     function setAuthenticated(key){state.key=key;$('loginModal').classList.add('hidden');$('sessionLabel').textContent='authenticated';setStatus(true,'CONNECTED');add('[auth] consumer key accepted','info');add('[link] agent channel established','system');}
-    function logout(){state.key=null;state.messages=[];$('terminal').innerHTML='';$('sessionLabel').textContent='offline';$('modelLabel').textContent='auto';setStatus(false,'AUTH REQUIRED');$('loginModal').classList.remove('hidden');$('apiKey').value='';boot();$('apiKey').focus()}
+    function logout(){state.key=null;if(state.abort)state.abort.abort();state.abort=null;state.messages=[];refreshHist();$('terminal').innerHTML='';$('sessionLabel').textContent='offline';$('modelLabel').textContent='auto';setStatus(false,'AUTH REQUIRED');$('loginModal').classList.remove('hidden');$('apiKey').value='';boot();$('apiKey').focus()}
     function localCommand(v){
-      if(v==='/clear'){ $('terminal').innerHTML=''; return true }
+      if(v==='/clear'){ $('terminal').innerHTML=''; state.messages=[]; refreshHist(); add('[session] conversation memory cleared','system'); return true }
+      if(v==='/stop'){ if(state.abort){state.abort.abort();add('[run] aborted by user','system')} return true }
       if(v==='/logout'){logout();return true}
-      if(v==='/help'){add('/clear   clear terminal','info');add('/status  show connection status','info');add('/logout  end session','info');add('Anything else is sent to the DecentraAI agent.','system');return true}
-      if(v==='/status'){add(`[status] ${state.key?'connected':'offline'} · model=${state.model} · tools=${state.tools}`,'info');return true}
+      if(v==='/help'){add('/clear   clear terminal AND conversation memory','info');add('/stop    abort the in-flight request','info');add('/status  show connection status','info');add('/logout  end session','info');add('Anything else is sent to the DecentraAI agent.','system');return true}
+      if(v==='/status'){add(`[status] ${state.key?'connected':'offline'} · model=${state.model} · history=${state.messages.length} msgs`,'info');return true}
       return false;
     }
     function extractDelta(obj){
@@ -98,7 +103,8 @@
       if(typeof c?.content==='string') return c.content;
       return '';
     }
-    function addTool(toolName,args){state.tools++;$('toolCount').textContent=String(state.tools);add(`[tool] ${toolName} ${args||'{}'}`,'tool')}
+    function addTool(toolName,args){add(`[tool] ${toolName} ${args||'{}'}`,'tool')}
+    function refreshHist(){$('histCount').textContent=String(state.messages.length)}
     async function discoverModel(){
       if(CONFIG.model) {$('modelLabel').textContent=CONFIG.model;state.model=CONFIG.model;return}
       try{const r=await fetch(CONFIG.apiBase+'/models',{headers:{Authorization:`Bearer ${state.key}`}});if(!r.ok)throw new Error(`models ${r.status}`);const j=await r.json();const id=j?.data?.[0]?.id;if(id){state.model=id;$('modelLabel').textContent=id;}}
@@ -106,28 +112,52 @@
     }
     async function sendMessage(text){
       if(!state.key||state.busy)return;
-      state.busy=true;$('sendBtn').disabled=true;
-      add(`you> ${text}`,'user');state.messages.push({role:'user',content:text});
-      const row=add('agent> ','assistant');const cursor=document.createElement('span');cursor.className='cursor';row.appendChild(cursor);
+      state.busy=true;$('sendBtn').disabled=true;$('sendBtn').textContent='Abort';
+      add(`you> ${text}`,'user');state.messages.push({role:'user',content:text});refreshHist();
+      const row=add('agent> prefill…','assistant');const cursor=document.createElement('span');cursor.className='cursor';row.appendChild(cursor);
+      // AbortController: the user can cut a slow prefill instead of watching
+      // a frozen terminal (CPU nodes can hold zero bytes for minutes).
+      state.abort=new AbortController();
       try{
-        const body={model:state.model||CONFIG.model||'default',messages:state.messages,stream:true,tools:[{type:'function',function:{name:'get_weather',description:'Get current weather for a location',parameters:{type:'object',properties:{location:{type:'string'}},required:['location']}}}]};
-        const res=await fetch(CONFIG.apiBase+'/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${state.key}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+        // Bounded history: the LAST messages only. Unbounded growth inflates
+        // the prompt every turn — on CPU nodes that multiplies prefill time
+        // and eventually overflows the model's context window.
+        const MAX_HISTORY=24;
+        const history=state.messages.slice(-MAX_HISTORY);
+        const body={model:state.model||CONFIG.model||'default',messages:history,stream:true};
+        // No `tools` here: there is no client-side tool execution loop yet.
+        // Advertising tools the caller cannot execute makes the backend burn
+        // context on schemas and the UI lie about "tool calls".
+        const res=await fetch(CONFIG.apiBase+'/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${state.key}`,'Content-Type':'application/json'},body:JSON.stringify(body),signal:state.abort.signal});
         if(res.status===401){add('[auth] rejected by API','err');logout();return}
         if(!res.ok){const t=await res.text();throw new Error(`HTTP ${res.status}: ${t.slice(0,240)}`)}
-        const reader=res.body.getReader();const dec=new TextDecoder();let buf='';let answer='';let toolName='';let toolArgs='';
+        row.textContent='agent> ';let answer='';
+        const reader=res.body.getReader();const dec=new TextDecoder();let buf='';
         while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(/\n\n/);buf=parts.pop()||'';for(const part of parts){for(const line of part.split('\n')){if(!line.startsWith('data:'))continue;const payload=line.slice(5).trim();if(!payload||payload==='[DONE]')continue;let obj;try{obj=JSON.parse(payload)}catch{continue}
-          const delta=obj?.choices?.[0]?.delta||{};
-          if(delta.tool_calls){for(const tc of delta.tool_calls){const fn=tc?.function;if(fn?.name)toolName+=fn.name;if(typeof fn?.arguments==='string')toolArgs+=fn.arguments;}}
-          const d=extractDelta(obj);if(d){answer+=d;cursor.remove();row.appendChild(document.createTextNode(d));row.appendChild(cursor);}
+          const d=extractDelta(obj);if(d){if(answer===''){row.textContent='agent> ';}answer+=d;cursor.remove();row.appendChild(document.createTextNode(d));row.appendChild(cursor);}
         }}}
         cursor.remove();
-        if(toolName){addTool(toolName,toolArgs);add('[tool] execution delegated to client-integrated agent loop','system')}
         state.messages.push({role:'assistant',content:answer||null});
-      }catch(err){cursor.remove();add(`[error] ${err.message}`,'err')}
-      finally{state.busy=false;$('sendBtn').disabled=false;$('input').focus()}
+        refreshHist();
+      }catch(err){
+        cursor.remove();
+        if(err.name==='AbortError'){add('[run] aborted','system');state.messages.pop();}
+        else add(`[error] ${err.message}`,'err');
+      }
+      finally{state.busy=false;$('sendBtn').disabled=false;$('sendBtn').textContent='Transmit';$('input').focus()}
     }
 
-    $('loginForm').addEventListener('submit',async e=>{e.preventDefault();$('loginError').textContent='';const key=$('apiKey').value.trim();if(!key.startsWith('dsk_')){$('loginError').textContent='Expected a DecentraAI consumer key starting with dsk_.';return}setAuthenticated(key);await discoverModel();$('input').focus()});
+    // Login: the prefix is NOT authentication. Accept both key namespaces
+    // (dca_ consumer keys are what the node issues today; dsk_ subscription
+    // tokens still exist on older nodes) and PROBE a real endpoint with the
+    // key before closing the modal — only a 200 from /models proves it.
+    $('loginForm').addEventListener('submit',async e=>{e.preventDefault();$('loginError').textContent='';const key=$('apiKey').value.trim();
+      if(!(key.startsWith('dca_')||key.startsWith('dsk_'))){$('loginError').textContent='Expected a DecentraAI API key (dca_… or dsk_…).';return}
+      let ok=false;
+      try{const r=await fetch(CONFIG.apiBase+'/models',{headers:{Authorization:`Bearer ${key}`}});ok=r.ok;if(!ok)$('loginError').textContent=`Key rejected by ${CONFIG.apiBase} (HTTP ${r.status}).`}
+      catch(err){$('loginError').textContent=`Cannot reach ${CONFIG.apiBase}: ${err.message}`}
+      if(!ok)return;
+      setAuthenticated(key);await discoverModel();$('input').focus()});
     $('composer').addEventListener('submit',e=>{e.preventDefault();const v=$('input').value.trim();if(!v)return;$('input').value='';if(localCommand(v)){return}sendMessage(v)});
     $('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}});
     $('clearBtn').addEventListener('click',()=>localCommand('/clear'));$('statusBtn').addEventListener('click',()=>localCommand('/status'));$('logoutBtn').addEventListener('click',()=>localCommand('/logout'));
