@@ -2286,9 +2286,22 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     ),
                 );
                 let p2p_for_worker = distributed.p2p_node().clone();
+                let sender_p2p = p2p_for_worker.clone();
+                let send_to_peer: decentraai_runtime::intel_assist::PeerSender =
+                    std::sync::Arc::new(move |peer, bytes| {
+                        let p2p = sender_p2p.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = p2p.request(peer, bytes).await {
+                                tracing::warn!(%peer, error = %e, "assist result delivery failed");
+                            }
+                        });
+                    });
                 let mut p2p_mut = p2p_for_worker.clone();
                 p2p_mut.set_on_dfcp(
-                    decentraai_runtime::intel_assist::attach_dfcp_worker(worker_state.clone()),
+                    decentraai_runtime::intel_assist::attach_dfcp_worker(
+                        std::sync::Arc::clone(&worker_state),
+                        send_to_peer,
+                    ),
                 );
                 // Keep the live engine URL fresh for assist execution.
                 {

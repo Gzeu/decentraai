@@ -37,6 +37,10 @@ pub struct ActiveLease {
     pub expires_at: Instant,
 }
 
+/// Callback delivering arbitrary bytes to one peer over the fabric channel
+/// (used to return async assist results to the requesting peer).
+pub type PeerSender = Arc<dyn Fn(decentraai_p2p::PeerId, Vec<u8>) + Send + Sync>;
+
 /// Worker-side assist state shared across DFCP callbacks.
 pub struct AssistWorkerState {
     pub limits: Arc<AssistSharingSection>,
@@ -75,8 +79,11 @@ impl AssistWorkerState {
 #[allow(clippy::too_many_arguments)]
 pub fn attach_dfcp_worker(
     state: Arc<AssistWorkerState>,
+    send_to_peer: PeerSender,
 ) -> impl Fn(libp2p::PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync + 'static {
-    move |peer, msg| match msg {
+    move |peer, msg| {
+        let send_to_peer = std::sync::Arc::clone(&send_to_peer);
+        match msg {
         // Capacity poll: answer with an owner-limit-checked OFFER only when
         // we can genuinely help. An empty reply means "not a candidate".
         DfcInbound::Request(request) => {
@@ -103,7 +110,9 @@ pub fn attach_dfcp_worker(
             }
         }
         DfcInbound::Reserve(reserve) => handle_reserve(&state, &reserve),
-        DfcInbound::Assign(assign) => handle_assign(state.clone(), &assign),
+        DfcInbound::Assign(assign) => {
+            handle_assign(state.clone(), &assign, std::sync::Arc::clone(&send_to_peer), peer)
+        }
         DfcInbound::Release(release) => {
             let removed = state
                 .leases
@@ -120,6 +129,7 @@ pub fn attach_dfcp_worker(
         }
         // Results complete parked oneshots in the p2p layer itself.
         DfcInbound::Result(_) => None,
+        }
     }
 }
 
@@ -186,7 +196,12 @@ fn handle_reserve(
     serde_json::to_vec(&confirmed).ok()
 }
 
-fn handle_assign(state: Arc<AssistWorkerState>, assign: &AssistTaskAssign) -> Option<Vec<u8>> {
+fn handle_assign(
+    state: Arc<AssistWorkerState>,
+    assign: &AssistTaskAssign,
+    send_to_peer: PeerSender,
+    requester_peer: decentraai_p2p::PeerId,
+) -> Option<Vec<u8>> {
     // Lease must be alive and must match this assignment's reservation.
     let lease = {
         let leases = state.leases.lock().expect("lease lock");
@@ -222,15 +237,11 @@ fn handle_assign(state: Arc<AssistWorkerState>, assign: &AssistTaskAssign) -> Op
             elapsed_ms = started.elapsed().as_millis() as u64,
             "assist task finished"
         );
-        let _ = result; // sent by the caller below via p2p channel
-        if let Some(sender) = ASSIST_RESULT_SENDERS
-            .lock()
-            .expect("result senders")
-            .get(&task_assign.assignment_id.0)
-        {
-            let bytes = serde_json::to_vec(&result).unwrap_or_default();
-            sender(bytes);
-        }
+        // Deliver the result to the REQUESTER as its own DFCP message; the
+        // requester's parked oneshot completes there and contribution credit
+        // is recorded on verified success.
+        let bytes = serde_json::to_vec(&result).unwrap_or_default();
+        send_to_peer(requester_peer, bytes);
     });
 
     Some(
@@ -238,28 +249,6 @@ fn handle_assign(state: Arc<AssistWorkerState>, assign: &AssistTaskAssign) -> Op
     )
 }
 
-/// Registry of callbacks able to SEND a result back to the requesting peer.
-/// Populated when the worker attaches; keeps this module free of a direct
-/// P2PNode dependency while still delivering asynchronously.
-/// Callback able to deliver one assist result back to its requester.
-type ResultSender = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
-type ResultSenderMap = HashMap<String, ResultSender>;
-
-static ASSIST_RESULT_SENDERS: std::sync::LazyLock<std::sync::Mutex<ResultSenderMap>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-pub fn register_result_sender(assignment_id: &str, sender: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
-    ASSIST_RESULT_SENDERS
-        .lock()
-        .expect("result senders")
-        .insert(assignment_id.to_string(), sender);
-}
-pub fn clear_result_sender(assignment_id: &str) {
-    ASSIST_RESULT_SENDERS
-        .lock()
-        .expect("result senders")
-        .remove(assignment_id);
-}
 
 /// Executes one capability against THIS node's local managed engine.
 async fn execute_capability(
@@ -423,10 +412,14 @@ pub async fn run_assist_request(
             );
         }
     };
-    let winner_dfc_offer = offers
-        .iter()
-        .find(|(dfcp, _)| dfcp.offer_id.as_str() == winner.peer_id.as_str())
-        .map(|(d, _)| d.clone());
+    // The DFCP offer paired with the winning scored candidate carries the
+    // worker-generated offer id needed for the RESERVE handshake.
+    let Some((winner_dfc_offer, _)) =
+        offers.iter().find(|(_, a)| a.peer_id == winner.peer_id)
+    else {
+        return (false, Vec::new(), "winner offer vanished during selection".into());
+    };
+    let winner_dfc_offer = winner_dfc_offer.clone();
 
 
     // 3. RESERVE against the winner's authoritative ledger. The worker
@@ -436,15 +429,12 @@ pub async fn run_assist_request(
         Ok(p) => p,
         Err(_) => return (false, Vec::new(), format!("invalid peer id {}", winner.peer_id)),
     };
-    let Some(echo) = winner_dfc_offer else {
-        return (false, Vec::new(), "winner offer vanished during selection".into());
-    };
     let Ok(reply) = p2p
         .request(
             winner_peer,
             decentraai_protocol::serialize_message(&ResourceReserve {
                 protocol_version: decentraai_protocol::dfcp::DFCP_VERSION,
-                offer_id: echo.offer_id.clone(),
+                offer_id: winner_dfc_offer.offer_id.clone(),
                 request_id: dfcp_req.request_id.clone(),
             })
             .unwrap_or_default(),
