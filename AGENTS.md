@@ -43,10 +43,22 @@ process, never FFI).
 | `milestone/sharing-is-caring` | DFCP v1 negotiation + Compute Assist verified LIVE on 3 nodes; contribution credit only on verified success |
 
 Forward roadmap (agreed): **M15** Autonomous Pressure Trigger +
-PlacementEngine fairness · **M16** Capability Sharing (VPS as capability
-worker) · **M17** Agent Gateway / Collective Orchestration · then memory,
-adaptive execution, model parallelism. Full historical detail:
-`docs/ROADMAP_HISTORY.md`.
+PlacementEngine fairness · **M16** Agent Gateway (BYOA: scoped credentials
++ MCP execution tools) · **M17** Capability Sharing / Collective
+Orchestration · then collective memory, adaptive execution, model
+parallelism. Full historical detail: `docs/ROADMAP_HISTORY.md`.
+
+### The agent organization
+
+Specialized agents form an operating system over the fabric — each with a
+role contract, RBAC scopes/forbidden lists, approval gates and its own
+memory scope. See `docs/AGENT_ORGANIZATION.md` and the contracts in
+`.agents/registry/*.md` (governor, architect, rust-engineer, api-engineer,
+fabric-engineer, qa, security, vps-operator, memory-keeper, researcher,
+concierge). Rule of thumb:
+
+> **Worker = compute identity. Agent = cognitive identity.**
+> AI proposes → deterministic Rust decides → workers execute.
 
 ### Repository layout (17 workspace crates)
 
