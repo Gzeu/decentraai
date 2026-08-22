@@ -13,6 +13,10 @@ decentraai-audit = { path = "../audit" }
 decentraai-identity = { path = "../identity" }
 decentraai-manifest = { path = "../manifest" }
 decentraai-protocol = { path = "../protocol" }
+# Timeout alignment: the P2P request/response budget must derive from the
+# SAME shared value as the backend HTTP client and remote routes, otherwise
+# the shortest layer cuts healthy slow-prefill workers mid-generation.
+decentraai-config = { path = "../config" }
 decentraai-registry = { path = "../registry" }
 futures.workspace = true
 libp2p.workspace = true

@@ -64,19 +64,37 @@ const MAX_PROMPT_BYTES: usize = 200_000;
 /// `BackendConfig::max_output_tokens`). llama-server clamps internally, but we
 /// reject loudly instead of forwarding an unbounded generation request.
 const MAX_OUTPUT_TOKENS: u64 = 8192;
-/// HTTP request timeout to the managed llama-server backend, matching the
-/// distributed `BackendConfig` default so a hung engine releases its slot
-/// instead of holding the queue forever.
-/// Overridable for slow-CPU nodes whose prefill on large agent prompts
-/// legitimately exceeds 5 minutes (e.g. OpenClaw ~11.5k-token prompts on a
-/// 6-vCPU VPS): set DECENTRAAI_BACKEND_TIMEOUT_SECS in the service env.
+/// HTTP request timeout to the managed llama-server backend.
+///
+/// SUPERSEDED as a wall-clock cap: the shared client no longer carries a
+/// total `.timeout()`, because reqwest applies it to the WHOLE response
+/// including streamed bodies — a healthy engine mid-prefill on a large model
+/// (minutes with zero bytes before the first token) was killed at the limit
+/// and surfaced to callers as "backend unavailable". The budget now lives in:
+///   * `read_timeout` on the client — IDLE per read, not cumulative: slow
+///     prefill (one long wait) passes, a hung engine (infinite silence) still
+///     releases its slot;
+///   * an explicit per-request total timeout ONLY on the non-streaming path,
+///     where the whole body is one buffered read;
+///   * SSE keepalive comments injected toward callers while upstream is
+///     silent, so intermediaries (Caddy/LB/browser) never see idle TCP.
+///
+/// Overridable for slow-CPU nodes via `DECENTRAAI_BACKEND_TIMEOUT_SECS`
+/// (shared helper, also drives P2P and remote-route budgets).
 fn backend_request_timeout() -> Duration {
-    let secs = std::env::var("DECENTRAAI_BACKEND_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(300);
-    Duration::from_secs(secs)
+    decentraai_config::backend_request_timeout()
+}
+
+/// Remote-hop budget for `InferRequest.timeout_ms`, in milliseconds.
+///
+/// Must be >= the backend budget, never shorter: a remote worker's prefill
+/// consumes the same wall-clock as a local one, and the P2P request/response
+/// layer uses the SAME shared value — the previous fixed 120s here cut
+/// healthy slow workers while P2P would have allowed 300s (and both were
+/// shorter than large-model CPU prefill entirely).
+fn remote_request_timeout_ms() -> u32 {
+    u32::try_from(decentraai_config::backend_request_timeout().as_millis())
+        .unwrap_or(u32::MAX)
 }
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
@@ -377,9 +395,17 @@ impl ApiState {
             auth_token: auth_token.map(Into::into),
             manager,
             client: reqwest::Client::builder()
-                .timeout(backend_request_timeout())
+                // Short connect: an engine that does not accept TCP is dead
+                // NOW, not after the full inference budget.
+                .connect_timeout(Duration::from_secs(10))
+                // IDLE budget per read, NOT a cumulative wall clock. A slow
+                // prefill is ONE long wait (passes); a hung engine is
+                // infinite silence between reads (releases the slot); a long
+                // generation with steady tokens never trips it regardless of
+                // total duration.
+                .read_timeout(backend_request_timeout())
                 .build()
-                .unwrap_or_default(),
+                .expect("reqwest client builds (rustls init cannot fail at this point)"),
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
             active_model: Arc::new(tokio::sync::RwLock::new(info.model_name.clone())),
@@ -2297,7 +2323,7 @@ async fn execute_decision_stream(state: &ApiState, req: &serde_json::Value) -> R
     )
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(true);
-    request.timeout_ms = 120_000;
+    request.timeout_ms = remote_request_timeout_ms();
     if let Some(sid) = req
         .get("session_id")
         .and_then(|s| s.as_str())
@@ -2482,7 +2508,7 @@ async fn run_execute_decision(state: &ApiState, req: &serde_json::Value) -> Resp
     )
     .with_sender(distributed.p2p_node().local_peer_id())
     .with_streaming(stream);
-    request.timeout_ms = 120_000;
+    request.timeout_ms = remote_request_timeout_ms();
     // Continuation support (KV locality): an optional session_id links this run
     // to an earlier one, steering the fabric router back to the worker holding
     // the session's KV prefix.
@@ -5964,7 +5990,23 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
 /// are rejected) — the token never leaves the host. Do NOT widen this
 /// endpoint's trust model without first introducing a proper
 /// operator-authenticated bootstrap flow.
-async fn token_handler(State(state): State<ApiState>) -> Response {
+/// Loopback-only master-token convenience endpoint (dashboard auto-login).
+///
+/// The handler is intentionally UNAUTHENTICATED — the API binds to loopback
+/// only, so a caller on the host is trusted with the master token. But a
+/// reverse proxy in front of the node (Caddy on a VPS) makes REMOTE callers
+/// indistinguishable from local ones at the socket level: the connection
+/// comes from 127.0.0.1. Proxies mark forwarded requests with
+/// `X-Forwarded-*` headers, so their presence means "this did NOT originate
+/// on this host" and the token must not be served. Answer 404 (not 401/403)
+/// so the endpoint's existence is not even confirmed to outsiders.
+async fn token_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-forwarded-proto")
+        || headers.contains_key("x-real-ip")
+    {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
     match &state.auth_token {
         Some(token) => token.to_string().into_response(),
         None => String::new().into_response(),
@@ -8771,6 +8813,77 @@ where
     })
 }
 
+/// How long the proxy tolerates silence toward a streaming caller before
+/// injecting an SSE keepalive comment. Prefill on large models can hold
+/// ZERO bytes for minutes; without traffic, browsers, Caddy and load
+/// balancers close idle TCP (often at 60s) and the user sees "connection
+/// dropped" for a healthy engine.
+const SSE_KEEPALIVE_EVERY: Duration = Duration::from_secs(15);
+/// Granularity of the keepalive check loop. Kept well below
+/// SSE_KEEPALIVE_EVERY so the injected comment lands within ~1 tick of the
+/// threshold; also the smallest value tests may use.
+const SSE_KEEPALIVE_TICK: Duration = Duration::from_secs(5);
+
+/// Pumps an upstream SSE byte stream into the client channel, injecting
+/// `: keepalive` comments whenever nothing has been forwarded for
+/// `keepalive_every`. Generic over the stream type so tests can drive it
+/// with synthetic silent/flowing streams instead of a live llama-server.
+///
+/// Keepalives are NOT appended to `drain_buffer`: metrics and token counts
+/// must see only real upstream bytes. SSE comments (`: ...`) are ignored by
+/// every conforming parser, so they are invisible to callers that count.
+async fn pump_sse_with_keepalive<S, E>(
+    upstream: S,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, E>>,
+    drain_buffer: Arc<StdMutex<Vec<u8>>>,
+    keepalive_every: Duration,
+) where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display + Send + 'static,
+{
+    let mut chunks = Box::pin(sse_safe_stream(upstream));
+    let mut last_emit = Instant::now();
+    let mut ticker = tokio::time::interval(SSE_KEEPALIVE_TICK.min(keepalive_every));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick of a tokio interval fires immediately; skip it so we
+    // do not emit before the upstream had any chance to speak.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            item = chunks.next() => match item {
+                Some(Ok(bytes)) => {
+                    drain_buffer.lock().unwrap().extend_from_slice(&bytes);
+                    last_emit = Instant::now();
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                // sse_safe_stream never yields Err (it converts mid-stream
+                // failures into a clean SSE error event + [DONE]); keep the
+                // arm as a defensive fallback only.
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+                None => break,
+            },
+            _ = ticker.tick() => {
+                if last_emit.elapsed() < keepalive_every {
+                    continue;
+                }
+                if tx
+                    .send(Ok(Bytes::from_static(b": keepalive\n\n")))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                last_emit = Instant::now();
+            }
+        }
+    }
+}
+
 /// Proxies a streaming inference response to the caller chunk-by-chunk while
 /// recording the same best-effort metrics the non-streaming path does. The
 /// channel lets a drop of the client cut upstream early; the spawned task
@@ -8789,24 +8902,13 @@ fn stream_inference(
     let drain_buffer = Arc::clone(&buffer);
     let drain_path = path.clone();
     tokio::spawn(async move {
-        let mut chunks = Box::pin(sse_safe_stream(upstream.bytes_stream()));
-        while let Some(item) = chunks.next().await {
-            match item {
-                Ok(bytes) => {
-                    drain_buffer.lock().unwrap().extend_from_slice(&bytes);
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        return;
-                    }
-                }
-                // sse_safe_stream never yields Err (it converts mid-stream
-                // failures into a clean SSE error event + [DONE]); keep the
-                // arm as a defensive fallback only.
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            }
-        }
+        pump_sse_with_keepalive(
+            upstream.bytes_stream(),
+            tx,
+            Arc::clone(&drain_buffer),
+            SSE_KEEPALIVE_EVERY,
+        )
+        .await;
         // Upstream finished cleanly: account the stream (best effort).
         let body = drain_buffer.lock().unwrap().clone();
         if !body.is_empty() {
@@ -9199,7 +9301,7 @@ async fn batch_handler(State(state): State<ApiState>, headers: HeaderMap, body: 
             decentraai_distributed::InferRequest::new(model_hash, prompt.to_string(), max_tokens)
                 .with_sender(sender)
                 .with_streaming(false);
-        ir.timeout_ms = 120_000;
+        ir.timeout_ms = remote_request_timeout_ms();
         if let Some(sid) = item
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -9577,6 +9679,14 @@ async fn proxy_with_auth(
         request = request.header(header::CONTENT_TYPE, content_type);
     }
     let wants_stream = is_inference && detect_stream(&outgoing);
+    // Non-streaming only: the whole body arrives in one buffered read, so a
+    // total cap is safe here and keeps a hung engine from holding the queue
+    // slot forever. Streaming requests must NOT carry it — reqwest applies a
+    // request timeout to the entire streamed body, which would kill healthy
+    // long generations; they rely on the client's idle read_timeout instead.
+    if !wants_stream {
+        request = request.timeout(backend_request_timeout());
+    }
     match request.body(outgoing).send().await {
         Ok(upstream) => {
             let status =
@@ -9742,7 +9852,7 @@ async fn route_remote_chat(
     // real chat turn. Match the CLI's explicit 120s so slow-but-healthy
     // workers are not cut off mid-stream (which previously surfaced as
     // "Error in input stream").
-    request.timeout_ms = 120_000;
+    request.timeout_ms = remote_request_timeout_ms();
     let started = Instant::now();
 
     if stream {
@@ -10193,6 +10303,85 @@ mod tests {
         assert!(saw_done, "expected [DONE] terminator, got: {chunks:?}");
         // The first chunk (a real delta) must pass through unchanged.
         assert!(chunks[0].contains("content\":\"hi\""));
+    }
+
+    /// Regression for the large-model prefill drop: after one real chunk the
+    /// upstream goes silent (prefill on a 14B/CPU holds ZERO bytes for
+    /// minutes). The pump must keep injecting `: keepalive` comments so
+    /// browsers/Caddy never see idle TCP, while metrics buffer records only
+    /// REAL upstream bytes.
+    #[tokio::test]
+    async fn sse_pump_injects_keepalive_while_upstream_is_silent() {
+        let real = Bytes::from_static(b"data: {\"delta\":\"x\"}\n\n");
+        let upstream =
+            futures::stream::iter(vec![Ok::<_, std::convert::Infallible>(real)])
+                .chain(futures::stream::pending());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+        let buf_for_check = Arc::clone(&buffer);
+        tokio::spawn(pump_sse_with_keepalive(
+            upstream,
+            tx,
+            buffer,
+            Duration::from_millis(30),
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first item within timeout")
+            .expect("channel open")
+            .expect("no error");
+        assert_eq!(first.as_ref(), b"data: {\"delta\":\"x\"}\n\n");
+
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("keepalive within timeout")
+            .expect("channel open")
+            .expect("no error");
+        assert_eq!(
+            second.as_ref(),
+            b": keepalive\n\n",
+            "silence after real bytes must produce an SSE comment"
+        );
+
+        // Continued silence keeps the connection warm.
+        let third = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("second keepalive within timeout")
+            .expect("channel open")
+            .expect("no error");
+        assert_eq!(third.as_ref(), b": keepalive\n\n");
+
+        // Metrics/token accounting must see ONLY real bytes — keepalives are
+        // transport filler, not content.
+        assert_eq!(
+            buf_for_check.lock().unwrap().as_slice(),
+            b"data: {\"delta\":\"x\"}\n\n"
+        );
+    }
+
+    /// A flowing stream must NEVER get keepalive noise: every forwarded
+    /// item is real upstream bytes.
+    #[tokio::test]
+    async fn sse_pump_does_not_keepalive_when_stream_flows() {
+        let chunk = Ok::<_, std::convert::Infallible>(Bytes::from_static(b"data: d\n\n"));
+        let upstream = futures::stream::repeat_with(move || chunk.clone()).take(20);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+        tokio::spawn(pump_sse_with_keepalive(
+            upstream,
+            tx,
+            buffer,
+            Duration::from_millis(100),
+        ));
+        for _ in 0..20 {
+            let item = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("item within timeout")
+                .expect("channel open")
+                .expect("no error");
+            assert_eq!(item.as_ref(), b"data: d\n\n", "no keepalive amid flow");
+        }
     }
 
     #[cfg(unix)]

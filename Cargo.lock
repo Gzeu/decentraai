@@ -1236,6 +1236,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "decentraai-audit",
+ "decentraai-config",
  "decentraai-identity",
  "decentraai-manifest",
  "decentraai-protocol",

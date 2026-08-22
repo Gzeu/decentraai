@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,6 +10,35 @@ pub enum HelperError {
     InsecureMode(u32),
     #[error("not a regular file: {0}")]
     NotRegular(String),
+}
+
+/// Environment variable that overrides every inference-timeout layer
+/// (backend HTTP, P2P request/response, remote route) with one value.
+pub const BACKEND_TIMEOUT_ENV: &str = "DECENTRAAI_BACKEND_TIMEOUT_SECS";
+/// Default inference budget in seconds. Slow-CPU prefill on large agent
+/// prompts legitimately exceeds 5 minutes (e.g. ~11.5k-token prompts on a
+/// 6-vCPU node at ~20 tok/s), so operators can raise it via the env var.
+pub const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 300;
+
+/// Single source of truth for the inference timeout shared by every
+/// transport layer. All strata must derive from THIS value — a remote hop
+/// whose limit is shorter than the backend's would cut a healthy worker
+/// mid-prefill, which surfaces to callers as "connection dropped".
+///
+/// Overridable for slow-CPU nodes: set `DECENTRAAI_BACKEND_TIMEOUT_SECS`
+/// in the service environment.
+pub fn backend_request_timeout() -> Duration {
+    backend_request_timeout_from(std::env::var(BACKEND_TIMEOUT_ENV).ok())
+}
+
+/// Pure decision behind [`backend_request_timeout`], separated from the
+/// environment so tests can drive it with synthetic inputs.
+pub fn backend_request_timeout_from(env_value: Option<String>) -> Duration {
+    let secs = env_value
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_BACKEND_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// Ensure that the given path has permissions 0o600 (owner read/write only).
@@ -56,5 +86,29 @@ mod tests {
         let err = ensure_mode_0600(path).unwrap_err();
         let s = format!("{}", err);
         assert!(s.contains("InsecureMode") || s.to_lowercase().contains("insecure"));
+    }
+
+    /// The shared timeout helper must honor the env override and reject
+    /// nonsense values (0 would mean "no budget" for a hung engine).
+    #[test]
+    fn backend_request_timeout_env_override() {
+        assert_eq!(
+            backend_request_timeout_from(Some("1800".into())),
+            Duration::from_secs(1800),
+            "env override must win over the default"
+        );
+        assert_eq!(
+            backend_request_timeout_from(Some("0".into())),
+            Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS),
+            "0 must fall back to the default, not disable the budget"
+        );
+        assert_eq!(
+            backend_request_timeout_from(Some("garbage".into())),
+            Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            backend_request_timeout_from(None),
+            Duration::from_secs(DEFAULT_BACKEND_TIMEOUT_SECS)
+        );
     }
 }

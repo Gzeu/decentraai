@@ -35,6 +35,15 @@ use tracing::{debug, info, warn};
 pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
 /// Base backoff (ms) doubled on each reconnect attempt.
 pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
+/// A connection that survived at least this long counts as "stable": only
+/// its drop resets the redial budget. Short-lived connections (sub-second
+/// churn, typically dial collisions over a stale NAT address) must NOT
+/// reset the budget, otherwise a collision loop re-dials forever.
+pub const RECONNECT_STABLE_SECS: u64 = 30;
+/// Upper bound on learned external (NAT-observed) addresses. Every
+/// reconnect through NAT can surface a new observed port; without a bound
+/// this list grows without limit on WAN links.
+pub const MAX_EXTERNAL_ADDRESSES: usize = 8;
 
 /// Transport/discovery options for a node. Defaults to LAN-only (mDNS), which
 /// preserves the original single-subnet behaviour exactly. To reach peers
@@ -524,12 +533,13 @@ impl P2PNode {
                     codec,
                     [(MESSAGE_PROTOCOL, ProtocolSupport::Full)],
                     // Default is 30s per request. A remote inference stream on
-                    // CPU can easily exceed that (Mistral-7B ~22s for 24
-                    // tokens); a tight protocol timeout cuts the stream
-                    // mid-answer and the browser reports "Error in input
-                    // stream". 300s keeps slow-but-healthy workers usable.
+                    // CPU can easily exceed that; a tight protocol timeout
+                    // cuts the stream mid-answer and the browser reports
+                    // "Error in input stream". The budget derives from the
+                    // SHARED inference timeout (env-overridable) so no
+                    // transport layer is stricter than the backend it fronts.
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(300)),
+                        .with_request_timeout(decentraai_config::backend_request_timeout()),
                 ),
                 identify: identify::Behaviour::new(identify::Config::new(
                     format!("decentraai/{}", env!("CARGO_PKG_VERSION")),
@@ -625,6 +635,9 @@ impl P2PNode {
             > = HashMap::new();
             let mut pending_listens: VecDeque<oneshot::Sender<Result<Multiaddr>>> = VecDeque::new();
             let mut connected: Vec<PeerId> = Vec::new();
+            // When the current connection to each peer was established, used
+            // to distinguish stable links from collision churn.
+            let mut connected_since: HashMap<PeerId, std::time::Instant> = HashMap::new();
             // Per-peer reconnect attempts since the last successful connection,
             // so a peer that went away doesn't get dialed forever.
             let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
@@ -652,6 +665,29 @@ impl P2PNode {
                                 }
                             }
                             Command::Dial { addr, reply } => {
+                                // Idempotent dial: if the target peer is
+                                // already connected, re-dialing would open a
+                                // PARALLEL connection whenever the stored
+                                // address differs from the live one (NAT
+                                // rebinding makes every reconnect observe a
+                                // new port). Parallel connections then get
+                                // pruned, the prune triggers a redial, and the
+                                // cycle repeats — observed live as ~15
+                                // connect/disconnect events per second against
+                                // a WAN bootstrap peer. A dial to an already
+                                // connected peer is reported as success.
+                                if let Some(peer) = addr.iter().find_map(|p| match p {
+                                    libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                                    _ => None,
+                                }) {
+                                    if connected.contains(&peer) {
+                                        debug!(%peer, %addr, "dial skipped: already connected");
+                                        if let Some(r) = reply {
+                                            let _ = r.send(Ok(()));
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let res = swarm.dial(addr).map_err(Into::into);
                                 if let Some(r) = reply {
                                     let _ = r.send(res);
@@ -706,18 +742,41 @@ impl P2PNode {
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 info!(%peer_id, "peer connected");
+                                connected_since.insert(peer_id, std::time::Instant::now());
                                 if !connected.contains(&peer_id) {
                                     connected.push(peer_id);
                                 }
-                                // A successful connection resets the redial
-                                // budget so a future drop can attempt again.
-                                reconnect_attempts.remove(&peer_id);
+                                // The redial budget is NOT reset here: a
+                                // fresh connection says nothing about
+                                // stability. ConnectionClosed resets it only
+                                // when the link lasted >= RECONNECT_STABLE_SECS.
                             }
                             SwarmEvent::ConnectionClosed {
-                                peer_id, endpoint, ..
+                                peer_id,
+                                endpoint,
+                                cause,
+                                ..
                             } => {
-                                info!(%peer_id, "peer disconnected");
+                                // Log the cause: without it, a disconnect
+                                // storm is indistinguishable from a clean
+                                // remote shutdown in the journal.
+                                match &cause {
+                                    Some(err) => info!(%peer_id, error = %err, "peer disconnected"),
+                                    None => info!(%peer_id, "peer disconnected"),
+                                }
                                 connected.retain(|p| p != &peer_id);
+                                // Only a STABLE connection resets the redial
+                                // budget. Sub-second churn means dial
+                                // collision over a stale address; resetting
+                                // there turns one bad address into an endless
+                                // connect/prune/redial loop (observed live at
+                                // ~15 events/s against a WAN peer).
+                                let stable = connected_since
+                                    .remove(&peer_id)
+                                    .is_some_and(|t| t.elapsed().as_secs() >= RECONNECT_STABLE_SECS);
+                                if stable {
+                                    reconnect_attempts.remove(&peer_id);
+                                }
                                 // Remember the remote address from the closing
                                 // link when it was us doing the dialing.
                                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } =
@@ -728,8 +787,8 @@ impl P2PNode {
                                 let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
                                 let addr_known = known_addresses.get(&peer_id).cloned();
                                 // Bounded explicit re-dial: drop the budget when
-                                // we've retried too often or have no address, and
-                                // let mDNS re-discovery take over.
+                                // we've retried too often or have no address,
+                                // and let mDNS/bootstrap re-discovery take over.
                                 let Some(addr) = addr_known.clone() else {
                                     reconnect_attempts.remove(&peer_id);
                                     continue;
@@ -938,6 +997,12 @@ impl P2PNode {
                                 if !info.observed_addr.is_empty() {
                                     if !external_addresses.contains(&info.observed_addr) {
                                         external_addresses.push(info.observed_addr.clone());
+                                        // NAT rebinds surface a new observed
+                                        // port on every reconnect; keep the
+                                        // list bounded (most recent wins).
+                                        while external_addresses.len() > MAX_EXTERNAL_ADDRESSES {
+                                            external_addresses.remove(0);
+                                        }
                                     }
                                     // Register with the swarm so it is
                                     // announced and used for inbound dials.

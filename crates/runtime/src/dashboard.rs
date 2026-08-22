@@ -1479,21 +1479,36 @@ const nodeIdOf = p => (p && p.length) ? ('dca-' + (p.indexOf('12D3KooW') === 0 ?
 function toast(msg, bad=false){ const t=document.createElement('div'); t.className='toast'+(bad?' bad':''); t.textContent=msg; $('toast').appendChild(t); setTimeout(()=>t.remove(), 3600); }
 
 // ---- auth ------------------------------------------------------------------
+// Single key classifier — mirrors the server-side Auth::classify() gate and
+// must stay in sync with it:
+//   dca_…  = consumer API key → inference-only, decided locally.
+//   dsk_…  = subscription token → NEVER master, whatever its role; the
+//            server enforces operator gates per endpoint anyway.
+//   other  = master CANDIDATE → promoted ONLY by a successful probe of a
+//            master-only endpoint. A prefix alone never grants admin UI
+//            (a stale dsk_ used to be promoted by the old !startsWith check).
 let token = '';
 let isMaster = false;
 
 const storedToken = localStorage.getItem('dai_token');
 if (storedToken) {
   token = storedToken;
-  isMaster = !token.startsWith('dca_');
   $('login-overlay').classList.add('hidden');
 }
 const headers = token ? { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
-const isAdmin = isMaster;
+// Admin chrome renders only after the master probe succeeds (fail-closed).
+let isAdmin = false;
+// Consumer keys can reach Chat only — decided locally from the dca_ prefix,
+// exactly like the server's consumer branch.
+const isConsumerOnly = !!token && token.startsWith('dca_');
 
-// If logged in with a consumer key (not master), only the Chat view works.
-// Show a notice and restrict navigation to chat + a read-only overview.
-const isConsumerOnly = !!token && !isMaster;
+(async () => {
+  if (!token || isConsumerOnly || token.startsWith('dsk_')) return;
+  try {
+    const r = await fetch('/api/admin/token/list', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (r.ok) { isMaster = true; isAdmin = true; refresh(); }
+  } catch (_) {}
+})();
 
 // ---- login overlay ----
 function doLogin(){

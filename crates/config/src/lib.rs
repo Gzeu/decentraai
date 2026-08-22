@@ -651,6 +651,61 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Fail-closed pin: `require_signed_announcements` has NO serde default.
+    /// A config that omits it must FAIL to parse — never silently fall back
+    /// to `false` (which would let the node accept unsigned mDNS model
+    /// announcements). The safe default lives in the example/init templates,
+    /// not in a silent deserialization fallback.
+    #[test]
+    fn omitting_require_signed_announcements_is_a_parse_error() {
+        let yaml = r#"
+node:
+  name: t
+network:
+  private_swarm: true
+storage:
+  chunk_size_mb: 4
+  hash_algorithm: blake3
+  max_cache_gb: 10
+  min_free_disk_gb: 1
+resources:
+  cpu_max_percent: 80
+  memory_max_percent: 80
+  reserve_cpu_cores: 1
+  reserve_ram_mb: 512
+inference:
+  enabled: auto
+  runtime: llama_server
+  bind_address: 127.0.0.1
+  api_auth_required: true
+  allow_remote_inference: false
+  max_concurrent_requests: 1
+  max_context_tokens: 2048
+  max_generated_tokens: 256
+  request_timeout_seconds: 120
+  queue_max_requests: 4
+  idle_model_unload_minutes: 10
+  api_port: 0
+privacy:
+  log_prompts: false
+  log_outputs: false
+  publish_exact_hardware: false
+  telemetry_opt_in: false
+security:
+  trust_mode: private
+  require_request_signatures: true
+  ban_duration_minutes: 60
+  max_invalid_chunks_per_peer: 2
+"#;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let result = NodeConfig::load(file.path());
+        assert!(
+            result.is_err(),
+            "omitting require_signed_announcements must be a parse error (fail-closed)"
+        );
+    }
+
     #[test]
     fn example_configuration_is_valid() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -1145,4 +1200,7 @@ security:
 }
 
 mod helpers;
-pub use helpers::ensure_mode_0600;
+pub use helpers::{
+    backend_request_timeout, backend_request_timeout_from, ensure_mode_0600,
+    DEFAULT_BACKEND_TIMEOUT_SECS,
+};
