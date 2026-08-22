@@ -76,7 +76,32 @@ impl AssistWorkerState {
 pub fn attach_dfcp_worker(
     state: Arc<AssistWorkerState>,
 ) -> impl Fn(libp2p::PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync + 'static {
-    move |_peer, msg| match msg {
+    move |peer, msg| match msg {
+        // Capacity poll: answer with an owner-limit-checked OFFER only when
+        // we can genuinely help. An empty reply means "not a candidate".
+        DfcInbound::Request(request) => {
+            let trusted = true; // private swarm + admission gate upstream
+            if let Some((cpu, ram)) = state.limits.admit(
+                &request.capability,
+                &peer.to_string(),
+                trusted,
+                request.cpu_cores,
+                request.ram_mb,
+            ) {
+                let offer = decentraai_protocol::dfcp::ResourceOffer::answering(
+                    &request, cpu, ram, state.limits.max_lease_seconds,
+                );
+                state
+                    .offers_sent
+                    .lock()
+                    .expect("offers lock")
+                    .insert(offer.offer_id.clone(), (request.capability.clone(), cpu, ram));
+                tracing::info!(offer = %offer.offer_id, capability = %request.capability, "dfcp offering capacity");
+                serde_json::to_vec(&offer).ok()
+            } else {
+                None
+            }
+        }
         DfcInbound::Reserve(reserve) => handle_reserve(&state, &reserve),
         DfcInbound::Assign(assign) => handle_assign(state.clone(), &assign),
         DfcInbound::Release(release) => {
@@ -350,8 +375,13 @@ pub async fn run_assist_request(
     let mut offers: Vec<(ResourceOffer, AssistOffer)> = Vec::new();
     for peer in &connected_peers {
         let peer_str = peer.to_string();
-        let Ok(reply) = p2p.request(*peer, req_bytes.clone()).await else {
-            continue; // unreachable/slow peer: simply not a candidate
+        tracing::info!(peer = %peer_str, capability = %request.capability, "dfcp RESOURCE_REQUEST sent");
+        let reply = match p2p.request(*peer, req_bytes.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(peer = %peer_str, error = %e, "dfcp request transport failed");
+                continue; // unreachable/slow peer: simply not a candidate
+            }
         };
         let offer: Option<ResourceOffer> = serde_json::from_slice(&reply).ok();
         let Some(offer) = offer else { continue };

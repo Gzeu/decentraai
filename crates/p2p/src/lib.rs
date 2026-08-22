@@ -402,6 +402,8 @@ type ManifestAnnouncementHandler =
 /// `Result`/`Release` are fire-and-forget notifications.
 #[derive(Debug)]
 pub enum DfcInbound {
+    /// A mesh-wide capacity poll from a busy node.
+    Request(decentraai_protocol::dfcp::ResourceRequest),
     Reserve(decentraai_protocol::dfcp::ResourceReserve),
     Assign(decentraai_protocol::dfcp::AssistTaskAssign),
     Release(decentraai_protocol::dfcp::ResourceRelease),
@@ -952,10 +954,31 @@ impl P2PNode {
                                         // else fallthrough to normal handler
                                     }
                                     // DFCP ("Sharing is Caring"): bounded negotiation
-                                    // messages. Reserve/Assign get a synchronous
-                                    // reply through the same channel; Result
-                                    // completes a parked oneshot on the requester;
-                                    // Release is fire-and-forget.
+                                    // messages. Request gets an owner-limit-checked
+                                    // Offer (or nothing); Reserve/Assign get a
+                                    // synchronous reply through the same channel;
+                                    // Result completes a parked oneshot on the
+                                    // requester; Release is fire-and-forget.
+                                    if let Ok(dfcp_request) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::ResourceRequest>(
+                                        &request,
+                                        decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
+                                    ) {
+                                        let guard = on_dfcp_clone.lock().await;
+                                        let offer_bytes = if let Some(cb) = &*guard {
+                                            cb(peer, DfcInbound::Request(dfcp_request))
+                                        } else {
+                                            None
+                                        };
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, offer_bytes.unwrap_or_default())
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send dfcp offer");
+                                        }
+                                        continue;
+                                    }
                                     if let Ok(reserve) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::ResourceReserve>(
                                         &request,
                                         decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
