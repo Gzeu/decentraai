@@ -40,9 +40,12 @@ TREE = {
     "02_FABRIC": ["nodes", "capabilities", "models", "protocols", "topology"],
     "03_PROJECT": ["architecture", "roadmap", "decisions", "milestones"],
     "04_KNOWLEDGE": ["technical", "research", "experiments", "references"],
-    "05_AGENTS": ["openclaw", "external", "collaboration"],
+    "05_AGENTS": [f"agents/{a}" for a in ['governor', 'architect', 'rust-engineer', 'api-engineer', 'fabric-engineer', 'qa', 'security', 'vps-operator', 'memory-keeper', 'researcher', 'concierge']] + ["external", "collaboration"],
     "06_MEMORY": ["daily", "sessions", "lessons", "failures"],
     "07_EVIDENCE": ["benchmarks", "decisions", "verified-results"],
+    # Shared knowledge is readable by all agents; writes go through the
+    # Memory Keeper consolidation path, never direct.
+    "08_SHARED": ["architecture", "decisions", "fabric", "knowledge"],
 }
 
 TYPE_FOLDER = {
@@ -159,7 +162,7 @@ def cmd_init(args):
     for top, subs in TREE.items():
         (vault / top).mkdir(parents=True, exist_ok=True)
         for sub in subs or []:
-            (vault / top / sub).mkdir(exist_ok=True)
+            (vault / top / sub).mkdir(parents=True, exist_ok=True)  # nested ok
     readme = vault / "README.md"
     if not readme.exists():
         readme.write_text(
@@ -202,7 +205,7 @@ def cmd_store(args):
     if ntype == "inbox":
         folder = "00_INBOX"
     else:
-        top, sub = TYPE_FOLDER[ntype]
+        top, sub = TYPE_FOLDER.get(ntype, ("06_MEMORY", "sessions"))
         folder = f"{top}/{sub}"
 
     meta = {
@@ -214,6 +217,13 @@ def cmd_store(args):
         "source": args.source or "agent-session",
         "tags": ",".join(t.strip() for t in (args.tags or "").split(",") if t.strip()),
     }
+    # Per-agent memory scoping: --agent routes the note into the agent's own
+    # folder and stamps ownership in frontmatter.
+    if getattr(args, "agent", ""):
+        agent_dir = f"05_AGENTS/agents/{args.agent}"
+        (Path(vault) / agent_dir).mkdir(parents=True, exist_ok=True)
+        folder = agent_dir
+        meta["agent"] = args.agent
     # Wiki links both inline ([[Name]] inside body) and explicit --links list.
     links = [l.strip() for l in (args.links or "").split(",") if l.strip()]
     if links:
@@ -349,6 +359,7 @@ def main():
     p.add_argument("--links", default="", help="comma-separated wiki link targets")
     p.add_argument("--source", default="")
     p.add_argument("--confidence", default="inferred")
+    p.add_argument("--agent", default="", help="route note into 05_AGENTS/agents/<id>")
     p.set_defaults(fn=cmd_store)
 
     p = sub.add_parser("get")
