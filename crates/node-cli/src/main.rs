@@ -2276,7 +2276,6 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         let dist_handle = std::sync::Arc::new(distributed.clone());
         state.attach_distributed(dist_handle.clone());
         // M15 — Autonomous Compute Pressure: observe own signals; when the
-        // M15 — Autonomous Compute Pressure: observe own signals; when the
         // pressure engine fires, request assist through the EXISTING DFCP
         // flow. The pressure layer only PROPOSES; the planner still routes.
         // Opt-in via config; disabled by default.
@@ -2284,6 +2283,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             if auto_cfg.enabled && auto_cfg.profile.is_some() {
                 let auto = std::sync::Arc::new(auto_cfg.clone());
                 let p2p_auto = distributed.p2p_node().clone();
+                let state_auto = state.clone();
                 tokio::spawn(async move {
                     let thresholds: decentraai_compute::pressure::PressureThresholds =
                         decentraai_compute::pressure::PressureThresholds {
@@ -2297,25 +2297,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     let mut last_fired: Option<std::time::Instant> = None;
                     loop {
                         tokio::time::sleep(Duration::from_secs(auto.tick_seconds)).await;
-                        // Honest signals only: what THIS node can measure now.
-                        let snap = SystemSnapshot::collect();
-                        let Some(cm) = dist_handle.compute_manager() else {
-                            continue; // no engine attached: nothing to observe
-                        };
-                        let perf = cm.perf_snapshot();
-                        let signals = decentraai_compute::pressure::PressureSignals {
-                            queue_depth: perf.queue_depth,
-                            latency_ms: u64::from(perf.current_latency_ms),
-                            cpu_percent: snap.cpu_usage_percent,
-                            ram_percent: if snap.total_memory_bytes > 0 {
-                                100.0 * (1.0
-                                    - snap.available_memory_bytes as f32
-                                        / snap.total_memory_bytes as f32)
-                            } else {
-                                0.0
-                            },
-                            missing_local_capability: false,
-                        };
+                        // Honest signals only, measured by the API state itself.
+                        let signals = state_auto.pressure_signals().await;
                         let (new_state, decision) =
                             decentraai_compute::pressure::evaluate(
                                 &signals,
