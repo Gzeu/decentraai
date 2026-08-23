@@ -275,9 +275,7 @@ mod tests {
             cu_version: 2,
             epoch: 1,
         };
-        let err = BlockchainAdapter::submit_settlement(&adapter, &rec)
-            .err()
-            .expect("writes refused");
+        let err = BlockchainAdapter::submit_settlement(&adapter, &rec).expect_err("writes refused");
         assert!(err.to_string().contains("read-only"));
         assert_eq!(BlockchainAdapter::name(&adapter), "multiversx-devnet");
     }
