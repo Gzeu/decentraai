@@ -45,6 +45,10 @@ pub struct NodeConfig {
     /// deterministic planner). Absent = disabled; `/v1/intel/*` returns 404.
     #[serde(default)]
     pub fabric_intelligence: Option<FabricIntelligenceSection>,
+    /// M15 Autonomous Compute Pressure. Absent = disabled; the node never
+    /// requests assistance on its own.
+    #[serde(default)]
+    pub autonomous_assist: Option<AutonomousAssistSection>,
     /// Local STT (faster-whisper subprocess). Absent = STT is disabled;
     /// `/v1/stt` returns 404. Enabling requires `<data_dir>/tools/stt/venv`.
     #[serde(default)]
@@ -550,6 +554,104 @@ pub struct FabricIntelExternalSection {
     pub model: String,
 }
 
+/// M15 — Autonomous Compute Pressure: the node observes ITS OWN pressure
+/// signals and may trigger an assist request through the EXISTING DFCP flow.
+/// The agent/pressure layer can only PROPOSE; routing stays with the
+/// deterministic planner. Opt-in; absent = disabled.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomousAssistSection {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Seconds between pressure evaluations.
+    #[serde(default = "default_tick_secs")]
+    pub tick_seconds: u64,
+    /// Minimum seconds between two consecutive assist requests (hysteresis
+    /// cooldown on top of the score-based state machine).
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_seconds: u64,
+    #[serde(default)]
+    pub thresholds: PressureThresholdsSection,
+    /// The assist profile executed when pressure fires: which capability to
+    /// offload and what payload template to send.
+    #[serde(default)]
+    pub profile: Option<AssistProfileSection>,
+}
+
+fn default_tick_secs() -> u64 {
+    15
+}
+fn default_cooldown_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PressureThresholdsSection {
+    #[serde(default = "default_queue_high")]
+    pub queue_depth_high: u32,
+    #[serde(default = "default_latency_high")]
+    pub latency_ms_high: u64,
+    #[serde(default = "default_cpu_high")]
+    pub cpu_percent_high: f32,
+    #[serde(default = "default_ram_high")]
+    pub ram_percent_high: f32,
+}
+
+impl Default for PressureThresholdsSection {
+    fn default() -> Self {
+        Self {
+            queue_depth_high: default_queue_high(),
+            latency_ms_high: default_latency_high(),
+            cpu_percent_high: default_cpu_high(),
+            ram_percent_high: default_ram_high(),
+        }
+    }
+}
+
+impl PressureThresholdsSection {
+    /// Boot-time sanity mirroring `compute::pressure::PressureThresholds`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.queue_depth_high == 0 {
+            return Err("queue_depth_high must be > 0".into());
+        }
+        if self.latency_ms_high == 0 {
+            return Err("latency_ms_high must be > 0".into());
+        }
+        if !(1.0..=100.0).contains(&self.cpu_percent_high) {
+            return Err(format!("cpu_percent_high must be within [1,100], got {}", self.cpu_percent_high));
+        }
+        if !(1.0..=100.0).contains(&self.ram_percent_high) {
+            return Err(format!("ram_percent_high must be within [1,100], got {}", self.ram_percent_high));
+        }
+        Ok(())
+    }
+}
+
+fn default_queue_high() -> u32 {
+    2
+}
+fn default_latency_high() -> u64 {
+    5_000
+}
+fn default_cpu_high() -> f32 {
+    90.0
+}
+fn default_ram_high() -> f32 {
+    85.0
+}
+
+/// What to offload when pressure fires. `payload_template` is a JSON object
+/// sent verbatim as the assist task payload (e.g. an OpenAI-shaped chat body
+/// or an embeddings request); placeholders like {input} are filled by the
+/// caller of the assist endpoint, not by the engine.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssistProfileSection {
+    pub capability: String,
+    pub payload_template: serde_json::Value,
+}
+
 /// Fabric Intelligence configuration. Absent section = disabled; the node
 /// behaves exactly as before this feature existed.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -731,6 +833,29 @@ impl NodeConfig {
         }
         if let Some(intel) = &self.fabric_intelligence {
             intel.validate().map_err(ConfigError::Validation)?;
+        }
+        if let Some(assist) = &self.autonomous_assist {
+            assist.thresholds.validate().map_err(|e| {
+                ConfigError::Validation(format!("autonomous_assist: {e}"))
+            })?;
+            if assist.enabled && assist.profile.is_none() {
+                return Err(ConfigError::Validation(
+                    "autonomous_assist.enabled requires a `profile` (capability + payload_template)"
+                        .into(),
+                ));
+            }
+            if let Some(profile) = &assist.profile {
+                if profile.capability.trim().is_empty() {
+                    return Err(ConfigError::Validation(
+                        "autonomous_assist.profile.capability must not be empty".into(),
+                    ));
+                }
+                if !profile.payload_template.is_object() {
+                    return Err(ConfigError::Validation(
+                        "autonomous_assist.profile.payload_template must be a JSON object".into(),
+                    ));
+                }
+            }
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(

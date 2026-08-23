@@ -2273,7 +2273,90 @@ async fn node_start(args: NodeArgs) -> Result<()> {
 
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
-        state.attach_distributed(distributed.clone().into());
+        let dist_handle = std::sync::Arc::new(distributed.clone());
+        state.attach_distributed(dist_handle.clone());
+        // M15 — Autonomous Compute Pressure: observe own signals; when the
+        // pressure engine fires, request assist through the EXISTING DFCP
+        // flow. The pressure layer only PROPOSES; the planner still routes.
+        // Opt-in via config; disabled by default.
+        if let Some(auto_cfg) = config.autonomous_assist.as_ref() {
+            if auto_cfg.enabled && auto_cfg.profile.is_some() {
+                let auto = std::sync::Arc::new(auto_cfg.clone());
+                let p2p_auto = distributed.p2p_node().clone();
+                let state_auto = state.clone();
+                tokio::spawn(async move {
+                    let thresholds: decentraai_compute::pressure::PressureThresholds =
+                        decentraai_compute::pressure::PressureThresholds {
+                            queue_depth_high: auto.thresholds.queue_depth_high,
+                            latency_ms_high: auto.thresholds.latency_ms_high,
+                            cpu_percent_high: auto.thresholds.cpu_percent_high,
+                            ram_percent_high: auto.thresholds.ram_percent_high,
+                        };
+                    let mut state_machine =
+                        decentraai_compute::pressure::AssistState::Normal;
+                    let mut last_fired: Option<std::time::Instant> = None;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(auto.tick_seconds)).await;
+                        // Honest signals only, measured by the API state itself.
+                        let signals = state_auto.pressure_signals().await;
+                        let (new_state, decision) =
+                            decentraai_compute::pressure::evaluate(
+                                &signals,
+                                &thresholds,
+                                state_machine,
+                            );
+                        state_machine = new_state;
+                        tracing::info!(
+                            score = format_args!("{:.2}", decision.score),
+                            should_assist = decision.should_assist,
+                            reasons = ?decision.reasons,
+                            "autonomous pressure evaluated"
+                        );
+                        if !decision.should_assist {
+                            continue;
+                        }
+                        if let Some(t) = last_fired {
+                            if t.elapsed() < Duration::from_secs(auto.cooldown_seconds) {
+                                continue; // hysteresis cooldown
+                            }
+                        }
+                        last_fired = Some(std::time::Instant::now());
+                        let profile = auto.profile.as_ref().expect("checked at boot");
+                        let payload_json = serde_json::json!({
+                            "messages": profile.payload_template.get("messages")
+                                .cloned()
+                                .unwrap_or_default(),
+                            "max_tokens": profile.payload_template.get("max_tokens").cloned().unwrap_or(serde_json::json!(64)),
+                        });
+                        let Ok(payload_bytes) = serde_json::to_vec(&payload_json) else {
+                            continue;
+                        };
+                        let peers = p2p_auto.connected_peers().await;
+                        // Lease = min(cooldown, 120s): an autonomous assist is a
+                        // probe-scale task, not a long-running lease.
+                        let lease = auto.cooldown_seconds.min(120);
+                        let outcome =
+                            decentraai_runtime::intel_assist::run_assist_request(
+                                &p2p_auto,
+                                peers,
+                                decentraai_compute::assist::AssistRequest {
+                                    capability: profile.capability.clone(),
+                                    cpu_cores: 2,
+                                    ram_mb: 512,
+                                },
+                                payload_bytes,
+                                lease,
+                            )
+                            .await;
+                        tracing::info!(
+                            success = outcome.0,
+                            explanation = %outcome.2,
+                            "autonomous assist executed"
+                        );
+                    }
+                });
+            }
+        }
         // Sharing is Caring (M14/M15 M1): answer DFCP assist requests under
         // owner limits when configured; disabled by default.
         if let Some(assist_cfg) = config.sharing.assist.as_ref() {

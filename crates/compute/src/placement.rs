@@ -183,6 +183,9 @@ pub struct PlacementWeights {
     pub w_load: f64,
     pub w_model: f64,
     pub w_headroom: f64,
+    /// FAIRNESS weight for the contribution-balance bias. The bias is
+    /// saturated to ±0.15 BEFORE weighting: capacity/health/trust dominate.
+    pub w_fairness: f64,
 }
 
 impl Default for PlacementWeights {
@@ -194,7 +197,8 @@ impl Default for PlacementWeights {
             w_health: 0.10,
             w_load: 0.15,
             w_model: 0.15,
-            w_headroom: 0.10,
+            w_headroom: 0.08,
+            w_fairness: 0.02,
         }
     }
 }
@@ -379,6 +383,7 @@ impl PlacementEngine {
         let w = &self.weights;
         w.w_compute * self.compute_fitness(node, req)
             + w.w_network * self.network_fitness(node, graph)
+            + w.w_fairness * self.fairness_bias(node)
             + w.w_trust * if node.trusted { 1.0 } else { 0.0 }
             + w.w_health * if node.healthy { 1.0 } else { 0.0 }
             + w.w_load * self.load_fitness(node)
@@ -406,6 +411,16 @@ impl PlacementEngine {
     fn load_fitness(&self, node: &crate::fabric_graph::FabricNode) -> f64 {
         let load = node.availability.load_percent as f64 / 100.0;
         1.0 - load
+    }
+
+    /// Saturated fairness bias in −0.15..=+0.15 from the node's contribution
+    /// balance. tanh keeps it smooth; ±200 credits reach the cap. A bias may
+    /// reorder near-equal candidates but can NEVER outrank a hard gate
+    /// failure or a decisively better capacity fit — those are decided
+    /// before scoring.
+    fn fairness_bias(&self, node: &crate::fabric_graph::FabricNode) -> f64 {
+        const SATURATION: f64 = 200.0;
+        0.15 * ((node.contribution_balance as f64 / SATURATION).clamp(-2.0, 2.0)).tanh()
     }
 
     fn headroom(&self, node: &crate::fabric_graph::FabricNode, req: &ModelRequirements) -> f64 {
@@ -538,6 +553,7 @@ mod tests {
             },
             availability: crate::availability::ComputeAvailability::ready(),
             link: None,
+            contribution_balance: 0,
         };
         node.capability.served_models = vec![crate::capability::ServedModel {
             model_hash: "m1".to_string(),
@@ -563,6 +579,84 @@ mod tests {
         assert!(plan.rejected.is_empty());
     }
 
+    /// FAIRNESS BIAS pin (M15): two IDENTICAL nodes except contribution
+    /// balance. The net giver (+200, bias cap) must win the tie — but the
+    /// bias is bounded, so a decisively worse capacity fit still loses.
+    #[test]
+    fn placement_engine_fairness_bias_breaks_ties_only() {
+        use crate::fabric_graph::{FabricGraph, FabricNode};
+        use crate::capability::{ComputeCapability, GpuSpec};
+
+        fn node(peer: &str, balance: i64) -> FabricNode {
+            FabricNode {
+                peer_id: peer.to_string(),
+                node_name: peer.to_string(),
+                node_version: "1.0.0".to_string(),
+                trusted: true,
+                healthy: true,
+                accepts_remote: true,
+                capability: ComputeCapability {
+                    cpu_cores: 8,
+                    ram_mb: 64_000,
+                    gpu: Some(GpuSpec::simple("t", 24_000, "t")),
+                    engine: "llama_server".to_string(),
+                    served_models: vec![],
+                    can_provision: false,
+                    available_models: vec![],
+                },
+                availability: crate::availability::ComputeAvailability::ready(),
+                link: None,
+                contribution_balance: balance,
+            }
+        }
+
+        let req = ModelRequirements {
+            model_id: "m1".to_string(),
+            min_gpu_count: 1,
+            min_vram_mb: 20_000,
+            min_ram_mb: 30_000,
+            context_tokens: 4096,
+            ..Default::default()
+        };
+
+        // Tie case: identical fit, giver wins.
+        let mut graph = FabricGraph::new();
+        graph.upsert(node("neutral", 0));
+        graph.upsert(node("giver", 400));
+        let plan = PlacementEngine::default().plan(&req, &graph);
+        assert_eq!(
+            plan.selected_workers,
+            vec!["giver".to_string()],
+            "contribution bias decides the otherwise-equal tie"
+        );
+
+        // Capacity dominates: a taker with better VRAM headroom beats a
+        // giver whose node barely fits.
+        let mut graph2 = FabricGraph::new();
+        let mut tight_giver = node("tight-giver", 400);
+        tight_giver.capability.ram_mb = 31_000;
+        tight_giver.availability.available_ram_mb = 30_500;
+        graph2.upsert(tight_giver);
+        let mut roomy_taker = node("roomy-taker", -100);
+        roomy_taker.capability.ram_mb = 64_000;
+        roomy_taker.availability.available_ram_mb = 60_000;
+        graph2.upsert(roomy_taker);
+        let req_big = ModelRequirements {
+            model_id: "m1".to_string(),
+            min_gpu_count: 1,
+            min_vram_mb: 20_000,
+            min_ram_mb: 30_000,
+            context_tokens: 4096,
+            ..Default::default()
+        };
+        let plan2 = PlacementEngine::default().plan(&req_big, &graph2);
+        assert_eq!(
+            plan2.selected_workers,
+            vec!["roomy-taker".to_string()],
+            "capacity fit outranks the fairness bias"
+        );
+    }
+
     #[test]
     fn placement_engine_rejects_untrusted_with_reason() {
         use crate::fabric_graph::{FabricGraph, FabricNode};
@@ -576,6 +670,7 @@ mod tests {
             trusted: false,
             healthy: true,
             accepts_remote: true,
+            contribution_balance: 0,
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 64_000,
@@ -617,6 +712,7 @@ mod tests {
                 trusted: true,
                 healthy: true,
                 accepts_remote: true,
+                contribution_balance: 0,
                 capability: ComputeCapability {
                     cpu_cores: 8,
                     ram_mb: 64_000,
@@ -661,6 +757,7 @@ mod tests {
             trusted: true,
             healthy: true,
             accepts_remote: true,
+                contribution_balance: 0,
             capability: ComputeCapability {
                 cpu_cores: 16,
                 ram_mb: 128_000,
@@ -709,6 +806,7 @@ mod tests {
             trusted: true,
             healthy: true,
             accepts_remote: true,
+                contribution_balance: 0,
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 64_000,

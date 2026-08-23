@@ -504,6 +504,36 @@ impl ApiState {
         self.orchestrator = Some(orchestrator);
     }
 
+    /// M15: honest local pressure signals for the autonomous engine —
+    /// REAL waiting-room depth and mean latency of recent completed
+    /// requests, plus system CPU/RAM. Never invented.
+    pub async fn pressure_signals(
+        &self,
+    ) -> decentraai_compute::pressure::PressureSignals {
+        let (serving, waiting) = self.queue.snapshot();
+        let _ = serving;
+        let recent = self.recent_requests.lock().expect("recent lock");
+        let mean_latency_ms = if recent.is_empty() {
+            0
+        } else {
+            recent.iter().map(|r| r.duration_ms).sum::<u64>() / recent.len() as u64
+        };
+        drop(recent);
+        let snap = decentraai_system_probe::SystemSnapshot::collect();
+        decentraai_compute::pressure::PressureSignals {
+            queue_depth: waiting.len() as u32,
+            latency_ms: mean_latency_ms,
+            cpu_percent: snap.cpu_usage_percent,
+            ram_percent: if snap.total_memory_bytes > 0 {
+                100.0 * (1.0 - snap.available_memory_bytes as f32
+                    / snap.total_memory_bytes as f32)
+            } else {
+                0.0
+            },
+            missing_local_capability: false,
+        }
+    }
+
     /// Attaches the Fabric Intelligence layer (built from config in the node
     /// daemon). Absent = `/v1/intel/*` answer 404 and the node behaves as if
     /// the feature did not exist.
