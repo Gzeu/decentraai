@@ -547,6 +547,21 @@ impl MemoryRegistry {
         Ok(())
     }
 
+    /// Checks whether a note with identical content already exists in the
+    /// given scope. Returns `true` if a duplicate is found (caller should
+    /// skip storing). Uses BLAKE3 content hash for exact-match dedup.
+    pub fn is_duplicate(&self, scope_name: &str, content: &str) -> bool {
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        self.entries
+            .get(scope_name)
+            .map(|bucket| {
+                bucket.iter().any(|e| {
+                    blake3::hash(e.content.as_bytes()).to_hex().to_string() == hash
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Reads a scope's non-expired entries in insertion order.
     ///
     /// Ownership is derived honestly from the scope itself (`reader_agent ==

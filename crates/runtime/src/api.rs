@@ -5053,6 +5053,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/rag/index", post(rag_index_handler))
         .route("/v1/rag/query", post(rag_query_handler))
         .route("/v1/memory", get(memory_handler))
+        .route("/v1/memory/search", post(memory_search_handler))
         .route("/v1/reputation", get(reputation_handler))
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
@@ -8121,6 +8122,62 @@ async fn intel_status_handler(State(state): State<ApiState>, headers: HeaderMap)
     body["providers"] =
         serde_json::to_value(intel.telemetry().scores()).unwrap_or_else(|_| serde_json::json!([]));
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// POST /v1/memory/search — search collective memory by content keywords.
+/// Operator+. Body: {"scope":"...", "query":"..."} or {"query":"..."} to
+/// search all accessible scopes. Returns matching entries with provenance.
+async fn memory_search_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    let query = body.0.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let scope_filter = body.0.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "query must not be empty"})),
+        ).into_response();
+    }
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    let mut results = Vec::new();
+    for scope in memory.list_scopes().unwrap_or_default() {
+        if let Some(filter) = &scope_filter {
+            if scope.name != *filter { continue; }
+        }
+        let entries = match memory.read(&scope.name, "governor", true) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.iter() {
+            let text = format!("{} {}", entry.entry_id, entry.content).to_lowercase();
+            let matches = terms.iter().all(|t| text.contains(t));
+            if matches {
+                results.push(serde_json::json!({
+                    "scope": entry.scope,
+                    "entry_id": entry.entry_id,
+                    "author": entry.author_agent,
+                    "content": entry.content.chars().take(300).collect::<String>(),
+                    "tags": entry.tags,
+                }));
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"results": results, "count": results.len()})),
+    ).into_response()
 }
 
 async fn agents_orchestrate_handler(
