@@ -7,6 +7,7 @@ edition.workspace = true
 decentraai-agents = { path = "../agents" }
 decentraai-compute = { path = "../compute" }
 blake3.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
