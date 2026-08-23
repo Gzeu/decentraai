@@ -128,20 +128,52 @@ function advance() {
   setTimeout(advance, step.d);
 }
 
-function sendText(raw) {
+const GOV_SYSTEM_PROMPT = `You are the DecentraAI Governor, an autonomous fabric operator.
+You manage a cooperative AI compute fabric with 3 workers (Desktop, VPS, Laptop).
+You can observe pressure, detect capability gaps, delegate tasks via DFCP,
+and propose improvements. You NEVER mutate fabric state directly —
+deterministic Rust decides. Answer concisely in the user's language.`;
+
+async function callLLM(messages) {
+  const body = {
+    messages,
+    max_tokens: 300,
+    temperature: 0.7,
+  };
+  const res = await fetch("/gov-api/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error("LLM error " + res.status);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || "(no response)";
+}
+
+async function sendText(raw) {
   const input = document.querySelector("#composer");
   const t = (raw ?? (input ? input.value : "")).trim();
   if (!t) return;
   if (!raw && input) input.value = "";
   addMsg("user", t);
-  const l = t.toLowerCase();
-  if (/latenc|slow|desktop|worker/.test(l)) startScenario();
-  else if (/memory|remember/.test(l)) { setGov("THINKING", "Opening typed memory."); addMsg("gov", "These are typed residues, not a graph."); state.inspector = "memory"; }
-  else if (/evolv|skill|gap/.test(l)) { state.inspector = "evolution"; setGov("RESEARCHING", "Capability gap #42 is live."); addMsg("gov", "Capability gap #42 is the live evolutionary thread."); }
-  else if (/incident|down/.test(l)) simulateIncident();
-  else {
-    setGov("THINKING", "I can observe, propose, and delegate.");
-    addMsg("gov", "Noted. I will not mutate fabric without a deterministic decision.", [{ kind: "THINKING", title: "Stay inside the contract", detail: "AI proposes → deterministic Rust decides → workers execute.", open: true }]);
+
+  setGov("THINKING", "Processing…");
+  render();
+
+  try {
+    // Build conversation from state + system prompt
+    const messages = [
+      { role: "system", content: GOV_SYSTEM_PROMPT },
+      ...state.messages.filter(m => m.role === "user" || m.role === "gov").slice(-10)
+        .map(m => ({ role: m.role === "gov" ? "assistant" : "user", content: m.text })),
+    ];
+    // The last user message is already in state.messages
+    const reply = await callLLM(messages);
+    addMsg("gov", reply);
+    setGov("IDLE", "Quiet. Watching the fabric.");
+  } catch (e) {
+    addMsg("gov", "[error] " + e.message);
+    setGov("IDLE", state.utterance);
   }
   render();
 }
