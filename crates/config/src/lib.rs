@@ -49,6 +49,9 @@ pub struct NodeConfig {
     /// requests assistance on its own.
     #[serde(default)]
     pub autonomous_assist: Option<AutonomousAssistSection>,
+    /// M16 Agent Gateway (BYOA). Absent = gateway disabled; onboarding returns 404.
+    #[serde(default)]
+    pub agent_gateway: Option<AgentGatewaySection>,
     /// Local STT (faster-whisper subprocess). Absent = STT is disabled;
     /// `/v1/stt` returns 404. Enabling requires `<data_dir>/tools/stt/venv`.
     #[serde(default)]
@@ -750,6 +753,99 @@ impl FabricIntelligenceSection {
     }
 }
 
+/// Agent Gateway (M16): scoped identities for external agents (BYOA).
+/// Absent = gateway disabled; onboarding endpoint returns 404.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentGatewaySection {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Max quota ceiling an onboarded agent may receive.
+    #[serde(default = "default_gateway_quota")]
+    pub max_quota_ceiling: u64,
+    /// Max rate limit an onboarded agent may receive (req/min).
+    #[serde(default = "default_gateway_rate")]
+    pub max_rate_limit: u32,
+    /// Max expiry in seconds for an onboarded credential (0 = no expiry cap).
+    #[serde(default = "default_gateway_expiry")]
+    pub max_expiry_seconds: u64,
+    /// Capabilities allowed for onboarding. Empty = any hub taxonomy capability.
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+    /// Conservative free-starter preset applied when the caller requests starter.
+    #[serde(default)]
+    pub free_starter: FreeStarterSection,
+}
+
+fn default_gateway_quota() -> u64 {
+    1000
+}
+fn default_gateway_rate() -> u32 {
+    60
+}
+fn default_gateway_expiry() -> u64 {
+    86400
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreeStarterSection {
+    #[serde(default = "default_starter_quota")]
+    pub quota_ceiling: u64,
+    #[serde(default = "default_starter_rate")]
+    pub rate_limit: u32,
+    #[serde(default = "default_starter_scopes")]
+    pub scopes: Vec<String>,
+}
+
+fn default_starter_quota() -> u64 {
+    100
+}
+fn default_starter_rate() -> u32 {
+    10
+}
+fn default_starter_scopes() -> Vec<String> {
+    vec!["inference".to_string(), "embeddings".to_string()]
+}
+
+impl Default for AgentGatewaySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_quota_ceiling: default_gateway_quota(),
+            max_rate_limit: default_gateway_rate(),
+            max_expiry_seconds: default_gateway_expiry(),
+            allowed_capabilities: vec![],
+            free_starter: FreeStarterSection::default(),
+        }
+    }
+}
+
+impl Default for FreeStarterSection {
+    fn default() -> Self {
+        Self {
+            quota_ceiling: default_starter_quota(),
+            rate_limit: default_starter_rate(),
+            scopes: default_starter_scopes(),
+        }
+    }
+}
+
+impl AgentGatewaySection {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_quota_ceiling == 0 {
+            return Err("agent_gateway.max_quota_ceiling must be > 0".into());
+        }
+        if self.max_rate_limit == 0 {
+            return Err("agent_gateway.max_rate_limit must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
 /// Local speech-to-text (STT). Drives a faster-whisper (CTranslate2) Python
 /// subprocess — external engine, never FFI — exposed as `/v1/stt`. Models
 /// download on first use (or are pre-placed in `<data_dir>/tools/stt/models`
@@ -856,6 +952,9 @@ impl NodeConfig {
                     ));
                 }
             }
+        }
+        if let Some(gw) = &self.agent_gateway {
+            gw.validate().map_err(ConfigError::Validation)?;
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(

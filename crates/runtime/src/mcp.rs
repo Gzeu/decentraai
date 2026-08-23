@@ -316,6 +316,33 @@ fn all_tools() -> Vec<ToolDef> {
             description: "Consumer API key metadata (Compute Contribution & Quota): per-key id, display prefix, owner account, quota ceiling, rate limit, scopes, status, and live usage + the owner account's quota balance. Read-only; NEVER exposes the plaintext secret.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
+        ToolDef {
+            name: "decentraai_embeddings",
+            description: "Generate embeddings for a text input (L1 ASSIST). Requires a consumer key with 'embeddings' scope. Rate-limited and quota-gated. Returns the embedding vector or an error if the capability is not available.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Text to embed." },
+                    "model": { "type": "string", "description": "Optional model id; defaults to the node's available embedding model." }
+                },
+                "required": ["input"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "decentraai_compute_request",
+            description: "Request remote compute assistance (L1 ASSIST, Sharing is Caring DFCP). Requires a consumer key with 'compute' or matching capability scope. The fabric planner decides the worker; the caller never selects a peer. Rate-limited, quota-gated, audited.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capability": { "type": "string", "description": "Capability to offload, e.g. 'embeddings', 'ocr', 'chat'." },
+                    "payload": { "type": "object", "description": "Task payload as JSON (e.g. {\"input\":\"text\"} or {\"messages\":[...]})" },
+                    "lease_seconds": { "type": "integer", "description": "Max lease in seconds (1..120, default 60)." }
+                },
+                "required": ["capability", "payload"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -697,6 +724,45 @@ pub fn compensation_request(raw: &str) -> bool {
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
         == Some("get_compensation")
+}
+
+/// Extract `decentraai_embeddings` parameters (L1 ASSIST). Pure.
+pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    if name != "decentraai_embeddings" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let input = args.get("input").and_then(|v| v.as_str())?.to_string();
+    if input.is_empty() || input.len() > 8000 {
+        return None;
+    }
+    let model = args.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some((input, model))
+}
+
+/// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).
+pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    if name != "decentraai_compute_request" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let capability = args.get("capability").and_then(|v| v.as_str())?.to_string();
+    if capability.is_empty() {
+        return None;
+    }
+    let payload = args.get("payload").cloned().unwrap_or(json!({}));
+    let lease = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(60).clamp(1, 120);
+    Some((capability, payload, lease))
 }
 
 /// Pure, deterministic intent → capability → local-model resolution.
