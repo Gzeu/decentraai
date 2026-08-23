@@ -39,6 +39,8 @@
 pub mod advertisement;
 pub mod agent;
 pub mod benchmark;
+pub mod collective;
+pub mod collective_bridge;
 pub mod capability;
 pub mod dataset;
 pub mod decision;
