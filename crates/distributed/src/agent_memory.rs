@@ -26,8 +26,10 @@
 
 use anyhow::Result;
 use decentraai_agents::memory::{
-    MemoryAccessDecision, MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope, can_read, can_write,
+    can_read, can_write, can_transition, MemoryAccessDecision, MemoryEntry, MemoryLevel,
+    MemoryPolicy, MemoryScope, MemoryStatus, MemoryTransition, MAX_HISTORY, WriteOutcome,
 };
+use decentraai_agents::training_export::{training_candidates, TrainingCandidate};
 use decentraai_hub::capability::Provenance;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -49,6 +51,16 @@ pub enum MemoryStoreError {
     /// The named scope does not exist.
     #[error("memory scope '{name}' does not exist")]
     UnknownScope { name: String },
+    /// The referenced entry does not exist in the scope.
+    #[error("memory entry '{entry_id}' does not exist in scope")]
+    UnknownEntry { entry_id: String },
+    /// A lifecycle transition violated the state machine.
+    #[error("invalid memory transition for '{entry_id}': {from:?} → {to:?}")]
+    InvalidTransition {
+        entry_id: String,
+        from: MemoryStatus,
+        to: MemoryStatus,
+    },
 }
 
 impl From<rusqlite::Error> for MemoryStoreError {
@@ -85,9 +97,40 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER,
     provenance TEXT,
+    content_hash TEXT NOT NULL DEFAULT '',
+    meta TEXT,
     FOREIGN KEY(scope) REFERENCES memory_scopes(name)
 );
 ";
+
+/// Created after the M18 migration so pre-M18 databases get the column
+/// before the index references it.
+const CREATE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_memory_entries_scope ON memory_entries(scope, content_hash);";
+
+/// Adds columns introduced by M18 to databases created before it. Idempotent:
+/// existing installs get one `ALTER TABLE` per missing column, fresh installs
+/// already have them from `CREATE_SCHEMA`.
+fn ensure_m18_columns(conn: &Connection) -> Result<(), MemoryStoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memory_entries)")?;
+    let mut has_content_hash = false;
+    let mut has_meta = false;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in rows {
+        match name? {
+            ref n if n == "content_hash" => has_content_hash = true,
+            ref n if n == "meta" => has_meta = true,
+            _ => {}
+        }
+    }
+    if !has_content_hash {
+        conn.execute("ALTER TABLE memory_entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !has_meta {
+        conn.execute("ALTER TABLE memory_entries ADD COLUMN meta TEXT", [])?;
+    }
+    Ok(())
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -100,8 +143,10 @@ fn level_to_str(level: MemoryLevel) -> &'static str {
     match level {
         MemoryLevel::Agent => "agent",
         MemoryLevel::Team => "team",
+        MemoryLevel::Node => "node",
         MemoryLevel::Network => "network",
         MemoryLevel::Fabric => "fabric",
+        MemoryLevel::System => "system",
     }
 }
 
@@ -109,8 +154,10 @@ fn level_from_str(s: &str) -> Result<MemoryLevel, MemoryStoreError> {
     match s {
         "agent" => Ok(MemoryLevel::Agent),
         "team" => Ok(MemoryLevel::Team),
+        "node" => Ok(MemoryLevel::Node),
         "network" => Ok(MemoryLevel::Network),
         "fabric" => Ok(MemoryLevel::Fabric),
+        "system" => Ok(MemoryLevel::System),
         other => Err(MemoryStoreError::Sql(format!(
             "unrecognized memory level stored in db: '{other}'"
         ))),
@@ -134,12 +181,64 @@ fn provenance_from_str(s: &str) -> Result<Provenance, MemoryStoreError> {
     }
 }
 
+/// BLAKE3 content hash used for exact-match dedup (same function as the pure
+/// model's dedup — one definition of "identical knowledge").
+fn content_hash(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+/// Deletes expired entries of one scope inside a transaction.
+fn prune_expired(
+    tx: &rusqlite::Transaction<'_>,
+    scope_name: &str,
+    now: u64,
+) -> Result<(), MemoryStoreError> {
+    tx.execute(
+        "DELETE FROM memory_entries WHERE scope = ?1 AND expires_at_ms IS NOT NULL AND expires_at_ms < ?2",
+        params![scope_name, now as i64],
+    )?;
+    Ok(())
+}
+
+/// Drops the oldest live entries so that, counting `extra` rows about to be
+/// inserted (`extra = 0` when called after the insert), the scope holds at
+/// most `policy.max_entries` rows. Deterministic: created asc, id desc.
+fn enforce_max_entries(
+    tx: &rusqlite::Transaction<'_>,
+    policy: &MemoryPolicy,
+    scope_name: &str,
+    now: u64,
+    extra: i64,
+) -> Result<(), MemoryStoreError> {
+    let live: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM memory_entries WHERE scope = ?1
+         AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
+        params![scope_name, now as i64],
+        |r| r.get(0),
+    )?;
+    let to_delete = (live + extra).saturating_sub(policy.max_entries as i64);
+    if to_delete > 0 {
+        tx.execute(
+            "DELETE FROM memory_entries WHERE scope = ?1 AND entry_id IN (
+                SELECT entry_id FROM memory_entries
+                WHERE scope = ?1
+                ORDER BY created_at_ms ASC, entry_id DESC
+                LIMIT ?2
+            )",
+            params![scope_name, to_delete],
+        )?;
+    }
+    Ok(())
+}
+
 impl MemoryStore {
     /// Opens (creating if needed) the SQLite store at `path`, ensuring the
-    /// schema exists. Idempotent.
+    /// schema exists (including M18 columns on pre-M18 databases). Idempotent.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(CREATE_SCHEMA)?;
+        ensure_m18_columns(&conn)?;
+        conn.execute_batch(CREATE_INDEX)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -268,34 +367,14 @@ impl MemoryStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         // Prune expired entries for this scope.
-        tx.execute(
-            "DELETE FROM memory_entries WHERE scope = ?1 AND expires_at_ms IS NOT NULL AND expires_at_ms < ?2",
-            params![scope_name, now as i64],
-        )?;
+        prune_expired(&tx, scope_name, now)?;
         // Drop the oldest live entries so that, after inserting the new one,
         // the scope holds at most `max_entries` live entries.
-        let live: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM memory_entries WHERE scope = ?1
-             AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
-            params![scope_name, now as i64],
-            |r| r.get(0),
-        )?;
-        let to_delete = (live + 1).saturating_sub(scope.policy.max_entries as i64);
-        if to_delete > 0 {
-            tx.execute(
-                "DELETE FROM memory_entries WHERE scope = ?1 AND entry_id IN (
-                    SELECT entry_id FROM memory_entries
-                    WHERE scope = ?1
-                    ORDER BY created_at_ms ASC, entry_id DESC
-                    LIMIT ?2
-                )",
-                params![scope_name, to_delete],
-            )?;
-        }
+        enforce_max_entries(&tx, &scope.policy, scope_name, now, 1)?;
         tx.execute(
             "INSERT INTO memory_entries
-                (entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, content_hash, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.entry_id,
                 entry.scope,
@@ -309,10 +388,216 @@ impl MemoryStore {
                 entry
                     .provenance
                     .map(|p| provenance_to_str(p).to_string()),
+                content_hash(&entry.content),
+                serde_json::to_string(&entry.meta)
+                    .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
             ],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes through the collective-memory path (M18): access policy,
+    /// exact-duplicate rejection by BLAKE3 content hash, and subject-key
+    /// conflict handling — competing claims are stored alongside existing
+    /// ones and linked bidirectionally; nothing is ever overwritten.
+    pub fn write_checked(
+        &self,
+        scope_name: &str,
+        entry: &MemoryEntry,
+        writer_agent: &str,
+        writer_is_owner: bool,
+        trusted: bool,
+        verified_provenance: bool,
+    ) -> Result<WriteOutcome, MemoryStoreError> {
+        let scope = self
+            .get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
+                name: scope_name.to_string(),
+            })?;
+        match can_write(
+            &scope,
+            writer_agent,
+            writer_is_owner,
+            trusted,
+            verified_provenance,
+        ) {
+            MemoryAccessDecision::Granted => {}
+            MemoryAccessDecision::Denied { reason } => {
+                return Err(MemoryStoreError::AccessDenied { reason });
+            }
+        }
+        let now = now_ms();
+        let hash = content_hash(&entry.content);
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Expired entries never count for dedup or conflicts.
+        prune_expired(&tx, scope_name, now)?;
+        if let Some(existing_id) = tx
+            .query_row(
+                "SELECT entry_id FROM memory_entries WHERE scope = ?1 AND content_hash = ?2 LIMIT 1",
+                params![scope_name, hash],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(WriteOutcome::Duplicate { existing_id });
+        }
+        // Competing claims about the same subject: link both directions.
+        let mut competitors: Vec<String> = Vec::new();
+        let mut relink: Vec<(String, String)> = Vec::new(); // (entry_id, new_meta_json)
+        if !entry.meta.subject_key.is_empty() {
+            let mut stmt = tx.prepare(
+                "SELECT entry_id, meta FROM memory_entries WHERE scope = ?1",
+            )?;
+            let rows = stmt.query_map(params![scope_name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, meta_json) = row?;
+                let mut meta: decentraai_agents::memory::MemoryMeta = meta_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or_default();
+                if meta.subject_key != entry.meta.subject_key {
+                    continue;
+                }
+                competitors.push(id.clone());
+                if !meta.competes_with.contains(&entry.entry_id) {
+                    meta.competes_with.push(entry.entry_id.clone());
+                    relink.push((
+                        id,
+                        serde_json::to_string(&meta)
+                            .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
+                    ));
+                }
+            }
+        }
+        for (id, meta_json) in relink {
+            tx.execute(
+                "UPDATE memory_entries SET meta = ?2 WHERE entry_id = ?1",
+                params![id, meta_json],
+            )?;
+        }
+        let mut entry_meta = entry.meta.clone();
+        entry_meta.competes_with = competitors.clone();
+        tx.execute(
+            "INSERT INTO memory_entries
+                (entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, content_hash, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.entry_id,
+                entry.scope,
+                entry.author_agent,
+                entry.author_node,
+                entry.content,
+                serde_json::to_string(&entry.tags)
+                    .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
+                entry.created_at_ms as i64,
+                entry.expires_at_ms.map(|ms| ms as i64),
+                entry
+                    .provenance
+                    .map(|p| provenance_to_str(p).to_string()),
+                hash,
+                serde_json::to_string(&entry_meta)
+                    .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
+            ],
+        )?;
+        enforce_max_entries(&tx, &scope.policy, scope_name, now, 0)?;
+        tx.commit()?;
+        if competitors.is_empty() {
+            Ok(WriteOutcome::Stored)
+        } else {
+            Ok(WriteOutcome::CompetingClaim {
+                stored_id: entry.entry_id.clone(),
+                competes_with: competitors,
+            })
+        }
+    }
+
+    /// Applies a lifecycle transition (`candidate → verified → trusted`,
+    /// any active → `obsolete`), recording it in the entry's bounded history
+    /// and bumping its version. Obsolete entries remain in the store.
+    pub fn transition_status(
+        &self,
+        scope_name: &str,
+        entry_id: &str,
+        to: MemoryStatus,
+        actor: &str,
+        reason: &str,
+    ) -> Result<(), MemoryStoreError> {
+        self.get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
+                name: scope_name.to_string(),
+            })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let row: Option<Option<String>> = tx
+            .query_row(
+                "SELECT meta FROM memory_entries WHERE scope = ?1 AND entry_id = ?2",
+                params![scope_name, entry_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(meta_json) = row else {
+            return Err(MemoryStoreError::UnknownEntry {
+                entry_id: entry_id.to_string(),
+            });
+        };
+        let mut meta: decentraai_agents::memory::MemoryMeta = meta_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let from = meta.status;
+        if !can_transition(from, to) {
+            return Err(MemoryStoreError::InvalidTransition {
+                entry_id: entry_id.to_string(),
+                from,
+                to,
+            });
+        }
+        meta.history.push(MemoryTransition {
+            from,
+            to,
+            actor: actor.to_string(),
+            reason: decentraai_agents::memory::bounded(reason.to_string()),
+            at_ms: now_ms(),
+        });
+        if meta.history.len() > MAX_HISTORY {
+            meta.history.drain(..meta.history.len() - MAX_HISTORY);
+        }
+        meta.status = to;
+        meta.version = meta.version.saturating_add(1);
+        tx.execute(
+            "UPDATE memory_entries SET meta = ?3 WHERE scope = ?1 AND entry_id = ?2",
+            params![
+                scope_name,
+                entry_id,
+                serde_json::to_string(&meta)
+                    .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Collects Training Lab candidates from every scope readable by
+    /// `reader_agent`: only VERIFIED/TRUSTED, evidence-backed generalizations
+    /// qualify. Explicit export — nothing here trains anything.
+    pub fn export_training_candidates(
+        &self,
+        reader_agent: &str,
+        trusted: bool,
+    ) -> Result<Vec<TrainingCandidate>, MemoryStoreError> {
+        let mut out = Vec::new();
+        for scope in self.list_scopes()? {
+            let entries = match self.read(&scope.name, reader_agent, trusted) {
+                Ok(e) => e,
+                Err(_) => continue, // inaccessible scopes are silently skipped
+            };
+            out.extend(training_candidates(&entries));
+        }
+        Ok(out)
     }
 
     /// Reads a scope's non-expired entries, newest-first
@@ -338,7 +623,7 @@ impl MemoryStore {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance
+            "SELECT entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, meta
              FROM memory_entries
              WHERE scope = ?1 AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)
              ORDER BY created_at_ms DESC, entry_id ASC",
@@ -405,10 +690,17 @@ fn scope_from_row(
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let tags_json: String = row.get(5)?;
     let provenance: Option<String> = row.get(8)?;
+    let meta_json: Option<String> = row.get(9)?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let provenance = provenance
         .as_deref()
         .and_then(|s| provenance_from_str(s).ok());
+    // Pre-M18 rows (meta NULL) deserialize to the conservative default:
+    // observation / candidate / v1 / no detail.
+    let meta = meta_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
     Ok(MemoryEntry {
         entry_id: row.get(0)?,
         scope: row.get(1)?,
@@ -419,6 +711,7 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         created_at_ms: row.get::<_, i64>(6)? as u64,
         expires_at_ms: row.get::<_, Option<i64>>(7)?.map(|ms| ms as u64),
         provenance,
+        meta,
     })
 }
 
@@ -751,5 +1044,143 @@ mod tests {
         assert!(got.policy.allow_remote_write);
         assert_eq!(got.policy.retention_secs, Some(7200));
         assert_eq!(got.policy, policy);
+    }
+
+    // ----- M18: collective-memory persistence -----
+
+    fn team_scope() -> MemoryScope {
+        let policy = MemoryPolicy::default().team().with_remote_write();
+        MemoryScope::new("team.knowledge", "governor", MemoryLevel::Team).with_policy(policy)
+    }
+
+    fn knowledge(id: &str, content: &str, subject: &str) -> MemoryEntry {
+        let mut e = MemoryEntry::new(id, "team.knowledge", "researcher", "node-1", content)
+            .with_subject(subject);
+        e.created_at_ms = 100;
+        e
+    }
+
+    #[test]
+    fn store_write_checked_dedups_and_links_conflicts() {
+        let store = store_in_memory();
+        store.register_scope(&team_scope()).unwrap();
+        store
+            .write_checked("team.knowledge", &knowledge("e1", "lesson A", "q:x"), "governor", true, false, false)
+            .unwrap();
+        // Exact duplicate → skipped.
+        let out = store
+            .write_checked("team.knowledge", &knowledge("e2", "lesson A", "q:x"), "governor", true, false, false)
+            .unwrap();
+        assert!(matches!(out, WriteOutcome::Duplicate { ref existing_id } if existing_id == "e1"));
+        // Different content, same subject → competing claim, linked both ways.
+        let out = store
+            .write_checked("team.knowledge", &knowledge("e3", "lesson B", "q:x"), "peer-2", false, true, false)
+            .unwrap();
+        let competes = match out {
+            WriteOutcome::CompetingClaim { competes_with, .. } => competes_with,
+            other => panic!("expected CompetingClaim, got {other:?}"),
+        };
+        assert_eq!(competes, vec!["e1".to_string()]);
+        let all = store.read("team.knowledge", "governor", true).unwrap();
+        assert_eq!(all.len(), 2, "both claims persisted");
+        let e1 = all.iter().find(|e| e.entry_id == "e1").unwrap();
+        assert!(e1.meta.competes_with.contains(&"e3".to_string()), "bidirectional link");
+    }
+
+    #[test]
+    fn store_transition_status_gates_and_persists() {
+        let store = store_in_memory();
+        store.register_scope(&team_scope()).unwrap();
+        store
+            .write_checked("team.knowledge", &knowledge("e1", "lesson", "q:t"), "governor", true, false, false)
+            .unwrap();
+        // Illegal jump rejected.
+        assert!(matches!(
+            store.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "gov", "skip"),
+            Err(MemoryStoreError::InvalidTransition { .. })
+        ));
+        // Legal path persists status + history.
+        store.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "verifier", "evidence checked").unwrap();
+        store.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "corroborator", "seen twice").unwrap();
+        let e = &store.read("team.knowledge", "governor", true).unwrap()[0];
+        assert_eq!(e.meta.status, MemoryStatus::Trusted);
+        assert_eq!(e.meta.version, 3);
+        assert_eq!(e.meta.history.len(), 2);
+        // Unknown entry.
+        assert!(matches!(
+            store.transition_status("team.knowledge", "ghost", MemoryStatus::Obsolete, "gov", "x"),
+            Err(MemoryStoreError::UnknownEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn store_exports_only_verified_evidenced_candidates() {
+        use decentraai_agents::memory::{KnowledgeKind, MemoryProvenance};
+        let store = store_in_memory();
+        store.register_scope(&team_scope()).unwrap();
+        // Verified + evidenced learning → exports.
+        let mut good = knowledge("g", "use backoff on 429", "q:backoff");
+        good.meta.kind = KnowledgeKind::Learning;
+        good.meta.detail = Some(
+            MemoryProvenance::new("execution", "r", "n1", 1, 90).with_evidence("aud-1"),
+        );
+        store.write_checked("team.knowledge", &good, "governor", true, false, false).unwrap();
+        store.transition_status("team.knowledge", "g", MemoryStatus::Verified, "v", "ok").unwrap();
+        // Candidate with evidence → does NOT export.
+        let mut cand = knowledge("c", "unverified hunch", "q:hunch");
+        cand.meta.kind = KnowledgeKind::Learning;
+        cand.meta.detail = Some(
+            MemoryProvenance::new("agent_reasoning", "r", "n1", 2, 50).with_evidence("aud-2"),
+        );
+        store.write_checked("team.knowledge", &cand, "governor", true, false, false).unwrap();
+        let got = store.export_training_candidates("governor", true).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].entry_id, "g");
+        assert_eq!(got[0].evidence_ref, "aud-1");
+    }
+
+    #[test]
+    fn pre_m18_database_migrates_and_legacy_rows_get_default_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        // Create a PRE-M18 schema by hand (no content_hash/meta columns).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memory_scopes (
+                    name TEXT PRIMARY KEY, owner_agent TEXT NOT NULL, level TEXT NOT NULL,
+                    policy TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+                 CREATE TABLE memory_entries (
+                    entry_id TEXT PRIMARY KEY, scope TEXT NOT NULL, author_agent TEXT NOT NULL,
+                    author_node TEXT NOT NULL, content TEXT NOT NULL, tags TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER, provenance TEXT);
+                 INSERT INTO memory_scopes VALUES ('notes','agent-a','agent','{}',0);
+                 INSERT INTO memory_entries (entry_id, scope, author_agent, author_node, content, tags, created_at_ms)
+                    VALUES ('old','notes','agent-a','n1','legacy content','[]',5);",
+            )
+            .unwrap();
+        }
+        // Opening with the new code migrates in place and preserves the row.
+        let store = MemoryStore::open(&db_path).unwrap();
+        let seen = store.read("notes", "agent-a", false).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].content, "legacy content");
+        assert_eq!(seen[0].meta, Default::default(), "legacy row → candidate/observation/v1");
+        // New collective path works on the migrated store.
+        store.register_scope(&team_scope()).unwrap();
+        let out = store
+            .write_checked("team.knowledge", &knowledge("m1", "fresh", "q:m"), "governor", true, false, false)
+            .unwrap();
+        assert_eq!(out, WriteOutcome::Stored);
+    }
+
+    #[test]
+    fn node_and_system_levels_round_trip() {
+        let store = store_in_memory();
+        for level in [MemoryLevel::Node, MemoryLevel::System] {
+            let name = format!("s-{level:?}").to_lowercase();
+            store.register_scope(&scope(&name, "governor", level)).unwrap();
+            assert_eq!(store.get_scope(&name).unwrap().unwrap().level, level);
+        }
     }
 }

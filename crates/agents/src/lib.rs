@@ -56,6 +56,7 @@ pub mod registry;
 pub mod reputation;
 pub mod retrieval;
 pub mod receipt;
+pub mod training_export;
 pub mod signed_receipt;
 pub mod selfopt;
 pub mod talent_tree;

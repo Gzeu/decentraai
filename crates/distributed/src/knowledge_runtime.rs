@@ -417,6 +417,7 @@ impl KnowledgeRuntime {
             created_at_ms: now_ms(),
             expires_at_ms: None,
             provenance: Some(decentraai_hub::capability::Provenance::Verified),
+            meta: Default::default(),
         };
         // The runtime is the scope owner → writer is owner, trusted, verified.
         store
