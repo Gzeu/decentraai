@@ -27,6 +27,7 @@ pub mod engine;
 pub mod evidence;
 #[cfg(test)]
 pub mod governance_invariants;
+pub mod multiversx_devnet;
 pub mod settlement;
 pub mod tokenomics;
 
