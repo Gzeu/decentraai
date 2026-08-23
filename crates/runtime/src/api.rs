@@ -347,6 +347,12 @@ pub struct ApiState {
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
     /// Optional collective memory store (persistent scopes/entries).
     memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
+    /// Model Colony registry (M-I): governance stages persist across
+    /// restarts via db/model_intel.json; shared with the intel/route/
+    /// governance handlers.
+    model_intel: Option<Arc<std::sync::RwLock<decentraai_hub::model_intel::ModelIntelRegistry>>>,
+    /// Path for the persisted registry (set at attach time).
+    model_intel_path: Option<PathBuf>,
     /// The P8 talent tree (capability graph), read-only for the dashboard.
     talent_tree: Option<Arc<decentraai_agents::TalentTree>>,
     /// Provider control plane (Model Fabric): external OpenAI-compatible
@@ -440,6 +446,8 @@ impl ApiState {
             embedding: None,
             retrieval: None,
             memory: None,
+            model_intel: None,
+            model_intel_path: None,
             talent_tree: None,
             providers: None,
             tts: Arc::new(TtsManager::disabled()),
@@ -617,6 +625,21 @@ impl ApiState {
         memory: Arc<decentraai_distributed::agent_memory::MemoryStore>,
     ) {
         self.memory = Some(memory);
+    }
+
+    /// Attaches the Model Colony registry backed by `path` (JSON). Loads an
+    /// existing file (governance stages survive restarts) or seeds the
+    /// initial colony on first boot.
+    pub fn attach_model_intel(&mut self, path: PathBuf) {
+        let registry = load_model_intel_registry(&path);
+        self.model_intel = Some(Arc::new(std::sync::RwLock::new(registry)));
+        self.model_intel_path = Some(path);
+    }
+
+    fn save_model_intel(&self, registry: &decentraai_hub::model_intel::ModelIntelRegistry) {
+        if let Some(path) = &self.model_intel_path {
+            save_model_intel_registry(path, registry);
+        }
     }
 
     /// Attaches the talent tree (capability graph) for the dashboard.
@@ -3534,6 +3557,39 @@ fn variant_quantization_from_file_name(file_name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod model_intel_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn registry_round_trips_through_disk_and_seeds_on_first_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_intel.json");
+
+        // First boot: no file → seeded colony with 3 experimental members.
+        let reg = load_model_intel_registry(&path);
+        assert_eq!(reg.len(), 3);
+        // File not yet written on load (write happens on transition).
+        assert!(!path.exists());
+
+        // Persist, then reload: identical membership and stages.
+        save_model_intel_registry(&path, &reg);
+        assert!(path.exists());
+        let reloaded = load_model_intel_registry(&path);
+        assert_eq!(reloaded.len(), 3);
+        for m in reg.all() {
+            let other = reloaded.get(&m.model_id).unwrap();
+            assert_eq!(other.governance, m.governance);
+            assert_eq!(other.capabilities.len(), m.capabilities.len());
+        }
+
+        // A corrupt file must never yield an empty registry — loud seed wins.
+        std::fs::write(&path, "{not json").unwrap();
+        let healed = load_model_intel_registry(&path);
+        assert_eq!(healed.len(), 3);
+    }
+}
+
+#[cfg(test)]
 fn worker_capability_verdict(
     adv: &decentraai_compute::ComputeAdvertisement,
     trusted: bool,
@@ -5056,6 +5112,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/memory/index", post(memory_index_handler))
         .route("/v1/models/intel", get(models_intel_handler))
         .route("/v1/models/route", post(models_route_handler))
+        .route("/v1/models/governance", post(models_governance_handler))
+        .route("/v1/bench/shadow", post(bench_shadow_handler))
         .route("/v1/memory/sync-to", post(memory_sync_to_handler))
         .route(
             "/v1/memory/training-candidates",
@@ -8534,6 +8592,45 @@ fn respond_lexical(
         .into_response()
 }
 
+/// Loads the colony registry from disk; seeds on first boot or corrupt file
+/// (loud seed default, never an empty registry).
+fn load_model_intel_registry(
+    path: &std::path::Path,
+) -> decentraai_hub::model_intel::ModelIntelRegistry {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_else(decentraai_hub::model_intel::seed_model_colony)
+}
+
+/// Atomic persistence: tmp write then rename (the repo's storage discipline).
+fn save_model_intel_registry(
+    path: &std::path::Path,
+    registry: &decentraai_hub::model_intel::ModelIntelRegistry,
+) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(registry) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Live RAM pressure percent 0..=100 from the real system probe (integer).
+fn ram_pressure_percent() -> u8 {
+    let snap = decentraai_system_probe::SystemSnapshot::collect();
+    if snap.total_memory_bytes == 0 {
+        return 0;
+    }
+    let used = snap
+        .total_memory_bytes
+        .saturating_sub(snap.available_memory_bytes);
+    ((used * 100) / snap.total_memory_bytes).min(100) as u8
+}
+
 /// GET /v1/models/intel — the Model Colony view (operator+): seeded
 /// registry facts (governance, claims, hardware) joined with runtime
 /// availability (which model is actually loaded) and VERIFIED performance
@@ -8543,10 +8640,18 @@ async fn models_intel_handler(State(state): State<ApiState>, headers: HeaderMap)
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
-    let registry = decentraai_hub::model_intel::seed_model_colony();
+    let Some(shared) = &state.model_intel else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "model intelligence not attached"})),
+        )
+            .into_response();
+    };
+    let registry_snapshot = shared.read().expect("model_intel lock").clone();
+    let pressure = ram_pressure_percent();
     let active = state.active_model.read().await.clone();
     let mut rows = Vec::new();
-    for record in registry.all() {
+    for record in registry_snapshot.all() {
         // Honest availability: we only KNOW about the loaded engine.
         let availability =
             if normalize_model_name(&active) == normalize_model_name(&record.model_id) {
@@ -8559,6 +8664,7 @@ async fn models_intel_handler(State(state): State<ApiState>, headers: HeaderMap)
         });
         let mut v = record.summary();
         v["availability"] = serde_json::json!(availability);
+        v["ram_pressure_percent"] = serde_json::json!(pressure);
         v["observed"] = match observed {
             Some(o) => serde_json::json!({
                 "samples": o.samples,
@@ -8655,11 +8761,20 @@ async fn models_route_handler(
         traffic,
     };
 
-    let registry = decentraai_hub::model_intel::seed_model_colony();
+    let Some(shared) = &state.model_intel else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "model intelligence not attached"})),
+        )
+            .into_response();
+    };
+    let registry = shared.read().expect("model_intel lock").clone();
+    let pressure = ram_pressure_percent();
     let active = state.active_model.read().await.clone();
-    let candidates: Vec<RoutedCandidate<'_>> = registry
-        .all()
-        .into_iter()
+    let candidates_owned: Vec<decentraai_hub::model_intel::ModelIntelRecord> =
+        registry.all().into_iter().cloned().collect();
+    let candidates: Vec<RoutedCandidate<'_>> = candidates_owned
+        .iter()
         .map(|record| {
             let availability =
                 if normalize_model_name(&active) == normalize_model_name(&record.model_id) {
@@ -8679,7 +8794,7 @@ async fn models_route_handler(
                     success_percent: o.success_percent.min(255) as u8,
                     mean_latency_ms: o.mean_latency_ms,
                 }),
-                ram_pressure_percent: 0, // dry-run projection; scheduler feeds live values at plan time
+                ram_pressure_percent: pressure,
             }
         })
         .collect();
@@ -8704,6 +8819,182 @@ async fn models_route_handler(
         "note": "dry-run projection — the deterministic planner still owns real placement",
     });
     (StatusCode::OK, axum::Json(payload)).into_response()
+}
+
+/// POST /v1/models/governance — apply a gated lifecycle transition to a
+/// colony model (operator+). Body: {"model_id":"…","to":"shadow"|"candidate"|
+/// "approved"|"rejected"}. The state machine validates the jump; the new
+/// stage persists to db/model_intel.json (tmp+rename); audited. This is the
+/// ONLY path from shadow recommendation to approved — evidence first,
+/// human decision second.
+async fn models_governance_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_hub::model_intel::GovernanceStage;
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(shared) = &state.model_intel else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "model intelligence not attached"})),
+        )
+            .into_response();
+    };
+    let Some(model_id) = body.0.get("model_id").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "model_id is required"})),
+        )
+            .into_response();
+    };
+    let Some(to_raw) = body.0.get("to").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "to (stage) is required"})),
+        )
+            .into_response();
+    };
+    let Ok(to) =
+        serde_json::from_value::<GovernanceStage>(serde_json::Value::String(to_raw.to_string()))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "invalid stage; expected experimental|shadow|candidate|approved|rejected"
+            })),
+        )
+            .into_response();
+    };
+    let mut registry = shared.write().expect("model_intel lock");
+    match registry.transition_governance(model_id, to) {
+        Ok(applied) => {
+            state.save_model_intel(&registry);
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "model_governance_transition",
+                serde_json::json!({ "model_id": model_id, "to": applied }),
+            );
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "ok": true, "model_id": model_id, "governance": applied,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/bench/shadow — run the Model Intelligence corpus through THIS
+/// node's loaded model and persist VERIFIED observations into Collective
+/// Memory (operator+). Body: {"limit"? ≤ 24}. The active model must be a
+/// registered colony member; observations carry the benchmark run id as
+/// their evidence reference.
+async fn bench_shadow_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_hub::model_intel::GovernanceStage;
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(bench) = &state.benchmark else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "benchmark manager not attached (no inference executor)"})),
+        ).into_response();
+    };
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    // The executing model is whatever this node actually serves.
+    let active_raw = state.active_model.read().await.clone();
+    let active_norm = normalize_model_name(&active_raw);
+    let shared = state.model_intel.as_ref();
+    let model_id = shared.and_then(|r| {
+        r.read()
+            .expect("model_intel lock")
+            .all()
+            .into_iter()
+            .map(|rec| rec.model_id.clone())
+            .find(|id| normalize_model_name(id) == active_norm)
+    });
+    let Some(model_id) = model_id else {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": format!("active model '{active_raw}' is not a registered colony member"),
+            })),
+        )
+            .into_response();
+    };
+    // Governance gate: benchmark traffic requires may_benchmark().
+    if let Some(reg) = shared {
+        let stage = reg
+            .read()
+            .expect("model_intel lock")
+            .get(&model_id)
+            .map(|m| m.governance);
+        if stage.is_some_and(|s| !s.may_benchmark()) {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "error": "model governance stage does not allow benchmarking"
+                })),
+            )
+                .into_response();
+        }
+    }
+    let _ = GovernanceStage::Experimental;
+    let limit = body
+        .0
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8)
+        .min(24) as usize;
+    match bench.run_intel_suite(memory, &model_id, limit).await {
+        Ok(report) => {
+            let summary =
+                decentraai_distributed::model_performance::aggregate_model(memory, &model_id).ok();
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "bench_shadow_suite",
+                serde_json::json!({
+                    "model_id": model_id,
+                    "attempted": report.attempted,
+                    "correct": report.correct,
+                    "recorded": report.recorded,
+                }),
+            );
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "report": report,
+                    "performance": summary,
+                    "advisory": true,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /v1/memory/sync-to — push a bounded batch of one scope's collective

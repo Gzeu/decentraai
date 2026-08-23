@@ -2498,6 +2498,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(store) = agent_memory_store.clone() {
             state.attach_memory(store);
         }
+        // Model Colony registry (M-I): governance stages persist across
+        // restarts; seeds the initial three candidates on first boot.
+        state.attach_model_intel(data_dir.join("db/model_intel.json"));
         // Memory-sync inbound (M19): accept collective-memory batches from
         // peers into scopes that EXPLICITLY opted in (access public +
         // allow_remote_write). Remote claims always land as Candidate —
