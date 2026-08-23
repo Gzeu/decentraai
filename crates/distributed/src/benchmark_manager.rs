@@ -28,6 +28,7 @@ use decentraai_agents::evidence::{EvidenceEntry, EvidenceFamily};
 
 use crate::agent_runtime::InferenceAgentExecutor;
 use crate::evidence_manager::EvidenceManager;
+use serde::{Deserialize, Serialize};
 
 /// Boxed future returned by [`BenchmarkInference::execute`] (avoids repeating
 /// the complex type in every implementation).
@@ -109,6 +110,16 @@ pub struct BenchmarkManager {
     evidence: Option<Arc<EvidenceManager>>,
     /// Next run counter for stable run ids.
     next_id: Mutex<u64>,
+}
+
+/// Outcome of one bounded Model Intelligence suite run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntelSuiteReport {
+    pub model_id: String,
+    pub attempted: u32,
+    pub correct: u32,
+    pub recorded: u32,
+    pub persist_errors: u32,
 }
 
 impl BenchmarkManager {
@@ -296,6 +307,50 @@ impl BenchmarkManager {
             }
         }
         runs
+    }
+    /// MODEL INTELLIGENCE suite (Model Colony): runs the bounded
+    /// model-intelligence corpus through this node's executor and persists
+    /// one VERIFIED observation per graded run into the collective-memory
+    /// `model.intel` scope. Evidence reference = the benchmark run id.
+    ///
+    /// Nothing here trains or promotes anything — this only produces the
+    /// verified facts the deterministic router and shadow comparison
+    /// consume.
+    pub async fn run_intel_suite(
+        &self,
+        store: &crate::agent_memory::MemoryStore,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<IntelSuiteReport> {
+        use crate::model_performance::{ExecutionObservation, record_observation};
+        let tasks = crate::benchmark_datasets::model_intelligence_tasks();
+        let mut report = IntelSuiteReport {
+            model_id: model_id.to_string(),
+            ..Default::default()
+        };
+        for task in tasks.iter().take(limit) {
+            let run = self.run_task(task, BenchmarkMode::Single, 1).await?;
+            report.attempted += 1;
+            let success = run.verdict == decentraai_agents::benchmark::BenchmarkVerdict::Correct;
+            if success {
+                report.correct += 1;
+            }
+            let obs = ExecutionObservation {
+                model_id: model_id.to_string(),
+                task_id: task.task_id.clone(),
+                success,
+                latency_ms: run.metrics.latency_ms,
+                evidence_ref: format!("bench:{}", run.run_id),
+            };
+            match record_observation(store, &obs) {
+                Ok(_) => report.recorded += 1,
+                Err(e) => {
+                    report.persist_errors += 1;
+                    tracing::warn!(error = %e, task = %task.task_id, "intel observation persist failed");
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// The registry snapshot.
