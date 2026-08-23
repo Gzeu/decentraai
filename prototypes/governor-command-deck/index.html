@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DecentraAI — Sentient Command Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+:root{
+  --void:#060708;--obsidian:#0a0c0f;--elev:#101318;--line:rgba(255,255,255,.07);
+  --text:#ecece8;--dim:#8f938e;--faint:#5e625d;
+  --intel:#5ce1d6;--health:#3dbe8c;--attention:#e0b15b;--research:#9b8cff;--warn:#e08a5b;
+  --accent:var(--intel);--energy:.28;--tempo:4.6s;
+}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--void);color:var(--text);
+  font:14px/1.45 "IBM Plex Sans",sans-serif;letter-spacing:.01em}
+button,input{font:inherit;color:inherit}button{background:none;border:0;padding:0;cursor:pointer}
+.mono{font-family:"IBM Plex Mono",monospace;letter-spacing:0}
+#app{min-height:100%;display:grid;grid-template-rows:auto auto 1fr auto;position:relative;overflow:hidden}
+#app::before{content:"";position:absolute;inset:0 0 auto 0;height:42vh;pointer-events:none;
+  background:radial-gradient(80% 70% at 50% -10%,color-mix(in srgb,var(--accent) calc(var(--energy)*28%),transparent),transparent 70%);opacity:.9;transition:background .6s}
+#app[data-state=IDLE]{--energy:.22;--tempo:4.8s;--accent:var(--intel)}
+#app[data-state=OBSERVING],#app[data-state=THINKING],#app[data-state=WAITING]{--energy:.45;--tempo:2.2s}
+#app[data-state=RESEARCHING]{--energy:.55;--tempo:1.8s;--accent:var(--research)}
+#app[data-state=USING_SKILL],#app[data-state=CALLING_MCP],#app[data-state=DELEGATING],#app[data-state=EXECUTING],#app[data-state=VERIFYING],#app[data-state=LEARNING],#app[data-state=COMPLETED]{--energy:.72;--tempo:1.15s}
+#app[data-state=WARNING]{--accent:var(--attention);--energy:.8}
+#app[data-state=INCIDENT]{--accent:var(--warn);--energy:1;--tempo:.9s}
+.top{display:flex;align-items:center;justify-content:space-between;padding:18px 28px 8px;position:relative;z-index:1}
+.brand{display:flex;align-items:center;gap:12px}
+.mark{width:14px;height:14px;border:1px solid color-mix(in srgb,var(--intel) 70%,transparent);transform:rotate(45deg);
+  animation:breathe var(--tempo) ease-in-out infinite;box-shadow:0 0 0 1px color-mix(in srgb,var(--intel) 12%,transparent)}
+.word{font-size:11px;letter-spacing:.22em;color:var(--dim);text-transform:uppercase}
+.word b{color:var(--text);font-weight:500}
+.state{font-size:11px;letter-spacing:.28em;color:var(--accent);text-transform:uppercase}
+.icon-btn{color:var(--dim);padding:6px 8px;font-size:12px;letter-spacing:.12em}
+.icon-btn:hover{color:var(--text)}
+.pulse{display:flex;flex-wrap:wrap;gap:18px 26px;padding:6px 28px 14px;border-bottom:1px solid var(--line);position:relative;z-index:1}
+.pulse button,.p{display:flex;flex-direction:column;gap:3px;text-align:left;min-width:72px}
+.k{font-size:10px;letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+.v{font-size:12px;color:var(--text)}.v.ok{color:var(--health)}.v.warn{color:var(--attention)}.v.intel{color:var(--intel)}
+.nav{display:flex;gap:28px;padding:0 28px;border-bottom:1px solid var(--line);position:relative;z-index:1}
+.nav button{padding:14px 0 12px;color:var(--faint);letter-spacing:.2em;font-size:11px;text-transform:uppercase;position:relative}
+.nav button.on{color:var(--text)}
+.nav button.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:var(--intel)}
+.stage{position:relative;z-index:1;overflow:auto;padding:28px 28px 40px}
+.transcript,.timeline{max-width:860px;margin:0 auto}
+.msg{margin:0 0 28px}.who{display:flex;justify-content:space-between;margin-bottom:8px}
+.who span{font-size:10px;letter-spacing:.2em;color:var(--faint);text-transform:uppercase}
+.who time{font-size:11px;color:var(--faint)}
+.body{font-size:15px;line-height:1.55;max-width:62ch}
+.user .body{color:var(--dim)}
+.caps{margin-top:12px;display:flex;flex-direction:column;gap:8px}
+.cap{border-left:1px solid var(--line);padding:8px 0 8px 14px;cursor:pointer}
+.cap:hover{border-color:color-mix(in srgb,var(--intel) 35%,transparent)}
+.cap-h{display:flex;gap:12px;align-items:baseline}
+.tag{font-size:10px;letter-spacing:.16em;color:var(--intel);text-transform:uppercase;min-width:92px}
+.tag.res{color:var(--research)}.tag.att{color:var(--attention)}.tag.ok{color:var(--health)}
+.cap-t{flex:1}.cap-m{color:var(--faint);font-size:11px}
+.cap-x{display:none;margin-top:8px;color:var(--dim);font-size:13px}
+.cap.open .cap-x{display:block}
+.spine{position:relative;margin:8px 0 0 8px;padding-left:22px}
+.spine::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:1px;background:var(--line)}
+.ev{position:relative;padding:0 0 22px 0;cursor:pointer}
+.ev::before{content:"";position:absolute;left:-26px;top:6px;width:7px;height:7px;border-radius:50%;
+  background:var(--void);border:1px solid var(--dim)}
+.ev.live::before{border-color:var(--intel);background:var(--intel);box-shadow:0 0 0 4px color-mix(in srgb,var(--intel) 16%,transparent)}
+.ev.done::before{border-color:var(--health)}
+.ev-h{display:flex;gap:14px;align-items:baseline}
+.ev-x{display:none;margin-top:8px;color:var(--dim);font-size:13px}
+.ev.open .ev-x{display:grid;gap:4px}
+.meta{display:grid;grid-template-columns:88px 1fr;gap:2px 10px;font-size:12px}
+.meta b{font-weight:400;color:var(--faint)}
+.composer{display:flex;gap:12px;align-items:center;padding:14px 28px 18px;border-top:1px solid var(--line);position:relative;z-index:1}
+.composer input{flex:1;background:transparent;border:0;outline:none;font-size:14px}
+.hint{padding:0 28px 10px;color:var(--faint);font-size:11px;letter-spacing:.04em}
+.drawer,.palette{position:fixed;inset:0;z-index:5;background:rgba(4,5,6,.46)}
+.panel{position:absolute;right:0;top:0;bottom:0;width:min(420px,100%);background:var(--obsidian);border-left:1px solid var(--line);
+  padding:28px;overflow:auto;transform:translateX(8px);animation:in .2s ease both}
+.palette .box{width:min(520px,92vw);margin:18vh auto 0;background:var(--obsidian);border:1px solid var(--line);padding:8px}
+.palette input{width:100%;background:transparent;border:0;outline:none;padding:12px 14px;font-size:15px}
+.cmd{display:flex;justify-content:space-between;width:100%;padding:10px 14px;color:var(--dim);text-align:left}
+.cmd:hover,.cmd.on{background:color-mix(in srgb,var(--intel) 8%,transparent);color:var(--text)}
+.rel{margin:0;padding:0;list-style:none}.rel li{padding:6px 0;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
+.h{font-size:11px;letter-spacing:.2em;color:var(--faint);text-transform:uppercase;margin:0 0 16px}
+.close{position:absolute;top:18px;right:18px;color:var(--dim)}
+@keyframes breathe{0%,100%{opacity:.35}50%{opacity:1}}
+@keyframes in{from{opacity:0}to{opacity:1}}
+@media (max-width:1100px){.pulse{gap:14px 18px}.stage{padding:20px}.panel{width:100%}}
+@media (max-width:820px){.top,.pulse,.nav,.composer,.hint{padding-left:16px;padding-right:16px}.k{display:none}}
+</style>
+</head>
+<body>
+<div id="app" data-state="IDLE">
+  <header class="top">
+    <div class="brand"><i class="mark"></i><div class="word"><b>DecentraAI</b> · Command Deck</div></div>
+    <div class="state" id="govState">IDLE</div>
+    <button class="icon-btn mono" id="cmdBtn" type="button">⌘K</button>
+  </header>
+  <div class="pulse" id="pulse"></div>
+  <nav class="nav">
+    <button type="button" data-surface="chat" class="on">Chat</button>
+    <button type="button" data-surface="execution">Execution</button>
+  </nav>
+  <main class="stage" id="stage"></main>
+  <div class="composer" id="composerWrap">
+    <input id="composer" placeholder="Instruct the Governor…" autocomplete="off" />
+    <button class="icon-btn" id="send" type="button">Send</button>
+  </div>
+  <div class="hint mono">1 chat · 2 execution · space pause · r replay · m memory · e evolution · esc</div>
+</div>
+<div class="drawer" id="drawer" hidden></div>
+<div class="palette" id="palette" hidden></div>
+<script>
+const STATES=["IDLE","OBSERVING","THINKING","RESEARCHING","USING_SKILL","CALLING_MCP","DELEGATING","EXECUTING","VERIFYING","LEARNING","WAITING","COMPLETED","WARNING","INCIDENT"];
+const MODELS={ "ox-alpha":"Ox Alpha", laguna:"Laguna", local:"Local" };
+const PROVIDERS={ hybrid:"LOCAL + COMMAND CODE", local:"LOCAL", "command-code":"COMMAND CODE" };
+const $ = (s,r=document)=>r.querySelector(s);
+const app=$("#app"), stage=$("#stage"), drawer=$("#drawer"), palette=$("#palette");
+const state={
+  governor:"IDLE", surface:"chat", provider:"hybrid", model:"ox-alpha",
+  inspector:null, palette:false, paletteQ:"", paletteI:0,
+  paused:false, running:false, step:-1, clock:0, selectedEvent:null,
+  workers:[
+    {id:"wrk_desktop_01",name:"Desktop",ok:true,lat:"1.82s"},
+    {id:"wrk_hub_02",name:"Hub",ok:true,lat:"0.41s"},
+    {id:"wrk_studio_03",name:"Studio",ok:true,lat:"0.66s"}
+  ],
+  messages:[], events:[], memories: seedMem(), gaps: seedGaps(), experiments: seedExp()
+};
+let timer=null, ticker=null;
+function seedMem(){return[
+  {id:"m1",type:"OBSERVATION",text:"Desktop prefill tail exceeds 1.6s under mixed batch.",conf:.86,rel:["wrk_desktop_01"]},
+  {id:"m2",type:"FACT",text:"Fabric health remains 3/3. Pressure is scheduling, not capacity.",conf:.93,rel:["fabric"]},
+  {id:"m3",type:"DECISION",text:"Diagnostic tasks on Desktop require deterministic ALLOW.",conf:.99,rel:["policy"]},
+  {id:"m4",type:"HYPOTHESIS",text:"Embedding runtime v2 reduces stall without quality loss.",conf:.71,rel:["gap-42"]},
+  {id:"m5",type:"LESSON",text:"Do not treat worker latency as provider failure.",conf:.88,rel:["m1"]},
+  {id:"m6",type:"EXPERIMENT",text:"v2 vs v1 throughput bench pending promotion.",conf:.64,rel:["exp-7"]}
+];}
+function seedGaps(){return[{id:"gap-42",title:"Embedding runtime optimization",research:4,status:"open"}];}
+function seedExp(){return[{id:"exp-7",title:"v2 vs v1",result:null,status:"idle"}];}
+function now(){return new Date().toLocaleTimeString([], {hour12:false,hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+function setGov(s){state.governor=s;app.dataset.state=s;$("#govState").textContent=s;}
+function addMsg(role,text,caps=[]){state.messages.push({id:"msg_"+state.messages.length,role,text,caps,t:now()});}
+function addEv(partial){const ev={id:"ex_0f3a"+String(state.events.length+1).padStart(2,"0"),open:false,live:true,done:false,elapsed:"0.0s",model:MODELS[state.model],...partial};state.events.push(ev);state.selectedEvent=ev.id;return ev;}
+function lastEv(patch){const ev=state.events[state.events.length-1];if(ev) Object.assign(ev,patch);}
+function renderPulse(){
+  const ok=state.workers.filter(w=>w.ok).length;
+  const incident=state.governor==="INCIDENT";
+  $("#pulse").innerHTML=`
+    <div class="p"><span class="k">Governor</span><span class="v intel">ONLINE</span></div>
+    <div class="p"><span class="k">Fabric</span><span class="v ${incident?"warn":"ok"}">${incident?"DEGRADED":"HEALTHY"}</span></div>
+    <button type="button" data-open="workers"><span class="k">Workers</span><span class="v mono">${ok} / 3</span></button>
+    <div class="p"><span class="k">Pressure</span><span class="v ${state.governor==="EXECUTING"?"warn":"ok"}">${state.governor==="EXECUTING"?"RISING":"LOW"}</span></div>
+    <div class="p"><span class="k">MCP</span><span class="v ok">HEALTHY</span></div>
+    <button type="button" data-open="providers"><span class="k">Providers</span><span class="v">${PROVIDERS[state.provider]}</span></button>
+    <button type="button" data-open="providers"><span class="k">Active model</span><span class="v mono">${MODELS[state.model]}</span></button>
+    <button type="button" data-open="evolution"><span class="k">Evolution</span><span class="v">${state.gaps[0].status==="proposed"?"proposal ready":"capability gaps"}</span></button>`;
+}
+function capHtml(c,i,mi){
+  const tag=c.kind==="PROPOSAL"||c.kind==="RESEARCH"?"res":c.kind==="RESULT"||c.kind==="VERIFICATION"?"ok":c.kind==="WARNING"?"att":"";
+  return `<div class="cap ${c.open?"open":""}" data-cap="${mi}:${i}">
+    <div class="cap-h"><span class="tag ${tag}">${c.kind}</span><span class="cap-t">${c.title}</span><span class="cap-m mono">${c.meta||""}</span></div>
+    <div class="cap-x">${c.detail||""}</div></div>`;
+}
+function renderChat(){
+  stage.innerHTML=`<div class="transcript">${state.messages.map((m,mi)=>`
+    <article class="msg ${m.role}">
+      <div class="who"><span>${m.role==="user"?"Operator":"Governor"}</span><time class="mono">${m.t}</time></div>
+      <div class="body">${m.text}</div>
+      ${m.caps?.length?`<div class="caps">${m.caps.map((c,i)=>capHtml(c,i,mi)).join("")}</div>`:""}
+    </article>`).join("")}</div>`;
+  stage.scrollTop=stage.scrollHeight;
+}
+function renderExec(){
+  if(!state.events.length){stage.innerHTML=`<div class="timeline"><p class="body" style="color:var(--dim)">No live execution. Replay the latency scenario from the palette.</p></div>`;return;}
+  stage.innerHTML=`<div class="timeline"><div class="who"><span>Governor</span><span class="mono">${state.events[0]?.id||""}</span></div>
+    <div class="spine">${state.events.map(ev=>`
+      <div class="ev ${ev.open?"open":""} ${ev.live?"live":""} ${ev.done?"done":""}" data-ev="${ev.id}">
+        <div class="ev-h"><span>${ev.title}</span><span class="cap-m mono">${ev.elapsed}</span></div>
+        <div class="ev-x">
+          <div class="meta">
+            <b>Operation</b><span>${ev.op||ev.title}</span>
+            <b>State</b><span class="mono">${ev.st||state.governor}</span>
+            <b>Elapsed</b><span class="mono">${ev.elapsed}</span>
+            <b>Model</b><span class="mono">${ev.model}</span>
+            <b>Skill</b><span class="mono">${ev.skill||"—"}</span>
+            <b>Tool</b><span class="mono">${ev.tool||"—"}</span>
+            <b>Worker</b><span class="mono">${ev.worker||"—"}</span>
+            <b>Result</b><span>${ev.result||"pending"}</span>
+            <b>Verify</b><span>${ev.verify||"—"}</span>
+          </div>
+        </div>
+      </div>`).join("")}</div></div>`;
+}
+function render(){
+  renderPulse();
+  $("#composerWrap").style.display=state.surface==="chat"?"flex":"none";
+  document.querySelectorAll("[data-surface]").forEach(b=>b.classList.toggle("on",b.dataset.surface===state.surface));
+  if(state.surface==="chat") renderChat(); else renderExec();
+  renderInspector(); renderPalette();
+}
+function renderInspector(){
+  if(!state.inspector){drawer.hidden=true;drawer.innerHTML="";return;}
+  drawer.hidden=false;
+  let html="";
+  if(state.inspector==="memory"){
+    html=`<h2 class="h">Memory</h2>${state.memories.map(m=>`<div class="cap open" style="margin-bottom:14px">
+      <div class="cap-h"><span class="tag">${m.type}</span><span class="cap-m mono">${Math.round(m.conf*100)}%</span></div>
+      <div class="cap-x">${m.text}<ul class="rel">${m.rel.map(r=>`<li class="mono">${r}</li>`).join("")}</ul></div></div>`).join("")}`;
+  } else if(state.inspector==="evolution"){
+    const g=state.gaps[0], e=state.experiments[0];
+    html=`<h2 class="h">Evolution</h2>
+      <p class="tag res">Capability gap #42</p><p>${g.title}</p>
+      <div class="meta" style="margin:16px 0">
+        <b>Research</b><span>${g.research} sources</span>
+        <b>Experiment</b><span>${e.title}</span>
+        <b>Result</b><span>${e.result||"pending"}</span>
+        <b>Status</b><span class="mono">${g.status}</span>
+      </div>
+      <p style="color:var(--dim)">This is skill evolution, not a ticket. A proposal is issued only after verification.</p>`;
+  } else if(state.inspector==="workers"){
+    html=`<h2 class="h">Workers</h2>${state.workers.map(w=>`<div class="cap open" style="margin-bottom:12px">
+      <div class="cap-h"><span>${w.name}</span><span class="cap-m mono">${w.id}</span></div>
+      <div class="cap-x">Latency ${w.lat} · ${w.ok?"healthy":"incident"}</div></div>`).join("")}`;
+  } else if(state.inspector==="providers"){
+    html=`<h2 class="h">Providers / models</h2>
+      <button class="cmd" data-cmd="prov:local">Local</button>
+      <button class="cmd" data-cmd="prov:command-code">Command Code</button>
+      <button class="cmd" data-cmd="prov:hybrid">Local + Command Code</button>
+      <button class="cmd" data-cmd="model:ox-alpha">Ox Alpha</button>
+      <button class="cmd" data-cmd="model:laguna">Laguna</button>
+      <button class="cmd" data-cmd="model:local">Local</button>`;
+  }
+  drawer.innerHTML=`<aside class="panel"><button class="close" data-close type="button">Close</button>${html}</aside>`;
+}
+const COMMANDS=[
+  ["Go to Chat","surf:chat"],["Go to Execution","surf:execution"],
+  ["Replay latency scenario","replay"],["Pause / resume","pause"],["Cancel execution","cancel"],
+  ["Provider: Local","prov:local"],["Provider: Command Code","prov:command-code"],["Provider: Hybrid","prov:hybrid"],
+  ["Model: Ox Alpha","model:ox-alpha"],["Model: Laguna","model:laguna"],["Model: Local","model:local"],
+  ["Inspect memory","insp:memory"],["Inspect evolution","insp:evolution"],["Inspect workers","insp:workers"],
+  ["Simulate incident","incident"]
+];
+function renderPalette(){
+  if(!state.palette){palette.hidden=true;palette.innerHTML="";return;}
+  const q=state.paletteQ.toLowerCase();
+  const items=COMMANDS.filter(c=>c[0].toLowerCase().includes(q));
+  state.paletteI=Math.max(0,Math.min(state.paletteI,items.length-1));
+  palette.hidden=false;
+  palette.innerHTML=`<div class="box"><input id="palInput" placeholder="Command the deck…" value="${state.paletteQ}" />
+    ${items.map((c,i)=>`<button class="cmd ${i===state.paletteI?"on":""}" data-cmd="${c[1]}" type="button"><span>${c[0]}</span><span class="mono" style="color:var(--faint)">${c[1]}</span></button>`).join("")}</div>`;
+  const inp=$("#palInput"); if(inp){inp.focus(); inp.selectionStart=inp.value.length;}
+}
+function runCmd(cmd){
+  state.palette=false;
+  if(cmd==="surf:chat") state.surface="chat";
+  else if(cmd==="surf:execution") state.surface="execution";
+  else if(cmd==="replay") startScenario();
+  else if(cmd==="pause") togglePause();
+  else if(cmd==="cancel") cancelRun();
+  else if(cmd.startsWith("prov:")) state.provider=cmd.slice(5);
+  else if(cmd.startsWith("model:")) state.model=cmd.slice(6);
+  else if(cmd.startsWith("insp:")) state.inspector=cmd.slice(5);
+  else if(cmd==="incident") simulateIncident();
+  render();
+}
+function simulateIncident(){
+  state.workers[0].ok=false; setGov("INCIDENT");
+  addMsg("gov","Desktop dropped heartbeats. Holding new delegations until fabric reports healthy.",[{
+    kind:"WARNING",title:"wrk_desktop_01 unreachable",meta:"incident",detail:"Restrained hold. No failover storm. Hub and Studio remain admitted.",open:false
+  }]);
+  render();
+}
+function togglePause(){if(!state.running) return; state.paused=!state.paused; if(state.paused) setGov("WAITING"); render();}
+function cancelRun(){
+  state.running=false; state.paused=false; state.step=99;
+  lastEv({live:false,done:false,result:"cancelled"});
+  setGov("WAITING");
+  addMsg("gov","Execution cancelled. Workers keep last verified state. I do not roll forward on a partial proposal.");
+  setTimeout(()=>{if(state.governor==="WAITING") setGov("IDLE"); render();},900);
+  render();
+}
+const SCENARIO=[
+  {d:500, run(){ setGov("OBSERVING"); addMsg("gov","Investigating elevated Desktop inference latency."); addEv({title:"Investigating latency",op:"observe fabric telemetry",st:"OBSERVING"}); }},
+  {d:1100, run(){ setGov("THINKING"); lastEv({live:false,done:true,elapsed:"0.8s"}); addMsg("gov","Tracing whether the stall is admission, prefill, or provider selection.",[{kind:"THINKING",title:"Compare Desktop tail vs Hub/Studio",meta:"0.9s",detail:"Hypothesis: local prefill on wrk_desktop_01, not a Command Code outage.",open:true}]); addEv({title:"Thinking through stall locus",st:"THINKING"}); }},
+  {d:1200, run(){ setGov("USING_SKILL"); lastEv({live:false,done:true,elapsed:"1.1s"}); addMsg("gov","Invoking a bounded diagnostic skill. I propose; Rust will decide whether it may run.",[{kind:"SKILL",title:"fabric-diagnostics",meta:"skill",detail:"Read-only probes. No weight mutation. No production traffic shift.",open:true}]); addEv({title:"Skill → diagnostics",skill:"fabric-diagnostics",st:"USING_SKILL"}); }},
+  {d:1000, run(){ setGov("CALLING_MCP"); lastEv({live:false,done:true,elapsed:"0.7s",result:"skill admitted"}); addMsg("gov","Calling MCP for live worker status.",[{kind:"MCP",title:"get_worker_status",meta:"mcp",detail:"Target wrk_desktop_01 · payload mock · no real transport.",open:true}]); addEv({title:"MCP → worker status",tool:"get_worker_status",st:"CALLING_MCP"}); }},
+  {d:1100, run(){ setGov("DELEGATING"); lastEv({live:false,done:true,elapsed:"0.6s",result:"Desktop 1.82s tail"}); addMsg("gov","Desktop is alive and admitted. Delegating a diagnostic task — after deterministic ALLOW.",[{kind:"DELEGATION",title:"Desktop → diagnostic task",meta:"wrk_desktop_01",detail:"Policy: ALLOW · bound 8s · workers execute; the Governor does not.",open:true}]); addEv({title:"Delegation → Desktop",worker:"wrk_desktop_01",st:"DELEGATING"}); }},
+  {d:1400, run(){ setGov("EXECUTING"); lastEv({live:false,done:true,elapsed:"0.4s"}); addEv({title:"Desktop executes diagnostic",worker:"wrk_desktop_01",skill:"fabric-diagnostics",st:"EXECUTING"}); }},
+  {d:1300, run(){ lastEv({live:false,done:true,elapsed:"1.8s",result:"Latency confirmed: 1.8s"}); addMsg("gov","Latency confirmed on Desktop prefill.",[{kind:"RESULT",title:"Latency confirmed: 1.8s",meta:"verify pending",detail:"p95 1.82s · queue 41ms · Hub 0.41s · Studio 0.66s",open:true}]); addEv({title:"Result captured",st:"COMPLETED",result:"1.8s prefill tail"}); }},
+  {d:900, run(){ setGov("VERIFYING"); lastEv({live:false,done:true,elapsed:"0.3s"}); addMsg("gov","Verifying the measurement against fabric telemetry.",[{kind:"VERIFICATION",title:"Independent corroboration",meta:"ok",detail:"Two observers agree. This is not a single-sample ghost.",open:false}]); addEv({title:"VERIFYING",st:"VERIFYING",verify:"corroborated"}); }},
+  {d:1100, run(){ setGov("RESEARCHING"); lastEv({live:false,done:true,elapsed:"0.8s",result:"verified"}); addMsg("gov","This is a capability gap, not an incident.",[{kind:"RESEARCH",title:"Embedding runtime optimization",meta:"gap #42",detail:"4 sources on kernel fusion and batching. Research, not a ticket.",open:true}]); state.gaps[0].status="research"; addEv({title:"Research capability gap #42",st:"RESEARCHING"}); }},
+  {d:1200, run(){ lastEv({live:false,done:true,elapsed:"1.0s"}); addMsg("gov","Opening a bounded experiment.",[{kind:"PROPOSAL",title:"Experiment v2 vs v1",meta:"exp-7",detail:"Compare embedding runtime v2 against v1 on Desktop only.",open:true}]); state.experiments[0].status="running"; addEv({title:"Benchmark",st:"EXECUTING",skill:"inference-benchmark"}); }},
+  {d:1300, run(){ lastEv({live:false,done:true,elapsed:"1.4s",result:"+18% throughput"}); state.experiments[0].result="+18% throughput"; addMsg("gov","v2 is faster on the stalled path.",[{kind:"RESULT",title:"+18% throughput",meta:"v2",detail:"Quality delta inside noise. Ready to propose, not to deploy.",open:true}]); addEv({title:"Benchmark complete",result:"+18% throughput"}); }},
+  {d:1000, run(){ setGov("LEARNING"); addMsg("gov","Proposal only. Deterministic Rust decides promotion.",[{kind:"PROPOSAL",title:"Promote skill v2",meta:"awaiting Rust",detail:"I do not ship skills. Policy engine must ALLOW promotion.",open:true},{kind:"MEMORY",title:"Lesson written",meta:"0.88",detail:"Worker latency is not a provider failure.",open:false}]); state.gaps[0].status="proposed"; addEv({title:"Proposal → promote skill v2",st:"LEARNING",verify:"policy ALLOW (sim)"}); }},
+  {d:900, run(){ lastEv({live:false,done:true,elapsed:"0.5s",result:"ALLOW recorded"}); setGov("COMPLETED"); state.running=false; addMsg("gov","Policy ALLOW recorded in simulation. Skill v2 is proposed, not merged. Fabric stays on v1 until a real governor loop exists."); }}
+];
+function startScenario(){
+  state.running=true; state.paused=false; state.step=-1; state.clock=0;
+  state.events=[]; state.messages=state.messages.filter(m=>m.keep);
+  state.workers[0].ok=true; state.gaps[0].status="open"; state.experiments[0].result=null;
+  addMsg("user","Desktop inference feels slow. Check the fabric.");
+  setGov("IDLE"); render(); advance();
+}
+function advance(){
+  if(!state.running||state.paused) return;
+  state.step++;
+  const step=SCENARIO[state.step];
+  if(!step){state.running=false; setTimeout(()=>{if(state.governor==="COMPLETED") setGov("IDLE"); render();},1600); return;}
+  step.run(); render();
+  timer=setTimeout(advance, step.d);
+}
+function sendText(){
+  const input=$("#composer"); const t=input.value.trim(); if(!t) return; input.value="";
+  addMsg("user",t);
+  const l=t.toLowerCase();
+  if(/latenc|slow|desktop|worker/.test(l)) startScenario();
+  else if(/memory|remember/.test(l)){ setGov("THINKING"); addMsg("gov","Opening the memory inspector. These are typed residues, not a graph."); state.inspector="memory"; setTimeout(()=>{setGov("IDLE");render();},700);}
+  else if(/evolv|skill|gap/.test(l)){ state.inspector="evolution"; addMsg("gov","Capability gap #42 is the live evolutionary thread."); }
+  else if(/incident|down/.test(l)) simulateIncident();
+  else { setGov("THINKING"); addMsg("gov","Noted. I can observe, propose, and delegate. I will not mutate fabric without a deterministic decision.",[{kind:"THINKING",title:"Stay inside the contract",detail:"AI proposes → deterministic Rust decides → workers execute.",open:true}]); setTimeout(()=>{setGov("IDLE");render();},800);} 
+  render();
+}
+document.addEventListener("click",e=>{
+  const t=e.target.closest("[data-surface],[data-open],[data-cap],[data-ev],[data-cmd],[data-close],#cmdBtn,#send");
+  if(!t) return;
+  if(t.id==="cmdBtn"){state.palette=true;state.paletteQ="";state.paletteI=0;render();return;}
+  if(t.id==="send"){sendText();return;}
+  if(t.dataset.surface){state.surface=t.dataset.surface;render();return;}
+  if(t.dataset.open){state.inspector=t.dataset.open;render();return;}
+  if(t.dataset.cap){const [mi,i]=t.dataset.cap.split(":").map(Number); const c=state.messages[mi].caps[i]; c.open=!c.open;render();return;}
+  if(t.dataset.ev){const ev=state.events.find(x=>x.id===t.dataset.ev); ev.open=!ev.open; state.selectedEvent=ev.id;render();return;}
+  if(t.dataset.cmd){runCmd(t.dataset.cmd);return;}
+  if(t.hasAttribute("data-close")){state.inspector=null;render();}
+});
+drawer.addEventListener("click",e=>{if(e.target===drawer){state.inspector=null;render();}});
+palette.addEventListener("click",e=>{if(e.target===palette){state.palette=false;render();}});
+palette.addEventListener("input",e=>{if(e.target.id==="palInput"){state.paletteQ=e.target.value;render();}});
+$("#composer").addEventListener("keydown",e=>{if(e.key==="Enter") sendText();});
+document.addEventListener("keydown",e=>{
+  const typing=e.target.matches("input");
+  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){e.preventDefault();state.palette=!state.palette;state.paletteQ="";render();return;}
+  if(e.key==="Escape"){state.palette=false;state.inspector=null;render();return;}
+  if(state.palette && !typing || (state.palette && e.target.id==="palInput")){
+    const items=COMMANDS.filter(c=>c[0].toLowerCase().includes(state.paletteQ.toLowerCase()));
+    if(e.key==="ArrowDown"){e.preventDefault();state.paletteI++;render();}
+    if(e.key==="ArrowUp"){e.preventDefault();state.paletteI--;render();}
+    if(e.key==="Enter"){e.preventDefault(); if(items[state.paletteI]) runCmd(items[state.paletteI][1]);}
+    if(e.target.id==="palInput") return;
+  }
+  if(typing) return;
+  if(e.key==="1"){state.surface="chat";render();}
+  if(e.key==="2"){state.surface="execution";render();}
+  if(e.key===" " ){e.preventDefault();togglePause();}
+  if(e.key.toLowerCase()==="r") startScenario();
+  if(e.key.toLowerCase()==="m"){state.inspector="memory";render();}
+  if(e.key.toLowerCase()==="e"){state.inspector="evolution";render();}
+  if(e.key.toLowerCase()==="p") togglePause();
+  if(e.key==="["||e.key==="]"){
+    if(!state.events.length) return;
+    const ids=state.events.map(x=>x.id);
+    let i=Math.max(0,ids.indexOf(state.selectedEvent));
+    i=e.key==="["?Math.max(0,i-1):Math.min(ids.length-1,i+1);
+    state.events.forEach(ev=>{ev.open=ev.id===ids[i];}); state.selectedEvent=ids[i]; state.surface="execution"; render();
+  }
+});
+setInterval(()=>{
+  if(!state.running||state.paused) return;
+  state.clock+=0.1;
+  const ev=state.events.find(x=>x.live);
+  if(ev){ev.elapsed=(parseFloat(ev.elapsed)+0.1).toFixed(1)+"s"; if(state.surface==="execution") renderExec();}
+},100);
+addMsg("gov","Governor online. Fabric healthy. I observe, propose, and wait for deterministic Rust before anyone executes.");
+state.messages[0].keep=true;
+render();
+setTimeout(startScenario,700);
+</script>
+</body>
+</html>
