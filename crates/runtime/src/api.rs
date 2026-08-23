@@ -5042,6 +5042,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/compute", get(compute_handler))
         .route("/v1/agents", get(agents_handler))
         .route("/v1/agents/onboard", post(agents_onboard_handler))
+        .route("/v1/agents/workflow", post(collective_workflow_handler))
         .route("/v1/agents/capabilities", get(agents_capabilities_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/intel/plan", post(intel_plan_handler))
@@ -7679,6 +7680,157 @@ async fn intel_assist_handler(
         })),
     )
         .into_response()
+}
+
+/// POST /v1/agents/workflow — Collective Orchestration (M17.1).
+/// Accepts a workflow definition (stages + dependencies) and executes it
+/// across the fabric using the existing DFCP/Sharing is Caring infrastructure.
+/// Each stage produces evidence; workers receive credit on verified success.
+async fn collective_workflow_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(p2p) = state.p2p.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "p2p not attached"})),
+        )
+            .into_response();
+    };
+    let intent = body.0.get("intent").and_then(|v| v.as_str()).unwrap_or("collective_task").to_string();
+    let stages_val = match body.0.get("stages").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "field `stages` (array) is required"})),
+        ).into_response(),
+    };
+
+    // Build ProposedStages from the JSON input
+    use decentraai_agents::collective_bridge::ProposedStage;
+    let proposed: Vec<ProposedStage> = stages_val.iter().map(|s| {
+        ProposedStage {
+            capability: s.get("capability").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+            prompt: s.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+            depends_on: s.get("depends_on").and_then(|d| d.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|y| y.to_string())).collect())
+                .unwrap_or_default(),
+        }
+    }).collect();
+
+    // Build and validate the DAG
+    let dag = match decentraai_agents::collective_bridge::task_plan_to_dag(
+        &format!("wf-{}", now_nanos()), &intent, &proposed,
+    ) {
+        Ok(d) => d,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": format!("invalid DAG: {e}")})),
+        ).into_response(),
+    };
+
+    // Execute stages in topological order via the existing assist flow
+    let _token = read_governor_token();
+    let mut stage_results = serde_json::Map::new();
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_success = true;
+    let started = std::time::Instant::now();
+
+    // Topological execution: repeatedly find ready stages, execute them.
+    let total_stages = dag.stages.len();
+    let mut executed_count = 0;
+
+    while executed_count < total_stages {
+        let mut progressed = false;
+        for stage in &dag.stages {
+            if completed.contains(&stage.stage_id) {
+                continue;
+            }
+            if !stage.depends_on.iter().all(|d| completed.contains(d)) {
+                continue;
+            }
+
+            // Build the prompt from dependencies' outputs
+            let mut prompt_text = stage.prompt.clone();
+            for dep in &stage.depends_on {
+                if let Some(prev) = stage_results.get(dep) {
+                    prompt_text += &format!("\n\nPrevious result ({}): {}", dep, prev);
+                }
+            }
+
+            tracing::info!(stage = %stage.stage_id, capability = %stage.capability, "executing collective stage");
+
+            // Use the existing assist path
+            let peers = p2p.connected_peers().await;
+            if peers.is_empty() {
+                stage_results.insert(stage.stage_id.clone(), serde_json::json!({"error": "no connected peers"}));
+                all_success = false;
+                executed_count += 1;
+                continue;
+            }
+
+            let payload = serde_json::json!({
+                "messages": [{"role": "user", "content": prompt_text}],
+                "max_tokens": 300,
+            });
+            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            let request = decentraai_compute::assist::AssistRequest {
+                capability: stage.capability.clone(),
+                cpu_cores: 2,
+                ram_mb: 512,
+            };
+            let lease = stage.lease_seconds.min(120);
+
+            let outcome = crate::intel_assist::run_assist_request(
+                &p2p, peers, request, payload_bytes, lease,
+            ).await;
+
+            if outcome.0 {
+                stage_results.insert(stage.stage_id.clone(), serde_json::from_slice(&outcome.1).unwrap_or(serde_json::Value::Null));
+                completed.insert(stage.stage_id.clone());
+                tracing::info!(stage = %stage.stage_id, "collective stage completed");
+            } else {
+                stage_results.insert(stage.stage_id.clone(), serde_json::json!({"error": outcome.2}));
+                all_success = false;
+                executed_count += 1;
+            }
+            progressed = true;
+        }
+        if !progressed && executed_count < total_stages {
+            // Deadlock — no ready stages but not all done
+            all_success = false;
+            break;
+        }
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "workflow_id": dag.workflow_id,
+            "intent": dag.intent,
+            "success": all_success,
+            "elapsed_ms": elapsed_ms,
+            "stages_completed": completed.len(),
+            "stages_total": total_stages,
+            "results": stage_results,
+        })),
+    ).into_response()
+}
+
+fn read_governor_token() -> String {
+    std::env::var("DECENTRAAI_TOKEN").unwrap_or_default()
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// POST /v1/agents/onboard — Agent Gateway (M16 BYOA).
