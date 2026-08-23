@@ -229,6 +229,87 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// MODEL INTELLIGENCE → ECONOMICS bridge (Phase 9).
+///
+/// Converts a verified model observation into deterministic economic facts.
+/// Honesty rules:
+/// - only SUCCESSFUL observations with an evidence reference map to
+///   `Verified` facts (payable);
+/// - failed executions map to `Invalid` — they pay exactly zero but remain
+///   recorded history;
+/// - quality/reliability/baselines/scarcity/difficulty come from the
+///   CALLER's policy inputs, never invented here.
+///
+/// This function NEVER awards anything: producing facts is not paying.
+#[must_use]
+pub fn observation_to_economic_facts(
+    obs: &ExecutionObservation,
+    quality_percent: u8,
+    reliability_percent: u8,
+    baseline_latency_ms: u64,
+    scarcity_bps: u64,
+    difficulty_bps: u64,
+) -> decentraai_economy::contribution::ContributionFacts {
+    use decentraai_economy::contribution::{ContributionFacts, VerificationStatus};
+    let verified = obs.success && !obs.evidence_ref.trim().is_empty();
+    ContributionFacts {
+        worker_id: format!("model:{}", obs.model_id),
+        verified_units: u64::from(verified),
+        quality_percent,
+        reliability_percent,
+        latency_ms: obs.latency_ms,
+        baseline_latency_ms,
+        resource_bytes: 0, // resource accounting lands with real deployments
+        efficiency_index_x100: 100,
+        scarcity_bps,
+        difficulty_bps,
+        verification: if verified {
+            VerificationStatus::Verified
+        } else {
+            VerificationStatus::Invalid
+        },
+        evidence_ref: obs.evidence_ref.clone(),
+        verifier_id: "benchmark-verifier".into(),
+    }
+}
+
+#[cfg(test)]
+mod econ_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn successful_observation_maps_to_payable_facts_and_failures_pay_zero() {
+        use decentraai_economy::contribution::{VerificationStatus, compute_award};
+        let good = ExecutionObservation {
+            model_id: "qwen3-1.7b-q4".into(),
+            task_id: "mi_dfcp_order".into(),
+            success: true,
+            latency_ms: 800,
+            evidence_ref: "bench:single:mi_dfcp_order:0".into(),
+        };
+        let f = observation_to_economic_facts(&good, 90, 95, 1000, 15_000, 20_000);
+        assert_eq!(f.verification, VerificationStatus::Verified);
+        assert_eq!(f.worker_id, "model:qwen3-1.7b-q4");
+        let award = compute_award(&f);
+        assert!(award.micro_cu > 0, "verified success is payable");
+
+        let failed = ExecutionObservation {
+            success: false,
+            ..good.clone()
+        };
+        let f2 = observation_to_economic_facts(&failed, 90, 95, 1000, 15_000, 20_000);
+        assert_eq!(compute_award(&f2).micro_cu, 0, "failures pay exactly zero");
+
+        let no_evidence = ExecutionObservation {
+            success: true,
+            evidence_ref: String::new(),
+            ..good
+        };
+        let f3 = observation_to_economic_facts(&no_evidence, 90, 95, 1000, 15_000, 20_000);
+        assert_eq!(compute_award(&f3).micro_cu, 0, "no evidence → no money");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

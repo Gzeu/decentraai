@@ -1,0 +1,56 @@
+{
+  "config": "configs/economy/example-params.json",
+  "generator": "cargo run -p decentraai-economy --example simulate -- <config> <nodes> <avg_award>",
+  "reproducible": true,
+  "assumptions": [
+    "integer micro-CU math; identical inputs produce identical bytes",
+    "fixed per-node average award per epoch (varied only in configs)",
+    "sustainability = pool never negative + supply never exceeded + min reward payable every epoch"
+  ],
+  "unresolved_economic_decisions": [
+    "final supply/emission numbers",
+    "final allocation split",
+    "fee and burn levels",
+    "slashing enforcement policy",
+    "collusion detection heuristics",
+    "epoch length in real time",
+    "whether example params are ever promoted beyond simulation"
+  ],
+  "scenarios": [
+    {
+      "nodes": 10,
+      "sustainable": true,
+      "total_emitted_micro_cu": 450000000000000,
+      "total_burned_micro_cu": 288,
+      "failure_reason": null
+    },
+    {
+      "nodes": 100,
+      "sustainable": true,
+      "total_emitted_micro_cu": 450000000000000,
+      "total_burned_micro_cu": 288,
+      "failure_reason": null
+    },
+    {
+      "nodes": 1000,
+      "sustainable": true,
+      "total_emitted_micro_cu": 450000000000000,
+      "total_burned_micro_cu": 288,
+      "failure_reason": null
+    },
+    {
+      "nodes": 10000,
+      "sustainable": true,
+      "total_emitted_micro_cu": 450000000000000,
+      "total_burned_micro_cu": 288,
+      "failure_reason": null
+    },
+    {
+      "nodes": 100000,
+      "sustainable": true,
+      "total_emitted_micro_cu": 450000000000000,
+      "total_burned_micro_cu": 288,
+      "failure_reason": null
+    }
+  ]
+}

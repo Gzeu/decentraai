@@ -34,6 +34,7 @@ decentraai-hub = { path = "../hub" }
 decentraai-identity = { path = "../identity" }
 decentraai-protocol = { path = "../protocol" }
 decentraai-p2p = { path = "../p2p" }
+decentraai-economy = { path = "../economy" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-system-probe = { path = "../system-probe" }
 decentraai-registry = { path = "../registry" }

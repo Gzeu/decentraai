@@ -15,9 +15,7 @@
 //!
 //! No LLM decides anything here: inputs are facts + the pure formula.
 
-use crate::contribution::{
-    compute_award, ContributionFacts, VerificationStatus, AwardOutcome,
-};
+use crate::contribution::{AwardOutcome, ContributionFacts, VerificationStatus, compute_award};
 use serde::{Deserialize, Serialize};
 
 /// One worker's economic account, in micro-CU.
@@ -76,15 +74,15 @@ impl RewardEngine {
     }
 
     pub fn total_awarded_micro_cu(&self) -> u64 {
-        self.accounts.values().map(|a| a.gross_earned_micro_cu).sum()
+        self.accounts
+            .values()
+            .map(|a| a.gross_earned_micro_cu)
+            .sum()
     }
 
     /// Awards one verified contribution. Non-verified facts pay 0 and are
     /// recorded as a zero-award mutation (the gate is visible in audit).
-    pub fn award(
-        &mut self,
-        facts: &ContributionFacts,
-    ) -> Result<Mutation, crate::EconomyError> {
+    pub fn award(&mut self, facts: &ContributionFacts) -> Result<Mutation, crate::EconomyError> {
         // ANTI-GAMING GATES (cheapest rejections first).
         // 1. Nobody verifies their own work — kills self-verification.
         if facts.verifier_id == facts.worker_id {
@@ -112,7 +110,10 @@ impl RewardEngine {
         let acc = self
             .accounts
             .entry(facts.worker_id.clone())
-            .or_insert_with(|| Account { worker_id: facts.worker_id.clone(), ..Default::default() });
+            .or_insert_with(|| Account {
+                worker_id: facts.worker_id.clone(),
+                ..Default::default()
+            });
         acc.balance_micro_cu = acc.balance_micro_cu.saturating_add(outcome.micro_cu);
         acc.gross_earned_micro_cu = acc.gross_earned_micro_cu.saturating_add(outcome.micro_cu);
         Ok(Mutation {
@@ -134,7 +135,10 @@ impl RewardEngine {
         let acc = self
             .accounts
             .entry(worker_id.to_string())
-            .or_insert_with(|| Account { worker_id: worker_id.to_string(), ..Default::default() });
+            .or_insert_with(|| Account {
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
         let applied = micro_cu.min(acc.balance_micro_cu);
         acc.balance_micro_cu -= applied;
         acc.reversed_micro_cu += applied;
@@ -148,11 +152,19 @@ impl RewardEngine {
 
     /// Applies a bounded penalty: at most [`MAX_PENALTY_PERCENT`] % of the
     /// CURRENT balance, regardless of the requested amount or reason.
-    pub fn penalize_bounded(&mut self, worker_id: &str, requested_micro_cu: u64, reason: &str) -> Mutation {
+    pub fn penalize_bounded(
+        &mut self,
+        worker_id: &str,
+        requested_micro_cu: u64,
+        reason: &str,
+    ) -> Mutation {
         let acc = self
             .accounts
             .entry(worker_id.to_string())
-            .or_insert_with(|| Account { worker_id: worker_id.to_string(), ..Default::default() });
+            .or_insert_with(|| Account {
+                worker_id: worker_id.to_string(),
+                ..Default::default()
+            });
         let cap = acc.balance_micro_cu * MAX_PENALTY_PERCENT / 100;
         let applied = requested_micro_cu.min(cap);
         acc.balance_micro_cu -= applied;
@@ -164,7 +176,6 @@ impl RewardEngine {
             reason: reason.to_string(),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -256,7 +267,10 @@ mod tests {
         let mut e = RewardEngine::new();
         let mut expected = 0u64;
         for i in 0..10 {
-            expected += e.award(&facts(&format!("sybil-{i}"), &format!("ev-{i}"))).unwrap().micro_cu;
+            expected += e
+                .award(&facts(&format!("sybil-{i}"), &format!("ev-{i}")))
+                .unwrap()
+                .micro_cu;
         }
         assert_eq!(e.total_awarded_micro_cu(), expected);
     }

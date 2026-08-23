@@ -1,0 +1,25 @@
+{
+  "total_supply_micro_cu": 1000000000000000,
+  "epochs": 48,
+  "schedule": {
+    "halving": {
+      "halving_every_epochs": 12
+    }
+  },
+  "initial_emission_bps_of_supply": 200,
+  "allocations": {
+    "contributors_bps": 6000,
+    "validators_bps": 2000,
+    "development_bps": 1000,
+    "treasury_bps": 1000
+  },
+  "network_fee_bps": 300,
+  "burn_bps_of_fee": 2500,
+  "vesting_epochs": 6,
+  "slashing": {
+    "enabled": true,
+    "max_bps_per_epoch": 500
+  },
+  "min_reward_micro_cu": 500,
+  "max_reward_micro_cu": 40000
+}

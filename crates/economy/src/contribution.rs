@@ -108,17 +108,23 @@ pub fn micro_cu_v2(facts: &ContributionFacts) -> u128 {
     if facts.verification != VerificationStatus::Verified || facts.verified_units == 0 {
         return 0;
     }
-    let mut v: u128 =
-        u128::from(BASE_MICRO_CU_PER_UNIT) * u128::from(facts.verified_units);
+    let mut v: u128 = u128::from(BASE_MICRO_CU_PER_UNIT) * u128::from(facts.verified_units);
 
     let apply = |v: u128, bps: u64| -> u128 { v * u128::from(bps) / u128::from(super::BPS) };
 
     // Quality: percent → bps (clamped band).
-    v = apply(v, ContributionFacts::clamp_pct(facts.quality_percent, QUALITY_MIN_PCT, QUALITY_MAX_PCT));
+    v = apply(
+        v,
+        ContributionFacts::clamp_pct(facts.quality_percent, QUALITY_MIN_PCT, QUALITY_MAX_PCT),
+    );
     // Reliability.
     v = apply(
         v,
-        ContributionFacts::clamp_pct(facts.reliability_percent, RELIABILITY_MIN_PCT, RELIABILITY_MAX_PCT),
+        ContributionFacts::clamp_pct(
+            facts.reliability_percent,
+            RELIABILITY_MIN_PCT,
+            RELIABILITY_MAX_PCT,
+        ),
     );
     // Latency vs baseline: ratio baseline/actual ×10000, clamped band.
     let lat_bps = if facts.latency_ms == 0 {
@@ -132,9 +138,12 @@ pub fn micro_cu_v2(facts: &ContributionFacts) -> u128 {
     v = apply(v, lat_bps);
     // Resource efficiency (pre-computed index ×100 fixed point; u128 keeps
     // hostile inputs from overflowing before the band clamp).
-    let eff_bps = ((u128::from(facts.efficiency_index_x100) * 100)
-        .min(u128::from(u64::MAX))) as u64;
-    v = apply(v, clamp_bps(eff_bps, EFFICIENCY_MIN_BPS, EFFICIENCY_MAX_BPS));
+    let eff_bps =
+        ((u128::from(facts.efficiency_index_x100) * 100).min(u128::from(u64::MAX))) as u64;
+    v = apply(
+        v,
+        clamp_bps(eff_bps, EFFICIENCY_MIN_BPS, EFFICIENCY_MAX_BPS),
+    );
     // Capability scarcity and task difficulty: policy inputs, bounded here.
     v = apply(v, clamp_bps(facts.scarcity_bps, 10_000, 30_000));
     v = apply(v, clamp_bps(facts.difficulty_bps, 10_000, 50_000));
@@ -165,10 +174,18 @@ pub struct AwardOutcome {
 /// Entry point used by engines/ledgers: version-tagged, explained.
 pub fn compute_award(facts: &ContributionFacts) -> AwardOutcome {
     if facts.verification != VerificationStatus::Verified {
-        return AwardOutcome { micro_cu: 0, zero_reason: Some(ZeroReason::NotVerified), version: super::ECONOMICS_VERSION };
+        return AwardOutcome {
+            micro_cu: 0,
+            zero_reason: Some(ZeroReason::NotVerified),
+            version: super::ECONOMICS_VERSION,
+        };
     }
     if facts.verified_units == 0 {
-        return AwardOutcome { micro_cu: 0, zero_reason: Some(ZeroReason::NoWork), version: super::ECONOMICS_VERSION };
+        return AwardOutcome {
+            micro_cu: 0,
+            zero_reason: Some(ZeroReason::NoWork),
+            version: super::ECONOMICS_VERSION,
+        };
     }
     AwardOutcome {
         micro_cu: u64::try_from(micro_cu_v2(facts)).unwrap_or(u64::MAX),

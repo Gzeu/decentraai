@@ -24,6 +24,11 @@
 
 pub mod contribution;
 pub mod engine;
+pub mod evidence;
+#[cfg(test)]
+pub mod governance_invariants;
+pub mod settlement;
+pub mod tokenomics;
 
 use thiserror::Error;
 
@@ -39,7 +44,10 @@ pub enum EconomyError {
     #[error("self-verification rejected: worker '{worker_id}' cannot verify its own work")]
     SelfVerification { worker_id: String },
     #[error("duplicate evidence '{evidence_ref}' for worker '{worker_id}' — replay rejected")]
-    DuplicateEvidence { worker_id: String, evidence_ref: String },
+    DuplicateEvidence {
+        worker_id: String,
+        evidence_ref: String,
+    },
 }
 
 /// Version of the Contribution Unit formula. Bump on ANY weight/rule change;
