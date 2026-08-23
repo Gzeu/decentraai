@@ -51,6 +51,11 @@ pub struct TrainingCandidate {
     pub created_at_ms: u64,
     /// Source entry version at export time.
     pub version: u32,
+    /// Content of the VERIFIED failure this solution resolved (same
+    /// subject key), when one exists. Problem+solution pairs are a far
+    /// richer training signal than solutions alone; absent = standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_failure: Option<String>,
 }
 
 impl TrainingCandidate {
@@ -85,7 +90,28 @@ fn exportable_kind(kind: KnowledgeKind) -> bool {
 /// evidence-backed (explicit evidence reference present), an exportable
 /// knowledge kind, and non-empty content. Input order is preserved so the
 /// export is reproducible from the same memory state.
+///
+/// Failure→Solution pairing (M19): a VERIFIED, evidenced `failure` entry is
+/// matched to later verified `solution` entries on the same non-empty
+/// subject key; the exported solution then carries the failure content in
+/// `paired_failure`. A failure alone never exports — it only enriches its
+/// solution. Unverified failures poison nothing: they are invisible to the
+/// pairing map.
 pub fn training_candidates(entries: &[MemoryEntry]) -> Vec<TrainingCandidate> {
+    use std::collections::HashMap;
+    // Verified failures by subject key → earliest verified failure wins
+    // (deterministic: first in input order).
+    let mut failures: HashMap<&str, &str> = HashMap::new();
+    for e in entries {
+        if e.meta.kind == KnowledgeKind::Failure
+            && e.meta.status == MemoryStatus::Verified
+            && e.meta.is_evidence_backed()
+            && !e.meta.subject_key.is_empty()
+            && !e.content.trim().is_empty()
+        {
+            failures.entry(e.meta.subject_key.as_str()).or_insert(&e.content);
+        }
+    }
     entries
         .iter()
         .filter(|e| {
@@ -116,6 +142,11 @@ pub fn training_candidates(entries: &[MemoryEntry]) -> Vec<TrainingCandidate> {
             author_node: e.author_node.clone(),
             created_at_ms: e.created_at_ms,
             version: e.meta.version,
+            paired_failure: if e.meta.kind == KnowledgeKind::Solution && !e.meta.subject_key.is_empty() {
+                failures.get(e.meta.subject_key.as_str()).map(|f| f.chars().take(1024).collect())
+            } else {
+                None
+            },
         })
         .collect()
 }
@@ -192,5 +223,43 @@ mod tests {
         let bare = vec![MemoryEntry::new("x", "s", "a", "n", "legacy")];
         assert!(bare[0].meta == MemoryMeta::default());
         assert!(training_candidates(&bare).is_empty());
+    }
+
+    fn verified_with_subject(
+        id: &str,
+        kind: KnowledgeKind,
+        status: MemoryStatus,
+        evidence: Option<&str>,
+        content: &str,
+        subject: &str,
+    ) -> MemoryEntry {
+        let mut e = evidenced_entry(id, kind, status, evidence, content);
+        e.meta.subject_key = subject.to_string();
+        e
+    }
+
+    #[test]
+    fn failure_pairs_with_its_verified_solution_only() {
+        let entries = vec![
+            // The verified failure on subject q:oom.
+            verified_with_subject("f1", KnowledgeKind::Failure, MemoryStatus::Verified, Some("aud-f"), "llama-server OOM at 8k ctx", "q:oom"),
+            // Its verified solution → must carry paired_failure.
+            verified_with_subject("s1", KnowledgeKind::Solution, MemoryStatus::Verified, Some("aud-s"), "cap ctx at 4k or raise swap", "q:oom"),
+            // UNVERIFIED failure on q:leak: invisible to pairing.
+            verified_with_subject("f2", KnowledgeKind::Failure, MemoryStatus::Candidate, Some("aud-x"), "unconfirmed leak", "q:leak"),
+            // Solution for the unverified failure → standalone, no pair.
+            verified_with_subject("s2", KnowledgeKind::Solution, MemoryStatus::Trusted, Some("aud-l"), "fix leak workaround", "q:leak"),
+            // Solution on a DIFFERENT failure that is obsolete → no pair.
+            verified_with_subject("f3", KnowledgeKind::Failure, MemoryStatus::Obsolete, Some("aud-o"), "old stale failure", "q:stale"),
+            verified_with_subject("s3", KnowledgeKind::Solution, MemoryStatus::Verified, Some("aud-t"), "standalone fix", "q:stale"),
+        ];
+        let got = training_candidates(&entries);
+        // Failures never export alone; only solutions do.
+        let ids: Vec<&str> = got.iter().map(|c| c.entry_id.as_str()).collect();
+        assert_eq!(ids, vec!["s1", "s2", "s3"]);
+        let by_id = |id: &str| got.iter().find(|c| c.entry_id == id).unwrap();
+        assert_eq!(by_id("s1").paired_failure.as_deref(), Some("llama-server OOM at 8k ctx"));
+        assert_eq!(by_id("s2").paired_failure, None, "unverified failure poisons nothing");
+        assert_eq!(by_id("s3").paired_failure, None, "obsolete failure does not pair");
     }
 }

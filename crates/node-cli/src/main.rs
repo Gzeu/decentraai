@@ -2537,6 +2537,12 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 Some(store),
             ) {
                 Ok(knowledge_runtime) => {
+                    // M19: when an embeddings backend exists, new feedback
+                    // entries are auto-indexed for semantic search.
+                    let knowledge_runtime = match &embedding_client {
+                        Some(client) => knowledge_runtime.with_embedder(client.clone()),
+                        None => knowledge_runtime,
+                    };
                     state.attach_knowledge(Arc::new(knowledge_runtime));
                 }
                 Err(e) => warn!(error = %e, "P12 knowledge runtime failed to attach"),
