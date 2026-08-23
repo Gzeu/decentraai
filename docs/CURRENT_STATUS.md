@@ -39,17 +39,18 @@
   candidates (`GET /v1/memory/training-candidates`) → manual feed into the
   Training Lab dataset builder. Nothing trains automatically.
 
-## Open follow-ups (implementable now)
+## Open follow-ups
 
-1. Auto-embed-on-write for the KnowledgeRuntime feedback path (semantic search
-   coverage without operator backfill).
-2. Failure→Solution pairing in the training export (verified failure + its
-   verified solution on one subject exported together).
-3. Governor daemon consumption of collective memory (python side — separate
-   front, `scripts/` only).
+1. ~~Auto-embed-on-write~~ DONE (KnowledgeRuntime background indexing).
+2. ~~Failure→Solution pairing in training export~~ DONE (`paired_failure`).
+3. Governor daemon consumption of collective memory — DONE via PR #41
+   (`feat/memory-governor-ops`, untrusted-labeled context + operator actions).
 4. Two-node LAN validation of the full loop (workflow result → memory →
    candidate → verify → export) on real hardware.
-5. Automatic peer-selection policy for sync propagation (currently explicit).
+5. ~~Automatic peer-selection policy for sync propagation~~ DONE
+   (`memory_propagator.rs`, opt-in via `DECENTRAAI_MEMORY_PROPAGATE=1`).
+6. p2p: honour `lan_discovery` fully — announce side still runs; only the
+   reaction to discovery is gated today (needs behaviour-level rework).
 
 ## Standing decisions (do not relitigate casually)
 
