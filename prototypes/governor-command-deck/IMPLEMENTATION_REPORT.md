@@ -1,81 +1,52 @@
 # Implementation Report — Sentient Command Deck
 
-Prototype lives only on `feat/governor-command-deck-prototype` under `prototypes/governor-command-deck/`.
+Lives only on `feat/governor-command-deck-prototype`.
 Not merged. Production DecentraAI is untouched.
 
 ## 1. Visual concept
 
-Governor Presence: an intelligent operating system, not a chatbot and not an admin dashboard.
-
-The first read is identity, utterance, and path. Obsidian field, soft white type, cool gray secondary, electric cyan intelligence, restrained emerald health, amber attention, violet research. Energy comes from state and motion — not neon, cards, or charts.
-
-IBM Plex Sans for UI. IBM Plex Mono only for telemetry, IDs, models, and logs.
+Governor Presence first: identity, utterance, path. Not a chatbot. Not an admin dashboard.
 
 ## 2. Interaction model
 
-Chat is the Governor's brain. Execution is a live spine, not a job table.
-Inspectors slide in only when asked.
-The palette is `Ask Governor...` — questions go to Chat; named commands are power controls.
-
-Product path (fewer, calmer nodes):
-
-`OBSERVING → DIAGNOSING → DELEGATING → VERIFYING`
-
-Internal states still exist and retune ambient energy. Proposals stay proposals until a simulated Rust decision.
+Two surfaces. Inspectors on demand. Palette is `Ask Governor...`.
+Product path: `OBSERVING → DIAGNOSING → DELEGATING → VERIFYING`.
+Proposals wait for a simulated Rust decision.
 
 ## 3. Component architecture
 
-GovernorShell, GovernorPresence, GovernorStatus, ChatSurface, ChatMessage, ActivityCapsule, ExecutionTimeline, ExecutionEvent, ToolCall, SkillActivity, DelegationActivity, WorkerStatus, ProviderStatus, EvolutionPanel, CapabilityGap, Experiment, MemoryInspector, CommandPalette.
+Extracted, still frontend-only:
 
-No imports from `crates/` or production services.
+| File | Role |
+| --- | --- |
+| `index.html` | GovernorShell mount |
+| `css/deck.css` | visual system |
+| `js/state.js` | mock fabric + state machine |
+| `js/components.js` | Presence, Chat, Execution, inspectors, palette |
+| `js/app.js` | scenario player + keyboard |
 
-## 4. Mock execution scenario
+No `crates/` imports. No network calls.
 
-Elevated Desktop inference latency → OBSERVING → THINKING → `fabric-diagnostics` → MCP `get_worker_status` → Desktop delegation → RESULT 1.8s → VERIFYING → capability gap #42 → RESEARCHING → experiment v2 vs v1 → +18% throughput → PROPOSAL to promote skill v2 → deterministic ALLOW (simulated) → LEARNING.
+## 4. Mock scenario
 
-Replay with `R` or Replay execution.
+Desktop latency → diagnostics → MCP `get_worker_status` → Desktop → 1.8s → verify → gap #42 → bench +18% → propose skill v2 → simulated ALLOW.
 
 ## 5. Design decisions
 
-- Presence first. Pulse metrics are no longer a dashboard strip.
-- Two surfaces only. Chat / Execute sit under the utterance.
-- Capsules keep a discreet signature: MCP, Skill, Worker, Memory, Proposal.
-- State changes tempo, wash, path, and utterance weight — not layout chrome.
-- Desktop-first 1440×1024.
+Presence over dashboards. Discreet capsule signatures. State changes energy, not chrome.
 
-## 6. What should later connect to real DecentraAI APIs
+## 6. Later API connections
 
-- Governor state and transcript
-- MCP tool calls and results
-- Skill invocation
-- Worker delegation / Fabric execution
-- Verification receipts
-- Memory read/write
-- Capability gaps, experiments, proposals
-- Provider and model inventory
-- Pause / cancel of real runs
+Governor transcript, MCP, skills, Fabric/workers, verification, memory, gaps, providers/models, pause/cancel.
 
-## 7. What should remain frontend-only
+## 7. Remain frontend-only
 
-- Presence composition and motion
-- Capsule signatures
-- Command palette UX
-- Keyboard map
-- Mock scenario player
+Presence, signatures, palette UX, keyboard, demo scenario.
 
-## 8. Screenshots / preview
+## 8. Preview
 
-The preview **is** `index.html`. Open it locally. No fabricated screenshots.
+`python3 -m http.server 5173 --directory prototypes/governor-command-deck`
 
-## 9. Recommended next iteration
+## 9. Next
 
-Keep this branch as the visual contract. Do not merge.
-When Presence feels right, extract the component model and wire Chat → MCP → Execution → Fabric → Memory behind the same two surfaces.
-
-## Governor Presence iteration
-
-Tested in this pass, still mock-only:
-
-1. **State transitions** — IDLE breathes; OBSERVING / THINKING raise the utterance; EXECUTING / DELEGATING energize the path and spine; VERIFYING turns emerald; LEARNING turns violet; INCIDENT is restrained amber.
-2. **Execution capsules** — MCP, Skill, Worker/Delegation, Memory, Proposal each have a quiet mark and hue. No icon pack, no neon.
-3. **Command palette** — `Ask Governor...` plus Run capability, Inspect worker, Inspect memory, Run benchmark, Research capability, Replay execution, Pause execution, Open incident, Switch provider, Switch model.
+Keep as visual contract. Wire Chat → MCP → Execution → Fabric → Memory only after this composition is accepted.
