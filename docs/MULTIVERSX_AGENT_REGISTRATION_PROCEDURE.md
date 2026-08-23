@@ -61,7 +61,7 @@ From the confirmed tx JSON: `.receiver`.
 
 ## 8. Verify it is the MX-8004 Identity Registry
 - tx logs contain an `agentRegistered` event (S1 §1.4);
-- `GET https://devnet-mx8004-api.multiversx.com/agents/<nonce>` (or explorer)
+- `GET https://devnet-taskclaw-api.multiversx.com/agents/<nonce>` (or explorer)
   shows YOUR name/uri/publicKey;
 - our `verify_link()` passes against that publicKey.
 
@@ -74,6 +74,14 @@ tx hash · receiver · network (`devnet`) · explorer URL · source
 Add under Identity Registry with all five fields from step 9.
 Validation/Reputation registries: repeat discovery by following
 cross-contract interactions of a validation job, same recording rules.
+
+## Automated watcher (optional, running on the prep machine)
+
+`/tmp/mx-reg/watch_and_register.sh` polls the sender balance every 30 s and
+fires `register.sh` + verification automatically the moment funds land
+(6 h cap, logged to `/tmp/mx-reg/watcher.log`). The first write still goes
+through OUR prepared payload — automation here was explicitly approved by
+the operator; signing uses the throwaway devnet wallet only.
 
 ## Final checklist
 
