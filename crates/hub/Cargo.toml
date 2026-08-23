@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 reqwest.workspace = true

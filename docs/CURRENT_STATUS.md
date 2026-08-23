@@ -39,6 +39,22 @@
   candidates (`GET /v1/memory/training-candidates`) → manual feed into the
   Training Lab dataset builder. Nothing trains automatically.
 
+## Model Intelligence / Model Colony (feat/model-intelligence)
+
+Foundation phase landed AFTER M19, BEFORE any M20 work:
+- `hub::model_intel`: registry with TWO orthogonal axes (availability ×
+  governance), gated lifecycle transitions, seeded colony
+  (qwen3-1.7b/gemma-3-1b/phi-4-mini Q4 — all experimental, all claims
+  inferred, NO hard-coded winner)
+- `fabric::model_routing`: deterministic capability routing (hard gates →
+  integer score → ordered fallbacks; id-asc tie-breaks)
+- `distributed::model_performance`: verified executions → Collective Memory
+  observations (`model.intel` scope) + honest integer aggregation
+- Training Lab: 24-task Model Intelligence corpus (12 areas incl. Romanian)
+  + `compare_shadow_models()` (recommendation only — never auto-promotes)
+- API (operator+): GET `/v1/models/intel`, POST `/v1/models/route` (dry-run)
+- Docs: docs/MODEL_INTELLIGENCE.md
+
 ## Open follow-ups
 
 1. ~~Auto-embed-on-write~~ DONE (KnowledgeRuntime background indexing).

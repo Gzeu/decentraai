@@ -418,6 +418,79 @@ pub fn paired_compare(all_runs: &[BenchmarkRun]) -> ModeComparison {
     }
 }
 
+/// Minimum graded runs per side before a shadow comparison means anything.
+pub const SHADOW_MIN_SAMPLES: usize = 8;
+/// Minimum accuracy advantage the candidate must show to be recommended.
+pub const SHADOW_MIN_ACCURACY_MARGIN: f64 = 0.10;
+
+/// What the deterministic shadow comparison concludes. NOTE: a
+/// recommendation NEVER promotes anything — an operator applies the
+/// governance transition after reviewing the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowRecommendation {
+    /// Not enough graded evidence yet — keep benchmarking.
+    InsufficientEvidence,
+    /// Production stays; the candidate did not beat it convincingly.
+    KeepProduction,
+    /// Candidate won by margin on sufficient samples — operator review.
+    OperatorReviewRecommended,
+}
+
+/// Deterministic production-vs-candidate verdict for one benchmark corpus.
+///
+/// Pure: same aggregates → same verdict, always. Latency participates only
+/// as a tie-breaker when accuracies are within a hair (≤1 %): quality first,
+/// speed second — never speed over correctness.
+pub fn compare_shadow_models(
+    production: &ModeAggregate,
+    candidate: &ModeAggregate,
+) -> (ShadowRecommendation, String) {
+    let enough =
+        production.graded >= SHADOW_MIN_SAMPLES && candidate.graded >= SHADOW_MIN_SAMPLES;
+    if !enough {
+        return (
+            ShadowRecommendation::InsufficientEvidence,
+            format!(
+                "not enough graded runs: production={}, candidate={} (need ≥{} each)",
+                production.graded, candidate.graded, SHADOW_MIN_SAMPLES
+            ),
+        );
+    }
+    let margin = candidate.accuracy - production.accuracy;
+    if margin >= SHADOW_MIN_ACCURACY_MARGIN {
+        return (
+            ShadowRecommendation::OperatorReviewRecommended,
+            format!(
+                "candidate accuracy {:.3} beats production {:.3} by +{:.3} (≥{:.2})",
+                candidate.accuracy, production.accuracy, margin, SHADOW_MIN_ACCURACY_MARGIN
+            ),
+        );
+    }
+    // Near-tie on quality: latency decides ONLY inside the hair band.
+    if margin.abs() < 0.01 && candidate.avg_latency_ms > 0.0 {
+        let faster = candidate.avg_latency_ms < production.avg_latency_ms;
+        return (
+            if faster {
+                ShadowRecommendation::OperatorReviewRecommended
+            } else {
+                ShadowRecommendation::KeepProduction
+            },
+            format!(
+                "accuracy near-tie ({:+.3}); candidate latency {:.0} ms vs production {:.0} ms",
+                margin, candidate.avg_latency_ms, production.avg_latency_ms
+            ),
+        );
+    }
+    (
+        ShadowRecommendation::KeepProduction,
+        format!(
+            "candidate accuracy {:+.3} vs production (margin threshold {:.2})",
+            margin, SHADOW_MIN_ACCURACY_MARGIN
+        ),
+    )
+}
+
 /// Deterministic in-memory registry of benchmark tasks and runs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BenchmarkRegistry {
@@ -666,5 +739,42 @@ mod tests {
         assert_eq!(registry.task_count(), 2);
         assert_eq!(registry.runs().len(), 1);
         assert_eq!(registry.counts()[&BenchmarkMode::Single], 1);
+    }
+
+    #[test]
+    fn shadow_comparison_is_deterministic_and_never_auto_promotes() {
+        let agg = |graded: usize, acc: f64, lat: f64| ModeAggregate {
+            mode: BenchmarkMode::Single,
+            runs: graded,
+            graded,
+            accuracy: acc,
+            avg_tokens: 0.0,
+            avg_latency_ms: lat,
+        };
+
+        // Insufficient evidence dominates everything else.
+        let (rec, why) = compare_shadow_models(&agg(3, 0.9, 100.0), &agg(2, 1.0, 50.0));
+        assert_eq!(rec, ShadowRecommendation::InsufficientEvidence);
+        assert!(why.contains("not enough graded"));
+
+        // Clear candidate win by margin.
+        let (rec, _) = compare_shadow_models(&agg(10, 0.60, 500.0), &agg(10, 0.75, 900.0));
+        assert_eq!(rec, ShadowRecommendation::OperatorReviewRecommended);
+
+        // Candidate slower on a near-tie: production stays.
+        let (rec, why) = compare_shadow_models(&agg(10, 0.70, 300.0), &agg(10, 0.705, 800.0));
+        assert_eq!(rec, ShadowRecommendation::KeepProduction);
+        assert!(why.contains("near-tie"));
+
+        // Candidate faster within the hair band: review recommended — but the
+        // CALLER still must run the operator-gated transition; this function
+        // returns data, never mutates any registry.
+        let (rec, _) = compare_shadow_models(&agg(10, 0.70, 800.0), &agg(10, 0.705, 250.0));
+        assert_eq!(rec, ShadowRecommendation::OperatorReviewRecommended);
+
+        // Determinism: same inputs → same verdict + reasoning bytes.
+        let p = agg(12, 0.55, 400.0);
+        let c = agg(12, 0.70, 400.0);
+        assert_eq!(compare_shadow_models(&p, &c), compare_shadow_models(&p, &c));
     }
 }
