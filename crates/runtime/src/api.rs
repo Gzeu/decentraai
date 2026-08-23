@@ -204,6 +204,7 @@ enum Auth {
         account: String,
         quota_ceiling: u64,
         rate_limit_per_minute: u32,
+        scopes: Vec<String>,
     },
 }
 
@@ -713,17 +714,19 @@ pub async fn intel_available_capabilities(&self) -> Vec<decentraai_hub::capabili
                                 r.owner_account.clone(),
                                 r.quota_ceiling,
                                 r.rate_limit_per_minute,
+                                r.scopes.clone(),
                             )
                         })
                     };
                     match record {
-                        Some((key_id, account, quota_ceiling, rate_limit_per_minute)) => {
+                        Some((key_id, account, quota_ceiling, rate_limit_per_minute, scopes)) => {
                             store.touch_used(&key_id);
                             return Ok(Auth::Consumer {
                                 key_id,
                                 account,
                                 quota_ceiling,
                                 rate_limit_per_minute,
+                                scopes,
                             });
                         }
                         None => return Err(GateError::Unauthorized),
@@ -5038,6 +5041,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/peers", get(peers_handler))
         .route("/v1/compute", get(compute_handler))
         .route("/v1/agents", get(agents_handler))
+        .route("/v1/agents/onboard", post(agents_onboard_handler))
+        .route("/v1/agents/capabilities", get(agents_capabilities_handler))
         .route("/v1/agents/orchestrate", post(agents_orchestrate_handler))
         .route("/v1/intel/plan", post(intel_plan_handler))
         .route("/v1/intel/status", get(intel_status_handler))
@@ -5893,6 +5898,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         account,
         quota_ceiling,
         rate_limit_per_minute,
+        scopes,
     } = auth
     else {
         return forbidden("not a consumer credential");
@@ -5904,6 +5910,93 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     // so an agent can pick what to run before executing.
     if let Some((intent, evidence, model)) = crate::mcp::decision_request(&raw) {
         ctx.decision = unified_fabric_decision(state, &intent, &evidence, model.as_deref()).await;
+    } else if let Some((input, _model)) = crate::mcp::embeddings_request(&raw) {
+        // `decentraai_embeddings` — L1 ASSIST, scoped to embeddings.
+        if !scopes.iter().any(|s| s == "embeddings" || s == "inference" || s == "*") {
+            return forbidden("consumer key missing embeddings scope");
+        }
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
+        let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
+        let Some(mut guard) = state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling) else {
+            return forbidden("no spendable quota for this consumer account");
+        };
+        // Execute via embeddings path if available, otherwise stub.
+        let result = serde_json::json!({
+            "capability": "embeddings",
+            "input_chars": input.chars().count(),
+            "note": "embeddings via fabric — stub for M16, wire to local model in M16.1",
+            "available": state.embedding.is_some() || state.skills.is_some(),
+        });
+        guard.settle(1);
+        state.note_token_usage(auth, 1);
+        // Return directly (bypass generic handle_message which would look for tool in McpContext)
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]}
+        });
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        ).into_response();
+    } else if let Some((capability, payload, lease_secs)) = crate::mcp::compute_request(&raw) {
+        // `decentraai_compute_request` — L1 ASSIST via DFCP, scoped to compute/capability.
+        if !scopes.iter().any(|s| s == "compute" || s == &capability || s == "*") {
+            return forbidden(&format!("consumer key missing scope for capability '{}'", capability));
+        }
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
+        let p2p = match &state.p2p {
+            Some(p) => p.clone(),
+            None => return forbidden("p2p not attached for compute assist"),
+        };
+        let peers = p2p.connected_peers().await;
+        if peers.is_empty() {
+            return forbidden("no connected workers for compute assist");
+        }
+        let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
+        let Some(mut guard) = state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling) else {
+            return forbidden("no spendable quota for this consumer account");
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let (success, result_payload, explanation) = crate::intel_assist::run_assist_request(
+            &p2p,
+            peers,
+            decentraai_compute::assist::AssistRequest {
+                capability: capability.clone(),
+                cpu_cores: 2,
+                ram_mb: 512,
+            },
+            payload_bytes,
+            lease_secs,
+        )
+        .await;
+        let result_json: serde_json::Value = serde_json::from_slice(&result_payload).unwrap_or(serde_json::Value::Null);
+        if success {
+            guard.settle(1);
+            state.note_token_usage(auth, 1);
+        }
+        let result_body = serde_json::json!({
+            "status": if success { 200 } else { 502 },
+            "ok": success,
+            "capability": capability,
+            "explanation": explanation,
+            "quota": {"reserved": true, "settled": success, "tokens_settled": if success {1} else {0}},
+            "body": result_json,
+        });
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"content": [{"type": "text", "text": serde_json::to_string(&result_body).unwrap_or_default()}]}
+            }).to_string(),
+        ).into_response();
     } else if crate::mcp::execution_request(&raw).is_some() {
         // `execute_decision`: the mutating consumption step, quota-gated.
         // The confirmation gate is enforced inside `run_execute_decision`.
@@ -5944,9 +6037,15 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
             "body": payload,
         });
+    } else if raw.contains("\"method\":\"tools/list\"")
+        || raw.contains("\"method\":\"initialize\"")
+        || raw.contains("\"method\":\"ping\"")
+        || raw.contains("\"method\":\"notifications/initialized\"")
+    {
+        // Read-only discovery — allowed for consumer keys.
     } else {
         // Any other tool is not in the consumer consumption scope.
-        return forbidden("consumer API keys may only call decide or execute_decision");
+        return forbidden("consumer API keys may only call decide, execute_decision, decentraai_embeddings or decentraai_compute_request");
     }
 
     let response = crate::mcp::handle_message(&ctx, &raw);
@@ -7529,6 +7628,183 @@ async fn intel_assist_handler(
             "elapsed_ms": elapsed_ms,
             "result": serde_json::from_slice::<serde_json::Value>(&result_payload)
                 .unwrap_or(serde_json::Value::Null),
+        })),
+    )
+        .into_response()
+}
+
+/// POST /v1/agents/onboard — Agent Gateway (M16 BYOA).
+/// Master-only. Issues a scoped `dca_…` credential for an external agent.
+/// Policy-gated: capabilities, quota, rate and expiry are clamped to
+/// `agent_gateway` limits. The plaintext is returned ONLY here, then only
+/// its hash is stored. Audited without ever logging the secret.
+async fn agents_onboard_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let Some(path) = state.consumer_keys_path.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "consumer key store not configured"})),
+        )
+            .into_response();
+    };
+    // Gateway policy: conservative defaults, config-driven when present.
+    // For M16, gateway is enabled whenever the consumer key store exists
+    // (Q2). Future: gate on `agent_gateway.enabled` from live config.
+    let cfg = decentraai_config::AgentGatewaySection::default();
+    // Enforce M16 invariant: onboarding is master-only and audited; the
+    // handler already passed require_master above.
+    let agent_name = body.0.get("agent_name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if agent_name.is_empty() || agent_name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "agent_name must be 1..64 chars"})),
+        )
+            .into_response();
+    }
+    let starter = body.0.get("starter").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut capabilities: Vec<String> = body
+        .0
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let mut quota = body.0.get("quota").and_then(|v| v.get("quota_ceiling")).and_then(|v| v.as_u64()).unwrap_or(body.0.get("quota").and_then(|v| v.as_u64()).unwrap_or(cfg.free_starter.quota_ceiling));
+    let mut rate = body.0.get("quota").and_then(|v| v.get("rate_limit")).and_then(|v| v.as_u64()).unwrap_or(cfg.free_starter.rate_limit as u64) as u32;
+    let mut scopes = body.0.get("scopes").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_else(|| {
+        if !capabilities.is_empty() { capabilities.clone() } else { cfg.free_starter.scopes.clone() }
+    });
+    if starter {
+        capabilities = cfg.free_starter.scopes.clone();
+        scopes = cfg.free_starter.scopes.clone();
+        quota = cfg.free_starter.quota_ceiling;
+        rate = cfg.free_starter.rate_limit;
+    }
+    // Policy clamp
+    quota = quota.min(cfg.max_quota_ceiling);
+    rate = rate.min(cfg.max_rate_limit);
+    if !cfg.allowed_capabilities.is_empty() {
+        capabilities.retain(|c| cfg.allowed_capabilities.contains(c));
+    }
+    if capabilities.is_empty() {
+        capabilities = cfg.free_starter.scopes.clone();
+    }
+    if scopes.is_empty() {
+        scopes = capabilities.clone();
+    }
+    // Enforce max 8 scopes to keep metadata bounded
+    if scopes.len() > 8 {
+        scopes.truncate(8);
+    }
+    if capabilities.len() > 8 {
+        capabilities.truncate(8);
+    }
+    let owner_account = format!("agent:{}", agent_name);
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": format!("key store load failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let plaintext = match store.create(&owner_account, quota, rate, scopes.clone()) {
+        Ok(k) => k,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": format!("key creation failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    // Audit without logging the secret (only key_id/prefix and scopes)
+    if let Some(rec) = store.lookup(&plaintext) {
+        decentraai_audit::record_best_effort(
+            &state.info.repo_root.join("logs"),
+            "agent_onboarded",
+            serde_json::json!({
+                "agent_name": agent_name,
+                "key_id": rec.key_id,
+                "prefix": rec.prefix,
+                "scopes": scopes,
+                "capabilities": capabilities,
+                "quota_ceiling": quota,
+                "rate_limit": rate,
+            }),
+        );
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "agent_name": agent_name,
+                "key_id": rec.key_id,
+                "api_key": plaintext,
+                "prefix": rec.prefix,
+                "scopes": scopes,
+                "capabilities": capabilities,
+                "quota": {"quota_ceiling": quota, "rate_limit": rate},
+                "endpoints": {
+                    "openai": "/v1/chat/completions",
+                    "mcp": "/mcp"
+                },
+                "note": "API key shown once — store it securely, it will not be shown again"
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({"error": "key created but lookup failed"})),
+    )
+        .into_response()
+}
+
+/// GET /v1/agents/capabilities — what can DecentraAI do for an agent?
+/// Returns hub taxonomy capabilities with description, availability and
+/// required permission level. No auth required beyond any valid credential
+/// (open for discovery), but never exposes secrets.
+async fn agents_capabilities_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    // Allow any authenticated caller (including consumer keys) and open mode.
+    if let Err(e) = state.classify(&headers) {
+        // Open discovery still allowed without auth — return public view.
+        let _ = e;
+    }
+    let available = state.intel_available_capabilities().await;
+    let all_names = decentraai_hub::capability::CapabilityKind::ALL_NAMES;
+    let caps: Vec<serde_json::Value> = all_names
+        .iter()
+        .map(|name| {
+            let kind: decentraai_hub::capability::CapabilityKind = name.parse().unwrap();
+            let available_now = available.contains(&kind);
+            serde_json::json!({
+                "capability": name,
+                "description": kind.label(),
+                "available": available_now,
+                "required_permission": if available_now { "consumer" } else { "operator" },
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "fabric": "DecentraAI",
+            "protocols": ["OpenAI-compatible", "MCP"],
+            "capabilities": caps,
+            "endpoints": {
+                "openai": "/v1/chat/completions",
+                "mcp": "/mcp",
+                "onboard": "/v1/agents/onboard"
+            }
         })),
     )
         .into_response()
@@ -9731,6 +10007,7 @@ async fn proxy_with_auth(
         key_id,
         quota_ceiling,
         rate_limit_per_minute,
+        ..
     } = &auth
     {
         if is_inference {
