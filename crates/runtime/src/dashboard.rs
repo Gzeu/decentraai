@@ -410,6 +410,7 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--bg-2);border:1px sol
     <button class="nav-item advanced" data-view="evidence"><span class="ic">✎</span><span>Evidence</span></button>
     <button class="nav-item advanced" data-view="bench"><span class="ic">⚗</span><span>Bench</span></button>
     <button class="nav-item advanced" data-view="memory"><span class="ic">◈</span><span>Memory</span></button>
+    <button class="nav-item advanced" data-view="colony"><span class="ic">⬢</span><span>Model Colony</span></button>
     <button class="nav-item advanced" data-view="reputation"><span class="ic">★</span><span>Reputation</span></button>
     <button class="nav-item advanced" data-view="talents"><span class="ic">◈</span><span>Talents</span></button>
     <button class="nav-item advanced" data-view="workers"><span class="ic">▤</span><span>Workers</span></button>
@@ -951,6 +952,21 @@ decentraai-worker --model &lt;file.gguf&gt; --data-dir ~/.decentraai-worker</pre
         <div class="card">
           <h2>Collective memory <span class="count" id="memory-count"></span></h2>
           <div id="memory" class="worker-cards"><div class="empty">loading…</div></div>
+        </div>
+      </section>
+
+      <!-- MODEL COLONY (Model Intelligence): registry facts + governance +
+           verified observation aggregates from /v1/models/intel. Actions are
+           operator-gated on the server; the panel is only an honest window. -->
+      <section class="view" id="view-colony">
+        <div class="card">
+          <h2>Model Colony <span class="count" id="colony-count"></span></h2>
+          <div class="wc-meta" style="margin-bottom:8px">
+            <span id="colony-pressure"></span>
+            <button class="btn" style="margin-left:auto" onclick="runShadowSuite()">⚗ Run shadow suite (8 tasks)</button>
+            <span class="badge faint" id="colony-status"></span>
+          </div>
+          <div id="colony" class="worker-cards"><div class="empty">loading…</div></div>
         </div>
       </section>
 
@@ -1546,7 +1562,7 @@ if (loginCancelLink) loginCancelLink.addEventListener('click', (e) => {
 
 // ---- navigation ------------------------------------------------------------
 const VIEWS = ['overview','chat','fabric','decisions','execution','agents','skills','memory','reputation','talents','workers','devices','network','models','observability','recovery','diag','security','settings'];
-const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', devices:'Devices', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
+const TITLES = { overview:'Overview', chat:'Chat', fabric:'Fabric · Topology', decisions:'Autonomous decisions', execution:'Execution lifecycle', agents:'Agents', skills:'Skills', memory:'Memory', colony:'Model Colony', reputation:'Reputation', talents:'Talent Tree', workers:'Workers', devices:'Devices', network:'Network', models:'Models', observability:'Observability', recovery:'Recovery', diag:'Diagnostics', security:'Security · Admin', settings:'Settings' };
 let current = 'overview';
 function show(view){
   // Consumer keys can only access Chat
@@ -2680,6 +2696,93 @@ function renderMemory(d){
     '</div>';
   }).join('');
   $('memory').innerHTML = scopes.length ? cards : '<div class="empty">no memory scopes yet — run a completed workflow to write results here</div>';
+}
+
+
+// ---- Model Colony (Model Intelligence) ----
+// Renders /v1/models/intel: registry facts, governance stages, live
+// availability and VERIFIED observation aggregates. Operator actions call
+// the gated endpoints; every response carries its own server-side verdict.
+function stageBadge(st){
+  if (st === 'approved') return '<span class="badge ok">APPROVED</span>';
+  if (st === 'candidate') return '<span class="badge accent">CANDIDATE</span>';
+  if (st === 'shadow') return '<span class="badge warn">SHADOW</span>';
+  if (st === 'experimental') return '<span class="badge faint">EXPERIMENTAL</span>';
+  if (st === 'rejected') return '<span class="badge warn">REJECTED</span>';
+  return '<span class="badge faint">'+esc(st||'—')+'</span>';
+}
+function renderColony(d){
+  if (!d) return;
+  const models = d.models || [];
+  $('colony-count').textContent = models.length + ' model(s)';
+  const pressure = models.length ? (models[0].ram_pressure_percent ?? 0) : 0;
+  $('colony-pressure').innerHTML = '<b>RAM pressure:</b> '+pressure+'%';
+  const cards = models.map(m => {
+    const obs = m.observed
+      ? '<span class="badge ok">'+m.observed.success_percent+'% success</span>'+
+        '<span class="badge faint">'+m.observed.mean_latency_ms+' ms avg</span>'+
+        '<span class="badge accent">'+m.observed.samples+' samples</span>'
+      : '<span class="badge faint">no verified observations yet</span>';
+    const caps = (m.capabilities||[]).map(c =>
+      '<span class="nc-model" title="'+esc(c.provenance)+' '+c.strength+'%">'+
+        esc((c.kind||'').replace(/_/g,' '))+' '+c.strength+'</span>').join('');
+    const stages = ['shadow','candidate','approved','rejected'];
+    const opts = stages.map(st =>
+      '<option value="'+st+'"'+(m.governance===st?' selected':'')+'>'+st+'</option>').join('');
+    return '<div class="worker-card"><div class="wc-head">'+
+      '<span class="wc-name mono">'+esc(m.model_id)+'</span>'+ stageBadge(m.governance)+
+      (m.availability==='available' ? '<span class="badge ok">available</span>' : '<span class="badge warn">'+esc(m.availability)+'</span>')+
+      '</div>'+
+      '<div class="wc-meta"><span><b>ctx</b> '+m.context_length+' tok</span>'+
+        '<span><b>quant</b> '+esc(m.quantization)+'</span>'+
+        '<span><b>ram</b> '+(m.hardware ? Math.round(m.hardware.ram_needed_bytes/1073741824*10)/10 : '—')+' GiB</span>'+
+        '<span><b>ro</b> '+(m.romanian_strength ?? '—')+'%</span></div>'+
+      '<div class="wc-meta" style="flex-wrap:wrap;gap:4px">'+obs+'</div>'+
+      '<div class="wc-meta" style="flex-wrap:wrap;gap:4px">'+caps+'</div>'+
+      '<div class="wc-meta" style="gap:6px;margin-top:6px">'+
+        '<select id="gov-'+esc(m.model_id)+'" class="mono" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:2px 6px">'+opts+'</select>'+
+        '<button class="btn" onclick="applyGovernance(\''+esc(m.model_id)+'\')">Apply transition</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+  $('colony').innerHTML = cards.length ? cards : '<div class="empty">colony registry not attached</div>';
+}
+async function applyGovernance(modelId){
+  const stage = document.getElementById('gov-'+modelId).value;
+  $('colony-status').textContent = 'transitioning…';
+  try {
+    const r = await fetch('/v1/models/governance', { method:'POST',
+      headers: Object.assign({}, headers, {'Content-Type':'application/json'}),
+      body: JSON.stringify({ model_id: modelId, to: stage }) });
+    const d = await r.json();
+    if (!r.ok || d.ok === false) {
+      $('colony-status').textContent = '';
+      toast('transition rejected: ' + ((d && d.error) || r.status));
+      refresh(); return;
+    }
+    $('colony-status').textContent = '';
+    toast('governance → ' + d.governance + ' (persisted)');
+    refresh();
+  } catch (e) { $('colony-status').textContent = ''; toast('governance failed'); }
+}
+async function runShadowSuite(){
+  $('colony-status').textContent = 'running suite…';
+  try {
+    const r = await fetch('/v1/bench/shadow', { method:'POST',
+      headers: Object.assign({}, headers, {'Content-Type':'application/json'}),
+      body: JSON.stringify({ limit: 8 }) });
+    const d = await r.json();
+    if (!r.ok) {
+      $('colony-status').textContent = '';
+      toast('suite failed: ' + ((d && d.error) || r.status));
+      refresh(); return;
+    }
+    const rep = d.report || {};
+    $('colony-status').textContent = rep.attempted + ' attempted · ' + rep.correct +
+      ' correct · ' + rep.recorded + ' recorded';
+    toast('shadow suite done — observations recorded');
+    refresh();
+  } catch (e) { $('colony-status').textContent = ''; toast('suite failed'); }
 }
 
 // ---- Skills (P8 dataset/skill) ----
@@ -5035,6 +5138,7 @@ async function refresh(){
   try { const ag = await (await fetch('/v1/agents', { headers })).json(); renderAgents(ag); } catch (e) {}
   try { const sk = await (await fetch('/v1/skills', { headers })).json(); renderSkills(sk); } catch (e) {}
   try { const mem = await (await fetch('/v1/memory', { headers })).json(); renderMemory(mem); } catch (e) {}
+  try { const col = await (await fetch('/v1/models/intel', { headers })).json(); renderColony(col); } catch (e) {}
   try { const rep = await (await fetch('/v1/reputation', { headers })).json(); renderReputation(rep); } catch (e) {}
   try { const tt = await (await fetch('/v1/talent-tree', { headers })).json(); renderTalentTree(tt); } catch (e) {}
   try { await renderKnowledge(); } catch (e) {}
