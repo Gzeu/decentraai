@@ -1,0 +1,15 @@
+[package]
+name = "decentraai-economy"
+version = "1.0.0"
+edition.workspace = true
+
+[dependencies]
+decentraai-agents = { path = "../agents" }
+decentraai-compute = { path = "../compute" }
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

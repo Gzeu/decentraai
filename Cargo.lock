@@ -1141,6 +1141,7 @@ dependencies = [
  "decentraai-compute",
  "decentraai-config",
  "decentraai-discovery",
+ "decentraai-economy",
  "decentraai-fabric",
  "decentraai-hub",
  "decentraai-identity",
@@ -1164,10 +1165,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-economy"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "decentraai-agents",
+ "decentraai-compute",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "decentraai-fabric"
 version = "1.0.0"
 dependencies = [
  "decentraai-compute",
+ "decentraai-hub",
  "serde",
  "serde_json",
  "tempfile",
@@ -1196,6 +1211,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
