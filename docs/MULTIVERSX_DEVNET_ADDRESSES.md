@@ -85,3 +85,17 @@ Conclusion: contract addresses stay UNVERIFIED. Next legitimate sources to
 try: official deployment artifacts/config of the wrapper service, a live
 registration transaction on the devnet explorer (receiver = Identity
 Registry), or direct contact with the MX agents team.
+
+## Deployer analysis — 2026-08-24
+
+Identity Registry deployer (full): `erd1c83tgujs47scafsu7kyt0myxeg50aw5lzxm47y73ue45ktzfkgjq8m3fae`
+→ `/accounts/{owner}/contracts` lists **25 deployed contracts**, INCLUDING our
+verified Identity Registry (`…jqeyu68x`). Official-team deployment CONFIRMED.
+
+Validation + Reputation registries resolve to a DIFFERENT owner
+(`erd1qyu5wthld…`): functional behavior matches spec exactly (args verified),
+but they are NOT from the primary official deployer's list. Status:
+- Identity Registry: **VERIFIED + official-deployer confirmed**
+- Validation / Reputation: **functional-match, alternative deployment**
+  (usable for devnet experiments; re-verify against the official deployer's
+  current registry set before any production use)
