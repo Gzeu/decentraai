@@ -1,0 +1,12 @@
+{
+  "model_id": "decentraai-governor-v0.1-smoke",
+  "base_model": "Qwen/Qwen3.5-4B",
+  "base_model_source": "https://huggingface.co/Qwen/Qwen3.5-4B",
+  "license": "Check Qwen model card (typically Apache-2.0 or Qwen license)",
+  "dataset_version": "corpus_v0_smoke_12examples",
+  "dataset_path": "training/datasets/corpus_v0.jsonl",
+  "training_method": "SFT + LoRA (r=16, alpha=32)",
+  "status": "EXPERIMENT",
+  "created_at": null,
+  "notes": "Smoke test — pipeline validation only, not production candidate"
+}

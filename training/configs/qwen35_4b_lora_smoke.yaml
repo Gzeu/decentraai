@@ -1,0 +1,33 @@
+# Qwen3.5-4B LoRA SFT — smoke test (~100 examples)
+# Runs on Desktop/GPU/Colab — NOT the 12GB VPS.
+#
+# Usage:
+#   pip install transformers datasets peft trl accelerate torch
+#   python3 training/configs/run_smoke.py
+
+base_model: "Qwen/Qwen3.5-4B"
+dataset_path: "training/datasets/corpus_v0.jsonl"
+output_dir: "training/artifacts/qwen35_4b_lora_smoke"
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+training:
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.1
+  lr_scheduler: "cosine"
+  bf16: true
+  max_seq_length: 1024
+  logging_steps: 10
+  save_strategy: "epoch"
+
+evaluation:
+  min_examples: 20
+  adversarial_required: true
+  policy_adherence_threshold: 0.95
