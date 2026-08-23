@@ -39,6 +39,9 @@
   candidates (`GET /v1/memory/training-candidates`) → manual feed into the
   Training Lab dataset builder. Nothing trains automatically.
 
+> Index complet al componentelor: docs/INVENTORY.md ·
+> Operațiuni VPS: docs/VPS_OPERATIONS.md
+
 ## Model Intelligence / Model Colony (feat/model-intelligence)
 
 Foundation phase landed AFTER M19, BEFORE any M20 work:
