@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     provenance TEXT,
     content_hash TEXT NOT NULL DEFAULT '',
     meta TEXT,
+    embedding BLOB,
     FOREIGN KEY(scope) REFERENCES memory_scopes(name)
 );
 ";
@@ -108,18 +109,20 @@ CREATE TABLE IF NOT EXISTS memory_entries (
 const CREATE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_memory_entries_scope ON memory_entries(scope, content_hash);";
 
-/// Adds columns introduced by M18 to databases created before it. Idempotent:
-/// existing installs get one `ALTER TABLE` per missing column, fresh installs
-/// already have them from `CREATE_SCHEMA`.
+/// Adds columns introduced by M18/M19 to databases created before them.
+/// Idempotent: existing installs get one `ALTER TABLE` per missing column,
+/// fresh installs already have them from `CREATE_SCHEMA`.
 fn ensure_m18_columns(conn: &Connection) -> Result<(), MemoryStoreError> {
     let mut stmt = conn.prepare("PRAGMA table_info(memory_entries)")?;
     let mut has_content_hash = false;
     let mut has_meta = false;
+    let mut has_embedding = false;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
     for name in rows {
         match name? {
             ref n if n == "content_hash" => has_content_hash = true,
             ref n if n == "meta" => has_meta = true,
+            ref n if n == "embedding" => has_embedding = true,
             _ => {}
         }
     }
@@ -129,7 +132,45 @@ fn ensure_m18_columns(conn: &Connection) -> Result<(), MemoryStoreError> {
     if !has_meta {
         conn.execute("ALTER TABLE memory_entries ADD COLUMN meta TEXT", [])?;
     }
+    if !has_embedding {
+        conn.execute("ALTER TABLE memory_entries ADD COLUMN embedding BLOB", [])?;
+    }
     Ok(())
+}
+
+/// Serializes an embedding vector as little-endian f32 bytes (stable layout
+/// across platforms; SQLite BLOB storage).
+pub(crate) fn vector_to_blob(vec: &[f32]) -> Vec<u8> {
+    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Inverse of [`vector_to_blob`]; `None` when the blob length is not a
+/// multiple of 4 or is empty.
+pub(crate) fn blob_to_vector(blob: &[u8]) -> Option<Vec<f32>> {
+    if blob.is_empty() || blob.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Cosine similarity between two equal-length, non-zero vectors.
+/// Deterministic pure function; `None` on length mismatch or a zero vector
+/// (no direction → no meaningful similarity, never silently scored 0).
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return None;
+    }
+    Some(dot / (norm_a * norm_b))
 }
 
 fn now_ms() -> u64 {
@@ -600,6 +641,115 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// Stores the embedding vector for one entry (semantic retrieval index).
+    /// Idempotent: re-indexing overwrites the previous vector.
+    pub fn store_embedding(
+        &self,
+        scope_name: &str,
+        entry_id: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryStoreError> {
+        self.get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
+                name: scope_name.to_string(),
+            })?;
+        if vector.is_empty() {
+            return Err(MemoryStoreError::Sql(
+                "refusing to store an empty embedding vector".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE memory_entries SET embedding = ?3 WHERE scope = ?1 AND entry_id = ?2",
+            params![scope_name, entry_id, vector_to_blob(vector)],
+        )?;
+        if updated == 0 {
+            return Err(MemoryStoreError::UnknownEntry {
+                entry_id: entry_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// How many live entries in a scope have / lack an embedding vector.
+    /// Observability for the index backfill — gaps must be visible, never
+    /// guessed.
+    pub fn index_status(
+        &self,
+        scope_name: &str,
+    ) -> Result<(usize, usize), MemoryStoreError> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let indexed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_entries WHERE scope = ?1
+             AND embedding IS NOT NULL
+             AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
+            params![scope_name, now as i64],
+            |r| r.get(0),
+        )?;
+        let unindexed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_entries WHERE scope = ?1
+             AND embedding IS NULL
+             AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
+            params![scope_name, now as i64],
+            |r| r.get(0),
+        )?;
+        Ok((indexed as usize, unindexed as usize))
+    }
+
+    /// Semantic search inside one scope: cosine similarity between
+    /// `query_vector` and each indexed entry's stored vector, deterministic
+    /// order (score desc → entry_id asc), bounded by `top_k`. Enforces
+    /// [`can_read`] like every read. Entries without vectors are invisible
+    /// here (they remain reachable through lexical search).
+    pub fn search_semantic(
+        &self,
+        scope_name: &str,
+        reader_agent: &str,
+        trusted: bool,
+        query_vector: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(MemoryEntry, f32)>, MemoryStoreError> {
+        let scope = self
+            .get_scope(scope_name)?
+            .ok_or_else(|| MemoryStoreError::UnknownScope {
+                name: scope_name.to_string(),
+            })?;
+        let reader_is_owner = scope.owner_agent == reader_agent;
+        match can_read(&scope, reader_agent, reader_is_owner, trusted) {
+            MemoryAccessDecision::Granted => {}
+            MemoryAccessDecision::Denied { reason } => {
+                return Err(MemoryStoreError::AccessDenied { reason });
+            }
+        }
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, meta, embedding
+             FROM memory_entries
+             WHERE scope = ?1 AND embedding IS NOT NULL
+               AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
+        )?;
+        let rows = stmt.query_map(params![scope_name, now as i64], entry_from_row_with_embedding)?;
+        let mut scored: Vec<(MemoryEntry, f32)> = Vec::new();
+        for row in rows {
+            let (entry, blob) = row?;
+            let Some(vec) = blob_to_vector(&blob) else {
+                continue; // corrupt/legacy blob → skip, never guess a score
+            };
+            if let Some(score) = cosine_similarity(query_vector, &vec) {
+                scored.push((entry, score));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.entry_id.cmp(&b.0.entry_id))
+        });
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
     /// Reads a scope's non-expired entries, newest-first
     /// (`created_at_ms` desc, `entry_id` asc). Enforces [`can_read`].
     pub fn read(
@@ -623,12 +773,14 @@ impl MemoryStore {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, meta
+            "SELECT entry_id, scope, author_agent, author_node, content, tags, created_at_ms, expires_at_ms, provenance, meta, embedding
              FROM memory_entries
              WHERE scope = ?1 AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)
              ORDER BY created_at_ms DESC, entry_id ASC",
         )?;
-        let rows = stmt.query_map(params![scope_name, now as i64], entry_from_row)?;
+        let rows = stmt.query_map(params![scope_name, now as i64], |r| {
+            entry_from_row_with_embedding(r).map(|(e, _)| e)
+        })?;
         let mut entries = Vec::new();
         for row in rows {
             entries.push(row?);
@@ -688,9 +840,17 @@ fn scope_from_row(
 }
 
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    Ok(entry_from_row_with_embedding(row)?.0)
+}
+
+/// Row mapper that also extracts the optional embedding BLOB (M19).
+fn entry_from_row_with_embedding(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(MemoryEntry, Vec<u8>)> {
     let tags_json: String = row.get(5)?;
     let provenance: Option<String> = row.get(8)?;
     let meta_json: Option<String> = row.get(9)?;
+    let embedding: Option<Vec<u8>> = row.get(10)?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let provenance = provenance
         .as_deref()
@@ -701,18 +861,21 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         .as_deref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
-    Ok(MemoryEntry {
-        entry_id: row.get(0)?,
-        scope: row.get(1)?,
-        author_agent: row.get(2)?,
-        author_node: row.get(3)?,
-        content: row.get(4)?,
-        tags,
-        created_at_ms: row.get::<_, i64>(6)? as u64,
-        expires_at_ms: row.get::<_, Option<i64>>(7)?.map(|ms| ms as u64),
-        provenance,
-        meta,
-    })
+    Ok((
+        MemoryEntry {
+            entry_id: row.get(0)?,
+            scope: row.get(1)?,
+            author_agent: row.get(2)?,
+            author_node: row.get(3)?,
+            content: row.get(4)?,
+            tags,
+            created_at_ms: row.get::<_, i64>(6)? as u64,
+            expires_at_ms: row.get::<_, Option<i64>>(7)?.map(|ms| ms as u64),
+            provenance,
+            meta,
+        },
+        embedding.unwrap_or_default(),
+    ))
 }
 
 #[cfg(test)]
@@ -1182,5 +1345,95 @@ mod tests {
             store.register_scope(&scope(&name, "governor", level)).unwrap();
             assert_eq!(store.get_scope(&name).unwrap().unwrap().level, level);
         }
+    }
+
+    #[test]
+    fn cosine_similarity_is_deterministic_and_honest() {
+        // Identical direction → 1.0; opposite → -1.0.
+        let a = [1.0, 0.0, 2.0];
+        let b = [2.0, 0.0, 4.0];
+        assert!((cosine_similarity(&a, &b).unwrap() - 1.0).abs() < 1e-6);
+        assert!((cosine_similarity(&a, &[-a[0], 0.0, -a[2]]).unwrap() + 1.0).abs() < 1e-6);
+        // Orthogonal → 0.
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).unwrap().abs() < 1e-6);
+        // Zero vector / length mismatch / empty → None, never a fake score.
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), None);
+        assert_eq!(cosine_similarity(&[], &[1.0]), None);
+    }
+
+    #[test]
+    fn vector_blob_round_trips() {
+        let v = vec![0.25f32, -3.5, 1e-9, f32::MAX];
+        let blob = vector_to_blob(&v);
+        assert_eq!(blob.len(), 16);
+        assert_eq!(blob_to_vector(&blob).unwrap(), v);
+        assert_eq!(blob_to_vector(&[1, 2, 3]), None, "non-multiple-of-4 rejected");
+        assert_eq!(blob_to_vector(&[]), None);
+    }
+
+    #[test]
+    fn search_semantic_ranks_by_score_then_id_and_enforces_access() {
+        use decentraai_agents::memory::KnowledgeKind;
+        let store = store_in_memory();
+        store.register_scope(&team_scope()).unwrap();
+        // Three entries with hand-made vectors; query closest to "close1".
+        for (id, vec) in [
+            ("far", vec![1.0f32, 0.0]),
+            ("mid", vec![0.9f32, 0.1]),
+            ("close1", vec![0.8f32, 0.2]),
+            ("close2", vec![0.8f32, 0.2]), // identical score to close1 → id tie-break
+        ] {
+            let mut e = knowledge(id, id, "q:sem");
+            e.meta.kind = KnowledgeKind::Observation;
+            e.created_at_ms = 100;
+            store.write_checked("team.knowledge", &e, "governor", true, false, false).unwrap();
+            store.store_embedding("team.knowledge", id, &vec).unwrap();
+        }
+        // An entry WITHOUT a vector: invisible to semantic mode.
+        store
+            .write_checked("team.knowledge", &knowledge("novector", "x", "q:sem"), "governor", true, false, false)
+            .unwrap();
+
+        let hits = store
+            .search_semantic("team.knowledge", "governor", true, &[0.8f32, 0.2], 10)
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|(e, _)| e.entry_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["close1", "close2", "mid", "far"],
+            "score desc then entry_id asc; unindexed 'novector' invisible"
+        );
+        let scores: Vec<f32> = hits.iter().map(|(_, s)| *s).collect();
+        assert!(scores[0] > scores[2], "perfect match beats partial");
+        // top_k bounds the result set.
+        let bounded = store
+            .search_semantic("team.knowledge", "governor", true, &[0.8f32, 0.2], 1)
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].0.entry_id, "close1");
+        // Non-owner untrusted reader is denied like any other read path.
+        assert!(matches!(
+            store.search_semantic("team.knowledge", "stranger", false, &[0.8, 0.2], 10),
+            Err(MemoryStoreError::AccessDenied { .. })
+        ));
+        // Unknown scope errors, empty vectors refused at store time.
+        assert!(store.search_semantic("ghost", "governor", true, &[1.0], 5).is_err());
+        assert!(store.store_embedding("team.knowledge", "far", &[]).is_err());
+        assert!(matches!(
+            store.store_embedding("team.knowledge", "ghost-entry", &[1.0]),
+            Err(MemoryStoreError::UnknownEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn index_status_reports_gaps_honestly() {
+        let store = store_in_memory();
+        store.register_scope(&team_scope()).unwrap();
+        store.write_checked("team.knowledge", &knowledge("i1", "a", "q:i"), "governor", true, false, false).unwrap();
+        store.write_checked("team.knowledge", &knowledge("i2", "b", "q:i"), "governor", true, false, false).unwrap();
+        assert_eq!(store.index_status("team.knowledge").unwrap(), (0, 2));
+        store.store_embedding("team.knowledge", "i1", &[1.0f32, 2.0]).unwrap();
+        assert_eq!(store.index_status("team.knowledge").unwrap(), (1, 1));
     }
 }
