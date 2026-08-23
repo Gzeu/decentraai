@@ -134,16 +134,19 @@ pub fn evaluate(
     let score = score.min(1.0);
     // Hysteresis: entering ASSIST needs ≥0.5; leaving needs ≤0.25. Between
     // the two the PREVIOUS state holds — no flapping on a noisy signal.
+    // Entry 0.35 = queue+cpu or a capability gap alone; exit 0.20 = genuinely
+    // quiet. Calibrated against REAL signals on a CPU node (queue depth +
+    // CPU load = 0.35 under sustained load, no latency signal yet).
     let (should_assist, new_state) = match state {
         AssistState::Normal => {
-            let fire = score >= 0.5;
+            let fire = score >= 0.35;
             (
                 fire,
                 if fire { AssistState::AssistRequested } else { AssistState::Normal },
             )
         }
         AssistState::AssistRequested => {
-            let still = score > 0.25;
+            let still = score > 0.20;
             (still, if still { AssistState::AssistRequested } else { AssistState::Normal })
         }
     };
@@ -231,14 +234,9 @@ mod tests {
         let mut sig = signals(10.0, 0, 10);
         sig.missing_local_capability = true;
         let (_, d) = evaluate(&sig, &t_default(), AssistState::Normal);
-        // 0.35 alone does not fire (needs 0.5) but it IS visible.
-        assert!(!d.should_assist);
-        assert!(d.score >= 0.35);
-        // Combined with mild CPU load above threshold it fires.
-        let mut sig2 = signals(91.0, 0, 10);
-        sig2.missing_local_capability = true;
-        let (_, d2) = evaluate(&sig2, &t_default(), AssistState::Normal);
-        assert!(d2.should_assist, "capability gap + CPU pressure fires");
+        // 0.35 reaches the entry threshold alone: capability gap is actionable.
+        assert!(d.should_assist, "capability gap 0.35 fires at the calibrated entry");
+        assert!((d.score - 0.35).abs() < f32::EPSILON);
     }
 
     fn t_default() -> PressureThresholds {
