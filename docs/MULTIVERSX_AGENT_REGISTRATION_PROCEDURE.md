@@ -36,7 +36,7 @@ Produced above in `data_field`. Format (source S1/S2):
 ## 4. Transaction fields you must provide
 | Field | Where from |
 |---|---|
-| receiver | Identity Registry devnet address — obtain via step 8 below |
+| receiver | **`erd1qqqqqqqqqqqqqpgqzcufga3vm5r44xe3ukzyl4dmhpsvalrkkgjqeyu68x`** — VERIFIED Identity Registry (see MULTIVERSX_DEVNET_ADDRESSES.md; re-verify via step 8 anyway) |
 | sender | your wallet address |
 | value | `0` |
 | data | `registration-prep.json → data_field` |

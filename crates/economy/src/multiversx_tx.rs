@@ -363,8 +363,8 @@ pub fn registration_preparation(
         operator_fields: vec![
             OperatorField {
                 name: "receiver",
-                value: "PENDING_VERIFIED_ADDRESS".into(),
-                note: "MX-8004 Identity Registry on devnet — fill ONLY after verifying via docs/MULTIVERSX_DEVNET_ADDRESSES.md procedure",
+                value: crate::multiversx_devnet::registry_addresses::IDENTITY.into(),
+                note: "VERIFIED Identity Registry (devnet indexer; 2 independent register_agent txs — MULTIVERSX_DEVNET_ADDRESSES.md)",
             },
             OperatorField {
                 name: "nonce",
@@ -566,11 +566,8 @@ mod tests {
         assert!(p.data_field.starts_with("register_agent@"));
         assert_eq!(p.sender_wallet_address, "erd1operator");
         // Receiver MUST be a pending placeholder — no address invented.
-        assert!(
-            p.operator_fields
-                .iter()
-                .any(|f| f.name == "receiver" && f.value == "PENDING_VERIFIED_ADDRESS")
-        );
+        assert!(p.operator_fields.iter().any(|f| f.name == "receiver"
+            && f.value == crate::multiversx_devnet::registry_addresses::IDENTITY));
         assert_eq!(p.verification_steps.len(), 5);
         // Determinism.
         let p2 = registration_preparation(
