@@ -16,11 +16,20 @@ Then visit `http://localhost:5173`.
 
 Target frame: 1440 × 1024.
 
+## Presence
+
+The first thing on screen is the Governor, not a dashboard.
+
+- Identity + online + active model
+- Current utterance
+- Product path: OBSERVING → DIAGNOSING → DELEGATING → VERIFYING
+- Then Chat (brain) or Execution (hands)
+
+`AI proposes → deterministic Rust decides → workers execute` stays visible on proposals.
+
 ## Contract
 
-`AI proposes → deterministic Rust decides → workers execute`
-
-Two primary surfaces: **Chat** (brain) and **Execution** (hands). Everything else is an inspector or a command.
+Two primary surfaces: **Chat** and **Execution**. Everything else is an inspector or a command.
 
 All data is mocked. No network calls.
 
@@ -28,22 +37,18 @@ All data is mocked. No network calls.
 
 | Key | Action |
 | --- | --- |
-| `⌘K` / `Ctrl+K` | Command palette |
+| `⌘K` / `Ctrl+K` | Ask Governor / command palette |
 | `1` | Chat |
 | `2` | Execution |
-| `Space` | Pause / resume scenario |
-| `R` | Replay latency scenario |
-| `M` | Memory inspector |
-| `E` | Evolution inspector |
-| `P` | Pause |
+| `Space` | Pause / resume |
+| `R` | Replay execution |
+| `M` | Inspect memory |
+| `E` | Research capability |
 | `Esc` | Close overlay |
 | `[` `]` | Previous / next execution event |
 
+Palette commands: Run capability, Inspect worker, Inspect memory, Run benchmark, Research capability, Replay execution, Pause execution, Open incident, Switch provider, Switch model.
+
 ## Isolation
 
-This prototype must not touch:
-
-- `crates/`
-- production configuration
-- Agent OS, MCP, Fabric, DFCP, workers
-- memory implementation or authentication
+Do not touch `crates/`, production configuration, Agent OS, MCP, Fabric, DFCP, workers, memory implementation, or authentication.

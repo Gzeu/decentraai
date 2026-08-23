@@ -5,25 +5,27 @@ Not merged. Production DecentraAI is untouched.
 
 ## 1. Visual concept
 
-An intelligent operating system, not a chatbot and not an admin dashboard.
+Governor Presence: an intelligent operating system, not a chatbot and not an admin dashboard.
 
-Obsidian field, soft white type, cool gray secondary, electric cyan as intelligence, restrained emerald for health, amber for attention, violet for research. Energy comes from state, spacing, and motion — not neon, cards, or charts.
+The first read is identity, utterance, and path. Obsidian field, soft white type, cool gray secondary, electric cyan intelligence, restrained emerald health, amber attention, violet research. Energy comes from state and motion — not neon, cards, or charts.
 
 IBM Plex Sans for UI. IBM Plex Mono only for telemetry, IDs, models, and logs.
 
 ## 2. Interaction model
 
 Chat is the Governor's brain. Execution is a live spine, not a job table.
-Inspectors slide in only when an object is selected.
-Command palette (`⌘K`) is the power-user path: surfaces, providers, models, replay, pause, cancel, memory, evolution, incident preview.
+Inspectors slide in only when asked.
+The palette is `Ask Governor...` — questions go to Chat; named commands are power controls.
 
-The state machine retunes ambient energy: IDLE breathes, ACTIVE pulses, INCIDENT is a restrained amber warning.
+Product path (fewer, calmer nodes):
+
+`OBSERVING → DIAGNOSING → DELEGATING → VERIFYING`
+
+Internal states still exist and retune ambient energy. Proposals stay proposals until a simulated Rust decision.
 
 ## 3. Component architecture
 
-Named concepts in `index.html` (ready to extract later):
-
-GovernorShell, GovernorStatus, ChatSurface, ChatMessage, ActivityCapsule, ExecutionTimeline, ExecutionEvent, ToolCall, SkillActivity, DelegationActivity, WorkerStatus, ProviderStatus, EvolutionPanel, CapabilityGap, Experiment, MemoryInspector, CommandPalette.
+GovernorShell, GovernorPresence, GovernorStatus, ChatSurface, ChatMessage, ActivityCapsule, ExecutionTimeline, ExecutionEvent, ToolCall, SkillActivity, DelegationActivity, WorkerStatus, ProviderStatus, EvolutionPanel, CapabilityGap, Experiment, MemoryInspector, CommandPalette.
 
 No imports from `crates/` or production services.
 
@@ -31,16 +33,15 @@ No imports from `crates/` or production services.
 
 Elevated Desktop inference latency → OBSERVING → THINKING → `fabric-diagnostics` → MCP `get_worker_status` → Desktop delegation → RESULT 1.8s → VERIFYING → capability gap #42 → RESEARCHING → experiment v2 vs v1 → +18% throughput → PROPOSAL to promote skill v2 → deterministic ALLOW (simulated) → LEARNING.
 
-Replay with `R` or the palette.
+Replay with `R` or Replay execution.
 
 ## 5. Design decisions
 
-- Two surfaces only. Pulse is a hairline strip, not a dashboard.
-- Proposals stay proposals until a simulated Rust decision.
-- Capsules and timeline events expand in place.
-- Memory is a typed list with confidence, not a graph.
-- Evolution is a living gap thread, not project management.
-- Desktop-first 1440×1024; inspectors become sheets on narrower widths.
+- Presence first. Pulse metrics are no longer a dashboard strip.
+- Two surfaces only. Chat / Execute sit under the utterance.
+- Capsules keep a discreet signature: MCP, Skill, Worker, Memory, Proposal.
+- State changes tempo, wash, path, and utterance weight — not layout chrome.
+- Desktop-first 1440×1024.
 
 ## 6. What should later connect to real DecentraAI APIs
 
@@ -56,12 +57,11 @@ Replay with `R` or the palette.
 
 ## 7. What should remain frontend-only
 
-- Visual system and motion
-- Surface layout and inspector chrome
+- Presence composition and motion
+- Capsule signatures
 - Command palette UX
-- Capsule / timeline presentation
 - Keyboard map
-- Mock scenario player used for demos
+- Mock scenario player
 
 ## 8. Screenshots / preview
 
@@ -70,4 +70,12 @@ The preview **is** `index.html`. Open it locally. No fabricated screenshots.
 ## 9. Recommended next iteration
 
 Keep this branch as the visual contract. Do not merge.
-When the direction is accepted, extract the component model into a real frontend and wire Chat → MCP → Execution → Fabric → Memory behind the same surfaces. Do not let operational UI regress into an admin dashboard.
+When Presence feels right, extract the component model and wire Chat → MCP → Execution → Fabric → Memory behind the same two surfaces.
+
+## Governor Presence iteration
+
+Tested in this pass, still mock-only:
+
+1. **State transitions** — IDLE breathes; OBSERVING / THINKING raise the utterance; EXECUTING / DELEGATING energize the path and spine; VERIFYING turns emerald; LEARNING turns violet; INCIDENT is restrained amber.
+2. **Execution capsules** — MCP, Skill, Worker/Delegation, Memory, Proposal each have a quiet mark and hue. No icon pack, no neon.
+3. **Command palette** — `Ask Governor...` plus Run capability, Inspect worker, Inspect memory, Run benchmark, Research capability, Replay execution, Pause execution, Open incident, Switch provider, Switch model.
