@@ -105,10 +105,7 @@ fn latency_points(mean_latency_ms: u64) -> u32 {
 
 /// Scoring for ONE candidate against the need. Pure and deterministic.
 /// Returns `Err(reason)` on hard-gate rejection.
-pub fn score_candidate(
-    candidate: &RoutedCandidate<'_>,
-    need: &RouteNeed,
-) -> Result<u32, String> {
+pub fn score_candidate(candidate: &RoutedCandidate<'_>, need: &RouteNeed) -> Result<u32, String> {
     let record = candidate.record;
 
     // ---- hard gates (rejection reasons, never penalties) ----
@@ -153,7 +150,10 @@ pub fn score_candidate(
     let mut score = claim.effective_strength() * 2;
 
     let (quality, latency) = match candidate.observed {
-        Some(o) => (u32::from(o.success_percent) * 3, latency_points(o.mean_latency_ms)),
+        Some(o) => (
+            u32::from(o.success_percent) * 3,
+            latency_points(o.mean_latency_ms),
+        ),
         None => (COLD_START_QUALITY_POINTS, COLD_START_LATENCY_POINTS),
     };
     score += quality + latency;
@@ -172,14 +172,10 @@ pub fn score_candidate(
     // Resource pressure bites PROPORTIONALLY TO FOOTPRINT: a 3 GiB model
     // under 95 % RAM pressure loses far more than a 0.5 GiB one — pressure
     // is exactly when small models shine. Integer math only.
-    let footprint_gb = u32::try_from(
-        record.hardware.ram_needed_bytes / (1024 * 1024 * 1024),
-    )
-    .unwrap_or(u32::MAX);
-    let pressure_penalty = u32::from(candidate.ram_pressure_percent)
-        * footprint_gb.min(8)
-        * 15
-        / 100;
+    let footprint_gb =
+        u32::try_from(record.hardware.ram_needed_bytes / (1024 * 1024 * 1024)).unwrap_or(u32::MAX);
+    let pressure_penalty =
+        u32::from(candidate.ram_pressure_percent) * footprint_gb.min(8) * 15 / 100;
     score = score.saturating_sub(pressure_penalty);
 
     Ok(score)
@@ -189,10 +185,7 @@ pub fn score_candidate(
 /// score second, id-ascending tie-break. Produces a primary selection and
 /// ordered fallbacks — the caller still goes through the planner's
 /// reservation machinery; nothing here bypasses policy.
-pub fn route<'a>(
-    candidates: &[RoutedCandidate<'a>],
-    need: &RouteNeed,
-) -> RoutingDecision {
+pub fn route<'a>(candidates: &[RoutedCandidate<'a>], need: &RouteNeed) -> RoutingDecision {
     let mut scored: Vec<(u32, &str)> = Vec::new();
     let mut rejections = Vec::new();
 
@@ -222,11 +215,15 @@ pub fn route<'a>(
 mod tests {
     use super::*;
     use decentraai_hub::model_intel::{
-        CapabilityClaim, GovernanceStage, HardwareRequirements, ModelIntelRecord,
-        seed_model_colony,
+        CapabilityClaim, GovernanceStage, HardwareRequirements, ModelIntelRecord, seed_model_colony,
     };
 
-    fn record(id: &str, cap: CapabilityKind, ctx: u32, governance: GovernanceStage) -> ModelIntelRecord {
+    fn record(
+        id: &str,
+        cap: CapabilityKind,
+        ctx: u32,
+        governance: GovernanceStage,
+    ) -> ModelIntelRecord {
         ModelIntelRecord {
             model_id: id.into(),
             provider: "local".into(),
@@ -236,7 +233,10 @@ mod tests {
             capabilities: vec![CapabilityClaim::inferred(cap, 75)],
             romanian_strength: 50,
             version: "v1".into(),
-            hardware: HardwareRequirements { ram_needed_bytes: 3_221_225_472, min_free_ram_bytes: 2_147_483_648 },
+            hardware: HardwareRequirements {
+                ram_needed_bytes: 3_221_225_472,
+                min_free_ram_bytes: 2_147_483_648,
+            },
             governance,
         }
     }
@@ -267,8 +267,9 @@ mod tests {
         let d = route(&candidates, &NEED);
         assert!(d.selected.is_none());
         assert!(
-            d.rejections.iter().any(|r| r.model_id == "gemma-3-1b-q4"
-                && r.reason.contains("not claimed")),
+            d.rejections
+                .iter()
+                .any(|r| r.model_id == "gemma-3-1b-q4" && r.reason.contains("not claimed")),
             "missing capability is a rejection"
         );
 
@@ -276,19 +277,38 @@ mod tests {
         candidates.push(cand(qwen, AvailabilityState::Available));
         let d = route(&candidates, &NEED);
         assert!(d.selected.is_none());
-        assert!(d.rejections.iter().any(|r| r.reason.contains("cannot serve production")));
+        assert!(
+            d.rejections
+                .iter()
+                .any(|r| r.reason.contains("cannot serve production"))
+        );
 
         // Approved + capable but UNAVAILABLE: availability gate rejects.
-        let reasoning_approved =
-            ModelIntelRecord { governance: GovernanceStage::Approved, ..qwen.clone() };
+        let reasoning_approved = ModelIntelRecord {
+            governance: GovernanceStage::Approved,
+            ..qwen.clone()
+        };
         candidates.push(cand(&reasoning_approved, AvailabilityState::Unavailable));
         let d = route(&candidates, &NEED);
-        assert!(d.rejections.iter().any(|r| r.reason.contains("unavailable")));
+        assert!(
+            d.rejections
+                .iter()
+                .any(|r| r.reason.contains("unavailable"))
+        );
 
         // Context gate: require more than any seed provides.
-        let huge_ctx_need = RouteNeed { min_context_tokens: 100_000, ..NEED };
-        let approved_qwen = ModelIntelRecord { governance: GovernanceStage::Approved, ..qwen.clone() };
-        let d = route(&[cand(&approved_qwen, AvailabilityState::Available)], &huge_ctx_need);
+        let huge_ctx_need = RouteNeed {
+            min_context_tokens: 100_000,
+            ..NEED
+        };
+        let approved_qwen = ModelIntelRecord {
+            governance: GovernanceStage::Approved,
+            ..qwen.clone()
+        };
+        let d = route(
+            &[cand(&approved_qwen, AvailabilityState::Available)],
+            &huge_ctx_need,
+        );
         assert!(d.rejections.iter().any(|r| r.reason.contains("context")));
     }
 
@@ -296,10 +316,19 @@ mod tests {
     fn traffic_classes_match_governance_stages_exactly() {
         let reg = seed_model_colony();
         let qwen = reg.get("qwen3-1.7b-q4").unwrap();
-        let shadow_rec = ModelIntelRecord { governance: GovernanceStage::Shadow, ..qwen.clone() };
+        let shadow_rec = ModelIntelRecord {
+            governance: GovernanceStage::Shadow,
+            ..qwen.clone()
+        };
 
-        let shadow_need = RouteNeed { traffic: TrafficClass::Shadow, ..NEED };
-        let d = route(&[cand(&shadow_rec, AvailabilityState::Available)], &shadow_need);
+        let shadow_need = RouteNeed {
+            traffic: TrafficClass::Shadow,
+            ..NEED
+        };
+        let d = route(
+            &[cand(&shadow_rec, AvailabilityState::Available)],
+            &shadow_need,
+        );
         assert_eq!(d.selected.as_deref(), Some("qwen3-1.7b-q4"));
 
         // A shadow-stage model canNOT take production even though capable.
@@ -307,9 +336,18 @@ mod tests {
         assert!(d.selected.is_none());
 
         // Rejected models are benchmark-invisible too.
-        let rejected = ModelIntelRecord { governance: GovernanceStage::Rejected, ..qwen.clone() };
-        let bench_need = RouteNeed { traffic: TrafficClass::Benchmark, ..NEED };
-        let d = route(&[cand(&rejected, AvailabilityState::Available)], &bench_need);
+        let rejected = ModelIntelRecord {
+            governance: GovernanceStage::Rejected,
+            ..qwen.clone()
+        };
+        let bench_need = RouteNeed {
+            traffic: TrafficClass::Benchmark,
+            ..NEED
+        };
+        let d = route(
+            &[cand(&rejected, AvailabilityState::Available)],
+            &bench_need,
+        );
         assert!(d.selected.is_none());
     }
 
@@ -329,7 +367,10 @@ mod tests {
         let observed = RoutedCandidate {
             record: &gemma,
             availability: AvailabilityState::Available,
-            observed: Some(ObservedPerformance { success_percent: 60, mean_latency_ms: 400 }),
+            observed: Some(ObservedPerformance {
+                success_percent: 60,
+                mean_latency_ms: 400,
+            }),
             ram_pressure_percent: 30,
         };
         let cold = cand(&qwen, AvailabilityState::Available);
@@ -339,13 +380,27 @@ mod tests {
         // Qwen's inferred claim strength (75) exceeds Gemma's raw (60):
         // effective 120×2 + 180+130 vs 150×2 + cold floors.
         assert_eq!(d.selected.as_deref(), Some("gemma-3-1b-q4"));
-        assert_eq!(d.fallbacks, vec!["qwen3-1.7b-q4"], "ordered fallback exists");
+        assert_eq!(
+            d.fallbacks,
+            vec!["qwen3-1.7b-q4"],
+            "ordered fallback exists"
+        );
     }
 
     #[test]
     fn ties_break_by_model_id_ascending_and_routing_is_pure() {
-        let a = record("alpha", CapabilityKind::Reasoning, 8192, GovernanceStage::Approved);
-        let b = record("beta", CapabilityKind::Reasoning, 8192, GovernanceStage::Approved);
+        let a = record(
+            "alpha",
+            CapabilityKind::Reasoning,
+            8192,
+            GovernanceStage::Approved,
+        );
+        let b = record(
+            "beta",
+            CapabilityKind::Reasoning,
+            8192,
+            GovernanceStage::Approved,
+        );
         let ca = cand(&a, AvailabilityState::Available);
         let cb = cand(&b, AvailabilityState::Available);
 
@@ -358,11 +413,24 @@ mod tests {
 
     #[test]
     fn degraded_and_pressure_shift_the_order_deterministically() {
-        let big = record("big-model", CapabilityKind::Reasoning, 8192, GovernanceStage::Approved);
+        let big = record(
+            "big-model",
+            CapabilityKind::Reasoning,
+            8192,
+            GovernanceStage::Approved,
+        );
         let small = ModelIntelRecord {
             model_id: "small-model".into(),
-            hardware: HardwareRequirements { ram_needed_bytes: 512 * 1024 * 1024, min_free_ram_bytes: 2_147_483_648 },
-            ..record("x", CapabilityKind::Reasoning, 8192, GovernanceStage::Approved)
+            hardware: HardwareRequirements {
+                ram_needed_bytes: 512 * 1024 * 1024,
+                min_free_ram_bytes: 2_147_483_648,
+            },
+            ..record(
+                "x",
+                CapabilityKind::Reasoning,
+                8192,
+                GovernanceStage::Approved,
+            )
         };
         let mut small = small;
         small.model_id = "small-model".into();
@@ -377,7 +445,11 @@ mod tests {
             }
         }
         let d = route(&[high_pressure(&big), high_pressure(&small)], &NEED);
-        assert_eq!(d.selected.as_deref(), Some("small-model"), "pressure favors small footprints");
+        assert_eq!(
+            d.selected.as_deref(),
+            Some("small-model"),
+            "pressure favors small footprints"
+        );
 
         // Degraded health penalizes but does not reject.
         let degraded_big = RoutedCandidate {

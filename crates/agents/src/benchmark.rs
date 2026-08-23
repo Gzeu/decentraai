@@ -446,8 +446,7 @@ pub fn compare_shadow_models(
     production: &ModeAggregate,
     candidate: &ModeAggregate,
 ) -> (ShadowRecommendation, String) {
-    let enough =
-        production.graded >= SHADOW_MIN_SAMPLES && candidate.graded >= SHADOW_MIN_SAMPLES;
+    let enough = production.graded >= SHADOW_MIN_SAMPLES && candidate.graded >= SHADOW_MIN_SAMPLES;
     if !enough {
         return (
             ShadowRecommendation::InsufficientEvidence,

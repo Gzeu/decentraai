@@ -25,9 +25,7 @@
 //!   same numbers, always.
 
 use crate::agent_memory::MemoryStore;
-use decentraai_agents::memory::{
-    KnowledgeKind, MemoryEntry, MemoryProvenance, MemoryStatus,
-};
+use decentraai_agents::memory::{KnowledgeKind, MemoryEntry, MemoryProvenance, MemoryStatus};
 use decentraai_hub::capability::Provenance;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -72,12 +70,9 @@ pub fn ensure_scope(store: &MemoryStore) -> Result<(), ObservationError> {
             access: MemoryAccess::TeamOnly,
             ..MemoryPolicy::default()
         };
-        store.register_scope(&MemoryScope::new(
-            MODEL_INTEL_SCOPE,
-            "governor",
-            MemoryLevel::Team,
-        )
-        .with_policy(policy))?;
+        store.register_scope(
+            &MemoryScope::new(MODEL_INTEL_SCOPE, "governor", MemoryLevel::Team).with_policy(policy),
+        )?;
     }
     Ok(())
 }
@@ -100,9 +95,15 @@ pub fn record_observation(
         "model={} task={} success={} latency_ms={}",
         obs.model_id, obs.task_id, obs.success, obs.latency_ms
     );
-    let mut entry = MemoryEntry::new(&entry_id, MODEL_INTEL_SCOPE, "model-intel", "local", &content)
-        .with_kind(KnowledgeKind::ModelEvaluation)
-        .with_subject(format!("model:{}:{}", obs.model_id, obs.task_id));
+    let mut entry = MemoryEntry::new(
+        &entry_id,
+        MODEL_INTEL_SCOPE,
+        "model-intel",
+        "local",
+        &content,
+    )
+    .with_kind(KnowledgeKind::ModelEvaluation)
+    .with_subject(format!("model:{}:{}", obs.model_id, obs.task_id));
     entry.created_at_ms = now_ms();
     // Verified ON ARRIVAL: the caller had to produce an evidence reference;
     // the store still enforces its own gates and dedup.
@@ -146,7 +147,10 @@ pub struct TaskPerformance {
 }
 
 /// Aggregates ALL verified observations for one model from the intel scope.
-pub fn aggregate_model(store: &MemoryStore, model_id: &str) -> Result<PerformanceSummary, ObservationError> {
+pub fn aggregate_model(
+    store: &MemoryStore,
+    model_id: &str,
+) -> Result<PerformanceSummary, ObservationError> {
     let entries = store.read(MODEL_INTEL_SCOPE, "governor", true)?;
     let prefix = format!("model={model_id} ");
     let mut summary = PerformanceSummary {
@@ -215,7 +219,7 @@ pub fn aggregate_model(store: &MemoryStore, model_id: &str) -> Result<Performanc
 }
 
 fn percent(part: u32, total: u32) -> u32 {
-    if total == 0 { 0 } else { part * 100 / total }
+    (part * 100).checked_div(total).unwrap_or(0)
 }
 
 fn now_ms() -> u64 {
@@ -262,11 +266,17 @@ mod tests {
         assert_eq!(sum.success_percent, 75);
         assert_eq!(sum.mean_latency_ms, 825);
         let dfcp = sum.per_task.get("mi_dfcp_order").unwrap();
-        assert_eq!((dfcp.attempts, dfcp.successes, dfcp.success_percent), (3, 2, 66));
+        assert_eq!(
+            (dfcp.attempts, dfcp.successes, dfcp.success_percent),
+            (3, 2, 66)
+        );
         assert_eq!(dfcp.mean_latency_ms, 966);
         // Another model has nothing — honest zeros, not fabricated data.
         let empty = aggregate_model(&s, "gemma-3-1b-q4").unwrap();
-        assert_eq!((empty.samples, empty.success_percent, empty.mean_latency_ms), (0, 0, 0));
+        assert_eq!(
+            (empty.samples, empty.success_percent, empty.mean_latency_ms),
+            (0, 0, 0)
+        );
         // Same state → identical aggregation bytes.
         let again = aggregate_model(&s, "qwen3-1.7b-q4").unwrap();
         assert_eq!(sum, again);

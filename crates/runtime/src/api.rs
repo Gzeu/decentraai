@@ -8548,12 +8548,12 @@ async fn models_intel_handler(State(state): State<ApiState>, headers: HeaderMap)
     let mut rows = Vec::new();
     for record in registry.all() {
         // Honest availability: we only KNOW about the loaded engine.
-        let availability = if normalize_model_name(&active) == normalize_model_name(&record.model_id)
-        {
-            "available"
-        } else {
-            "unavailable"
-        };
+        let availability =
+            if normalize_model_name(&active) == normalize_model_name(&record.model_id) {
+                "available"
+            } else {
+                "unavailable"
+            };
         let observed = state.memory.as_ref().and_then(|m| {
             decentraai_distributed::model_performance::aggregate_model(m, &record.model_id).ok()
         });
@@ -8576,13 +8576,15 @@ async fn models_intel_handler(State(state): State<ApiState>, headers: HeaderMap)
             "advisory": true,
             "invariant": "AI proposes -> deterministic policy decides -> workers execute",
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 fn normalize_model_name(name: &str) -> String {
     name.to_lowercase()
         .replace(['.', '_', ' '], "-")
-        .trim_matches('-').to_string()
+        .trim_matches('-')
+        .to_string()
 }
 
 /// POST /v1/models/route — DRY-RUN routing projection (operator+).
@@ -8597,36 +8599,59 @@ async fn models_route_handler(
     body: axum::Json<serde_json::Value>,
 ) -> Response {
     use decentraai_fabric::model_routing::{
-        route, ObservedPerformance, RouteNeed, RoutedCandidate, TrafficClass,
+        ObservedPerformance, RouteNeed, RoutedCandidate, TrafficClass, route,
     };
     use decentraai_hub::model_intel::AvailabilityState;
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
     let Some(cap_str) = body.0.get("capability").and_then(|v| v.as_str()) else {
-        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
-            "error": "capability is required"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "capability is required"
+            })),
+        )
+            .into_response();
     };
     let Some(required) = serde_json::from_value::<decentraai_hub::capability::CapabilityKind>(
         serde_json::Value::String(cap_str.to_string()),
     )
     .ok() else {
-        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
-            "error": format!("unknown capability '{cap_str}'; see hub taxonomy")
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": format!("unknown capability '{cap_str}'; see hub taxonomy")
+            })),
+        )
+            .into_response();
     };
-    let traffic = match body.0.get("traffic").and_then(|v| v.as_str()).unwrap_or("production") {
-        "production" => TrafficClass::Production,
-        "shadow" => TrafficClass::Shadow,
-        "benchmark" => TrafficClass::Benchmark,
-        other => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
-            "error": format!("traffic must be production|shadow|benchmark, got '{other}'")
-        }))).into_response(),
-    };
+    let traffic =
+        match body
+            .0
+            .get("traffic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("production")
+        {
+            "production" => TrafficClass::Production,
+            "shadow" => TrafficClass::Shadow,
+            "benchmark" => TrafficClass::Benchmark,
+            other => return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": format!("traffic must be production|shadow|benchmark, got '{other}'")
+                })),
+            )
+                .into_response(),
+        };
     let need = RouteNeed {
         required,
-        min_context_tokens: body.0.get("min_context_tokens").and_then(|v| v.as_u64()).unwrap_or(4096).min(u32::MAX as u64) as u32,
+        min_context_tokens: body
+            .0
+            .get("min_context_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4096)
+            .min(u32::MAX as u64) as u32,
         traffic,
     };
 

@@ -22,10 +22,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod capability;
-pub mod model_intel;
 pub mod catalog;
 pub mod download;
 pub mod intent;
+pub mod model_intel;
 pub mod requirements;
 
 pub use capability::{CapabilityClaim, CapabilityKind, ModelCapabilities, Provenance};

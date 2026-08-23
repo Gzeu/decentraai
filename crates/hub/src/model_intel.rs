@@ -111,7 +111,10 @@ impl HardwareRequirements {
     /// Whether a node with these memory numbers fits this model.
     /// Pure function — same inputs, same verdict, always.
     pub fn fits(&self, total_ram_bytes: u64, available_ram_bytes: u64) -> bool {
-        available_ram_bytes >= self.ram_needed_bytes.saturating_add(self.min_free_ram_bytes)
+        available_ram_bytes
+            >= self
+                .ram_needed_bytes
+                .saturating_add(self.min_free_ram_bytes)
             && total_ram_bytes >= self.ram_needed_bytes
     }
 }
@@ -384,18 +387,30 @@ mod tests {
         // Revocation from anywhere pre-approved + from approved itself.
         assert!(can_transition_governance(Approved, Rejected));
         // Illegal jumps.
-        assert!(!can_transition_governance(Experimental, Approved), "no skipping evidence stages");
+        assert!(
+            !can_transition_governance(Experimental, Approved),
+            "no skipping evidence stages"
+        );
         assert!(!can_transition_governance(Experimental, Candidate));
         assert!(!can_transition_governance(Shadow, Approved));
-        assert!(!can_transition_governance(Candidate, Shadow), "no demotion churn");
-        assert!(!can_transition_governance(Rejected, Experimental), "rejected is terminal");
+        assert!(
+            !can_transition_governance(Candidate, Shadow),
+            "no demotion churn"
+        );
+        assert!(
+            !can_transition_governance(Rejected, Experimental),
+            "rejected is terminal"
+        );
         assert!(!can_transition_governance(Approved, Candidate));
 
         // Traffic-class helpers.
         assert!(GovernanceStage::Approved.serves_production());
         assert!(!GovernanceStage::Shadow.serves_production());
         assert!(GovernanceStage::Candidate.receives_shadow());
-        assert!(!GovernanceStage::Approved.receives_shadow(), "approved IS production, not shadow");
+        assert!(
+            !GovernanceStage::Approved.receives_shadow(),
+            "approved IS production, not shadow"
+        );
         assert!(!GovernanceStage::Rejected.may_benchmark());
         assert!(GovernanceStage::Experimental.may_benchmark());
     }
@@ -430,14 +445,13 @@ mod tests {
         let all = reg.all();
         // Sorted by id — deterministic.
         let ids: Vec<&str> = all.iter().map(|m| m.model_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["gemma-3-1b-q4", "phi-4-mini-q4", "qwen3-1.7b-q4"]
-        );
+        assert_eq!(ids, vec!["gemma-3-1b-q4", "phi-4-mini-q4", "qwen3-1.7b-q4"]);
         for m in &all {
             assert_eq!(m.governance, GovernanceStage::Experimental);
             assert!(
-                m.capabilities.iter().all(|c| c.provenance == Provenance::Inferred),
+                m.capabilities
+                    .iter()
+                    .all(|c| c.provenance == Provenance::Inferred),
                 "{}: seeds start INFERRED",
                 m.model_id
             );
@@ -458,14 +472,18 @@ mod tests {
     #[test]
     fn registry_transition_updates_record_and_validates() {
         let mut reg = seed_model_colony();
-        reg.transition_governance("gemma-3-1b-q4", GovernanceStage::Shadow).unwrap();
+        reg.transition_governance("gemma-3-1b-q4", GovernanceStage::Shadow)
+            .unwrap();
         assert_eq!(
             reg.get("gemma-3-1b-q4").unwrap().governance,
             GovernanceStage::Shadow
         );
         // Illegal jump errors and leaves state untouched.
         let err = reg.transition_governance("gemma-3-1b-q4", GovernanceStage::Approved);
-        assert!(matches!(err, Err(ModelIntelError::InvalidTransition { .. })));
+        assert!(matches!(
+            err,
+            Err(ModelIntelError::InvalidTransition { .. })
+        ));
         assert_eq!(
             reg.get("gemma-3-1b-q4").unwrap().governance,
             GovernanceStage::Shadow
