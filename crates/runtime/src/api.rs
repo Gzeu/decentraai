@@ -5923,12 +5923,32 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             return forbidden("no spendable quota for this consumer account");
         };
         // Execute via embeddings path if available, otherwise stub.
-        let result = serde_json::json!({
-            "capability": "embeddings",
-            "input_chars": input.chars().count(),
-            "note": "embeddings via fabric — stub for M16, wire to local model in M16.1",
-            "available": state.embedding.is_some() || state.skills.is_some(),
-        });
+        // Try real embedding client first; fall back to stub with proper note.
+        let result = if let Some(client) = &state.embedding {
+            match client.embed(&input).await {
+                Ok(vec) => serde_json::json!({
+                    "capability": "embeddings",
+                    "input": input.chars().take(100).collect::<String>(),
+                    "embedding": vec.iter().take(8).collect::<Vec<_>>(),
+                    "dimensions": vec.len(),
+                    "truncated": vec.len() > 8,
+                }),
+                Err(e) => serde_json::json!({
+                    "capability": "embeddings",
+                    "input_chars": input.chars().count(),
+                    "error": e.to_string(),
+                    "note": "embedding client error — check model availability",
+                }),
+            }
+        } else {
+            serde_json::json!({
+                "capability": "embeddings",
+                "input_chars": input.chars().count(),
+                "note": "embeddings via fabric — stub (no embedding model loaded on this node)",
+                "available": state.skills.is_some(),
+                "hint": "Load an embedding model (e.g. nomic-embed) or use compute_request to offload to a capable worker",
+            })
+        };
         guard.settle(1);
         state.note_token_usage(auth, 1);
         // Return directly (bypass generic handle_message which would look for tool in McpContext)
@@ -6037,8 +6057,36 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
             "body": payload,
         });
-    } else if raw.contains("\"method\":\"tools/list\"")
-        || raw.contains("\"method\":\"initialize\"")
+    } else if raw.contains("\"method\":\"tools/list\"") {
+        // RBAC-filtered tool list: consumer sees only tools matching its scopes.
+        let response = crate::mcp::handle_message(&ctx, &raw);
+        if let Some(mut json) = response {
+            if let Some(result) = json.get_mut("result") {
+                if let Some(tools) = result.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                    tools.retain(|t| {
+                        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        match name {
+                            "decide" | "execute_decision" => true,
+                            "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings" || s == "inference" || s == "*"),
+                            "decentraai_compute_request" => scopes.iter().any(|s| s == "compute" || s == "inference" || s == "*"),
+                            "serve_model" | "pull_model" | "list_consumer_keys" | "get_compensation" => false,
+                            _ => true,
+                        }
+                    });
+                }
+            }
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&json).unwrap_or_default(),
+            )
+                .into_response();
+        }
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&serde_json::json!({})).unwrap_or_default(),
+        )
+            .into_response();
+    } else if raw.contains("\"method\":\"initialize\"")
         || raw.contains("\"method\":\"ping\"")
         || raw.contains("\"method\":\"notifications/initialized\"")
     {
@@ -7704,6 +7752,23 @@ async fn agents_onboard_handler(
     if capabilities.len() > 8 {
         capabilities.truncate(8);
     }
+    // Expiry: optional, clamped to max_expiry_seconds
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut expires_at: Option<u64> = body.0.get("expires_at").and_then(|v| v.as_u64())
+        .or_else(|| body.0.get("expires_in").and_then(|v| v.as_u64()).map(|secs| now + secs))
+        .or_else(|| body.0.get("expires").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()));
+    if let Some(exp) = expires_at {
+        if cfg.max_expiry_seconds > 0 && exp > now + cfg.max_expiry_seconds {
+            expires_at = Some(now + cfg.max_expiry_seconds);
+        }
+        if exp <= now {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "expires_at must be in the future"})),
+            )
+                .into_response();
+        }
+    }
     let owner_account = format!("agent:{}", agent_name);
     let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
         Ok(s) => s,
@@ -7715,7 +7780,7 @@ async fn agents_onboard_handler(
                 .into_response();
         }
     };
-    let plaintext = match store.create(&owner_account, quota, rate, scopes.clone()) {
+    let plaintext = match store.create_with_expiry(&owner_account, quota, rate, scopes.clone(), expires_at) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -7738,6 +7803,7 @@ async fn agents_onboard_handler(
                 "capabilities": capabilities,
                 "quota_ceiling": quota,
                 "rate_limit": rate,
+                "expires_at": rec.expires_at,
             }),
         );
         return (
@@ -7750,6 +7816,7 @@ async fn agents_onboard_handler(
                 "scopes": scopes,
                 "capabilities": capabilities,
                 "quota": {"quota_ceiling": quota, "rate_limit": rate},
+                "expires_at": rec.expires_at,
                 "endpoints": {
                     "openai": "/v1/chat/completions",
                     "mcp": "/mcp"

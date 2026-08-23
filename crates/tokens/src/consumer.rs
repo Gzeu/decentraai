@@ -80,6 +80,10 @@ pub struct ConsumerKeyRecord {
     /// explicit, inspectable field so scope policy can be enforced without a
     /// schema change.
     pub scopes: Vec<String>,
+    /// Optional expiry Unix seconds; `None` = never expires. Enforced at auth
+    /// time — an expired key stops authenticating like a revoked one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +169,19 @@ impl ConsumerKeyStore {
         rate_limit_per_minute: u32,
         scopes: Vec<String>,
     ) -> Result<String> {
+        self.create_with_expiry(owner_account, quota_ceiling, rate_limit_per_minute, scopes, None)
+    }
+
+    /// Same as `create` but with optional expiry. `expires_at` is Unix seconds;
+    /// `None` = never expires. Past expiry is rejected at creation time.
+    pub fn create_with_expiry(
+        &mut self,
+        owner_account: &str,
+        quota_ceiling: u64,
+        rate_limit_per_minute: u32,
+        scopes: Vec<String>,
+        expires_at: Option<u64>,
+    ) -> Result<String> {
         let owner_account = owner_account.trim();
         if owner_account.is_empty() {
             bail!("owner account must not be empty");
@@ -174,6 +191,11 @@ impl ConsumerKeyStore {
         }
         if rate_limit_per_minute == 0 {
             bail!("rate_limit_per_minute must be > 0");
+        }
+        if let Some(exp) = expires_at {
+            if exp <= now_secs() {
+                bail!("expires_at must be in the future");
+            }
         }
         let mut bytes = [0u8; 32];
         rand_core::OsRng.fill_bytes(&mut bytes);
@@ -189,6 +211,7 @@ impl ConsumerKeyStore {
             quota_ceiling,
             rate_limit_per_minute,
             scopes,
+            expires_at,
         };
         let hash = hash_key(&plaintext);
         self.keys.insert(hash, record);
@@ -196,10 +219,28 @@ impl ConsumerKeyStore {
         Ok(plaintext)
     }
 
-    /// Resolves a plaintext key to its record, if active (not revoked). A
-    /// revoked key does not resolve, so a stolen/revoked secret stops working.
+    /// Resolves a plaintext key to its record, if active (not revoked, not expired).
     pub fn lookup(&self, plaintext: &str) -> Option<&ConsumerKeyRecord> {
-        self.keys.get(&hash_key(plaintext)).filter(|r| !r.revoked)
+        self.keys.get(&hash_key(plaintext)).filter(|r| {
+            if r.revoked {
+                return false;
+            }
+            if let Some(exp) = r.expires_at {
+                if now_secs() >= exp {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    /// Whether a key is expired (for audit/status display).
+    pub fn is_expired(&self, record: &ConsumerKeyRecord) -> bool {
+        if let Some(exp) = record.expires_at {
+            now_secs() >= exp
+        } else {
+            false
+        }
     }
 
     /// Marks a key as used (updates `last_used_at`), if it exists. Best-effort

@@ -327,6 +327,45 @@ impl ConfiguredProvider {
     }
 }
 
+/// Governor auto-routing: task classification → provider selection.
+/// Cheap/fast/private tasks stay local; complex reasoning goes external
+/// when available, with fallback to local on failure.
+/// Never panics; defaults to local when nothing else is available.
+pub fn governor_select_provider(
+    task: &str,
+    local_available: bool,
+    external_available: bool,
+) -> ProviderKind {
+    if !local_available && !external_available {
+        return ProviderKind::Local;
+    }
+    if !external_available {
+        return ProviderKind::Local;
+    }
+    if !local_available {
+        return ProviderKind::External;
+    }
+    // Both available: classify by complexity.
+    let lower = task.to_lowercase();
+    let complex_keywords = [
+        "reasoning",
+        "analysis",
+        "complex",
+        "research",
+        "architecture",
+        "planning",
+        "code review",
+        "security",
+    ];
+    let is_complex = lower.len() > 500
+        || complex_keywords.iter().any(|k| lower.contains(k));
+    if is_complex {
+        ProviderKind::External
+    } else {
+        ProviderKind::Local
+    }
+}
+
 /// Builds the artifact-size policy hint embedded in status responses: the
 /// intelligence layer may RECOMMEND models, and recommendations must respect
 /// the same hard limit the provisioning pipeline enforces.
@@ -408,5 +447,33 @@ mod tests {
             Err(ProviderError::AuthMissing(name)) => assert_eq!(name, var),
             other => panic!("expected AuthMissing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn governor_auto_routing_prefers_local_for_simple_and_external_for_complex() {
+        // Simple/cheap tasks stay local; complex reasoning goes external when available.
+        assert_eq!(
+            governor_select_provider("hi", true, true),
+            ProviderKind::Local
+        );
+        assert_eq!(
+            governor_select_provider("complex reasoning analysis for architecture planning", true, true),
+            ProviderKind::External
+        );
+        // Fallback when only one provider is available.
+        assert_eq!(
+            governor_select_provider("hi", false, true),
+            ProviderKind::External
+        );
+        assert_eq!(
+            governor_select_provider("complex task", true, false),
+            ProviderKind::Local
+        );
+        // Long task (>500 chars) is considered complex.
+        let long = "a".repeat(600);
+        assert_eq!(
+            governor_select_provider(&long, true, true),
+            ProviderKind::External
+        );
     }
 }
