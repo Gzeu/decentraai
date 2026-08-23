@@ -28,6 +28,17 @@ method:  same receiver across THREE distinct functions (submit_proof,
 example tx hash: 09b7b9abf2bb1dad… (submit_proof)
 ```
 
+### On-chain corroboration (gateway /address probe, 2026-08-24)
+All three addresses return `codeHash` present = deployed smart contracts:
+| Registry | codeHash present | Owner |
+|---|---|---|
+| Identity | ✅ | `erd1c83tgujs47scafsu7kyt…` |
+| Validation | ✅ | `erd1qyu5wthldzr8wx5c9ucg…` |
+| Reputation | ✅ | `erd1qyu5wthldzr8wx5c9ucg…` (SAME deployer as Validation → same MX-8004 deployment family) |
+
+Reputation status upgraded PARTIALLY → **VERIFIED** (args match spec +
+same-deployer corroboration with the two fully corroborated registries).
+
 ### Reputation Registry — PARTIALLY VERIFIED (single success observed)
 ```
 address: erd1qqqqqqqqqqqqqpgqwhqpuzkrywc5j8q2ec6skqnejtzgjnzad8ssdmv962
