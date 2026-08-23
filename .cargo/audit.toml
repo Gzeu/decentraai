@@ -1,0 +1,18 @@
+# cargo-audit configuration
+# Each ignored advisory documents WHY it cannot be fixed today and WHEN to
+# revisit. Ignoring is a recorded decision, never a silent silencer.
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2: no fixed upgrade exists upstream; transitive via
+    # libp2p-mdns 0.48 (libp2p 0.56). Revisit when libp2p ships mdns against
+    # hickory-proto >= 0.26.
+    "RUSTSEC-2026-0118",
+    # fix needs hickory-proto >= 0.26.1 but latest libp2p 0.56.0 still pins
+    # 0.25.x — blocked upstream, not by us. Revisit at the next libp2p release.
+    "RUSTSEC-2026-0119",
+    # async-std unmaintained — DEV-only via httpmock test harness; unreachable
+    # from production binaries.
+    "RUSTSEC-2025-0052",
+    # paste unmaintained — macro-only transitive via if-watch <- libp2p-mdns.
+    "RUSTSEC-2024-0436",
+]
