@@ -5055,6 +5055,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/memory", get(memory_handler))
         .route("/v1/memory/search", post(memory_search_handler))
         .route("/v1/memory/transition", post(memory_transition_handler))
+        .route("/v1/memory/index", post(memory_index_handler))
+        .route("/v1/memory/sync-to", post(memory_sync_to_handler))
         .route(
             "/v1/memory/training-candidates",
             get(memory_training_candidates_handler),
@@ -8129,20 +8131,18 @@ async fn intel_status_handler(State(state): State<ApiState>, headers: HeaderMap)
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-/// POST /v1/memory/search — search collective memory by content keywords.
-/// Operator+. Body: {"scope":"...", "query":"..."} or {"query":"..."} to
-/// search all accessible scopes. Returns matching entries with full
-/// provenance (kind, lifecycle status, version, evidence backing).
-///
-/// Retrieved memory is UNTRUSTED INPUT by contract: consumers (governor,
-/// agents) must treat it as advisory context — it never bypasses the
-/// deterministic policy layer. The response carries `"untrusted_input": true`
-/// to make that explicit at every call site.
+/// POST /v1/memory/search — search collective memory.
+/// Operator+. Body: {"query":"…", "scope"?, "kind"?, "min_status"?,
+/// "mode"?: "auto"|"semantic"|"lexical", "top_k"?: 1..=64}.
+/// "auto" (default) uses the embeddings backend when attached and degrades
+/// to lexical on any failure; explicit "semantic" fails loudly instead of
+/// degrading silently. Retrieved memory is UNTRUSTED INPUT by contract.
 async fn memory_search_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: axum::Json<serde_json::Value>,
 ) -> Response {
+    use decentraai_agents::memory::MemoryStatus;
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -8160,60 +8160,169 @@ async fn memory_search_handler(
         .0
         .get("min_status")
         .and_then(|v| v.as_str())
-        .and_then(|s| serde_json::from_value::<decentraai_agents::memory::MemoryStatus>(
-            serde_json::Value::String(s.to_string()),
-        )
-        .ok())
+        .and_then(|s| serde_json::from_value::<MemoryStatus>(serde_json::Value::String(s.to_string())).ok())
         .map(|st| st.strength());
+    let mode = body.0.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+    if !matches!(mode, "auto" | "semantic" | "lexical") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "mode must be auto|semantic|lexical"})),
+        ).into_response();
+    }
+    let top_k = body
+        .0
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .map(|k| k.min(64) as usize)
+        .unwrap_or(16);
     if query.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "query must not be empty"})),
         ).into_response();
     }
+    let visible_scopes = || -> Vec<decentraai_agents::memory::MemoryScope> {
+        memory
+            .list_scopes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| scope_filter.as_ref().is_none_or(|f| &s.name == f))
+            .collect()
+    };
+
+    // ----- semantic path -----
+    if mode != "lexical" {
+        let Some(client) = state.embedding.clone() else {
+            if mode == "semantic" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"error": "no embeddings backend attached"})),
+                ).into_response();
+            }
+            // auto → lexical fallback below
+            return respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min);
+        };
+        return match client.embed(&query).await {
+            Ok(qvec) => {
+                let mut merged: Vec<(serde_json::Value, f32)> = Vec::new();
+                for scope in visible_scopes() {
+                    for (entry, score) in memory
+                        .search_semantic(&scope.name, "governor", true, &qvec, top_k)
+                        .unwrap_or_default()
+                    {
+                        if !entry_matches_filters(&entry, kind_filter.as_deref(), status_min) {
+                            continue;
+                        }
+                        merged.push((memory_entry_json(&entry), score));
+                    }
+                }
+                merged.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0["entry_id"].as_str().cmp(&b.0["entry_id"].as_str()))
+                });
+                merged.truncate(top_k);
+                let count = merged.len();
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "results": merged.into_iter().map(|(mut v, score)| {
+                            v["score"] = serde_json::json!(score);
+                            v
+                        }).collect::<Vec<_>>(),
+                        "count": count,
+                        "mode": "semantic",
+                        "untrusted_input": true,
+                    })),
+                ).into_response()
+            }
+            Err(e) => {
+                if mode == "semantic" {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "error": "embeddings backend unavailable",
+                            "detail": e.to_string(),
+                        })),
+                    ).into_response();
+                }
+                respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min)
+            }
+        };
+    }
+
+    // ----- lexical path -----
+    respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min)
+}
+
+/// Applies the optional kind/min_status filters shared by both retrieval modes.
+fn entry_matches_filters(
+    entry: &decentraai_agents::memory::MemoryEntry,
+    kind_filter: Option<&str>,
+    status_min: Option<u8>,
+) -> bool {
+    if let Some(min) = status_min {
+        if entry.meta.status.strength() < min {
+            return false;
+        }
+    }
+    if let Some(kind) = kind_filter {
+        let tag = serde_json::to_value(entry.meta.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if tag != kind {
+            return false;
+        }
+    }
+    true
+}
+
+/// One search result with full provenance metadata.
+fn memory_entry_json(entry: &decentraai_agents::memory::MemoryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "scope": entry.scope,
+        "entry_id": entry.entry_id,
+        "author": entry.author_agent,
+        "author_node": entry.author_node,
+        "content": entry.content.chars().take(300).collect::<String>(),
+        "tags": entry.tags,
+        "kind": entry.meta.kind,
+        "status": entry.meta.status,
+        "version": entry.meta.version,
+        "subject_key": entry.meta.subject_key,
+        "competes_with": entry.meta.competes_with,
+        "confidence": entry.meta.detail.as_ref().map(|d| d.confidence),
+        "evidence_ref": entry.meta.detail.as_ref().and_then(|d| d.evidence_ref.clone()),
+        "evidence_backed": entry.meta.is_evidence_backed(),
+        "verified": entry.meta.is_verified(),
+    })
+}
+
+/// Lexical (keyword) retrieval — the always-available fallback mode.
+fn respond_lexical(
+    memory: &std::sync::Arc<decentraai_distributed::agent_memory::MemoryStore>,
+    scopes: Vec<decentraai_agents::memory::MemoryScope>,
+    query: &str,
+    kind_filter: Option<&str>,
+    status_min: Option<u8>,
+) -> axum::response::Response {
     let terms: Vec<&str> = query.split_whitespace().collect();
     let mut results = Vec::new();
-    for scope in memory.list_scopes().unwrap_or_default() {
-        if let Some(filter) = &scope_filter {
-            if scope.name != *filter { continue; }
-        }
+    for scope in scopes {
         let entries = match memory.read(&scope.name, "governor", true) {
             Ok(e) => e,
             Err(_) => continue, // inaccessible scopes stay invisible
         };
         for entry in entries.iter() {
-            // Lifecycle floor filter (e.g. only verified+): strength compare.
-            if let Some(min) = status_min {
-                if entry.meta.status.strength() < min { continue; }
+            if !entry_matches_filters(entry, kind_filter, status_min) {
+                continue;
             }
-            if let Some(kind) = &kind_filter {
-                let tag = serde_json::to_value(entry.meta.kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                if &tag != kind { continue; }
-            }
-            let text = format!("{} {} {}", entry.entry_id, entry.content, entry.tags.join(" "))
-                .to_lowercase();
-            let matches = terms.iter().all(|t| text.contains(t));
-            if matches {
-                results.push(serde_json::json!({
-                    "scope": entry.scope,
-                    "entry_id": entry.entry_id,
-                    "author": entry.author_agent,
-                    "author_node": entry.author_node,
-                    "content": entry.content.chars().take(300).collect::<String>(),
-                    "tags": entry.tags,
-                    "kind": entry.meta.kind,
-                    "status": entry.meta.status,
-                    "version": entry.meta.version,
-                    "subject_key": entry.meta.subject_key,
-                    "competes_with": entry.meta.competes_with,
-                    "confidence": entry.meta.detail.as_ref().map(|d| d.confidence),
-                    "evidence_ref": entry.meta.detail.as_ref().and_then(|d| d.evidence_ref.clone()),
-                    "evidence_backed": entry.meta.is_evidence_backed(),
-                    "verified": entry.meta.is_verified(),
-                }));
+            let text =
+                format!("{} {} {}", entry.entry_id, entry.content, entry.tags.join(" "))
+                    .to_lowercase();
+            if terms.iter().all(|t| text.contains(t)) {
+                results.push(memory_entry_json(entry));
             }
         }
     }
@@ -8222,7 +8331,204 @@ async fn memory_search_handler(
         axum::Json(serde_json::json!({
             "results": results,
             "count": results.len(),
+            "mode": "lexical",
             "untrusted_input": true,
+        })),
+    ).into_response()
+}
+
+
+/// POST /v1/memory/sync-to — push a bounded batch of one scope's collective
+/// memory to a peer over the existing p2p transport. Operator+.
+/// Body: {"peer":"<peer id>","scope":"…"}. The receiver applies its OWN
+/// policy gates (only scopes with public access + remote-write opt-in accept
+/// entries) and downgrades imported claims to `candidate` — verification is
+/// always local. Audited.
+async fn memory_sync_to_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_protocol::memory_sync::{
+        MemorySyncRequest, MemorySyncResponse, SyncMemoryEntry, MAX_SYNC_BATCH_ENTRIES,
+    };
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        ).into_response();
+    };
+    let Some(p2p) = &state.p2p else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "p2p not enabled on this node"})),
+        ).into_response();
+    };
+    let Some(scope) = body.0.get("scope").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "scope is required"})),
+        ).into_response();
+    };
+    let peer_str = body.0.get("peer").and_then(|v| v.as_str()).unwrap_or_default();
+    let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "peer must be a valid libp2p PeerId"})),
+        ).into_response();
+    };
+    let entries = match memory.read(scope, "governor", true) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    };
+    // Bounded batch: newest-first order from read(), capped at the wire max.
+    // Shared conversion with the auto-propagator — one wire mapping.
+    let payload_entries: Vec<SyncMemoryEntry> = entries
+        .into_iter()
+        .take(MAX_SYNC_BATCH_ENTRIES)
+        .map(|e| decentraai_distributed::agent_memory::memory_entry_to_sync(&e))
+        .collect();
+    let batch_len = payload_entries.len();
+    let request = MemorySyncRequest {
+        protocol_version: MemorySyncRequest::VERSION,
+        sender_node: p2p.local_peer_id().to_string(),
+        scope: scope.to_string(),
+        entries: payload_entries,
+    };
+    let Ok(bytes) = serde_json::to_vec(&request) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": "failed to encode sync batch"})),
+        ).into_response();
+    };
+    if bytes.len() > decentraai_protocol::memory_sync::MAX_MEMORY_SYNC_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "encoded batch exceeds the memory-sync byte cap; sync fewer entries"
+            })),
+        ).into_response();
+    }
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "memory_sync_push",
+        serde_json::json!({
+            "scope": scope,
+            "peer": peer_str,
+            "entries": batch_len,
+        }),
+    );
+    match p2p.request(peer_id, bytes).await {
+        Ok(resp_bytes) => match serde_json::from_slice::<MemorySyncResponse>(&resp_bytes) {
+            Ok(resp) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "scope": scope,
+                    "sent": batch_len,
+                    "peer_declined": resp.declined,
+                    "accepted": resp.accepted,
+                    "duplicates": resp.duplicates,
+                    "conflicts_linked": resp.conflicts_linked,
+                    "expired": resp.expired,
+                    "rejected": resp.rejected,
+                })),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({
+                    "error": "peer response was not a valid memory-sync response",
+                    "scope": scope,
+                    "sent": batch_len,
+                })),
+            ).into_response(),
+        },
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "error": format!("sync request to peer failed: {e}"),
+                "scope": scope,
+            })),
+        ).into_response(),
+    }
+}
+
+/// POST /v1/memory/index — backfill embedding vectors for one scope's live
+/// entries (semantic retrieval index). Operator+. Body: {"scope":"…"}.
+/// Explicit and audited: entries lacking vectors are invisible to semantic
+/// search until indexed; the response reports exact gaps.
+async fn memory_index_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    let Some(client) = state.embedding.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "no embeddings backend attached"})),
+        )
+            .into_response();
+    };
+    let Some(scope) = body.0.get("scope").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "scope is required"})),
+        ).into_response();
+    };
+    let entries = match memory.read(scope, "governor", true) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    };
+    // Bounded batch: index at most 256 entries per call so one request can
+    // never hammer the backend unboundedly; the operator re-runs for more.
+    let mut indexed = 0u32;
+    let mut skipped = 0u32;
+    for entry in entries.iter().take(256) {
+        match client.embed(&entry.content).await {
+            Ok(vec) if !vec.is_empty() => match memory.store_embedding(scope, &entry.entry_id, &vec)
+            {
+                Ok(()) => indexed += 1,
+                Err(_) => skipped += 1,
+            },
+            _ => skipped += 1,
+        }
+    }
+    let (have_indexed, unindexed) = memory.index_status(scope).unwrap_or((0, 0));
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "memory_index",
+        serde_json::json!({"scope": scope, "indexed": indexed, "skipped": skipped}),
+    );
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "scope": scope,
+            "indexed_now": indexed,
+            "failed": skipped,
+            "indexed_total": have_indexed,
+            "unindexed_remaining": unindexed,
         })),
     ).into_response()
 }

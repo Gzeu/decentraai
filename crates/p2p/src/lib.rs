@@ -22,6 +22,8 @@ use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{Multiaddr, dcutr, identify, kad, mdns, noise, ping, relay, tcp, yamux};
+
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -413,6 +415,16 @@ pub enum DfcInbound {
 
 type DfcHandler = Arc<dyn Fn(PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync>;
 
+/// Memory-sync dispatch slot (M19): a decoded, bounds-checked
+/// [`decentraai_protocol::memory_sync::MemorySyncRequest`] from a peer.
+/// The handler merges the batch into the local store (deterministic,
+/// additive-only) and returns the ENCODED [`decentraai_protocol::memory_sync::
+/// MemorySyncResponse`]. Identity comes from the transport (`peer`), never
+/// from the payload's `sender_node`.
+type MemorySyncHandler = Arc<
+    dyn Fn(PeerId, decentraai_protocol::memory_sync::MemorySyncRequest) -> Vec<u8> + Send + Sync,
+>;
+
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
 
@@ -436,6 +448,9 @@ pub struct P2PNode {
     on_cancel: SharedHandler<CancelHandler>,
     /// Optional callback invoked for inbound manifest announcements.
     on_manifest: SharedHandler<ManifestAnnouncementHandler>,
+    /// Memory-sync dispatch slot. `None` = this node does not accept memory
+    /// sync; inbound batches get an explicit `declined` response.
+    on_memory_sync: SharedHandler<MemorySyncHandler>,
 }
 
 impl P2PNode {
@@ -487,6 +502,25 @@ impl P2PNode {
         *guard = Some(std::sync::Arc::new(callback));
     }
 
+    /// Sets the memory-sync handler (M19). Called by the runtime with the
+    /// local [`MemoryStore`]: the handler runs the deterministic additive
+    /// merge and returns the encoded response. When unset, inbound sync
+    /// batches are answered with a `declined` response — peers learn the
+    /// feature is off without retry loops.
+    pub fn set_on_memory_sync<F>(&mut self, callback: F)
+    where
+        F: Fn(
+                PeerId,
+                decentraai_protocol::memory_sync::MemorySyncRequest,
+            ) -> Vec<u8>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_memory_sync.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
     /// Creates a node and spawns its swarm task, LAN-only (mDNS discovery,
     /// no DHT, no relay). Must be called from within a Tokio runtime: the
     /// mDNS behaviour registers with the reactor.
@@ -519,6 +553,9 @@ impl P2PNode {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
         let peer_id = PeerId::from(&keypair.public());
+        // mDNS honours the config flag (M19 fix): tests and nodes that set
+        // `lan_discovery: false` must stay invisible on the segment instead
+        // of being auto-discovered by every neighbour.
         let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .context("creating mDNS behaviour")?;
         let codec = FrameCodec {
@@ -666,6 +703,9 @@ impl P2PNode {
         let on_manifest: SharedHandler<ManifestAnnouncementHandler> =
             Arc::new(tokio::sync::Mutex::new(None));
         let on_manifest_clone = on_manifest.clone();
+        let on_memory_sync: SharedHandler<MemorySyncHandler> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let on_memory_sync_loop = on_memory_sync.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -741,9 +781,14 @@ impl P2PNode {
                                 // connection is not established yet —
                                 // request_response auto-dials in that case.
                                 let mut peers = connected.clone();
-                                for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
-                                    if !peers.contains(peer) {
-                                        peers.push(*peer);
+                                if network.lan_discovery {
+                                    // Only act on discovery when enabled;
+                                    // otherwise unknown peers are never
+                                    // proactively contacted.
+                                    for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
+                                        if !peers.contains(peer) {
+                                            peers.push(*peer);
+                                        }
                                     }
                                 }
                                 for peer in peers {
@@ -856,7 +901,7 @@ impl P2PNode {
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
                                 mdns::Event::Discovered(list),
-                            )) => {
+                            )) if network.lan_discovery => {
                                 for (peer, addr) in list {
                                     info!(%peer, %addr, "mDNS discovered peer");
                                     swarm.add_peer_address(peer, addr.clone());
@@ -976,6 +1021,41 @@ impl P2PNode {
                                             .is_err()
                                         {
                                             warn!(%peer, "failed to send dfcp offer");
+                                        }
+                                        continue;
+                                    }
+                                    // Memory sync (M19): bounded batch of collective
+                                    // memory entries from a peer. Merged
+                                    // deterministically by the runtime's handler;
+                                    // when no handler is registered the node
+                                    // answers with an explicit `declined`
+                                    // response so senders stop retrying.
+                                    if let Ok(sync_req) = decentraai_protocol::deserialize_message::<decentraai_protocol::memory_sync::MemorySyncRequest>(
+                                        &request,
+                                        decentraai_protocol::memory_sync::MAX_MEMORY_SYNC_BYTES,
+                                    ) {
+                                        let guard = on_memory_sync_loop.lock().await;
+                                        let reply_bytes = if let Some(cb) = &*guard {
+                                            cb(peer, sync_req)
+                                        } else {
+                                            serde_json::to_vec(&decentraai_protocol::memory_sync::MemorySyncResponse {
+                                                protocol_version: 1,
+                                                declined: true,
+                                                accepted: 0,
+                                                duplicates: 0,
+                                                conflicts_linked: 0,
+                                                expired: 0,
+                                                rejected: 0,
+                                            })
+                                            .unwrap_or_default()
+                                        };
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, reply_bytes)
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send memory-sync response");
                                         }
                                         continue;
                                     }
@@ -1229,6 +1309,7 @@ impl P2PNode {
             on_infer,
             on_cancel,
             on_manifest,
+            on_memory_sync,
         })
     }
 

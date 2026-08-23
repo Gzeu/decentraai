@@ -114,6 +114,10 @@ pub struct KnowledgeRuntime {
     /// Optional persistent collective memory. When attached, feedback entries
     /// are written into `collective.knowledge`.
     memory_store: Option<Arc<MemoryStore>>,
+    /// Optional embeddings backend (M19): when attached, every persisted
+    /// feedback entry is embedded in a background task so semantic search
+    /// covers new knowledge without operator backfill.
+    embedder: Option<Arc<crate::embedding::EmbeddingClient>>,
     /// This node's peer id, stamped as author_node on feedback entries.
     local_node: String,
     /// Per-worker contribution profiles, set at wiring from measured reality
@@ -147,17 +151,24 @@ impl KnowledgeRuntime {
             receipts: Arc::new(Mutex::new(ReceiptRegistry::new())),
             compensation,
             memory_store,
+            embedder: None,
             local_node: local_node.into(),
             profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             receipt_credits: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
+    /// Attaches the embeddings backend (M19): new feedback entries are then
+    /// indexed for semantic search automatically, in the background.
+    pub fn with_embedder(mut self, embedder: Arc<crate::embedding::EmbeddingClient>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
     /// Sets the measured contribution profile for a worker. Called at wiring
     /// time from the compute manager's real measured contribution — never from
     /// a client request.
-    pub fn set_contribution_profile(&self, worker: &str, profile: ContributionProfile) {
-        if let Ok(mut p) = self.profiles.lock() {
+    pub fn set_contribution_profile(&self, worker: &str, profile: ContributionProfile) {        if let Ok(mut p) = self.profiles.lock() {
             p.insert(worker.to_string(), profile);
         }
     }
@@ -429,7 +440,31 @@ impl KnowledgeRuntime {
                 true,
                 true,
             )
-            .context("writing collective knowledge memory feedback")
+            .context("writing collective knowledge memory feedback")?;
+        // M19 auto-embed: index the fresh entry for semantic search in the
+        // background. Fire-and-forget by design — indexing is an optimization
+        // and must never break (or slow) the verified-knowledge write path;
+        // gaps stay visible via /v1/memory/index status and lexical search
+        // still covers unindexed entries.
+        if let Some(embedder) = &self.embedder {
+            let embedder = embedder.clone();
+            let store = store.clone();
+            let entry_id = entry.entry_id.clone();
+            let content = entry.content.clone();
+            let scope = KNOWLEDGE_MEMORY_SCOPE.to_string();
+            tokio::spawn(async move {
+                match embedder.embed(&content).await {
+                    Ok(vec) if !vec.is_empty() => {
+                        if let Err(e) = store.store_embedding(&scope, &entry_id, &vec) {
+                            tracing::warn!(error = %e, entry_id = %entry_id, "auto-embed store failed");
+                        }
+                    }
+                    Ok(_) => tracing::warn!(entry_id = %entry_id, "embeddings backend returned an empty vector"),
+                    Err(e) => tracing::warn!(error = %e, entry_id = %entry_id, "auto-embed failed; entry remains lexically searchable"),
+                }
+            });
+        }
+        Ok(())
     }
 }
 

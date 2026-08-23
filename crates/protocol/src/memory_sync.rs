@@ -116,6 +116,10 @@ pub const MAX_SYNC_BATCH_ENTRIES: usize = 128;
 pub struct MemorySyncResponse {
     /// Protocol version (mirrors the request).
     pub protocol_version: u32,
+    /// True when the receiver does not run a memory-sync handler at all
+    /// (feature off). All counters are zero; the sender must not retry.
+    #[serde(default)]
+    pub declined: bool,
     /// Fresh entries stored (including linked competing claims).
     pub accepted: u32,
     /// Exact duplicates skipped.
@@ -203,6 +207,7 @@ mod tests {
     fn response_mirrors_merge_report_semantics() {
         let resp = MemorySyncResponse {
             protocol_version: 1,
+            declined: false,
             accepted: 3,
             duplicates: 2,
             conflicts_linked: 1,
@@ -212,6 +217,10 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: MemorySyncResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+        // Declined responses parse with the default flag and carry no work.
+        let declined: MemorySyncResponse =
+            serde_json::from_str(r#"{"protocol_version":1,"declined":true,"accepted":0,"duplicates":0,"conflicts_linked":0,"expired":0,"rejected":0}"#).unwrap();
+        assert!(declined.declined);
         // Conservation: every reported entry is accounted for exactly once.
         let total_in_batch: u32 = 3 + 2 + 1; // accepted + duplicates + rejected
         assert_eq!(
