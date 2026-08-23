@@ -174,19 +174,43 @@ async function apiFetch(path, options) {
  *   invariant: string}>}
  */
 export async function getGovernorState() {
-  if (USE_MOCK) {
+  // Fetch REAL state from the Governor daemon JSON (served by Caddy).
+  try {
+    const res = await fetch("https://deck-api.169.58.213.145.nip.io/state.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status);
+    const real = await res.json();
+    // Map daemon output to the contract shape
+    return {
+      governor_id: real.governor_id || "governor",
+      status: real.status || "OBSERVING",
+      pressure_score: real.pressure_score || 0,
+      sharing_active: real.sharing_active !== false,
+      provider: real.provider || "LOCAL",
+      workers: (real.workers || []).map(w => ({
+        worker_id: w.worker_id,
+        name: w.name,
+        healthy: w.healthy,
+        avg_latency: w.avg_latency || "-",
+        load_percent: w.load_percent || 0,
+        capabilities: [],
+        contribution_balance: w.contribution_balance || 0,
+      })),
+      signals: real.signals || {},
+      invariant: real.invariant || "AI proposes -> deterministic policy decides -> workers execute",
+    };
+  } catch (_) {
+    // Fallback to mock if API is unreachable
     await delay(80);
     return {
       governor_id: "governor",
-      status: "OBSERVING",
-      pressure_score: 0.15,
-      sharing_active: true,
+      status: "OFFLINE",
+      pressure_score: 0,
+      sharing_active: false,
       provider: "LOCAL",
       workers: MOCK_WORKERS,
       invariant: "AI proposes -> deterministic policy decides -> workers execute",
     };
   }
-  return apiFetch("/state");
 }
 
 /**
@@ -252,11 +276,12 @@ export async function getExecution() {
  * @returns {Promise<WorkerStatus[]>}
  */
 export async function getWorkers() {
-  if (USE_MOCK) {
-    await delay(50);
+  try {
+    const st = await getGovernorState();
+    return st.workers;
+  } catch (_) {
     return MOCK_WORKERS;
   }
-  return apiFetch("/workers");
 }
 
 /**
