@@ -20,8 +20,24 @@
 use crate::settlement::{BlockchainAdapter, SettlementError, SettlementReceipt, SettlementRecord};
 use serde::{Deserialize, Serialize};
 
-/// Official MX-8004 devnet API base (from the published skill.md).
-pub const DEVNET_API_BASE: &str = "https://devnet-mx8004-api.multiversx.com";
+/// LIVE devnet API base — discovered from the official explorer bundle
+/// (agents.multiversx.com calls THIS host; the skill.md-documented
+/// `devnet-mx8004-api.multiversx.com` did not resolve from any of our
+/// environments). Verified live 2026-08-23.
+pub const DEVNET_API_BASE: &str = "https://devnet-taskclaw-api.multiversx.com";
+
+/// Registry contract addresses on devnet — discovered by inspecting
+/// successful on-chain transactions (see
+/// docs/MULTIVERSX_DEVNET_ADDRESSES.md for hashes and method).
+/// - Identity: corroborated by 2 independent register_agent txs.
+/// - Validation: corroborated by 3 different functions.
+/// - Reputation: single successful submit_feedback observed (PARTIALLY).
+pub mod registry_addresses {
+    pub const IDENTITY: &str = "erd1qqqqqqqqqqqqqpgqzcufga3vm5r44xe3ukzyl4dmhpsvalrkkgjqeyu68x";
+    pub const VALIDATION: &str = "erd1qqqqqqqqqqqqqpgqvax6z79cvyz9gkfwg57hqume352p7s7rd8ss4g3t43";
+    /// PARTIALLY verified — one successful submit_feedback observed.
+    pub const REPUTATION: &str = "erd1qqqqqqqqqqqqqpgqwhqpuzkrywc5j8q2ec6skqnejtzgjnzad8ssdmv962";
+}
 
 /// HTTP transport seam: production uses reqwest-blocking; tests inject a
 /// fake. Keeping this trait tiny keeps the adapter honest and offline-testable.
@@ -91,14 +107,18 @@ pub struct MxReputation {
 }
 
 fn parse_agent(v: &serde_json::Value) -> MxAgentRecord {
+    // Live devnet field is `publicKeyHex`; skill.md documents `publicKey`.
+    // Accept BOTH — lenient by contract.
+    let pk = v
+        .get("publicKeyHex")
+        .or_else(|| v.get("publicKey"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     MxAgentRecord {
         nonce: v.get("nonce").and_then(|x| x.as_u64()),
         name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
         uri: v.get("uri").and_then(|x| x.as_str()).map(str::to_string),
-        public_key: v
-            .get("publicKey")
-            .and_then(|x| x.as_str())
-            .map(str::to_string),
+        public_key: pk,
     }
 }
 
@@ -131,9 +151,12 @@ impl<T: MxHttp> MxDevnetClient<T> {
     pub fn list_agents(&self, from: u64, size: u64) -> Result<Vec<MxAgentRecord>, String> {
         let size = size.clamp(1, 1000);
         let v = self.get(&format!("/agents?from={from}&size={size}"))?;
+        // Live wrapper wraps pages in {items:[...]}; bare arrays also accepted.
         let arr = v
-            .as_array()
-            .ok_or_else(|| "unexpected /agents shape (expected array)".to_string())?;
+            .get("items")
+            .and_then(|x| x.as_array())
+            .or_else(|| v.as_array())
+            .ok_or_else(|| "unexpected /agents shape".to_string())?;
         Ok(arr.iter().map(parse_agent).collect())
     }
 
@@ -233,11 +256,11 @@ mod tests {
         let fake = FakeMx::default()
             .with(
                 "/agents?",
-                serde_json::json!([
+                serde_json::json!({"items": [
                     {"nonce": 42, "name": "DecentraGovernor",
-                     "uri": "ipfs://QmX", "publicKey": "0x04aa"},
+                     "uri": "ipfs://QmX", "publicKeyHex": "0x04aa"},
                     {"weird": true}
-                ]),
+                ]}),
             )
             .with(
                 "/agents/42",
