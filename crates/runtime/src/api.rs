@@ -5053,6 +5053,12 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/rag/index", post(rag_index_handler))
         .route("/v1/rag/query", post(rag_query_handler))
         .route("/v1/memory", get(memory_handler))
+        .route("/v1/memory/search", post(memory_search_handler))
+        .route("/v1/memory/transition", post(memory_transition_handler))
+        .route(
+            "/v1/memory/training-candidates",
+            get(memory_training_candidates_handler),
+        )
         .route("/v1/reputation", get(reputation_handler))
         .route("/v1/talent-tree", get(talent_tree_handler))
         .route("/v1/network", get(network_handler))
@@ -8121,6 +8127,242 @@ async fn intel_status_handler(State(state): State<ApiState>, headers: HeaderMap)
     body["providers"] =
         serde_json::to_value(intel.telemetry().scores()).unwrap_or_else(|_| serde_json::json!([]));
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// POST /v1/memory/search — search collective memory by content keywords.
+/// Operator+. Body: {"scope":"...", "query":"..."} or {"query":"..."} to
+/// search all accessible scopes. Returns matching entries with full
+/// provenance (kind, lifecycle status, version, evidence backing).
+///
+/// Retrieved memory is UNTRUSTED INPUT by contract: consumers (governor,
+/// agents) must treat it as advisory context — it never bypasses the
+/// deterministic policy layer. The response carries `"untrusted_input": true`
+/// to make that explicit at every call site.
+async fn memory_search_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    let query = body.0.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let scope_filter = body.0.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let kind_filter = body.0.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let status_min = body
+        .0
+        .get("min_status")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_value::<decentraai_agents::memory::MemoryStatus>(
+            serde_json::Value::String(s.to_string()),
+        )
+        .ok())
+        .map(|st| st.strength());
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "query must not be empty"})),
+        ).into_response();
+    }
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    let mut results = Vec::new();
+    for scope in memory.list_scopes().unwrap_or_default() {
+        if let Some(filter) = &scope_filter {
+            if scope.name != *filter { continue; }
+        }
+        let entries = match memory.read(&scope.name, "governor", true) {
+            Ok(e) => e,
+            Err(_) => continue, // inaccessible scopes stay invisible
+        };
+        for entry in entries.iter() {
+            // Lifecycle floor filter (e.g. only verified+): strength compare.
+            if let Some(min) = status_min {
+                if entry.meta.status.strength() < min { continue; }
+            }
+            if let Some(kind) = &kind_filter {
+                let tag = serde_json::to_value(entry.meta.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                if &tag != kind { continue; }
+            }
+            let text = format!("{} {} {}", entry.entry_id, entry.content, entry.tags.join(" "))
+                .to_lowercase();
+            let matches = terms.iter().all(|t| text.contains(t));
+            if matches {
+                results.push(serde_json::json!({
+                    "scope": entry.scope,
+                    "entry_id": entry.entry_id,
+                    "author": entry.author_agent,
+                    "author_node": entry.author_node,
+                    "content": entry.content.chars().take(300).collect::<String>(),
+                    "tags": entry.tags,
+                    "kind": entry.meta.kind,
+                    "status": entry.meta.status,
+                    "version": entry.meta.version,
+                    "subject_key": entry.meta.subject_key,
+                    "competes_with": entry.meta.competes_with,
+                    "confidence": entry.meta.detail.as_ref().map(|d| d.confidence),
+                    "evidence_ref": entry.meta.detail.as_ref().and_then(|d| d.evidence_ref.clone()),
+                    "evidence_backed": entry.meta.is_evidence_backed(),
+                    "verified": entry.meta.is_verified(),
+                }));
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "results": results,
+            "count": results.len(),
+            "untrusted_input": true,
+        })),
+    ).into_response()
+}
+
+/// GET /v1/memory/training-candidates — explicit Training Lab export path.
+/// Operator+. Returns verified + evidence-backed generalizations as JSONL
+/// records ready for the dataset builder. Audited; NOTHING is trained or
+/// added to datasets automatically.
+async fn memory_training_candidates_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    use decentraai_agents::training_export::TrainingCandidate;
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    match memory.export_training_candidates("governor", true) {
+        Ok(candidates) => {
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "memory_training_export",
+                serde_json::json!({
+                    "count": candidates.len(),
+                    "kinds": candidates.iter().map(|c| c.kind).collect::<Vec<_>>(),
+                }),
+            );
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/x-ndjson"),
+                    (header::CONTENT_DISPOSITION, "attachment; filename=\"training-candidates.jsonl\""),
+                ],
+                TrainingCandidate::to_jsonl(&candidates),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/memory/transition — apply a lifecycle move to one memory entry
+/// (`candidate → verified → trusted`, any active → `obsolete`). Operator+.
+/// Body: {"scope":"…","entry_id":"…","to":"verified","reason":"…"}. The
+/// state machine ([`can_transition`]) rejects illegal jumps; every applied
+/// transition is audited and recorded in the entry's bounded history.
+async fn memory_transition_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        )
+            .into_response();
+    };
+    let Some(scope) = body.0.get("scope").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "scope is required"})),
+        ).into_response();
+    };
+    let Some(entry_id) = body.0.get("entry_id").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "entry_id is required"})),
+        ).into_response();
+    };
+    let Some(to_raw) = body.0.get("to").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "to (status) is required"})),
+        ).into_response();
+    };
+    let Ok(to) = serde_json::from_value::<decentraai_agents::memory::MemoryStatus>(
+        serde_json::Value::String(to_raw.to_string()),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "invalid status; expected candidate|verified|trusted|obsolete"
+            })),
+        ).into_response();
+    };
+    let reason = body
+        .0
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match memory.transition_status(scope, entry_id, to, "operator", &reason) {
+        Ok(()) => {
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "memory_transition",
+                serde_json::json!({
+                    "scope": scope,
+                    "entry_id": entry_id,
+                    "to": to,
+                    "reason_chars": reason.len(),
+                }),
+            );
+            // Re-read so the caller sees the authoritative post-state without
+            // exposing other scopes.
+            let entry = memory
+                .read(scope, "governor", true)
+                .ok()
+                .and_then(|entries| {
+                    entries.into_iter().find(|e| e.entry_id == entry_id)
+                })
+                .map(|e| {
+                    serde_json::json!({
+                        "entry_id": e.entry_id,
+                        "status": e.meta.status,
+                        "version": e.meta.version,
+                    })
+                })
+                .unwrap_or_else(|| serde_json::json!({}));
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"ok": true, "entry": entry})),
+            ).into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        ).into_response(),
+    }
 }
 
 async fn agents_orchestrate_handler(

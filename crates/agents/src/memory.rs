@@ -38,21 +38,29 @@ pub enum MemoryLevel {
     Agent,
     /// Shared within an agent team.
     Team,
+    /// Shared across the agents of a single node (node-local collective).
+    Node,
     /// Shared across trusted nodes.
     Network,
     /// Public across the fabric, opt-in.
     Fabric,
+    /// System/operator tier: infrastructure facts, admission learnings,
+    /// governance state. Widest clearance by rank; conservative by default
+    /// policy (`Private`) — widening it is always an explicit owner choice.
+    System,
 }
 
 impl MemoryLevel {
-    /// Breadth rank (Agent < Team < Network < Fabric), used by
+    /// Breadth rank (Agent < Team < Node < Network < Fabric < System), used by
     /// [`MemoryAccess::permits`]. Private by intent, never exposed on the wire.
     fn rank(self) -> u8 {
         match self {
             MemoryLevel::Agent => 0,
             MemoryLevel::Team => 1,
-            MemoryLevel::Network => 2,
-            MemoryLevel::Fabric => 3,
+            MemoryLevel::Node => 2,
+            MemoryLevel::Network => 3,
+            MemoryLevel::Fabric => 4,
+            MemoryLevel::System => 5,
         }
     }
 }
@@ -78,13 +86,14 @@ pub enum MemoryAccess {
 }
 
 impl MemoryAccess {
-    /// Breadth rank (Private < TeamOnly < TrustedNetwork < Public).
+    /// Breadth ceiling on the [`MemoryLevel`] ladder
+    /// (Private=Agent < TeamOnly=Team < TrustedNetwork=Network < Public=System).
     fn rank(self) -> u8 {
         match self {
             MemoryAccess::Private => 0,
             MemoryAccess::TeamOnly => 1,
-            MemoryAccess::TrustedNetwork => 2,
-            MemoryAccess::Public => 3,
+            MemoryAccess::TrustedNetwork => 3,
+            MemoryAccess::Public => 5,
         }
     }
 
@@ -205,6 +214,11 @@ pub struct MemoryEntry {
     /// How the entry's content was obtained; `None` when unknown/not claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    /// Collective-memory metadata (kind, lifecycle status, version, conflict
+    /// links, detailed provenance). Defaults preserve legacy entries:
+    /// observation / candidate / v1.
+    #[serde(default)]
+    pub meta: MemoryMeta,
 }
 
 impl MemoryEntry {
@@ -226,6 +240,7 @@ impl MemoryEntry {
             created_at_ms: 0,
             expires_at_ms: None,
             provenance: None,
+            meta: MemoryMeta::default(),
         }
     }
 
@@ -254,6 +269,246 @@ impl MemoryEntry {
     pub fn with_provenance(mut self, provenance: Provenance) -> Self {
         self.provenance = Some(provenance);
         self
+    }
+
+    /// Sets the collective-memory kind (observation, decision, …).
+    pub fn with_kind(mut self, kind: KnowledgeKind) -> Self {
+        self.meta.kind = kind;
+        self
+    }
+
+    /// Sets the subject key used for conflict grouping.
+    pub fn with_subject(mut self, subject_key: impl Into<String>) -> Self {
+        self.meta.subject_key = bounded(subject_key.into());
+        self
+    }
+
+    /// Attaches detailed provenance (source, confidence, evidence reference).
+    pub fn with_detail(mut self, detail: MemoryProvenance) -> Self {
+        self.meta.detail = Some(detail);
+        self
+    }
+}
+
+/// What kind of knowledge a memory entry carries (M18 knowledge objects).
+///
+/// Closed set: unknown kinds are a rejection at the parse boundary, never a
+/// new variant guessed from untrusted input.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeKind {
+    /// Something observed on the mesh (a fact, a measurement).
+    #[default]
+    Observation,
+    /// A decision taken (by an agent or the deterministic layer).
+    Decision,
+    /// A task execution record (what ran, where, with what outcome).
+    Execution,
+    /// A generalization derived from executions/observations.
+    Learning,
+    /// A capability statement (what a node/agent/model can do).
+    Capability,
+    /// A failure record (what broke, with what evidence).
+    Failure,
+    /// A solution that resolved a recorded failure.
+    Solution,
+    /// A model evaluation result (benchmarks, quality measurements).
+    ModelEvaluation,
+    /// Research output (reports, experiment results).
+    Research,
+}
+
+/// Lifecycle status of a collective-memory entry.
+///
+/// Flow: `candidate → verified → trusted`, any active state → `obsolete`.
+/// Obsolete entries are retained (recoverable, provenance preserved) —
+/// memory is never silently destroyed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    /// Freshly written, unverified.
+    #[default]
+    Candidate,
+    /// Verified against evidence (execution record, benchmark, audit).
+    Verified,
+    /// Verified and corroborated over time; the strongest active state.
+    Trusted,
+    /// Superseded or retracted; retained for provenance and recovery.
+    Obsolete,
+}
+
+impl MemoryStatus {
+    /// Strength rank used by deterministic conflict resolution
+    /// (`trusted > verified > candidate`; obsolete is excluded from
+    /// resolution and only survives as history).
+    pub fn strength(self) -> u8 {
+        match self {
+            MemoryStatus::Obsolete => 0,
+            MemoryStatus::Candidate => 1,
+            MemoryStatus::Verified => 2,
+            MemoryStatus::Trusted => 3,
+        }
+    }
+
+    /// Whether the entry is an active (non-obsolete) claim.
+    pub fn is_active(self) -> bool {
+        self != MemoryStatus::Obsolete
+    }
+}
+
+/// Whether a lifecycle transition is allowed.
+///
+/// Allowed: candidate→verified, verified→trusted, and any active state may
+/// become obsolete. No transitions out of obsolete (write a new entry
+/// instead — the old one stays as provenance-preserving history).
+pub fn can_transition(from: MemoryStatus, to: MemoryStatus) -> bool {
+    use MemoryStatus::*;
+    matches!(
+        (from, to),
+        (Candidate, Verified)
+            | (Verified, Trusted)
+            | (Candidate, Obsolete)
+            | (Verified, Obsolete)
+            | (Trusted, Obsolete)
+    )
+}
+
+/// Detailed provenance of a collective-memory entry: who/where/when produced
+/// the knowledge, how confident the claim is, and which evidence record
+/// backs it. `confidence` is an integer percent 0..=100 — deterministic,
+/// orderable, no float ambiguity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProvenance {
+    /// How the content was produced (e.g. `"execution"`, `"benchmark"`,
+    /// `"agent_reasoning"`, `"manual"`).
+    pub source: String,
+    /// Authoring agent.
+    pub agent: String,
+    /// Node (peer id) the authoring agent ran on.
+    pub node: String,
+    /// When the knowledge was observed (unix ms; may precede write time).
+    pub observed_at_ms: u64,
+    /// Confidence percent 0..=100 (clamped).
+    pub confidence: u8,
+    /// Reference to a verified execution/audit/evidence record. `Some` means
+    /// the claim is evidence-backed; `None` means unverified assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+}
+
+impl MemoryProvenance {
+    /// A provenance record with clamped confidence.
+    pub fn new(
+        source: impl Into<String>,
+        agent: impl Into<String>,
+        node: impl Into<String>,
+        observed_at_ms: u64,
+        confidence: u8,
+    ) -> Self {
+        Self {
+            source: bounded(source.into()),
+            agent: agent.into(),
+            node: node.into(),
+            observed_at_ms,
+            confidence: confidence.min(100),
+            evidence_ref: None,
+        }
+    }
+
+    /// Attaches an evidence reference (audit/execution record id).
+    pub fn with_evidence(mut self, evidence_ref: impl Into<String>) -> Self {
+        self.evidence_ref = Some(bounded(evidence_ref.into()));
+        self
+    }
+}
+
+/// One audited lifecycle transition, embedded in the entry's bounded history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTransition {
+    /// Status before the transition.
+    pub from: MemoryStatus,
+    /// Status after the transition.
+    pub to: MemoryStatus,
+    /// Agent that performed the transition.
+    pub actor: String,
+    /// Why (bounded to [`MAX_META_STRING`] chars).
+    pub reason: String,
+    /// When (unix ms).
+    pub at_ms: u64,
+}
+
+/// Maximum length of bounded metadata strings (subject keys, reasons,
+/// evidence refs). Keeps wire messages and DB rows bounded by construction.
+pub const MAX_META_STRING: usize = 256;
+
+/// Maximum embedded lifecycle-history records per entry. Oldest records are
+/// dropped first when exceeded — the recent audit trail survives, the entry
+/// never grows unbounded.
+pub const MAX_HISTORY: usize = 16;
+
+/// Truncates a metadata string to [`MAX_META_STRING`] chars (char-boundary
+/// safe).
+pub fn bounded(s: String) -> String {
+    s.chars().take(MAX_META_STRING).collect()
+}
+
+/// Collective-memory metadata carried by every [`MemoryEntry`].
+///
+/// Defaults (`observation`/`candidate`/v1) keep legacy entries valid on the
+/// wire and in the SQLite store without migration of old rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryMeta {
+    /// Knowledge-object kind.
+    pub kind: KnowledgeKind,
+    /// Lifecycle status.
+    pub status: MemoryStatus,
+    /// Monotonic version; bumped on every lifecycle transition.
+    pub version: u32,
+    /// Grouping key for conflicting claims (e.g. `"q:routing_timeout"`).
+    /// Empty = the entry does not participate in conflict grouping.
+    pub subject_key: String,
+    /// Detailed provenance (source/confidence/evidence), when claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<MemoryProvenance>,
+    /// Entry ids of competing claims about the same subject (bidirectional).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub competes_with: Vec<String>,
+    /// Bounded audit trail of lifecycle transitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<MemoryTransition>,
+}
+
+impl Default for MemoryMeta {
+    fn default() -> Self {
+        Self {
+            kind: KnowledgeKind::Observation,
+            status: MemoryStatus::Candidate,
+            version: 1,
+            subject_key: String::new(),
+            detail: None,
+            competes_with: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+}
+
+impl MemoryMeta {
+    /// Whether the claim passed a verification gate (`verified`/`trusted`).
+    pub fn is_verified(&self) -> bool {
+        self.status == MemoryStatus::Verified || self.status == MemoryStatus::Trusted
+    }
+
+    /// Whether the claim carries an explicit evidence reference (a verified
+    /// execution/audit record). This is the honest distinction between
+    /// evidence-derived knowledge and unverified agent assertions.
+    pub fn is_evidence_backed(&self) -> bool {
+        self.detail
+            .as_ref()
+            .is_some_and(|d| d.evidence_ref.is_some())
     }
 }
 
@@ -446,6 +701,81 @@ pub enum MemoryError {
     /// The entry was already expired at write time.
     #[error("memory entry '{entry_id}' is already expired")]
     EntryExpired { entry_id: String },
+    /// The referenced entry does not exist in the scope.
+    #[error("memory entry '{entry_id}' does not exist in scope")]
+    UnknownEntry { entry_id: String },
+    /// A lifecycle transition violated the state machine.
+    #[error("invalid memory transition for '{entry_id}': {from:?} → {to:?}")]
+    InvalidTransition {
+        entry_id: String,
+        from: MemoryStatus,
+        to: MemoryStatus,
+    },
+}
+
+/// Outcome of a checked collective-memory write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriteOutcome {
+    /// Stored as a fresh claim.
+    Stored,
+    /// Exact duplicate (same content hash) — not stored again.
+    Duplicate {
+        /// Id of the already-present identical entry.
+        existing_id: String,
+    },
+    /// Stored as a COMPETING claim about an existing subject; every side
+    /// keeps its own provenance/confidence/verification state.
+    CompetingClaim {
+        /// The id the new claim was stored under.
+        stored_id: String,
+        /// Ids of the pre-existing claims it competes with.
+        competes_with: Vec<String>,
+    },
+}
+
+/// Deterministic report of a remote sync-batch merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MergeReport {
+    /// Fresh entries stored (including competing claims).
+    pub accepted: u32,
+    /// Exact duplicates skipped by content hash.
+    pub duplicates: u32,
+    /// Subset of accepted that linked into existing subject conflicts.
+    pub conflicts_linked: u32,
+    /// Remote entries dropped because they were already expired.
+    pub expired: u32,
+    /// Entries rejected by policy gates.
+    pub rejected: u32,
+}
+
+/// BLAKE3 content hash used for exact-match dedup across the collective.
+fn content_hash(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+/// Deterministic conflict ranking over active claims: status strength desc,
+/// evidence confidence desc (unprovenanced = 0), first-observed asc,
+/// entry id asc. Pure — same input, same order, always.
+pub fn rank_claims(entries: &[MemoryEntry]) -> Vec<&MemoryEntry> {
+    let mut ranked: Vec<&MemoryEntry> =
+        entries.iter().filter(|e| e.meta.status.is_active()).collect();
+    ranked.sort_by(|a, b| {
+        let conf = |e: &MemoryEntry| {
+            e.meta
+                .detail
+                .as_ref()
+                .map(|d| d.confidence)
+                .unwrap_or(0u8)
+        };
+        b.meta
+            .status
+            .strength()
+            .cmp(&a.meta.status.strength())
+            .then(conf(b).cmp(&conf(a)))
+            .then(a.created_at_ms.cmp(&b.created_at_ms))
+            .then(a.entry_id.cmp(&b.entry_id))
+    });
+    ranked
 }
 
 /// A deterministic, per-node registry of memory scopes and their entries.
@@ -547,6 +877,225 @@ impl MemoryRegistry {
         Ok(())
     }
 
+    /// Checks whether a note with identical content already exists in the
+    /// given scope. Returns `true` if a duplicate is found (caller should
+    /// skip storing). Uses BLAKE3 content hash for exact-match dedup.
+    pub fn is_duplicate(&self, scope_name: &str, content: &str) -> bool {
+        let hash = content_hash(content);
+        self.entries
+            .get(scope_name)
+            .map(|bucket| bucket.iter().any(|e| content_hash(&e.content) == hash))
+            .unwrap_or(false)
+    }
+
+    /// Writes an entry through the collective-memory path: access policy,
+    /// exact-duplicate rejection (BLAKE3 content hash) and subject-key
+    /// conflict handling.
+    ///
+    /// Conflicts are NEVER silently overwritten: a claim about the same
+    /// non-empty `subject_key` with different content is stored alongside the
+    /// existing claims and linked bidirectionally (`competes_with`), keeping
+    /// every side's provenance, confidence and verification state intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_checked(
+        &mut self,
+        scope_name: &str,
+        entry: MemoryEntry,
+        writer_agent: &str,
+        writer_is_owner: bool,
+        trusted: bool,
+        verified_provenance: bool,
+        now_ms: u64,
+    ) -> Result<WriteOutcome, MemoryError> {
+        let scope =
+            self.scopes
+                .get(scope_name)
+                .cloned()
+                .ok_or_else(|| MemoryError::UnknownScope {
+                    name: scope_name.to_string(),
+                })?;
+        match can_write(
+            &scope,
+            writer_agent,
+            writer_is_owner,
+            trusted,
+            verified_provenance,
+        ) {
+            MemoryAccessDecision::Granted => {}
+            MemoryAccessDecision::Denied { reason } => {
+                return Err(MemoryError::AccessDenied { reason });
+            }
+        }
+        if entry_expired(&entry, now_ms) {
+            return Err(MemoryError::EntryExpired {
+                entry_id: entry.entry_id.clone(),
+            });
+        }
+        let hash = content_hash(&entry.content);
+        let bucket = self.entries.entry(scope_name.to_string()).or_default();
+        // 1. Exact duplicate: knowledge must not replicate endlessly.
+        if let Some(existing) = bucket.iter().find(|e| content_hash(&e.content) == hash) {
+            return Ok(WriteOutcome::Duplicate {
+                existing_id: existing.entry_id.clone(),
+            });
+        }
+        // 2. Subject conflict: link competing claims, preserve all sides.
+        let mut competitors = Vec::new();
+        if !entry.meta.subject_key.is_empty() {
+            for e in bucket.iter_mut() {
+                if e.meta.subject_key == entry.meta.subject_key {
+                    competitors.push(e.entry_id.clone());
+                }
+            }
+            for e in bucket.iter_mut() {
+                if e.meta.subject_key == entry.meta.subject_key
+                    && !e.meta.competes_with.contains(&entry.entry_id)
+                {
+                    e.meta.competes_with.push(entry.entry_id.clone());
+                }
+            }
+        }
+        let mut entry = entry;
+        entry.meta.competes_with = competitors.clone();
+        bucket.push(entry);
+        // Retention including the just-written entry.
+        *bucket = enforce_retention(std::mem::take(bucket), &scope.policy, now_ms);
+        if competitors.is_empty() {
+            Ok(WriteOutcome::Stored)
+        } else {
+            Ok(WriteOutcome::CompetingClaim {
+                stored_id: self
+                    .entries
+                    .get(scope_name)
+                    .and_then(|b| b.last())
+                    .map(|e| e.entry_id.clone())
+                    .unwrap_or_default(),
+                competes_with: competitors,
+            })
+        }
+    }
+
+    /// Applies a lifecycle transition to one entry, deterministically.
+    ///
+    /// Only [`can_transition`]-legal moves are applied; every applied move is
+    /// recorded in the entry's bounded history and bumps its `version`.
+    /// Obsolete entries stay in the store (recoverable, provenance preserved).
+    pub fn transition_status(
+        &mut self,
+        scope_name: &str,
+        entry_id: &str,
+        to: MemoryStatus,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<(), MemoryError> {
+        let bucket = self.entries.get_mut(scope_name).ok_or_else(|| {
+            MemoryError::UnknownScope {
+                name: scope_name.to_string(),
+            }
+        })?;
+        let entry = bucket
+            .iter_mut()
+            .find(|e| e.entry_id == entry_id)
+            .ok_or_else(|| MemoryError::UnknownEntry {
+                entry_id: entry_id.to_string(),
+            })?;
+        let from = entry.meta.status;
+        if !can_transition(from, to) {
+            return Err(MemoryError::InvalidTransition {
+                entry_id: entry_id.to_string(),
+                from,
+                to,
+            });
+        }
+        entry.meta.history.push(MemoryTransition {
+            from,
+            to,
+            actor: actor.to_string(),
+            reason: bounded(reason.to_string()),
+            at_ms: now_ms,
+        });
+        if entry.meta.history.len() > MAX_HISTORY {
+            entry.meta.history.drain(..entry.meta.history.len() - MAX_HISTORY);
+        }
+        entry.meta.status = to;
+        entry.meta.version = entry.meta.version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Deterministically resolves conflicting claims about one subject:
+    /// active (non-obsolete) entries ranked by status strength, then
+    /// evidence confidence, then first-observed, then entry id ascending.
+    /// Returns the winning claim, or `None` when nothing lives for that
+    /// subject.
+    ///
+    /// Resolution is a READ-TIME projection — it never deletes or rewrites
+    /// the competing claims themselves.
+    pub fn resolve_subject(
+        &self,
+        scope_name: &str,
+        subject_key: &str,
+        now_ms: u64,
+    ) -> Option<MemoryEntry> {
+        let entries: Vec<MemoryEntry> = self
+            .entries
+            .get(scope_name)?
+            .iter()
+            .filter(|e| {
+                e.meta.subject_key == subject_key
+                    && e.meta.status.is_active()
+                    && !entry_expired(e, now_ms)
+            })
+            .cloned()
+            .collect();
+        rank_claims(&entries).into_iter().next().cloned()
+    }
+
+    /// Merges a remote sync batch into one local scope (cross-node
+    /// propagation over the existing fabric transport).
+    ///
+    /// Deterministic and additive-only: exact duplicates are skipped,
+    /// competing claims are linked and kept, remote provenance/status travel
+    /// with each entry, and NOTHING local is overwritten. Expired remote
+    /// entries are dropped.
+    pub fn merge_batch(
+        &mut self,
+        scope_name: &str,
+        remote: Vec<MemoryEntry>,
+        now_ms: u64,
+    ) -> Result<MergeReport, MemoryError> {
+        if !self.scopes.contains_key(scope_name) {
+            return Err(MemoryError::UnknownScope {
+                name: scope_name.to_string(),
+            });
+        }
+        let mut report = MergeReport::default();
+        for entry in remote {
+            if entry_expired(&entry, now_ms) {
+                report.expired += 1;
+                continue;
+            }
+            match self.write_checked(
+                scope_name,
+                entry,
+                "memory-sync",
+                true, // the store applies its own scope policy before calling this
+                false,
+                false,
+                now_ms,
+            ) {
+                Ok(WriteOutcome::Stored) => report.accepted += 1,
+                Ok(WriteOutcome::Duplicate { .. }) => report.duplicates += 1,
+                Ok(WriteOutcome::CompetingClaim { .. }) => {
+                    report.accepted += 1;
+                    report.conflicts_linked += 1;
+                }
+                Err(_) => report.rejected += 1,
+            }
+        }
+        Ok(report)
+    }
+
     /// Reads a scope's non-expired entries in insertion order.
     ///
     /// Ownership is derived honestly from the scope itself (`reader_agent ==
@@ -626,10 +1175,12 @@ mod tests {
         assert!(MemoryAccess::Private.permits(MemoryLevel::Agent));
         assert!(!MemoryAccess::Private.permits(MemoryLevel::Team));
         assert!(MemoryAccess::TeamOnly.permits(MemoryLevel::Team));
-        assert!(!MemoryAccess::TeamOnly.permits(MemoryLevel::Network));
+        assert!(!MemoryAccess::TeamOnly.permits(MemoryLevel::Node));
+        assert!(MemoryAccess::TrustedNetwork.permits(MemoryLevel::Node));
         assert!(MemoryAccess::TrustedNetwork.permits(MemoryLevel::Network));
         assert!(!MemoryAccess::TrustedNetwork.permits(MemoryLevel::Fabric));
         assert!(MemoryAccess::Public.permits(MemoryLevel::Fabric));
+        assert!(MemoryAccess::Public.permits(MemoryLevel::System));
     }
 
     #[test]
@@ -1112,5 +1663,186 @@ mod tests {
             serde_json::to_string(&MemoryAccess::Public).unwrap(),
             "\"public\""
         );
+    }
+
+    // ----- M18: collective memory (lifecycle, conflicts, sync) -----
+
+    fn collective_scope() -> MemoryScope {
+        let policy = MemoryPolicy::default().team().with_remote_write();
+        MemoryScope::new("team.knowledge", "governor", MemoryLevel::Team).with_policy(policy)
+    }
+
+    fn knowledge(
+        id: &str,
+        content: &str,
+        subject: &str,
+    ) -> MemoryEntry {
+        let mut e = MemoryEntry::new(id, "team.knowledge", "researcher", "node-1", content)
+            .with_subject(subject)
+            .with_kind(KnowledgeKind::Learning);
+        e.created_at_ms = 100;
+        e
+    }
+
+    #[test]
+    fn write_checked_rejects_exact_duplicates() {
+        let mut reg = MemoryRegistry::new();
+        reg.register_scope(collective_scope()).unwrap();
+        reg.write_checked(
+            "team.knowledge",
+            knowledge("e1", "retry with backoff", "q:retries"),
+            "governor",
+            true,
+            false,
+            false,
+            1000,
+        )
+        .unwrap();
+        // Same content, different id: deduped, nothing stored.
+        let out = reg
+            .write_checked(
+                "team.knowledge",
+                knowledge("e2", "retry with backoff", "q:other"),
+                "governor",
+                true,
+                false,
+                false,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            WriteOutcome::Duplicate {
+                existing_id: "e1".to_string()
+            }
+        );
+        assert_eq!(reg.read("team.knowledge", "governor", true, 2000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conflicting_claims_are_linked_never_overwritten() {
+        let mut reg = MemoryRegistry::new();
+        reg.register_scope(collective_scope()).unwrap();
+        reg.write_checked("team.knowledge", knowledge("a", "claim A", "q:timeout"), "governor", true, false, false, 100).unwrap();
+        let out = reg
+            .write_checked("team.knowledge", knowledge("b", "claim B", "q:timeout"), "peer-2", false, true, false, 200)
+            .unwrap();
+        assert!(matches!(out, WriteOutcome::CompetingClaim { .. }), "different content on same subject = competing claim");
+        let read = reg.read("team.knowledge", "governor", true, 1000).unwrap();
+        assert_eq!(read.len(), 2, "both claims preserved");
+        let a = read.iter().find(|e| e.entry_id == "a").unwrap();
+        let b = read.iter().find(|e| b_id(e) == "b").unwrap();
+        assert!(a.meta.competes_with.contains(&"b".to_string()));
+        assert!(b.meta.competes_with.contains(&"a".to_string()), "links are bidirectional");
+    }
+
+    fn b_id(e: &MemoryEntry) -> &str {
+        &e.entry_id
+    }
+
+    #[test]
+    fn lifecycle_transitions_are_gated_and_audited() {
+        let mut reg = MemoryRegistry::new();
+        reg.register_scope(collective_scope()).unwrap();
+        reg.write_checked("team.knowledge", knowledge("e1", "lesson", "q:l"), "governor", true, false, false, 100).unwrap();
+        // candidate → trusted is NOT a legal jump.
+        let err = reg.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "gov", "shortcut", 150);
+        assert!(matches!(err, Err(MemoryError::InvalidTransition { .. })));
+        // candidate → verified → trusted works and bumps versions + history.
+        reg.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "verifier", "bench passed", 150).unwrap();
+        reg.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "corroborator", "seen twice", 200).unwrap();
+        // verified → verified is illegal too.
+        let err = reg.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "x", "again", 250);
+        assert!(matches!(err, Err(MemoryError::InvalidTransition { .. })));
+        let e = &reg.read("team.knowledge", "governor", true, 300).unwrap()[0];
+        assert_eq!(e.meta.status, MemoryStatus::Trusted);
+        assert_eq!(e.meta.version, 3);
+        assert_eq!(e.meta.history.len(), 2);
+        assert_eq!(e.meta.history[0].from, MemoryStatus::Candidate);
+        assert_eq!(e.meta.history[0].reason, "bench passed");
+        // Obsolete stays recoverable in place.
+        reg.transition_status("team.knowledge", "e1", MemoryStatus::Obsolete, "gov", "superseded", 400).unwrap();
+        let e = &reg.read("team.knowledge", "governor", true, 500).unwrap()[0];
+        assert_eq!(e.meta.status, MemoryStatus::Obsolete);
+        assert_eq!(e.content, "lesson", "obsolete entries keep their content");
+    }
+
+    #[test]
+    fn subject_resolution_is_deterministic() {
+        let mut reg = MemoryRegistry::new();
+        reg.register_scope(collective_scope()).unwrap();
+        // Three competing claims: candidate(50), verified(80), candidate(90).
+        let mut low = knowledge("low", "low conf", "q:x");
+        low.meta.detail = Some(MemoryProvenance::new("agent_reasoning", "a", "n1", 10, 50));
+        let mut mid = knowledge("mid", "verified", "q:x");
+        mid.meta.status = MemoryStatus::Verified;
+        mid.meta.detail = Some(MemoryProvenance::new("execution", "a", "n1", 20, 40).with_evidence("aud-1"));
+        let mut high = knowledge("high", "high conf", "q:x");
+        high.meta.detail = Some(MemoryProvenance::new("benchmark", "a", "n2", 30, 90));
+        for e in [low, mid, high] {
+            reg.write_checked("team.knowledge", e, "governor", true, false, false, 100).unwrap();
+        }
+        // Verified beats any confidence; ties would fall to first-observed then id.
+        let winner = reg.resolve_subject("team.knowledge", "q:x", 1000).unwrap();
+        assert_eq!(winner.entry_id, "mid");
+        assert_eq!(winner.meta.status, MemoryStatus::Verified);
+        // Unknown subject → None.
+        assert!(reg.resolve_subject("team.knowledge", "q:none", 1000).is_none());
+    }
+
+    #[test]
+    fn merge_batch_is_additive_and_dedups() {
+        let mut local = MemoryRegistry::new();
+        local.register_scope(collective_scope()).unwrap();
+        local
+            .write_checked("team.knowledge", knowledge("local1", "shared lesson", "q:s"), "governor", true, false, false, 100)
+            .unwrap();
+
+        let remote = vec![
+            knowledge("r1", "remote lesson", "q:r"),
+            knowledge("r2", "shared lesson", "q:s"),   // exact duplicate of local1
+            knowledge("r3", "competing view", "q:r"),  // competes with r1
+        ];
+        let report = local.merge_batch("team.knowledge", remote, 1000).unwrap();
+        assert_eq!(report.accepted, 2);
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.conflicts_linked, 1);
+
+        // Re-merging the same batch is a full no-op (idempotent).
+        let remote_again = vec![knowledge("r1", "remote lesson", "q:r")];
+        let again = local.merge_batch("team.knowledge", remote_again, 1000).unwrap();
+        assert_eq!(again.accepted, 0);
+        assert_eq!(again.duplicates, 1);
+
+        // Local entry was never overwritten.
+        let all = local.read("team.knowledge", "governor", true, 1000).unwrap();
+        assert_eq!(all.len(), 3, "1 local + r1 + r3 (r2 duplicate skipped)");
+        assert!(all.iter().any(|e| e.entry_id == "local1" && e.content == "shared lesson"));
+
+        // Expired remote entries are dropped, not merged.
+        let expired = vec![knowledge("rx", "stale", "q:z").expires_at(500)];
+        let rep = local.merge_batch("team.knowledge", expired, 1000).unwrap();
+        assert_eq!(rep.expired, 1);
+
+        // Unknown scope is an error, never an implicit creation.
+        assert!(matches!(
+            local.merge_batch("ghost", vec![], 1000),
+            Err(MemoryError::UnknownScope { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_backed_is_distinguishable_from_assertion() {
+        let mut backed = knowledge("e1", "from execution", "q:b");
+        backed.meta.detail = Some(
+            MemoryProvenance::new("execution", "a", "n1", 10, 95).with_evidence("audit-77"),
+        );
+        assert!(backed.meta.is_evidence_backed());
+
+        let mut assertion = knowledge("e2", "just said", "q:b");
+        assertion.meta.detail =
+            Some(MemoryProvenance::new("agent_reasoning", "a", "n1", 10, 60));
+        assert!(!assertion.meta.is_evidence_backed());
+        assert!(!MemoryMeta::default().is_evidence_backed());
     }
 }
