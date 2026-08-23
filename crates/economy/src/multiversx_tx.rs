@@ -69,6 +69,8 @@ pub enum TxBuildError {
     ScoreOutOfRange,
     #[error("payment value is required for a paid job")]
     ValueRequired,
+    #[error("uri scheme must be ipfs:// or https://")]
+    InvalidUriScheme,
 }
 
 const MAX_NAME: usize = 64;
@@ -156,6 +158,9 @@ impl Mx8004TxBuilder {
                 field: "uri",
                 max: MAX_URI,
             });
+        }
+        if !(manifest_uri.starts_with("ipfs://") || manifest_uri.starts_with("https://")) {
+            return Err(TxBuildError::InvalidUriScheme);
         }
         let pk = public_key_hex
             .strip_prefix("0x")
@@ -302,6 +307,94 @@ pub struct MxReputationSignal {
     pub agent_nonce: u64,
     pub average_percent: u8,
     pub count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// REGISTRATION PREPARATION (operator runbook support)
+//
+// Produces everything the OPERATOR needs to execute the first registration
+// manually: the exact data field, every tx field they must fill, and the
+// verification steps AFTER confirmation. Nothing here signs or submits.
+// ---------------------------------------------------------------------------
+
+/// One field the operator must supply/verify at signing time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorField {
+    pub name: &'static str,
+    pub value: String,
+    pub note: &'static str,
+}
+
+/// Full preparation report for the first Governor registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationPreparation {
+    pub network: &'static str,
+    pub chain_id: &'static str,
+    pub endpoint: &'static str,
+    /// The complete on-chain data string, ready to paste.
+    pub data_field: String,
+    pub sender_wallet_address: String,
+    pub agent_public_key_hex: String,
+    pub manifest_uri: String,
+    /// Fields the operator fills from live devnet state / wallet tooling.
+    pub operator_fields: Vec<OperatorField>,
+    /// Post-confirmation verification steps (ordered).
+    pub verification_steps: Vec<&'static str>,
+}
+
+/// Builds the full registration preparation. Pure + offline.
+/// `gas_limit` suggestion is a STARTING POINT — confirm on explorer.
+pub fn registration_preparation(
+    name: &str,
+    manifest_uri: &str,
+    agent_public_key_hex: &str,
+    sender_wallet_address: &str,
+    suggested_gas_limit: u64,
+) -> Result<RegistrationPreparation, TxBuildError> {
+    let intent = Mx8004TxBuilder::register_agent(name, manifest_uri, agent_public_key_hex, &[])?;
+    Ok(RegistrationPreparation {
+        network: DEVNET_NETWORK,
+        chain_id: "D",
+        endpoint: REGISTER_AGENT_ENDPOINT,
+        data_field: intent.data_field(),
+        sender_wallet_address: sender_wallet_address.to_string(),
+        agent_public_key_hex: agent_public_key_hex.to_string(),
+        manifest_uri: manifest_uri.to_string(),
+        operator_fields: vec![
+            OperatorField {
+                name: "receiver",
+                value: "PENDING_VERIFIED_ADDRESS".into(),
+                note: "MX-8004 Identity Registry on devnet — fill ONLY after verifying via docs/MULTIVERSX_DEVNET_ADDRESSES.md procedure",
+            },
+            OperatorField {
+                name: "nonce",
+                value: "<account nonce of sender, from GET /accounts/{sender}>".into(),
+                note: "live devnet account state",
+            },
+            OperatorField {
+                name: "gasLimit",
+                value: suggested_gas_limit.to_string(),
+                note: "STARTING POINT — NFT mint burns gas; raise if explorer shows insufficient",
+            },
+            OperatorField {
+                name: "chainId",
+                value: "D".into(),
+                note: "devnet",
+            },
+            OperatorField {
+                name: "version",
+                value: "1".into(),
+                note: "tx version",
+            },
+        ],
+        verification_steps: vec![
+            "GET https://devnet-api.multiversx.com/transactions/{txHash} until status=success",
+            "extract `receiver` from the confirmed tx",
+            "check tx logs/events contain agentRegistered",
+            "GET DEVNET_API_BASE/agents/{nonce} — publicKey must equal ours",
+            "record receiver+txHash+explorer URL into MULTIVERSX_DEVNET_ADDRESSES.md",
+        ],
+    })
 }
 
 #[cfg(test)]
@@ -457,5 +550,47 @@ mod tests {
             count: 5,
         };
         assert!(rep.average_percent <= 100);
+    }
+    #[test]
+    fn registration_preparation_is_complete_and_deterministic() {
+        let p = registration_preparation(
+            "DecentraGovernor",
+            "ipfs://QmZ",
+            &key_hex(),
+            "erd1operator",
+            30_000_000,
+        )
+        .unwrap();
+        assert_eq!(p.chain_id, "D");
+        assert_eq!(p.endpoint, REGISTER_AGENT_ENDPOINT);
+        assert!(p.data_field.starts_with("register_agent@"));
+        assert_eq!(p.sender_wallet_address, "erd1operator");
+        // Receiver MUST be a pending placeholder — no address invented.
+        assert!(
+            p.operator_fields
+                .iter()
+                .any(|f| f.name == "receiver" && f.value == "PENDING_VERIFIED_ADDRESS")
+        );
+        assert_eq!(p.verification_steps.len(), 5);
+        // Determinism.
+        let p2 = registration_preparation(
+            "DecentraGovernor",
+            "ipfs://QmZ",
+            &key_hex(),
+            "erd1operator",
+            30_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            serde_json::to_string(&p2).unwrap()
+        );
+    }
+
+    #[test]
+    fn registration_preparation_rejects_bad_inputs() {
+        assert!(registration_preparation("", "ipfs://QmZ", &key_hex(), "erd1o", 1000).is_err());
+        assert!(registration_preparation("n", "http://bad", &key_hex(), "erd1o", 1000).is_err());
+        assert!(registration_preparation("n", "ipfs://QmZ", "not-a-key", "erd1o", 1000).is_err());
     }
 }
