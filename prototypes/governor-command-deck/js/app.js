@@ -1,4 +1,5 @@
 import { addEv, addMsg, COMMANDS, lastEv, setGov, state } from "./state.js";
+import { getGovernorState, getWorkers } from "./api.js";
 import { CommandPalette, EvolutionPanel, GovernorShell, MemoryInspector, ProviderStatus, WorkerStatus } from "./components.js";
 
 const app = document.querySelector("#app");
@@ -205,4 +206,29 @@ setInterval(() => {
 addMsg("gov", "Governor online. I observe, propose, and wait for deterministic Rust before anyone executes.");
 state.messages[0].keep = true;
 render();
+
+// Fetch real fabric state from Governor daemon and update UI.
+async function loadRealState() {
+  try {
+    const gs = await getGovernorState();
+    if (gs.workers && gs.workers.length) {
+      state.workers = gs.workers.map(w => ({
+        id: w.worker_id,
+        name: w.name,
+        ok: w.healthy,
+        lat: w.avg_latency || "-"
+      }));
+    }
+    if (gs.pressure_score > 0) {
+      state.utterance = "Pressure " + gs.pressure_score + " — watching.";
+      setGov("OBSERVING", state.utterance);
+    }
+    render();
+  } catch (e) {
+    console.warn("governor state fetch failed:", e);
+  }
+}
+loadRealState();
+setInterval(loadRealState, 30000);
+
 setTimeout(startScenario, 800);
