@@ -5912,7 +5912,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         ctx.decision = unified_fabric_decision(state, &intent, &evidence, model.as_deref()).await;
     } else if let Some((input, _model)) = crate::mcp::embeddings_request(&raw) {
         // `decentraai_embeddings` — L1 ASSIST, scoped to embeddings.
-        if !scopes.iter().any(|s| s == "embeddings" || s == "inference" || s == "*") {
+        if !scopes.iter().any(|s| s == "embeddings" || s == "*") {
             return forbidden("consumer key missing embeddings scope");
         }
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
@@ -6067,8 +6067,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         match name {
                             "decide" | "execute_decision" => true,
-                            "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings" || s == "inference" || s == "*"),
-                            "decentraai_compute_request" => scopes.iter().any(|s| s == "compute" || s == "inference" || s == "*"),
+                            "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings" || s == "*"),
+                            "decentraai_compute_request" => scopes.iter().any(|s| s == "compute" || s == "*"),
                             "serve_model" | "pull_model" | "list_consumer_keys" | "get_compensation" => false,
                             _ => true,
                         }
