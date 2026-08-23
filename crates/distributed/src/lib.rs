@@ -89,6 +89,7 @@ pub mod embedding;
 pub mod evidence_manager;
 pub mod fallback;
 pub mod knowledge_runtime;
+pub mod memory_propagator;
 pub mod p2p_handler;
 pub mod probe;
 pub mod queue;

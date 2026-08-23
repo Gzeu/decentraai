@@ -8350,7 +8350,7 @@ async fn memory_sync_to_handler(
     body: axum::Json<serde_json::Value>,
 ) -> Response {
     use decentraai_protocol::memory_sync::{
-        MemorySyncRequest, MemorySyncResponse, SyncEntryMeta, SyncMemoryEntry, MAX_SYNC_BATCH_ENTRIES,
+        MemorySyncRequest, MemorySyncResponse, SyncMemoryEntry, MAX_SYNC_BATCH_ENTRIES,
     };
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -8390,39 +8390,11 @@ async fn memory_sync_to_handler(
         }
     };
     // Bounded batch: newest-first order from read(), capped at the wire max.
+    // Shared conversion with the auto-propagator — one wire mapping.
     let payload_entries: Vec<SyncMemoryEntry> = entries
         .into_iter()
         .take(MAX_SYNC_BATCH_ENTRIES)
-        .map(|e| {
-            let (source, confidence, evidence_ref) = e
-                .meta
-                .detail
-                .clone()
-                .map(|d| (d.source, d.confidence, d.evidence_ref))
-                .unwrap_or_else(|| (String::new(), 0u8, None));
-            SyncMemoryEntry {
-                entry_id: e.entry_id,
-                author_agent: e.author_agent,
-                author_node: e.author_node,
-                content: e.content.chars().take(4096).collect(),
-                created_at_ms: e.created_at_ms,
-                meta: SyncEntryMeta {
-                    kind: serde_json::to_value(e.meta.kind)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_else(|| "observation".to_string()),
-                    status: serde_json::to_value(e.meta.status)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_else(|| "candidate".to_string()),
-                    version: e.meta.version,
-                    subject_key: e.meta.subject_key.chars().take(256).collect(),
-                    source: source.chars().take(256).collect(),
-                    confidence,
-                    evidence_ref: evidence_ref.unwrap_or_default().chars().take(256).collect(),
-                },
-            }
-        })
+        .map(|e| decentraai_distributed::agent_memory::memory_entry_to_sync(&e))
         .collect();
     let batch_len = payload_entries.len();
     let request = MemorySyncRequest {

@@ -22,6 +22,8 @@ use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{Multiaddr, dcutr, identify, kad, mdns, noise, ping, relay, tcp, yamux};
+
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -551,6 +553,9 @@ impl P2PNode {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
         let peer_id = PeerId::from(&keypair.public());
+        // mDNS honours the config flag (M19 fix): tests and nodes that set
+        // `lan_discovery: false` must stay invisible on the segment instead
+        // of being auto-discovered by every neighbour.
         let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .context("creating mDNS behaviour")?;
         let codec = FrameCodec {
@@ -776,9 +781,14 @@ impl P2PNode {
                                 // connection is not established yet —
                                 // request_response auto-dials in that case.
                                 let mut peers = connected.clone();
-                                for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
-                                    if !peers.contains(peer) {
-                                        peers.push(*peer);
+                                if network.lan_discovery {
+                                    // Only act on discovery when enabled;
+                                    // otherwise unknown peers are never
+                                    // proactively contacted.
+                                    for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
+                                        if !peers.contains(peer) {
+                                            peers.push(*peer);
+                                        }
                                     }
                                 }
                                 for peer in peers {
@@ -891,7 +901,7 @@ impl P2PNode {
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(
                                 mdns::Event::Discovered(list),
-                            )) => {
+                            )) if network.lan_discovery => {
                                 for (peer, addr) in list {
                                     info!(%peer, %addr, "mDNS discovered peer");
                                     swarm.add_peer_address(peer, addr.clone());

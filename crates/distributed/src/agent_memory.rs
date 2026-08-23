@@ -177,6 +177,42 @@ use decentraai_protocol::memory_sync::SyncMemoryEntry;
 
 /// Converts a wire sync entry into a domain entry, enforcing the trust
 /// boundary: a remote claim ALWAYS lands as [`MemoryStatus::Candidate`] —
+/// Converts a local domain entry into its wire projection for outbound
+/// sync (propagator + sync-to endpoint share this one mapping). Content is
+/// clipped; metadata travels honestly — the RECEIVER decides trust (its
+/// gates + candidate downgrade), never the sender.
+#[must_use]
+pub fn memory_entry_to_sync(entry: &MemoryEntry) -> SyncMemoryEntry {
+    let (source, confidence, evidence_ref) = entry
+        .meta
+        .detail
+        .clone()
+        .map(|d| (d.source, d.confidence, d.evidence_ref))
+        .unwrap_or_else(|| (String::new(), 0u8, None));
+    SyncMemoryEntry {
+        entry_id: entry.entry_id.clone(),
+        author_agent: entry.author_agent.clone(),
+        author_node: entry.author_node.clone(),
+        content: entry.content.chars().take(4096).collect(),
+        created_at_ms: entry.created_at_ms,
+        meta: decentraai_protocol::memory_sync::SyncEntryMeta {
+            kind: serde_json::to_value(entry.meta.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "observation".to_string()),
+            status: serde_json::to_value(entry.meta.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "candidate".to_string()),
+            version: entry.meta.version,
+            subject_key: entry.meta.subject_key.chars().take(256).collect(),
+            source: source.chars().take(256).collect(),
+            confidence,
+            evidence_ref: evidence_ref.unwrap_or_default().chars().take(256).collect(),
+        },
+    }
+}
+
 /// verified/trusted status is earned through LOCAL verification
 /// (`transition_status` against local evidence), never imported from the
 /// payload where a hostile peer could self-declare `trusted` and win
