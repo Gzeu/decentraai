@@ -2461,6 +2461,66 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(store) = agent_memory_store.clone() {
             state.attach_memory(store);
         }
+        // Memory-sync inbound (M19): accept collective-memory batches from
+        // peers into scopes that EXPLICITLY opted in (access public +
+        // allow_remote_write). Remote claims always land as Candidate —
+        // verification is a local act, never imported from the wire.
+        if let Some(store) = agent_memory_store.clone() {
+            let mut p2p_mut_sync = distributed.p2p_node().clone();
+            p2p_mut_sync.set_on_memory_sync(move |_peer, req| {
+                use decentraai_distributed::agent_memory::sync_entry_to_memory;
+                use decentraai_protocol::memory_sync::MemorySyncResponse;
+                let reject_all = |n: usize| {
+                    serde_json::to_vec(&MemorySyncResponse {
+                        protocol_version: 1,
+                        declined: false,
+                        accepted: 0,
+                        duplicates: 0,
+                        conflicts_linked: 0,
+                        expired: 0,
+                        rejected: n.min(u32::MAX as usize) as u32,
+                    })
+                    .unwrap_or_default()
+                };
+                if !req.is_shape_valid() || req.scope.is_empty() {
+                    return reject_all(req.entries.len());
+                }
+                let mut accepted = 0u32;
+                let mut duplicates = 0u32;
+                let mut conflicts_linked = 0u32;
+                let mut rejected = 0u32;
+                for se in req.entries {
+                    let entry = sync_entry_to_memory(se, &req.scope);
+                    match store.write_checked(&req.scope, &entry, "memory-sync", false, false, false) {
+                        Ok(decentraai_agents::memory::WriteOutcome::Stored) => accepted += 1,
+                        Ok(decentraai_agents::memory::WriteOutcome::Duplicate { .. }) => duplicates += 1,
+                        Ok(decentraai_agents::memory::WriteOutcome::CompetingClaim { .. }) => {
+                            accepted += 1;
+                            conflicts_linked += 1;
+                        }
+                        Err(_) => rejected += 1,
+                    }
+                }
+                tracing::info!(
+                    scope = %req.scope,
+                    accepted,
+                    duplicates,
+                    conflicts_linked,
+                    rejected,
+                    "memory-sync batch processed"
+                );
+                serde_json::to_vec(&MemorySyncResponse {
+                    protocol_version: 1,
+                    declined: false,
+                    accepted,
+                    duplicates,
+                    conflicts_linked,
+                    expired: 0,
+                    rejected,
+                })
+                .unwrap_or_default()
+            });
+        }
         // P12: collective knowledge & decisions runtime. It shares the
         // authoritative compensation ledger with the compute manager, so a
         // verified compute receipt credits the SAME earnings bookkeeping the

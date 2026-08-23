@@ -173,6 +173,59 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(dot / (norm_a * norm_b))
 }
 
+use decentraai_protocol::memory_sync::SyncMemoryEntry;
+
+/// Converts a wire sync entry into a domain entry, enforcing the trust
+/// boundary: a remote claim ALWAYS lands as [`MemoryStatus::Candidate`] —
+/// verified/trusted status is earned through LOCAL verification
+/// (`transition_status` against local evidence), never imported from the
+/// payload where a hostile peer could self-declare `trusted` and win
+/// conflict resolution. Provenance detail (source/confidence/evidence_ref)
+/// is preserved honestly as context.
+#[must_use]
+pub fn sync_entry_to_memory(entry: SyncMemoryEntry, target_scope: &str) -> MemoryEntry {
+    let mut meta: decentraai_agents::memory::MemoryMeta =
+        serde_json::from_value(serde_json::json!({
+            "kind": entry.meta.kind,
+            "status": entry.meta.status,
+            "version": entry.meta.version,
+            "subject_key": entry.meta.subject_key,
+        }))
+        .unwrap_or_default();
+    // Downgrade whatever the wire claimed.
+    meta.status = MemoryStatus::Candidate;
+    meta.version = 1;
+    if !entry.meta.source.is_empty() || !entry.meta.evidence_ref.is_empty() {
+        let mut detail = decentraai_agents::memory::MemoryProvenance::new(
+            if entry.meta.source.is_empty() { "remote" } else { entry.meta.source.as_str() },
+            entry.author_agent.as_str(),
+            entry.author_node.as_str(),
+            entry.created_at_ms,
+            entry.meta.confidence,
+        );
+        if !entry.meta.evidence_ref.is_empty() {
+            detail = detail.with_evidence(entry.meta.evidence_ref.as_str());
+        }
+        meta.detail = Some(detail);
+    }
+    let mut e = MemoryEntry {
+        entry_id: entry.entry_id,
+        scope: target_scope.to_string(),
+        author_agent: entry.author_agent,
+        author_node: entry.author_node,
+        content: entry.content,
+        tags: Vec::new(),
+        created_at_ms: entry.created_at_ms,
+        expires_at_ms: None,
+        provenance: None,
+        meta,
+    };
+    // Local identity for this imported knowledge: subject keys still group
+    // conflicts; ids stay stable for dedup across re-sends.
+    let _ = &mut e;
+    e
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -837,10 +890,6 @@ fn scope_from_row(
         policy,
         created_at_ms: created_at_ms as u64,
     })
-}
-
-fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
-    Ok(entry_from_row_with_embedding(row)?.0)
 }
 
 /// Row mapper that also extracts the optional embedding BLOB (M19).

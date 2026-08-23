@@ -5056,6 +5056,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/memory/search", post(memory_search_handler))
         .route("/v1/memory/transition", post(memory_transition_handler))
         .route("/v1/memory/index", post(memory_index_handler))
+        .route("/v1/memory/sync-to", post(memory_sync_to_handler))
         .route(
             "/v1/memory/training-candidates",
             get(memory_training_candidates_handler),
@@ -8336,6 +8337,156 @@ fn respond_lexical(
     ).into_response()
 }
 
+
+/// POST /v1/memory/sync-to — push a bounded batch of one scope's collective
+/// memory to a peer over the existing p2p transport. Operator+.
+/// Body: {"peer":"<peer id>","scope":"…"}. The receiver applies its OWN
+/// policy gates (only scopes with public access + remote-write opt-in accept
+/// entries) and downgrades imported claims to `candidate` — verification is
+/// always local. Audited.
+async fn memory_sync_to_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_protocol::memory_sync::{
+        MemorySyncRequest, MemorySyncResponse, SyncEntryMeta, SyncMemoryEntry, MAX_SYNC_BATCH_ENTRIES,
+    };
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(memory) = &state.memory else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "memory store not attached"})),
+        ).into_response();
+    };
+    let Some(p2p) = &state.p2p else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "p2p not enabled on this node"})),
+        ).into_response();
+    };
+    let Some(scope) = body.0.get("scope").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "scope is required"})),
+        ).into_response();
+    };
+    let peer_str = body.0.get("peer").and_then(|v| v.as_str()).unwrap_or_default();
+    let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "peer must be a valid libp2p PeerId"})),
+        ).into_response();
+    };
+    let entries = match memory.read(scope, "governor", true) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    };
+    // Bounded batch: newest-first order from read(), capped at the wire max.
+    let payload_entries: Vec<SyncMemoryEntry> = entries
+        .into_iter()
+        .take(MAX_SYNC_BATCH_ENTRIES)
+        .map(|e| {
+            let (source, confidence, evidence_ref) = e
+                .meta
+                .detail
+                .clone()
+                .map(|d| (d.source, d.confidence, d.evidence_ref))
+                .unwrap_or_else(|| (String::new(), 0u8, None));
+            SyncMemoryEntry {
+                entry_id: e.entry_id,
+                author_agent: e.author_agent,
+                author_node: e.author_node,
+                content: e.content.chars().take(4096).collect(),
+                created_at_ms: e.created_at_ms,
+                meta: SyncEntryMeta {
+                    kind: serde_json::to_value(e.meta.kind)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "observation".to_string()),
+                    status: serde_json::to_value(e.meta.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "candidate".to_string()),
+                    version: e.meta.version,
+                    subject_key: e.meta.subject_key.chars().take(256).collect(),
+                    source: source.chars().take(256).collect(),
+                    confidence,
+                    evidence_ref: evidence_ref.unwrap_or_default().chars().take(256).collect(),
+                },
+            }
+        })
+        .collect();
+    let batch_len = payload_entries.len();
+    let request = MemorySyncRequest {
+        protocol_version: MemorySyncRequest::VERSION,
+        sender_node: p2p.local_peer_id().to_string(),
+        scope: scope.to_string(),
+        entries: payload_entries,
+    };
+    let Ok(bytes) = serde_json::to_vec(&request) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": "failed to encode sync batch"})),
+        ).into_response();
+    };
+    if bytes.len() > decentraai_protocol::memory_sync::MAX_MEMORY_SYNC_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "encoded batch exceeds the memory-sync byte cap; sync fewer entries"
+            })),
+        ).into_response();
+    }
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "memory_sync_push",
+        serde_json::json!({
+            "scope": scope,
+            "peer": peer_str,
+            "entries": batch_len,
+        }),
+    );
+    match p2p.request(peer_id, bytes).await {
+        Ok(resp_bytes) => match serde_json::from_slice::<MemorySyncResponse>(&resp_bytes) {
+            Ok(resp) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "scope": scope,
+                    "sent": batch_len,
+                    "peer_declined": resp.declined,
+                    "accepted": resp.accepted,
+                    "duplicates": resp.duplicates,
+                    "conflicts_linked": resp.conflicts_linked,
+                    "expired": resp.expired,
+                    "rejected": resp.rejected,
+                })),
+            ).into_response(),
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({
+                    "error": "peer response was not a valid memory-sync response",
+                    "scope": scope,
+                    "sent": batch_len,
+                })),
+            ).into_response(),
+        },
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "error": format!("sync request to peer failed: {e}"),
+                "scope": scope,
+            })),
+        ).into_response(),
+    }
+}
 
 /// POST /v1/memory/index — backfill embedding vectors for one scope's live
 /// entries (semantic retrieval index). Operator+. Body: {"scope":"…"}.

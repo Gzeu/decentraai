@@ -413,6 +413,16 @@ pub enum DfcInbound {
 
 type DfcHandler = Arc<dyn Fn(PeerId, DfcInbound) -> Option<Vec<u8>> + Send + Sync>;
 
+/// Memory-sync dispatch slot (M19): a decoded, bounds-checked
+/// [`decentraai_protocol::memory_sync::MemorySyncRequest`] from a peer.
+/// The handler merges the batch into the local store (deterministic,
+/// additive-only) and returns the ENCODED [`decentraai_protocol::memory_sync::
+/// MemorySyncResponse`]. Identity comes from the transport (`peer`), never
+/// from the payload's `sender_node`.
+type MemorySyncHandler = Arc<
+    dyn Fn(PeerId, decentraai_protocol::memory_sync::MemorySyncRequest) -> Vec<u8> + Send + Sync,
+>;
+
 /// Shared, swappable handler slot read by the swarm task.
 type SharedHandler<T> = Arc<tokio::sync::Mutex<Option<T>>>;
 
@@ -436,6 +446,9 @@ pub struct P2PNode {
     on_cancel: SharedHandler<CancelHandler>,
     /// Optional callback invoked for inbound manifest announcements.
     on_manifest: SharedHandler<ManifestAnnouncementHandler>,
+    /// Memory-sync dispatch slot. `None` = this node does not accept memory
+    /// sync; inbound batches get an explicit `declined` response.
+    on_memory_sync: SharedHandler<MemorySyncHandler>,
 }
 
 impl P2PNode {
@@ -484,6 +497,25 @@ impl P2PNode {
         F: Fn(PeerId, decentraai_manifest::Manifest, bool) + Send + Sync + 'static,
     {
         let mut guard = futures::executor::block_on(self.on_manifest.lock());
+        *guard = Some(std::sync::Arc::new(callback));
+    }
+
+    /// Sets the memory-sync handler (M19). Called by the runtime with the
+    /// local [`MemoryStore`]: the handler runs the deterministic additive
+    /// merge and returns the encoded response. When unset, inbound sync
+    /// batches are answered with a `declined` response — peers learn the
+    /// feature is off without retry loops.
+    pub fn set_on_memory_sync<F>(&mut self, callback: F)
+    where
+        F: Fn(
+                PeerId,
+                decentraai_protocol::memory_sync::MemorySyncRequest,
+            ) -> Vec<u8>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut guard = futures::executor::block_on(self.on_memory_sync.lock());
         *guard = Some(std::sync::Arc::new(callback));
     }
 
@@ -666,6 +698,9 @@ impl P2PNode {
         let on_manifest: SharedHandler<ManifestAnnouncementHandler> =
             Arc::new(tokio::sync::Mutex::new(None));
         let on_manifest_clone = on_manifest.clone();
+        let on_memory_sync: SharedHandler<MemorySyncHandler> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let on_memory_sync_loop = on_memory_sync.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -979,6 +1014,41 @@ impl P2PNode {
                                         }
                                         continue;
                                     }
+                                    // Memory sync (M19): bounded batch of collective
+                                    // memory entries from a peer. Merged
+                                    // deterministically by the runtime's handler;
+                                    // when no handler is registered the node
+                                    // answers with an explicit `declined`
+                                    // response so senders stop retrying.
+                                    if let Ok(sync_req) = decentraai_protocol::deserialize_message::<decentraai_protocol::memory_sync::MemorySyncRequest>(
+                                        &request,
+                                        decentraai_protocol::memory_sync::MAX_MEMORY_SYNC_BYTES,
+                                    ) {
+                                        let guard = on_memory_sync_loop.lock().await;
+                                        let reply_bytes = if let Some(cb) = &*guard {
+                                            cb(peer, sync_req)
+                                        } else {
+                                            serde_json::to_vec(&decentraai_protocol::memory_sync::MemorySyncResponse {
+                                                protocol_version: 1,
+                                                declined: true,
+                                                accepted: 0,
+                                                duplicates: 0,
+                                                conflicts_linked: 0,
+                                                expired: 0,
+                                                rejected: 0,
+                                            })
+                                            .unwrap_or_default()
+                                        };
+                                        if swarm
+                                            .behaviour_mut()
+                                            .messages
+                                            .send_response(channel, reply_bytes)
+                                            .is_err()
+                                        {
+                                            warn!(%peer, "failed to send memory-sync response");
+                                        }
+                                        continue;
+                                    }
                                     if let Ok(reserve) = decentraai_protocol::deserialize_message::<decentraai_protocol::dfcp::ResourceReserve>(
                                         &request,
                                         decentraai_protocol::dfcp::MAX_DFCP_MESSAGE_BYTES,
@@ -1229,6 +1299,7 @@ impl P2PNode {
             on_infer,
             on_cancel,
             on_manifest,
+            on_memory_sync,
         })
     }
 
