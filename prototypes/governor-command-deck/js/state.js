@@ -1,5 +1,4 @@
 export const PATH = ["OBSERVING", "DIAGNOSING", "DELEGATING", "VERIFYING"];
-export const MODELS = { "ox-alpha": "Ox Alpha", laguna: "Laguna", local: "Local" };
 export const COMMANDS = [
   ["Run capability", "capability"],
   ["Inspect worker", "insp:workers"],
@@ -8,38 +7,35 @@ export const COMMANDS = [
   ["Research capability", "research"],
   ["Replay execution", "replay"],
   ["Pause execution", "pause"],
-  ["Open incident", "incident"],
-  ["Switch provider", "insp:providers"],
-  ["Switch model", "insp:providers"]
+  ["Open incident", "incident"]
 ];
 
 export const state = {
   governor: "IDLE",
   phase: "idle",
   surface: "chat",
-  provider: "hybrid",
-  model: "ox-alpha",
   inspector: null,
   palette: false,
   paletteQ: "",
   paletteI: 0,
-  utterance: "Quiet. Watching the fabric.",
+  utterance: "Pressure 0.2 — watching.",
+  pressure: 0.2,
   paused: false,
   running: false,
   step: -1,
   selectedEvent: null,
   workers: [
-    { id: "wrk_desktop_01", name: "Desktop", ok: true, lat: "1.82s" },
-    { id: "wrk_hub_02", name: "Hub", ok: true, lat: "0.41s" },
-    { id: "wrk_studio_03", name: "Studio", ok: true, lat: "0.66s" }
+    { id: "wrk_desktop_01", name: "Desktop", ok: true, lat: "1.82s", note: "local GPU · prefill tail" },
+    { id: "wrk_vps_02", name: "VPS", ok: true, lat: "0.64s", note: "remote capacity · GPU 98% in last sample" },
+    { id: "wrk_laptop_03", name: "Laptop", ok: true, lat: "0.91s", note: "admitted · energy-sensitive" }
   ],
   messages: [],
   events: [],
   memories: [
     { type: "OBSERVATION", text: "Desktop prefill tail exceeds 1.6s under mixed batch.", conf: 0.86, rel: ["wrk_desktop_01"] },
-    { type: "FACT", text: "Fabric health remains 3/3. Pressure is scheduling, not capacity.", conf: 0.93, rel: ["fabric"] },
-    { type: "DECISION", text: "Diagnostic tasks on Desktop require deterministic ALLOW.", conf: 0.99, rel: ["policy"] },
-    { type: "LESSON", text: "Do not treat worker latency as provider failure.", conf: 0.88, rel: ["m1"] }
+    { type: "FACT", text: "Fabric is 3/3: Desktop, VPS, Laptop. Pressure is 0.2 at idle.", conf: 0.94, rel: ["fabric"] },
+    { type: "DECISION", text: "Diagnostic tasks require deterministic ALLOW before a worker executes.", conf: 0.99, rel: ["policy"] },
+    { type: "LESSON", text: "Worker latency is not a provider failure.", conf: 0.88, rel: ["wrk_desktop_01"] }
   ],
   gaps: [{ id: "gap-42", title: "Embedding runtime optimization", research: 4, status: "open" }],
   experiments: [{ id: "exp-7", title: "v2 vs v1", result: null, status: "idle" }]
@@ -68,6 +64,10 @@ export function setGov(s, utter) {
   state.governor = s;
   state.phase = phaseOf(s);
   if (utter) state.utterance = utter;
+  if (s === "EXECUTING" || s === "DELEGATING") state.pressure = 0.61;
+  else if (s === "INCIDENT") state.pressure = 0.84;
+  else if (s === "IDLE") state.pressure = 0.2;
+  else state.pressure = 0.34;
   const app = document.querySelector("#app");
   app.dataset.phase = state.phase;
   app.dataset.live = state.events.some((e) => e.live) || ["DELEGATING", "EXECUTING"].includes(s) ? "true" : "false";
@@ -81,7 +81,7 @@ export function addEv(partial) {
   const ev = {
     id: "ex_0f3a" + String(state.events.length + 1).padStart(2, "0"),
     open: false, live: true, done: false, elapsed: "0.0s",
-    model: MODELS[state.model], ...partial
+    model: "governor", ...partial
   };
   state.events.push(ev);
   state.selectedEvent = ev.id;

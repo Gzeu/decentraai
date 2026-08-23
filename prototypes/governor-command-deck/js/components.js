@@ -1,4 +1,4 @@
-import { COMMANDS, MODELS, PATH, pathIndex, state } from "./state.js";
+import { COMMANDS, PATH, pathIndex, state } from "./state.js";
 
 export function GovernorStatus() {
   return `<div class="online"><i class="pip"></i><span>Governor online</span></div>`;
@@ -6,20 +6,16 @@ export function GovernorStatus() {
 
 export function GovernorPresence() {
   const idx = pathIndex(state.phase);
-  const label = state.provider === "hybrid"
-    ? `${MODELS[state.model]} / Local`
-    : `${MODELS[state.model]} / ${state.provider === "command-code" ? "Command Code" : "Local"}`;
+  const pressure = state.pressure.toFixed(1);
   return `
     <header class="bar">
       ${GovernorStatus()}
-      <div class="bar-r">
-        <button class="model mono" id="modelBtn" type="button">${label}</button>
-        <button class="icon-btn mono" id="cmdBtn" type="button">⌘K</button>
-      </div>
+      <button class="icon-btn mono" id="cmdBtn" type="button">⌘K</button>
     </header>
     <section class="presence">
       <div class="who">Governor</div>
-      <p class="utter" id="utter">${state.utterance}</p>
+      <p class="utter">${state.utterance}</p>
+      <p class="sub">Pressure ${pressure} · Desktop · VPS · Laptop</p>
       <ol class="path">${PATH.map((n, i) => `<li class="${i === idx ? "on" : i < idx ? "done" : ""}">${n}</li>`).join("")}</ol>
       <div class="flow">↓ Live execution</div>
     </section>`;
@@ -30,8 +26,9 @@ export function ActivityCapsule(c, i, mi) {
     ? `<div class="policy">AI proposes → simulated Rust decision → execution</div>` : "";
   return `<div class="cap ${c.open ? "open" : ""}" data-kind="${c.kind}" data-cap="${mi}:${i}">
     <i class="sig"></i>
-    <div>
-      <div class="cap-h"><span class="tag">${c.kind}</span><span class="cap-t">${c.title}</span><span class="cap-m mono">${c.meta || ""}</span></div>
+    <div class="cap-main">
+      <span class="kind">${c.kind}</span>
+      <div class="cap-h"><span class="cap-t">${c.title}</span><span class="cap-m mono">${c.meta || ""}</span></div>
       <div class="cap-x">${c.detail || ""}${policy}</div>
     </div></div>`;
 }
@@ -59,7 +56,6 @@ export function ExecutionEvent(ev) {
       <b>Operation</b><span>${ev.op || ev.title}</span>
       <b>State</b><span class="mono">${ev.st || state.governor}</span>
       <b>Elapsed</b><span class="mono">${ev.elapsed}</span>
-      <b>Model</b><span class="mono">${ev.model}</span>
       <b>Skill</b><span class="mono">${SkillActivity(ev)}</span>
       <b>Tool</b><span class="mono">${ToolCall(ev)}</span>
       <b>Worker</b><span class="mono">${DelegationActivity(ev)}</span>
@@ -77,23 +73,18 @@ export function ExecutionTimeline() {
 }
 
 export function WorkerStatus() {
-  return `<h2 class="h">Workers</h2>${state.workers.map((w) => `<div class="cap open" data-kind="WORKER" style="margin-bottom:12px">
-    <i class="sig"></i><div><div class="cap-h"><span>${w.name}</span><span class="cap-m mono">${w.id}</span></div>
-    <div class="cap-x">Latency ${w.lat} · ${w.ok ? "healthy" : "incident"}</div></div></div>`).join("")}`;
+  return `<h2 class="h">Workers</h2>${state.workers.map((w) => `<div class="cap open" data-kind="WORKER" style="margin-bottom:14px">
+    <i class="sig"></i><div class="cap-main"><span class="kind">${w.ok ? "healthy" : "incident"}</span>
+    <div class="cap-h"><span class="cap-t">${w.name}</span><span class="cap-m mono">${w.id}</span></div>
+    <div class="cap-x">Latency ${w.lat}<br>${w.note}</div></div></div>`).join("")}`;
 }
 
 export function ProviderStatus() {
-  return `<h2 class="h">Providers / models</h2>
-    <button class="cmd" data-cmd="prov:local">Local</button>
-    <button class="cmd" data-cmd="prov:command-code">Command Code</button>
-    <button class="cmd" data-cmd="prov:hybrid">Local + Command Code</button>
-    <button class="cmd" data-cmd="model:ox-alpha">Ox Alpha</button>
-    <button class="cmd" data-cmd="model:laguna">Laguna</button>
-    <button class="cmd" data-cmd="model:local">Local</button>`;
+  return WorkerStatus();
 }
 
 export function CapabilityGap(g) {
-  return `<p class="tag" style="color:var(--research)">Capability gap #42</p><p>${g.title}</p>`;
+  return `<p class="kind" style="color:var(--research)">Capability gap #42</p><p>${g.title}</p>`;
 }
 
 export function Experiment(e) {
@@ -111,7 +102,8 @@ export function EvolutionPanel() {
 
 export function MemoryInspector() {
   return `<h2 class="h">Memory</h2>${state.memories.map((m) => `<div class="cap open" data-kind="MEMORY" style="margin-bottom:14px">
-    <i class="sig"></i><div><div class="cap-h"><span class="tag">${m.type}</span><span class="cap-m mono">${Math.round(m.conf * 100)}%</span></div>
+    <i class="sig"></i><div class="cap-main"><span class="kind">${m.type}</span>
+    <div class="cap-h"><span class="cap-t">${Math.round(m.conf * 100)}%</span></div>
     <div class="cap-x">${m.text}<ul class="rel">${m.rel.map((r) => `<li class="mono">${r}</li>`).join("")}</ul></div></div></div>`).join("")}`;
 }
 
