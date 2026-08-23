@@ -22,6 +22,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod capability;
+pub mod model_intel;
 pub mod catalog;
 pub mod download;
 pub mod intent;

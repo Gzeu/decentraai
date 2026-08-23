@@ -13,6 +13,7 @@ uuid.workspace = true
 # can discover what a worker COULD serve, not just what is loaded. ServedModel
 # is a pure serde-serializable type; no I/O enters this crate.
 decentraai-compute = { path = "../compute" }
+decentraai-hub = { path = "../hub" }
 
 [dev-dependencies]
 tempfile.workspace = true

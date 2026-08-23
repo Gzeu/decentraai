@@ -35,6 +35,7 @@ pub mod decision;
 pub mod engine;
 pub mod expert;
 pub mod kv;
+pub mod model_routing;
 pub mod network;
 pub mod plan;
 pub mod planner;

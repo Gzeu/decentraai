@@ -5054,6 +5054,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/memory/search", post(memory_search_handler))
         .route("/v1/memory/transition", post(memory_transition_handler))
         .route("/v1/memory/index", post(memory_index_handler))
+        .route("/v1/models/intel", get(models_intel_handler))
+        .route("/v1/models/route", post(models_route_handler))
         .route("/v1/memory/sync-to", post(memory_sync_to_handler))
         .route(
             "/v1/memory/training-candidates",
@@ -8530,6 +8532,153 @@ fn respond_lexical(
         })),
     )
         .into_response()
+}
+
+/// GET /v1/models/intel — the Model Colony view (operator+): seeded
+/// registry facts (governance, claims, hardware) joined with runtime
+/// availability (which model is actually loaded) and VERIFIED performance
+/// observations from Collective Memory. Read-only; nothing here promotes
+/// or trains anything.
+async fn models_intel_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let registry = decentraai_hub::model_intel::seed_model_colony();
+    let active = state.active_model.read().await.clone();
+    let mut rows = Vec::new();
+    for record in registry.all() {
+        // Honest availability: we only KNOW about the loaded engine.
+        let availability = if normalize_model_name(&active) == normalize_model_name(&record.model_id)
+        {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let observed = state.memory.as_ref().and_then(|m| {
+            decentraai_distributed::model_performance::aggregate_model(m, &record.model_id).ok()
+        });
+        let mut v = record.summary();
+        v["availability"] = serde_json::json!(availability);
+        v["observed"] = match observed {
+            Some(o) => serde_json::json!({
+                "samples": o.samples,
+                "success_percent": o.success_percent,
+                "mean_latency_ms": o.mean_latency_ms,
+            }),
+            None => serde_json::json!(null),
+        };
+        rows.push(v);
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "models": rows,
+            "advisory": true,
+            "invariant": "AI proposes -> deterministic policy decides -> workers execute",
+        })),
+    ).into_response()
+}
+
+fn normalize_model_name(name: &str) -> String {
+    name.to_lowercase()
+        .replace(['.', '_', ' '], "-")
+        .trim_matches('-').to_string()
+}
+
+/// POST /v1/models/route — DRY-RUN routing projection (operator+).
+/// Body: {"capability":"reasoning","min_context_tokens":4096,
+///        "traffic":"production"|"shadow"|"benchmark"}.
+/// Deterministic policy output: selected + ordered fallbacks + every hard-gate
+/// rejection with its reason. ADVISORY ONLY — actual serving still goes
+/// through the planner/reservations; this endpoint never loads a model.
+async fn models_route_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use decentraai_fabric::model_routing::{
+        route, ObservedPerformance, RouteNeed, RoutedCandidate, TrafficClass,
+    };
+    use decentraai_hub::model_intel::AvailabilityState;
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let Some(cap_str) = body.0.get("capability").and_then(|v| v.as_str()) else {
+        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+            "error": "capability is required"
+        }))).into_response();
+    };
+    let Some(required) = serde_json::from_value::<decentraai_hub::capability::CapabilityKind>(
+        serde_json::Value::String(cap_str.to_string()),
+    )
+    .ok() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+            "error": format!("unknown capability '{cap_str}'; see hub taxonomy")
+        }))).into_response();
+    };
+    let traffic = match body.0.get("traffic").and_then(|v| v.as_str()).unwrap_or("production") {
+        "production" => TrafficClass::Production,
+        "shadow" => TrafficClass::Shadow,
+        "benchmark" => TrafficClass::Benchmark,
+        other => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+            "error": format!("traffic must be production|shadow|benchmark, got '{other}'")
+        }))).into_response(),
+    };
+    let need = RouteNeed {
+        required,
+        min_context_tokens: body.0.get("min_context_tokens").and_then(|v| v.as_u64()).unwrap_or(4096).min(u32::MAX as u64) as u32,
+        traffic,
+    };
+
+    let registry = decentraai_hub::model_intel::seed_model_colony();
+    let active = state.active_model.read().await.clone();
+    let candidates: Vec<RoutedCandidate<'_>> = registry
+        .all()
+        .into_iter()
+        .map(|record| {
+            let availability =
+                if normalize_model_name(&active) == normalize_model_name(&record.model_id) {
+                    AvailabilityState::Available
+                } else {
+                    AvailabilityState::Unavailable
+                };
+            let observed = state.memory.as_ref().and_then(|m| {
+                decentraai_distributed::model_performance::aggregate_model(m, &record.model_id)
+                    .ok()
+                    .filter(|o| o.samples > 0)
+            });
+            RoutedCandidate {
+                record,
+                availability,
+                observed: observed.map(|o| ObservedPerformance {
+                    success_percent: o.success_percent.min(255) as u8,
+                    mean_latency_ms: o.mean_latency_ms,
+                }),
+                ram_pressure_percent: 0, // dry-run projection; scheduler feeds live values at plan time
+            }
+        })
+        .collect();
+
+    let decision = route(&candidates, &need);
+    let payload = serde_json::json!({
+        "need": {
+            "capability": required,
+            "min_context_tokens": need.min_context_tokens,
+            "traffic": match traffic {
+                TrafficClass::Production => "production",
+                TrafficClass::Shadow => "shadow",
+                TrafficClass::Benchmark => "benchmark",
+            },
+        },
+        "selected": decision.selected,
+        "fallbacks": decision.fallbacks,
+        "rejections": decision.rejections.iter().map(|r| serde_json::json!({
+            "model_id": r.model_id, "reason": r.reason,
+        })).collect::<Vec<_>>(),
+        "advisory": true,
+        "note": "dry-run projection — the deterministic planner still owns real placement",
+    });
+    (StatusCode::OK, axum::Json(payload)).into_response()
 }
 
 /// POST /v1/memory/sync-to — push a bounded batch of one scope's collective
