@@ -159,7 +159,11 @@ impl Mx8004TxBuilder {
                 max: MAX_URI,
             });
         }
-        if !(manifest_uri.starts_with("ipfs://") || manifest_uri.starts_with("https://")) {
+        // S2 §3.1: hosting can be IPFS, HTTPS, or base64 data URI.
+        if !(manifest_uri.starts_with("ipfs://")
+            || manifest_uri.starts_with("https://")
+            || manifest_uri.starts_with("data:application/json;base64,"))
+        {
             return Err(TxBuildError::InvalidUriScheme);
         }
         let pk = public_key_hex
