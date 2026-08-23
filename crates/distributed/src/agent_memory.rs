@@ -26,10 +26,10 @@
 
 use anyhow::Result;
 use decentraai_agents::memory::{
-    can_read, can_write, can_transition, MemoryAccessDecision, MemoryEntry, MemoryLevel,
-    MemoryPolicy, MemoryScope, MemoryStatus, MemoryTransition, MAX_HISTORY, WriteOutcome,
+    MAX_HISTORY, MemoryAccessDecision, MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope,
+    MemoryStatus, MemoryTransition, WriteOutcome, can_read, can_transition, can_write,
 };
-use decentraai_agents::training_export::{training_candidates, TrainingCandidate};
+use decentraai_agents::training_export::{TrainingCandidate, training_candidates};
 use decentraai_hub::capability::Provenance;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -127,7 +127,10 @@ fn ensure_m18_columns(conn: &Connection) -> Result<(), MemoryStoreError> {
         }
     }
     if !has_content_hash {
-        conn.execute("ALTER TABLE memory_entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''", [])?;
+        conn.execute(
+            "ALTER TABLE memory_entries ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
     }
     if !has_meta {
         conn.execute("ALTER TABLE memory_entries ADD COLUMN meta TEXT", [])?;
@@ -233,7 +236,11 @@ pub fn sync_entry_to_memory(entry: SyncMemoryEntry, target_scope: &str) -> Memor
     meta.version = 1;
     if !entry.meta.source.is_empty() || !entry.meta.evidence_ref.is_empty() {
         let mut detail = decentraai_agents::memory::MemoryProvenance::new(
-            if entry.meta.source.is_empty() { "remote" } else { entry.meta.source.as_str() },
+            if entry.meta.source.is_empty() {
+                "remote"
+            } else {
+                entry.meta.source.as_str()
+            },
             entry.author_agent.as_str(),
             entry.author_node.as_str(),
             entry.created_at_ms,
@@ -577,9 +584,8 @@ impl MemoryStore {
         let mut competitors: Vec<String> = Vec::new();
         let mut relink: Vec<(String, String)> = Vec::new(); // (entry_id, new_meta_json)
         if !entry.meta.subject_key.is_empty() {
-            let mut stmt = tx.prepare(
-                "SELECT entry_id, meta FROM memory_entries WHERE scope = ?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT entry_id, meta FROM memory_entries WHERE scope = ?1")?;
             let rows = stmt.query_map(params![scope_name], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
             })?;
@@ -703,8 +709,7 @@ impl MemoryStore {
             params![
                 scope_name,
                 entry_id,
-                serde_json::to_string(&meta)
-                    .map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
+                serde_json::to_string(&meta).map_err(|e| MemoryStoreError::Sql(e.to_string()))?,
             ],
         )?;
         tx.commit()?;
@@ -763,10 +768,7 @@ impl MemoryStore {
     /// How many live entries in a scope have / lack an embedding vector.
     /// Observability for the index backfill — gaps must be visible, never
     /// guessed.
-    pub fn index_status(
-        &self,
-        scope_name: &str,
-    ) -> Result<(usize, usize), MemoryStoreError> {
+    pub fn index_status(&self, scope_name: &str) -> Result<(usize, usize), MemoryStoreError> {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         let indexed: i64 = conn.query_row(
@@ -819,7 +821,10 @@ impl MemoryStore {
              WHERE scope = ?1 AND embedding IS NOT NULL
                AND (expires_at_ms IS NULL OR expires_at_ms >= ?2)",
         )?;
-        let rows = stmt.query_map(params![scope_name, now as i64], entry_from_row_with_embedding)?;
+        let rows = stmt.query_map(
+            params![scope_name, now as i64],
+            entry_from_row_with_embedding,
+        )?;
         let mut scored: Vec<(MemoryEntry, f32)> = Vec::new();
         for row in rows {
             let (entry, blob) = row?;
@@ -1313,16 +1318,37 @@ mod tests {
         let store = store_in_memory();
         store.register_scope(&team_scope()).unwrap();
         store
-            .write_checked("team.knowledge", &knowledge("e1", "lesson A", "q:x"), "governor", true, false, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("e1", "lesson A", "q:x"),
+                "governor",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         // Exact duplicate → skipped.
         let out = store
-            .write_checked("team.knowledge", &knowledge("e2", "lesson A", "q:x"), "governor", true, false, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("e2", "lesson A", "q:x"),
+                "governor",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         assert!(matches!(out, WriteOutcome::Duplicate { ref existing_id } if existing_id == "e1"));
         // Different content, same subject → competing claim, linked both ways.
         let out = store
-            .write_checked("team.knowledge", &knowledge("e3", "lesson B", "q:x"), "peer-2", false, true, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("e3", "lesson B", "q:x"),
+                "peer-2",
+                false,
+                true,
+                false,
+            )
             .unwrap();
         let competes = match out {
             WriteOutcome::CompetingClaim { competes_with, .. } => competes_with,
@@ -1332,7 +1358,10 @@ mod tests {
         let all = store.read("team.knowledge", "governor", true).unwrap();
         assert_eq!(all.len(), 2, "both claims persisted");
         let e1 = all.iter().find(|e| e.entry_id == "e1").unwrap();
-        assert!(e1.meta.competes_with.contains(&"e3".to_string()), "bidirectional link");
+        assert!(
+            e1.meta.competes_with.contains(&"e3".to_string()),
+            "bidirectional link"
+        );
     }
 
     #[test]
@@ -1340,7 +1369,14 @@ mod tests {
         let store = store_in_memory();
         store.register_scope(&team_scope()).unwrap();
         store
-            .write_checked("team.knowledge", &knowledge("e1", "lesson", "q:t"), "governor", true, false, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("e1", "lesson", "q:t"),
+                "governor",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         // Illegal jump rejected.
         assert!(matches!(
@@ -1348,15 +1384,37 @@ mod tests {
             Err(MemoryStoreError::InvalidTransition { .. })
         ));
         // Legal path persists status + history.
-        store.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "verifier", "evidence checked").unwrap();
-        store.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "corroborator", "seen twice").unwrap();
+        store
+            .transition_status(
+                "team.knowledge",
+                "e1",
+                MemoryStatus::Verified,
+                "verifier",
+                "evidence checked",
+            )
+            .unwrap();
+        store
+            .transition_status(
+                "team.knowledge",
+                "e1",
+                MemoryStatus::Trusted,
+                "corroborator",
+                "seen twice",
+            )
+            .unwrap();
         let e = &store.read("team.knowledge", "governor", true).unwrap()[0];
         assert_eq!(e.meta.status, MemoryStatus::Trusted);
         assert_eq!(e.meta.version, 3);
         assert_eq!(e.meta.history.len(), 2);
         // Unknown entry.
         assert!(matches!(
-            store.transition_status("team.knowledge", "ghost", MemoryStatus::Obsolete, "gov", "x"),
+            store.transition_status(
+                "team.knowledge",
+                "ghost",
+                MemoryStatus::Obsolete,
+                "gov",
+                "x"
+            ),
             Err(MemoryStoreError::UnknownEntry { .. })
         ));
     }
@@ -1369,18 +1427,22 @@ mod tests {
         // Verified + evidenced learning → exports.
         let mut good = knowledge("g", "use backoff on 429", "q:backoff");
         good.meta.kind = KnowledgeKind::Learning;
-        good.meta.detail = Some(
-            MemoryProvenance::new("execution", "r", "n1", 1, 90).with_evidence("aud-1"),
-        );
-        store.write_checked("team.knowledge", &good, "governor", true, false, false).unwrap();
-        store.transition_status("team.knowledge", "g", MemoryStatus::Verified, "v", "ok").unwrap();
+        good.meta.detail =
+            Some(MemoryProvenance::new("execution", "r", "n1", 1, 90).with_evidence("aud-1"));
+        store
+            .write_checked("team.knowledge", &good, "governor", true, false, false)
+            .unwrap();
+        store
+            .transition_status("team.knowledge", "g", MemoryStatus::Verified, "v", "ok")
+            .unwrap();
         // Candidate with evidence → does NOT export.
         let mut cand = knowledge("c", "unverified hunch", "q:hunch");
         cand.meta.kind = KnowledgeKind::Learning;
-        cand.meta.detail = Some(
-            MemoryProvenance::new("agent_reasoning", "r", "n1", 2, 50).with_evidence("aud-2"),
-        );
-        store.write_checked("team.knowledge", &cand, "governor", true, false, false).unwrap();
+        cand.meta.detail =
+            Some(MemoryProvenance::new("agent_reasoning", "r", "n1", 2, 50).with_evidence("aud-2"));
+        store
+            .write_checked("team.knowledge", &cand, "governor", true, false, false)
+            .unwrap();
         let got = store.export_training_candidates("governor", true).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].entry_id, "g");
@@ -1413,11 +1475,22 @@ mod tests {
         let seen = store.read("notes", "agent-a", false).unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].content, "legacy content");
-        assert_eq!(seen[0].meta, Default::default(), "legacy row → candidate/observation/v1");
+        assert_eq!(
+            seen[0].meta,
+            Default::default(),
+            "legacy row → candidate/observation/v1"
+        );
         // New collective path works on the migrated store.
         store.register_scope(&team_scope()).unwrap();
         let out = store
-            .write_checked("team.knowledge", &knowledge("m1", "fresh", "q:m"), "governor", true, false, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("m1", "fresh", "q:m"),
+                "governor",
+                true,
+                false,
+                false,
+            )
             .unwrap();
         assert_eq!(out, WriteOutcome::Stored);
     }
@@ -1427,7 +1500,9 @@ mod tests {
         let store = store_in_memory();
         for level in [MemoryLevel::Node, MemoryLevel::System] {
             let name = format!("s-{level:?}").to_lowercase();
-            store.register_scope(&scope(&name, "governor", level)).unwrap();
+            store
+                .register_scope(&scope(&name, "governor", level))
+                .unwrap();
             assert_eq!(store.get_scope(&name).unwrap().unwrap().level, level);
         }
     }
@@ -1453,7 +1528,11 @@ mod tests {
         let blob = vector_to_blob(&v);
         assert_eq!(blob.len(), 16);
         assert_eq!(blob_to_vector(&blob).unwrap(), v);
-        assert_eq!(blob_to_vector(&[1, 2, 3]), None, "non-multiple-of-4 rejected");
+        assert_eq!(
+            blob_to_vector(&[1, 2, 3]),
+            None,
+            "non-multiple-of-4 rejected"
+        );
         assert_eq!(blob_to_vector(&[]), None);
     }
 
@@ -1472,12 +1551,21 @@ mod tests {
             let mut e = knowledge(id, id, "q:sem");
             e.meta.kind = KnowledgeKind::Observation;
             e.created_at_ms = 100;
-            store.write_checked("team.knowledge", &e, "governor", true, false, false).unwrap();
+            store
+                .write_checked("team.knowledge", &e, "governor", true, false, false)
+                .unwrap();
             store.store_embedding("team.knowledge", id, &vec).unwrap();
         }
         // An entry WITHOUT a vector: invisible to semantic mode.
         store
-            .write_checked("team.knowledge", &knowledge("novector", "x", "q:sem"), "governor", true, false, false)
+            .write_checked(
+                "team.knowledge",
+                &knowledge("novector", "x", "q:sem"),
+                "governor",
+                true,
+                false,
+                false,
+            )
             .unwrap();
 
         let hits = store
@@ -1503,7 +1591,11 @@ mod tests {
             Err(MemoryStoreError::AccessDenied { .. })
         ));
         // Unknown scope errors, empty vectors refused at store time.
-        assert!(store.search_semantic("ghost", "governor", true, &[1.0], 5).is_err());
+        assert!(
+            store
+                .search_semantic("ghost", "governor", true, &[1.0], 5)
+                .is_err()
+        );
         assert!(store.store_embedding("team.knowledge", "far", &[]).is_err());
         assert!(matches!(
             store.store_embedding("team.knowledge", "ghost-entry", &[1.0]),
@@ -1515,10 +1607,30 @@ mod tests {
     fn index_status_reports_gaps_honestly() {
         let store = store_in_memory();
         store.register_scope(&team_scope()).unwrap();
-        store.write_checked("team.knowledge", &knowledge("i1", "a", "q:i"), "governor", true, false, false).unwrap();
-        store.write_checked("team.knowledge", &knowledge("i2", "b", "q:i"), "governor", true, false, false).unwrap();
+        store
+            .write_checked(
+                "team.knowledge",
+                &knowledge("i1", "a", "q:i"),
+                "governor",
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        store
+            .write_checked(
+                "team.knowledge",
+                &knowledge("i2", "b", "q:i"),
+                "governor",
+                true,
+                false,
+                false,
+            )
+            .unwrap();
         assert_eq!(store.index_status("team.knowledge").unwrap(), (0, 2));
-        store.store_embedding("team.knowledge", "i1", &[1.0f32, 2.0]).unwrap();
+        store
+            .store_embedding("team.knowledge", "i1", &[1.0f32, 2.0])
+            .unwrap();
         assert_eq!(store.index_status("team.knowledge").unwrap(), (1, 1));
     }
 }

@@ -8,7 +8,7 @@ use decentraai_agents::memory::{
 };
 use decentraai_distributed::agent_memory::MemoryStore;
 use decentraai_distributed::memory_propagator::{
-    eligible_scopes, propagate_once, travel_worthy, PropagationConfig, PropagationReport,
+    PropagationConfig, PropagationReport, eligible_scopes, propagate_once, travel_worthy,
 };
 use decentraai_identity::Identity;
 use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
@@ -97,14 +97,34 @@ fn unique_scope() -> String {
 
 fn seeded_store(scope_name: &str) -> Arc<MemoryStore> {
     let store = Arc::new(MemoryStore::open(Path::new(":memory:")).unwrap());
-    store.register_scope(&fabric_public_scope(scope_name)).unwrap();
-    let mut verified = MemoryEntry::new("e-verified", scope_name, "researcher", "node-a", "verified lesson");
+    store
+        .register_scope(&fabric_public_scope(scope_name))
+        .unwrap();
+    let mut verified = MemoryEntry::new(
+        "e-verified",
+        scope_name,
+        "researcher",
+        "node-a",
+        "verified lesson",
+    );
     verified.created_at_ms = 100;
     verified.meta.status = MemoryStatus::Verified;
-    let mut candidate = MemoryEntry::new("e-candidate", scope_name, "researcher", "node-a", "unverified hunch");
+    let mut candidate = MemoryEntry::new(
+        "e-candidate",
+        scope_name,
+        "researcher",
+        "node-a",
+        "unverified hunch",
+    );
     candidate.created_at_ms = 100;
     // meta.status defaults to Candidate.
-    let mut trusted = MemoryEntry::new("e-trusted", scope_name, "researcher", "node-a", "trusted lesson");
+    let mut trusted = MemoryEntry::new(
+        "e-trusted",
+        scope_name,
+        "researcher",
+        "node-a",
+        "trusted lesson",
+    );
     trusted.created_at_ms = 100;
     trusted.meta.status = MemoryStatus::Trusted;
 
@@ -120,10 +140,7 @@ fn seeded_store(scope_name: &str) -> Arc<MemoryStore> {
 /// node-cli (merge into store, trust boundary downgrades to candidate).
 fn receiver_handler(
     store: Arc<MemoryStore>,
-) -> impl Fn(
-    libp2p::PeerId,
-    decentraai_protocol::memory_sync::MemorySyncRequest,
-) -> Vec<u8> {
+) -> impl Fn(libp2p::PeerId, decentraai_protocol::memory_sync::MemorySyncRequest) -> Vec<u8> {
     move |_peer, req| {
         use decentraai_protocol::memory_sync::MemorySyncResponse;
         let mut accepted = 0u32;
@@ -131,8 +148,7 @@ fn receiver_handler(
         let mut conflicts_linked = 0u32;
         let mut rejected = 0u32;
         for se in req.entries {
-            let entry =
-                decentraai_distributed::agent_memory::sync_entry_to_memory(se, &req.scope);
+            let entry = decentraai_distributed::agent_memory::sync_entry_to_memory(se, &req.scope);
             match store.write_checked(&req.scope, &entry, "memory-sync", false, false, false) {
                 Ok(decentraai_agents::memory::WriteOutcome::Stored) => accepted += 1,
                 Ok(decentraai_agents::memory::WriteOutcome::Duplicate { .. }) => duplicates += 1,
@@ -161,7 +177,9 @@ async fn propagation_cycle_moves_only_travel_worthy_knowledge() -> Result<()> {
     let scope_name = unique_scope();
     // Receiver: owns an accepting store + handler.
     let receiver_store = Arc::new(MemoryStore::open(Path::new(":memory:")).unwrap());
-    receiver_store.register_scope(&fabric_public_scope(&scope_name)).unwrap();
+    receiver_store
+        .register_scope(&fabric_public_scope(&scope_name))
+        .unwrap();
     let receiver = P2PNode::new_with_network(
         &Identity::generate(),
         DEFAULT_MAX_MESSAGE_BYTES,
@@ -205,8 +223,17 @@ async fn propagation_cycle_moves_only_travel_worthy_knowledge() -> Result<()> {
     // are idempotent by content-hash dedup on both ends.
     let mut report = PropagationReport::default();
     for _round in 0..25 {
-        report = propagate_once(&sender_store, &sender, &sender.local_peer_id().to_string(), &cfg).await;
-        let have = receiver_store.read(&scope_name, "governor", false).unwrap().len();
+        report = propagate_once(
+            &sender_store,
+            &sender,
+            &sender.local_peer_id().to_string(),
+            &cfg,
+        )
+        .await;
+        let have = receiver_store
+            .read(&scope_name, "governor", false)
+            .unwrap()
+            .len();
         if have >= 2 {
             break;
         }
@@ -236,8 +263,17 @@ async fn propagation_cycle_moves_only_travel_worthy_knowledge() -> Result<()> {
 
     // Idempotency on a settled link: another full cycle adds nothing new and
     // everything collapses as duplicates.
-    let quiet = propagate_once(&sender_store, &sender, &sender.local_peer_id().to_string(), &cfg).await;
-    let after = receiver_store.read(&scope_name, "governor", false).unwrap().len();
+    let quiet = propagate_once(
+        &sender_store,
+        &sender,
+        &sender.local_peer_id().to_string(),
+        &cfg,
+    )
+    .await;
+    let after = receiver_store
+        .read(&scope_name, "governor", false)
+        .unwrap()
+        .len();
     assert_eq!(after, 2, "content-hash dedup keeps cycles idempotent");
     if quiet.errors == 0 {
         assert_eq!(quiet.accepted, 0);

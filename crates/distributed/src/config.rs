@@ -101,9 +101,7 @@ impl InferenceConfig {
                 .stale_worker_timeout_ms
                 .unwrap_or(base.stale_worker_timeout_ms),
             max_retries: section.max_retries.unwrap_or(base.max_retries),
-            retry_backoff_ms: section
-                .retry_backoff_ms
-                .unwrap_or(base.retry_backoff_ms),
+            retry_backoff_ms: section.retry_backoff_ms.unwrap_or(base.retry_backoff_ms),
             request_timeout_ms: u64::from(section.request_timeout_seconds)
                 .saturating_mul(1000)
                 .max(1),

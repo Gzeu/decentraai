@@ -63,10 +63,10 @@ pub use plan::{
 };
 pub use planner::{
     CandidateScore, ExecutionPlanner, NormalizedMetrics, PlanResult, PlannerConfig,
-    PlannerRationale, RejectedCandidate, RequestFacts, ScoringWeights, SelectionTrace,
-    WorkerFacts, base_score,
+    PlannerRationale, RejectedCandidate, RequestFacts, ScoringWeights, SelectionTrace, WorkerFacts,
+    base_score,
 };
 pub use unified::{
-    Divergence, GoldenCase, GoldenReport, GoldenSuite, ShadowDiff, ShadowField,
-    UnifiedSelection, UnifiedSelector, shadow_compare,
+    Divergence, GoldenCase, GoldenReport, GoldenSuite, ShadowDiff, ShadowField, UnifiedSelection,
+    UnifiedSelector, shadow_compare,
 };

@@ -86,7 +86,10 @@ pub fn packet_loss_percent(samples: &VecDeque<LinkSample>) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
-    let failed = samples.iter().filter(|s| matches!(s, LinkSample::Err)).count();
+    let failed = samples
+        .iter()
+        .filter(|s| matches!(s, LinkSample::Err))
+        .count();
     Some((failed as f64 / samples.len() as f64) * 100.0)
 }
 

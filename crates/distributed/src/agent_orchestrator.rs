@@ -22,9 +22,9 @@
 
 use anyhow::{Context, Result, bail};
 use decentraai_agents::{
-    AgentMessage, AgentRequirement, AgentTask, DelegationPlan, DelegationPlanner,
-    DelegationStage, DelegationVerdict, MessageKind, ReputationFactor, ReputationStore,
-    ReputationUpdate, StageResult, TaskVerification, WorkflowOutcome, match_agent_semantic,
+    AgentMessage, AgentRequirement, AgentTask, DelegationPlan, DelegationPlanner, DelegationStage,
+    DelegationVerdict, MessageKind, ReputationFactor, ReputationStore, ReputationUpdate,
+    StageResult, TaskVerification, WorkflowOutcome, match_agent_semantic,
 };
 use libp2p::PeerId;
 use serde_json::Value;
@@ -41,8 +41,7 @@ use crate::agents::{AgentManager, AgentView};
 /// (e.g. the unified `match_agent`: semantic + agent model allowlist + compute
 /// physical gate against the hosting node's advertisement). `None` keeps the
 /// legacy semantic-only selection (honest: physical gate unknown).
-pub type ExecutionGate =
-    dyn Fn(&AgentView, &AgentRequirement) -> bool + Send + Sync;
+pub type ExecutionGate = dyn Fn(&AgentView, &AgentRequirement) -> bool + Send + Sync;
 
 /// A stage executor chosen by the orchestrator (agent id + hosting peer).
 #[derive(Debug, Clone)]
@@ -161,7 +160,11 @@ impl AgentOrchestrator {
         // workload) so the execution gate can run the full match_agent.
         let requirement = AgentRequirement {
             semantic: stage.task.required_capabilities.clone(),
-            workload: stage.task.required_workload.as_ref().map(|w| w.to_compute()),
+            workload: stage
+                .task
+                .required_workload
+                .as_ref()
+                .map(|w| w.to_compute()),
         };
         let mut candidates: Vec<(bool /*local*/, f32 /*score*/, String, PeerId)> = self
             .agents
@@ -788,11 +791,7 @@ mod tests {
         let entries = store
             .read("workflow_results", "orchestrator", true)
             .unwrap();
-        assert_eq!(
-            entries.len(),
-            2,
-            "one run = 1 verified stage + 1 summary"
-        );
+        assert_eq!(entries.len(), 2, "one run = 1 verified stage + 1 summary");
         let ids: Vec<String> = entries.iter().map(|e| e.entry_id.clone()).collect();
         assert_eq!(
             ids.len(),
@@ -806,8 +805,8 @@ mod tests {
         // Review wiring: with an execution gate attached, an agent that passes
         // the SEMANTIC match but fails the PHYSICAL gate must NOT be selected.
         // Without the gate (legacy), the same agent IS selected.
-        use decentraai_agents::{AgentRecord, ROLE_SPECIALIST};
         use decentraai_agents::task::AgentWorkloadRequirement;
+        use decentraai_agents::{AgentRecord, ROLE_SPECIALIST};
         use decentraai_hub::capability::{CapabilityClaim, CapabilityKind, Provenance};
         use decentraai_hub::requirements::{CapabilityRequirement, EvidenceLevel};
 

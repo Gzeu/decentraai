@@ -163,7 +163,10 @@ impl IntelligenceProvider for LocalLlamaProvider {
     }
 
     async fn analyze(&self, brief: &TaskBrief<'_>) -> Result<String, ProviderError> {
-        let url = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
         let mut body = build_chat_body(self.model.as_deref(), brief);
         // Disable Qwen3-style thinking blocks server-side (see
         // [`strip_think_block`] for why this matters).
@@ -254,10 +257,7 @@ impl IntelligenceProvider for OpenAiCompatProvider {
             // Only the VARIABLE NAME is reported — never any value.
             return Err(ProviderError::AuthMissing(self.api_key_env.clone()));
         };
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = build_chat_body(Some(&self.model), brief);
         let res = self
             .client
@@ -357,8 +357,7 @@ pub fn governor_select_provider(
         "code review",
         "security",
     ];
-    let is_complex = lower.len() > 500
-        || complex_keywords.iter().any(|k| lower.contains(k));
+    let is_complex = lower.len() > 500 || complex_keywords.iter().any(|k| lower.contains(k));
     if is_complex {
         ProviderKind::External
     } else {
@@ -391,7 +390,10 @@ mod tests {
 
     #[test]
     fn leaves_non_thinking_output_untouched() {
-        assert_eq!(strip_think_block("{\"intent\":\"x\"}"), "{\"intent\":\"x\"}");
+        assert_eq!(
+            strip_think_block("{\"intent\":\"x\"}"),
+            "{\"intent\":\"x\"}"
+        );
     }
 
     #[test]
@@ -427,7 +429,9 @@ mod tests {
         });
 
         let provider = LocalLlamaProvider::new(format!("http://{addr}"), Some("Qwen3-0.6B".into()));
-        let brief = TaskBrief { task: "classify me" };
+        let brief = TaskBrief {
+            task: "classify me",
+        };
         let raw = provider.analyze(&brief).await.expect("mock answered");
         let plan = crate::TaskPlan::parse(&raw).expect("raw answer parses into a plan");
         assert_eq!(plan.intent, "t");
@@ -440,8 +444,7 @@ mod tests {
         let var = "DECENTRAAI_INTEL_TEST_KEY_DEFINITELY_UNSET";
         // NOTE(test): not calling remove_var (unsafe in Rust 2024); the var
         // name is unique enough that no other test sets it.
-        let provider =
-            OpenAiCompatProvider::new("https://api.example.com/v1", var, "test-model");
+        let provider = OpenAiCompatProvider::new("https://api.example.com/v1", var, "test-model");
         let brief = TaskBrief { task: "x" };
         match provider.analyze(&brief).await {
             Err(ProviderError::AuthMissing(name)) => assert_eq!(name, var),
@@ -457,7 +460,11 @@ mod tests {
             ProviderKind::Local
         );
         assert_eq!(
-            governor_select_provider("complex reasoning analysis for architecture planning", true, true),
+            governor_select_provider(
+                "complex reasoning analysis for architecture planning",
+                true,
+                true
+            ),
             ProviderKind::External
         );
         // Fallback when only one provider is available.

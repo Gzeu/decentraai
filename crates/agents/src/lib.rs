@@ -39,9 +39,9 @@
 pub mod advertisement;
 pub mod agent;
 pub mod benchmark;
+pub mod capability;
 pub mod collective;
 pub mod collective_bridge;
-pub mod capability;
 pub mod dataset;
 pub mod decision;
 pub mod delegation;
@@ -52,16 +52,16 @@ pub mod matcher;
 pub mod memory;
 pub mod message;
 pub mod policy;
+pub mod receipt;
 pub mod registry;
 pub mod reputation;
 pub mod retrieval;
-pub mod receipt;
-pub mod training_export;
-pub mod signed_receipt;
 pub mod selfopt;
+pub mod signed_receipt;
 pub mod talent_tree;
 pub mod task;
 pub mod tool;
+pub mod training_export;
 pub mod verification;
 pub mod workflow;
 
@@ -73,8 +73,8 @@ pub use agent::{
 };
 pub use benchmark::{
     BenchmarkMode, BenchmarkRegistry, BenchmarkRun, BenchmarkTask, BenchmarkVerdict, MIN_MARGIN,
-    MIN_SAMPLES, ModeAggregate, ModeComparison, RunMetrics, aggregate, compare_modes,
-    grade_answer, normalize_answer,
+    MIN_SAMPLES, ModeAggregate, ModeComparison, RunMetrics, aggregate, compare_modes, grade_answer,
+    normalize_answer,
 };
 pub use capability::{AgentCapability, model_capabilities_from_claims};
 pub use dataset::{
@@ -97,9 +97,9 @@ pub use evidence::{
     EvidenceEntry, EvidenceFamily, EvidenceHit, EvidenceIndex, EvidenceSummary, Lesson, lessons,
 };
 pub use knowledge::{
-    Evidence, EvidenceKind, KnowledgeConfidence, KnowledgeError, KnowledgeObject, KnowledgeRegistry,
-    WEIGHT_CONSENSUS, WEIGHT_DIRECT_OBSERVATION, WEIGHT_REPUTATION, WEIGHT_SYNTHETIC,
-    WEIGHT_VERIFIED_EXECUTION, evidence_confidence,
+    Evidence, EvidenceKind, KnowledgeConfidence, KnowledgeError, KnowledgeObject,
+    KnowledgeRegistry, WEIGHT_CONSENSUS, WEIGHT_DIRECT_OBSERVATION, WEIGHT_REPUTATION,
+    WEIGHT_SYNTHETIC, WEIGHT_VERIFIED_EXECUTION, evidence_confidence,
 };
 pub use matcher::{
     AgentMatchOutcome, AgentMatchReason, AgentRequirement, match_agent, match_agent_semantic,
@@ -112,9 +112,7 @@ pub use message::{
     AgentInbox, AgentMessage, MessageKind, MessageValidationError, validate_message,
 };
 pub use policy::{ExplorationLimit, Permission, PolicyDecision, PolicyEngine, policy_engine};
-pub use receipt::{
-    ReceiptError, ReceiptRegistry, ReceiptVerdict, VerifiedComputeReceipt,
-};
+pub use receipt::{ReceiptError, ReceiptRegistry, ReceiptVerdict, VerifiedComputeReceipt};
 pub use registry::{AgentRegistry, AgentRegistryError};
 pub use reputation::{
     AgentReputation, DEFAULT_MIN_SAMPLES, FactorScore, ReputationFactor, ReputationStore,

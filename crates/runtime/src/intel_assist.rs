@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use decentraai_config::AssistSharingSection;
 use decentraai_compute::assist::{AssistOffer, AssistRequest};
+use decentraai_config::AssistSharingSection;
 use decentraai_p2p::DfcInbound;
 use decentraai_protocol::dfcp::{
-    AssistTaskAssign, AssistTaskResult, ResourceReserve, ResourceReserved, ReservationId,
+    AssistTaskAssign, AssistTaskResult, ReservationId, ResourceReserve, ResourceReserved,
 };
 use serde_json::json;
 
@@ -84,59 +84,61 @@ pub fn attach_dfcp_worker(
     move |peer, msg| {
         let send_to_peer = std::sync::Arc::clone(&send_to_peer);
         match msg {
-        // Capacity poll: answer with an owner-limit-checked OFFER only when
-        // we can genuinely help. An empty reply means "not a candidate".
-        DfcInbound::Request(request) => {
-            let trusted = true; // private swarm + admission gate upstream
-            if let Some((cpu, ram)) = state.limits.admit(
-                &request.capability,
-                &peer.to_string(),
-                trusted,
-                request.cpu_cores,
-                request.ram_mb,
-            ) {
-                let offer = decentraai_protocol::dfcp::ResourceOffer::answering(
-                    &request, cpu, ram, state.limits.max_lease_seconds,
-                );
-                state
-                    .offers_sent
+            // Capacity poll: answer with an owner-limit-checked OFFER only when
+            // we can genuinely help. An empty reply means "not a candidate".
+            DfcInbound::Request(request) => {
+                let trusted = true; // private swarm + admission gate upstream
+                if let Some((cpu, ram)) = state.limits.admit(
+                    &request.capability,
+                    &peer.to_string(),
+                    trusted,
+                    request.cpu_cores,
+                    request.ram_mb,
+                ) {
+                    let offer = decentraai_protocol::dfcp::ResourceOffer::answering(
+                        &request,
+                        cpu,
+                        ram,
+                        state.limits.max_lease_seconds,
+                    );
+                    state.offers_sent.lock().expect("offers lock").insert(
+                        offer.offer_id.clone(),
+                        (request.capability.clone(), cpu, ram),
+                    );
+                    tracing::info!(offer = %offer.offer_id, capability = %request.capability, "dfcp offering capacity");
+                    serde_json::to_vec(&offer).ok()
+                } else {
+                    None
+                }
+            }
+            DfcInbound::Reserve(reserve) => handle_reserve(&state, &reserve),
+            DfcInbound::Assign(assign) => handle_assign(
+                state.clone(),
+                &assign,
+                std::sync::Arc::clone(&send_to_peer),
+                peer,
+            ),
+            DfcInbound::Release(release) => {
+                let removed = state
+                    .leases
                     .lock()
-                    .expect("offers lock")
-                    .insert(offer.offer_id.clone(), (request.capability.clone(), cpu, ram));
-                tracing::info!(offer = %offer.offer_id, capability = %request.capability, "dfcp offering capacity");
-                serde_json::to_vec(&offer).ok()
-            } else {
+                    .expect("lease lock")
+                    .remove(&release.reservation_id)
+                    .is_some();
+                tracing::info!(
+                    reservation = %release.reservation_id,
+                    released = removed,
+                    "dfcp resource release"
+                );
                 None
             }
-        }
-        DfcInbound::Reserve(reserve) => handle_reserve(&state, &reserve),
-        DfcInbound::Assign(assign) => {
-            handle_assign(state.clone(), &assign, std::sync::Arc::clone(&send_to_peer), peer)
-        }
-        DfcInbound::Release(release) => {
-            let removed = state
-                .leases
-                .lock()
-                .expect("lease lock")
-                .remove(&release.reservation_id)
-                .is_some();
-            tracing::info!(
-                reservation = %release.reservation_id,
-                released = removed,
-                "dfcp resource release"
-            );
-            None
-        }
-        // Results complete parked oneshots in the p2p layer itself.
-        DfcInbound::Result(_) => None,
+            // Results complete parked oneshots in the p2p layer itself.
+            DfcInbound::Result(_) => None,
         }
     }
 }
 
-fn handle_reserve(
-    state: &Arc<AssistWorkerState>,
-    reserve: &ResourceReserve,
-) -> Option<Vec<u8>> {
+fn handle_reserve(state: &Arc<AssistWorkerState>, reserve: &ResourceReserve) -> Option<Vec<u8>> {
     // The offer we sent defines the terms; unknown offer ids are refused so
     // replayed/forged reserves cannot conjure capacity out of thin air.
     let (capability, cpu_cores, ram_mb) = state
@@ -208,8 +210,10 @@ fn handle_assign(
         let lease = leases.get(&assign.reservation_id)?;
         if lease.expires_at <= Instant::now() || lease.capability != assign.capability {
             return Some(
-                serde_json::to_vec(&json!({"accepted": false, "error": "lease expired or mismatched"}))
-                    .unwrap_or_default(),
+                serde_json::to_vec(
+                    &json!({"accepted": false, "error": "lease expired or mismatched"}),
+                )
+                .unwrap_or_default(),
             );
         }
         // Copy what we need; the lock is dropped before any awaiting work.
@@ -244,11 +248,8 @@ fn handle_assign(
         send_to_peer(requester_peer, bytes);
     });
 
-    Some(
-        serde_json::to_vec(&json!({"accepted": true})).unwrap_or_default(),
-    )
+    Some(serde_json::to_vec(&json!({"accepted": true})).unwrap_or_default())
 }
-
 
 /// Executes one capability against THIS node's local managed engine.
 async fn execute_capability(
@@ -278,7 +279,11 @@ async fn execute_capability(
                     let body = r.bytes().await.unwrap_or_default();
                     (true, body.to_vec(), None)
                 }
-                Ok(r) => (false, Vec::new(), Some(format!("backend HTTP {}", r.status()))),
+                Ok(r) => (
+                    false,
+                    Vec::new(),
+                    Some(format!("backend HTTP {}", r.status())),
+                ),
                 Err(e) => (false, Vec::new(), Some(format!("backend unreachable: {e}"))),
             }
         }
@@ -300,7 +305,11 @@ async fn execute_capability(
                     let body_bytes = r.bytes().await.unwrap_or_default();
                     (true, body_bytes.to_vec(), None)
                 }
-                Ok(r) => (false, Vec::new(), Some(format!("backend HTTP {}", r.status()))),
+                Ok(r) => (
+                    false,
+                    Vec::new(),
+                    Some(format!("backend HTTP {}", r.status())),
+                ),
                 Err(e) => (false, Vec::new(), Some(format!("backend unreachable: {e}"))),
             }
         }
@@ -311,7 +320,6 @@ async fn execute_capability(
         ),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Requester side
@@ -358,8 +366,7 @@ pub async fn run_assist_request(
         request.ram_mb,
         lease_seconds,
     );
-    let req_bytes = decentraai_protocol::serialize_message(&dfcp_req)
-        .unwrap_or_default();
+    let req_bytes = decentraai_protocol::serialize_message(&dfcp_req).unwrap_or_default();
 
     let mut offers: Vec<(ResourceOffer, AssistOffer)> = Vec::new();
     for peer in &connected_peers {
@@ -414,20 +421,28 @@ pub async fn run_assist_request(
     };
     // The DFCP offer paired with the winning scored candidate carries the
     // worker-generated offer id needed for the RESERVE handshake.
-    let Some((winner_dfc_offer, _)) =
-        offers.iter().find(|(_, a)| a.peer_id == winner.peer_id)
+    let Some((winner_dfc_offer, _)) = offers.iter().find(|(_, a)| a.peer_id == winner.peer_id)
     else {
-        return (false, Vec::new(), "winner offer vanished during selection".into());
+        return (
+            false,
+            Vec::new(),
+            "winner offer vanished during selection".into(),
+        );
     };
     let winner_dfc_offer = winner_dfc_offer.clone();
-
 
     // 3. RESERVE against the winner's authoritative ledger. The worker
     //    remembers every offer it sent (offer id → terms), so echoing the
     //    offer id is the authentication of this handshake.
     let winner_peer = match winner.peer_id.parse::<libp2p::PeerId>() {
         Ok(p) => p,
-        Err(_) => return (false, Vec::new(), format!("invalid peer id {}", winner.peer_id)),
+        Err(_) => {
+            return (
+                false,
+                Vec::new(),
+                format!("invalid peer id {}", winner.peer_id),
+            );
+        }
     };
     let Ok(reply) = p2p
         .request(
@@ -441,7 +456,11 @@ pub async fn run_assist_request(
         )
         .await
     else {
-        return (false, Vec::new(), format!("reserve handshake with {} failed", winner.peer_id));
+        return (
+            false,
+            Vec::new(),
+            format!("reserve handshake with {} failed", winner.peer_id),
+        );
     };
     let reserved: Result<decentraai_protocol::dfcp::ResourceReserved, _> =
         serde_json::from_slice(&reply);
@@ -465,7 +484,10 @@ pub async fn run_assist_request(
     );
     let rx = p2p.register_assist_wait(assignment.assignment_id.as_str());
     let Ok(_ack) = p2p
-        .request(winner_peer, decentraai_protocol::serialize_message(&assignment).unwrap_or_default())
+        .request(
+            winner_peer,
+            decentraai_protocol::serialize_message(&assignment).unwrap_or_default(),
+        )
         .await
     else {
         // Lease will expire on the worker side (TTL backstop).
@@ -500,13 +522,14 @@ pub async fn run_assist_request(
             );
         }
     };
-    let result: AssistTaskResult = serde_json::from_slice(&result_bytes).unwrap_or(AssistTaskResult {
-        protocol_version: 0,
-        assignment_id: assignment.assignment_id.clone(),
-        success: false,
-        payload: Vec::new(),
-        error: Some("unparsable result".into()),
-    });
+    let result: AssistTaskResult =
+        serde_json::from_slice(&result_bytes).unwrap_or(AssistTaskResult {
+            protocol_version: 0,
+            assignment_id: assignment.assignment_id.clone(),
+            success: false,
+            payload: Vec::new(),
+            error: Some("unparsable result".into()),
+        });
 
     // 6. RELEASE the lease early on success.
     if result.success {
@@ -540,5 +563,9 @@ pub async fn run_assist_request(
     }
 
     tracing::info!(worker = %winner.peer_id, "assist complete; contribution credit pending evidence");
-    (true, result.payload, format!("assisted by {}", winner.peer_id))
+    (
+        true,
+        result.payload,
+        format!("assisted by {}", winner.peer_id),
+    )
 }

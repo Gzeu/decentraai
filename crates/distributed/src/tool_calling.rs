@@ -37,7 +37,11 @@ pub struct ToolBinding {
 }
 
 impl ToolBinding {
-    pub fn new(name: impl Into<String>, description: impl Into<String>, url: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -88,7 +92,9 @@ pub fn tool_prompt(tools: &[ToolBinding], user_prompt: &str) -> String {
 /// parsed as JSON (a model protocol violation — the caller decides whether to
 /// surface it).
 pub fn parse_tool_call(response: &str) -> Result<Option<ToolCall>> {
-    let start = response.find("[TOOL_CALL]").map(|i| i + "[TOOL_CALL]".len());
+    let start = response
+        .find("[TOOL_CALL]")
+        .map(|i| i + "[TOOL_CALL]".len());
     let Some(start) = start else {
         return Ok(None);
     };
@@ -97,9 +103,8 @@ pub fn parse_tool_call(response: &str) -> Result<Option<ToolCall>> {
         anyhow::anyhow!("unterminated [TOOL_CALL] block (opening found but no closing tag)")
     })?;
     let json = &rest[..end];
-    let call: ToolCall = serde_json::from_str(json).with_context(|| {
-        format!("tool call is not valid JSON: {json:?}")
-    })?;
+    let call: ToolCall = serde_json::from_str(json)
+        .with_context(|| format!("tool call is not valid JSON: {json:?}"))?;
     Ok(Some(call))
 }
 
@@ -169,12 +174,17 @@ mod tests {
 
     #[test]
     fn plain_answer_has_no_tool_call() {
-        assert!(parse_tool_call("I can see the text: it says hello.").unwrap().is_none());
+        assert!(
+            parse_tool_call("I can see the text: it says hello.")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn well_formed_tool_call_parses() {
-        let raw = "[TOOL_CALL]{\"name\":\"sentiment\",\"arguments\":{\"text\":\"wow\"}}[/TOOL_CALL]";
+        let raw =
+            "[TOOL_CALL]{\"name\":\"sentiment\",\"arguments\":{\"text\":\"wow\"}}[/TOOL_CALL]";
         let call = parse_tool_call(raw).unwrap().unwrap();
         assert_eq!(call.name, "sentiment");
         assert_eq!(call.arguments["text"], "wow");

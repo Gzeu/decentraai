@@ -125,17 +125,21 @@ impl VerifiedComputeReceipt {
     /// [`crate::decision::decide_collectively`].
     pub fn to_knowledge_object(&self, object_id: &str, fact: &str) -> KnowledgeObject {
         let evidence = if self.verdict == ReceiptVerdict::Verified {
-            vec![Evidence::new(
-                EvidenceKind::VerifiedExecution,
-                format!("execution {} verified", self.execution_id),
-            )
-            .referencing(self.execution_id.clone())]
+            vec![
+                Evidence::new(
+                    EvidenceKind::VerifiedExecution,
+                    format!("execution {} verified", self.execution_id),
+                )
+                .referencing(self.execution_id.clone()),
+            ]
         } else {
-            vec![Evidence::new(
-                EvidenceKind::Synthetic,
-                format!("execution {} failed verification", self.execution_id),
-            )
-            .referencing(self.execution_id.clone())]
+            vec![
+                Evidence::new(
+                    EvidenceKind::Synthetic,
+                    format!("execution {} failed verification", self.execution_id),
+                )
+                .referencing(self.execution_id.clone()),
+            ]
         };
         KnowledgeObject::new(
             object_id,
@@ -171,8 +175,7 @@ impl ReceiptRegistry {
                 id: receipt.execution_id,
             });
         }
-        self.receipts
-            .insert(receipt.execution_id.clone(), receipt);
+        self.receipts.insert(receipt.execution_id.clone(), receipt);
         Ok(())
     }
 

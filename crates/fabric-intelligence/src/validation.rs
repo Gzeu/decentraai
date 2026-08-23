@@ -74,7 +74,10 @@ mod tests {
         let v = validate_against_fabric(&plan, &[CapabilityKind::Ocr]);
         assert_eq!(v.satisfied, vec!["ocr"]);
         assert_eq!(v.missing, vec!["reasoning"]);
-        assert!(!v.executable(), "a missing required capability blocks execution");
+        assert!(
+            !v.executable(),
+            "a missing required capability blocks execution"
+        );
     }
 
     #[test]

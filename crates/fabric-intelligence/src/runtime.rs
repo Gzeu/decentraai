@@ -7,13 +7,11 @@
 
 use decentraai_config::{FabricIntelligencePolicy, FabricIntelligenceSection};
 
-use crate::limits::ArtifactLimit;
-use crate::policy::{select_provider, ProviderChoice};
-use crate::provider::{
-    ConfiguredProvider, LocalLlamaProvider, OpenAiCompatProvider, ProviderKind,
-};
-use crate::telemetry::IntelTelemetry;
 use crate::TaskPlan;
+use crate::limits::ArtifactLimit;
+use crate::policy::{ProviderChoice, select_provider};
+use crate::provider::{ConfiguredProvider, LocalLlamaProvider, OpenAiCompatProvider, ProviderKind};
+use crate::telemetry::IntelTelemetry;
 
 /// Everything the intelligence layer needs at runtime, built once from
 /// config in the node daemon. Cheap to share (`Arc<FabricIntelligence>`).
@@ -71,7 +69,10 @@ impl FabricIntelligence {
     /// proxy uses.
     pub fn from_config(section: &FabricIntelligenceSection) -> Self {
         let local = if section.enabled {
-            Some(LocalLlamaProvider::new(String::new(), section.local_model.clone()))
+            Some(LocalLlamaProvider::new(
+                String::new(),
+                section.local_model.clone(),
+            ))
         } else {
             None
         };
@@ -146,9 +147,7 @@ impl FabricIntelligence {
     /// resolvable). Unconfigured/unkeyed externals are not selectable under
     /// policies that would otherwise pick them.
     fn external_ready(&self) -> bool {
-        self.external
-            .as_ref()
-            .is_some_and(|e| e.key_available())
+        self.external.as_ref().is_some_and(|e| e.key_available())
     }
 
     async fn run_provider(
@@ -199,11 +198,7 @@ impl FabricIntelligence {
 
         let mut local_failed = false;
         loop {
-            let choice = select_provider(
-                self.map_policy(),
-                self.external_ready(),
-                local_failed,
-            );
+            let choice = select_provider(self.map_policy(), self.external_ready(), local_failed);
             let Some(provider) = self.provider_for(choice) else {
                 last_error.get_or_insert_with(|| {
                     "no usable intelligence provider for the configured policy".to_string()
@@ -311,7 +306,10 @@ mod tests {
     use super::*;
     use decentraai_config::{FabricIntelExternalSection, FabricIntelligenceSection};
 
-    fn cfg(policy: FabricIntelligencePolicy, external: Option<FabricIntelExternalSection>) -> FabricIntelligenceSection {
+    fn cfg(
+        policy: FabricIntelligencePolicy,
+        external: Option<FabricIntelExternalSection>,
+    ) -> FabricIntelligenceSection {
         FabricIntelligenceSection {
             enabled: true,
             policy,
@@ -342,17 +340,28 @@ mod tests {
             api_key_env: "DECENTRAAI_INTEL_TEST_UNSET_KEY".into(),
             model: "test-model".into(),
         };
-        let fi = FabricIntelligence::from_config(&cfg(FabricIntelligencePolicy::ExternalOnly, Some(ext)));
+        let fi = FabricIntelligence::from_config(&cfg(
+            FabricIntelligencePolicy::ExternalOnly,
+            Some(ext),
+        ));
         // NOTE(test): remove_var is unsafe in Rust 2024 and unnecessary —
         // this env name is never set anywhere in the test suite.
         let outcome = fi.plan("classify me", "http://127.0.0.1:9").await;
         assert!(!outcome.succeeded(), "must not produce a plan");
         assert!(
-            outcome.error.as_deref().is_some_and(|e| e.contains("DECENTRAAI_INTEL_TEST_UNSET_KEY")),
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("DECENTRAAI_INTEL_TEST_UNSET_KEY")),
             "error names the missing env var: {:?}",
             outcome.error
         );
         // And NO attempt ever touched the local provider.
-        assert!(outcome.attempts.iter().all(|(k, _, _)| *k != crate::ProviderKind::Local));
+        assert!(
+            outcome
+                .attempts
+                .iter()
+                .all(|(k, _, _)| *k != crate::ProviderKind::Local)
+        );
     }
 }

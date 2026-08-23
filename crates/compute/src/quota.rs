@@ -409,8 +409,7 @@ impl QuotaLedger {
             ref_id: ref_id.to_string(),
             policy_version: self.policy.version,
         });
-        self.dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns and clears the mutation flag. Persistence layers poll this to

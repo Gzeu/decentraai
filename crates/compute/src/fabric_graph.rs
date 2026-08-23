@@ -95,7 +95,11 @@ impl FabricNode {
 
     /// Number of GPUs advertised by the node (`0` when GPU-less).
     pub fn gpu_count(&self) -> u32 {
-        self.capability.gpu.as_ref().map(|g| g.count.max(1)).unwrap_or(0)
+        self.capability
+            .gpu
+            .as_ref()
+            .map(|g| g.count.max(1))
+            .unwrap_or(0)
     }
 
     /// Total RAM advertised by the node (MiB).

@@ -607,7 +607,11 @@ mod tests {
             "the resume bitmap must be quarantined with the artifact"
         );
         // Metadata recorded.
-        assert!(quarantine.join(format!("{}.quarantine.json", m.model_id)).exists());
+        assert!(
+            quarantine
+                .join(format!("{}.quarantine.json", m.model_id))
+                .exists()
+        );
 
         // A retry prepares a fresh staging state: empty bitmap (no stale marks).
         let (_part, _bitmap, done) = prepare_staging(dir.path(), &m).unwrap();
@@ -625,11 +629,7 @@ mod tests {
         let staging = dir.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let m = manifest_with("quar-only-bitmap", "m.gguf");
-        std::fs::write(
-            staging.join(format!("{}.done", m.model_id)),
-            [0u8, 1u8],
-        )
-        .unwrap();
+        std::fs::write(staging.join(format!("{}.done", m.model_id)), [0u8, 1u8]).unwrap();
         quarantine_staging(dir.path(), &m, &PeerId::random(), "test");
         let quarantine = dir.path().join("quarantine");
         assert!(

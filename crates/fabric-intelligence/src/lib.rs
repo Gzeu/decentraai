@@ -34,9 +34,7 @@ pub mod validation;
 pub use limits::{MAX_ARTIFACT_BYTES, RECOMMENDED_ARTIFACT_BYTES};
 pub use plan::{PlanCapability, PlanError, TaskPlan};
 pub use policy::{ProviderChoice, SelectionPolicy};
-pub use provider::{
-    IntelligenceProvider, LocalLlamaProvider, OpenAiCompatProvider, ProviderError,
-};
+pub use provider::{IntelligenceProvider, LocalLlamaProvider, OpenAiCompatProvider, ProviderError};
 pub use runtime::{FabricIntelligence, PlanOutcome};
 pub use telemetry::{IntelTelemetry, ProviderKind};
 pub use validation::PlanValidation;

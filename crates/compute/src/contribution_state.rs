@@ -65,7 +65,10 @@ impl NodeContributionState {
             *self.by_resource.entry("tokens".to_string()).or_default() += d.value;
         }
         if let Some(d) = &rc.execution_duration_ms {
-            *self.by_resource.entry("duration_ms".to_string()).or_default() += d.value;
+            *self
+                .by_resource
+                .entry("duration_ms".to_string())
+                .or_default() += d.value;
         }
         if let Some(d) = &rc.cpu_time_seconds {
             *self.by_resource.entry("cpu_time".to_string()).or_default() += d.value;
@@ -76,10 +79,13 @@ impl NodeContributionState {
 
         // by_model
         if let Some(model) = &rc.model {
-            let mc = self.by_model.entry(model.clone()).or_insert_with(|| ModelContribution {
-                model: model.clone(),
-                ..Default::default()
-            });
+            let mc = self
+                .by_model
+                .entry(model.clone())
+                .or_insert_with(|| ModelContribution {
+                    model: model.clone(),
+                    ..Default::default()
+                });
             mc.executions += 1;
             if let Some(d) = &rc.tokens_processed {
                 mc.tokens = mc.tokens.saturating_add(d.value as u64);

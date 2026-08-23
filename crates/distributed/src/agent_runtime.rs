@@ -164,9 +164,10 @@ impl AgentRuntime {
                     .ok_or_else(|| {
                         anyhow::anyhow!("delegate from '{}' has no reply peer", msg.from_agent)
                     })?;
-                self.messenger.send(reply_peer, reply).await.with_context(|| {
-                    format!("sending policy-denial reply for '{task_id}'")
-                })?;
+                self.messenger
+                    .send(reply_peer, reply)
+                    .await
+                    .with_context(|| format!("sending policy-denial reply for '{task_id}'"))?;
                 return Ok(Some(ExecutedMessage::Replied { task_id }));
             }
         }
@@ -410,19 +411,23 @@ impl InferenceAgentExecutor {
             let Ok(Some(call)) = crate::tool_calling::parse_tool_call(&final_text) else {
                 break; // plain answer, no tool ceremony — done
             };
-            let result =
-                match crate::tool_calling::execute_tool_call(&self.client, &self.tools, &call).await
-                {
-                    Ok(body) => body,
-                    Err(e) => {
-                        tracing::warn!(error = %e, tool = %call.name, "agent tool call failed");
-                        tool_results.push(serde_json::json!({
-                            "tool": call.name,
-                            "error": e.to_string(),
-                        }));
-                        break;
-                    }
-                };
+            let result = match crate::tool_calling::execute_tool_call(
+                &self.client,
+                &self.tools,
+                &call,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(error = %e, tool = %call.name, "agent tool call failed");
+                    tool_results.push(serde_json::json!({
+                        "tool": call.name,
+                        "error": e.to_string(),
+                    }));
+                    break;
+                }
+            };
             tool_results.push(serde_json::json!({
                 "tool": call.name,
                 "arguments": call.arguments,
@@ -599,8 +604,8 @@ mod tests {
         // P7 wiring regression: a policy gate that denies a task must prevent
         // the executor from running and answer the delegate with a policy
         // error. "Agent Power ≠ Permission" is enforced on the real path.
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // A messenger with a REAL transport so the policy-denial reply can be
         // self-delivered (no libp2p self-dial needed).
@@ -637,7 +642,9 @@ mod tests {
         let result = runtime.process_one().await.unwrap();
         assert_eq!(
             result,
-            Some(ExecutedMessage::Replied { task_id: "untracked".to_string() }),
+            Some(ExecutedMessage::Replied {
+                task_id: "untracked".to_string()
+            }),
             "a policy-denied delegate is answered, not executed"
         );
         assert!(

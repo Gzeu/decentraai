@@ -88,8 +88,7 @@ pub fn truncate_doc(text: &str) -> String {
 /// tasks. Rows without an answer (or without a query) are skipped — an
 /// ungradable task would only pollute the registry with Abstained noise.
 pub fn load_browsecomp_plus(path: &std::path::Path, limit: usize) -> Result<Vec<BenchmarkTask>> {
-    let file = File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
@@ -100,8 +99,8 @@ pub fn load_browsecomp_plus(path: &std::path::Path, limit: usize) -> Result<Vec<
         if line.trim().is_empty() {
             continue;
         }
-        let row: BrowseCompPlusRow = serde_json::from_str(&line)
-            .with_context(|| format!("parsing line {idx}"))?;
+        let row: BrowseCompPlusRow =
+            serde_json::from_str(&line).with_context(|| format!("parsing line {idx}"))?;
         if row.query.trim().is_empty() {
             continue;
         }
@@ -140,11 +139,23 @@ mod tests {
             query: "Who won?".into(),
             answer: Some("Paris".into()),
             evidence_docs: vec![
-                BrowseDoc { docid: "d1".into(), text: "short".into() },
-                BrowseDoc { docid: "d1".into(), text: "duplicate".into() },
-                BrowseDoc { docid: "d2".into(), text: "x".repeat(5000) },
+                BrowseDoc {
+                    docid: "d1".into(),
+                    text: "short".into(),
+                },
+                BrowseDoc {
+                    docid: "d1".into(),
+                    text: "duplicate".into(),
+                },
+                BrowseDoc {
+                    docid: "d2".into(),
+                    text: "x".repeat(5000),
+                },
             ],
-            gold_docs: vec![BrowseDoc { docid: "d3".into(), text: "gold".into() }],
+            gold_docs: vec![BrowseDoc {
+                docid: "d3".into(),
+                text: "gold".into(),
+            }],
         };
         let passages = row.evidence_passages();
         assert_eq!(passages.len(), 3);

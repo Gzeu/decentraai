@@ -75,7 +75,10 @@ pub struct CollectiveDag {
 pub enum DagError {
     Empty,
     DuplicateStage(String),
-    UnknownDependency { stage_id: String, depends_on: String },
+    UnknownDependency {
+        stage_id: String,
+        depends_on: String,
+    },
     CycleDetected(Vec<String>),
 }
 
@@ -84,8 +87,14 @@ impl std::fmt::Display for DagError {
         match self {
             Self::Empty => write!(f, "DAG has no stages"),
             Self::DuplicateStage(id) => write!(f, "duplicate stage id: {id}"),
-            Self::UnknownDependency { stage_id, depends_on } => {
-                write!(f, "stage '{stage_id}' depends on unknown stage '{depends_on}'")
+            Self::UnknownDependency {
+                stage_id,
+                depends_on,
+            } => {
+                write!(
+                    f,
+                    "stage '{stage_id}' depends on unknown stage '{depends_on}'"
+                )
             }
             Self::CycleDetected(cycle) => write!(f, "cycle detected: {}", cycle.join(" → ")),
         }
@@ -161,15 +170,11 @@ pub fn validate_dag(stages: &[DagStage]) -> Result<(), DagError> {
 
 /// Returns the stage ids that are ready to execute (all dependencies completed).
 /// Pure function — the caller tracks completion state.
-pub fn ready_stages(
-    stages: &[DagStage],
-    completed: &HashSet<String>,
-) -> Vec<String> {
+pub fn ready_stages(stages: &[DagStage], completed: &HashSet<String>) -> Vec<String> {
     stages
         .iter()
         .filter(|s| {
-            !completed.contains(&s.stage_id)
-                && s.depends_on.iter().all(|d| completed.contains(d))
+            !completed.contains(&s.stage_id) && s.depends_on.iter().all(|d| completed.contains(d))
         })
         .map(|s| s.stage_id.clone())
         .collect()
@@ -204,7 +209,10 @@ mod tests {
     #[test]
     fn duplicate_stage_detected() {
         let stages = vec![stage("a", &[]), stage("a", &[])];
-        assert!(matches!(validate_dag(&stages), Err(DagError::DuplicateStage(_))));
+        assert!(matches!(
+            validate_dag(&stages),
+            Err(DagError::DuplicateStage(_))
+        ));
     }
 
     #[test]
@@ -220,17 +228,20 @@ mod tests {
     fn cycle_detected() {
         let mut a = stage("a", &[]);
         a.depends_on.push("c".to_string());
-        let stages = vec![
-            a,
-            stage("b", &["a"]),
-            stage("c", &["b"]),
-        ];
-        assert!(matches!(validate_dag(&stages), Err(DagError::CycleDetected(_))));
+        let stages = vec![a, stage("b", &["a"]), stage("c", &["b"])];
+        assert!(matches!(
+            validate_dag(&stages),
+            Err(DagError::CycleDetected(_))
+        ));
     }
 
     #[test]
     fn ready_stages_respects_dependencies() {
-        let stages = vec![stage("root", &[]), stage("child", &["root"]), stage("orphan", &[])];
+        let stages = vec![
+            stage("root", &[]),
+            stage("child", &["root"]),
+            stage("orphan", &[]),
+        ];
         // Initially only root and orphan are ready.
         let done: HashSet<String> = HashSet::new();
         let ready = ready_stages(&stages, &done);
@@ -244,11 +255,18 @@ mod tests {
 
     #[test]
     fn fan_in_waits_for_all_parents() {
-        let stages = vec![stage("a", &[]), stage("b", &[]), stage("synth", &["a", "b"])];
+        let stages = vec![
+            stage("a", &[]),
+            stage("b", &[]),
+            stage("synth", &["a", "b"]),
+        ];
         let mut done = HashSet::new();
         done.insert("a".to_string());
         let ready = ready_stages(&stages, &done);
-        assert!(!ready.contains(&"synth".to_string()), "fan-in waits for all parents");
+        assert!(
+            !ready.contains(&"synth".to_string()),
+            "fan-in waits for all parents"
+        );
         done.insert("b".to_string());
         let ready = ready_stages(&stages, &done);
         assert!(ready.contains(&"synth".to_string()));

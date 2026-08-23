@@ -33,13 +33,11 @@
 //!   `workflow_results`.
 
 use anyhow::{Context, Result};
+use decentraai_agents::memory::{MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope};
 use decentraai_agents::{
     CollectiveDecision, ConsensusPolicy, DecisionRegistry, DecisionVerdict, EvidenceKind,
     KnowledgeObject, KnowledgeRegistry, ReceiptRegistry, VerifiedComputeReceipt,
     decide_collectively, decision_feedback_entry,
-};
-use decentraai_agents::memory::{
-    MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope,
 };
 use decentraai_compute::{CompensationLedger, ContributionProfile};
 use serde::{Deserialize, Serialize};
@@ -168,7 +166,8 @@ impl KnowledgeRuntime {
     /// Sets the measured contribution profile for a worker. Called at wiring
     /// time from the compute manager's real measured contribution — never from
     /// a client request.
-    pub fn set_contribution_profile(&self, worker: &str, profile: ContributionProfile) {        if let Ok(mut p) = self.profiles.lock() {
+    pub fn set_contribution_profile(&self, worker: &str, profile: ContributionProfile) {
+        if let Ok(mut p) = self.profiles.lock() {
             p.insert(worker.to_string(), profile);
         }
     }
@@ -177,7 +176,10 @@ impl KnowledgeRuntime {
     /// node has no measured profile for it yet (unknown workers earn nothing
     /// — compensation rewards verified, measured service).
     pub fn contribution_profile(&self, worker: &str) -> Option<ContributionProfile> {
-        self.profiles.lock().ok().and_then(|p| p.get(worker).copied())
+        self.profiles
+            .lock()
+            .ok()
+            .and_then(|p| p.get(worker).copied())
     }
 
     /// Registers a knowledge object and persists it into collective memory.
@@ -270,7 +272,8 @@ impl KnowledgeRuntime {
                 .map_err(|e| anyhow::anyhow!("registering decision: {e}"))?;
         }
         // Memory feedback: the decision is itself a collective fact.
-        let (content, feedback_object_id) = decision_feedback_entry(&decision, KNOWLEDGE_MEMORY_SCOPE);
+        let (content, feedback_object_id) =
+            decision_feedback_entry(&decision, KNOWLEDGE_MEMORY_SCOPE);
         self.write_memory_feedback(
             &decision.decision_id,
             &content,
@@ -290,11 +293,13 @@ impl KnowledgeRuntime {
                 &self.local_node,
                 created_at_ms,
             )
-            .with_evidence(vec![decentraai_agents::Evidence::new(
-                EvidenceKind::Consensus,
-                format!("collective decision {} adopted", decision.decision_id),
-            )
-            .referencing(decision.decision_id.clone())]);
+            .with_evidence(vec![
+                decentraai_agents::Evidence::new(
+                    EvidenceKind::Consensus,
+                    format!("collective decision {} adopted", decision.decision_id),
+                )
+                .referencing(decision.decision_id.clone()),
+            ]);
             let mut reg = self
                 .knowledge
                 .lock()
@@ -318,7 +323,12 @@ impl KnowledgeRuntime {
         self.knowledge
             .lock()
             .ok()
-            .map(|reg| reg.all_with_confidence().into_iter().map(|(o, _)| o).collect())
+            .map(|reg| {
+                reg.all_with_confidence()
+                    .into_iter()
+                    .map(|(o, _)| o)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -357,11 +367,7 @@ impl KnowledgeRuntime {
                     author_agent: o.author_agent,
                     author_node: o.author_node,
                     capability: o.capability,
-                    evidence_kinds: o
-                        .evidence
-                        .iter()
-                        .map(|e| format!("{:?}", e.kind))
-                        .collect(),
+                    evidence_kinds: o.evidence.iter().map(|e| format!("{:?}", e.kind)).collect(),
                     confidence,
                     confidence_label: decentraai_agents::KnowledgeConfidence::of(confidence)
                         .to_string(),
@@ -459,8 +465,12 @@ impl KnowledgeRuntime {
                             tracing::warn!(error = %e, entry_id = %entry_id, "auto-embed store failed");
                         }
                     }
-                    Ok(_) => tracing::warn!(entry_id = %entry_id, "embeddings backend returned an empty vector"),
-                    Err(e) => tracing::warn!(error = %e, entry_id = %entry_id, "auto-embed failed; entry remains lexically searchable"),
+                    Ok(_) => {
+                        tracing::warn!(entry_id = %entry_id, "embeddings backend returned an empty vector")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, entry_id = %entry_id, "auto-embed failed; entry remains lexically searchable")
+                    }
                 }
             });
         }
@@ -509,8 +519,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use decentraai_agents::{
-        EvidenceKind, KnowledgeObject, ReceiptVerdict, VerifiedComputeReceipt,
-        evidence_confidence,
+        EvidenceKind, KnowledgeObject, ReceiptVerdict, VerifiedComputeReceipt, evidence_confidence,
     };
     use std::path::PathBuf;
 
@@ -570,8 +579,9 @@ mod tests {
     fn full_circuit_receipt_to_knowledge_to_decision() {
         let memory = tmp_memory_store();
         let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
-        let runtime = KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory.clone()))
-            .expect("runtime attaches");
+        let runtime =
+            KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory.clone()))
+                .expect("runtime attaches");
         assert!(runtime.view().memory_attached);
 
         // 1. Record a verified receipt → credits + knowledge object.
@@ -579,10 +589,20 @@ mod tests {
             .record_receipt(&verified_receipt("e1"), &profile())
             .expect("receipt records");
         assert!(credits > 0);
-        assert_eq!(compensation.lock().unwrap().account("peer-worker").unwrap().earned, credits);
+        assert_eq!(
+            compensation
+                .lock()
+                .unwrap()
+                .account("peer-worker")
+                .unwrap()
+                .earned,
+            credits
+        );
 
         // The receipt became a high-confidence knowledge object.
-        let ko = runtime.knowledge_object("k:receipt:e1").expect("receipt knowledge");
+        let ko = runtime
+            .knowledge_object("k:receipt:e1")
+            .expect("receipt knowledge");
         assert!((evidence_confidence(&ko) - 0.90).abs() < 1e-6);
 
         // 2. Decide collectively over the receipt's knowledge → adopted.
@@ -592,7 +612,14 @@ mod tests {
             require_schema: false,
         };
         let decision = runtime
-            .decide("d1", "the model output is trustworthy", "a:coord", &[ko], &policy, 3000)
+            .decide(
+                "d1",
+                "the model output is trustworthy",
+                "a:coord",
+                &[ko],
+                &policy,
+                3000,
+            )
             .expect("decision runs");
         assert_eq!(decision.verdict, DecisionVerdict::Adopted);
 
@@ -622,16 +649,25 @@ mod tests {
     fn failed_receipt_never_credits_or_claims_confidence() {
         let memory = tmp_memory_store();
         let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
-        let runtime = KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
+        let runtime =
+            KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
 
         let credits = runtime
             .record_receipt(&failed_receipt("e2"), &profile())
             .expect("receipt records");
         assert_eq!(credits, 0, "failed work never credits");
-        assert!(compensation.lock().unwrap().account("peer-worker").is_none());
+        assert!(
+            compensation
+                .lock()
+                .unwrap()
+                .account("peer-worker")
+                .is_none()
+        );
 
         // The failed receipt's knowledge object carries synthetic evidence.
-        let ko = runtime.knowledge_object("k:receipt:e2").expect("receipt knowledge");
+        let ko = runtime
+            .knowledge_object("k:receipt:e2")
+            .expect("receipt knowledge");
         assert!(evidence_confidence(&ko) < 0.3);
         assert!(runtime.view().total_credits == 0);
     }
@@ -640,12 +676,24 @@ mod tests {
     fn idempotency_receipt_and_decision_are_exactly_once() {
         let memory = tmp_memory_store();
         let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
-        let runtime = KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
+        let runtime =
+            KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
 
-        runtime.record_receipt(&verified_receipt("e3"), &profile()).unwrap();
+        runtime
+            .record_receipt(&verified_receipt("e3"), &profile())
+            .unwrap();
         // Same execution id again → duplicate receipt rejected, no second credit.
-        assert!(runtime.record_receipt(&verified_receipt("e3"), &profile()).is_err());
-        let credits = compensation.lock().unwrap().account("peer-worker").unwrap().earned;
+        assert!(
+            runtime
+                .record_receipt(&verified_receipt("e3"), &profile())
+                .is_err()
+        );
+        let credits = compensation
+            .lock()
+            .unwrap()
+            .account("peer-worker")
+            .unwrap()
+            .earned;
         assert!(credits > 0);
         assert_eq!(runtime.view().receipts.len(), 1);
 
@@ -656,8 +704,28 @@ mod tests {
             agreement_threshold: 0.5,
             require_schema: false,
         };
-        runtime.decide("d3", "dup", "a:coord", std::slice::from_ref(&ko), &policy, 3000).unwrap();
-        assert!(runtime.decide("d3", "dup", "a:coord", std::slice::from_ref(&ko), &policy, 3000).is_err());
+        runtime
+            .decide(
+                "d3",
+                "dup",
+                "a:coord",
+                std::slice::from_ref(&ko),
+                &policy,
+                3000,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .decide(
+                    "d3",
+                    "dup",
+                    "a:coord",
+                    std::slice::from_ref(&ko),
+                    &policy,
+                    3000
+                )
+                .is_err()
+        );
         assert_eq!(runtime.view().decisions.len(), 1);
     }
 
@@ -665,7 +733,8 @@ mod tests {
     fn declaration_without_evidence_stays_zero_confidence() {
         let memory = tmp_memory_store();
         let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
-        let runtime = KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
+        let runtime =
+            KnowledgeRuntime::new(compensation.clone(), "peer-local", Some(memory)).unwrap();
 
         // An agent "declares" a fact with no evidence → confidence 0.0.
         let plain = KnowledgeObject::new("k:plain", "the sky is blue", "a:research", "peer1", 1000);
@@ -684,7 +753,9 @@ mod tests {
             agreement_threshold: 0.5,
             require_schema: false,
         };
-        let decision = runtime.decide("d4", "plain fact", "a:coord", &[ko], &policy, 3000).unwrap();
+        let decision = runtime
+            .decide("d4", "plain fact", "a:coord", &[ko], &policy, 3000)
+            .unwrap();
         assert!(
             !matches!(decision.verdict, DecisionVerdict::Adopted),
             "declaration without evidence must never be adopted, got {:?}",
@@ -697,7 +768,9 @@ mod tests {
         let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
         let runtime = KnowledgeRuntime::new(compensation.clone(), "peer-local", None).unwrap();
         assert!(!runtime.view().memory_attached);
-        runtime.record_receipt(&verified_receipt("e5"), &profile()).unwrap();
+        runtime
+            .record_receipt(&verified_receipt("e5"), &profile())
+            .unwrap();
         assert!(runtime.view().receipts.len() == 1);
         assert!(runtime.view().knowledge_objects.len() == 1);
         // Memory writes are no-ops when no store is attached.

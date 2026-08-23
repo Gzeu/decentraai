@@ -93,8 +93,7 @@ fn backend_request_timeout() -> Duration {
 /// healthy slow workers while P2P would have allowed 300s (and both were
 /// shorter than large-model CPU prefill entirely).
 fn remote_request_timeout_ms() -> u32 {
-    u32::try_from(decentraai_config::backend_request_timeout().as_millis())
-        .unwrap_or(u32::MAX)
+    u32::try_from(decentraai_config::backend_request_timeout().as_millis()).unwrap_or(u32::MAX)
 }
 
 /// Per-token usage counters: (requests, generated tokens, last-used unix secs).
@@ -508,9 +507,7 @@ impl ApiState {
     /// M15: honest local pressure signals for the autonomous engine —
     /// REAL waiting-room depth and mean latency of recent completed
     /// requests, plus system CPU/RAM. Never invented.
-    pub async fn pressure_signals(
-        &self,
-    ) -> decentraai_compute::pressure::PressureSignals {
+    pub async fn pressure_signals(&self) -> decentraai_compute::pressure::PressureSignals {
         let (serving, waiting) = self.queue.snapshot();
         let _ = serving;
         let recent = self.recent_requests.lock().expect("recent lock");
@@ -526,8 +523,7 @@ impl ApiState {
             latency_ms: mean_latency_ms,
             cpu_percent: snap.cpu_usage_percent,
             ram_percent: if snap.total_memory_bytes > 0 {
-                100.0 * (1.0 - snap.available_memory_bytes as f32
-                    / snap.total_memory_bytes as f32)
+                100.0 * (1.0 - snap.available_memory_bytes as f32 / snap.total_memory_bytes as f32)
             } else {
                 0.0
             },
@@ -538,63 +534,61 @@ impl ApiState {
     /// Attaches the Fabric Intelligence layer (built from config in the node
     /// daemon). Absent = `/v1/intel/*` answer 404 and the node behaves as if
     /// the feature did not exist.
-    pub fn attach_intel(
-        &mut self,
-        intel: Arc<decentraai_fabric_intelligence::FabricIntelligence>,
-    ) {
+    pub fn attach_intel(&mut self, intel: Arc<decentraai_fabric_intelligence::FabricIntelligence>) {
         self.intel = Some(intel);
     }
 
-/// Fabric Intelligence: capability inventory the deterministic fabric can
-/// currently vouch for. Assembled ONLY from attached, real sources — never
-/// invented:
-///   * the local LLM backend (any served GGUF genuinely provides chat /
-///     generation / reasoning / coding / structured output / summarization);
-///   * the embeddings + retrieval managers when configured (RAG path);
-///   * the skill registry's declared capabilities when attached;
-///   * local agents' semantic claims when an agent manager is attached.
-pub async fn intel_available_capabilities(&self) -> Vec<decentraai_hub::capability::CapabilityKind> {
-    use decentraai_hub::capability::CapabilityKind;
-    let mut out = vec![
-        // The managed llama-server backend is an LLM; these are honest.
-        CapabilityKind::Chat,
-        CapabilityKind::TextGeneration,
-        CapabilityKind::Reasoning,
-        CapabilityKind::Coding,
-        CapabilityKind::StructuredOutput,
-        CapabilityKind::Summarization,
-        CapabilityKind::Translation,
-    ];
-    if self.embedding.is_some() {
-        out.push(CapabilityKind::Embeddings);
-    }
-    if self.retrieval.is_some() {
-        out.push(CapabilityKind::Retrieval);
-    }
-    // Skill registry claims: every registered skill DEVELOPS capabilities
-    // (OCR/STT/TTS/translation/…) — declared evidence, never invented.
-    if let Some(skills) = &self.skills {
-        for skill in skills.as_ref().skills() {
-            for cap in &skill.develops {
-                if !out.contains(cap) {
-                    out.push(*cap);
+    /// Fabric Intelligence: capability inventory the deterministic fabric can
+    /// currently vouch for. Assembled ONLY from attached, real sources — never
+    /// invented:
+    ///   * the local LLM backend (any served GGUF genuinely provides chat /
+    ///     generation / reasoning / coding / structured output / summarization);
+    ///   * the embeddings + retrieval managers when configured (RAG path);
+    ///   * the skill registry's declared capabilities when attached;
+    ///   * local agents' semantic claims when an agent manager is attached.
+    pub async fn intel_available_capabilities(
+        &self,
+    ) -> Vec<decentraai_hub::capability::CapabilityKind> {
+        use decentraai_hub::capability::CapabilityKind;
+        let mut out = vec![
+            // The managed llama-server backend is an LLM; these are honest.
+            CapabilityKind::Chat,
+            CapabilityKind::TextGeneration,
+            CapabilityKind::Reasoning,
+            CapabilityKind::Coding,
+            CapabilityKind::StructuredOutput,
+            CapabilityKind::Summarization,
+            CapabilityKind::Translation,
+        ];
+        if self.embedding.is_some() {
+            out.push(CapabilityKind::Embeddings);
+        }
+        if self.retrieval.is_some() {
+            out.push(CapabilityKind::Retrieval);
+        }
+        // Skill registry claims: every registered skill DEVELOPS capabilities
+        // (OCR/STT/TTS/translation/…) — declared evidence, never invented.
+        if let Some(skills) = &self.skills {
+            for skill in skills.as_ref().skills() {
+                for cap in &skill.develops {
+                    if !out.contains(cap) {
+                        out.push(*cap);
+                    }
                 }
             }
         }
-    }
-    // Local agents' semantic claims (signed advertisements, mesh-wide).
-    if let Some(agents) = &self.agents {
-        for record in agents.local_agents() {
-            for claim in &record.semantic_capabilities {
-                if !out.contains(&claim.capability) {
-                    out.push(claim.capability);
+        // Local agents' semantic claims (signed advertisements, mesh-wide).
+        if let Some(agents) = &self.agents {
+            for record in agents.local_agents() {
+                for claim in &record.semantic_capabilities {
+                    if !out.contains(&claim.capability) {
+                        out.push(claim.capability);
+                    }
                 }
             }
         }
+        out
     }
-    out
-}
-
 
     /// Attaches the P8 dataset/skill registry (read-only) for the dashboard.
     pub fn attach_skills(&mut self, skills: Arc<decentraai_agents::SkillRegistry>) {
@@ -4675,9 +4669,8 @@ async fn admin_model_select_handler(
                     }
                 }
                 Err(e) => {
-                    note = format!(
-                        "model saved; engine respawn error: {e:.200} — restart the node"
-                    );
+                    note =
+                        format!("model saved; engine respawn error: {e:.200} — restart the node");
                 }
             }
         } else {
@@ -4728,7 +4721,12 @@ fn persist_model_config(path: &std::path::Path, model_name: &str) -> bool {
             } else if let Some(rest) = trimmed.strip_prefix("model:") {
                 let value = rest.trim();
                 let _ = value;
-                out.push(format!("{}{}model: \"{}\"", &line[..indent], "", model_name));
+                out.push(format!(
+                    "{}{}model: \"{}\"",
+                    &line[..indent],
+                    "",
+                    model_name
+                ));
                 wrote = true;
                 continue;
             }
@@ -5095,7 +5093,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/contribution", get(contribution_state_handler))
         .route("/v1/credits/balance", get(credits_balance_handler))
         .route("/v1/credits/events", get(credits_events_handler))
-        .route("/v1/verified-compute/history", get(verified_compute_history_handler))
+        .route(
+            "/v1/verified-compute/history",
+            get(verified_compute_history_handler),
+        )
         .route("/v1/placement/plan", get(placement_plan_handler))
         .route("/v1/fabric/graphs", get(fabric_graphs_handler))
         .route("/v1/evidence-chain", get(evidence_chain_handler))
@@ -5117,10 +5118,7 @@ pub fn build_router(state: ApiState) -> Router {
             get(admin_consumer_key_list_handler),
         )
         // Q2b - Quota management (master-gated; grant quota to consumer accounts)
-        .route(
-            "/api/admin/quota/grant",
-            post(admin_quota_grant_handler),
-        )
+        .route("/api/admin/quota/grant", post(admin_quota_grant_handler))
         // P3/M10 - Worker trust + audit events (master-gated control plane)
         .route("/api/admin/worker/trust", post(admin_worker_trust_handler))
         .route(
@@ -5928,7 +5926,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             return e.into_response();
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let Some(mut guard) = state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling) else {
+        let Some(mut guard) =
+            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        else {
             return forbidden("no spendable quota for this consumer account");
         };
         // Execute via embeddings path if available, otherwise stub.
@@ -5961,7 +5961,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         guard.settle(1);
         state.note_token_usage(auth, 1);
         // Return directly (bypass generic handle_message which would look for tool in McpContext)
-        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -5970,11 +5973,18 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         return (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             serde_json::to_string(&body).unwrap_or_default(),
-        ).into_response();
+        )
+            .into_response();
     } else if let Some((capability, payload, lease_secs)) = crate::mcp::compute_request(&raw) {
         // `decentraai_compute_request` — L1 ASSIST via DFCP, scoped to compute/capability.
-        if !scopes.iter().any(|s| s == "compute" || s == &capability || s == "*") {
-            return forbidden(&format!("consumer key missing scope for capability '{}'", capability));
+        if !scopes
+            .iter()
+            .any(|s| s == "compute" || s == &capability || s == "*")
+        {
+            return forbidden(&format!(
+                "consumer key missing scope for capability '{}'",
+                capability
+            ));
         }
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
@@ -5988,7 +5998,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             return forbidden("no connected workers for compute assist");
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
-        let Some(mut guard) = state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling) else {
+        let Some(mut guard) =
+            state.reserve_consumer_quota(account, key_id, &request_id, *quota_ceiling)
+        else {
             return forbidden("no spendable quota for this consumer account");
         };
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
@@ -6004,7 +6016,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             lease_secs,
         )
         .await;
-        let result_json: serde_json::Value = serde_json::from_slice(&result_payload).unwrap_or(serde_json::Value::Null);
+        let result_json: serde_json::Value =
+            serde_json::from_slice(&result_payload).unwrap_or(serde_json::Value::Null);
         if success {
             guard.settle(1);
             state.note_token_usage(auth, 1);
@@ -6017,7 +6030,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": {"reserved": true, "settled": success, "tokens_settled": if success {1} else {0}},
             "body": result_json,
         });
-        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
         return (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             serde_json::json!({
@@ -6076,9 +6092,14 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         match name {
                             "decide" | "execute_decision" => true,
-                            "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings" || s == "*"),
-                            "decentraai_compute_request" => scopes.iter().any(|s| s == "compute" || s == "*"),
-                            "serve_model" | "pull_model" | "list_consumer_keys" | "get_compensation" => false,
+                            "decentraai_embeddings" => {
+                                scopes.iter().any(|s| s == "embeddings" || s == "*")
+                            }
+                            "decentraai_compute_request" => {
+                                scopes.iter().any(|s| s == "compute" || s == "*")
+                            }
+                            "serve_model" | "pull_model" | "list_consumer_keys"
+                            | "get_compensation" => false,
                             _ => true,
                         }
                     });
@@ -6102,7 +6123,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         // Read-only discovery — allowed for consumer keys.
     } else {
         // Any other tool is not in the consumer consumption scope.
-        return forbidden("consumer API keys may only call decide, execute_decision, decentraai_embeddings or decentraai_compute_request");
+        return forbidden(
+            "consumer API keys may only call decide, execute_decision, decentraai_embeddings or decentraai_compute_request",
+        );
     }
 
     let response = crate::mcp::handle_message(&ctx, &raw);
@@ -6420,21 +6443,26 @@ async fn admin_quota_grant_handler(
         Some(a) if !a.trim().is_empty() => a.trim().to_string(),
         _ => return forbidden("missing account"),
     };
-    let amount = req
-        .get("amount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let amount = req.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
     if amount == 0 {
         return forbidden("amount must be > 0");
     }
-    let ref_id = format!("admin-grant-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0));
+    let ref_id = format!(
+        "admin-grant-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
     let mut l = ledger.lock().unwrap();
     let credited = l.credit(&account, &ref_id, Some(amount as u32), None);
     drop(l);
-    tracing::info!(account, amount, credited, "admin granted quota to consumer account");
+    tracing::info!(
+        account,
+        amount,
+        credited,
+        "admin granted quota to consumer account"
+    );
     (
         StatusCode::OK,
         serde_json::json!({"account": account, "amount": amount, "credited": credited}).to_string(),
@@ -6592,7 +6620,8 @@ async fn ocr_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
     if !state.ocr.enabled() {
         return (
             StatusCode::NOT_FOUND,
-            serde_json::json!({"error": {"message": "OCR is not enabled on this node"}}).to_string(),
+            serde_json::json!({"error": {"message": "OCR is not enabled on this node"}})
+                .to_string(),
         )
             .into_response();
     }
@@ -6689,7 +6718,8 @@ async fn stt_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
     if !state.stt.enabled() {
         return (
             StatusCode::NOT_FOUND,
-            serde_json::json!({"error": {"message": "STT is not enabled on this node"}}).to_string(),
+            serde_json::json!({"error": {"message": "STT is not enabled on this node"}})
+                .to_string(),
         )
             .into_response();
     }
@@ -7077,7 +7107,10 @@ async fn credits_events_handler(State(state): State<ApiState>, headers: HeaderMa
 /// P14 — Verified compute history (read-only). Mirrors the recent execution
 /// trail already kept by the compute manager, surfaced as a stable projection
 /// for dashboards and agents.
-async fn verified_compute_history_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+async fn verified_compute_history_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
@@ -7099,7 +7132,10 @@ async fn verified_compute_history_handler(State(state): State<ApiState>, headers
 /// P14 — Placement plan (read-only, explainable). Given model requirements and
 /// a strategy hint, returns candidate workers, rejected candidates with safe
 /// reasons, selected workers, and expected resource/network cost.
-async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+async fn placement_plan_handler(
+    State(state): State<ApiState>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let Some(compute) = &state.compute else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7110,11 +7146,26 @@ async fn placement_plan_handler(State(state): State<ApiState>, query: axum::extr
     // Parse requirements from query params; missing values become defaults.
     let q = query.0;
     let model_id = q.get("model_id").cloned().unwrap_or_default();
-    let min_vram_mb = q.get("min_vram_mb").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let min_ram_mb = q.get("min_ram_mb").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let min_gpu_count = q.get("min_gpu_count").and_then(|s| s.parse().ok()).unwrap_or(1u32);
-    let context_tokens = q.get("context_tokens").and_then(|s| s.parse().ok()).unwrap_or(4096u32);
-    let allow_distributed = q.get("distributed").map(|s| s == "true" || s == "1").unwrap_or(true);
+    let min_vram_mb = q
+        .get("min_vram_mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let min_ram_mb = q
+        .get("min_ram_mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let min_gpu_count = q
+        .get("min_gpu_count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u32);
+    let context_tokens = q
+        .get("context_tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096u32);
+    let allow_distributed = q
+        .get("distributed")
+        .map(|s| s == "true" || s == "1")
+        .unwrap_or(true);
     let requirements = decentraai_compute::ModelRequirements {
         model_id: model_id.clone(),
         min_gpu_count,
@@ -7288,7 +7339,8 @@ async fn knowledge_decide_handler(
             agreement_threshold: p
                 .get("agreement_threshold")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(default.agreement_threshold as f64) as f32,
+                .unwrap_or(default.agreement_threshold as f64)
+                as f32,
             require_schema: p
                 .get("require_schema")
                 .and_then(|v| v.as_bool())
@@ -7431,11 +7483,7 @@ async fn bench_handler(State(state): State<ApiState>, headers: HeaderMap) -> Res
     };
     let comparison = bench.comparison();
     let global = bench.global_comparison();
-    let runs = bench
-        .registry()
-        .lock()
-        .map(|r| r.runs().len())
-        .unwrap_or(0);
+    let runs = bench.registry().lock().map(|r| r.runs().len()).unwrap_or(0);
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({
@@ -7617,7 +7665,11 @@ async fn intel_assist_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("embeddings")
         .to_string();
-    let cpu_cores = body.0.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
+    let cpu_cores = body
+        .0
+        .get("cpu_cores")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as u16;
     let ram_mb = body.0.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(512);
     let lease_seconds = body
         .0
@@ -7648,14 +7700,9 @@ async fn intel_assist_handler(
         ram_mb,
     };
     let started = std::time::Instant::now();
-    let (success, result_payload, explanation) = crate::intel_assist::run_assist_request(
-        &p2p,
-        peers,
-        request,
-        task_payload,
-        lease_seconds,
-    )
-    .await;
+    let (success, result_payload, explanation) =
+        crate::intel_assist::run_assist_request(&p2p, peers, request, task_payload, lease_seconds)
+            .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     // Evidence + contribution credit for the EXECUTING worker: recorded only
@@ -7668,7 +7715,13 @@ async fn intel_assist_handler(
             if let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() {
                 cm.record_credited_contribution(
                     &peer_id,
-                    &format!("assist-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)),
+                    &format!(
+                        "assist-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    ),
                     true,
                     None,
                     Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX)),
@@ -7709,36 +7762,64 @@ async fn collective_workflow_handler(
         )
             .into_response();
     };
-    let intent = body.0.get("intent").and_then(|v| v.as_str()).unwrap_or("collective_task").to_string();
+    let intent = body
+        .0
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("collective_task")
+        .to_string();
     let stages_val = match body.0.get("stages").and_then(|v| v.as_array()) {
         Some(a) => a.clone(),
-        None => return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "field `stages` (array) is required"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "field `stages` (array) is required"})),
+            )
+                .into_response();
+        }
     };
 
     // Build ProposedStages from the JSON input
     use decentraai_agents::collective_bridge::ProposedStage;
-    let proposed: Vec<ProposedStage> = stages_val.iter().map(|s| {
-        ProposedStage {
-            capability: s.get("capability").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-            prompt: s.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-            depends_on: s.get("depends_on").and_then(|d| d.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|y| y.to_string())).collect())
+    let proposed: Vec<ProposedStage> = stages_val
+        .iter()
+        .map(|s| ProposedStage {
+            capability: s
+                .get("capability")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+            prompt: s
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string(),
+            depends_on: s
+                .get("depends_on")
+                .and_then(|d| d.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|y| y.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
-        }
-    }).collect();
+        })
+        .collect();
 
     // Build and validate the DAG
     let dag = match decentraai_agents::collective_bridge::task_plan_to_dag(
-        &format!("wf-{}", now_nanos()), &intent, &proposed,
+        &format!("wf-{}", now_nanos()),
+        &intent,
+        &proposed,
     ) {
         Ok(d) => d,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": format!("invalid DAG: {e}")})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": format!("invalid DAG: {e}")})),
+            )
+                .into_response();
+        }
     };
 
     // Execute stages in topological order via the existing assist flow
@@ -7775,7 +7856,10 @@ async fn collective_workflow_handler(
             // Use the existing assist path
             let peers = p2p.connected_peers().await;
             if peers.is_empty() {
-                stage_results.insert(stage.stage_id.clone(), serde_json::json!({"error": "no connected peers"}));
+                stage_results.insert(
+                    stage.stage_id.clone(),
+                    serde_json::json!({"error": "no connected peers"}),
+                );
                 all_success = false;
                 executed_count += 1;
                 continue;
@@ -7793,16 +7877,22 @@ async fn collective_workflow_handler(
             };
             let lease = stage.lease_seconds.min(120);
 
-            let outcome = crate::intel_assist::run_assist_request(
-                &p2p, peers, request, payload_bytes, lease,
-            ).await;
+            let outcome =
+                crate::intel_assist::run_assist_request(&p2p, peers, request, payload_bytes, lease)
+                    .await;
 
             if outcome.0 {
-                stage_results.insert(stage.stage_id.clone(), serde_json::from_slice(&outcome.1).unwrap_or(serde_json::Value::Null));
+                stage_results.insert(
+                    stage.stage_id.clone(),
+                    serde_json::from_slice(&outcome.1).unwrap_or(serde_json::Value::Null),
+                );
                 completed.insert(stage.stage_id.clone());
                 tracing::info!(stage = %stage.stage_id, "collective stage completed");
             } else {
-                stage_results.insert(stage.stage_id.clone(), serde_json::json!({"error": outcome.2}));
+                stage_results.insert(
+                    stage.stage_id.clone(),
+                    serde_json::json!({"error": outcome.2}),
+                );
                 all_success = false;
                 executed_count += 1;
             }
@@ -7827,7 +7917,8 @@ async fn collective_workflow_handler(
             "stages_total": total_stages,
             "results": stage_results,
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 fn read_governor_token() -> String {
@@ -7867,7 +7958,13 @@ async fn agents_onboard_handler(
     let cfg = decentraai_config::AgentGatewaySection::default();
     // Enforce M16 invariant: onboarding is master-only and audited; the
     // handler already passed require_master above.
-    let agent_name = body.0.get("agent_name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let agent_name = body
+        .0
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if agent_name.is_empty() || agent_name.len() > 64 {
         return (
             StatusCode::BAD_REQUEST,
@@ -7875,18 +7972,54 @@ async fn agents_onboard_handler(
         )
             .into_response();
     }
-    let starter = body.0.get("starter").and_then(|v| v.as_bool()).unwrap_or(false);
+    let starter = body
+        .0
+        .get("starter")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut capabilities: Vec<String> = body
         .0
         .get("capabilities")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
-    let mut quota = body.0.get("quota").and_then(|v| v.get("quota_ceiling")).and_then(|v| v.as_u64()).unwrap_or(body.0.get("quota").and_then(|v| v.as_u64()).unwrap_or(cfg.free_starter.quota_ceiling));
-    let mut rate = body.0.get("quota").and_then(|v| v.get("rate_limit")).and_then(|v| v.as_u64()).unwrap_or(cfg.free_starter.rate_limit as u64) as u32;
-    let mut scopes = body.0.get("scopes").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_else(|| {
-        if !capabilities.is_empty() { capabilities.clone() } else { cfg.free_starter.scopes.clone() }
-    });
+    let mut quota = body
+        .0
+        .get("quota")
+        .and_then(|v| v.get("quota_ceiling"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(
+            body.0
+                .get("quota")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cfg.free_starter.quota_ceiling),
+        );
+    let mut rate = body
+        .0
+        .get("quota")
+        .and_then(|v| v.get("rate_limit"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(cfg.free_starter.rate_limit as u64) as u32;
+    let mut scopes = body
+        .0
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            if !capabilities.is_empty() {
+                capabilities.clone()
+            } else {
+                cfg.free_starter.scopes.clone()
+            }
+        });
     if starter {
         capabilities = cfg.free_starter.scopes.clone();
         scopes = cfg.free_starter.scopes.clone();
@@ -7913,10 +8046,26 @@ async fn agents_onboard_handler(
         capabilities.truncate(8);
     }
     // Expiry: optional, clamped to max_expiry_seconds
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let mut expires_at: Option<u64> = body.0.get("expires_at").and_then(|v| v.as_u64())
-        .or_else(|| body.0.get("expires_in").and_then(|v| v.as_u64()).map(|secs| now + secs))
-        .or_else(|| body.0.get("expires").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut expires_at: Option<u64> = body
+        .0
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            body.0
+                .get("expires_in")
+                .and_then(|v| v.as_u64())
+                .map(|secs| now + secs)
+        })
+        .or_else(|| {
+            body.0
+                .get("expires")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        });
     if let Some(exp) = expires_at {
         if cfg.max_expiry_seconds > 0 && exp > now + cfg.max_expiry_seconds {
             expires_at = Some(now + cfg.max_expiry_seconds);
@@ -7940,16 +8089,17 @@ async fn agents_onboard_handler(
                 .into_response();
         }
     };
-    let plaintext = match store.create_with_expiry(&owner_account, quota, rate, scopes.clone(), expires_at) {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": format!("key creation failed: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    let plaintext =
+        match store.create_with_expiry(&owner_account, quota, rate, scopes.clone(), expires_at) {
+            Ok(k) => k,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": format!("key creation failed: {e}")})),
+                )
+                    .into_response();
+            }
+        };
     // Audit without logging the secret (only key_id/prefix and scopes)
     if let Some(rec) = store.lookup(&plaintext) {
         decentraai_audit::record_best_effort(
@@ -8086,11 +8236,9 @@ async fn intel_plan_handler(
     let outcome = intel.plan(task, &backend_url).await;
     let plan = outcome.plan.clone();
     let available = state.intel_available_capabilities().await;
-    let validation = plan
-        .as_ref()
-        .map(|p| {
-            decentraai_fabric_intelligence::validation::validate_against_fabric(p, &available)
-        });
+    let validation = plan.as_ref().map(|p| {
+        decentraai_fabric_intelligence::validation::validate_against_fabric(p, &available)
+    });
 
     let body = serde_json::json!({
         "proposal": true,
@@ -8153,21 +8301,41 @@ async fn memory_search_handler(
         )
             .into_response();
     };
-    let query = body.0.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-    let scope_filter = body.0.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let kind_filter = body.0.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let query = body
+        .0
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let scope_filter = body
+        .0
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let kind_filter = body
+        .0
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let status_min = body
         .0
         .get("min_status")
         .and_then(|v| v.as_str())
-        .and_then(|s| serde_json::from_value::<MemoryStatus>(serde_json::Value::String(s.to_string())).ok())
+        .and_then(|s| {
+            serde_json::from_value::<MemoryStatus>(serde_json::Value::String(s.to_string())).ok()
+        })
         .map(|st| st.strength());
-    let mode = body.0.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+    let mode = body
+        .0
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
     if !matches!(mode, "auto" | "semantic" | "lexical") {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "mode must be auto|semantic|lexical"})),
-        ).into_response();
+        )
+            .into_response();
     }
     let top_k = body
         .0
@@ -8179,7 +8347,8 @@ async fn memory_search_handler(
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "query must not be empty"})),
-        ).into_response();
+        )
+            .into_response();
     }
     let visible_scopes = || -> Vec<decentraai_agents::memory::MemoryScope> {
         memory
@@ -8197,10 +8366,17 @@ async fn memory_search_handler(
                 return (
                     StatusCode::NOT_FOUND,
                     axum::Json(serde_json::json!({"error": "no embeddings backend attached"})),
-                ).into_response();
+                )
+                    .into_response();
             }
             // auto → lexical fallback below
-            return respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min);
+            return respond_lexical(
+                memory,
+                visible_scopes(),
+                &query,
+                kind_filter.as_deref(),
+                status_min,
+            );
         };
         return match client.embed(&query).await {
             Ok(qvec) => {
@@ -8234,7 +8410,8 @@ async fn memory_search_handler(
                         "mode": "semantic",
                         "untrusted_input": true,
                     })),
-                ).into_response()
+                )
+                    .into_response()
             }
             Err(e) => {
                 if mode == "semantic" {
@@ -8244,15 +8421,28 @@ async fn memory_search_handler(
                             "error": "embeddings backend unavailable",
                             "detail": e.to_string(),
                         })),
-                    ).into_response();
+                    )
+                        .into_response();
                 }
-                respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min)
+                respond_lexical(
+                    memory,
+                    visible_scopes(),
+                    &query,
+                    kind_filter.as_deref(),
+                    status_min,
+                )
             }
         };
     }
 
     // ----- lexical path -----
-    respond_lexical(memory, visible_scopes(), &query, kind_filter.as_deref(), status_min)
+    respond_lexical(
+        memory,
+        visible_scopes(),
+        &query,
+        kind_filter.as_deref(),
+        status_min,
+    )
 }
 
 /// Applies the optional kind/min_status filters shared by both retrieval modes.
@@ -8318,9 +8508,13 @@ fn respond_lexical(
             if !entry_matches_filters(entry, kind_filter, status_min) {
                 continue;
             }
-            let text =
-                format!("{} {} {}", entry.entry_id, entry.content, entry.tags.join(" "))
-                    .to_lowercase();
+            let text = format!(
+                "{} {} {}",
+                entry.entry_id,
+                entry.content,
+                entry.tags.join(" ")
+            )
+            .to_lowercase();
             if terms.iter().all(|t| text.contains(t)) {
                 results.push(memory_entry_json(entry));
             }
@@ -8334,9 +8528,9 @@ fn respond_lexical(
             "mode": "lexical",
             "untrusted_input": true,
         })),
-    ).into_response()
+    )
+        .into_response()
 }
-
 
 /// POST /v1/memory/sync-to — push a bounded batch of one scope's collective
 /// memory to a peer over the existing p2p transport. Operator+.
@@ -8350,7 +8544,7 @@ async fn memory_sync_to_handler(
     body: axum::Json<serde_json::Value>,
 ) -> Response {
     use decentraai_protocol::memory_sync::{
-        MemorySyncRequest, MemorySyncResponse, SyncMemoryEntry, MAX_SYNC_BATCH_ENTRIES,
+        MAX_SYNC_BATCH_ENTRIES, MemorySyncRequest, MemorySyncResponse, SyncMemoryEntry,
     };
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -8359,26 +8553,34 @@ async fn memory_sync_to_handler(
         return (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"error": "memory store not attached"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let Some(p2p) = &state.p2p else {
         return (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"error": "p2p not enabled on this node"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let Some(scope) = body.0.get("scope").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "scope is required"})),
-        ).into_response();
+        )
+            .into_response();
     };
-    let peer_str = body.0.get("peer").and_then(|v| v.as_str()).unwrap_or_default();
+    let peer_str = body
+        .0
+        .get("peer")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "peer must be a valid libp2p PeerId"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let entries = match memory.read(scope, "governor", true) {
         Ok(e) => e,
@@ -8386,7 +8588,8 @@ async fn memory_sync_to_handler(
             return (
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": e.to_string()})),
-            ).into_response()
+            )
+                .into_response();
         }
     };
     // Bounded batch: newest-first order from read(), capped at the wire max.
@@ -8407,7 +8610,8 @@ async fn memory_sync_to_handler(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({"error": "failed to encode sync batch"})),
-        ).into_response();
+        )
+            .into_response();
     };
     if bytes.len() > decentraai_protocol::memory_sync::MAX_MEMORY_SYNC_BYTES {
         return (
@@ -8415,7 +8619,8 @@ async fn memory_sync_to_handler(
             axum::Json(serde_json::json!({
                 "error": "encoded batch exceeds the memory-sync byte cap; sync fewer entries"
             })),
-        ).into_response();
+        )
+            .into_response();
     }
     decentraai_audit::record_best_effort(
         &state.info.repo_root.join("logs"),
@@ -8440,7 +8645,8 @@ async fn memory_sync_to_handler(
                     "expired": resp.expired,
                     "rejected": resp.rejected,
                 })),
-            ).into_response(),
+            )
+                .into_response(),
             Err(_) => (
                 StatusCode::BAD_GATEWAY,
                 axum::Json(serde_json::json!({
@@ -8448,7 +8654,8 @@ async fn memory_sync_to_handler(
                     "scope": scope,
                     "sent": batch_len,
                 })),
-            ).into_response(),
+            )
+                .into_response(),
         },
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -8456,7 +8663,8 @@ async fn memory_sync_to_handler(
                 "error": format!("sync request to peer failed: {e}"),
                 "scope": scope,
             })),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -8490,7 +8698,8 @@ async fn memory_index_handler(
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "scope is required"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let entries = match memory.read(scope, "governor", true) {
         Ok(e) => e,
@@ -8498,7 +8707,8 @@ async fn memory_index_handler(
             return (
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": e.to_string()})),
-            ).into_response()
+            )
+                .into_response();
         }
     };
     // Bounded batch: index at most 256 entries per call so one request can
@@ -8507,11 +8717,12 @@ async fn memory_index_handler(
     let mut skipped = 0u32;
     for entry in entries.iter().take(256) {
         match client.embed(&entry.content).await {
-            Ok(vec) if !vec.is_empty() => match memory.store_embedding(scope, &entry.entry_id, &vec)
-            {
-                Ok(()) => indexed += 1,
-                Err(_) => skipped += 1,
-            },
+            Ok(vec) if !vec.is_empty() => {
+                match memory.store_embedding(scope, &entry.entry_id, &vec) {
+                    Ok(()) => indexed += 1,
+                    Err(_) => skipped += 1,
+                }
+            }
             _ => skipped += 1,
         }
     }
@@ -8530,14 +8741,18 @@ async fn memory_index_handler(
             "indexed_total": have_indexed,
             "unindexed_remaining": unindexed,
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// GET /v1/memory/training-candidates — explicit Training Lab export path.
 /// Operator+. Returns verified + evidence-backed generalizations as JSONL
 /// records ready for the dataset builder. Audited; NOTHING is trained or
 /// added to datasets automatically.
-async fn memory_training_candidates_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+async fn memory_training_candidates_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
     use decentraai_agents::training_export::TrainingCandidate;
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
@@ -8563,7 +8778,10 @@ async fn memory_training_candidates_handler(State(state): State<ApiState>, heade
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/x-ndjson"),
-                    (header::CONTENT_DISPOSITION, "attachment; filename=\"training-candidates.jsonl\""),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"training-candidates.jsonl\"",
+                    ),
                 ],
                 TrainingCandidate::to_jsonl(&candidates),
             )
@@ -8601,19 +8819,22 @@ async fn memory_transition_handler(
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "scope is required"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let Some(entry_id) = body.0.get("entry_id").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "entry_id is required"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let Some(to_raw) = body.0.get("to").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "to (status) is required"})),
-        ).into_response();
+        )
+            .into_response();
     };
     let Ok(to) = serde_json::from_value::<decentraai_agents::memory::MemoryStatus>(
         serde_json::Value::String(to_raw.to_string()),
@@ -8623,7 +8844,8 @@ async fn memory_transition_handler(
             axum::Json(serde_json::json!({
                 "error": "invalid status; expected candidate|verified|trusted|obsolete"
             })),
-        ).into_response();
+        )
+            .into_response();
     };
     let reason = body
         .0
@@ -8648,9 +8870,7 @@ async fn memory_transition_handler(
             let entry = memory
                 .read(scope, "governor", true)
                 .ok()
-                .and_then(|entries| {
-                    entries.into_iter().find(|e| e.entry_id == entry_id)
-                })
+                .and_then(|entries| entries.into_iter().find(|e| e.entry_id == entry_id))
                 .map(|e| {
                     serde_json::json!({
                         "entry_id": e.entry_id,
@@ -8662,12 +8882,14 @@ async fn memory_transition_handler(
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({"ok": true, "entry": entry})),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -11660,9 +11882,8 @@ mod tests {
     #[tokio::test]
     async fn sse_pump_injects_keepalive_while_upstream_is_silent() {
         let real = Bytes::from_static(b"data: {\"delta\":\"x\"}\n\n");
-        let upstream =
-            futures::stream::iter(vec![Ok::<_, std::convert::Infallible>(real)])
-                .chain(futures::stream::pending());
+        let upstream = futures::stream::iter(vec![Ok::<_, std::convert::Infallible>(real)])
+            .chain(futures::stream::pending());
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
         let buf_for_check = Arc::clone(&buffer);
@@ -13726,9 +13947,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn knowledge_receipt_auto_seeds_from_compute_measurement() {
-        use decentraai_distributed::{
-            ComputeManager, LivePerf, build_advertisement,
-        };
+        use decentraai_distributed::{ComputeManager, LivePerf, build_advertisement};
         use decentraai_p2p::PeerId;
         use decentraai_system_probe::{GpuProbeStatus, SystemSnapshot};
         use std::collections::HashSet;
@@ -13768,7 +13987,13 @@ mod tests {
             ))
             .await;
         // Measure verified work for the worker: this is what auto-seed reads.
-        assert!(compute.record_credited_contribution(&worker, "exec-m1", true, Some(100), Some(2000)));
+        assert!(compute.record_credited_contribution(
+            &worker,
+            "exec-m1",
+            true,
+            Some(100),
+            Some(2000)
+        ));
 
         let mut state = ApiState::new(
             format!("http://{backend}"),
@@ -13825,7 +14050,11 @@ mod tests {
         // least the receipt's credit (the earlier record_credited_contribution
         // for exec-m1 also credited the same ledger) — proving the receipt
         // wrote to the SAME bookkeeping compute shows.
-        let balances = compute.compensation_ledger().lock().unwrap().account(&worker.to_string());
+        let balances = compute
+            .compensation_ledger()
+            .lock()
+            .unwrap()
+            .account(&worker.to_string());
         assert!(balances.is_some());
         let earned = balances.unwrap().earned;
         assert!(
@@ -14001,19 +14230,21 @@ mod tests {
                 Box::pin(async move {
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     // Extract the question after the RAG prefix if present.
-                    let q = prompt
-                        .rsplit("Question: ")
-                        .next()
-                        .unwrap_or(prompt)
-                        .trim();
-                    let out = if q.contains("capital") { "paris".to_string() } else { "wrong".to_string() };
+                    let q = prompt.rsplit("Question: ").next().unwrap_or(prompt).trim();
+                    let out = if q.contains("capital") {
+                        "paris".to_string()
+                    } else {
+                        "wrong".to_string()
+                    };
                     Ok((out, 100, 50))
                 })
             }
         }
         let bench = Arc::new(
             decentraai_distributed::benchmark_manager::BenchmarkManager::new(
-                Arc::new(EchoExecutor { calls: calls.clone() }),
+                Arc::new(EchoExecutor {
+                    calls: calls.clone(),
+                }),
                 None,
             ),
         );
@@ -14050,7 +14281,11 @@ mod tests {
         assert_eq!(body["runs"], 1);
         assert_eq!(body["comparison"]["single"]["runs"], 0);
         assert_eq!(body["comparison"]["single"]["graded"], 0);
-        assert!(!body["comparison"]["collective_beats_single"].as_bool().unwrap());
+        assert!(
+            !body["comparison"]["collective_beats_single"]
+                .as_bool()
+                .unwrap()
+        );
         // 0 shared tasks → honest "not enough".
         let reason = body["comparison"]["reasoning"].as_str().unwrap();
         assert!(reason.contains("not enough"));
@@ -14073,8 +14308,16 @@ mod tests {
             "/v1/credits/events",
             "/v1/verified-compute/history",
         ] {
-            let resp = client.get(format!("http://{api}{path}")).send().await.unwrap();
-            assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let resp = client
+                .get(format!("http://{api}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(body["error"].as_str().unwrap().contains("compute manager"));
         }
@@ -14217,7 +14460,9 @@ mod tests {
 
         // Placement plan is available (it is a public read-only projection).
         let resp = client
-            .get(format!("http://{api}/v1/placement/plan?model_id=m1&min_vram_mb=100"))
+            .get(format!(
+                "http://{api}/v1/placement/plan?model_id=m1&min_vram_mb=100"
+            ))
             .send()
             .await
             .unwrap();
@@ -15406,10 +15651,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(
-            status["model"], "test-model.gguf",
-            "startup model reported"
-        );
+        assert_eq!(status["model"], "test-model.gguf", "startup model reported");
         // Simulate a successful live swap: the engine now serves "new.gguf".
         // The selector handler writes active_model exactly like this.
         *handle.active_model.write().await = "new.gguf".to_string();
@@ -15932,7 +16174,11 @@ mod tests {
                 cpu_cores: 4,
                 ram_mb: 16384,
                 gpu: if est_vram > 0 {
-                    Some(decentraai_distributed::compute::GpuSpec::simple("gpu", est_vram + 1024, "x"))
+                    Some(decentraai_distributed::compute::GpuSpec::simple(
+                        "gpu",
+                        est_vram + 1024,
+                        "x",
+                    ))
                 } else {
                     None
                 },

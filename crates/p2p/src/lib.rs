@@ -23,7 +23,6 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{Multiaddr, dcutr, identify, kad, mdns, noise, ping, relay, tcp, yamux};
 
-
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
@@ -436,7 +435,8 @@ pub struct P2PNode {
     /// Pending assist results: assignment id → completion channel. The
     /// requester parks a receiver here before sending TASK_ASSIGN and the
     /// swarm loop completes it when the worker calls back with RESULT.
-    pending_assists: std::sync::Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+    pending_assists:
+        std::sync::Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
     /// DFCP dispatch slot (Sharing is Caring). Registered by the runtime.
     on_dfcp: SharedHandler<DfcHandler>,
     /// Optional callback invoked for inbound InferRequest messages. Stored
@@ -509,10 +509,7 @@ impl P2PNode {
     /// feature is off without retry loops.
     pub fn set_on_memory_sync<F>(&mut self, callback: F)
     where
-        F: Fn(
-                PeerId,
-                decentraai_protocol::memory_sync::MemorySyncRequest,
-            ) -> Vec<u8>
+        F: Fn(PeerId, decentraai_protocol::memory_sync::MemorySyncRequest) -> Vec<u8>
             + Send
             + Sync
             + 'static,
@@ -1600,7 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_bootstrap_peer_lan_and_public() {        // A LAN peer with trailing /p2p/<PeerId>.
+    fn parse_bootstrap_peer_lan_and_public() {
+        // A LAN peer with trailing /p2p/<PeerId>.
         let (peer, addr) = parse_bootstrap_peer(
             "/ip4/192.168.1.129/tcp/41873/p2p/12D3KooWNGE65ZF4rCdLx7DVcna8zp4AcR3RiWgpdR49sixmvkRs",
         )

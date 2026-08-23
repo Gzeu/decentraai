@@ -26,7 +26,7 @@
 //!
 //! Everything here is pure (no I/O): sign/verify are functions over bytes.
 
-use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version guard so a signature from an older schema never silently
@@ -38,7 +38,7 @@ pub const SIGNED_RECEIPT_VERSION: u16 = 1;
 /// - `receipt_bytes`: the **canonical** serialization of the receipt payload —
 ///   the exact bytes that were signed. Verifying signs/compares against this, so
 ///   any field change invalidates the signature.
-/// - `signer_public_key`: the Ed25519 public key of the node that executed + 
+/// - `signer_public_key`: the Ed25519 public key of the node that executed +
 ///   signed (derives its libp2p `PeerId`).
 /// - `signature`: Ed25519 over `receipt_bytes`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

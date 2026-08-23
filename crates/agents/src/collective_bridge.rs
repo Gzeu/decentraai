@@ -4,7 +4,7 @@
 //! dependencies) into a validated [`CollectiveDag`] that the orchestrator
 //! can execute across the fabric.
 
-use crate::collective::{validate_dag, CollectiveDag, DagError, DagStage};
+use crate::collective::{CollectiveDag, DagError, DagStage, validate_dag};
 use serde::{Deserialize, Serialize};
 
 /// A proposed stage from Fabric Intelligence's TaskPlan.
@@ -50,8 +50,16 @@ mod tests {
     #[test]
     fn sequential_plan_builds_valid_dag() {
         let stages = vec![
-            ProposedStage { capability: "research".into(), prompt: "search".into(), depends_on: vec![] },
-            ProposedStage { capability: "summarization".into(), prompt: "summarize".into(), depends_on: vec!["research".into()] },
+            ProposedStage {
+                capability: "research".into(),
+                prompt: "search".into(),
+                depends_on: vec![],
+            },
+            ProposedStage {
+                capability: "summarization".into(),
+                prompt: "summarize".into(),
+                depends_on: vec!["research".into()],
+            },
         ];
         let dag = task_plan_to_dag("wf1", "test", &stages).unwrap();
         assert_eq!(dag.stages.len(), 2);
@@ -60,9 +68,21 @@ mod tests {
     #[test]
     fn parallel_plan_builds_fan_out() {
         let stages = vec![
-            ProposedStage { capability: "a".into(), prompt: "p".into(), depends_on: vec![] },
-            ProposedStage { capability: "b".into(), prompt: "p".into(), depends_on: vec![] },
-            ProposedStage { capability: "synth".into(), prompt: "s".into(), depends_on: vec!["a".into(), "b".into()] },
+            ProposedStage {
+                capability: "a".into(),
+                prompt: "p".into(),
+                depends_on: vec![],
+            },
+            ProposedStage {
+                capability: "b".into(),
+                prompt: "p".into(),
+                depends_on: vec![],
+            },
+            ProposedStage {
+                capability: "synth".into(),
+                prompt: "s".into(),
+                depends_on: vec!["a".into(), "b".into()],
+            },
         ];
         let dag = task_plan_to_dag("wf2", "fan-out", &stages).unwrap();
         assert_eq!(dag.stages.len(), 3);

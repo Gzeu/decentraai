@@ -27,7 +27,7 @@ use decentraai_agents::evidence::{
 use crate::agent_memory::MemoryStore;
 use crate::compute::ComputeManager;
 use crate::embedding::EmbeddingClient;
-use crate::knowledge_runtime::{KnowledgeRuntime, KNOWLEDGE_MEMORY_SCOPE};
+use crate::knowledge_runtime::{KNOWLEDGE_MEMORY_SCOPE, KnowledgeRuntime};
 
 /// Maximum number of memory entries indexed per scope on one sync (bounded
 /// index; the store keeps the full history).
@@ -110,7 +110,11 @@ impl EvidenceManager {
     /// Syncs the compute manager's real execution history (idempotent on
     /// request id). Best-effort: never fails the caller.
     pub fn sync_from_compute(&self, compute: &ComputeManager) {
-        for plan in compute.executions().into_iter().take(MAX_EXECUTIONS_PER_SYNC) {
+        for plan in compute
+            .executions()
+            .into_iter()
+            .take(MAX_EXECUTIONS_PER_SYNC)
+        {
             self.record_execution(&plan);
         }
     }
@@ -300,9 +304,7 @@ mod tests {
     #[test]
     fn sync_from_knowledge_indexes_receipts_and_decisions() {
         let mgr = manager();
-        let compensation = Arc::new(Mutex::new(
-            CompensationLedger::default(),
-        ));
+        let compensation = Arc::new(Mutex::new(CompensationLedger::default()));
         let knowledge = KnowledgeRuntime::new(compensation, "peer-local", None).unwrap();
         knowledge
             .record_receipt(&receipt("e1", 1000), &Default::default())

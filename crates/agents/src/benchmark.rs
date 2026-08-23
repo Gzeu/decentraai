@@ -76,7 +76,11 @@ pub struct BenchmarkTask {
 
 impl BenchmarkTask {
     /// A task with a gold answer.
-    pub fn new(task_id: impl Into<String>, prompt: impl Into<String>, gold: impl Into<String>) -> Self {
+    pub fn new(
+        task_id: impl Into<String>,
+        prompt: impl Into<String>,
+        gold: impl Into<String>,
+    ) -> Self {
         Self {
             task_id: task_id.into(),
             prompt: prompt.into(),
@@ -222,7 +226,9 @@ pub fn grade_answer(output: &str, gold: Option<&str>) -> BenchmarkVerdict {
 pub fn aggregate(mode: BenchmarkMode, runs: &[BenchmarkRun]) -> ModeAggregate {
     let graded: Vec<&BenchmarkRun> = runs
         .iter()
-        .filter(|r| r.verdict == BenchmarkVerdict::Correct || r.verdict == BenchmarkVerdict::Incorrect)
+        .filter(|r| {
+            r.verdict == BenchmarkVerdict::Correct || r.verdict == BenchmarkVerdict::Incorrect
+        })
         .collect();
     let correct = graded
         .iter()
@@ -253,16 +259,18 @@ pub fn aggregate(mode: BenchmarkMode, runs: &[BenchmarkRun]) -> ModeAggregate {
 /// Answers the lab's headline question over the three modes' runs. A run
 /// belongs to its `mode` field; runs are split deterministically.
 pub fn compare_modes(all_runs: &[BenchmarkRun]) -> ModeComparison {
-    let single = aggregate(BenchmarkMode::Single, &by_mode(all_runs, BenchmarkMode::Single));
+    let single = aggregate(
+        BenchmarkMode::Single,
+        &by_mode(all_runs, BenchmarkMode::Single),
+    );
     let rag = aggregate(BenchmarkMode::Rag, &by_mode(all_runs, BenchmarkMode::Rag));
     let collective = aggregate(
         BenchmarkMode::Collective,
         &by_mode(all_runs, BenchmarkMode::Collective),
     );
     let delta = collective.accuracy - single.accuracy;
-    let meaningful = collective.graded >= MIN_SAMPLES
-        && single.graded >= MIN_SAMPLES
-        && delta >= MIN_MARGIN;
+    let meaningful =
+        collective.graded >= MIN_SAMPLES && single.graded >= MIN_SAMPLES && delta >= MIN_MARGIN;
     let reasoning = if meaningful {
         format!(
             "collective {:.0}% > single {:.0}% (+{:.0}pp) on {} vs {} graded runs",
@@ -319,7 +327,9 @@ pub fn paired_compare(all_runs: &[BenchmarkRun]) -> ModeComparison {
         }
         match run.mode {
             BenchmarkMode::Single => {
-                single_votes.entry(run.task_id.clone()).or_insert(run.verdict);
+                single_votes
+                    .entry(run.task_id.clone())
+                    .or_insert(run.verdict);
             }
             BenchmarkMode::Collective => {
                 collective_votes
@@ -342,8 +352,16 @@ pub fn paired_compare(all_runs: &[BenchmarkRun]) -> ModeComparison {
         .iter()
         .filter(|k| collective_votes.get(k.as_str()) == Some(&BenchmarkVerdict::Correct))
         .count();
-    let s_acc = if n == 0 { 0.0 } else { s_correct as f64 / n as f64 };
-    let c_acc = if n == 0 { 0.0 } else { c_correct as f64 / n as f64 };
+    let s_acc = if n == 0 {
+        0.0
+    } else {
+        s_correct as f64 / n as f64
+    };
+    let c_acc = if n == 0 {
+        0.0
+    } else {
+        c_correct as f64 / n as f64
+    };
     let delta = c_acc - s_acc;
     let meaningful = n >= MIN_SAMPLES && delta >= MIN_MARGIN;
     let reasoning = if meaningful {
@@ -466,7 +484,13 @@ impl BenchmarkRegistry {
 mod tests {
     use super::*;
 
-    fn run(id: &str, task: &str, mode: BenchmarkMode, output: &str, gold: Option<&str>) -> BenchmarkRun {
+    fn run(
+        id: &str,
+        task: &str,
+        mode: BenchmarkMode,
+        output: &str,
+        gold: Option<&str>,
+    ) -> BenchmarkRun {
         BenchmarkRun {
             run_id: id.into(),
             task_id: task.into(),
@@ -491,7 +515,10 @@ mod tests {
             BenchmarkVerdict::Correct
         );
         assert_eq!(grade_answer("43", Some("42")), BenchmarkVerdict::Incorrect);
-        assert_eq!(grade_answer("I don't know", Some("42")), BenchmarkVerdict::Incorrect);
+        assert_eq!(
+            grade_answer("I don't know", Some("42")),
+            BenchmarkVerdict::Incorrect
+        );
         // No gold → honest Abstained, never guessed.
         assert_eq!(grade_answer("anything", None), BenchmarkVerdict::Abstained);
         // Empty output → Abstained.
@@ -524,8 +551,20 @@ mod tests {
         for i in 0..6 {
             let task = format!("t{i}");
             let gold = Some("g");
-            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, if i < 3 { "g" } else { "x" }, gold));
-            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, if i < 5 { "g" } else { "x" }, gold));
+            registry.add_run(run(
+                &format!("A{i}"),
+                &task,
+                BenchmarkMode::Single,
+                if i < 3 { "g" } else { "x" },
+                gold,
+            ));
+            registry.add_run(run(
+                &format!("C{i}"),
+                &task,
+                BenchmarkMode::Collective,
+                if i < 5 { "g" } else { "x" },
+                gold,
+            ));
         }
         let cmp = registry.comparison();
         assert!(cmp.collective_beats_single);
@@ -543,8 +582,20 @@ mod tests {
         for i in 0..6 {
             let task = format!("t{i}");
             let gold = Some("g");
-            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, "g", gold));
-            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, "g", gold));
+            registry.add_run(run(
+                &format!("A{i}"),
+                &task,
+                BenchmarkMode::Single,
+                "g",
+                gold,
+            ));
+            registry.add_run(run(
+                &format!("C{i}"),
+                &task,
+                BenchmarkMode::Collective,
+                "g",
+                gold,
+            ));
         }
         let cmp = registry.comparison();
         assert!(!cmp.collective_beats_single);
@@ -569,14 +620,32 @@ mod tests {
         for i in 0..3 {
             let task = format!("easy{i}");
             let gold = Some("g");
-            registry.add_run(run(&format!("A{i}"), &task, BenchmarkMode::Single, "g", gold));
-            registry.add_run(run(&format!("C{i}"), &task, BenchmarkMode::Collective, "g", gold));
+            registry.add_run(run(
+                &format!("A{i}"),
+                &task,
+                BenchmarkMode::Single,
+                "g",
+                gold,
+            ));
+            registry.add_run(run(
+                &format!("C{i}"),
+                &task,
+                BenchmarkMode::Collective,
+                "g",
+                gold,
+            ));
         }
         for i in 0..3 {
             let task = format!("hard{i}");
             let gold = Some("g");
             // single-only hard tasks, all wrong — must NOT count against single
-            registry.add_run(run(&format!("Ah{i}"), &task, BenchmarkMode::Single, "x", gold));
+            registry.add_run(run(
+                &format!("Ah{i}"),
+                &task,
+                BenchmarkMode::Single,
+                "x",
+                gold,
+            ));
         }
         let cmp = registry.comparison();
         // shared = 3 easy tasks: both 100% → no margin claim.

@@ -86,11 +86,16 @@ async fn executor_runs_a_real_tool_call_round_trip() {
     )]);
 
     let mut task = AgentTask::new("t1");
-    task.required_workload = Some(AgentWorkloadRequirement::from(
-        WorkloadRequirements::new("m-default".into(), 256, 0),
-    ));
+    task.required_workload = Some(AgentWorkloadRequirement::from(WorkloadRequirements::new(
+        "m-default".into(),
+        256,
+        0,
+    )));
     let out = executor
-        .execute(&task, &serde_json::json!({"prompt": "How do people feel about this?"}))
+        .execute(
+            &task,
+            &serde_json::json!({"prompt": "How do people feel about this?"}),
+        )
         .await
         .unwrap();
 

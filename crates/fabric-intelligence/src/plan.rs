@@ -122,11 +122,10 @@ impl TaskPlan {
                 .unwrap_or(rest.trim_end())
                 .trim_end()
         });
-        let raw: RawPlan = serde_json::from_str(body)
-            .map_err(|e| match e.classify() {
-                serde_json::error::Category::Syntax => PlanError::NotJson(e.to_string()),
-                _ => PlanError::SchemaMismatch(e.to_string()),
-            })?;
+        let raw: RawPlan = serde_json::from_str(body).map_err(|e| match e.classify() {
+            serde_json::error::Category::Syntax => PlanError::NotJson(e.to_string()),
+            _ => PlanError::SchemaMismatch(e.to_string()),
+        })?;
 
         let intent = raw.intent.trim().to_string();
         if intent.is_empty() || raw.capabilities.is_empty() {
@@ -256,7 +255,12 @@ mod tests {
 
     #[test]
     fn rejects_empty_and_oversized_plans() {
-        assert!(matches!(TaskPlan::parse("{\"intent\":\"\",\"capabilities\":[{\"name\":\"ocr\"}],\"workflow\":[],\"confidence\":0}"), Err(PlanError::EmptyPlan)));
+        assert!(matches!(
+            TaskPlan::parse(
+                "{\"intent\":\"\",\"capabilities\":[{\"name\":\"ocr\"}],\"workflow\":[],\"confidence\":0}"
+            ),
+            Err(PlanError::EmptyPlan)
+        ));
 
         let caps_json = (0..17)
             .map(|_| "{\"name\":\"ocr\"}".to_string())
@@ -265,7 +269,10 @@ mod tests {
         let many_caps = format!(
             "{{\"intent\":\"x\",\"capabilities\":[{caps_json}],\"workflow\":[],\"confidence\":1}}"
         );
-        assert!(matches!(TaskPlan::parse(&many_caps), Err(PlanError::TooLarge(_))));
+        assert!(matches!(
+            TaskPlan::parse(&many_caps),
+            Err(PlanError::TooLarge(_))
+        ));
     }
 
     #[test]

@@ -128,7 +128,8 @@ impl std::str::FromStr for CapabilityKind {
     type Err = ();
     /// Parse a capability from its snake_case serialized form (e.g. `ocr`,
     /// `text_generation`, `tool_calling`). Unknown strings error.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {        Ok(match s {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "chat" => CapabilityKind::Chat,
             "text_generation" => CapabilityKind::TextGeneration,
             "reasoning" => CapabilityKind::Reasoning,

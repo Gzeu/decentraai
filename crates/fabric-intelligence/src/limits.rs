@@ -36,7 +36,9 @@ impl ArtifactLimit {
     pub fn allows(&self, size_bytes: u64) -> bool {
         // The hard floor wins even if config tries to go above 2 GiB? No:
         // operators own their nodes. But zero/nonsense limits fail closed.
-        self.max_bytes > 0 && size_bytes <= self.max_bytes && size_bytes <= MAX_ARTIFACT_BYTES.max(self.max_bytes)
+        self.max_bytes > 0
+            && size_bytes <= self.max_bytes
+            && size_bytes <= MAX_ARTIFACT_BYTES.max(self.max_bytes)
     }
 
     /// Whether the artifact fits comfortably in the recommended envelope.

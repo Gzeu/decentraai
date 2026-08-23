@@ -12,18 +12,14 @@ use decentraai_agents::memory::{
 };
 use decentraai_distributed::agent_memory::{MemoryStore, sync_entry_to_memory};
 use decentraai_identity::Identity;
-use decentraai_p2p::{
-    DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode,
-};
+use decentraai_p2p::{DEFAULT_MAX_CHUNK_MESSAGE_BYTES, DEFAULT_MAX_MESSAGE_BYTES, P2PNode};
 use decentraai_protocol::memory_sync::{
     MemorySyncRequest, MemorySyncResponse, SyncEntryMeta, SyncMemoryEntry,
 };
 use std::sync::Arc;
 
 fn public_remote_scope(name: &str, owner: &str) -> decentraai_agents::memory::MemoryScope {
-    let policy = MemoryPolicy::default()
-        .public()
-        .with_remote_write();
+    let policy = MemoryPolicy::default().public().with_remote_write();
     decentraai_agents::memory::MemoryScope::new(name, owner, MemoryLevel::Fabric)
         .with_policy(policy)
 }
@@ -51,14 +47,24 @@ fn wire_entry(id: &str, content: &str, subject: &str, status: &str) -> SyncMemor
 async fn memory_sync_survives_the_wire_and_respects_trust_boundaries() -> Result<()> {
     // Receiver node: owns the store + handler.
     let store = Arc::new(MemoryStore::open(std::path::Path::new(":memory:")).unwrap());
-    store.register_scope(&public_remote_scope("team.knowledge", "governor")).unwrap();
+    store
+        .register_scope(&public_remote_scope("team.knowledge", "governor"))
+        .unwrap();
     // Pre-existing claim on subject q:x so the batch produces a conflict link
     // and an exact duplicate.
-    let mut local = MemoryEntry::new("local1", "team.knowledge", "governor", "node-b", "shared lesson");
+    let mut local = MemoryEntry::new(
+        "local1",
+        "team.knowledge",
+        "governor",
+        "node-b",
+        "shared lesson",
+    );
     local.created_at_ms = 100;
     local.meta.subject_key = "q:x".to_string();
     assert_eq!(
-        store.write_checked("team.knowledge", &local, "governor", true, false, false).unwrap(),
+        store
+            .write_checked("team.knowledge", &local, "governor", true, false, false)
+            .unwrap(),
         WriteOutcome::Stored
     );
 
@@ -94,7 +100,14 @@ async fn memory_sync_survives_the_wire_and_respects_trust_boundaries() -> Result
             let mut rejected = 0u32;
             for se in req.entries {
                 let entry = sync_entry_to_memory(se, &req.scope);
-                match store_for_handler.write_checked(&req.scope, &entry, "memory-sync", false, false, false) {
+                match store_for_handler.write_checked(
+                    &req.scope,
+                    &entry,
+                    "memory-sync",
+                    false,
+                    false,
+                    false,
+                ) {
                     Ok(WriteOutcome::Stored) => accepted += 1,
                     Ok(WriteOutcome::Duplicate { .. }) => duplicates += 1,
                     Ok(WriteOutcome::CompetingClaim { .. }) => {
@@ -152,7 +165,10 @@ async fn memory_sync_survives_the_wire_and_respects_trust_boundaries() -> Result
     // Connection settling retry (same discipline as e2e_transfer).
     let mut response: Option<MemorySyncResponse> = None;
     for _ in 0..20 {
-        match sender.request(receiver.local_peer_id(), bytes.clone()).await {
+        match sender
+            .request(receiver.local_peer_id(), bytes.clone())
+            .await
+        {
             Ok(reply) => {
                 response = serde_json::from_slice(&reply).ok();
                 if response.is_some() {
@@ -171,7 +187,11 @@ async fn memory_sync_survives_the_wire_and_respects_trust_boundaries() -> Result
     // Trust boundary: imported claims are Candidate locally, provenance kept.
     let seen = store.read("team.knowledge", "governor", false).unwrap();
     let comp = seen.iter().find(|e| e.entry_id == "comp").unwrap();
-    assert_eq!(comp.meta.status, MemoryStatus::Candidate, "remote 'trusted' downgraded");
+    assert_eq!(
+        comp.meta.status,
+        MemoryStatus::Candidate,
+        "remote 'trusted' downgraded"
+    );
     assert_eq!(comp.author_agent, "remote-researcher");
     let detail = comp.meta.detail.as_ref().expect("provenance preserved");
     assert_eq!(detail.source, "execution");
@@ -217,7 +237,10 @@ async fn node_without_handler_declines_explicitly() -> Result<()> {
     let bytes = decentraai_protocol::serialize_message(&request).unwrap();
     let mut resp: Option<MemorySyncResponse> = None;
     for _ in 0..20 {
-        match sender.request(receiver.local_peer_id(), bytes.clone()).await {
+        match sender
+            .request(receiver.local_peer_id(), bytes.clone())
+            .await
+        {
             Ok(reply) => {
                 resp = serde_json::from_slice(&reply).ok();
                 if resp.is_some() {

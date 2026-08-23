@@ -328,9 +328,10 @@ mod tests {
 
     #[test]
     fn verified_execution_dominates() {
-        let k = obj("k2", "model output passed schema check").with_evidence(vec![
-            Evidence::new(EvidenceKind::VerifiedExecution, "execution verified"),
-        ]);
+        let k = obj("k2", "model output passed schema check").with_evidence(vec![Evidence::new(
+            EvidenceKind::VerifiedExecution,
+            "execution verified",
+        )]);
         let c = evidence_confidence(&k);
         assert!((c - WEIGHT_VERIFIED_EXECUTION).abs() < 1e-6);
         assert_eq!(KnowledgeConfidence::of(c), KnowledgeConfidence::High);
@@ -356,27 +357,30 @@ mod tests {
     fn reputation_is_capped_and_never_dominates() {
         // A famous author with only reputation evidence stays Low — social
         // proof alone cannot reach Medium.
-        let famous = obj("k5", "fact").with_author_reputation(1.0).with_evidence(vec![
-            Evidence::new(EvidenceKind::ReputationWeighted, "author has great reputation"),
-        ]);
+        let famous = obj("k5", "fact")
+            .with_author_reputation(1.0)
+            .with_evidence(vec![Evidence::new(
+                EvidenceKind::ReputationWeighted,
+                "author has great reputation",
+            )]);
         let c = evidence_confidence(&famous);
         assert!((c - WEIGHT_REPUTATION).abs() < 1e-6);
         assert_eq!(KnowledgeConfidence::of(c), KnowledgeConfidence::Low);
 
         // Two reputation items still count once (capped).
-        let double = obj("k6", "fact").with_author_reputation(1.0).with_evidence(vec![
-            Evidence::new(EvidenceKind::ReputationWeighted, "a"),
-            Evidence::new(EvidenceKind::ReputationWeighted, "b"),
-        ]);
+        let double = obj("k6", "fact")
+            .with_author_reputation(1.0)
+            .with_evidence(vec![
+                Evidence::new(EvidenceKind::ReputationWeighted, "a"),
+                Evidence::new(EvidenceKind::ReputationWeighted, "b"),
+            ]);
         assert!((evidence_confidence(&double) - c).abs() < 1e-6);
     }
 
     #[test]
     fn synthetic_evidence_is_weakest() {
-        let synthetic = obj("k7", "counted row").with_evidence(vec![Evidence::new(
-            EvidenceKind::Synthetic,
-            "ledger row",
-        )]);
+        let synthetic = obj("k7", "counted row")
+            .with_evidence(vec![Evidence::new(EvidenceKind::Synthetic, "ledger row")]);
         let verified = obj("k8", "verified fact").with_evidence(vec![Evidence::new(
             EvidenceKind::VerifiedExecution,
             "execution verified",
@@ -424,13 +428,10 @@ mod tests {
     fn filter_by_confidence_only_returns_evidenced() {
         let mut reg = KnowledgeRegistry::new();
         reg.add(obj("plain", "no evidence")).unwrap();
-        reg.add(
-            obj("verified", "checked")
-                .with_evidence(vec![Evidence::new(
-                    EvidenceKind::VerifiedExecution,
-                    "execution verified",
-                )]),
-        )
+        reg.add(obj("verified", "checked").with_evidence(vec![Evidence::new(
+            EvidenceKind::VerifiedExecution,
+            "execution verified",
+        )]))
         .unwrap();
         let solid = reg.with_confidence_at_least(0.5);
         assert_eq!(solid.len(), 1);

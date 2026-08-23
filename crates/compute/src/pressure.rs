@@ -142,12 +142,23 @@ pub fn evaluate(
             let fire = score >= 0.35;
             (
                 fire,
-                if fire { AssistState::AssistRequested } else { AssistState::Normal },
+                if fire {
+                    AssistState::AssistRequested
+                } else {
+                    AssistState::Normal
+                },
             )
         }
         AssistState::AssistRequested => {
             let still = score > 0.20;
-            (still, if still { AssistState::AssistRequested } else { AssistState::Normal })
+            (
+                still,
+                if still {
+                    AssistState::AssistRequested
+                } else {
+                    AssistState::Normal
+                },
+            )
         }
     };
 
@@ -185,7 +196,11 @@ mod tests {
 
     #[test]
     fn quiet_node_stays_normal() {
-        let (_, d) = evaluate(&signals(10.0, 0, 50), &PressureThresholds::default(), AssistState::Normal);
+        let (_, d) = evaluate(
+            &signals(10.0, 0, 50),
+            &PressureThresholds::default(),
+            AssistState::Normal,
+        );
         assert!(!d.should_assist);
         assert!(d.reasons.is_empty(), "no fabricated reasons");
     }
@@ -235,7 +250,10 @@ mod tests {
         sig.missing_local_capability = true;
         let (_, d) = evaluate(&sig, &t_default(), AssistState::Normal);
         // 0.35 reaches the entry threshold alone: capability gap is actionable.
-        assert!(d.should_assist, "capability gap 0.35 fires at the calibrated entry");
+        assert!(
+            d.should_assist,
+            "capability gap 0.35 fires at the calibrated entry"
+        );
         assert!((d.score - 0.35).abs() < f32::EPSILON);
     }
 

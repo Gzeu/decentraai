@@ -587,7 +587,10 @@ async fn manifest_announcement_fires_callback() {
     let (peer, name, signed_ok) = seen.expect("announcement callback must fire");
     assert_eq!(peer, server.local_peer_id());
     assert_eq!(name, "model.gguf");
-    assert!(!signed_ok, "unsigned announcement must forward signed_ok=false");
+    assert!(
+        !signed_ok,
+        "unsigned announcement must forward signed_ok=false"
+    );
 }
 
 #[tokio::test]

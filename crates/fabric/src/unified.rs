@@ -99,7 +99,9 @@ impl UnifiedSelector {
                 .iter()
                 .map(|f| (f.peer_id.clone(), true, f.kv))
                 .collect::<Vec<_>>(),
-            eligible.iter().any(|f| f.capabilities.prefill_decode_separation),
+            eligible
+                .iter()
+                .any(|f| f.capabilities.prefill_decode_separation),
         );
 
         // Score + rank (shared pure primitive — no float divergence possible).
@@ -276,8 +278,16 @@ pub fn shadow_compare(
     });
 
     // Scoring provenance of the chosen worker (perf_measured marker).
-    let le_prov = legacy.ranked.first().map(|c| c.perf_measured).unwrap_or(false);
-    let u_prov = unified.ranked.first().map(|c| c.perf_measured).unwrap_or(false);
+    let le_prov = legacy
+        .ranked
+        .first()
+        .map(|c| c.perf_measured)
+        .unwrap_or(false);
+    let u_prov = unified
+        .ranked
+        .first()
+        .map(|c| c.perf_measured)
+        .unwrap_or(false);
     fields.push(ShadowField {
         field: "provenance".into(),
         verdict: if le_prov == u_prov { "match" } else { "diff" }.into(),
@@ -544,35 +554,55 @@ mod tests {
         continuation.context.is_continuation = true;
         continuation.context.prefix_resident_on = Some("host".into());
         let mut host = worker_facts("host", 150, 80, 20);
-        host.kv = KVCacheState::Partial { used: 5, capacity: 4096 };
+        host.kv = KVCacheState::Partial {
+            used: 5,
+            capacity: 4096,
+        };
 
         // A priority scenario.
         let mut urgent = req();
         urgent.priority = 255;
 
         let scenarios: Vec<(&str, RequestFacts, Vec<WorkerFacts>)> = vec![
-            ("fastest", req(), vec![
-                worker_facts("slow", 40, 400, 90),
-                worker_facts("fast", 180, 50, 10),
-            ]),
+            (
+                "fastest",
+                req(),
+                vec![
+                    worker_facts("slow", 40, 400, 90),
+                    worker_facts("fast", 180, 50, 10),
+                ],
+            ),
             ("single", req(), vec![worker_facts("only", 150, 60, 20)]),
-            ("three", req(), vec![
-                worker_facts("a", 180, 50, 10),
-                worker_facts("b", 150, 60, 20),
-                worker_facts("c", 120, 80, 30),
-            ]),
-            ("network", req(), vec![
-                worker_facts("far", 150, 40, 10),
-                worker_facts("near", 150, 40, 10),
-            ]),
-            ("continuation", continuation, vec![
-                worker_facts("fast", 180, 50, 10),
-                host,
-            ]),
-            ("urgent", urgent, vec![
-                worker_facts("fast", 180, 50, 10),
-                worker_facts("slow", 40, 400, 90),
-            ]),
+            (
+                "three",
+                req(),
+                vec![
+                    worker_facts("a", 180, 50, 10),
+                    worker_facts("b", 150, 60, 20),
+                    worker_facts("c", 120, 80, 30),
+                ],
+            ),
+            (
+                "network",
+                req(),
+                vec![
+                    worker_facts("far", 150, 40, 10),
+                    worker_facts("near", 150, 40, 10),
+                ],
+            ),
+            (
+                "continuation",
+                continuation,
+                vec![worker_facts("fast", 180, 50, 10), host],
+            ),
+            (
+                "urgent",
+                urgent,
+                vec![
+                    worker_facts("fast", 180, 50, 10),
+                    worker_facts("slow", 40, 400, 90),
+                ],
+            ),
         ];
 
         let cases: Vec<GoldenCase> = scenarios
@@ -622,11 +652,15 @@ mod tests {
 
         let scenarios: Vec<(&str, RequestFacts, Vec<WorkerFacts>)> = vec![
             // 0 eligible workers (all filtered).
-            ("zero_eligible", req(), vec![{
-                let mut w = worker_facts("x", 200, 20, 5);
-                w.serves_model = false;
-                w
-            }]),
+            (
+                "zero_eligible",
+                req(),
+                vec![{
+                    let mut w = worker_facts("x", 200, 20, 5);
+                    w.serves_model = false;
+                    w
+                }],
+            ),
             // 0 candidates at all.
             ("no_candidates", req(), vec![]),
             // Single candidate.
@@ -634,93 +668,145 @@ mod tests {
             // Equal scores -> PeerId asc tie-break.
             ("peerid_tiebreak", req(), vec![equal_a, equal_b, equal_c]),
             // Trust gate.
-            ("trust_gate", req(), vec![{
-                let mut w = worker_facts("untrusted", 200, 20, 5);
-                w.trusted = false;
-                w
-            }, worker_facts("trusted", 150, 60, 20)]),
+            (
+                "trust_gate",
+                req(),
+                vec![
+                    {
+                        let mut w = worker_facts("untrusted", 200, 20, 5);
+                        w.trusted = false;
+                        w
+                    },
+                    worker_facts("trusted", 150, 60, 20),
+                ],
+            ),
             // Health gate.
-            ("health_gate", req(), vec![{
-                let mut w = worker_facts("sick", 200, 20, 5);
-                w.healthy = false;
-                w
-            }, worker_facts("healthy", 150, 60, 20)]),
+            (
+                "health_gate",
+                req(),
+                vec![
+                    {
+                        let mut w = worker_facts("sick", 200, 20, 5);
+                        w.healthy = false;
+                        w
+                    },
+                    worker_facts("healthy", 150, 60, 20),
+                ],
+            ),
             // Model gate.
-            ("model_gate", req(), vec![{
-                let mut w = worker_facts("other_model", 200, 20, 5);
-                w.serves_model = false;
-                w
-            }, worker_facts("serves", 150, 60, 20)]),
+            (
+                "model_gate",
+                req(),
+                vec![
+                    {
+                        let mut w = worker_facts("other_model", 200, 20, 5);
+                        w.serves_model = false;
+                        w
+                    },
+                    worker_facts("serves", 150, 60, 20),
+                ],
+            ),
             // KV hit: prefix resident on a specific worker.
-            ("kv_hit", {
-                let mut r = req();
-                r.context.is_continuation = true;
-                r.context.prefix_resident_on = Some("kvhost".into());
-                r
-            }, vec![
-                worker_facts("fast", 180, 50, 10),
+            (
+                "kv_hit",
                 {
-                    let mut w = worker_facts("kvhost", 150, 80, 20);
-                    w.kv = KVCacheState::Partial { used: 100, capacity: 4096 };
-                    w
+                    let mut r = req();
+                    r.context.is_continuation = true;
+                    r.context.prefix_resident_on = Some("kvhost".into());
+                    r
                 },
-            ]),
+                vec![worker_facts("fast", 180, 50, 10), {
+                    let mut w = worker_facts("kvhost", 150, 80, 20);
+                    w.kv = KVCacheState::Partial {
+                        used: 100,
+                        capacity: 4096,
+                    };
+                    w
+                }],
+            ),
             // KV miss: continuation whose prefix host is NOT among candidates
             // (stale hint) — must degrade to plain scoring, deterministically.
-            ("kv_miss_stale_hint", {
-                let mut r = req();
-                r.context.is_continuation = true;
-                r.context.prefix_resident_on = Some("gone".into());
-                r
-            }, vec![
-                worker_facts("fast", 180, 50, 10),
-                worker_facts("slow", 40, 400, 90),
-            ]),
+            (
+                "kv_miss_stale_hint",
+                {
+                    let mut r = req();
+                    r.context.is_continuation = true;
+                    r.context.prefix_resident_on = Some("gone".into());
+                    r
+                },
+                vec![
+                    worker_facts("fast", 180, 50, 10),
+                    worker_facts("slow", 40, 400, 90),
+                ],
+            ),
             // Network reachability: equal perf, different link cost.
-            ("network_reach", req(), vec![
-                worker_facts("far", 150, 40, 10),
-                worker_facts("near", 150, 40, 10),
-            ]),
+            (
+                "network_reach",
+                req(),
+                vec![
+                    worker_facts("far", 150, 40, 10),
+                    worker_facts("near", 150, 40, 10),
+                ],
+            ),
             // Priority: urgent request amplifies latency/queue terms.
-            ("priority_high", {
-                let mut r = req();
-                r.priority = 255;
-                r
-            }, vec![
-                worker_facts("fast", 180, 50, 10),
-                worker_facts("slow", 40, 400, 90),
-            ]),
+            (
+                "priority_high",
+                {
+                    let mut r = req();
+                    r.priority = 255;
+                    r
+                },
+                vec![
+                    worker_facts("fast", 180, 50, 10),
+                    worker_facts("slow", 40, 400, 90),
+                ],
+            ),
             // Capacity exactly at the limit (headroom == 1.0).
             ("capacity_at_limit", req(), vec![at_limit]),
             // Capacity under the request (headroom < 1.0, still eligible —
             // capacity is a score term, not a gate, at this layer).
-            ("capacity_under", req(), vec![under, {
-                let mut roomy = worker_facts("roomy", 150, 60, 20);
-                roomy.available_ram_mb = 8192;
-                roomy
-            }]),
+            (
+                "capacity_under",
+                req(),
+                vec![under, {
+                    let mut roomy = worker_facts("roomy", 150, 60, 20);
+                    roomy.available_ram_mb = 8192;
+                    roomy
+                }],
+            ),
             // Multi-gate failure: one candidate fails ALL gates simultaneously.
-            ("multi_gate_failure", req(), vec![multi_fail, worker_facts("ok", 150, 60, 20)]),
+            (
+                "multi_gate_failure",
+                req(),
+                vec![multi_fail, worker_facts("ok", 150, 60, 20)],
+            ),
             // Combination: trust + KV + priority together.
-            ("combo_trust_kv_priority", {
-                let mut r = req();
-                r.context.is_continuation = true;
-                r.context.prefix_resident_on = Some("kvhost".into());
-                r.priority = 128;
-                r
-            }, vec![
+            (
+                "combo_trust_kv_priority",
                 {
-                    let mut w = worker_facts("untrusted", 200, 20, 5);
-                    w.trusted = false;
-                    w
+                    let mut r = req();
+                    r.context.is_continuation = true;
+                    r.context.prefix_resident_on = Some("kvhost".into());
+                    r.priority = 128;
+                    r
                 },
-                {
-                    let mut w = worker_facts("kvhost", 150, 80, 20);
-                    w.kv = KVCacheState::Partial { used: 50, capacity: 4096 };
-                    w
-                },
-                worker_facts("plain", 170, 55, 15),
-            ]),
+                vec![
+                    {
+                        let mut w = worker_facts("untrusted", 200, 20, 5);
+                        w.trusted = false;
+                        w
+                    },
+                    {
+                        let mut w = worker_facts("kvhost", 150, 80, 20);
+                        w.kv = KVCacheState::Partial {
+                            used: 50,
+                            capacity: 4096,
+                        };
+                        w
+                    },
+                    worker_facts("plain", 170, 55, 15),
+                ],
+            ),
         ];
 
         // The network_reach case needs link state; capture it with a planner
@@ -789,7 +875,10 @@ mod tests {
         let case = GoldenCase::capture(
             "local_peer_ranked_normally",
             &req(),
-            &[worker_facts("local-self", 200, 20, 5), worker_facts("remote", 150, 60, 20)],
+            &[
+                worker_facts("local-self", 200, 20, 5),
+                worker_facts("remote", 150, 60, 20),
+            ],
             &planner,
         );
         assert_eq!(case.golden.selected_worker.as_deref(), Some("local-self"));
@@ -805,7 +894,10 @@ mod tests {
         let case = GoldenCase::capture(
             "stale_kv_hint",
             &stale,
-            &[worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)],
+            &[
+                worker_facts("a", 180, 50, 10),
+                worker_facts("b", 150, 60, 20),
+            ],
             &planner,
         );
         assert_eq!(case.golden.selected_worker.as_deref(), Some("a"));
@@ -816,10 +908,16 @@ mod tests {
         // a RESERVATION-layer concern (reserve_worker re-validates gates); the
         // selection layer must stay deterministic on its inputs. Pin that the
         // selection for a candidate set is stable across repeated evaluation.
-        let ws = vec![worker_facts("a", 180, 50, 10), worker_facts("b", 150, 60, 20)];
+        let ws = vec![
+            worker_facts("a", 180, 50, 10),
+            worker_facts("b", 150, 60, 20),
+        ];
         let c1 = GoldenCase::capture("stability", &req(), &ws, &planner);
         let c2 = GoldenCase::capture("stability", &req(), &ws, &planner);
-        assert_eq!(c1.golden, c2.golden, "selection must be stable across evaluations");
+        assert_eq!(
+            c1.golden, c2.golden,
+            "selection must be stable across evaluations"
+        );
     }
 
     #[test]
@@ -845,10 +943,16 @@ mod tests {
             let sel = unified.select(&req(), &ws);
             // Live planner determinism.
             let again = GoldenCase::capture("det", &req(), &ws, &planner);
-            assert_eq!(golden.golden, again.golden, "live planner must be deterministic");
+            assert_eq!(
+                golden.golden, again.golden,
+                "live planner must be deterministic"
+            );
             // Unified selector determinism.
             let sel_again = unified.select(&req(), &ws);
-            assert_eq!(sel.trace, sel_again.trace, "unified selector must be deterministic");
+            assert_eq!(
+                sel.trace, sel_again.trace,
+                "unified selector must be deterministic"
+            );
             // And the two must agree.
             let report = GoldenSuite::run(std::slice::from_ref(&golden), &unified);
             assert!(report.equivalent, "{:?}", report.divergences);
@@ -906,7 +1010,12 @@ mod tests {
                 let idx = rng.below(workers.len() as u64 + 1) as usize;
                 r.context.prefix_resident_on = Some(format!("w{idx}-{case_no}"));
             }
-            cases.push(GoldenCase::capture(&format!("fuzz-{case_no}"), &r, &workers, &planner));
+            cases.push(GoldenCase::capture(
+                &format!("fuzz-{case_no}"),
+                &r,
+                &workers,
+                &planner,
+            ));
         }
 
         let report = GoldenSuite::run(&cases, &unified);
@@ -926,14 +1035,11 @@ mod tests {
         // byte-for-byte at the semantic level, so cases captured from real
         // fabric state can be persisted and replayed anywhere.
         let planner = ExecutionPlanner::default();
-        let ws = vec![
-            worker_facts("a", 180, 50, 10),
-            {
-                let mut w = worker_facts("b", 150, 60, 20);
-                w.trusted = false;
-                w
-            },
-        ];
+        let ws = vec![worker_facts("a", 180, 50, 10), {
+            let mut w = worker_facts("b", 150, 60, 20);
+            w.trusted = false;
+            w
+        }];
         let case = GoldenCase::capture("rt", &req(), &ws, &planner);
 
         let line = case.to_json_line().unwrap();
@@ -984,15 +1090,42 @@ mod tests {
         let selected = diff.fields.iter().find(|f| f.field == "selected").unwrap();
         assert_eq!(selected.verdict, "diff");
         // Eligible + rejected + provenance stay MATCH (not compared to nothing).
-        assert_eq!(diff.fields.iter().find(|f| f.field == "eligible").unwrap().verdict, "match");
-        assert_eq!(diff.fields.iter().find(|f| f.field == "rejected").unwrap().verdict, "match");
+        assert_eq!(
+            diff.fields
+                .iter()
+                .find(|f| f.field == "eligible")
+                .unwrap()
+                .verdict,
+            "match"
+        );
+        assert_eq!(
+            diff.fields
+                .iter()
+                .find(|f| f.field == "rejected")
+                .unwrap()
+                .verdict,
+            "match"
+        );
         // Reservation is always NOT-COMPARABLE, never a mismatch.
-        assert_eq!(diff.fields.iter().find(|f| f.field == "reservation").unwrap().verdict, "not_comparable");
+        assert_eq!(
+            diff.fields
+                .iter()
+                .find(|f| f.field == "reservation")
+                .unwrap()
+                .verdict,
+            "not_comparable"
+        );
 
         // Identical decisions -> agreement=true (with reservation nc).
         let same = shadow_compare("r1", &legacy, &legacy, 3);
-        assert!(same.agreement, "identical decisions agree (reservation excluded)");
-        assert_eq!(same.fields.iter().filter(|f| f.verdict == "match").count(), 5);
+        assert!(
+            same.agreement,
+            "identical decisions agree (reservation excluded)"
+        );
+        assert_eq!(
+            same.fields.iter().filter(|f| f.verdict == "match").count(),
+            5
+        );
     }
 
     fn candidate(id: &str) -> CandidateScore {

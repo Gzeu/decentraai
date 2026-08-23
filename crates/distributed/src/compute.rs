@@ -201,7 +201,11 @@ pub fn build_advertisement(
 ) -> ComputeAdvertisement {
     let (gpu_spec, free_vram_mib, gpu_temp, gpu_util) = match &gpu {
         GpuProbeStatus::Nvidia(info) => (
-            Some(GpuSpec::simple(&info.name, info.total_vram_mib * MIB / MIB, "nvidia")),
+            Some(GpuSpec::simple(
+                &info.name,
+                info.total_vram_mib * MIB / MIB,
+                "nvidia",
+            )),
             Some(info.free_vram_mib),
             Some(info.temperature_celsius),
             Some(info.utilization_percent),
@@ -323,10 +327,7 @@ pub struct ComputeManager {
     /// for the planner's `NetworkFacts.` `record_rtt_sample` pushes here; the
     /// derivation fills `LinkMetrics.jitter_us` / `packet_loss_percent`.
     link_history: std::sync::Mutex<
-        std::collections::BTreeMap<
-            PeerId,
-            std::collections::VecDeque<crate::probe::LinkSample>,
-        >,
+        std::collections::BTreeMap<PeerId, std::collections::VecDeque<crate::probe::LinkSample>>,
     >,
     /// Coordinator-side KV-cache / session accounting (M20): which worker
     /// holds each conversation's KV prefix and the honest per-worker KV
@@ -465,9 +466,7 @@ impl ComputeManager {
                 ),
             )),
             credits: std::sync::Arc::new(std::sync::Mutex::new(
-                decentraai_compute::CreditLedger::new(
-                    decentraai_compute::CreditPolicy::default(),
-                ),
+                decentraai_compute::CreditLedger::new(decentraai_compute::CreditPolicy::default()),
             )),
             contribution_state: std::sync::Mutex::new(
                 decentraai_compute::NodeContributionState::default(),
@@ -568,7 +567,9 @@ impl ComputeManager {
                 let mut ledger = self.credits.lock().unwrap();
                 ledger.restore(snap);
             }
-            Err(e) => tracing::warn!(error = %e, path = %path.display(), "corrupt credit snapshot; starting fresh"),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "corrupt credit snapshot; starting fresh")
+            }
         }
     }
 
@@ -582,7 +583,9 @@ impl ComputeManager {
                 let mut slot = self.contribution_state.lock().unwrap();
                 *slot = state;
             }
-            Err(e) => tracing::warn!(error = %e, path = %path.display(), "corrupt contribution snapshot; starting fresh"),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "corrupt contribution snapshot; starting fresh")
+            }
         }
     }
 
@@ -846,7 +849,10 @@ impl ComputeManager {
             return 0;
         };
         if trace.selected_worker.is_none() || trace.ranked.is_empty() {
-            tracing::warn!(request_id, "credit refused: selection trace has no eligible worker");
+            tracing::warn!(
+                request_id,
+                "credit refused: selection trace has no eligible worker"
+            );
             return 0;
         }
         // The credited worker must be the one the trace selected/reserved.
@@ -856,7 +862,10 @@ impl ComputeManager {
             .map(|w| w != peer.to_string())
             .unwrap_or(true)
         {
-            tracing::warn!(request_id, "credit refused: worker not the reserved worker in the trace");
+            tracing::warn!(
+                request_id,
+                "credit refused: worker not the reserved worker in the trace"
+            );
             return 0;
         }
         // Idempotent credit (ref_id = request_id) — replay/duplicate returns 0.
@@ -907,7 +916,10 @@ impl ComputeManager {
     /// so a receipt for a real worker credits from the same measured history
     /// the Workers view and tier suggestions reflect — never from a
     /// client-supplied value.
-    pub fn contribution_profile(&self, peer: &PeerId) -> Option<decentraai_compute::ContributionProfile> {
+    pub fn contribution_profile(
+        &self,
+        peer: &PeerId,
+    ) -> Option<decentraai_compute::ContributionProfile> {
         self.contribution
             .lock()
             .unwrap()
@@ -1125,13 +1137,11 @@ impl ComputeManager {
     /// [`decentraai_fabric::LinkMetrics`]. A meaningful RTT update also refreshes
     /// the graph's raw RTT/bandwidth as before.
     pub fn record_rtt_sample(&self, peer: &PeerId, rtt_us: u64, bandwidth_mbps: u32, lost: bool) {
-        use crate::probe::{derive_link_quality, LinkSample};
+        use crate::probe::{LinkSample, derive_link_quality};
         // 1. push the sample into the bounded per-peer window.
         {
             let mut history = self.link_history.lock().unwrap();
-            let window = history
-                .entry(*peer)
-                .or_default();
+            let window = history.entry(*peer).or_default();
             // Bound: keep at most `PROBE_WINDOW` newest samples per peer.
             if window.len() >= crate::probe::PROBE_WINDOW {
                 window.pop_front();
@@ -1414,11 +1424,13 @@ impl ComputeManager {
     /// Enables/disables shadow mode. Disabled by default; disableable at any
     /// time via configuration.
     pub fn set_shadow_enabled(&self, enabled: bool) {
-        self.shadow_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.shadow_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn shadow_enabled(&self) -> bool {
-        self.shadow_enabled.load(std::sync::atomic::Ordering::Relaxed)
+        self.shadow_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Runs the UnifiedSelector in parallel on the SAME request context the
@@ -1447,17 +1459,16 @@ impl ComputeManager {
         let latency_us = t0.elapsed().as_micros() as u32;
         match result {
             Ok(sel) => {
-                let diff = decentraai_fabric::shadow_compare(
-                    request_id,
-                    legacy,
-                    &sel.trace,
-                    latency_us,
-                );
+                let diff =
+                    decentraai_fabric::shadow_compare(request_id, legacy, &sel.trace, latency_us);
                 self.record_shadow(diff);
             }
             Err(_) => {
                 // Fail-closed: log + count, never propagate.
-                tracing::warn!(request_id, "unified-selector shadow run panicked; authoritative path unaffected");
+                tracing::warn!(
+                    request_id,
+                    "unified-selector shadow run panicked; authoritative path unaffected"
+                );
                 let mut m = self.shadow_metrics.lock().unwrap();
                 m.invocations += 1;
                 m.errors += 1;
@@ -1470,7 +1481,9 @@ impl ComputeManager {
         const MAX_SHADOW: usize = 128;
         let mut m = self.shadow_metrics.lock().unwrap();
         m.invocations += 1;
-        m.latency_us_sum = m.latency_us_sum.saturating_add(u64::from(diff.unified_latency_us));
+        m.latency_us_sum = m
+            .latency_us_sum
+            .saturating_add(u64::from(diff.unified_latency_us));
         if diff.agreement {
             m.agreements += 1;
         } else {
@@ -1781,7 +1794,7 @@ impl ComputeManager {
                 let cap = &adv.capability;
                 decentraai_fabric::WorkerFacts {
                     peer_id: adv.peer_id.to_string(),
-                trusted: scheduler.is_trusted(&adv.peer_id) || adv.peer_id == self.local_peer,
+                    trusted: scheduler.is_trusted(&adv.peer_id) || adv.peer_id == self.local_peer,
                     healthy: a.healthy(),
                     engine: decentraai_fabric::EngineKind::parse(&cap.engine),
                     tokens_per_second: a.tokens_per_second,
@@ -1956,7 +1969,12 @@ impl ComputeManager {
         // coordinator never schedules a remote request onto itself via P2P.
         let peer: libp2p::PeerId = match first.parse() {
             Ok(p) if p != self.local_peer => p,
-            _ => return self.select_pub_remote(req).await.map(|p| (result.plan, p, decision_trace)),
+            _ => {
+                return self
+                    .select_pub_remote(req)
+                    .await
+                    .map(|p| (result.plan, p, decision_trace));
+            }
         };
 
         let placement = self
@@ -1967,7 +1985,10 @@ impl ComputeManager {
         match placement {
             Some(p) => Some((result.plan, p, decision_trace)),
             // Planner's top worker is full/unreservable → scheduler fallback.
-            None => self.select_pub_remote(req).await.map(|p| (result.plan, p, decision_trace)),
+            None => self
+                .select_pub_remote(req)
+                .await
+                .map(|p| (result.plan, p, decision_trace)),
         }
     }
 
@@ -2038,9 +2059,7 @@ impl ComputeManager {
         let trace = decentraai_fabric::SelectionTrace {
             request_id: String::new(),
             model_hash: req.model_hash.clone(),
-            is_continuation: session_id
-                .and_then(|s| self.session_residency(s))
-                .is_some(),
+            is_continuation: session_id.and_then(|s| self.session_residency(s)).is_some(),
             prefix_worker: session_id
                 .and_then(|s| self.session_residency(s))
                 .map(|w| w.to_string()),
@@ -2162,10 +2181,7 @@ impl ComputeManager {
             ..Default::default()
         };
         Some(decentraai_fabric::GoldenCase::capture(
-            request_id,
-            &rfacts,
-            &facts,
-            &planner,
+            request_id, &rfacts, &facts, &planner,
         ))
     }
 
@@ -2690,7 +2706,8 @@ fn now_ms() -> u64 {
 }
 
 pub fn execution_statistics(history: &[ExecutedPlan]) -> serde_json::Value {
-    let total = history.len();    let succeeded = history.iter().filter(|p| p.outcome == "succeeded").count();
+    let total = history.len();
+    let succeeded = history.iter().filter(|p| p.outcome == "succeeded").count();
     let failed = history.iter().filter(|p| p.outcome == "failed").count();
 
     // Measured throughput (tokens/sec) and latency (ms) — only from records
@@ -3294,7 +3311,10 @@ mod tests {
         // set blocks it even though the in-memory dedup ring is fresh).
         restarted.record_credited_contribution(&worker, "exec-persist", true, Some(50), Some(250));
         assert_eq!(
-            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            restarted
+                .credit_account(&worker.to_string())
+                .unwrap()
+                .balance,
             balance_before,
             "balance must not grow on replay"
         );
@@ -3353,8 +3373,13 @@ mod tests {
             },
         );
 
-        let chain = manager.evidence_chain("exec-chain").expect("chain must exist");
-        assert!(chain.chain_complete, "execution + credit event both present");
+        let chain = manager
+            .evidence_chain("exec-chain")
+            .expect("chain must exist");
+        assert!(
+            chain.chain_complete,
+            "execution + credit event both present"
+        );
         let exec = chain.execution.expect("execution record present");
         assert_eq!(exec.request_id, "exec-chain");
         assert_eq!(exec.outcome, "succeeded");
@@ -3412,13 +3437,18 @@ mod tests {
         manager.record_selection_trace(trace.clone());
         manager.record_credited_contribution(&worker, "exec-trace", true, Some(30), Some(100));
 
-        let chain = manager.evidence_chain("exec-trace").expect("chain must exist");
+        let chain = manager
+            .evidence_chain("exec-trace")
+            .expect("chain must exist");
         assert!(chain.chain_complete);
         let chain_trace = chain
             .selection_trace
             .expect("selection trace must be linked into the chain");
         assert_eq!(chain_trace, trace);
-        assert_eq!(chain_trace.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        assert_eq!(
+            chain_trace.selected_worker.as_deref(),
+            Some(worker.to_string().as_str())
+        );
         assert_eq!(chain_trace.ranked.len(), 1);
         // The chain links execution -> selection trace -> credit event.
         let credit = chain.credit_event.expect("credit event present");
@@ -3550,13 +3580,19 @@ mod tests {
         // Duplicate execution (same ref_id) -> no double credit.
         let dup = manager.record_evidence_credit("exec-idem", &worker, 30, 100);
         assert_eq!(dup, 0, "duplicate execution must not credit again");
-        assert_eq!(manager.credit_account(&worker.to_string()).unwrap().balance, balance);
+        assert_eq!(
+            manager.credit_account(&worker.to_string()).unwrap().balance,
+            balance
+        );
 
         // Restart over the same file -> balance restored, replay does not grow it.
         let restarted = ComputeManager::new(peer(), "c".into(), HashSet::new());
         restarted.set_credits_path(Some(credits_path.clone()));
         assert_eq!(
-            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            restarted
+                .credit_account(&worker.to_string())
+                .unwrap()
+                .balance,
             balance,
             "restart must restore the exact balance"
         );
@@ -3590,9 +3626,15 @@ mod tests {
             attempt: 0,
         });
         let replayed = restarted.record_evidence_credit("exec-idem", &worker, 30, 100);
-        assert_eq!(replayed, 0, "replayed execution after restart must not credit again");
         assert_eq!(
-            restarted.credit_account(&worker.to_string()).unwrap().balance,
+            replayed, 0,
+            "replayed execution after restart must not credit again"
+        );
+        assert_eq!(
+            restarted
+                .credit_account(&worker.to_string())
+                .unwrap()
+                .balance,
             balance,
             "balance must not grow on replay after restart"
         );
@@ -3874,7 +3916,10 @@ mod tests {
             trace.rejected
         );
         // The trusted worker is selected and scored.
-        assert_eq!(trace.selected_worker.as_deref(), Some(worker.to_string().as_str()));
+        assert_eq!(
+            trace.selected_worker.as_deref(),
+            Some(worker.to_string().as_str())
+        );
         assert_eq!(trace.ranked.len(), 1);
         assert_eq!(trace.ranked[0].peer_id, worker.to_string());
         // Runtime half left unset for the caller.
@@ -3891,18 +3936,20 @@ mod tests {
         let local = peer();
         let worker = peer();
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        )).await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
 
         // Shadow OFF: baseline authoritative decision.
@@ -3915,8 +3962,14 @@ mod tests {
             placement_off.worker,
             plan_off.stage_count(),
         );
-        manager.release(placement_off.reservation.reservation_id).await;
-        assert_eq!(manager.shadow_metrics().invocations, 0, "shadow off -> no invocations");
+        manager
+            .release(placement_off.reservation.reservation_id)
+            .await;
+        assert_eq!(
+            manager.shadow_metrics().invocations,
+            0,
+            "shadow off -> no invocations"
+        );
 
         // Shadow ON: MUST produce an identical authoritative SELECTION. (The
         // plan_id itself is a per-call Uuid::new_v4() — unique by design, so we
@@ -3931,23 +3984,38 @@ mod tests {
             workers_off,
             "shadow must not change worker selection"
         );
-        assert_eq!(placement_on.worker, worker_id_off, "shadow must not change reservation");
+        assert_eq!(
+            placement_on.worker, worker_id_off,
+            "shadow must not change reservation"
+        );
         assert_eq!(plan_on.stage_count(), stages_off);
         // The decision trace must be identical too.
-        assert_eq!(trace_on, trace_off, "shadow must not alter the decision trace");
+        assert_eq!(
+            trace_on, trace_off,
+            "shadow must not alter the decision trace"
+        );
         let _ = trace_on;
-        manager.release(placement_on.reservation.reservation_id).await;
+        manager
+            .release(placement_on.reservation.reservation_id)
+            .await;
 
         // Shadow DID record a real invocation + agreement (observe-only).
         let m = manager.shadow_metrics();
         assert_eq!(m.invocations, 1, "shadow on -> 1 invocation recorded");
         assert_eq!(m.errors, 0, "no shadow errors on a healthy fabric");
-        assert_eq!(m.agreements, 1, "unified selector must agree on the real fabric");
+        assert_eq!(
+            m.agreements, 1,
+            "unified selector must agree on the real fabric"
+        );
         let recs = manager.shadow_records();
         assert_eq!(recs.len(), 1, "one shadow record");
         assert!(recs[0].agreement, "shadow diff agrees");
         // Reservation is recorded NOT-COMPARABLE (shadow never reserves).
-        let res = recs[0].fields.iter().find(|f| f.field == "reservation").unwrap();
+        let res = recs[0]
+            .fields
+            .iter()
+            .find(|f| f.field == "reservation")
+            .unwrap();
         assert_eq!(res.verdict, "not_comparable");
     }
 
@@ -3956,28 +4024,36 @@ mod tests {
         let local = peer();
         let worker = peer();
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        )).await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
         manager.set_shadow_enabled(true);
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        let (_plan, placement, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        let (_plan, placement, _) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
         assert_eq!(manager.shadow_metrics().invocations, 1);
         manager.release(placement.reservation.reservation_id).await;
 
         // Disable -> no further shadow invocations, but the authoritative path
         // still works (and metric counters are frozen, not reset).
         manager.set_shadow_enabled(false);
-        let (_p2, placement2, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        let (_p2, placement2, _) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
         assert_eq!(
             manager.shadow_metrics().invocations,
             1,
@@ -3994,21 +4070,26 @@ mod tests {
         let local = peer();
         let worker = peer();
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        )).await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
         manager.set_shadow_enabled(true);
         let req = WorkloadRequirements::new("abc".into(), 256, 3072);
-        let (_, placement, _) = manager.plan_and_reserve(&req, 200, None, 0).await.expect("plan");
+        let (_, placement, _) = manager
+            .plan_and_reserve(&req, 200, None, 0)
+            .await
+            .expect("plan");
         manager.release(placement.reservation.reservation_id).await;
         let recs = manager.shadow_records();
         assert_eq!(recs.len(), 1);
@@ -4017,11 +4098,25 @@ mod tests {
         let fields: Vec<&str> = r.fields.iter().map(|f| f.field.as_str()).collect();
         assert_eq!(
             fields,
-            vec!["eligible", "rejected", "ranking", "selected", "provenance", "reservation"]
+            vec![
+                "eligible",
+                "rejected",
+                "ranking",
+                "selected",
+                "provenance",
+                "reservation"
+            ]
         );
         // On a single trusted worker these all match except reservation (nc).
         assert!(r.fields.iter().filter(|f| f.verdict == "match").count() >= 5);
-        assert_eq!(r.fields.iter().find(|f| f.field == "reservation").unwrap().verdict, "not_comparable");
+        assert_eq!(
+            r.fields
+                .iter()
+                .find(|f| f.field == "reservation")
+                .unwrap()
+                .verdict,
+            "not_comparable"
+        );
     }
 
     #[tokio::test]
@@ -4035,32 +4130,36 @@ mod tests {
         let worker = peer();
         let untrusted = peer();
         let manager = ComputeManager::new(local, "coordinator".into(), HashSet::from([worker]));
-        manager.process_advertisement(build_advertisement(
-            worker,
-            "gpu-rig",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            true,
-            0,
-            LivePerf::default(),
-        )).await;
+        manager
+            .process_advertisement(build_advertisement(
+                worker,
+                "gpu-rig",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                true,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
         // An untrusted candidate with better nominal perf: must be rejected by
         // BOTH selectors (gate equivalence on real state).
-        manager.process_advertisement(build_advertisement(
-            untrusted,
-            "untrusted-fast",
-            ENGINE_LLAMA_SERVER,
-            snapshot(),
-            gpu(),
-            vec![model()],
-            false,
-            false,
-            0,
-            LivePerf::default(),
-        )).await;
+        manager
+            .process_advertisement(build_advertisement(
+                untrusted,
+                "untrusted-fast",
+                ENGINE_LLAMA_SERVER,
+                snapshot(),
+                gpu(),
+                vec![model()],
+                false,
+                false,
+                0,
+                LivePerf::default(),
+            ))
+            .await;
         manager.record_rtt(&worker, 2_000, 1_000);
 
         let case = manager
@@ -5427,14 +5526,22 @@ mod tests {
             ))
             .await;
         // After advertising, hardware is observed; no served work yet.
-        let p0 = manager.contribution_profile(&worker).expect("tracker exists");
+        let p0 = manager
+            .contribution_profile(&worker)
+            .expect("tracker exists");
         assert_eq!(p0.verified_requests, 0);
-        assert_eq!(p0.cpu_cores, snapshot().logical_cpus as u16, "hardware from advertisement");
+        assert_eq!(
+            p0.cpu_cores,
+            snapshot().logical_cpus as u16,
+            "hardware from advertisement"
+        );
 
         // One verified + one failed execution.
         assert!(manager.record_credited_contribution(&worker, "a-1", true, Some(100), Some(2000)));
         assert!(manager.record_credited_contribution(&worker, "a-2", false, None, None));
-        let p1 = manager.contribution_profile(&worker).expect("tracker exists");
+        let p1 = manager
+            .contribution_profile(&worker)
+            .expect("tracker exists");
         assert_eq!(p1.verified_requests, 1);
         assert_eq!(p1.failed_requests, 1);
         // A peer we never measured stays None.

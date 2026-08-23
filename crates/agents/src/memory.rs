@@ -757,16 +757,12 @@ fn content_hash(content: &str) -> String {
 /// evidence confidence desc (unprovenanced = 0), first-observed asc,
 /// entry id asc. Pure — same input, same order, always.
 pub fn rank_claims(entries: &[MemoryEntry]) -> Vec<&MemoryEntry> {
-    let mut ranked: Vec<&MemoryEntry> =
-        entries.iter().filter(|e| e.meta.status.is_active()).collect();
+    let mut ranked: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.meta.status.is_active())
+        .collect();
     ranked.sort_by(|a, b| {
-        let conf = |e: &MemoryEntry| {
-            e.meta
-                .detail
-                .as_ref()
-                .map(|d| d.confidence)
-                .unwrap_or(0u8)
-        };
+        let conf = |e: &MemoryEntry| e.meta.detail.as_ref().map(|d| d.confidence).unwrap_or(0u8);
         b.meta
             .status
             .strength()
@@ -989,11 +985,12 @@ impl MemoryRegistry {
         reason: &str,
         now_ms: u64,
     ) -> Result<(), MemoryError> {
-        let bucket = self.entries.get_mut(scope_name).ok_or_else(|| {
-            MemoryError::UnknownScope {
+        let bucket = self
+            .entries
+            .get_mut(scope_name)
+            .ok_or_else(|| MemoryError::UnknownScope {
                 name: scope_name.to_string(),
-            }
-        })?;
+            })?;
         let entry = bucket
             .iter_mut()
             .find(|e| e.entry_id == entry_id)
@@ -1016,7 +1013,10 @@ impl MemoryRegistry {
             at_ms: now_ms,
         });
         if entry.meta.history.len() > MAX_HISTORY {
-            entry.meta.history.drain(..entry.meta.history.len() - MAX_HISTORY);
+            entry
+                .meta
+                .history
+                .drain(..entry.meta.history.len() - MAX_HISTORY);
         }
         entry.meta.status = to;
         entry.meta.version = entry.meta.version.saturating_add(1);
@@ -1672,11 +1672,7 @@ mod tests {
         MemoryScope::new("team.knowledge", "governor", MemoryLevel::Team).with_policy(policy)
     }
 
-    fn knowledge(
-        id: &str,
-        content: &str,
-        subject: &str,
-    ) -> MemoryEntry {
+    fn knowledge(id: &str, content: &str, subject: &str) -> MemoryEntry {
         let mut e = MemoryEntry::new(id, "team.knowledge", "researcher", "node-1", content)
             .with_subject(subject)
             .with_kind(KnowledgeKind::Learning);
@@ -1716,24 +1712,52 @@ mod tests {
                 existing_id: "e1".to_string()
             }
         );
-        assert_eq!(reg.read("team.knowledge", "governor", true, 2000).unwrap().len(), 1);
+        assert_eq!(
+            reg.read("team.knowledge", "governor", true, 2000)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn conflicting_claims_are_linked_never_overwritten() {
         let mut reg = MemoryRegistry::new();
         reg.register_scope(collective_scope()).unwrap();
-        reg.write_checked("team.knowledge", knowledge("a", "claim A", "q:timeout"), "governor", true, false, false, 100).unwrap();
+        reg.write_checked(
+            "team.knowledge",
+            knowledge("a", "claim A", "q:timeout"),
+            "governor",
+            true,
+            false,
+            false,
+            100,
+        )
+        .unwrap();
         let out = reg
-            .write_checked("team.knowledge", knowledge("b", "claim B", "q:timeout"), "peer-2", false, true, false, 200)
+            .write_checked(
+                "team.knowledge",
+                knowledge("b", "claim B", "q:timeout"),
+                "peer-2",
+                false,
+                true,
+                false,
+                200,
+            )
             .unwrap();
-        assert!(matches!(out, WriteOutcome::CompetingClaim { .. }), "different content on same subject = competing claim");
+        assert!(
+            matches!(out, WriteOutcome::CompetingClaim { .. }),
+            "different content on same subject = competing claim"
+        );
         let read = reg.read("team.knowledge", "governor", true, 1000).unwrap();
         assert_eq!(read.len(), 2, "both claims preserved");
         let a = read.iter().find(|e| e.entry_id == "a").unwrap();
         let b = read.iter().find(|e| b_id(e) == "b").unwrap();
         assert!(a.meta.competes_with.contains(&"b".to_string()));
-        assert!(b.meta.competes_with.contains(&"a".to_string()), "links are bidirectional");
+        assert!(
+            b.meta.competes_with.contains(&"a".to_string()),
+            "links are bidirectional"
+        );
     }
 
     fn b_id(e: &MemoryEntry) -> &str {
@@ -1744,15 +1768,54 @@ mod tests {
     fn lifecycle_transitions_are_gated_and_audited() {
         let mut reg = MemoryRegistry::new();
         reg.register_scope(collective_scope()).unwrap();
-        reg.write_checked("team.knowledge", knowledge("e1", "lesson", "q:l"), "governor", true, false, false, 100).unwrap();
+        reg.write_checked(
+            "team.knowledge",
+            knowledge("e1", "lesson", "q:l"),
+            "governor",
+            true,
+            false,
+            false,
+            100,
+        )
+        .unwrap();
         // candidate → trusted is NOT a legal jump.
-        let err = reg.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "gov", "shortcut", 150);
+        let err = reg.transition_status(
+            "team.knowledge",
+            "e1",
+            MemoryStatus::Trusted,
+            "gov",
+            "shortcut",
+            150,
+        );
         assert!(matches!(err, Err(MemoryError::InvalidTransition { .. })));
         // candidate → verified → trusted works and bumps versions + history.
-        reg.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "verifier", "bench passed", 150).unwrap();
-        reg.transition_status("team.knowledge", "e1", MemoryStatus::Trusted, "corroborator", "seen twice", 200).unwrap();
+        reg.transition_status(
+            "team.knowledge",
+            "e1",
+            MemoryStatus::Verified,
+            "verifier",
+            "bench passed",
+            150,
+        )
+        .unwrap();
+        reg.transition_status(
+            "team.knowledge",
+            "e1",
+            MemoryStatus::Trusted,
+            "corroborator",
+            "seen twice",
+            200,
+        )
+        .unwrap();
         // verified → verified is illegal too.
-        let err = reg.transition_status("team.knowledge", "e1", MemoryStatus::Verified, "x", "again", 250);
+        let err = reg.transition_status(
+            "team.knowledge",
+            "e1",
+            MemoryStatus::Verified,
+            "x",
+            "again",
+            250,
+        );
         assert!(matches!(err, Err(MemoryError::InvalidTransition { .. })));
         let e = &reg.read("team.knowledge", "governor", true, 300).unwrap()[0];
         assert_eq!(e.meta.status, MemoryStatus::Trusted);
@@ -1761,7 +1824,15 @@ mod tests {
         assert_eq!(e.meta.history[0].from, MemoryStatus::Candidate);
         assert_eq!(e.meta.history[0].reason, "bench passed");
         // Obsolete stays recoverable in place.
-        reg.transition_status("team.knowledge", "e1", MemoryStatus::Obsolete, "gov", "superseded", 400).unwrap();
+        reg.transition_status(
+            "team.knowledge",
+            "e1",
+            MemoryStatus::Obsolete,
+            "gov",
+            "superseded",
+            400,
+        )
+        .unwrap();
         let e = &reg.read("team.knowledge", "governor", true, 500).unwrap()[0];
         assert_eq!(e.meta.status, MemoryStatus::Obsolete);
         assert_eq!(e.content, "lesson", "obsolete entries keep their content");
@@ -1776,18 +1847,23 @@ mod tests {
         low.meta.detail = Some(MemoryProvenance::new("agent_reasoning", "a", "n1", 10, 50));
         let mut mid = knowledge("mid", "verified", "q:x");
         mid.meta.status = MemoryStatus::Verified;
-        mid.meta.detail = Some(MemoryProvenance::new("execution", "a", "n1", 20, 40).with_evidence("aud-1"));
+        mid.meta.detail =
+            Some(MemoryProvenance::new("execution", "a", "n1", 20, 40).with_evidence("aud-1"));
         let mut high = knowledge("high", "high conf", "q:x");
         high.meta.detail = Some(MemoryProvenance::new("benchmark", "a", "n2", 30, 90));
         for e in [low, mid, high] {
-            reg.write_checked("team.knowledge", e, "governor", true, false, false, 100).unwrap();
+            reg.write_checked("team.knowledge", e, "governor", true, false, false, 100)
+                .unwrap();
         }
         // Verified beats any confidence; ties would fall to first-observed then id.
         let winner = reg.resolve_subject("team.knowledge", "q:x", 1000).unwrap();
         assert_eq!(winner.entry_id, "mid");
         assert_eq!(winner.meta.status, MemoryStatus::Verified);
         // Unknown subject → None.
-        assert!(reg.resolve_subject("team.knowledge", "q:none", 1000).is_none());
+        assert!(
+            reg.resolve_subject("team.knowledge", "q:none", 1000)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1795,13 +1871,21 @@ mod tests {
         let mut local = MemoryRegistry::new();
         local.register_scope(collective_scope()).unwrap();
         local
-            .write_checked("team.knowledge", knowledge("local1", "shared lesson", "q:s"), "governor", true, false, false, 100)
+            .write_checked(
+                "team.knowledge",
+                knowledge("local1", "shared lesson", "q:s"),
+                "governor",
+                true,
+                false,
+                false,
+                100,
+            )
             .unwrap();
 
         let remote = vec![
             knowledge("r1", "remote lesson", "q:r"),
-            knowledge("r2", "shared lesson", "q:s"),   // exact duplicate of local1
-            knowledge("r3", "competing view", "q:r"),  // competes with r1
+            knowledge("r2", "shared lesson", "q:s"), // exact duplicate of local1
+            knowledge("r3", "competing view", "q:r"), // competes with r1
         ];
         let report = local.merge_batch("team.knowledge", remote, 1000).unwrap();
         assert_eq!(report.accepted, 2);
@@ -1810,14 +1894,21 @@ mod tests {
 
         // Re-merging the same batch is a full no-op (idempotent).
         let remote_again = vec![knowledge("r1", "remote lesson", "q:r")];
-        let again = local.merge_batch("team.knowledge", remote_again, 1000).unwrap();
+        let again = local
+            .merge_batch("team.knowledge", remote_again, 1000)
+            .unwrap();
         assert_eq!(again.accepted, 0);
         assert_eq!(again.duplicates, 1);
 
         // Local entry was never overwritten.
-        let all = local.read("team.knowledge", "governor", true, 1000).unwrap();
+        let all = local
+            .read("team.knowledge", "governor", true, 1000)
+            .unwrap();
         assert_eq!(all.len(), 3, "1 local + r1 + r3 (r2 duplicate skipped)");
-        assert!(all.iter().any(|e| e.entry_id == "local1" && e.content == "shared lesson"));
+        assert!(
+            all.iter()
+                .any(|e| e.entry_id == "local1" && e.content == "shared lesson")
+        );
 
         // Expired remote entries are dropped, not merged.
         let expired = vec![knowledge("rx", "stale", "q:z").expires_at(500)];
@@ -1834,14 +1925,12 @@ mod tests {
     #[test]
     fn evidence_backed_is_distinguishable_from_assertion() {
         let mut backed = knowledge("e1", "from execution", "q:b");
-        backed.meta.detail = Some(
-            MemoryProvenance::new("execution", "a", "n1", 10, 95).with_evidence("audit-77"),
-        );
+        backed.meta.detail =
+            Some(MemoryProvenance::new("execution", "a", "n1", 10, 95).with_evidence("audit-77"));
         assert!(backed.meta.is_evidence_backed());
 
         let mut assertion = knowledge("e2", "just said", "q:b");
-        assertion.meta.detail =
-            Some(MemoryProvenance::new("agent_reasoning", "a", "n1", 10, 60));
+        assertion.meta.detail = Some(MemoryProvenance::new("agent_reasoning", "a", "n1", 10, 60));
         assert!(!assertion.meta.is_evidence_backed());
         assert!(!MemoryMeta::default().is_evidence_backed());
     }

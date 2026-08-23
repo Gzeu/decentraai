@@ -732,7 +732,10 @@ pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return None;
     }
-    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
     if name != "decentraai_embeddings" {
         return None;
     }
@@ -741,7 +744,10 @@ pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     if input.is_empty() || input.len() > 8000 {
         return None;
     }
-    let model = args.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let model = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Some((input, model))
 }
 
@@ -751,7 +757,10 @@ pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return None;
     }
-    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
     if name != "decentraai_compute_request" {
         return None;
     }
@@ -761,7 +770,11 @@ pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
         return None;
     }
     let payload = args.get("payload").cloned().unwrap_or(json!({}));
-    let lease = args.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(60).clamp(1, 120);
+    let lease = args
+        .get("lease_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60)
+        .clamp(1, 120);
     Some((capability, payload, lease))
 }
 

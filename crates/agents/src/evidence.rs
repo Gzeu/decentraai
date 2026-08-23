@@ -119,7 +119,10 @@ impl EvidenceEntry {
     pub fn matches(&self, term: &str) -> bool {
         let term = term.to_ascii_lowercase();
         self.id.to_ascii_lowercase().contains(&term)
-            || self.tags.iter().any(|t| t.to_ascii_lowercase().contains(&term))
+            || self
+                .tags
+                .iter()
+                .any(|t| t.to_ascii_lowercase().contains(&term))
             || self.text.to_ascii_lowercase().contains(&term)
     }
 }
@@ -189,10 +192,7 @@ impl EvidenceIndex {
 
     /// Entries of one family.
     pub fn by_kind(&self, kind: EvidenceFamily) -> Vec<EvidenceEntry> {
-        self.all()
-            .into_iter()
-            .filter(|e| e.kind == kind)
-            .collect()
+        self.all().into_iter().filter(|e| e.kind == kind).collect()
     }
 
     /// Count of entries per family (all five keys present, deterministic).
@@ -216,10 +216,7 @@ impl EvidenceIndex {
             .into_iter()
             .filter(|e| terms.iter().all(|t| e.matches(t)))
             .map(|e| {
-                let matched = terms
-                    .iter()
-                    .filter(|t| e.matches(t))
-                    .count();
+                let matched = terms.iter().filter(|t| e.matches(t)).count();
                 EvidenceHit {
                     score: matched as f32 / terms.len() as f32,
                     id: e.id,
@@ -449,9 +446,7 @@ pub fn lessons(entries: &[EvidenceEntry]) -> Vec<Lesson> {
             .collect();
         let graded = mode_entries
             .iter()
-            .filter(|e| {
-                tag_value(e, "verdict:").as_deref() != Some("Abstained")
-            })
+            .filter(|e| tag_value(e, "verdict:").as_deref() != Some("Abstained"))
             .count();
         let correct = mode_entries
             .iter()
@@ -535,8 +530,13 @@ mod tests {
         ix.add(exec("r1", "succeeded", 120, 15, 1000));
         ix.add(exec("r1", "succeeded", 120, 15, 1000)); // same id → replace
         ix.add(
-            EvidenceEntry::new("receipt:e1", EvidenceFamily::Receipt, "exec e1 Verified", 2000)
-                .tagged("verdict:Verified"),
+            EvidenceEntry::new(
+                "receipt:e1",
+                EvidenceFamily::Receipt,
+                "exec e1 Verified",
+                2000,
+            )
+            .tagged("verdict:Verified"),
         );
         assert_eq!(ix.len(), 2);
         assert_eq!(ix.counts()[&EvidenceFamily::Execution], 1);
@@ -549,8 +549,13 @@ mod tests {
         ix.add(exec("a", "succeeded", 100, 10, 3000));
         ix.add(exec("b", "failed", 500, 300, 2000));
         ix.add(
-            EvidenceEntry::new("receipt:e1", EvidenceFamily::Receipt, "exec e1 Verified", 1000)
-                .tagged("verdict:Verified"),
+            EvidenceEntry::new(
+                "receipt:e1",
+                EvidenceFamily::Receipt,
+                "exec e1 Verified",
+                1000,
+            )
+            .tagged("verdict:Verified"),
         );
 
         let hit = ix.query(&["succeeded".into()]);
@@ -572,10 +577,7 @@ mod tests {
     #[test]
     fn semantic_requires_real_embeddings_and_is_honest() {
         let mut ix = EvidenceIndex::new();
-        ix.add(
-            exec("a", "succeeded", 100, 10, 3000)
-                .with_embedding(vec![1.0, 0.0, 0.0]),
-        );
+        ix.add(exec("a", "succeeded", 100, 10, 3000).with_embedding(vec![1.0, 0.0, 0.0]));
         // This one has no embedding — must never match semantically.
         ix.add(exec("b", "failed", 500, 300, 2000));
 
@@ -603,10 +605,16 @@ mod tests {
             exec("c", "failed", 500, 300, 1000),
         ];
         let ls = lessons(&entries);
-        let rate = ls.iter().find(|l| l.id == "executions/success_rate").unwrap();
+        let rate = ls
+            .iter()
+            .find(|l| l.id == "executions/success_rate")
+            .unwrap();
         assert_eq!(rate.sample, 3);
         assert!((rate.value - 2.0 / 3.0).abs() < 1e-6);
-        let dur = ls.iter().find(|l| l.id == "executions/median_duration_ms").unwrap();
+        let dur = ls
+            .iter()
+            .find(|l| l.id == "executions/median_duration_ms")
+            .unwrap();
         assert_eq!(dur.sample, 3);
         assert_eq!(dur.value, 200.0); // median of 100,200,500
         let rtt = ls.iter().find(|l| l.id == "network/median_rtt_ms").unwrap();
@@ -649,10 +657,16 @@ mod tests {
         let single = ls.iter().find(|l| l.id == "bench/single_accuracy").unwrap();
         assert_eq!(single.sample, 3); // graded only (Abstained excluded)
         assert!((single.value - 2.0 / 3.0).abs() < 1e-6);
-        let collective = ls.iter().find(|l| l.id == "bench/collective_accuracy").unwrap();
+        let collective = ls
+            .iter()
+            .find(|l| l.id == "bench/collective_accuracy")
+            .unwrap();
         assert_eq!(collective.sample, 1);
         assert!((collective.value - 1.0).abs() < 1e-6);
-        let med = ls.iter().find(|l| l.id == "bench/median_latency_ms").unwrap();
+        let med = ls
+            .iter()
+            .find(|l| l.id == "bench/median_latency_ms")
+            .unwrap();
         assert_eq!(med.sample, 5);
         assert_eq!(med.value, 100.0); // median of 100,200,300,50,60
     }

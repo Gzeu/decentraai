@@ -261,7 +261,10 @@ impl AssistSharingSection {
         {
             return None;
         }
-        Some((requested_cpu.min(self.cpu_cap_cores()), requested_ram_mb.min(self.ram_max_mb)))
+        Some((
+            requested_cpu.min(self.cpu_cap_cores()),
+            requested_ram_mb.min(self.ram_max_mb),
+        ))
     }
 
     /// Cores this node may offer, derived from cpu_max_percent.
@@ -622,10 +625,16 @@ impl PressureThresholdsSection {
             return Err("latency_ms_high must be > 0".into());
         }
         if !(1.0..=100.0).contains(&self.cpu_percent_high) {
-            return Err(format!("cpu_percent_high must be within [1,100], got {}", self.cpu_percent_high));
+            return Err(format!(
+                "cpu_percent_high must be within [1,100], got {}",
+                self.cpu_percent_high
+            ));
         }
         if !(1.0..=100.0).contains(&self.ram_percent_high) {
-            return Err(format!("ram_percent_high must be within [1,100], got {}", self.ram_percent_high));
+            return Err(format!(
+                "ram_percent_high must be within [1,100], got {}",
+                self.ram_percent_high
+            ));
         }
         Ok(())
     }
@@ -726,8 +735,7 @@ impl FabricIntelligenceSection {
         // fail at boot, not silently per request.
         if self.policy == FabricIntelligencePolicy::ExternalOnly && self.external.is_none() {
             return Err(
-                "fabric_intelligence.policy=external_only requires an external section"
-                    .to_string(),
+                "fabric_intelligence.policy=external_only requires an external section".to_string(),
             );
         }
         if let Some(ext) = &self.external {
@@ -931,9 +939,10 @@ impl NodeConfig {
             intel.validate().map_err(ConfigError::Validation)?;
         }
         if let Some(assist) = &self.autonomous_assist {
-            assist.thresholds.validate().map_err(|e| {
-                ConfigError::Validation(format!("autonomous_assist: {e}"))
-            })?;
+            assist
+                .thresholds
+                .validate()
+                .map_err(|e| ConfigError::Validation(format!("autonomous_assist: {e}")))?;
             if assist.enabled && assist.profile.is_none() {
                 return Err(ConfigError::Validation(
                     "autonomous_assist.enabled requires a `profile` (capability + payload_template)"
@@ -1297,9 +1306,7 @@ security:
         file.write_all(include_bytes!("../../../configs/node.example.yaml"))
             .unwrap();
         let raw = std::fs::read_to_string(file.path()).unwrap();
-        let with_ocr = format!(
-            "{raw}\nocr:\n  enabled: true\n  lang: \"ro\"\n"
-        );
+        let with_ocr = format!("{raw}\nocr:\n  enabled: true\n  lang: \"ro\"\n");
         std::fs::write(file.path(), with_ocr).unwrap();
         let config = NodeConfig::load(file.path()).unwrap();
         let ocr = config.ocr.expect("ocr section parsed");
@@ -1337,9 +1344,8 @@ security:
         file.write_all(include_bytes!("../../../configs/node.example.yaml"))
             .unwrap();
         let raw = std::fs::read_to_string(file.path()).unwrap();
-        let with_skills = format!(
-            "{raw}\nskills:\n  enabled: true\n  list: [\"sentiment\", \"ner\"]\n"
-        );
+        let with_skills =
+            format!("{raw}\nskills:\n  enabled: true\n  list: [\"sentiment\", \"ner\"]\n");
         std::fs::write(file.path(), with_skills).unwrap();
         let config = NodeConfig::load(file.path()).unwrap();
         let skills = config.skills.expect("skills section parsed");
@@ -1544,7 +1550,9 @@ security:
         let raw = std::fs::read_to_string(file.path()).unwrap();
         std::fs::write(
             file.path(),
-            format!("{raw}\nfabric_intelligence:\n  enabled: true\n  max_artifact_bytes: 9999999999\n"),
+            format!(
+                "{raw}\nfabric_intelligence:\n  enabled: true\n  max_artifact_bytes: 9999999999\n"
+            ),
         )
         .unwrap();
         let err = NodeConfig::load(file.path()).unwrap_err().to_string();
@@ -1742,6 +1750,6 @@ security:
 
 mod helpers;
 pub use helpers::{
-    backend_request_timeout, backend_request_timeout_from, ensure_mode_0600,
-    DEFAULT_BACKEND_TIMEOUT_SECS,
+    DEFAULT_BACKEND_TIMEOUT_SECS, backend_request_timeout, backend_request_timeout_from,
+    ensure_mode_0600,
 };

@@ -24,7 +24,7 @@ use crate::agent_memory::{MemoryStore, memory_entry_to_sync};
 use decentraai_agents::memory::{MemoryEntry, MemoryLevel, MemoryScope, MemoryStatus};
 use decentraai_p2p::P2PNode;
 use decentraai_protocol::memory_sync::{
-    MemorySyncRequest, MemorySyncResponse, MAX_SYNC_BATCH_ENTRIES,
+    MAX_SYNC_BATCH_ENTRIES, MemorySyncRequest, MemorySyncResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -77,7 +77,10 @@ pub fn travel_worthy(entries: &[MemoryEntry]) -> Vec<MemoryEntry> {
         .iter()
         .filter(|e| {
             !e.content.trim().is_empty()
-                && matches!(e.meta.status, MemoryStatus::Verified | MemoryStatus::Trusted)
+                && matches!(
+                    e.meta.status,
+                    MemoryStatus::Verified | MemoryStatus::Trusted
+                )
         })
         .cloned()
         .collect()
@@ -119,8 +122,10 @@ pub async fn propagate_once(
     let mut batches: BTreeMap<String, Vec<MemoryEntry>> = BTreeMap::new();
     for scope in eligible_scopes(&store.list_scopes().unwrap_or_default()) {
         if let Ok(entries) = store.read(&scope.name, "governor", true) {
-            let batch: Vec<MemoryEntry> =
-                travel_worthy(&entries).into_iter().take(cfg.max_entries).collect();
+            let batch: Vec<MemoryEntry> = travel_worthy(&entries)
+                .into_iter()
+                .take(cfg.max_entries)
+                .collect();
             if !batch.is_empty() {
                 report.entries_offered += batch.len() as u32;
                 report.scopes_propagated += 1;

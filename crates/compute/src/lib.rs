@@ -66,30 +66,33 @@ pub use compensation::{
     total_attempts,
 };
 pub use contribution::{ContributionProfile, contribution_score, suggest_tier};
-pub use contribution_state::{ModelContribution, NodeContributionState, TimeRangeContribution, WorkerContribution};
+pub use contribution_state::{
+    ModelContribution, NodeContributionState, TimeRangeContribution, WorkerContribution,
+};
 pub use credits::{
     CreditAccount, CreditCalculation, CreditEvent, CreditLedger, CreditLedgerSnapshot,
     CreditPolicy, CreditPolicyDimension, ResourceSummary,
-};
-pub use placement::{
-    ComputeDemand, ComputeOffer, ComputePrice, ComputeReservation, ComputeSettlement,
-    ExecutionStrategy, ModelRequirements, NetworkConstraints, PlacementCandidate,
-    PlacementEngine, PlacementWeights, RejectedCandidate, ResourceConstraints, TrustConstraints,
-    plan_placement,
 };
 pub use fabric_graph::{
     AdvertisedCapabilities, CapabilityGraph, ComputeGraph, FabricGraph, FabricNode, LinkFacts,
 };
 pub use loadbalance::{LoadShare, adaptive_load_shares};
 pub use matcher::{CapabilityMatcher, MatchOutcome, MatchReason};
+pub use placement::{
+    ComputeDemand, ComputeOffer, ComputePrice, ComputeReservation, ComputeSettlement,
+    ExecutionStrategy, ModelRequirements, NetworkConstraints, PlacementCandidate, PlacementEngine,
+    PlacementWeights, RejectedCandidate, ResourceConstraints, TrustConstraints, plan_placement,
+};
 pub use quota::{
     AccountId, ContributionPolicy, QuotaAccount, QuotaError, QuotaEvent, QuotaLedger,
     QuotaReservation,
 };
 pub use registry::ComputeRegistry;
-pub use resource_contribution::{Provenance, ResourceContribution, ResourceContributionBuilder, ResourceDimension};
 pub use requirements::WorkloadRequirements;
 pub use reservation::{Admission, AdmitReason, ReservationLedger, ResourceReservation};
+pub use resource_contribution::{
+    Provenance, ResourceContribution, ResourceContributionBuilder, ResourceDimension,
+};
 pub use scheduler::{ComputeScheduler, Placement};
 
 /// Default heartbeat interval for compute advertisements (ms).

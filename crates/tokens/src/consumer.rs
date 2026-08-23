@@ -169,7 +169,13 @@ impl ConsumerKeyStore {
         rate_limit_per_minute: u32,
         scopes: Vec<String>,
     ) -> Result<String> {
-        self.create_with_expiry(owner_account, quota_ceiling, rate_limit_per_minute, scopes, None)
+        self.create_with_expiry(
+            owner_account,
+            quota_ceiling,
+            rate_limit_per_minute,
+            scopes,
+            None,
+        )
     }
 
     /// Same as `create` but with optional expiry. `expires_at` is Unix seconds;

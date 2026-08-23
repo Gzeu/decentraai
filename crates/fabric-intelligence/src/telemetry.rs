@@ -5,8 +5,8 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Non-sensitive identity of one provider for telemetry keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,8 +72,7 @@ impl IntelTelemetry {
             agg.failures.fetch_add(1, Ordering::Relaxed);
         }
         agg.last_latency_ms.store(latency_ms, Ordering::Relaxed);
-        agg.latency_sum_ms
-            .fetch_add(latency_ms, Ordering::Relaxed);
+        agg.latency_sum_ms.fetch_add(latency_ms, Ordering::Relaxed);
         drop(map);
         if kind == ProviderKind::External {
             self.external_calls.fetch_add(1, Ordering::Relaxed);
@@ -109,9 +108,7 @@ impl IntelTelemetry {
                         successes,
                         failures: a.failures.load(Ordering::Relaxed),
                         last_latency_ms: a.last_latency_ms.load(Ordering::Relaxed),
-                        mean_latency_ms: sum
-                            .checked_div(attempts)
-                            .unwrap_or_default(),
+                        mean_latency_ms: sum.checked_div(attempts).unwrap_or_default(),
                         plan_success_percent: successes
                             .checked_mul(100)
                             .and_then(|p| p.checked_div(attempts))

@@ -145,15 +145,18 @@ impl ProviderAdapter for OpenAICompatibleProvider {
     ) -> Result<(u64, usize), ProviderConnError> {
         let start = std::time::Instant::now();
         let url = self.auth_url(base_url, api_key, "v1/models");
-        let resp = Self::auth(self.client.get(&url), api_key).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ProviderConnError::Timeout(format!("connection timed out to {base_url}"))
-            } else if e.is_connect() {
-                ProviderConnError::Network(format!("cannot reach {base_url}: {e}"))
-            } else {
-                ProviderConnError::Transport(e.to_string())
-            }
-        })?;
+        let resp = Self::auth(self.client.get(&url), api_key)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderConnError::Timeout(format!("connection timed out to {base_url}"))
+                } else if e.is_connect() {
+                    ProviderConnError::Network(format!("cannot reach {base_url}: {e}"))
+                } else {
+                    ProviderConnError::Transport(e.to_string())
+                }
+            })?;
         let latency_ms = start.elapsed().as_millis() as u64;
         let http_status = resp.status();
         if !http_status.is_success() {
@@ -212,15 +215,18 @@ impl ProviderAdapter for OpenAICompatibleProvider {
         api_key: &str,
     ) -> Result<Vec<ProviderModelInfo>, ProviderConnError> {
         let url = self.auth_url(base_url, api_key, "v1/models");
-        let resp = Self::auth(self.client.get(&url), api_key).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ProviderConnError::Timeout(format!("discovery timed out to {base_url}"))
-            } else if e.is_connect() {
-                ProviderConnError::Network(format!("cannot reach {base_url}: {e}"))
-            } else {
-                ProviderConnError::Transport(e.to_string())
-            }
-        })?;
+        let resp = Self::auth(self.client.get(&url), api_key)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderConnError::Timeout(format!("discovery timed out to {base_url}"))
+                } else if e.is_connect() {
+                    ProviderConnError::Network(format!("cannot reach {base_url}: {e}"))
+                } else {
+                    ProviderConnError::Transport(e.to_string())
+                }
+            })?;
         let http_status = resp.status();
         if !http_status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -483,13 +489,13 @@ pub fn infer_diagnostic(err: &ProviderInferError) -> (&'static str, String) {
                 "AUTHENTICATION_FAILED",
                 format!("Provider authentication failed: {body}"),
             ),
-            ProviderErrorClass::RateLimited => (
-                "RATE_LIMITED",
-                format!("Provider rate-limited: {body}"),
-            ),
-            ProviderErrorClass::QuotaExhausted => {
-                ("QUOTA_EXHAUSTED", format!("Provider budget exhausted: {body}"))
+            ProviderErrorClass::RateLimited => {
+                ("RATE_LIMITED", format!("Provider rate-limited: {body}"))
             }
+            ProviderErrorClass::QuotaExhausted => (
+                "QUOTA_EXHAUSTED",
+                format!("Provider budget exhausted: {body}"),
+            ),
             ProviderErrorClass::ModelUnavailable => (
                 "MODEL_UNAVAILABLE",
                 format!("The requested model is not available: {body}"),
@@ -498,15 +504,18 @@ pub fn infer_diagnostic(err: &ProviderInferError) -> (&'static str, String) {
                 "UPSTREAM_TIMEOUT",
                 format!("Provider did not respond in time: {body}"),
             ),
-            ProviderErrorClass::Upstream => {
-                ("UPSTREAM_ERROR", format!("Provider server error (5xx): {body}"))
-            }
-            ProviderErrorClass::Protocol => {
-                ("PROTOCOL_ERROR", format!("Malformed response from provider: {body}"))
-            }
-            ProviderErrorClass::Policy => {
-                ("POLICY_DENIED", format!("Provider policy denied the request: {body}"))
-            }
+            ProviderErrorClass::Upstream => (
+                "UPSTREAM_ERROR",
+                format!("Provider server error (5xx): {body}"),
+            ),
+            ProviderErrorClass::Protocol => (
+                "PROTOCOL_ERROR",
+                format!("Malformed response from provider: {body}"),
+            ),
+            ProviderErrorClass::Policy => (
+                "POLICY_DENIED",
+                format!("Provider policy denied the request: {body}"),
+            ),
             ProviderErrorClass::Unknown => (
                 "UNKNOWN_ERROR",
                 format!("Unexpected provider error: {body}"),

@@ -45,11 +45,25 @@ pub struct AssistOffer {
 /// operators can explain any decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferRejection {
-    CapabilityMismatch { offered: String, wanted: String },
-    NotEnoughCpu { offered: u16, wanted: u16 },
-    NotEnoughRam { offered_mb: u64, wanted_mb: u64 },
-    StaleAdvertisement { max_age_secs: u64, sampled_ago_secs: u64 },
-    BusyQueue { queue_depth: u32 },
+    CapabilityMismatch {
+        offered: String,
+        wanted: String,
+    },
+    NotEnoughCpu {
+        offered: u16,
+        wanted: u16,
+    },
+    NotEnoughRam {
+        offered_mb: u64,
+        wanted_mb: u64,
+    },
+    StaleAdvertisement {
+        max_age_secs: u64,
+        sampled_ago_secs: u64,
+    },
+    BusyQueue {
+        queue_depth: u32,
+    },
     RecentFailure,
 }
 
@@ -62,11 +76,23 @@ impl std::fmt::Display for OfferRejection {
             Self::NotEnoughCpu { offered, wanted } => {
                 write!(f, "not enough CPU: offered {offered}, wanted {wanted}")
             }
-            Self::NotEnoughRam { offered_mb, wanted_mb } => {
-                write!(f, "not enough RAM: offered {offered_mb} MiB, wanted {wanted_mb} MiB")
+            Self::NotEnoughRam {
+                offered_mb,
+                wanted_mb,
+            } => {
+                write!(
+                    f,
+                    "not enough RAM: offered {offered_mb} MiB, wanted {wanted_mb} MiB"
+                )
             }
-            Self::StaleAdvertisement { max_age_secs, sampled_ago_secs } => {
-                write!(f, "stale advertisement: sampled {sampled_ago_secs}s ago, limit {max_age_secs}s")
+            Self::StaleAdvertisement {
+                max_age_secs,
+                sampled_ago_secs,
+            } => {
+                write!(
+                    f,
+                    "stale advertisement: sampled {sampled_ago_secs}s ago, limit {max_age_secs}s"
+                )
             }
             Self::BusyQueue { queue_depth } => write!(f, "worker busy: queue depth {queue_depth}"),
             Self::RecentFailure => write!(f, "peer has a recent unproven failure"),
@@ -84,10 +110,7 @@ pub const BUSY_QUEUE_DEPTH: u32 = 4;
 /// Deterministic hard-gate check + explanation. Trust is NOT re-checked
 /// here: the caller must pre-filter to trusted peers (trust is transport +
 /// admission policy, not a scoring concern).
-pub fn evaluate_offer(
-    offer: &AssistOffer,
-    request: &AssistRequest,
-) -> Result<(), OfferRejection> {
+pub fn evaluate_offer(offer: &AssistOffer, request: &AssistRequest) -> Result<(), OfferRejection> {
     if offer.capability != request.capability {
         return Err(OfferRejection::CapabilityMismatch {
             offered: offer.capability.clone(),
@@ -163,9 +186,7 @@ pub fn score_offer(offer: &AssistOffer, request: &AssistRequest) -> f32 {
     // without inventing a currency — this is priority-of-access arithmetic,
     // not money.
     let balance_bias = BALANCE_BIAS_MAX
-        * ((offer.contribution_balance as f64 / BALANCE_SATURATION)
-            .clamp(-2.0, 2.0))
-        .tanh() as f32;
+        * ((offer.contribution_balance as f64 / BALANCE_SATURATION).clamp(-2.0, 2.0)).tanh() as f32;
 
     // Weights: capacity fit dominates, freshness and queue break ties, the
     // fairness bias is deliberately the smallest voice.
@@ -241,16 +262,28 @@ mod tests {
         );
         o = offer("b");
         o.cpu_cores = 1;
-        assert!(matches!(evaluate_offer(&o, &r), Err(OfferRejection::NotEnoughCpu { .. })));
+        assert!(matches!(
+            evaluate_offer(&o, &r),
+            Err(OfferRejection::NotEnoughCpu { .. })
+        ));
         o = offer("b");
         o.ram_mb = 128;
-        assert!(matches!(evaluate_offer(&o, &r), Err(OfferRejection::NotEnoughRam { .. })));
+        assert!(matches!(
+            evaluate_offer(&o, &r),
+            Err(OfferRejection::NotEnoughRam { .. })
+        ));
         o = offer("b");
         o.sampled_ago_secs = 120;
-        assert!(matches!(evaluate_offer(&o, &r), Err(OfferRejection::StaleAdvertisement { .. })));
+        assert!(matches!(
+            evaluate_offer(&o, &r),
+            Err(OfferRejection::StaleAdvertisement { .. })
+        ));
         o = offer("b");
         o.queue_depth = 9;
-        assert!(matches!(evaluate_offer(&o, &r), Err(OfferRejection::BusyQueue { .. })));
+        assert!(matches!(
+            evaluate_offer(&o, &r),
+            Err(OfferRejection::BusyQueue { .. })
+        ));
         o = offer("b");
         o.has_recent_failure = true;
         assert_eq!(evaluate_offer(&o, &r), Err(OfferRejection::RecentFailure));

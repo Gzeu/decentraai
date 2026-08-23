@@ -8,8 +8,8 @@ use libp2p::PeerId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod dfcp;
-pub mod memory_sync;
 pub mod infer_protocol;
+pub mod memory_sync;
 
 pub use infer_protocol::{
     InferErrorCode, InferMessage, InferProgress, InferRequest, InferResponse, TaskPlacement,

@@ -268,9 +268,7 @@ impl RequestRouter {
                     final_response = Some(resp);
                 }
                 InferMessage::InferFailed {
-                    error,
-                    retryable,
-                    ..
+                    error, retryable, ..
                 } => {
                     tracker.remove(&request.request_id).await;
                     self.decrement_pending().await;
@@ -305,9 +303,7 @@ impl RequestRouter {
                             final_response = Some(resp);
                         }
                         InferMessage::InferFailed {
-                            error,
-                            retryable,
-                            ..
+                            error, retryable, ..
                         } => {
                             tracker.remove(&request.request_id).await;
                             self.decrement_pending().await;

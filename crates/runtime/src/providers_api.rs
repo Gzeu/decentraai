@@ -474,7 +474,9 @@ pub async fn providers_update_credential_handler(
                 "provider_credential_updated",
                 json!({ "provider_id": provider_id }),
             );
-            ok_json(json!({ "success": true, "provider_id": provider_id, "credential_fingerprint": fingerprint }))
+            ok_json(
+                json!({ "success": true, "provider_id": provider_id, "credential_fingerprint": fingerprint }),
+            )
         }
         Err(decentraai_providers::ProviderError::NotFound(_)) => not_found("provider not found"),
         Err(e) => bad(&e.to_string()),
@@ -678,15 +680,14 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
 }
 
 fn provider_error_response(e: &decentraai_providers::adapter::ProviderInferError) -> Response {
-    use decentraai_providers::adapter::ProviderInferError;
     use decentraai_providers::ProviderErrorClass;
+    use decentraai_providers::adapter::ProviderInferError;
 
     let (status, err_type, message) = match e {
         ProviderInferError::Timeout => {
             (StatusCode::GATEWAY_TIMEOUT, "timeout_error", e.to_string())
         }
-        ProviderInferError::PromptTooLarge
-        | ProviderInferError::OutputLimitExceeded => (
+        ProviderInferError::PromptTooLarge | ProviderInferError::OutputLimitExceeded => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             e.to_string(),
@@ -712,23 +713,17 @@ fn provider_error_response(e: &decentraai_providers::adapter::ProviderInferError
             "rate_limited_error",
             e.to_string(),
         ),
-        ProviderInferError::ProviderError(ProviderErrorClass::ModelUnavailable, _) => (
-            StatusCode::BAD_REQUEST,
-            "model_unavailable",
-            e.to_string(),
-        ),
+        ProviderInferError::ProviderError(ProviderErrorClass::ModelUnavailable, _) => {
+            (StatusCode::BAD_REQUEST, "model_unavailable", e.to_string())
+        }
         ProviderInferError::ProviderError(ProviderErrorClass::Upstream, _)
         | ProviderInferError::Transport(_)
-        | ProviderInferError::Protocol(_) => (
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            e.to_string(),
-        ),
-        ProviderInferError::ProviderError(ProviderErrorClass::Policy, _) => (
-            StatusCode::FORBIDDEN,
-            "policy_denied",
-            e.to_string(),
-        ),
+        | ProviderInferError::Protocol(_) => {
+            (StatusCode::BAD_GATEWAY, "upstream_error", e.to_string())
+        }
+        ProviderInferError::ProviderError(ProviderErrorClass::Policy, _) => {
+            (StatusCode::FORBIDDEN, "policy_denied", e.to_string())
+        }
         _ => (StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
     };
     (

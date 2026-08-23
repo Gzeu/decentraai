@@ -30,7 +30,9 @@
 //!   evidence trail (object ids + vote results) so it can be re-audited.
 
 use crate::knowledge::{KnowledgeObject, evidence_confidence};
-use crate::verification::{ConsensusPolicy, ConsensusResult, VerificationVerdict, evaluate_consensus};
+use crate::verification::{
+    ConsensusPolicy, ConsensusResult, VerificationVerdict, evaluate_consensus,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -150,10 +152,13 @@ pub fn decide_collectively(
         .iter()
         .map(|o| {
             let confidence = evidence_confidence(o);
-            let backed = o
-                .evidence
-                .iter()
-                .any(|e| matches!(e.kind, crate::knowledge::EvidenceKind::VerifiedExecution | crate::knowledge::EvidenceKind::Consensus));
+            let backed = o.evidence.iter().any(|e| {
+                matches!(
+                    e.kind,
+                    crate::knowledge::EvidenceKind::VerifiedExecution
+                        | crate::knowledge::EvidenceKind::Consensus
+                )
+            });
             ConsensusResult {
                 agent_id: o.author_agent.clone(),
                 agrees: backed || confidence > 0.0,
@@ -199,7 +204,8 @@ impl DecisionRegistry {
                 id: decision.decision_id,
             });
         }
-        self.decisions.insert(decision.decision_id.clone(), decision);
+        self.decisions
+            .insert(decision.decision_id.clone(), decision);
         Ok(())
     }
 
@@ -334,8 +340,15 @@ mod tests {
             agreement_threshold: 0.5,
             require_schema: false,
         };
-        let d = decide_collectively("d1", "fact", "a:coord", 1, &[verified_obj("k1", "x")], &policy)
-            .unwrap();
+        let d = decide_collectively(
+            "d1",
+            "fact",
+            "a:coord",
+            1,
+            &[verified_obj("k1", "x")],
+            &policy,
+        )
+        .unwrap();
         reg.add(d.clone()).unwrap();
         assert!(reg.add(d).is_err());
         assert_eq!(reg.len(), 1);

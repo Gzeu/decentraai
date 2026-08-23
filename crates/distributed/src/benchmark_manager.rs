@@ -31,9 +31,8 @@ use crate::evidence_manager::EvidenceManager;
 
 /// Boxed future returned by [`BenchmarkInference::execute`] (avoids repeating
 /// the complex type in every implementation).
-pub type InferenceFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(String, u64, u64)>> + Send + 'a>,
->;
+pub type InferenceFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, u64, u64)>> + Send + 'a>>;
 
 /// The inference surface the lab needs: one generation from a prompt,
 /// returning `(output_text, tokens, latency_ms)`. Implemented by the live
@@ -113,7 +112,10 @@ pub struct BenchmarkManager {
 }
 
 impl BenchmarkManager {
-    pub fn new(executor: Arc<dyn BenchmarkInference>, evidence: Option<Arc<EvidenceManager>>) -> Self {
+    pub fn new(
+        executor: Arc<dyn BenchmarkInference>,
+        evidence: Option<Arc<EvidenceManager>>,
+    ) -> Self {
         Self {
             registry: Arc::new(Mutex::new(BenchmarkRegistry::new())),
             executor,
@@ -179,32 +181,28 @@ impl BenchmarkManager {
         let mut verdict = BenchmarkVerdict::Abstained;
 
         match mode {
-            BenchmarkMode::Single => {
-                match self.executor.execute(&task.prompt, &[]).await {
-                    Ok((text, t, l)) => {
-                        output = text;
-                        tokens = t;
-                        latency = l;
-                        verdict = decentraai_agents::grade_answer(&output, task.gold.as_deref());
-                    }
-                    Err(e) => {
-                        output = format!("execution error: {e}");
-                    }
+            BenchmarkMode::Single => match self.executor.execute(&task.prompt, &[]).await {
+                Ok((text, t, l)) => {
+                    output = text;
+                    tokens = t;
+                    latency = l;
+                    verdict = decentraai_agents::grade_answer(&output, task.gold.as_deref());
                 }
-            }
-            BenchmarkMode::Rag => {
-                match self.executor.execute(&task.prompt, &task.evidence).await {
-                    Ok((text, t, l)) => {
-                        output = text;
-                        tokens = t;
-                        latency = l;
-                        verdict = decentraai_agents::grade_answer(&output, task.gold.as_deref());
-                    }
-                    Err(e) => {
-                        output = format!("execution error: {e}");
-                    }
+                Err(e) => {
+                    output = format!("execution error: {e}");
                 }
-            }
+            },
+            BenchmarkMode::Rag => match self.executor.execute(&task.prompt, &task.evidence).await {
+                Ok((text, t, l)) => {
+                    output = text;
+                    tokens = t;
+                    latency = l;
+                    verdict = decentraai_agents::grade_answer(&output, task.gold.as_deref());
+                }
+                Err(e) => {
+                    output = format!("execution error: {e}");
+                }
+            },
             BenchmarkMode::Collective => {
                 let count = agents.max(2);
                 let mut answers: Vec<(String, u64, u64)> = Vec::new();
@@ -372,7 +370,10 @@ mod tests {
     impl MockInference {
         fn new(answers: &[(&str, &str)]) -> Self {
             Self {
-                answers: answers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                answers: answers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
                 calls: Arc::new(AtomicU32::new(0)),
                 flaky: 0,
             }
@@ -386,11 +387,7 @@ mod tests {
     }
 
     impl BenchmarkInference for MockInference {
-        fn execute<'a>(
-            &'a self,
-            prompt: &'a str,
-            evidence: &'a [String],
-        ) -> InferenceFuture<'a> {
+        fn execute<'a>(&'a self, prompt: &'a str, evidence: &'a [String]) -> InferenceFuture<'a> {
             Box::pin(async move {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 let flaky = self.flaky > 0 && n < self.flaky;
@@ -401,19 +398,29 @@ mod tests {
                     prompt.to_string()
                 } else {
                     // RAG prompt format: "Evidence:\n- …\n\nQuestion: Q"
-                    prompt.rsplit("Question: ").next().unwrap_or(prompt).to_string()
+                    prompt
+                        .rsplit("Question: ")
+                        .next()
+                        .unwrap_or(prompt)
+                        .to_string()
                 };
                 let out = if flaky {
                     "wrong".to_string()
                 } else {
-                    self.answers.get(&key).cloned().unwrap_or_else(|| "wrong".to_string())
+                    self.answers
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| "wrong".to_string())
                 };
                 Ok((out, 100, 50))
             })
         }
     }
 
-    fn manager_with(mock: MockInference, evidence: Option<Arc<EvidenceManager>>) -> BenchmarkManager {
+    fn manager_with(
+        mock: MockInference,
+        evidence: Option<Arc<EvidenceManager>>,
+    ) -> BenchmarkManager {
         BenchmarkManager::new(Arc::new(mock), evidence)
     }
 
@@ -424,7 +431,8 @@ mod tests {
         let mgr = manager_with(mock, Some(ev.clone()));
         let task = BenchmarkTask::new("t1", "What is 2+2?", "4");
 
-        let run = futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
+        let run =
+            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
         assert_eq!(run.verdict, BenchmarkVerdict::Correct);
         assert_eq!(run.mode, BenchmarkMode::Single);
         assert_eq!(mgr.registry().lock().unwrap().runs().len(), 1);
@@ -443,7 +451,8 @@ mod tests {
         let mock = MockInference::new(&[("Q?", "paris")]);
         let mgr = manager_with(mock.clone(), None);
         let task = BenchmarkTask::new("t1", "Q?", "paris");
-        let run = futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
+        let run =
+            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
         assert_eq!(run.verdict, BenchmarkVerdict::Correct);
         assert_eq!(mock.calls.load(Ordering::SeqCst), 3);
 
@@ -451,7 +460,8 @@ mod tests {
         // "wrong", so use a real word).
         let bad = MockInference::new(&[]);
         let mgr = manager_with(bad, None);
-        let run = futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
+        let run =
+            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Collective, 3)).unwrap();
         assert_eq!(run.verdict, BenchmarkVerdict::Incorrect);
     }
 
@@ -469,7 +479,8 @@ mod tests {
         let mock = MockInference::new(&[]);
         let mgr = manager_with(mock, None);
         let task = BenchmarkTask::ungradable("t1", "Q?");
-        let run = futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
+        let run =
+            futures::executor::block_on(mgr.run_task(&task, BenchmarkMode::Single, 1)).unwrap();
         assert_eq!(run.verdict, BenchmarkVerdict::Abstained);
     }
 

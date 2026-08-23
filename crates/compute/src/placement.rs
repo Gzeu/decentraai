@@ -146,7 +146,11 @@ pub fn plan_placement(
     let selected: Vec<String> = candidates
         .iter()
         .filter(|c| c.rejected_reason.is_none())
-        .take(if strategy == ExecutionStrategy::SingleWorker { 1 } else { usize::MAX })
+        .take(if strategy == ExecutionStrategy::SingleWorker {
+            1
+        } else {
+            usize::MAX
+        })
         .map(|c| c.worker_id.clone())
         .collect();
     let rejected: Vec<RejectedCandidate> = candidates
@@ -157,7 +161,10 @@ pub fn plan_placement(
             reason: c.rejected_reason.clone().unwrap_or_default(),
         })
         .collect();
-    let network_cost: f64 = candidates.iter().filter_map(|c| c.rtt_ms.map(f64::from)).sum();
+    let network_cost: f64 = candidates
+        .iter()
+        .filter_map(|c| c.rtt_ms.map(f64::from))
+        .sum();
     let expected_resource_cost: f64 = requirements.min_vram_mb as f64
         + requirements.min_ram_mb as f64
         + (requirements.context_tokens as f64) / 1000.0;
@@ -302,7 +309,8 @@ impl PlacementEngine {
         if self.allow_distributed {
             let node_count = graph.compute.nodes().len();
             for size in 2..=node_count.min(4) {
-                if let Some((group, _)) = graph.compute.candidate_groups(req, size).into_iter().next()
+                if let Some((group, _)) =
+                    graph.compute.candidate_groups(req, size).into_iter().next()
                 {
                     let network_cost = graph.group_score(&group, req);
                     return PlacementPlan {
@@ -387,11 +395,20 @@ impl PlacementEngine {
             + w.w_trust * if node.trusted { 1.0 } else { 0.0 }
             + w.w_health * if node.healthy { 1.0 } else { 0.0 }
             + w.w_load * self.load_fitness(node)
-            + w.w_model * if node.has_model(&req.model_id) { 1.0 } else { 0.0 }
+            + w.w_model
+                * if node.has_model(&req.model_id) {
+                    1.0
+                } else {
+                    0.0
+                }
             + w.w_headroom * self.headroom(node, req)
     }
 
-    fn compute_fitness(&self, node: &crate::fabric_graph::FabricNode, req: &ModelRequirements) -> f64 {
+    fn compute_fitness(
+        &self,
+        node: &crate::fabric_graph::FabricNode,
+        req: &ModelRequirements,
+    ) -> f64 {
         let vram = node.total_vram_mb() as f64;
         let ram = node.total_ram_mb() as f64;
         let need_vram = req.min_vram_mb.max(1) as f64;
@@ -400,9 +417,17 @@ impl PlacementEngine {
         ((vram / need_vram).min(3.0) + (ram / need_ram).min(3.0)) / 6.0
     }
 
-    fn network_fitness(&self, node: &crate::fabric_graph::FabricNode, graph: &crate::fabric_graph::FabricGraph) -> f64 {
+    fn network_fitness(
+        &self,
+        node: &crate::fabric_graph::FabricNode,
+        graph: &crate::fabric_graph::FabricGraph,
+    ) -> f64 {
         let rtt_ms = node.link.as_ref().map(|l| l.rtt_us / 1000).unwrap_or(0);
-        let reach = graph.links.get(&node.peer_id).map(|l| l.reach_cost_ms(1)).unwrap_or(0);
+        let reach = graph
+            .links
+            .get(&node.peer_id)
+            .map(|l| l.reach_cost_ms(1))
+            .unwrap_or(0);
         let total_ms = rtt_ms.max(reach) as f64;
         // 1.0 at loopback, decaying toward 0 as reach grows.
         1.0 / (1.0 + total_ms / 1000.0)
@@ -531,8 +556,8 @@ mod tests {
 
     #[test]
     fn placement_engine_picks_single_capable_worker() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         let mut graph = FabricGraph::new();
         let mut node = FabricNode {
@@ -584,8 +609,8 @@ mod tests {
     /// bias is bounded, so a decisively worse capacity fit still loses.
     #[test]
     fn placement_engine_fairness_bias_breaks_ties_only() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         fn node(peer: &str, balance: i64) -> FabricNode {
             FabricNode {
@@ -659,8 +684,8 @@ mod tests {
 
     #[test]
     fn placement_engine_rejects_untrusted_with_reason() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         let mut graph = FabricGraph::new();
         let node = FabricNode {
@@ -700,11 +725,16 @@ mod tests {
     }
 
     #[test]
-    fn placement_engine_falls_back_to_distributed_group() {        use crate::fabric_graph::{FabricGraph, FabricNode};
+    fn placement_engine_falls_back_to_distributed_group() {
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         let mut graph = FabricGraph::new();
-        for (peer, vram) in [("peer-a", 24_000u64), ("peer-b", 24_000u64), ("peer-c", 24_000u64)] {
+        for (peer, vram) in [
+            ("peer-a", 24_000u64),
+            ("peer-b", 24_000u64),
+            ("peer-c", 24_000u64),
+        ] {
             graph.upsert(FabricNode {
                 peer_id: peer.to_string(),
                 node_name: peer.to_string(),
@@ -737,14 +767,18 @@ mod tests {
         };
         let engine = PlacementEngine::default();
         let plan = engine.plan(&req, &graph);
-        assert_eq!(plan.selected_workers.len(), 3, "three workers must be selected");
+        assert_eq!(
+            plan.selected_workers.len(),
+            3,
+            "three workers must be selected"
+        );
         assert_eq!(plan.execution_mode, "distributed");
     }
 
     #[test]
     fn multi_gpu_node_satisfies_min_gpu_count() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         let mut graph = FabricGraph::new();
         let mut gpu = GpuSpec::simple("A6000", 48_000, "nvidia");
@@ -757,7 +791,7 @@ mod tests {
             trusted: true,
             healthy: true,
             accepts_remote: true,
-                contribution_balance: 0,
+            contribution_balance: 0,
             capability: ComputeCapability {
                 cpu_cores: 16,
                 ram_mb: 128_000,
@@ -795,8 +829,8 @@ mod tests {
 
     #[test]
     fn single_gpu_node_rejected_for_min_gpu_count_2() {
-        use crate::fabric_graph::{FabricGraph, FabricNode};
         use crate::capability::{ComputeCapability, GpuSpec};
+        use crate::fabric_graph::{FabricGraph, FabricNode};
 
         let mut graph = FabricGraph::new();
         graph.upsert(FabricNode {
@@ -806,7 +840,7 @@ mod tests {
             trusted: true,
             healthy: true,
             accepts_remote: true,
-                contribution_balance: 0,
+            contribution_balance: 0,
             capability: ComputeCapability {
                 cpu_cores: 8,
                 ram_mb: 64_000,

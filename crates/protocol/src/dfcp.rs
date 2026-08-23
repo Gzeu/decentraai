@@ -104,7 +104,12 @@ pub struct ResourceRequest {
 }
 
 impl ResourceRequest {
-    pub fn new(capability: impl Into<String>, cpu_cores: u16, ram_mb: u64, max_lease_seconds: u64) -> Self {
+    pub fn new(
+        capability: impl Into<String>,
+        cpu_cores: u16,
+        ram_mb: u64,
+        max_lease_seconds: u64,
+    ) -> Self {
         Self {
             protocol_version: DFCP_VERSION,
             request_id: ResourceRequestId::new(),
@@ -139,7 +144,12 @@ pub struct ResourceOffer {
 }
 
 impl ResourceOffer {
-    pub fn answering(request: &ResourceRequest, cpu_cores: u16, ram_mb: u64, lease_seconds: u64) -> Self {
+    pub fn answering(
+        request: &ResourceRequest,
+        cpu_cores: u16,
+        ram_mb: u64,
+        lease_seconds: u64,
+    ) -> Self {
         Self {
             protocol_version: DFCP_VERSION,
             offer_id: ResourceOfferId::new(),
@@ -197,7 +207,11 @@ pub struct AssistTaskAssign {
 }
 
 impl AssistTaskAssign {
-    pub fn new(reservation_id: ReservationId, capability: impl Into<String>, payload: Vec<u8>) -> Self {
+    pub fn new(
+        reservation_id: ReservationId,
+        capability: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             protocol_version: DFCP_VERSION,
             assignment_id: AssignmentId::new(),

@@ -83,7 +83,11 @@ fn real_corpus_replays_through_unified_selector() {
             }
             match serde_json::from_str::<GoldenCase>(line) {
                 Ok(c) => cases.push(c),
-                Err(e) => panic!("corpus {} line {} is not a valid GoldenCase: {e}", f.display(), i + 1),
+                Err(e) => panic!(
+                    "corpus {} line {} is not a valid GoldenCase: {e}",
+                    f.display(),
+                    i + 1
+                ),
             }
         }
     }
@@ -172,7 +176,10 @@ fn real_corpus_replays_through_unified_selector() {
         "  full-fidelity replays: {}\n  structure-only (not-comparable): {}\n",
         total_compared, structure_only
     ));
-    rpt.push_str(&format!("  continuation / KV-locality cases: {}\n", n_continuation));
+    rpt.push_str(&format!(
+        "  continuation / KV-locality cases: {}\n",
+        n_continuation
+    ));
     rpt.push_str("--- divergence classification ---\n");
     rpt.push_str(&format!(
         "  genuine-regression: {}\n  expected-semantic (reserved!=selected, by design): {}\n  not-comparable (missing link graph -> 'net' term unreproducible): {}\n",

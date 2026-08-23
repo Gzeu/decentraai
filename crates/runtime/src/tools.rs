@@ -172,7 +172,13 @@ impl OcrServer {
         let dir = data_dir.join("tools").join("ocr");
         let venv_python = dir.join("venv").join("bin").join("python");
         let args = vec!["--lang".to_string(), "en".to_string()];
-        let server = ToolServer::start(&dir, &venv_python, OCR_SERVER_PY, &args, "scripts/setup-ocr.sh")?;
+        let server = ToolServer::start(
+            &dir,
+            &venv_python,
+            OCR_SERVER_PY,
+            &args,
+            "scripts/setup-ocr.sh",
+        )?;
         let port = server.port();
         if let Err(e) = wait_until_ready("127.0.0.1", port, Duration::from_secs(120)).await {
             let _ = server.stop().await;
@@ -212,7 +218,10 @@ impl OcrManager {
     pub fn healthy(&self) -> bool {
         self.server
             .as_ref()
-            .map(|_| super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port()).is_ok())
+            .map(|_| {
+                super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port())
+                    .is_ok()
+            })
             .unwrap_or(false)
     }
 }
@@ -235,7 +244,13 @@ impl SttServer {
         let dir = data_dir.join("tools").join("stt");
         let venv_python = dir.join("venv").join("bin").join("python");
         let args = vec!["--model".to_string(), model.to_string()];
-        let server = ToolServer::start(&dir, &venv_python, STT_SERVER_PY, &args, "scripts/setup-stt.sh")?;
+        let server = ToolServer::start(
+            &dir,
+            &venv_python,
+            STT_SERVER_PY,
+            &args,
+            "scripts/setup-stt.sh",
+        )?;
         let port = server.port();
         if let Err(e) = wait_until_ready("127.0.0.1", port, Duration::from_secs(120)).await {
             let _ = server.stop().await;
@@ -279,7 +294,10 @@ impl SttManager {
     pub fn healthy(&self) -> bool {
         self.server
             .as_ref()
-            .map(|_| super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port()).is_ok())
+            .map(|_| {
+                super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port())
+                    .is_ok()
+            })
             .unwrap_or(false)
     }
 }
@@ -365,7 +383,10 @@ impl HfSkillsManager {
     pub fn healthy(&self) -> bool {
         self.server
             .as_ref()
-            .map(|_| super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port()).is_ok())
+            .map(|_| {
+                super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port())
+                    .is_ok()
+            })
             .unwrap_or(false)
     }
 }

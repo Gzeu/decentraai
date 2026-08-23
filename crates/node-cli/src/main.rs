@@ -1670,7 +1670,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(saved) = decentraai_compute::QuotaLedger::load_snapshot(&quota_snapshot_path) {
             let mut guard = ledger.lock().expect("quota ledger mutex poisoned");
             guard.restore(saved);
-            tracing::info!("restored quota ledger from {}", quota_snapshot_path.display());
+            tracing::info!(
+                "restored quota ledger from {}",
+                quota_snapshot_path.display()
+            );
         }
     }
     {
@@ -1824,9 +1827,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // Benchmark Lab shares it: benchmark runs feed `EvidenceFamily::Benchmark`
     // entries so the fabric's lessons include lab results. The index itself
     // syncs lazily from the live sources at request time.
-    let evidence_rag = Arc::new(decentraai_distributed::evidence_manager::EvidenceManager::new(
-        embedding_client.clone(),
-    ));
+    let evidence_rag = Arc::new(
+        decentraai_distributed::evidence_manager::EvidenceManager::new(embedding_client.clone()),
+    );
     // Tool Runtime managers are created at most once and shared by the agent
     // executors (as real tool bindings) and the API (as /v1/<tool> proxies).
     let mut ocr_manager: Option<OcrManager> = None;
@@ -1835,15 +1838,15 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // DecentraAI Benchmark Lab: populated when an inference executor exists
     // (worker with a servable model). The lab runs single/RAG/collective
     // tasks through the real executor and feeds evidence.
-    let mut benchmark_manager: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>> =
-        None;
+    let mut benchmark_manager: Option<
+        Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>,
+    > = None;
     if is_worker && !model_hash.is_empty() {
         // Tool Runtime: spawn OCR/STT/HF-skills subprocesses BEFORE the agent
         // executors so the real tool bindings (name + description + loopback
         // URL) can be attached to the executor. Missing setups fail graceful —
         // the node runs without the tool and logs a warning.
-        (ocr_manager, stt_manager, skills_manager) =
-            spawn_tool_runtimes(&config, &data_dir).await;
+        (ocr_manager, stt_manager, skills_manager) = spawn_tool_runtimes(&config, &data_dir).await;
         // Real tool bindings for the agent executor — only for tools that are
         // actually online (spawn succeeded). The model is told about them and
         // may emit a [TOOL_CALL] block; the executor runs the tool and re-asks.
@@ -1877,13 +1880,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         "translate_en_ro" => "translates English to Romanian (input: text)",
                         other => return Err(anyhow::anyhow!("unknown skill '{other}'")),
                     };
-                    tool_bindings.push(
-                        decentraai_distributed::tool_calling::ToolBinding::new(
-                            skill.clone(),
-                            desc,
-                            format!("{base}/v1/skills/{skill}"),
-                        ),
-                    );
+                    tool_bindings.push(decentraai_distributed::tool_calling::ToolBinding::new(
+                        skill.clone(),
+                        desc,
+                        format!("{base}/v1/skills/{skill}"),
+                    ));
                 }
             }
         }
@@ -2247,15 +2248,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(compute_manager.clone()),
             Some(distributed.p2p_node().clone()),
         );
-                state.set_dashboard(config.node.dashboard);
+        state.set_dashboard(config.node.dashboard);
         // Fabric Intelligence: reasoning layer between a task and the
         // deterministic planner. Opt-in via config; disabled/absent = no-op.
         if let Some(intel_cfg) = config.fabric_intelligence.as_ref() {
             if intel_cfg.enabled {
                 state.attach_intel(std::sync::Arc::new(
-                    decentraai_fabric_intelligence::FabricIntelligence::from_config(
-                        intel_cfg
-                    ),
+                    decentraai_fabric_intelligence::FabricIntelligence::from_config(intel_cfg),
                 ));
             }
         }
@@ -2264,9 +2263,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(intel_cfg) = config.fabric_intelligence.as_ref() {
             if intel_cfg.enabled {
                 state.attach_intel(std::sync::Arc::new(
-                    decentraai_fabric_intelligence::FabricIntelligence::from_config(
-                        intel_cfg
-                    ),
+                    decentraai_fabric_intelligence::FabricIntelligence::from_config(intel_cfg),
                 ));
             }
         }
@@ -2292,19 +2289,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             cpu_percent_high: auto.thresholds.cpu_percent_high,
                             ram_percent_high: auto.thresholds.ram_percent_high,
                         };
-                    let mut state_machine =
-                        decentraai_compute::pressure::AssistState::Normal;
+                    let mut state_machine = decentraai_compute::pressure::AssistState::Normal;
                     let mut last_fired: Option<std::time::Instant> = None;
                     loop {
                         tokio::time::sleep(Duration::from_secs(auto.tick_seconds)).await;
                         // Honest signals only, measured by the API state itself.
                         let signals = state_auto.pressure_signals().await;
-                        let (new_state, decision) =
-                            decentraai_compute::pressure::evaluate(
-                                &signals,
-                                &thresholds,
-                                state_machine,
-                            );
+                        let (new_state, decision) = decentraai_compute::pressure::evaluate(
+                            &signals,
+                            &thresholds,
+                            state_machine,
+                        );
                         state_machine = new_state;
                         tracing::info!(
                             score = format_args!("{:.2}", decision.score),
@@ -2335,19 +2330,18 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         // Lease = min(cooldown, 120s): an autonomous assist is a
                         // probe-scale task, not a long-running lease.
                         let lease = auto.cooldown_seconds.min(120);
-                        let outcome =
-                            decentraai_runtime::intel_assist::run_assist_request(
-                                &p2p_auto,
-                                peers,
-                                decentraai_compute::assist::AssistRequest {
-                                    capability: profile.capability.clone(),
-                                    cpu_cores: 2,
-                                    ram_mb: 512,
-                                },
-                                payload_bytes,
-                                lease,
-                            )
-                            .await;
+                        let outcome = decentraai_runtime::intel_assist::run_assist_request(
+                            &p2p_auto,
+                            peers,
+                            decentraai_compute::assist::AssistRequest {
+                                capability: profile.capability.clone(),
+                                cpu_cores: 2,
+                                ram_mb: 512,
+                            },
+                            payload_bytes,
+                            lease,
+                        )
+                        .await;
                         tracing::info!(
                             success = outcome.0,
                             explanation = %outcome.2,
@@ -2361,13 +2355,12 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // owner limits when configured; disabled by default.
         if let Some(assist_cfg) = config.sharing.assist.as_ref() {
             if assist_cfg.enabled {
-                let worker_state = std::sync::Arc::new(
-                    decentraai_runtime::intel_assist::AssistWorkerState::new(
+                let worker_state =
+                    std::sync::Arc::new(decentraai_runtime::intel_assist::AssistWorkerState::new(
                         std::sync::Arc::new(assist_cfg.clone()),
                         backend_url.clone(),
                         vec![], // empty = any TRUSTED peer may request
-                    ),
-                );
+                    ));
                 let p2p_for_worker = distributed.p2p_node().clone();
                 let sender_p2p = p2p_for_worker.clone();
                 let send_to_peer: decentraai_runtime::intel_assist::PeerSender =
@@ -2380,12 +2373,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         });
                     });
                 let mut p2p_mut = p2p_for_worker.clone();
-                p2p_mut.set_on_dfcp(
-                    decentraai_runtime::intel_assist::attach_dfcp_worker(
-                        std::sync::Arc::clone(&worker_state),
-                        send_to_peer,
-                    ),
-                );
+                p2p_mut.set_on_dfcp(decentraai_runtime::intel_assist::attach_dfcp_worker(
+                    std::sync::Arc::clone(&worker_state),
+                    send_to_peer,
+                ));
                 // Keep the live engine URL fresh for assist execution.
                 {
                     let ws = worker_state.clone();
@@ -2417,7 +2408,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 let p2p_for_prop = distributed.p2p_node().clone();
                 let local = local_peer_id.to_string();
                 tokio::spawn(async move {
-                    let cfg = decentraai_distributed::memory_propagator::PropagationConfig::default();
+                    let cfg =
+                        decentraai_distributed::memory_propagator::PropagationConfig::default();
                     loop {
                         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
                         match decentraai_distributed::memory_propagator::propagate_once(
@@ -2536,9 +2528,18 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 let mut rejected = 0u32;
                 for se in req.entries {
                     let entry = sync_entry_to_memory(se, &req.scope);
-                    match store.write_checked(&req.scope, &entry, "memory-sync", false, false, false) {
+                    match store.write_checked(
+                        &req.scope,
+                        &entry,
+                        "memory-sync",
+                        false,
+                        false,
+                        false,
+                    ) {
                         Ok(decentraai_agents::memory::WriteOutcome::Stored) => accepted += 1,
-                        Ok(decentraai_agents::memory::WriteOutcome::Duplicate { .. }) => duplicates += 1,
+                        Ok(decentraai_agents::memory::WriteOutcome::Duplicate { .. }) => {
+                            duplicates += 1
+                        }
                         Ok(decentraai_agents::memory::WriteOutcome::CompetingClaim { .. }) => {
                             accepted += 1;
                             conflicts_linked += 1;
@@ -3996,7 +3997,7 @@ fn invite(args: InviteArgs) -> Result<()> {
 fn receipt_command(command: ReceiptCommand) -> Result<()> {
     use decentraai_agents::receipt::{ReceiptVerdict, VerifiedComputeReceipt};
     use decentraai_agents::signed_receipt::{
-        canonicalize_receipt, sign_receipt, verify_receipt_signature, SignedComputeReceipt,
+        SignedComputeReceipt, canonicalize_receipt, sign_receipt, verify_receipt_signature,
     };
     use decentraai_config::NodeConfig;
     use decentraai_identity::Identity;
@@ -4477,9 +4478,7 @@ async fn intel_command(command: IntelCommand) -> Result<()> {
             let cfg = decentraai_config::NodeConfig::load(&path)
                 .map_err(|e| anyhow::anyhow!("config {}: {e}", path.display()))?;
             println!("intelligence providers:");
-            println!(
-                "  local llama.cpp backend — available when the node is serving"
-            );
+            println!("  local llama.cpp backend — available when the node is serving");
             if let Some(ext) = cfg
                 .fabric_intelligence
                 .as_ref()
@@ -4507,7 +4506,10 @@ async fn intel_command(command: IntelCommand) -> Result<()> {
             if let Some(t) = token.as_deref().filter(|t| !t.is_empty()) {
                 req = req.bearer_auth(t);
             }
-            let res = req.send().await.map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+            let res = req
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
             let status = res.status();
             let body: serde_json::Value = res.json().await.unwrap_or_default();
             println!("POST {url} → HTTP {status}");
@@ -4651,7 +4653,10 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
             let run = &j["run"];
             let verdict = run.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
             let metrics = &run["metrics"];
-            let latency = metrics.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let latency = metrics
+                .get("latency_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let tokens = metrics.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             println!("verdict: {verdict} ({latency}ms, {tokens} tokens)");
             let output = run.get("output").and_then(|v| v.as_str()).unwrap_or("");
@@ -4926,10 +4931,17 @@ fn print_bench_comparison(j: &serde_json::Value) {
             format!("{:.0}%", acc * 100.0)
         }
     };
-    println!("  PAIRED (shared tasks)  : single {}   collective: {}",
-        pct(&cmp["single"]), pct(&cmp["collective"]));
-    println!("  global (all runs)      : single {}   rag: {}   collective: {}",
-        pct(&global["single"]), pct(&global["rag"]), pct(&global["collective"]));
+    println!(
+        "  PAIRED (shared tasks)  : single {}   collective: {}",
+        pct(&cmp["single"]),
+        pct(&cmp["collective"])
+    );
+    println!(
+        "  global (all runs)      : single {}   rag: {}   collective: {}",
+        pct(&global["single"]),
+        pct(&global["rag"]),
+        pct(&global["collective"])
+    );
     let verdict = cmp
         .get("collective_beats_single")
         .and_then(|v| v.as_bool())
