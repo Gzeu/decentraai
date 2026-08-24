@@ -323,28 +323,95 @@ async fn execute_capability(
         }
         // Chat/text generation: standard OpenAI-shaped completion against the
         // worker's served model. Payload is forwarded as-is.
+        //
+        // Batch form: when the payload carries an `inputs` array, the worker
+        // runs each prompt through the chat backend and returns a
+        // `{"responses":[content,...]}` array. This lets ONE DFCP negotiation
+        // carry many prompts, amortising per-task overhead.
         "chat" | "text_generation" => {
             let body: serde_json::Value = match serde_json::from_slice(payload) {
                 Ok(v) => v,
                 Err(e) => return (false, Vec::new(), Some(format!("bad payload: {e}"))),
             };
-            let res = state
-                .http
-                .post(format!("{base}/v1/chat/completions"))
-                .json(&body)
-                .send()
-                .await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    let body_bytes = r.bytes().await.unwrap_or_default();
-                    (true, body_bytes.to_vec(), None)
+            if let Some(inputs) = body.get("inputs").and_then(|v| v.as_array()) {
+                let model = body.get("model").cloned().unwrap_or(serde_json::Value::Null);
+                let max_tokens = body
+                    .get("max_tokens")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let mut responses: Vec<serde_json::Value> = Vec::new();
+                let mut failed = false;
+                for inp in inputs {
+                    let prompt = inp.as_str().unwrap_or("");
+                    let chat_body = serde_json::json!({
+                        "model": model,
+                        "messages": [{"role":"user","content": prompt}],
+                        "max_tokens": max_tokens,
+                    });
+                    let res = state
+                        .http
+                        .post(format!("{base}/v1/chat/completions"))
+                        .json(&chat_body)
+                        .send()
+                        .await;
+                    match res {
+                        Ok(r) if r.status().is_success() => {
+                            let b = r.bytes().await.unwrap_or_default();
+                            let content = serde_json::from_slice::<serde_json::Value>(&b)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("choices")
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|c| c.first())
+                                        .and_then(|ch| ch.get("message"))
+                                        .and_then(|m| m.get("content"))
+                                        .cloned()
+                                        .or_else(|| {
+                                            serde_json::from_slice::<serde_json::Value>(&b)
+                                                .ok()
+                                                .and_then(|v| {
+                                                    v.get("choices")
+                                                        .and_then(|c| c.as_array())
+                                                        .and_then(|c| c.first())
+                                                        .and_then(|ch| ch.get("text"))
+                                                        .cloned()
+                                                })
+                                        })
+                                })
+                                .unwrap_or(serde_json::Value::Null);
+                            responses.push(content);
+                        }
+                        _ => {
+                            responses.push(serde_json::Value::Null);
+                            failed = true;
+                        }
+                    }
                 }
-                Ok(r) => (
-                    false,
-                    Vec::new(),
-                    Some(format!("backend HTTP {}", r.status())),
-                ),
-                Err(e) => (false, Vec::new(), Some(format!("backend unreachable: {e}"))),
+                (
+                    !failed,
+                    serde_json::to_vec(&serde_json::json!({ "responses": responses }))
+                        .unwrap_or_default(),
+                    if failed { Some("some batch prompts failed".into()) } else { None },
+                )
+            } else {
+                let res = state
+                    .http
+                    .post(format!("{base}/v1/chat/completions"))
+                    .json(&body)
+                    .send()
+                    .await;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        let body_bytes = r.bytes().await.unwrap_or_default();
+                        (true, body_bytes.to_vec(), None)
+                    }
+                    Ok(r) => (
+                        false,
+                        Vec::new(),
+                        Some(format!("backend HTTP {}", r.status())),
+                    ),
+                    Err(e) => (false, Vec::new(), Some(format!("backend unreachable: {e}"))),
+                }
             }
         }
         other => (

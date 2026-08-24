@@ -8026,6 +8026,91 @@ async fn pool_bench_handler(
                     }
                 }
 
+                // ---- Chat BATCH for remote workers -------------------------
+                // Same idea as embeddings: one DFCP negotiation carries many
+                // prompts (payload inputs=[...]); the worker runs each through
+                // its chat backend and returns {"responses":[content,...]}.
+                // Chat is slow, so the win is amortising the negotiation, not
+                // the model time.
+                const CHAT_BATCH: usize = 4;
+                if capability_c == "chat" && matches!(target_c, PoolWorkerTarget::Peer(_)) {
+                    if let PoolWorkerTarget::Peer(peer) = &target_c {
+                        let mut chunks: Vec<Vec<usize>> = Vec::new();
+                        let mut chunk = Vec::new();
+                        for &i in &indexes {
+                            chunk.push(i);
+                            if chunk.len() >= CHAT_BATCH {
+                                chunks.push(std::mem::take(&mut chunk));
+                            }
+                        }
+                        if !chunk.is_empty() {
+                            chunks.push(chunk);
+                        }
+                        for batch in chunks {
+                            let prompts: Vec<String> =
+                                batch.iter().map(|i| tasks_c[*i].prompt.clone()).collect();
+                            let payload = serde_json::json!({
+                                "inputs": prompts,
+                                "model": model_c,
+                                "max_tokens": max_tokens,
+                            });
+                            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                            let request = decentraai_compute::assist::AssistRequest {
+                                capability: capability_c.clone(),
+                                cpu_cores,
+                                ram_mb,
+                            };
+                            let t_start = Instant::now();
+                            let (success, result_payload, _explanation) =
+                                crate::intel_assist::run_assist_request(
+                                    &p2p_c,
+                                    vec![*peer],
+                                    request,
+                                    payload_bytes,
+                                    lease_seconds,
+                                )
+                                .await;
+                            let latency_ms = t_start.elapsed().as_millis() as u64;
+                            let responses: Option<Vec<String>> = if success {
+                                serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                    .ok()
+                                    .and_then(|v| v.get("responses").cloned())
+                                    .and_then(|r| r.as_array().cloned())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .map(|s| s.as_str().unwrap_or("").to_string())
+                                            .collect()
+                                    })
+                            } else {
+                                None
+                            };
+                            for (j, &idx) in batch.iter().enumerate() {
+                                let (output, executed) = match &responses {
+                                    Some(rs) => match rs.get(j) {
+                                        Some(o) if !o.is_empty() => (o.clone(), true),
+                                        _ => (String::new(), true),
+                                    },
+                                    None => (String::new(), false),
+                                };
+                                let verdict = decentraai_agents::benchmark::grade_answer(
+                                    &output,
+                                    tasks_c[idx].gold.as_deref(),
+                                );
+                                worker_outcomes.push(decentraai_distributed::pool::PoolOutcome {
+                                    task_id: tasks_c[idx].task_id.clone(),
+                                    worker: label.clone(),
+                                    worker_kind: kind,
+                                    executed,
+                                    output,
+                                    verdict,
+                                    latency_ms,
+                                });
+                            }
+                        }
+                        return worker_outcomes;
+                    }
+                }
+
                 // ---- Non-embeddings, or local embeddings: per-task ---------
                 for idx in indexes {
                     let task = &tasks_c[idx];
