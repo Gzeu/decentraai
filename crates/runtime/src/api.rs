@@ -8667,7 +8667,13 @@ async fn governor_execute_handler(
     let verdict = decentraai_distributed::mp::resource_verdict(&rs);
     let reasoning = decentraai_distributed::mp::governor_reasoning(verdict, &rs);
 
-    let model = "Qwen3-1.7B-Q4_K_M.gguf".to_string();
+    // Model Intelligence: task kind selects the served model before placement.
+    let task_kind = b
+        .get("task_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chat")
+        .to_string();
+    let model = decentraai_distributed::mp::select_model(&task_kind).to_string();
     let max_tokens = 256u64;
     let cpu_cores = 2u16;
     let ram_mb = 512u64;
@@ -8888,6 +8894,26 @@ async fn governor_execute_handler(
                     .map(|(w, (s, l))| serde_json::json!({"worker": w, "shards": s, "latency_ms": l}))
                     .collect::<Vec<_>>()
             );
+            // ---- Economic loop: verified remote contribution -> credit ----
+            // Reuses the existing ledger: each remote worker that actually
+            // processed a shard earns contribution credit (synthetic
+            // bookkeeping, never money). RewardEngine reads this ledger.
+            let mut credited: Vec<String> = Vec::new();
+            if let Some(cm) = &state.compute {
+                for (label, _, lat) in &dist_partials {
+                    if let Ok(peer_id) = label.parse::<libp2p::PeerId>() {
+                        cm.record_credited_contribution(
+                            &peer_id,
+                            &format!("gov-{task_id}-{now}"),
+                            true,
+                            None,
+                            Some(u32::try_from(*lat).unwrap_or(u32::MAX)),
+                        );
+                        credited.push(label.clone());
+                    }
+                }
+            }
+            response["credited_workers"] = serde_json::json!(credited);
             serde_json::json!({"result": final_result})
         }
     };

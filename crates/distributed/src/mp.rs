@@ -248,6 +248,18 @@ pub fn governor_reasoning(v: GovernorVerdict, r: &ResourceState) -> String {
     }
 }
 
+/// Model Intelligence: selects the served model for a task kind. Pure and
+/// deterministic — the Governor uses it to answer "which model for this
+/// task?" before deciding placement.
+pub fn select_model(task_kind: &str) -> &'static str {
+    match task_kind {
+        "embeddings" | "embed" => "nomic-embed-text-v1.5.Q4_K_M.gguf",
+        // Chat / generation / summarization / analysis all ride the served
+        // chat model on this fabric.
+        _ => "Qwen3-1.7B-Q4_K_M.gguf",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +391,13 @@ mod tests {
         };
         assert_eq!(resource_verdict(&overloaded), GovernorVerdict::Reject);
         assert!(governor_reasoning(GovernorVerdict::Reject, &overloaded).starts_with("REJECT"));
+    }
+
+    #[test]
+    fn model_intelligence_selects_served_model() {
+        assert_eq!(select_model("embeddings"), "nomic-embed-text-v1.5.Q4_K_M.gguf");
+        assert_eq!(select_model("chat"), "Qwen3-1.7B-Q4_K_M.gguf");
+        assert_eq!(select_model("summarize"), "Qwen3-1.7B-Q4_K_M.gguf");
+        assert_eq!(select_model("anything"), "Qwen3-1.7B-Q4_K_M.gguf");
     }
 }
