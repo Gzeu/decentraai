@@ -226,8 +226,13 @@ fn handle_assign(
     let task_assign = assign.clone();
     tokio::spawn(async move {
         let started = Instant::now();
+        // Observe the worker's OWN CPU pressure before/after execution so we
+        // can demonstrate REAL remote resource use (not a masked local call).
+        let load_before = read_loadavg();
         let (success, payload, error) =
             execute_capability(&state, &task_assign.capability, &task_assign.payload).await;
+        let load_after = read_loadavg();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let result = AssistTaskResult {
             protocol_version: decentraai_protocol::dfcp::DFCP_VERSION,
             assignment_id: task_assign.assignment_id.clone(),
@@ -237,9 +242,12 @@ fn handle_assign(
         };
         tracing::info!(
             assignment = %task_assign.assignment_id,
+            capability = %task_assign.capability,
             success,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "assist task finished"
+            elapsed_ms,
+            worker_cpu_load_before = %load_before,
+            worker_cpu_load_after = %load_after,
+            "assist task finished (remote CPU observed)"
         );
         // Deliver the result to the REQUESTER as its own DFCP message; the
         // requester's parked oneshot completes there and contribution credit
@@ -568,4 +576,14 @@ pub async fn run_assist_request(
         result.payload,
         format!("assisted by {}", winner.peer_id),
     )
+}
+
+/// Reads this worker's 1-minute CPU load average (1 = one core fully busy).
+/// Used for observability of REAL remote CPU use during assist tasks.
+/// Deterministic, stdlib-only, no external process.
+fn read_loadavg() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "0.00".to_string())
 }
