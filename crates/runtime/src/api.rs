@@ -5103,6 +5103,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/intel/status", get(intel_status_handler))
         .route("/v1/intel/assist", post(intel_assist_handler))
         .route("/v1/pool/bench", post(pool_bench_handler))
+        .route("/v1/model-parallel", post(model_parallel_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
@@ -8269,7 +8270,322 @@ async fn pool_bench_handler(
         .into_response()
 }
 
-/// POST /v1/agents/workflow — Collective Orchestration (M17.1).
+/// POST /v1/model-parallel — the first genuine distributed-inference primitive
+/// for the llama-server stack (map-reduce / context-split inference).
+///
+/// llama-server cannot split one forward pass across separate nodes over the
+/// network (`--split-mode {layer,row,tensor}` is intra-machine only). For a
+/// single logical workload too large for one worker's context budget, the
+/// stack CAN run map-reduce: the planner splits the content into shards,
+/// workers map each shard to a partial result, then a reduce step fuses all
+/// partials into ONE final answer. The reduce step is what couples every
+/// worker into a single logical result — this is NOT independent prompts.
+///
+/// Body: {"task_id","instruction","content","max_workers","local_only"}
+/// The endpoint measures and returns: content chars, shards, distributed
+/// flag, serial-local baseline, distributed (map+reduce) time, speedup,
+/// per-worker shards/latency, the final result, and records EvidenceChain
+/// entries per participating worker.
+async fn model_parallel_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let b = body.0;
+    let task_id = b
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("mp")
+        .to_string();
+    let instruction = b
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = b
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let max_workers = b.get("max_workers").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let local_only = b.get("local_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    if instruction.is_empty() || content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "instruction and content are required"}).to_string(),
+        )
+            .into_response();
+    }
+    let Some(p2p) = state.p2p.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "p2p not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let Some(bench) = state.benchmark.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "benchmark runtime not attached"}).to_string(),
+        )
+            .into_response();
+    };
+
+    let workload = decentraai_distributed::mp::MpWorkload {
+        task_id: task_id.clone(),
+        instruction: instruction.clone(),
+        content: content.clone(),
+    };
+    let plan = decentraai_distributed::mp::plan(&workload);
+
+    #[derive(Clone)]
+    enum WTarget {
+        Local,
+        Peer(libp2p::PeerId),
+    }
+
+    // Runs one prompt at a target worker: local via the benchmark executor,
+    // remote via a batched DFCP chat request. Returns (output, latency_ms).
+    async fn run_one(
+        target: &WTarget,
+        prompt: &str,
+        bench: &decentraai_distributed::benchmark_manager::BenchmarkManager,
+        p2p: &decentraai_p2p::P2PNode,
+        model: &str,
+        max_tokens: u64,
+        cpu: u16,
+        ram: u64,
+        lease: u64,
+    ) -> (String, u64) {
+        let t = std::time::Instant::now();
+        match target {
+            WTarget::Local => {
+                let bt = decentraai_agents::benchmark::BenchmarkTask::ungradable("mp", prompt);
+                match bench.run_task(&bt, decentraai_agents::benchmark::BenchmarkMode::Single, 1).await {
+                    Ok(run) => (run.output, t.elapsed().as_millis() as u64),
+                    Err(e) => (format!("execution error: {e}"), t.elapsed().as_millis() as u64),
+                }
+            }
+            WTarget::Peer(peer) => {
+                let payload = serde_json::json!({
+                    "inputs": [prompt],
+                    "model": model,
+                    "max_tokens": max_tokens,
+                });
+                let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                let request = decentraai_compute::assist::AssistRequest {
+                    capability: "chat".to_string(),
+                    cpu_cores: cpu,
+                    ram_mb: ram,
+                };
+                let (success, result_payload, _) = crate::intel_assist::run_assist_request(
+                    p2p, vec![*peer], request, payload_bytes, lease,
+                )
+                .await;
+                if !success {
+                    return (String::new(), t.elapsed().as_millis() as u64);
+                }
+                let out = serde_json::from_slice::<serde_json::Value>(&result_payload)
+                    .ok()
+                    .and_then(|v| v.get("responses").cloned())
+                    .and_then(|r| r.as_array().cloned())
+                    .and_then(|a| a.first().cloned())
+                    .and_then(|s| s.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                (out, t.elapsed().as_millis() as u64)
+            }
+        }
+    }
+
+    let model = "Qwen3-1.7B-Q4_K_M.gguf".to_string();
+    let max_tokens = 256u64;
+    let cpu_cores = 2u16;
+    let ram_mb = 512u64;
+    let lease_seconds = 180u64;
+
+    // ---- Serial-local baseline: process every shard on the local node ----
+    let serial_start = std::time::Instant::now();
+    let mut serial_partials: Vec<String> = Vec::new();
+    let mut serial_latencies: Vec<u64> = Vec::new();
+    if !local_only {
+        for shard in &plan.shards {
+            let prompt = decentraai_distributed::mp::map_prompt(&instruction, shard);
+            let (out, lat) = run_one(
+                &WTarget::Local,
+                &prompt,
+                &bench,
+                &p2p,
+                &model,
+                max_tokens,
+                cpu_cores,
+                ram_mb,
+                lease_seconds,
+            )
+            .await;
+            serial_partials.push(out);
+            serial_latencies.push(lat);
+        }
+    }
+    let serial_local_ms = serial_start.elapsed().as_millis() as u64;
+
+    // ---- Distributed: map + reduce ----
+    let dist_start = std::time::Instant::now();
+    let peers = p2p.connected_peers().await;
+    let mut workers: Vec<WTarget> = vec![WTarget::Local];
+    for p in peers.iter().take(max_workers.saturating_sub(1)) {
+        workers.push(WTarget::Peer(*p));
+    }
+    let buckets = decentraai_distributed::pool::partition(plan.shards.len(), workers.len());
+    let mut dist_partials: Vec<(String, String, u64)> = Vec::new(); // (worker_label, output, latency)
+    let map_start = std::time::Instant::now();
+    let stream_futs: Vec<_> = buckets
+        .into_iter()
+        .zip(workers.iter())
+        .map(|(idxs, target)| {
+            let bench_c = bench.clone();
+            let p2p_c = p2p.clone();
+            let model_c = model.clone();
+            let instruction_c = instruction.clone();
+            let target_c = match target {
+                WTarget::Local => WTarget::Local,
+                WTarget::Peer(p) => WTarget::Peer(*p),
+            };
+            let shards = plan.shards.clone();
+            async move {
+                let mut results = Vec::new();
+                let label = match &target_c {
+                    WTarget::Local => "local".to_string(),
+                    WTarget::Peer(p) => p.to_string(),
+                };
+                for &si in &idxs {
+                    let shard = &shards[si];
+                    let prompt = decentraai_distributed::mp::map_prompt(&instruction_c, shard);
+                    let (out, lat) = run_one(
+                        &target_c,
+                        &prompt,
+                        &bench_c,
+                        &p2p_c,
+                        &model_c,
+                        max_tokens,
+                        cpu_cores,
+                        ram_mb,
+                        lease_seconds,
+                    )
+                    .await;
+                    results.push((label.clone(), si, out, lat));
+                }
+                results
+            }
+        })
+        .collect();
+    let map_results: Vec<Vec<(String, usize, String, u64)>> =
+        futures::future::join_all(stream_futs).await;
+    let mut by_index: std::collections::BTreeMap<usize, (String, String, u64)> =
+        std::collections::BTreeMap::new();
+    let mut per_worker: std::collections::BTreeMap<String, (usize, u64)> =
+        std::collections::BTreeMap::new();
+    for results in &map_results {
+        for (label, si, out, lat) in results {
+            by_index.insert(*si, (label.clone(), out.clone(), *lat));
+            let e = per_worker.entry(label.clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += *lat;
+        }
+    }
+    for (si, _) in plan.shards.iter().enumerate() {
+        if let Some((label, out, lat)) = by_index.get(&si) {
+            dist_partials.push((label.clone(), out.clone(), *lat));
+        }
+    }
+    let map_ms = map_start.elapsed().as_millis() as u64;
+
+    // ---- Reduce: fuse all partials into ONE final answer ----
+    let partial_texts: Vec<String> = dist_partials.iter().map(|(_, o, _)| o.clone()).collect();
+    let reduce_prompt = decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
+    let reduce_target = if let Some(p) = workers.get(1) {
+        p.clone()
+    } else {
+        WTarget::Local
+    };
+    let (final_result, reduce_ms) = run_one(
+        &reduce_target,
+        &reduce_prompt,
+        &bench,
+        &p2p,
+        &model,
+        max_tokens,
+        cpu_cores,
+        ram_mb,
+        lease_seconds,
+    )
+    .await;
+    let distributed_ms = dist_start.elapsed().as_millis() as u64;
+    let speedup = if serial_local_ms > 0 && serial_local_ms >= distributed_ms {
+        serial_local_ms as f64 / distributed_ms as f64
+    } else {
+        0.0
+    };
+
+    // ---- EvidenceChain: one entry per participating worker ----
+    let content_chars = content.chars().count();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Some(evidence) = &state.evidence {
+        {
+            let mut idx = evidence.index().lock().expect("evidence index lock");
+            for (label, _, lat) in &dist_partials {
+                let entry = decentraai_agents::evidence::EvidenceEntry::new(
+                    format!("mp:{task_id}:{label}:{now}"),
+                    decentraai_agents::evidence::EvidenceFamily::Execution,
+                    format!(
+                        "model-parallel map shard on worker {label} (latency {lat}ms, task {task_id})"
+                    ),
+                    now,
+                )
+                .tagged(format!("mp:{task_id}"))
+                .tagged(format!("worker:{label}"));
+                idx.add(entry);
+            }
+            let reduce_entry = decentraai_agents::evidence::EvidenceEntry::new(
+                format!("mp:{task_id}:reduce:{now}"),
+                decentraai_agents::evidence::EvidenceFamily::Execution,
+                format!("model-parallel reduce fused {content_chars} chars across {} shards (task {task_id})", plan.n_shards),
+                now,
+            )
+            .tagged(format!("mp:{task_id}"))
+            .tagged("reduce");
+            idx.add(reduce_entry);
+        }
+    }
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "task_id": task_id,
+            "instruction": instruction,
+            "content_chars": content_chars,
+            "distributed": plan.distributed,
+            "n_shards": plan.n_shards,
+            "workers_used": workers.len(),
+            "serial_local_ms": serial_local_ms,
+            "map_ms": map_ms,
+            "reduce_ms": reduce_ms,
+            "distributed_ms": distributed_ms,
+            "speedup": speedup,
+            "per_worker": per_worker.iter().map(|(w,(s,l))| serde_json::json!({"worker":w,"shards":s,"latency_ms":l})).collect::<Vec<_>>(),
+            "partials": dist_partials.iter().map(|(l,o,_)| serde_json::json!({"worker":l,"output":o})).collect::<Vec<_>>(),
+            "final_result": final_result,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
 /// Accepts a workflow definition (stages + dependencies) and executes it
 /// across the fabric using the existing DFCP/Sharing is Caring infrastructure.
 /// Each stage produces evidence; workers receive credit on verified success.

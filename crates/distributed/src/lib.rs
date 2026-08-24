@@ -92,6 +92,7 @@ pub mod intelligence_loop;
 pub mod knowledge_runtime;
 pub mod memory_propagator;
 pub mod model_performance;
+pub mod mp;
 pub mod p2p_handler;
 pub mod pool;
 pub mod probe;
