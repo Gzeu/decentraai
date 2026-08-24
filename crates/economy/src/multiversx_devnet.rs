@@ -20,10 +20,10 @@
 use crate::settlement::{BlockchainAdapter, SettlementError, SettlementReceipt, SettlementRecord};
 use serde::{Deserialize, Serialize};
 
-/// LIVE devnet API base — discovered from the official explorer bundle
-/// (agents.multiversx.com calls THIS host; the skill.md-documented
-/// `devnet-mx8004-api.multiversx.com` did not resolve from any of our
-/// environments). Verified live 2026-08-23.
+/// Testnet API base (verified live 2026-08-24).
+pub const TESTNET_API_BASE: &str = "https://testnet-api.multiversx.com";
+
+/// Legacy devnet API base — kept for reference; host does not resolve.
 pub const DEVNET_API_BASE: &str = "https://devnet-taskclaw-api.multiversx.com";
 
 /// Registry contract addresses on devnet — discovered by inspecting

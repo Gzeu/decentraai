@@ -31,6 +31,9 @@ pub const INIT_JOB_WITH_PAYMENT_ENDPOINT: &str = "init_job_with_payment";
 pub const SUBMIT_FEEDBACK_ENDPOINT: &str = "submit_feedback";
 
 /// Network tag carried on every intent produced here.
+pub const TESTNET_NETWORK: &str = "multiversx-testnet";
+
+/// Legacy devnet network tag.
 pub const DEVNET_NETWORK: &str = "multiversx-devnet";
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -123,7 +126,7 @@ impl UnsignedTxIntent {
 
 fn base_intent(endpoint: &str, fields: Vec<String>) -> UnsignedTxIntent {
     UnsignedTxIntent {
-        network: DEVNET_NETWORK.to_string(),
+        network: TESTNET_NETWORK.to_string(),
         endpoint: endpoint.to_string(),
         data_fields_hex: fields,
         value_denomination: 0,
@@ -358,7 +361,7 @@ pub fn registration_preparation(
     let intent = Mx8004TxBuilder::register_agent(name, manifest_uri, agent_public_key_hex, &[])?;
     Ok(RegistrationPreparation {
         network: DEVNET_NETWORK,
-        chain_id: "D",
+        chain_id: "T",
         endpoint: REGISTER_AGENT_ENDPOINT,
         data_field: intent.data_field(),
         sender_wallet_address: sender_wallet_address.to_string(),
@@ -382,8 +385,8 @@ pub fn registration_preparation(
             },
             OperatorField {
                 name: "chainId",
-                value: "D".into(),
-                note: "devnet",
+                value: "T".into(),
+                note: "testnet",
             },
             OperatorField {
                 name: "version",
@@ -534,7 +537,7 @@ mod tests {
         let back: UnsignedTxIntent =
             serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
         assert_eq!(back, intent);
-        assert_eq!(back.network, DEVNET_NETWORK);
+        assert_eq!(back.network, TESTNET_NETWORK);
     }
 
     #[test]
@@ -565,7 +568,7 @@ mod tests {
             30_000_000,
         )
         .unwrap();
-        assert_eq!(p.chain_id, "D");
+        assert_eq!(p.chain_id, "T");
         assert_eq!(p.endpoint, REGISTER_AGENT_ENDPOINT);
         assert!(p.data_field.starts_with("register_agent@"));
         assert_eq!(p.sender_wallet_address, "erd1operator");
