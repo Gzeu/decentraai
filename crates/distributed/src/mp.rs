@@ -143,7 +143,7 @@ pub fn map_prompt(instruction: &str, shard: &MpShard) -> String {
 /// Target token budget for the reduce call. A reduce only has to fuse the
 /// short partials into one short answer, so a small budget keeps the (slow,
 /// autoregressive) reduce call fast without harming quality.
-pub const REDUCE_MAX_TOKENS: u64 = 128;
+pub const REDUCE_MAX_TOKENS: u64 = 256;
 
 /// Builds the reduce prompt: combine all partial results into ONE final answer
 /// for the original instruction.
