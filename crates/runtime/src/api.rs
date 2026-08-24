@@ -8350,6 +8350,7 @@ async fn model_parallel_handler(
 
     // Runs one prompt at a target worker: local via the benchmark executor,
     // remote via a batched DFCP chat request. Returns (output, latency_ms).
+    #[allow(clippy::too_many_arguments)]
     async fn run_one(
         target: &WTarget,
         prompt: &str,
