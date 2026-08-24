@@ -158,51 +158,92 @@ pub fn reduce_prompt(instruction: &str, partials: &[String]) -> String {
     )
 }
 
-/// The Governor's automatic verdict on a workload: local only, or distributed.
+/// The Governor's automatic verdict on a workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum GovernorVerdict {
-    /// The workload fits the local node's per-call budget; execute locally.
-    LocalCapacitySufficient,
+    /// The workload fits the local node's capacity; execute locally.
+    Local,
     /// The workload exceeds local capacity and enough workers are reachable;
     /// borrow distributed compute and run map-reduce.
-    DistributedComputeRequired,
+    Distributed,
+    /// The local queue is saturated; enqueue (do not run now).
+    Queue,
+    /// The node is over-loaded (CPU+RAM pinned) and cannot serve this now.
+    Reject,
 }
 
-/// Deterministic Governor decision based on REAL availability.
+/// Real resource state fed to the resource-aware Governor decision.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ResourceState {
+    /// Workload size in characters (proxy for context/model footprint need).
+    pub content_chars: usize,
+    /// Total reachable worker slots including the local node.
+    pub available_workers: usize,
+    /// Local CPU usage percent (0-100), from the system probe.
+    pub cpu_percent: f32,
+    /// Local RAM usage percent (0-100), from the system probe.
+    pub ram_percent: f32,
+    /// Current local inference queue depth (waiting requests).
+    pub queue_depth: u32,
+    /// Queue capacity; 0 = unbounded (Queue verdict never fires).
+    pub queue_capacity: u32,
+}
+
+/// Deterministic resource-aware Governor decision from REAL state.
 ///
-/// - content within one worker's budget → local.
-/// - content beyond budget AND at least `min_workers` slots are reachable
-///   (local + ≥1 remote) → distributed.
-/// - content beyond budget but NO remote worker is reachable → local (the
-///   honest fallback: splitting without help would just be slow serial work).
+/// Priority: QUEUE (saturated) → REJECT (over-loaded) → DISTRIBUTED
+/// (workload exceeds local budget AND enough workers) → LOCAL.
 ///
-/// `available_workers` counts the total reachable slots including the local
-/// node (so 3 nodes → 3).
-pub fn governor_decide(content_chars: usize, available_workers: usize) -> GovernorVerdict {
-    if content_chars <= MAX_SHARD_CHARS {
-        GovernorVerdict::LocalCapacitySufficient
-    } else if available_workers >= 2 {
-        GovernorVerdict::DistributedComputeRequired
-    } else {
-        // No remote capacity to borrow: run locally even though it exceeds
-        // one call's budget (the honest, non-fabricated answer).
-        GovernorVerdict::LocalCapacitySufficient
+/// `cpu_percent`/`ram_percent` are the requesting node's own probe values.
+/// `content_chars` is the context/model-footprint proxy: when it exceeds one
+/// worker's per-call budget the workload is genuinely too heavy for a single
+/// call, so distributed compute is borrowed if workers exist.
+pub fn resource_verdict(r: &ResourceState) -> GovernorVerdict {
+    // 1. Saturated queue → enqueue, do not run now.
+    if r.queue_capacity > 0 && r.queue_depth >= r.queue_capacity {
+        return GovernorVerdict::Queue;
     }
+    // 2. Over-loaded node → reject now (honest: cannot serve).
+    if r.cpu_percent >= 95.0 && r.ram_percent >= 95.0 {
+        return GovernorVerdict::Reject;
+    }
+    // 3. Workload exceeds one worker's budget AND workers are reachable.
+    if r.content_chars > MAX_SHARD_CHARS && r.available_workers >= 2 {
+        return GovernorVerdict::Distributed;
+    }
+    // 4. Fits locally.
+    GovernorVerdict::Local
 }
 
 /// Human/operator-facing reasoning for a Governor verdict — used verbatim in
 /// the evidence record.
-pub fn governor_reasoning(v: GovernorVerdict, content_chars: usize, available_workers: usize) -> String {
+pub fn governor_reasoning(v: GovernorVerdict, r: &ResourceState) -> String {
     match v {
-        GovernorVerdict::LocalCapacitySufficient if content_chars <= MAX_SHARD_CHARS => format!(
-            "LOCAL_CAPACITY_SUFFICIENT: workload is {content_chars} chars (<= {MAX_SHARD_CHARS}) so one local worker call is enough; {available_workers} worker(s) available."
+        GovernorVerdict::Queue => format!(
+            "QUEUE: local queue {q}/{cap} is saturated; enqueuing instead of running now.",
+            q = r.queue_depth,
+            cap = r.queue_capacity
         ),
-        GovernorVerdict::LocalCapacitySufficient => format!(
-            "LOCAL_CAPACITY_SUFFICIENT: workload is {content_chars} chars (> {MAX_SHARD_CHARS}) but only {available_workers} worker(s) reachable, so distributed compute cannot be borrowed; executing locally."
+        GovernorVerdict::Reject => format!(
+            "REJECT: node over-loaded (cpu {cpu:.0}%, ram {ram:.0}%); cannot serve this workload now.",
+            cpu = r.cpu_percent,
+            ram = r.ram_percent
         ),
-        GovernorVerdict::DistributedComputeRequired => format!(
-            "DISTRIBUTED_COMPUTE_REQUIRED: workload is {content_chars} chars (> {MAX_SHARD_CHARS}) exceeding local per-call capacity; {available_workers} worker(s) available, borrowing distributed compute."
+        GovernorVerdict::Distributed => format!(
+            "DISTRIBUTED: workload is {c} chars (> {max}) exceeding local per-call capacity; {w} worker(s) available, borrowing distributed compute.",
+            c = r.content_chars,
+            max = MAX_SHARD_CHARS,
+            w = r.available_workers
+        ),
+        GovernorVerdict::Local => format!(
+            "LOCAL: workload is {c} chars, cpu {cpu:.0}%, ram {ram:.0}%, queue {q}/{cap}; {w} worker(s) available, one local call suffices.",
+            c = r.content_chars,
+            cpu = r.cpu_percent,
+            ram = r.ram_percent,
+            q = r.queue_depth,
+            cap = r.queue_capacity,
+            w = r.available_workers
         ),
     }
 }
@@ -277,38 +318,66 @@ mod tests {
 
     #[test]
     fn governor_decides_locally_when_content_fits() {
-        assert_eq!(
-            governor_decide(100, 1),
-            GovernorVerdict::LocalCapacitySufficient
-        );
-        assert_eq!(
-            governor_decide(100, 3),
-            GovernorVerdict::LocalCapacitySufficient
-        );
-        assert!(governor_reasoning(GovernorVerdict::LocalCapacitySufficient, 100, 3)
-            .starts_with("LOCAL_CAPACITY_SUFFICIENT"));
+        let r = ResourceState {
+            content_chars: 100,
+            available_workers: 3,
+            cpu_percent: 30.0,
+            ram_percent: 40.0,
+            queue_depth: 0,
+            queue_capacity: 10,
+        };
+        assert_eq!(resource_verdict(&r), GovernorVerdict::Local);
+        assert!(governor_reasoning(GovernorVerdict::Local, &r).starts_with("LOCAL"));
     }
 
     #[test]
     fn governor_requires_distributed_when_over_budget_with_workers() {
-        assert_eq!(
-            governor_decide(MAX_SHARD_CHARS + 1, 3),
-            GovernorVerdict::DistributedComputeRequired
-        );
-        assert_eq!(
-            governor_decide(MAX_SHARD_CHARS + 1, 2),
-            GovernorVerdict::DistributedComputeRequired
-        );
-        assert!(governor_reasoning(GovernorVerdict::DistributedComputeRequired, 2000, 3)
-            .starts_with("DISTRIBUTED_COMPUTE_REQUIRED"));
+        let r = ResourceState {
+            content_chars: MAX_SHARD_CHARS + 1,
+            available_workers: 3,
+            cpu_percent: 30.0,
+            ram_percent: 40.0,
+            queue_depth: 0,
+            queue_capacity: 10,
+        };
+        assert_eq!(resource_verdict(&r), GovernorVerdict::Distributed);
+        assert!(governor_reasoning(GovernorVerdict::Distributed, &r).starts_with("DISTRIBUTED"));
     }
 
     #[test]
     fn governor_falls_back_to_local_when_no_remote_workers() {
-        // Over budget but only 1 worker reachable: honest local fallback.
-        assert_eq!(
-            governor_decide(MAX_SHARD_CHARS + 1, 1),
-            GovernorVerdict::LocalCapacitySufficient
-        );
+        let r = ResourceState {
+            content_chars: MAX_SHARD_CHARS + 1,
+            available_workers: 1,
+            cpu_percent: 30.0,
+            ram_percent: 40.0,
+            queue_depth: 0,
+            queue_capacity: 10,
+        };
+        assert_eq!(resource_verdict(&r), GovernorVerdict::Local);
+    }
+
+    #[test]
+    fn governor_queues_when_saturated_and_rejects_when_overloaded() {
+        let queued = ResourceState {
+            content_chars: 100,
+            available_workers: 3,
+            cpu_percent: 30.0,
+            ram_percent: 40.0,
+            queue_depth: 10,
+            queue_capacity: 10,
+        };
+        assert_eq!(resource_verdict(&queued), GovernorVerdict::Queue);
+
+        let overloaded = ResourceState {
+            content_chars: 100,
+            available_workers: 3,
+            cpu_percent: 97.0,
+            ram_percent: 96.0,
+            queue_depth: 0,
+            queue_capacity: 10,
+        };
+        assert_eq!(resource_verdict(&overloaded), GovernorVerdict::Reject);
+        assert!(governor_reasoning(GovernorVerdict::Reject, &overloaded).starts_with("REJECT"));
     }
 }

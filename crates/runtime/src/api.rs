@@ -8654,9 +8654,18 @@ async fn governor_execute_handler(
     let peers = p2p.connected_peers().await;
     let available_workers = 1 + peers.len();
 
-    // ---- GOVERNOR DECISION (deterministic, from real availability) ----
-    let verdict = decentraai_distributed::mp::governor_decide(content_chars, available_workers);
-    let reasoning = decentraai_distributed::mp::governor_reasoning(verdict, content_chars, available_workers);
+    // ---- GOVERNOR DECISION (resource-aware, deterministic, real state) ----
+    let ps = state.pressure_signals().await;
+    let rs = decentraai_distributed::mp::ResourceState {
+        content_chars,
+        available_workers,
+        cpu_percent: ps.cpu_percent,
+        ram_percent: ps.ram_percent,
+        queue_depth: ps.queue_depth,
+        queue_capacity: 20, // from the fair-queue config posture
+    };
+    let verdict = decentraai_distributed::mp::resource_verdict(&rs);
+    let reasoning = decentraai_distributed::mp::governor_reasoning(verdict, &rs);
 
     let model = "Qwen3-1.7B-Q4_K_M.gguf".to_string();
     let max_tokens = 256u64;
@@ -8675,10 +8684,35 @@ async fn governor_execute_handler(
         "reasoning": reasoning,
         "available_workers": available_workers,
         "content_chars": content_chars,
+        "cpu_percent": ps.cpu_percent,
+        "ram_percent": ps.ram_percent,
+        "queue_depth": ps.queue_depth,
     });
 
     let result_payload = match verdict {
-        decentraai_distributed::mp::GovernorVerdict::LocalCapacitySufficient => {
+        decentraai_distributed::mp::GovernorVerdict::Queue
+        | decentraai_distributed::mp::GovernorVerdict::Reject => {
+            // Not running now: record the decision as evidence.
+            if let Some(evidence) = &state.evidence {
+                evidence
+                    .index()
+                    .lock()
+                    .expect("evidence lock")
+                    .add(
+                        decentraai_agents::evidence::EvidenceEntry::new(
+                            format!("gov:{task_id}:decision:{now}"),
+                            decentraai_agents::evidence::EvidenceFamily::Execution,
+                            format!("governor {reasoning}"),
+                            now,
+                        )
+                        .tagged(format!("gov:{task_id}"))
+                        .tagged("governor"),
+                    );
+            }
+            response["status"] = serde_json::json!("not-executed");
+            serde_json::json!({"result": null, "status": "not-executed"})
+        }
+        decentraai_distributed::mp::GovernorVerdict::Local => {
             // Execute locally: one call on the whole content.
             let prompt = format!("{instruction}\n\n{content}");
             let (out, latency_ms) = mp_run_one(
@@ -8713,7 +8747,7 @@ async fn governor_execute_handler(
             response["latency_ms"] = serde_json::json!(latency_ms);
             serde_json::json!({"result": out})
         }
-        decentraai_distributed::mp::GovernorVerdict::DistributedComputeRequired => {
+        decentraai_distributed::mp::GovernorVerdict::Distributed => {
             // Map-reduce: split, dispatch to workers, reduce into ONE result.
             let workload = decentraai_distributed::mp::MpWorkload {
                 task_id: task_id.clone(),
