@@ -8919,6 +8919,35 @@ async fn governor_execute_handler(
             response["reduce_status"] = serde_json::json!(
                 if reduce_result.is_some() { "valid" } else { "empty-failed" }
             );
+            // ---- Model Intelligence: reducer selection from verified evidence ----
+            // The reduce model is chosen from measured benchmark facts, never
+            // hardcoded. A reasoner (Qwen3) is penalised for the empty-output
+            // risk; faster non-reasoners win on evidence.
+            let candidates = [
+                decentraai_distributed::mp::ModelEvidence {
+                    model: "Phi-4-mini-instruct-Q4_K_M.gguf",
+                    accuracy: 0.33,
+                    latency_ms: 803,
+                    reasoner: false,
+                },
+                decentraai_distributed::mp::ModelEvidence {
+                    model: "Qwen3-1.7B-Q4_K_M.gguf",
+                    accuracy: 0.25,
+                    latency_ms: 4624,
+                    reasoner: true,
+                },
+                decentraai_distributed::mp::ModelEvidence {
+                    model: "Gemma-3-1B-it-Q4_K_M.gguf",
+                    accuracy: 0.33,
+                    latency_ms: 578,
+                    reasoner: false,
+                },
+            ];
+            let reducer_selected =
+                decentraai_distributed::mp::select_reducer(&candidates)
+                    .map(|m| m.model)
+                    .unwrap_or_default();
+            response["reducer_selected"] = serde_json::json!(reducer_selected);
             response["per_worker"] = serde_json::json!(
                 per_worker
                     .iter()

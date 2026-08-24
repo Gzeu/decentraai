@@ -260,6 +260,45 @@ pub fn select_model(task_kind: &str) -> &'static str {
     }
 }
 
+/// Benchmark/evidence facts about one candidate model, used by Model
+/// Intelligence to pick a reducer. Evidence is measured, never assumed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelEvidence {
+    pub model: &'static str,
+    /// Deterministic accuracy on the Model Intelligence corpus (0..1).
+    pub accuracy: f64,
+    /// Measured latency for a representative task (ms).
+    pub latency_ms: u64,
+    /// True when the model burns tokens on hidden reasoning, which can leave
+    /// a reduce/aggregation answer empty — a real, observed defect.
+    pub reasoner: bool,
+}
+
+/// Scores a candidate as a REDUCER: quality first, but penalise a reasoner
+/// (empty-output risk) and slow inference. Higher is better.
+fn reducer_score(m: &ModelEvidence) -> i64 {
+    let quality = (m.accuracy * 100.0).round() as i64;
+    let reasoner_penalty = if m.reasoner { 30 } else { 0 };
+    let speed_penalty = (m.latency_ms / 1000) as i64; // seconds, mild
+    quality - reasoner_penalty - speed_penalty
+}
+
+/// Model Intelligence reducer selection from VERIFIED evidence. Picks the
+/// best reducer by score; a reasoner is only chosen when nothing better
+/// exists. NOT hardcoded to any model — the evidence decides. If no model is
+/// provided, falls back to `None` (caller decides).
+pub fn select_reducer<'a>(models: &'a [ModelEvidence]) -> Option<&'a ModelEvidence> {
+    if models.is_empty() {
+        return None;
+    }
+    // Prefer non-reasoners; among those, highest score.
+    models
+        .iter()
+        .filter(|m| !m.reasoner)
+        .max_by_key(|m| reducer_score(m))
+        .or_else(|| models.iter().max_by_key(|m| reducer_score(m)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +438,25 @@ mod tests {
         assert_eq!(select_model("chat"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("summarize"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("anything"), "Qwen3-1.7B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn model_intelligence_picks_best_reducer_from_evidence_not_hardcoded() {
+        // Real measured benchmark facts (VPS): Phi is faster+non-reasoner,
+        // Qwen3 is a slow reasoner, Gemma is fast non-reasoner.
+        let phi = ModelEvidence { model: "Phi-4-mini", accuracy: 0.33, latency_ms: 803, reasoner: false };
+        let qwen = ModelEvidence { model: "Qwen3-1.7B", accuracy: 0.25, latency_ms: 4624, reasoner: true };
+        let gemma = ModelEvidence { model: "Gemma-3-1B", accuracy: 0.33, latency_ms: 578, reasoner: false };
+        let candidates = [phi, qwen, gemma];
+        let best = select_reducer(&candidates).unwrap();
+        // Gemma (same accuracy as Phi, faster, non-reasoner) should win on
+        // evidence — proof it is NOT hardcoded to Phi.
+        assert_eq!(best.model, "Gemma-3-1B");
+        // If only Qwen is available, it is still chosen (no better option).
+        let only_qwen = [qwen];
+        let only = select_reducer(&only_qwen).unwrap();
+        assert_eq!(only.model, "Qwen3-1.7B");
+        // Empty -> None.
+        assert!(select_reducer(&[]).is_none());
     }
 }
