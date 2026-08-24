@@ -287,7 +287,7 @@ fn reducer_score(m: &ModelEvidence) -> i64 {
 /// best reducer by score; a reasoner is only chosen when nothing better
 /// exists. NOT hardcoded to any model — the evidence decides. If no model is
 /// provided, falls back to `None` (caller decides).
-pub fn select_reducer<'a>(models: &'a [ModelEvidence]) -> Option<&'a ModelEvidence> {
+pub fn select_reducer(models: &[ModelEvidence]) -> Option<&ModelEvidence> {
     if models.is_empty() {
         return None;
     }
