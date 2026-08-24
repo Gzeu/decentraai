@@ -46,6 +46,12 @@ pub struct AssistWorkerState {
     pub limits: Arc<AssistSharingSection>,
     /// Live root URL of the local managed llama-server (resolved per call).
     pub backend_url: Arc<std::sync::RwLock<String>>,
+    /// Optional dedicated embeddings backend (a llama-server loaded with an
+    /// embedding model). When set, `capability = "embeddings"` is served from
+    /// here instead of the chat backend, so a node can serve both chat and
+    /// embeddings to the pool. Static (not live-resolved) — the operator
+    /// configures a stable embeddings endpoint.
+    pub embeddings_backend_url: Option<Arc<std::sync::RwLock<String>>>,
     pub http: reqwest::Client,
     pub leases: Mutex<HashMap<ReservationId, ActiveLease>>,
     pub offers_sent: Mutex<HashMap<decentraai_protocol::dfcp::ResourceOfferId, (String, u16, u64)>>,
@@ -58,9 +64,22 @@ impl AssistWorkerState {
         backend_url: String,
         trusted_peers: Vec<String>,
     ) -> Self {
+        Self::with_embeddings(limits, backend_url, None, trusted_peers)
+    }
+
+    /// Constructs the worker with an optional dedicated embeddings backend.
+    pub fn with_embeddings(
+        limits: Arc<AssistSharingSection>,
+        backend_url: String,
+        embeddings_backend_url: Option<String>,
+        trusted_peers: Vec<String>,
+    ) -> Self {
         Self {
             limits,
             backend_url: Arc::new(std::sync::RwLock::new(backend_url)),
+            embeddings_backend_url: embeddings_backend_url
+                .filter(|u| !u.is_empty())
+                .map(|u| Arc::new(std::sync::RwLock::new(u))),
             http: reqwest::Client::new(),
             leases: Mutex::new(HashMap::new()),
             offers_sent: Mutex::new(HashMap::new()),
@@ -269,6 +288,8 @@ async fn execute_capability(
     match capability {
         // Embeddings: llama-server `/v1/embeddings` with an embedding-capable
         // model loaded. Payload: JSON {"input":"text"}; result: vector JSON.
+        // When a dedicated embeddings backend is configured, serve from it so
+        // the chat backend (e.g. a non-embedding LLM) is not consulted.
         "embeddings" => {
             let input: serde_json::Value = match serde_json::from_slice(payload) {
                 Ok(v) => v,
@@ -276,9 +297,14 @@ async fn execute_capability(
                     return (false, Vec::new(), Some(format!("bad payload: {e}")));
                 }
             };
+            let embed_base = state
+                .embeddings_backend_url
+                .as_ref()
+                .map(|u| u.read().expect("embeddings url lock").clone())
+                .unwrap_or_else(|| base.clone());
             let res = state
                 .http
-                .post(format!("{base}/v1/embeddings"))
+                .post(format!("{embed_base}/v1/embeddings"))
                 .json(&json!({"input": input.get("input").cloned().unwrap_or_default()}))
                 .send()
                 .await;

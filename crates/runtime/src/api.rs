@@ -7918,6 +7918,7 @@ async fn pool_bench_handler(
         .map(|(indexes, target)| {
             let tasks_c = tasks.clone();
             let bench_c = bench.clone();
+            let embedding_c = state.embedding.clone();
             let p2p_c = p2p.clone();
             let model_c = model.clone();
             let capability_c = capability.clone();
@@ -7944,34 +7945,56 @@ async fn pool_bench_handler(
                     let t_start = Instant::now();
                     let (output, executed) = match &target_c {
                         PoolWorkerTarget::Local => {
-                            let bt = match task.gold.clone() {
-                                Some(g) => decentraai_agents::benchmark::BenchmarkTask::new(
-                                    task.task_id.clone(),
-                                    task.prompt.clone(),
-                                    g,
-                                ),
-                                None => decentraai_agents::benchmark::BenchmarkTask::ungradable(
-                                    task.task_id.clone(),
-                                    task.prompt.clone(),
-                                ),
-                            };
-                            match bench_c.run_task(
-                                &bt,
-                                decentraai_agents::benchmark::BenchmarkMode::Single,
-                                1,
-                            )
-                            .await
-                            {
-                                Ok(run) => (run.output, true),
-                                Err(e) => (format!("execution error: {e}"), false),
+                            // Embeddings run against the node's own embeddings
+                            // backend (not the chat benchmark executor).
+                            if capability_c == "embeddings" {
+                                match &embedding_c {
+                                    Some(emb) => match emb.embed(&task.prompt).await {
+                                        Ok(vec) => (
+                                            format!("embedding dim={} first={:?}", vec.len(), vec.first()),
+                                            true,
+                                        ),
+                                        Err(e) => (format!("embeddings error: {e}"), false),
+                                    },
+                                    None => (
+                                        "embeddings backend not configured locally".to_string(),
+                                        false,
+                                    ),
+                                }
+                            } else {
+                                let bt = match task.gold.clone() {
+                                    Some(g) => decentraai_agents::benchmark::BenchmarkTask::new(
+                                        task.task_id.clone(),
+                                        task.prompt.clone(),
+                                        g,
+                                    ),
+                                    None => decentraai_agents::benchmark::BenchmarkTask::ungradable(
+                                        task.task_id.clone(),
+                                        task.prompt.clone(),
+                                    ),
+                                };
+                                match bench_c.run_task(
+                                    &bt,
+                                    decentraai_agents::benchmark::BenchmarkMode::Single,
+                                    1,
+                                )
+                                .await
+                                {
+                                    Ok(run) => (run.output, true),
+                                    Err(e) => (format!("execution error: {e}"), false),
+                                }
                             }
                         }
                         PoolWorkerTarget::Peer(peer) => {
-                            let payload = serde_json::json!({
-                                "model": model_c,
-                                "messages": [{"role":"user","content": task.prompt}],
-                                "max_tokens": max_tokens,
-                            });
+                            let payload = if capability_c == "embeddings" {
+                                serde_json::json!({ "input": task.prompt })
+                            } else {
+                                serde_json::json!({
+                                    "model": model_c,
+                                    "messages": [{"role":"user","content": task.prompt}],
+                                    "max_tokens": max_tokens,
+                                })
+                            };
                             let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
                             let request = decentraai_compute::assist::AssistRequest {
                                 capability: capability_c.clone(),
@@ -7989,6 +8012,21 @@ async fn pool_bench_handler(
                                 .await;
                             if !success {
                                 (String::new(), false)
+                            } else if capability_c == "embeddings" {
+                                // Embeddings responses carry a vector in
+                                // data[].embedding rather than chat choices.
+                                let content = serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("data")
+                                            .and_then(|d| d.as_array())
+                                            .and_then(|d| d.first())
+                                            .and_then(|e| e.get("embedding"))
+                                            .and_then(|e| e.as_array())
+                                            .map(|arr| format!("embedding dim={} first={:?}", arr.len(), arr.first()))
+                                    })
+                                    .unwrap_or_default();
+                                (content, true)
                             } else {
                                 // Extract message content from the OpenAI-shaped
                                 // chat response returned by the remote worker.

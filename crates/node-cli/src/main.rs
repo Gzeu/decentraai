@@ -2377,9 +2377,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(assist_cfg) = config.sharing.assist.as_ref() {
             if assist_cfg.enabled {
                 let worker_state =
-                    std::sync::Arc::new(decentraai_runtime::intel_assist::AssistWorkerState::new(
+                    std::sync::Arc::new(decentraai_runtime::intel_assist::AssistWorkerState::with_embeddings(
                         std::sync::Arc::new(assist_cfg.clone()),
                         backend_url.clone(),
+                        config.inference.embeddings_backend_url.clone(),
                         vec![], // empty = any TRUSTED peer may request
                     ));
                 let p2p_for_worker = distributed.p2p_node().clone();
