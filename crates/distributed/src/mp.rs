@@ -130,13 +130,20 @@ pub fn plan(w: &MpWorkload) -> MpPlan {
 }
 
 /// Builds the per-shard chat prompt handed to a worker: apply the shared
-/// instruction to this slice, asking for a compact partial result.
+/// instruction to this slice, asking for a compact partial result (short
+/// partials keep the later reduce prompt small — the reduce cost scales with
+/// the size of the partials it must fuse).
 pub fn map_prompt(instruction: &str, shard: &MpShard) -> String {
     format!(
-        "{instruction}\n\nProcess ONLY the following section and give a concise partial result:\n---\n{}\n---",
+        "{instruction}\n\nProcess ONLY the following section and return a concise partial result IN UNDER 40 WORDS:\n---\n{}\n---",
         shard.content
     )
 }
+
+/// Target token budget for the reduce call. A reduce only has to fuse the
+/// short partials into one short answer, so a small budget keeps the (slow,
+/// autoregressive) reduce call fast without harming quality.
+pub const REDUCE_MAX_TOKENS: u64 = 128;
 
 /// Builds the reduce prompt: combine all partial results into ONE final answer
 /// for the original instruction.
