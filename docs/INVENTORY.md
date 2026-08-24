@@ -56,3 +56,11 @@
 No token launch · no mainnet · no auto-signing · no keys in repo ·
 external scores are untrusted · internal ledger authoritative ·
 AI proposes → deterministic policy decides → workers execute.
+
+## 6. Models deployed on VPS (testnet)
+
+| Model | Size | Governance | Status |
+|---|---|---|---|
+| Qwen3-1.7B Q4_K_M | 1.2 GB | approved | ✅ LOADED + benchmarked (16% MI corpus) |
+| Gemma-3-1B-it Q4_K_M | 769 MB | experimental | downloaded, awaiting deployment |
+| Phi-4-mini-instruct Q4_K_M | 2.4 GB | experimental | downloaded, awaiting deployment |
