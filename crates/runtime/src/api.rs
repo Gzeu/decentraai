@@ -5104,6 +5104,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/intel/assist", post(intel_assist_handler))
         .route("/v1/pool/bench", post(pool_bench_handler))
         .route("/v1/model-parallel", post(model_parallel_handler))
+        .route("/v1/governor/execute", post(governor_execute_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
@@ -8286,6 +8287,70 @@ async fn pool_bench_handler(
 /// flag, serial-local baseline, distributed (map+reduce) time, speedup,
 /// per-worker shards/latency, the final result, and records EvidenceChain
 /// entries per participating worker.
+/// A worker slot for model-parallel execution: the requesting node or a peer.
+#[derive(Clone)]
+enum MpTarget {
+    Local,
+    Peer(libp2p::PeerId),
+}
+
+/// Runs one prompt at a target worker: local via the benchmark executor,
+/// remote via a batched DFCP chat request. Returns (output, latency_ms).
+#[allow(clippy::too_many_arguments)]
+async fn mp_run_one(
+    target: &MpTarget,
+    prompt: &str,
+    bench: &decentraai_distributed::benchmark_manager::BenchmarkManager,
+    p2p: &decentraai_p2p::P2PNode,
+    model: &str,
+    max_tokens: u64,
+    cpu: u16,
+    ram: u64,
+    lease: u64,
+) -> (String, u64) {
+    let t = std::time::Instant::now();
+    match target {
+        MpTarget::Local => {
+            let bt = decentraai_agents::benchmark::BenchmarkTask::ungradable("mp", prompt);
+            match bench
+                .run_task(&bt, decentraai_agents::benchmark::BenchmarkMode::Single, 1)
+                .await
+            {
+                Ok(run) => (run.output, t.elapsed().as_millis() as u64),
+                Err(e) => (format!("execution error: {e}"), t.elapsed().as_millis() as u64),
+            }
+        }
+        MpTarget::Peer(peer) => {
+            let payload = serde_json::json!({
+                "inputs": [prompt],
+                "model": model,
+                "max_tokens": max_tokens,
+            });
+            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            let request = decentraai_compute::assist::AssistRequest {
+                capability: "chat".to_string(),
+                cpu_cores: cpu,
+                ram_mb: ram,
+            };
+            let (success, result_payload, _) = crate::intel_assist::run_assist_request(
+                p2p, vec![*peer], request, payload_bytes, lease,
+            )
+            .await;
+            if !success {
+                return (String::new(), t.elapsed().as_millis() as u64);
+            }
+            let out = serde_json::from_slice::<serde_json::Value>(&result_payload)
+                .ok()
+                .and_then(|v| v.get("responses").cloned())
+                .and_then(|r| r.as_array().cloned())
+                .and_then(|a| a.first().cloned())
+                .and_then(|s| s.as_str().map(str::to_string))
+                .unwrap_or_default();
+            (out, t.elapsed().as_millis() as u64)
+        }
+    }
+}
+
 async fn model_parallel_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -8342,66 +8407,6 @@ async fn model_parallel_handler(
     };
     let plan = decentraai_distributed::mp::plan(&workload);
 
-    #[derive(Clone)]
-    enum WTarget {
-        Local,
-        Peer(libp2p::PeerId),
-    }
-
-    // Runs one prompt at a target worker: local via the benchmark executor,
-    // remote via a batched DFCP chat request. Returns (output, latency_ms).
-    #[allow(clippy::too_many_arguments)]
-    async fn run_one(
-        target: &WTarget,
-        prompt: &str,
-        bench: &decentraai_distributed::benchmark_manager::BenchmarkManager,
-        p2p: &decentraai_p2p::P2PNode,
-        model: &str,
-        max_tokens: u64,
-        cpu: u16,
-        ram: u64,
-        lease: u64,
-    ) -> (String, u64) {
-        let t = std::time::Instant::now();
-        match target {
-            WTarget::Local => {
-                let bt = decentraai_agents::benchmark::BenchmarkTask::ungradable("mp", prompt);
-                match bench.run_task(&bt, decentraai_agents::benchmark::BenchmarkMode::Single, 1).await {
-                    Ok(run) => (run.output, t.elapsed().as_millis() as u64),
-                    Err(e) => (format!("execution error: {e}"), t.elapsed().as_millis() as u64),
-                }
-            }
-            WTarget::Peer(peer) => {
-                let payload = serde_json::json!({
-                    "inputs": [prompt],
-                    "model": model,
-                    "max_tokens": max_tokens,
-                });
-                let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-                let request = decentraai_compute::assist::AssistRequest {
-                    capability: "chat".to_string(),
-                    cpu_cores: cpu,
-                    ram_mb: ram,
-                };
-                let (success, result_payload, _) = crate::intel_assist::run_assist_request(
-                    p2p, vec![*peer], request, payload_bytes, lease,
-                )
-                .await;
-                if !success {
-                    return (String::new(), t.elapsed().as_millis() as u64);
-                }
-                let out = serde_json::from_slice::<serde_json::Value>(&result_payload)
-                    .ok()
-                    .and_then(|v| v.get("responses").cloned())
-                    .and_then(|r| r.as_array().cloned())
-                    .and_then(|a| a.first().cloned())
-                    .and_then(|s| s.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                (out, t.elapsed().as_millis() as u64)
-            }
-        }
-    }
-
     let model = "Qwen3-1.7B-Q4_K_M.gguf".to_string();
     let max_tokens = 256u64;
     let cpu_cores = 2u16;
@@ -8415,8 +8420,8 @@ async fn model_parallel_handler(
     if !local_only {
         for shard in &plan.shards {
             let prompt = decentraai_distributed::mp::map_prompt(&instruction, shard);
-            let (out, lat) = run_one(
-                &WTarget::Local,
+            let (out, lat) = mp_run_one(
+                &MpTarget::Local,
                 &prompt,
                 &bench,
                 &p2p,
@@ -8436,9 +8441,9 @@ async fn model_parallel_handler(
     // ---- Distributed: map + reduce ----
     let dist_start = std::time::Instant::now();
     let peers = p2p.connected_peers().await;
-    let mut workers: Vec<WTarget> = vec![WTarget::Local];
+    let mut workers: Vec<MpTarget> = vec![MpTarget::Local];
     for p in peers.iter().take(max_workers.saturating_sub(1)) {
-        workers.push(WTarget::Peer(*p));
+        workers.push(MpTarget::Peer(*p));
     }
     let buckets = decentraai_distributed::pool::partition(plan.shards.len(), workers.len());
     let mut dist_partials: Vec<(String, String, u64)> = Vec::new(); // (worker_label, output, latency)
@@ -8452,20 +8457,20 @@ async fn model_parallel_handler(
             let model_c = model.clone();
             let instruction_c = instruction.clone();
             let target_c = match target {
-                WTarget::Local => WTarget::Local,
-                WTarget::Peer(p) => WTarget::Peer(*p),
+                MpTarget::Local => MpTarget::Local,
+                MpTarget::Peer(p) => MpTarget::Peer(*p),
             };
             let shards = plan.shards.clone();
             async move {
                 let mut results = Vec::new();
                 let label = match &target_c {
-                    WTarget::Local => "local".to_string(),
-                    WTarget::Peer(p) => p.to_string(),
+                    MpTarget::Local => "local".to_string(),
+                    MpTarget::Peer(p) => p.to_string(),
                 };
                 for &si in &idxs {
                     let shard = &shards[si];
                     let prompt = decentraai_distributed::mp::map_prompt(&instruction_c, shard);
-                    let (out, lat) = run_one(
+                    let (out, lat) = mp_run_one(
                         &target_c,
                         &prompt,
                         &bench_c,
@@ -8510,9 +8515,9 @@ async fn model_parallel_handler(
     let reduce_target = if let Some(p) = workers.get(1) {
         p.clone()
     } else {
-        WTarget::Local
+        MpTarget::Local
     };
-    let (final_result, reduce_ms) = run_one(
+    let (final_result, reduce_ms) = mp_run_one(
         &reduce_target,
         &reduce_prompt,
         &bench,
@@ -8587,8 +8592,279 @@ async fn model_parallel_handler(
     )
         .into_response()
 }
-/// Accepts a workflow definition (stages + dependencies) and executes it
-/// across the fabric using the existing DFCP/Sharing is Caring infrastructure.
+
+/// POST /v1/governor/execute — the autonomous loop: Governor receives a
+/// workload, decides deterministically whether local capacity suffices, and
+/// if not borrows distributed compute (map-reduce) from the pool automatically.
+///
+/// The operator submits only the workload; the decision between
+/// LOCAL_CAPACITY_SUFFICIENT and DISTRIBUTED_COMPUTE_REQUIRED is made by the
+/// deterministic Governor from real availability (content budget vs reachable
+/// workers), NOT by the operator picking model-parallel.
+///
+/// Body: {"task_id","instruction","content"}
+async fn governor_execute_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let b = body.0;
+    let task_id = b
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("gov")
+        .to_string();
+    let instruction = b
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = b
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if instruction.is_empty() || content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "instruction and content are required"}).to_string(),
+        )
+            .into_response();
+    }
+    let Some(p2p) = state.p2p.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "p2p not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let Some(bench) = state.benchmark.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "benchmark runtime not attached"}).to_string(),
+        )
+            .into_response();
+    };
+
+    let content_chars = content.chars().count();
+    let peers = p2p.connected_peers().await;
+    let available_workers = 1 + peers.len();
+
+    // ---- GOVERNOR DECISION (deterministic, from real availability) ----
+    let verdict = decentraai_distributed::mp::governor_decide(content_chars, available_workers);
+    let reasoning = decentraai_distributed::mp::governor_reasoning(verdict, content_chars, available_workers);
+
+    let model = "Qwen3-1.7B-Q4_K_M.gguf".to_string();
+    let max_tokens = 256u64;
+    let cpu_cores = 2u16;
+    let ram_mb = 512u64;
+    let lease_seconds = 180u64;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut response = serde_json::json!({
+        "task_id": task_id,
+        "verdict": verdict,
+        "reasoning": reasoning,
+        "available_workers": available_workers,
+        "content_chars": content_chars,
+    });
+
+    let result_payload = match verdict {
+        decentraai_distributed::mp::GovernorVerdict::LocalCapacitySufficient => {
+            // Execute locally: one call on the whole content.
+            let prompt = format!("{instruction}\n\n{content}");
+            let (out, latency_ms) = mp_run_one(
+                &MpTarget::Local,
+                &prompt,
+                &bench,
+                &p2p,
+                &model,
+                max_tokens,
+                cpu_cores,
+                ram_mb,
+                lease_seconds,
+            )
+            .await;
+            if let Some(evidence) = &state.evidence {
+                evidence
+                    .index()
+                    .lock()
+                    .expect("evidence lock")
+                    .add(
+                        decentraai_agents::evidence::EvidenceEntry::new(
+                            format!("gov:{task_id}:local:{now}"),
+                            decentraai_agents::evidence::EvidenceFamily::Execution,
+                            format!("governor {reasoning} latency {latency_ms}ms"),
+                            now,
+                        )
+                        .tagged(format!("gov:{task_id}"))
+                        .tagged("governor")
+                        .tagged("local"),
+                    );
+            }
+            response["latency_ms"] = serde_json::json!(latency_ms);
+            serde_json::json!({"result": out})
+        }
+        decentraai_distributed::mp::GovernorVerdict::DistributedComputeRequired => {
+            // Map-reduce: split, dispatch to workers, reduce into ONE result.
+            let workload = decentraai_distributed::mp::MpWorkload {
+                task_id: task_id.clone(),
+                instruction: instruction.clone(),
+                content: content.clone(),
+            };
+            let plan = decentraai_distributed::mp::plan(&workload);
+            let mut workers: Vec<MpTarget> = vec![MpTarget::Local];
+            for p in peers.iter() {
+                workers.push(MpTarget::Peer(*p));
+            }
+            let buckets = decentraai_distributed::pool::partition(plan.shards.len(), workers.len());
+            let dist_start = std::time::Instant::now();
+            let stream_futs: Vec<_> = buckets
+                .into_iter()
+                .zip(workers.iter())
+                .map(|(idxs, target)| {
+                    let bench_c = bench.clone();
+                    let p2p_c = p2p.clone();
+                    let model_c = model.clone();
+                    let instruction_c = instruction.clone();
+                    let target_c = match target {
+                        MpTarget::Local => MpTarget::Local,
+                        MpTarget::Peer(p) => MpTarget::Peer(*p),
+                    };
+                    let shards = plan.shards.clone();
+                    async move {
+                        let mut results = Vec::new();
+                        let label = match &target_c {
+                            MpTarget::Local => "local".to_string(),
+                            MpTarget::Peer(p) => p.to_string(),
+                        };
+                        for &si in &idxs {
+                            let shard = &shards[si];
+                            let prompt =
+                                decentraai_distributed::mp::map_prompt(&instruction_c, shard);
+                            let (out, lat) = mp_run_one(
+                                &target_c,
+                                &prompt,
+                                &bench_c,
+                                &p2p_c,
+                                &model_c,
+                                max_tokens,
+                                cpu_cores,
+                                ram_mb,
+                                lease_seconds,
+                            )
+                            .await;
+                            results.push((label.clone(), si, out, lat));
+                        }
+                        results
+                    }
+                })
+                .collect();
+            let map_results: Vec<Vec<(String, usize, String, u64)>> =
+                futures::future::join_all(stream_futs).await;
+            let mut by_index: std::collections::BTreeMap<usize, (String, String, u64)> =
+                std::collections::BTreeMap::new();
+            let mut per_worker: std::collections::BTreeMap<String, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            for results in &map_results {
+                for (label, si, out, lat) in results {
+                    by_index.insert(*si, (label.clone(), out.clone(), *lat));
+                    let e = per_worker.entry(label.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += *lat;
+                }
+            }
+            let mut dist_partials: Vec<(String, String, u64)> = Vec::new();
+            for (si, _) in plan.shards.iter().enumerate() {
+                if let Some((label, out, lat)) = by_index.get(&si) {
+                    dist_partials.push((label.clone(), out.clone(), *lat));
+                }
+            }
+            let map_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
+            let partial_texts: Vec<String> =
+                dist_partials.iter().map(|(_, o, _)| o.clone()).collect();
+            let reduce_prompt = decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
+            let reduce_target = workers.get(1).cloned().unwrap_or(MpTarget::Local);
+            let (final_result, reduce_ms) = mp_run_one(
+                &reduce_target,
+                &reduce_prompt,
+                &bench,
+                &p2p,
+                &model,
+                max_tokens,
+                cpu_cores,
+                ram_mb,
+                lease_seconds,
+            )
+            .await;
+            let distributed_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
+
+            // EvidenceChain: verdict + per-worker map entries + reduce.
+            if let Some(evidence) = &state.evidence {
+                let mut idx = evidence.index().lock().expect("evidence lock");
+                idx.add(
+                    decentraai_agents::evidence::EvidenceEntry::new(
+                        format!("gov:{task_id}:decision:{now}"),
+                        decentraai_agents::evidence::EvidenceFamily::Execution,
+                        format!("governor {reasoning}"),
+                        now,
+                    )
+                    .tagged(format!("gov:{task_id}"))
+                    .tagged("governor"),
+                );
+                for (label, _, lat) in &dist_partials {
+                    idx.add(
+                        decentraai_agents::evidence::EvidenceEntry::new(
+                            format!("gov:{task_id}:{label}:{now}"),
+                            decentraai_agents::evidence::EvidenceFamily::Execution,
+                            format!("governor map shard worker {label} latency {lat}ms task {task_id}"),
+                            now,
+                        )
+                        .tagged(format!("gov:{task_id}"))
+                        .tagged(format!("worker:{label}")),
+                    );
+                }
+                idx.add(
+                    decentraai_agents::evidence::EvidenceEntry::new(
+                        format!("gov:{task_id}:reduce:{now}"),
+                        decentraai_agents::evidence::EvidenceFamily::Execution,
+                        format!("governor reduce fused {} shards task {task_id}", plan.n_shards),
+                        now,
+                    )
+                    .tagged(format!("gov:{task_id}"))
+                    .tagged("reduce"),
+                );
+            }
+
+            response["n_shards"] = serde_json::json!(plan.n_shards);
+            response["map_ms"] = serde_json::json!(map_ms);
+            response["reduce_ms"] = serde_json::json!(reduce_ms);
+            response["distributed_ms"] = serde_json::json!(distributed_ms);
+            response["per_worker"] = serde_json::json!(
+                per_worker
+                    .iter()
+                    .map(|(w, (s, l))| serde_json::json!({"worker": w, "shards": s, "latency_ms": l}))
+                    .collect::<Vec<_>>()
+            );
+            serde_json::json!({"result": final_result})
+        }
+    };
+    response["output"] = result_payload;
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        response.to_string(),
+    )
+        .into_response()
+}
 /// Each stage produces evidence; workers receive credit on verified success.
 async fn collective_workflow_handler(
     State(state): State<ApiState>,

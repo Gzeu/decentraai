@@ -151,6 +151,55 @@ pub fn reduce_prompt(instruction: &str, partials: &[String]) -> String {
     )
 }
 
+/// The Governor's automatic verdict on a workload: local only, or distributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum GovernorVerdict {
+    /// The workload fits the local node's per-call budget; execute locally.
+    LocalCapacitySufficient,
+    /// The workload exceeds local capacity and enough workers are reachable;
+    /// borrow distributed compute and run map-reduce.
+    DistributedComputeRequired,
+}
+
+/// Deterministic Governor decision based on REAL availability.
+///
+/// - content within one worker's budget → local.
+/// - content beyond budget AND at least `min_workers` slots are reachable
+///   (local + ≥1 remote) → distributed.
+/// - content beyond budget but NO remote worker is reachable → local (the
+///   honest fallback: splitting without help would just be slow serial work).
+///
+/// `available_workers` counts the total reachable slots including the local
+/// node (so 3 nodes → 3).
+pub fn governor_decide(content_chars: usize, available_workers: usize) -> GovernorVerdict {
+    if content_chars <= MAX_SHARD_CHARS {
+        GovernorVerdict::LocalCapacitySufficient
+    } else if available_workers >= 2 {
+        GovernorVerdict::DistributedComputeRequired
+    } else {
+        // No remote capacity to borrow: run locally even though it exceeds
+        // one call's budget (the honest, non-fabricated answer).
+        GovernorVerdict::LocalCapacitySufficient
+    }
+}
+
+/// Human/operator-facing reasoning for a Governor verdict — used verbatim in
+/// the evidence record.
+pub fn governor_reasoning(v: GovernorVerdict, content_chars: usize, available_workers: usize) -> String {
+    match v {
+        GovernorVerdict::LocalCapacitySufficient if content_chars <= MAX_SHARD_CHARS => format!(
+            "LOCAL_CAPACITY_SUFFICIENT: workload is {content_chars} chars (<= {MAX_SHARD_CHARS}) so one local worker call is enough; {available_workers} worker(s) available."
+        ),
+        GovernorVerdict::LocalCapacitySufficient => format!(
+            "LOCAL_CAPACITY_SUFFICIENT: workload is {content_chars} chars (> {MAX_SHARD_CHARS}) but only {available_workers} worker(s) reachable, so distributed compute cannot be borrowed; executing locally."
+        ),
+        GovernorVerdict::DistributedComputeRequired => format!(
+            "DISTRIBUTED_COMPUTE_REQUIRED: workload is {content_chars} chars (> {MAX_SHARD_CHARS}) exceeding local per-call capacity; {available_workers} worker(s) available, borrowing distributed compute."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +266,42 @@ mod tests {
         assert!(p.contains("summarize"));
         assert!(p.contains("the section"));
         assert!(p.contains("ONLY the following section"));
+    }
+
+    #[test]
+    fn governor_decides_locally_when_content_fits() {
+        assert_eq!(
+            governor_decide(100, 1),
+            GovernorVerdict::LocalCapacitySufficient
+        );
+        assert_eq!(
+            governor_decide(100, 3),
+            GovernorVerdict::LocalCapacitySufficient
+        );
+        assert!(governor_reasoning(GovernorVerdict::LocalCapacitySufficient, 100, 3)
+            .starts_with("LOCAL_CAPACITY_SUFFICIENT"));
+    }
+
+    #[test]
+    fn governor_requires_distributed_when_over_budget_with_workers() {
+        assert_eq!(
+            governor_decide(MAX_SHARD_CHARS + 1, 3),
+            GovernorVerdict::DistributedComputeRequired
+        );
+        assert_eq!(
+            governor_decide(MAX_SHARD_CHARS + 1, 2),
+            GovernorVerdict::DistributedComputeRequired
+        );
+        assert!(governor_reasoning(GovernorVerdict::DistributedComputeRequired, 2000, 3)
+            .starts_with("DISTRIBUTED_COMPUTE_REQUIRED"));
+    }
+
+    #[test]
+    fn governor_falls_back_to_local_when_no_remote_workers() {
+        // Over budget but only 1 worker reachable: honest local fallback.
+        assert_eq!(
+            governor_decide(MAX_SHARD_CHARS + 1, 1),
+            GovernorVerdict::LocalCapacitySufficient
+        );
     }
 }
