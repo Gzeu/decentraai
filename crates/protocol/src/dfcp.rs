@@ -47,7 +47,12 @@ fn dfcp_version() -> u32 {
 
 /// Upper bound for any single DFCP message payload (bytes). Negotiation
 /// metadata only — task payloads travel on the existing channels.
-pub const MAX_DFCP_MESSAGE_BYTES: usize = 16 * 1024;
+///
+/// 64 KiB accommodates the largest legitimate in-band payload: an embeddings
+/// result carries a 768-dim vector (~16 KiB serialized). Anything larger is
+/// rejected, so the cap still prevents oversized/abusive messages while
+/// letting verified embeddings flow through the assist result channel.
+pub const MAX_DFCP_MESSAGE_BYTES: usize = 64 * 1024;
 
 macro_rules! dfcp_id {
     ($name:ident) => {
