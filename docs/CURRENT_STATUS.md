@@ -1,80 +1,53 @@
-# CURRENT STATUS — Agent-OS milestone line (living doc)
+# DecentraAI — CURRENT STATUS
 
-> Numbering note: this file tracks the **Agent-OS milestone namespace**
-> (M15 pressure · M16 gateway · M17 orchestration · M18 collective memory ·
-> M19 semantic+sync). The older fabric-planner numbering (M18–M24 in
-> `ROADMAP_HISTORY.md`) is a separate, historical namespace.
+> Updated: 2026-08-24 post all-merges
 
-## Landed (merged)
+## main @ 7f747ae+ — 1386 tests · clippy clean · CI 100% green
 
-| Milestone | Tag |
-|---|---|
-| Fabric Intelligence | `milestone/fabric-intelligence` |
-| Sharing is Caring M1 (DFCP v1) | `milestone/sharing-is-caring` |
-| Agent OS + Obsidian memory | `milestone/agent-os` |
-| M15 Autonomous Pressure Trigger | `milestone/autonomous-pressure` |
-| Training Lab mechanism (datasets/skills/talent tree) | merged |
+## Merged milestones (all on main)
 
-## Open PRs — merge in this exact order
-
-| PR | Branch | Scope |
+| Milestone | PR | Tag |
 |---|---|---|
-| #37 | `feat/agent-gateway` | M16 Agent Gateway (BYOA scoped credentials) |
-| #38 | `feat/collective-orchestration` | M17.1 Collective Orchestration |
-| #39 | `feat/collective-memory` | M18 Collective Memory core |
-| #40 | `feat/memory-rag` | M19 Semantic retrieval + cross-node sync (stacked on #39) |
+| Fabric Intelligence | — | `milestone/fabric-intelligence` |
+| Sharing is Caring (DFCP v1) | — | `milestone/sharing-is-caring` |
+| Agent OS + Obsidian Memory | — | `milestone/agent-os` |
+| M15 Autonomous Pressure | — | `milestone/autonomous-pressure` |
+| Training Lab | — | merged |
+| M16 Agent Gateway | #37 | `milestone/agent-gateway` |
+| M17.1 Collective Orchestration | #38 | `milestone/collective-orchestration` |
+| M18 Collective Memory | #39 | `milestone/collective-memory` |
+| M19 Memory Fabric (semantic+sync+propagation) | #40 | `milestone/memory-fabric` |
+| MI-ops (persistence, governance API) | #48 | `milestone/model-colony-ops` |
+| Full-loop integration test | #50 | — |
+| Intelligence Loop (active colony) | #55 | — |
+| MVX Devnet Adapter + Identity | #45+#46 | — |
+| MX-8004 Write Path research | #47 | — |
 
-## What exists now (capability view)
+## MultiversX Testnet — LIVE
 
-- Collective memory: scopes (agent/team/node/network/fabric/system), 9 knowledge
-  kinds, lifecycle candidate→verified→trusted→obsolete with audited transitions,
-  BLAKE3 dedup, competing-claim preservation + deterministic resolution,
-  provenance with confidence + evidence refs.
-- Retrieval: `/v1/memory/search` lexical always; semantic via embeddings backend
-  (`mode=auto` degrades gracefully); explicit operator backfill `/v1/memory/index`.
-- Cross-node sync: bounded wire schema over the EXISTING p2p transport;
-  imported claims always land as `candidate` locally (verification is local);
-  receiver policy gates decide acceptance; declined is explicit.
-- Learning loop: verified+evidenced generalizations export as JSONL training
-  candidates (`GET /v1/memory/training-candidates`) → manual feed into the
-  Training Lab dataset builder. Nothing trains automatically.
+DecentraGovernor registered as soulbound NFT:
+- Agent nonce: **7**
+- txHash: `f25eed6bd9e5551289833f323b0de06a93ad96e43363d927bc410ca88806af33`
+- Identity Registry: `erd1qqqqqqqqqqqqqpgq8qn7lr9287vzkjtr55lz3r3c56dgthyzr5es626nms`
 
-> Index complet al componentelor: docs/INVENTORY.md ·
-> Operațiuni VPS: docs/VPS_OPERATIONS.md
+All three registries VERIFIED (codeHash confirmed via gateway probe):
+Identity · Validation · Reputation — see MULTIVERSX_DEVNET_ADDRESSES.md.
 
-## Model Intelligence / Model Colony (feat/model-intelligence)
+## Component index
 
-Foundation phase landed AFTER M19, BEFORE any M20 work:
-- `hub::model_intel`: registry with TWO orthogonal axes (availability ×
-  governance), gated lifecycle transitions, seeded colony
-  (qwen3-1.7b/gemma-3-1b/phi-4-mini Q4 — all experimental, all claims
-  inferred, NO hard-coded winner)
-- `fabric::model_routing`: deterministic capability routing (hard gates →
-  integer score → ordered fallbacks; id-asc tie-breaks)
-- `distributed::model_performance`: verified executions → Collective Memory
-  observations (`model.intel` scope) + honest integer aggregation
-- Training Lab: 24-task Model Intelligence corpus (12 areas incl. Romanian)
-  + `compare_shadow_models()` (recommendation only — never auto-promotes)
-- API (operator+): GET `/v1/models/intel`, POST `/v1/models/route` (dry-run)
-- Docs: docs/MODEL_INTELLIGENCE.md
+Full component→purpose→location mapping: docs/INVENTORY.md
+VPS operations: docs/VPS_OPERATIONS.md
+Economic model: docs/ECONOMIC_MODEL.md
+MX integration: docs/MULTIVERSX_AGENT_INTEGRATION.md
+Model Intelligence: docs/MODEL_INTELLIGENCE.md
 
-## Open follow-ups
+## Remaining work (all need external resources)
 
-1. ~~Auto-embed-on-write~~ DONE (KnowledgeRuntime background indexing).
-2. ~~Failure→Solution pairing in training export~~ DONE (`paired_failure`).
-3. Governor daemon consumption of collective memory — DONE via PR #41
-   (`feat/memory-governor-ops`, untrusted-labeled context + operator actions).
-4. Two-node LAN validation of the full loop (workflow result → memory →
-   candidate → verify → export) on real hardware.
-5. ~~Automatic peer-selection policy for sync propagation~~ DONE
-   (`memory_propagator.rs`, opt-in via `DECENTRAAI_MEMORY_PROPAGATE=1`).
-6. p2p: honour `lan_discovery` fully — announce side still runs; only the
-   reaction to discovery is gated today (needs behaviour-level rework).
-
-## Standing decisions (do not relitigate casually)
-
-- Merge order #37 → #38 → #39 → #40; never merge without gates green.
-- Memory retrieved by any agent is UNTRUSTED INPUT; deterministic policy layer
-  is the only authority.
-- Remote/imported knowledge starts at `candidate`; trust is earned locally.
-- No second memory system, no new network protocol, no auto-training.
+| Task | Blocker |
+|---|---|
+| GGUF models on worker | download Qwen/Gemma/Phi Q4 files |
+| Embeddings backend on VPS | llama-server --embedding |
+| LAN two-node validation | physical hardware access |
+| Governor daemon → Router integration | build (medium) |
+| Dashboard Colony actions UI | build (medium) |
+| P2P announce-side lan_discovery gating | p2p behaviour rework |
