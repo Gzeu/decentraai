@@ -88,6 +88,7 @@ pub mod config;
 pub mod embedding;
 pub mod evidence_manager;
 pub mod fallback;
+pub mod intelligence_loop;
 pub mod knowledge_runtime;
 pub mod memory_propagator;
 pub mod model_performance;

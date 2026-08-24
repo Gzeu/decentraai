@@ -6,13 +6,18 @@ fn main() {
     let agents = c.list_agents(0, 5).expect("list_agents live");
     println!("LIVE list_agents: {} items", agents.len());
     for a in &agents {
-        println!("  nonce={:?} name={:?} pk={:?}", a.nonce, a.name,
-            a.public_key.as_deref().map(|k| k.get(..12).unwrap_or(k)));
+        println!(
+            "  nonce={:?} name={:?} pk={:?}",
+            a.nonce,
+            a.name,
+            a.public_key.as_deref().map(|k| k.get(..12).unwrap_or(k))
+        );
     }
-    if let Some(first) = agents.first() {
-        if let Some(n) = first.nonce {
-            let rep = c.reputation(n).expect("reputation live");
-            println!("LIVE reputation nonce={} avg={} count={}", n, rep.average, rep.count);
-        }
+    if let Some(n) = agents.first().and_then(|a| a.nonce) {
+        let rep = c.reputation(n).expect("reputation live");
+        println!(
+            "LIVE reputation nonce={} avg={} count={}",
+            n, rep.average, rep.count
+        );
     }
 }

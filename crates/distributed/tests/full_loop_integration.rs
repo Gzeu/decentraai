@@ -12,8 +12,8 @@
 //! model intelligence actually form ONE FUNCTIONAL LOOP.
 
 use decentraai_agents::benchmark::{
-    aggregate, compare_shadow_models, BenchmarkMode, BenchmarkRun, BenchmarkVerdict,
-    RunMetrics, ShadowRecommendation,
+    BenchmarkMode, BenchmarkRun, BenchmarkVerdict, RunMetrics, ShadowRecommendation, aggregate,
+    compare_shadow_models,
 };
 use decentraai_agents::memory::{KnowledgeKind, MemoryEntry, MemoryStatus};
 use decentraai_distributed::agent_memory::MemoryStore;
