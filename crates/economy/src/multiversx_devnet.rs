@@ -166,6 +166,31 @@ impl<T: MxHttp> MxDevnetClient<T> {
         Ok(parse_agent(&v))
     }
 
+    /// Caută un agent după cheia publică (hex 0x-…) paginând lista.
+    /// Folosit DUPĂ registration pentru a descoperi nonce-ul on-chain
+    /// atribuit identității noastre. `max_pages` limitează traversarea.
+    pub fn find_agent_by_public_key(
+        &self,
+        public_key_hex: &str,
+        max_pages: u64,
+    ) -> Result<Option<MxAgentRecord>, String> {
+        let mut from: u64 = 0;
+        for _ in 0..max_pages {
+            let page = self.list_agents(from, 100)?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            if let Some(hit) = page
+                .iter()
+                .find(|a| a.public_key.as_deref() == Some(public_key_hex))
+            {
+                return Ok(Some(hit.clone()));
+            }
+            from += 100;
+        }
+        Ok(None)
+    }
+
     /// Fetches the registry's reputation summary for one agent.
     pub fn reputation(&self, nonce: u64) -> Result<MxReputation, String> {
         let v = self.get(&format!("/reputations/agents/{nonce}"))?;
