@@ -8832,20 +8832,40 @@ async fn governor_execute_handler(
             let partial_texts: Vec<String> =
                 dist_partials.iter().map(|(_, o, _)| o.clone()).collect();
             let reduce_prompt = decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
-            let reduce_target = workers.get(1).cloned().unwrap_or(MpTarget::Local);
-            let (final_result, reduce_ms) = mp_run_one(
-                &reduce_target,
-                &reduce_prompt,
-                &bench,
-                &p2p,
-                &model,
-                decentraai_distributed::mp::REDUCE_MAX_TOKENS,
-                cpu_cores,
-                ram_mb,
-                lease_seconds,
-            )
-            .await;
+            // Robust reduce: try workers until one returns a NON-EMPTY final
+            // result. Reasoning models (Qwen3) can burn the token budget and
+            // return empty content, which is NOT a valid reduction — so we
+            // retry on the next worker (e.g. the non-reasoning qwen2.5 node).
+            // If every worker yields empty output we fail HONESTLY and never
+            // manufacture a result.
+            let mut reduce_result: Option<(String, String, u64)> = None;
+            for target in &workers {
+                let (out, lat) = mp_run_one(
+                    target,
+                    &reduce_prompt,
+                    &bench,
+                    &p2p,
+                    &model,
+                    decentraai_distributed::mp::REDUCE_MAX_TOKENS,
+                    cpu_cores,
+                    ram_mb,
+                    lease_seconds,
+                )
+                .await;
+                if !out.trim().is_empty() {
+                    let reducer = match target {
+                        MpTarget::Local => "local".to_string(),
+                        MpTarget::Peer(p) => p.to_string(),
+                    };
+                    reduce_result = Some((out, reducer, lat));
+                    break;
+                }
+            }
             let distributed_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
+            let (final_result, reduce_ms) = match &reduce_result {
+                Some((out, _reducer, lat)) => (out.clone(), *lat),
+                None => (String::new(), 0),
+            };
 
             // EvidenceChain: verdict + per-worker map entries + reduce.
             if let Some(evidence) = &state.evidence {
@@ -8876,7 +8896,12 @@ async fn governor_execute_handler(
                     decentraai_agents::evidence::EvidenceEntry::new(
                         format!("gov:{task_id}:reduce:{now}"),
                         decentraai_agents::evidence::EvidenceFamily::Execution,
-                        format!("governor reduce fused {} shards task {task_id}", plan.n_shards),
+                        format!(
+                            "governor reduce fused {} shards task {task_id} reducer {} status {}",
+                            plan.n_shards,
+                            reduce_result.as_ref().map(|(_, r, _)| r.as_str()).unwrap_or("none"),
+                            if reduce_result.is_some() { "valid" } else { "empty-failed" }
+                        ),
                         now,
                     )
                     .tagged(format!("gov:{task_id}"))
@@ -8888,6 +8913,12 @@ async fn governor_execute_handler(
             response["map_ms"] = serde_json::json!(map_ms);
             response["reduce_ms"] = serde_json::json!(reduce_ms);
             response["distributed_ms"] = serde_json::json!(distributed_ms);
+            response["reducer"] = serde_json::json!(
+                reduce_result.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default()
+            );
+            response["reduce_status"] = serde_json::json!(
+                if reduce_result.is_some() { "valid" } else { "empty-failed" }
+            );
             response["per_worker"] = serde_json::json!(
                 per_worker
                     .iter()
