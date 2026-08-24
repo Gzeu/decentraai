@@ -29,6 +29,7 @@ pub mod evidence;
 pub mod governance_invariants;
 pub mod multiversx_devnet;
 pub mod multiversx_identity;
+pub mod multiversx_tx;
 pub mod settlement;
 pub mod tokenomics;
 
