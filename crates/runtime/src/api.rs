@@ -5102,6 +5102,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/intel/plan", post(intel_plan_handler))
         .route("/v1/intel/status", get(intel_status_handler))
         .route("/v1/intel/assist", post(intel_assist_handler))
+        .route("/v1/pool/bench", post(pool_bench_handler))
         .route("/v1/skills", get(skills_handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rag/index", post(rag_index_handler))
@@ -7799,6 +7800,386 @@ async fn intel_assist_handler(
             "result": serde_json::from_slice::<serde_json::Value>(&result_payload)
                 .unwrap_or(serde_json::Value::Null),
         })),
+    )
+        .into_response()
+}
+
+/// A worker slot in a pool run: the requesting node itself or one remote peer.
+enum PoolWorkerTarget {
+    Local,
+    Peer(libp2p::PeerId),
+}
+
+/// POST /v1/pool/bench — CPU pool evaluation over the Sharing is Caring mesh.
+///
+/// The requesting node holds a workload of MANY independent tasks (e.g. the
+/// 24-task Model Intelligence corpus). It partitions them across its own CPU
+/// and the connected worker peers, executes the batches in parallel (local
+/// via the benchmark executor, remote via the existing DFCP delegation —
+/// `run_assist_request`), then grades + aggregates deterministically. This
+/// demonstrates real batch/task parallelism: the pool's wall-clock should be
+/// lower than the serial single-node baseline, and each remote task runs on
+/// the worker's OWN CPU (observable via the worker's `read_loadavg` logs).
+///
+/// Body:
+/// ```json
+/// {
+///   "tasks": [{"task_id":"mi_arch_hash","prompt":"...","gold":"blake3"}],
+///   "capability":"chat", "model":"Qwen3-1.7B-Q4_K_M.gguf",
+///   "cpu_cores":2, "ram_mb":512, "lease_seconds":90, "max_tokens":64,
+///   "max_workers":3
+/// }
+/// ```
+/// `max_workers` includes the local node: 1 = serial local-only (the baseline
+/// for comparison), 3 = local + two remotes.
+async fn pool_bench_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = state.require_operator_or_admin(&headers) {
+        return e.into_response();
+    }
+    let b = body.0;
+    let Some(tasks_arr) = b.get("tasks").and_then(|v| v.as_array()) else {
+        return forbidden("tasks array is required");
+    };
+    let tasks: Vec<decentraai_distributed::pool::PoolTask> =
+        match serde_json::from_value(serde_json::Value::Array(tasks_arr.clone())) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": format!("invalid tasks: {e}")})
+                        .to_string(),
+                )
+                    .into_response();
+            }
+        };
+    if tasks.is_empty() {
+        return forbidden("tasks must not be empty");
+    }
+
+    let capability = b
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chat")
+        .to_string();
+    let model = b
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cpu_cores = b.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
+    let ram_mb = b.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(512);
+    let lease_seconds = b.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(90);
+    let max_tokens = b.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64);
+    let max_workers = b.get("max_workers").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
+    let Some(p2p) = state.p2p.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "p2p not attached"}).to_string(),
+        )
+            .into_response();
+    };
+    let Some(bench) = state.benchmark.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "benchmark runtime not attached"}).to_string(),
+        )
+            .into_response();
+    };
+
+    // Determine worker slots: local always slot 0, then up to max_workers-1
+    // remote peers (deterministic order from connected_peers).
+    let peers = p2p.connected_peers().await;
+    let mut workers: Vec<PoolWorkerTarget> = vec![PoolWorkerTarget::Local];
+    for peer in peers.iter().take(max_workers.saturating_sub(1)) {
+        workers.push(PoolWorkerTarget::Peer(*peer));
+    }
+    let labels: Vec<String> = workers
+        .iter()
+        .map(|w| match w {
+            PoolWorkerTarget::Local => "local".to_string(),
+            PoolWorkerTarget::Peer(p) => p.to_string(),
+        })
+        .collect();
+
+    // Deterministic round-robin partition of tasks across worker slots.
+    let buckets = decentraai_distributed::pool::partition(tasks.len(), workers.len());
+
+    let started = Instant::now();
+    // Run each worker's batch concurrently, collect outcomes as they arrive.
+    let mut outcomes: Vec<decentraai_distributed::pool::PoolOutcome> = Vec::new();
+    let streams: Vec<_> = buckets
+        .into_iter()
+        .zip(workers.iter())
+        .map(|(indexes, target)| {
+            let tasks_c = tasks.clone();
+            let bench_c = bench.clone();
+            let embedding_c = state.embedding.clone();
+            let p2p_c = p2p.clone();
+            let model_c = model.clone();
+            let capability_c = capability.clone();
+            let target_c = match target {
+                PoolWorkerTarget::Local => PoolWorkerTarget::Local,
+                PoolWorkerTarget::Peer(p) => PoolWorkerTarget::Peer(*p),
+            };
+            async move {
+                let mut worker_outcomes = Vec::new();
+                let kind = match &target_c {
+                    PoolWorkerTarget::Local => decentraai_distributed::pool::PoolWorkerKind::Local,
+                    PoolWorkerTarget::Peer(_) => {
+                        decentraai_distributed::pool::PoolWorkerKind::Remote
+                    }
+                };
+                let label = match &target_c {
+                    PoolWorkerTarget::Local => "local".to_string(),
+                    PoolWorkerTarget::Peer(p) => p.to_string(),
+                };
+
+                // ---- Embeddings BATCH for remote workers -------------------
+                // One DFCP negotiation carries a chunk of this worker's texts
+                // (payload input=[...]); the worker's embeddings backend embeds
+                // them in one call and returns N vectors. Chunks stay small
+                // enough that the batched result fits MAX_DFCP_MESSAGE_BYTES.
+                // This amortises the per-task REQUEST→RESERVE→ASSIGN overhead.
+                const EMBEDDINGS_BATCH: usize = 24;
+                if capability_c == "embeddings" {
+                    if let PoolWorkerTarget::Peer(peer) = &target_c {
+                        let mut chunks: Vec<Vec<usize>> = Vec::new();
+                        let mut chunk = Vec::new();
+                        for &i in &indexes {
+                            chunk.push(i);
+                            if chunk.len() >= EMBEDDINGS_BATCH {
+                                chunks.push(std::mem::take(&mut chunk));
+                            }
+                        }
+                        if !chunk.is_empty() {
+                            chunks.push(chunk);
+                        }
+                        for batch in chunks {
+                            let texts: Vec<String> =
+                                batch.iter().map(|i| tasks_c[*i].prompt.clone()).collect();
+                            let payload = serde_json::json!({ "input": texts });
+                            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                            let request = decentraai_compute::assist::AssistRequest {
+                                capability: capability_c.clone(),
+                                cpu_cores,
+                                ram_mb,
+                            };
+                            let t_start = Instant::now();
+                            let (success, result_payload, _explanation) =
+                                crate::intel_assist::run_assist_request(
+                                    &p2p_c,
+                                    vec![*peer],
+                                    request,
+                                    payload_bytes,
+                                    lease_seconds,
+                                )
+                                .await;
+                            let latency_ms = t_start.elapsed().as_millis() as u64;
+                            let parsed: Option<Vec<Option<String>>> = if success {
+                                serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                    .ok()
+                                    .and_then(|v| v.get("data").cloned())
+                                    .and_then(|d| d.as_array().cloned())
+                                    .map(|rows| {
+                                        rows.iter()
+                                            .map(|row| {
+                                                row.get("embedding")
+                                                    .and_then(|e| e.as_array())
+                                                    .map(|arr| {
+                                                        format!(
+                                                            "embedding dim={} first={:?}",
+                                                            arr.len(),
+                                                            arr.first()
+                                                        )
+                                                    })
+                                            })
+                                            .collect()
+                                    })
+                            } else {
+                                None
+                            };
+                            for (j, &idx) in batch.iter().enumerate() {
+                                let (output, executed) = match &parsed {
+                                    Some(rows) => match rows.get(j) {
+                                        Some(Some(o)) => (o.clone(), true),
+                                        _ => (String::new(), true),
+                                    },
+                                    None => (String::new(), false),
+                                };
+                                worker_outcomes.push(decentraai_distributed::pool::PoolOutcome {
+                                    task_id: tasks_c[idx].task_id.clone(),
+                                    worker: label.clone(),
+                                    worker_kind: kind,
+                                    executed,
+                                    output,
+                                    verdict: decentraai_agents::benchmark::BenchmarkVerdict::Abstained,
+                                    latency_ms,
+                                });
+                            }
+                        }
+                        return worker_outcomes;
+                    }
+                }
+
+                // ---- Non-embeddings, or local embeddings: per-task ---------
+                for idx in indexes {
+                    let task = &tasks_c[idx];
+                    let t_start = Instant::now();
+                    let (output, executed) = match &target_c {
+                        PoolWorkerTarget::Local => {
+                            // Embeddings run against the node's own embeddings
+                            // backend (not the chat benchmark executor).
+                            if capability_c == "embeddings" {
+                                match &embedding_c {
+                                    Some(emb) => match emb.embed(&task.prompt).await {
+                                        Ok(vec) => (
+                                            format!("embedding dim={} first={:?}", vec.len(), vec.first()),
+                                            true,
+                                        ),
+                                        Err(e) => (format!("embeddings error: {e}"), false),
+                                    },
+                                    None => (
+                                        "embeddings backend not configured locally".to_string(),
+                                        false,
+                                    ),
+                                }
+                            } else {
+                                let bt = match task.gold.clone() {
+                                    Some(g) => decentraai_agents::benchmark::BenchmarkTask::new(
+                                        task.task_id.clone(),
+                                        task.prompt.clone(),
+                                        g,
+                                    ),
+                                    None => decentraai_agents::benchmark::BenchmarkTask::ungradable(
+                                        task.task_id.clone(),
+                                        task.prompt.clone(),
+                                    ),
+                                };
+                                match bench_c.run_task(
+                                    &bt,
+                                    decentraai_agents::benchmark::BenchmarkMode::Single,
+                                    1,
+                                )
+                                .await
+                                {
+                                    Ok(run) => (run.output, true),
+                                    Err(e) => (format!("execution error: {e}"), false),
+                                }
+                            }
+                        }
+                        PoolWorkerTarget::Peer(peer) => {
+                            let payload = if capability_c == "embeddings" {
+                                serde_json::json!({ "input": task.prompt })
+                            } else {
+                                serde_json::json!({
+                                    "model": model_c,
+                                    "messages": [{"role":"user","content": task.prompt}],
+                                    "max_tokens": max_tokens,
+                                })
+                            };
+                            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                            let request = decentraai_compute::assist::AssistRequest {
+                                capability: capability_c.clone(),
+                                cpu_cores,
+                                ram_mb,
+                            };
+                            let (success, result_payload, _explanation) =
+                                crate::intel_assist::run_assist_request(
+                                    &p2p_c,
+                                    vec![*peer],
+                                    request,
+                                    payload_bytes,
+                                    lease_seconds,
+                                )
+                                .await;
+                            if !success {
+                                (String::new(), false)
+                            } else if capability_c == "embeddings" {
+                                // Embeddings responses carry a vector in
+                                // data[].embedding rather than chat choices.
+                                let content = serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("data")
+                                            .and_then(|d| d.as_array())
+                                            .and_then(|d| d.first())
+                                            .and_then(|e| e.get("embedding"))
+                                            .and_then(|e| e.as_array())
+                                            .map(|arr| format!("embedding dim={} first={:?}", arr.len(), arr.first()))
+                                    })
+                                    .unwrap_or_default();
+                                (content, true)
+                            } else {
+                                // Extract message content from the OpenAI-shaped
+                                // chat response returned by the remote worker.
+                                let content = serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("choices")
+                                            .and_then(|c| c.as_array())
+                                            .and_then(|c| c.first())
+                                            .and_then(|ch| ch.get("message"))
+                                            .and_then(|m| m.get("content"))
+                                            .and_then(|s| s.as_str())
+                                            .map(str::to_string)
+                                            .or_else(|| {
+                                                v.get("choices")
+                                                    .and_then(|c| c.as_array())
+                                                    .and_then(|c| c.first())
+                                                    .and_then(|ch| ch.get("text"))
+                                                    .and_then(|s| s.as_str())
+                                                    .map(str::to_string)
+                                            })
+                                    })
+                                    .unwrap_or_default();
+                                (content, true)
+                            }
+                        }
+                    };
+                    let latency_ms = t_start.elapsed().as_millis() as u64;
+                    worker_outcomes.push(decentraai_distributed::pool::PoolOutcome {
+                        task_id: task.task_id.clone(),
+                        worker: label.clone(),
+                        worker_kind: kind,
+                        executed,
+                        output: output.clone(),
+                        verdict: decentraai_agents::benchmark::grade_answer(
+                            &output,
+                            task.gold.as_deref(),
+                        ),
+                        latency_ms,
+                    });
+                }
+                worker_outcomes
+            }
+        })
+        .collect();
+    for worker_outcomes in futures::future::join_all(streams).await {
+        outcomes.extend(worker_outcomes);
+    }
+    let pool_wall_ms = started.elapsed().as_millis() as u64;
+
+    let agg = decentraai_distributed::pool::aggregate_pool(&outcomes);
+    let serial_wall_ms = agg.total_latency_ms;
+    let speedup = agg.speedup(pool_wall_ms, serial_wall_ms);
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "workers": labels,
+            "max_workers": max_workers,
+            "pool_wall_ms": pool_wall_ms,
+            "serial_wall_ms": serial_wall_ms,
+            "speedup": speedup,
+            "aggregate": agg,
+            "outcomes": outcomes,
+        })
+        .to_string(),
     )
         .into_response()
 }

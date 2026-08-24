@@ -639,7 +639,7 @@ impl P2PNode {
                 }),
             })
             .context("attaching network behaviour")?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(600)))
             .build();
         // Dial bootstrap peers so the DHT connects immediately instead of
         // waiting for an idle routing query to discover them. `info!` so the

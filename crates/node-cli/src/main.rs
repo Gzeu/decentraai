@@ -799,6 +799,27 @@ enum BenchCommand {
         #[arg(long, default_value = "3")]
         agents: usize,
     },
+    /// CPU pool evaluation: load the Model Intelligence corpus (24 tasks) and
+    /// partition it across the requesting node's CPU + connected worker peers
+    /// through `/v1/pool/bench`, then print the aggregated accuracy, wall
+    /// times and speedup vs the serial single-node baseline. Use
+    /// `--max-workers 1` to measure the serial baseline itself.
+    Pool {
+        #[arg(long, default_value = "configs/node.example.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value = "3")]
+        max_workers: usize,
+        #[arg(long, default_value = "chat")]
+        capability: String,
+        #[arg(long, default_value = "Qwen3-1.7B-Q4_K_M.gguf")]
+        model: String,
+        #[arg(long, default_value = "90")]
+        lease_seconds: u64,
+        #[arg(long, default_value = "64")]
+        max_tokens: u64,
+        #[arg(long)]
+        tasks_limit: Option<usize>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2356,9 +2377,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(assist_cfg) = config.sharing.assist.as_ref() {
             if assist_cfg.enabled {
                 let worker_state =
-                    std::sync::Arc::new(decentraai_runtime::intel_assist::AssistWorkerState::new(
+                    std::sync::Arc::new(decentraai_runtime::intel_assist::AssistWorkerState::with_embeddings(
                         std::sync::Arc::new(assist_cfg.clone()),
                         backend_url.clone(),
+                        config.inference.embeddings_backend_url.clone(),
                         vec![], // empty = any TRUSTED peer may request
                     ));
                 let p2p_for_worker = distributed.p2p_node().clone();
@@ -4756,6 +4778,53 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
             let resp = req.send().await?;
             let j: serde_json::Value = resp.json().await?;
             print_bench_comparison(&j);
+        }
+        BenchCommand::Pool {
+            config,
+            max_workers,
+            capability,
+            model,
+            lease_seconds,
+            max_tokens,
+            tasks_limit,
+        } => {
+            let tasks: Vec<decentraai_distributed::pool::PoolTask> =
+                decentraai_distributed::benchmark_datasets::model_intelligence_tasks()
+                    .iter()
+                    .take(tasks_limit.unwrap_or(usize::MAX))
+                    .map(decentraai_distributed::pool::PoolTask::from)
+                    .collect();
+            if tasks.is_empty() {
+                anyhow::bail!("no Model Intelligence tasks to run");
+            }
+            println!(
+                "pool-bench: {} tasks, max_workers={max_workers}, capability={capability}, model={model}",
+                tasks.len()
+            );
+            let (client, base_url, token) = build_local_client(&config)?;
+            let body = serde_json::json!({
+                "tasks": tasks,
+                "capability": capability,
+                "model": model,
+                "lease_seconds": lease_seconds,
+                "max_tokens": max_tokens,
+                "max_workers": max_workers,
+            });
+            let mut req = client.post(format!("{base_url}/v1/pool/bench")).json(&body);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let j: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "pool-bench failed (HTTP {}): {}",
+                    status,
+                    j.get("error").map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&j)?);
         }
     }
     Ok(())
