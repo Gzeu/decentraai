@@ -9066,7 +9066,20 @@ async fn governor_execute_handler(
             let partial_texts: Vec<String> = completed.iter().map(|r| r.output.clone()).collect();
             let reduce_prompt =
                 decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
-            let reduce_target = workers.get(1).cloned().unwrap_or(MpTarget::Local);
+            // Reduce must run on a worker PROVEN alive by this run: prefer one that
+            // completed a shard, fall back to local. A dead worker here would
+            // make the final answer empty even though shards completed.
+            let reduce_target = runs
+                .iter()
+                .find(|r| r.is_completed() && r.worker != "local")
+                .map(|r| {
+                    workers
+                        .iter()
+                        .find(|w| matches!(w, MpTarget::Peer(p) if p.to_string() == r.worker))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or(MpTarget::Local);
             let (final_result, reduce_ms) = mp_run_one(
                 &reduce_target,
                 &reduce_prompt,
