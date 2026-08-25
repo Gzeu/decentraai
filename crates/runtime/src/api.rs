@@ -8623,7 +8623,12 @@ async fn governor_execute_handler(
     };
     let _consumer_guard = match &auth {
         Auth::Master => None,
-        Auth::Consumer { key_id, account, quota_ceiling, .. } => {
+        Auth::Consumer { key_id, account, quota_ceiling, rate_limit_per_minute, .. } => {
+            // Rate limit BEFORE spending quota: a hot consumer key cannot
+            // saturate the Governor loop faster than its configured rate.
+            if let Err(_) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+                return forbidden("consumer rate limit exceeded");
+            }
             let rid = format!(
                 "gov-{}",
                 std::time::SystemTime::now()
