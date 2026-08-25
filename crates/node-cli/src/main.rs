@@ -2401,13 +2401,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         // verdict can legitimately choose DISTRIBUTED.
                         let content = format!(
                             "DecentraAI autonomous pressure probe. The fabric reports cpu={:.0}% ram={:.0}% queue={} workers={}. \
-                             Section 1 covers capability routing and DFCP negotiation between verified peers. Section 2 covers reservation, \
-                             lease expiry and release semantics under owner limits. Section 3 covers evidence verification before any contribution \
-                             credit is recorded for a remote worker. Section 4 covers the reward policy and how verified work maps to credit. \
+                             Section 1 covers capability routing and DFCP negotiation between verified peers, including how offers are scored \
+                             deterministically and how fairness is a bias rather than a dictator. Section 2 covers reservation, lease expiry \
+                             and release semantics under owner limits, and why every lease must expire. Section 3 covers evidence verification \
+                             before any contribution credit is recorded for a remote worker, and how only cryptographic failures punish a peer. \
+                             Section 4 covers the reward policy and how verified work maps to credit through the economy ledger. \
                              Section 5 covers Model Colony selection where the best model for a task is chosen by capability, RAM fit and verified \
-                             benchmark evidence. Section 6 covers the governor resource-aware verdict choosing LOCAL, DISTRIBUTED, QUEUE or REJECT. \
-                             Section 7 covers distributed map-reduce inference where a single logical workload is split into shards, mapped across \
-                             workers and reduced into one final answer. Section 8 covers deterministic ordering and stable ids for batched tasks.",
+                             benchmark evidence, with non-reasoners preferred for reduction. Section 6 covers the governor resource-aware verdict \
+                             choosing LOCAL, DISTRIBUTED, QUEUE or REJECT from real pressure signals. Section 7 covers distributed map-reduce \
+                             inference where a single logical workload is split into shards, mapped across workers and reduced into one final \
+                             answer, with the honest boundary that llama-server cannot split a forward pass across nodes. Section 8 covers \
+                             deterministic ordering, stable ids for batched tasks, retries, and how worker failure must never corrupt results.",
                             signals.cpu_percent,
                             signals.ram_percent,
                             signals.queue_depth,
