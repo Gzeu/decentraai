@@ -4863,7 +4863,7 @@ fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> 
 /// worker earned its suggested tier, then apply it.
 async fn admin_contribution_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_master(&headers) {
-return e.into_response();
+        return e.into_response();
     }
     let Some(compute) = &state.compute else {
         return (
@@ -7858,8 +7858,7 @@ async fn pool_bench_handler(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    serde_json::json!({"error": format!("invalid tasks: {e}")})
-                        .to_string(),
+                    serde_json::json!({"error": format!("invalid tasks: {e}")}).to_string(),
                 )
                     .into_response();
             }
@@ -7880,7 +7879,10 @@ async fn pool_bench_handler(
         .to_string();
     let cpu_cores = b.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
     let ram_mb = b.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(512);
-    let lease_seconds = b.get("lease_seconds").and_then(|v| v.as_u64()).unwrap_or(90);
+    let lease_seconds = b
+        .get("lease_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(90);
     let max_tokens = b.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64);
     let max_workers = b.get("max_workers").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
@@ -7996,15 +7998,15 @@ async fn pool_bench_handler(
                                     .map(|rows| {
                                         rows.iter()
                                             .map(|row| {
-                                                row.get("embedding")
-                                                    .and_then(|e| e.as_array())
-                                                    .map(|arr| {
+                                                row.get("embedding").and_then(|e| e.as_array()).map(
+                                                    |arr| {
                                                         format!(
                                                             "embedding dim={} first={:?}",
                                                             arr.len(),
                                                             arr.first()
                                                         )
-                                                    })
+                                                    },
+                                                )
                                             })
                                             .collect()
                                     })
@@ -8025,7 +8027,8 @@ async fn pool_bench_handler(
                                     worker_kind: kind,
                                     executed,
                                     output,
-                                    verdict: decentraai_agents::benchmark::BenchmarkVerdict::Abstained,
+                                    verdict:
+                                        decentraai_agents::benchmark::BenchmarkVerdict::Abstained,
                                     latency_ms,
                                 });
                             }
@@ -8131,7 +8134,11 @@ async fn pool_bench_handler(
                                 match &embedding_c {
                                     Some(emb) => match emb.embed(&task.prompt).await {
                                         Ok(vec) => (
-                                            format!("embedding dim={} first={:?}", vec.len(), vec.first()),
+                                            format!(
+                                                "embedding dim={} first={:?}",
+                                                vec.len(),
+                                                vec.first()
+                                            ),
                                             true,
                                         ),
                                         Err(e) => (format!("embeddings error: {e}"), false),
@@ -8148,17 +8155,20 @@ async fn pool_bench_handler(
                                         task.prompt.clone(),
                                         g,
                                     ),
-                                    None => decentraai_agents::benchmark::BenchmarkTask::ungradable(
-                                        task.task_id.clone(),
-                                        task.prompt.clone(),
-                                    ),
+                                    None => {
+                                        decentraai_agents::benchmark::BenchmarkTask::ungradable(
+                                            task.task_id.clone(),
+                                            task.prompt.clone(),
+                                        )
+                                    }
                                 };
-                                match bench_c.run_task(
-                                    &bt,
-                                    decentraai_agents::benchmark::BenchmarkMode::Single,
-                                    1,
-                                )
-                                .await
+                                match bench_c
+                                    .run_task(
+                                        &bt,
+                                        decentraai_agents::benchmark::BenchmarkMode::Single,
+                                        1,
+                                    )
+                                    .await
                                 {
                                     Ok(run) => (run.output, true),
                                     Err(e) => (format!("execution error: {e}"), false),
@@ -8195,41 +8205,49 @@ async fn pool_bench_handler(
                             } else if capability_c == "embeddings" {
                                 // Embeddings responses carry a vector in
                                 // data[].embedding rather than chat choices.
-                                let content = serde_json::from_slice::<serde_json::Value>(&result_payload)
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("data")
-                                            .and_then(|d| d.as_array())
-                                            .and_then(|d| d.first())
-                                            .and_then(|e| e.get("embedding"))
-                                            .and_then(|e| e.as_array())
-                                            .map(|arr| format!("embedding dim={} first={:?}", arr.len(), arr.first()))
-                                    })
-                                    .unwrap_or_default();
+                                let content =
+                                    serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("data")
+                                                .and_then(|d| d.as_array())
+                                                .and_then(|d| d.first())
+                                                .and_then(|e| e.get("embedding"))
+                                                .and_then(|e| e.as_array())
+                                                .map(|arr| {
+                                                    format!(
+                                                        "embedding dim={} first={:?}",
+                                                        arr.len(),
+                                                        arr.first()
+                                                    )
+                                                })
+                                        })
+                                        .unwrap_or_default();
                                 (content, true)
                             } else {
                                 // Extract message content from the OpenAI-shaped
                                 // chat response returned by the remote worker.
-                                let content = serde_json::from_slice::<serde_json::Value>(&result_payload)
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("choices")
-                                            .and_then(|c| c.as_array())
-                                            .and_then(|c| c.first())
-                                            .and_then(|ch| ch.get("message"))
-                                            .and_then(|m| m.get("content"))
-                                            .and_then(|s| s.as_str())
-                                            .map(str::to_string)
-                                            .or_else(|| {
-                                                v.get("choices")
-                                                    .and_then(|c| c.as_array())
-                                                    .and_then(|c| c.first())
-                                                    .and_then(|ch| ch.get("text"))
-                                                    .and_then(|s| s.as_str())
-                                                    .map(str::to_string)
-                                            })
-                                    })
-                                    .unwrap_or_default();
+                                let content =
+                                    serde_json::from_slice::<serde_json::Value>(&result_payload)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("choices")
+                                                .and_then(|c| c.as_array())
+                                                .and_then(|c| c.first())
+                                                .and_then(|ch| ch.get("message"))
+                                                .and_then(|m| m.get("content"))
+                                                .and_then(|s| s.as_str())
+                                                .map(str::to_string)
+                                                .or_else(|| {
+                                                    v.get("choices")
+                                                        .and_then(|c| c.as_array())
+                                                        .and_then(|c| c.first())
+                                                        .and_then(|ch| ch.get("text"))
+                                                        .and_then(|s| s.as_str())
+                                                        .map(str::to_string)
+                                                })
+                                        })
+                                        .unwrap_or_default();
                                 (content, true)
                             }
                         }
@@ -8323,7 +8341,10 @@ async fn mp_run_one(
                 .await
             {
                 Ok(run) => (run.output, t.elapsed().as_millis() as u64),
-                Err(e) => (format!("execution error: {e}"), t.elapsed().as_millis() as u64),
+                Err(e) => (
+                    format!("execution error: {e}"),
+                    t.elapsed().as_millis() as u64,
+                ),
             }
         }
         MpTarget::Peer(peer) => {
@@ -8339,7 +8360,11 @@ async fn mp_run_one(
                 ram_mb: ram,
             };
             let (success, result_payload, _) = crate::intel_assist::run_assist_request(
-                p2p, vec![*peer], request, payload_bytes, lease,
+                p2p,
+                vec![*peer],
+                request,
+                payload_bytes,
+                lease,
             )
             .await;
             if !success {
@@ -8383,7 +8408,10 @@ async fn model_parallel_handler(
         .unwrap_or("")
         .to_string();
     let max_workers = b.get("max_workers").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-    let local_only = b.get("local_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let local_only = b
+        .get("local_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if instruction.is_empty() || content.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -8624,10 +8652,19 @@ async fn governor_execute_handler(
     };
     let _consumer_guard = match &auth {
         Auth::Master => None,
-        Auth::Consumer { key_id, account, quota_ceiling, rate_limit_per_minute, .. } => {
+        Auth::Consumer {
+            key_id,
+            account,
+            quota_ceiling,
+            rate_limit_per_minute,
+            ..
+        } => {
             // Rate limit BEFORE spending quota: a hot consumer key cannot
             // saturate the Governor loop faster than its configured rate.
-            if state.check_consumer_rate_limit(key_id, *rate_limit_per_minute).is_err() {
+            if state
+                .check_consumer_rate_limit(key_id, *rate_limit_per_minute)
+                .is_err()
+            {
                 return forbidden("consumer rate limit exceeded");
             }
             let rid = format!(
@@ -8727,7 +8764,8 @@ async fn governor_execute_handler(
         let mut acc = seed_acc;
         let mut lat = seed_lat;
         if let Some(mem) = &mem {
-            if let Ok(summary) = decentraai_distributed::model_performance::aggregate_model(mem, model)
+            if let Ok(summary) =
+                decentraai_distributed::model_performance::aggregate_model(mem, model)
             {
                 if summary.samples > 0 {
                     if summary.success_percent > 0 {
@@ -8806,20 +8844,16 @@ async fn governor_execute_handler(
         | decentraai_distributed::mp::GovernorVerdict::Reject => {
             // Not running now: record the decision as evidence.
             if let Some(evidence) = &state.evidence {
-                evidence
-                    .index()
-                    .lock()
-                    .expect("evidence lock")
-                    .add(
-                        decentraai_agents::evidence::EvidenceEntry::new(
-                            format!("gov:{task_id}:decision:{now}"),
-                            decentraai_agents::evidence::EvidenceFamily::Execution,
-                            format!("governor {reasoning}"),
-                            now,
-                        )
-                        .tagged(format!("gov:{task_id}"))
-                        .tagged("governor"),
-                    );
+                evidence.index().lock().expect("evidence lock").add(
+                    decentraai_agents::evidence::EvidenceEntry::new(
+                        format!("gov:{task_id}:decision:{now}"),
+                        decentraai_agents::evidence::EvidenceFamily::Execution,
+                        format!("governor {reasoning}"),
+                        now,
+                    )
+                    .tagged(format!("gov:{task_id}"))
+                    .tagged("governor"),
+                );
             }
             response["status"] = serde_json::json!("not-executed");
             serde_json::json!({"result": null, "status": "not-executed"})
@@ -8840,27 +8874,27 @@ async fn governor_execute_handler(
             )
             .await;
             if let Some(evidence) = &state.evidence {
-                evidence
-                    .index()
-                    .lock()
-                    .expect("evidence lock")
-                    .add(
-                        decentraai_agents::evidence::EvidenceEntry::new(
-                            format!("gov:{task_id}:local:{now}"),
-                            decentraai_agents::evidence::EvidenceFamily::Execution,
-                            format!("governor {reasoning} latency {latency_ms}ms"),
-                            now,
-                        )
-                        .tagged(format!("gov:{task_id}"))
-                        .tagged("governor")
-                        .tagged("local"),
-                    );
+                evidence.index().lock().expect("evidence lock").add(
+                    decentraai_agents::evidence::EvidenceEntry::new(
+                        format!("gov:{task_id}:local:{now}"),
+                        decentraai_agents::evidence::EvidenceFamily::Execution,
+                        format!("governor {reasoning} latency {latency_ms}ms"),
+                        now,
+                    )
+                    .tagged(format!("gov:{task_id}"))
+                    .tagged("governor")
+                    .tagged("local"),
+                );
             }
             response["latency_ms"] = serde_json::json!(latency_ms);
             serde_json::json!({"result": out})
         }
         decentraai_distributed::mp::GovernorVerdict::Distributed => {
-            // Map-reduce: split, dispatch to workers, reduce into ONE result.
+            // Map-reduce with explicit shard lifecycle: assigned -> running ->
+            // completed | failed. A failed shard is retried on an alternative
+            // worker (same shard_id); a completed shard never runs twice. If a
+            // shard still fails with no alternative worker left, the result is
+            // honestly incomplete — never fabricated.
             let workload = decentraai_distributed::mp::MpWorkload {
                 task_id: task_id.clone(),
                 instruction: instruction.clone(),
@@ -8871,109 +8905,208 @@ async fn governor_execute_handler(
             for p in peers.iter() {
                 workers.push(MpTarget::Peer(*p));
             }
-            let buckets = decentraai_distributed::pool::partition(plan.shards.len(), workers.len());
-            let dist_start = std::time::Instant::now();
-            let stream_futs: Vec<_> = buckets
-                .into_iter()
-                .zip(workers.iter())
-                .map(|(idxs, target)| {
-                    let bench_c = bench.clone();
-                    let p2p_c = p2p.clone();
-                    let model_c = model.clone();
-                    let instruction_c = instruction.clone();
-                    let target_c = match target {
-                        MpTarget::Local => MpTarget::Local,
-                        MpTarget::Peer(p) => MpTarget::Peer(*p),
-                    };
-                    let shards = plan.shards.clone();
-                    async move {
-                        let mut results = Vec::new();
-                        let label = match &target_c {
-                            MpTarget::Local => "local".to_string(),
-                            MpTarget::Peer(p) => p.to_string(),
-                        };
-                        for &si in &idxs {
-                            let shard = &shards[si];
-                            let prompt =
-                                decentraai_distributed::mp::map_prompt(&instruction_c, shard);
-                            let (out, lat) = mp_run_one(
-                                &target_c,
-                                &prompt,
-                                &bench_c,
-                                &p2p_c,
-                                &model_c,
-                                max_tokens,
-                                cpu_cores,
-                                ram_mb,
-                                lease_seconds,
-                            )
-                            .await;
-                            results.push((label.clone(), si, out, lat));
-                        }
-                        results
-                    }
+            let labels: Vec<String> = workers
+                .iter()
+                .map(|w| match w {
+                    MpTarget::Local => "local".to_string(),
+                    MpTarget::Peer(p) => p.to_string(),
                 })
                 .collect();
-            let map_results: Vec<Vec<(String, usize, String, u64)>> =
-                futures::future::join_all(stream_futs).await;
-            let mut by_index: std::collections::BTreeMap<usize, (String, String, u64)> =
-                std::collections::BTreeMap::new();
-            let mut per_worker: std::collections::BTreeMap<String, (usize, u64)> =
-                std::collections::BTreeMap::new();
-            for results in &map_results {
-                for (label, si, out, lat) in results {
-                    by_index.insert(*si, (label.clone(), out.clone(), *lat));
-                    let e = per_worker.entry(label.clone()).or_insert((0, 0));
-                    e.0 += 1;
-                    e.1 += *lat;
-                }
-            }
-            let mut dist_partials: Vec<(String, String, u64)> = Vec::new();
-            for (si, _) in plan.shards.iter().enumerate() {
-                if let Some((label, out, lat)) = by_index.get(&si) {
-                    dist_partials.push((label.clone(), out.clone(), *lat));
-                }
-            }
-            let map_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
-            let partial_texts: Vec<String> =
-                dist_partials.iter().map(|(_, o, _)| o.clone()).collect();
-            let reduce_prompt = decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
-            // Robust reduce: try workers until one returns a NON-EMPTY final
-            // result. Reasoning models (Qwen3) can burn the token budget and
-            // return empty content, which is NOT a valid reduction — so we
-            // retry on the next worker (e.g. the non-reasoning qwen2.5 node).
-            // If every worker yields empty output we fail HONESTLY and never
-            // manufacture a result.
-            let mut reduce_result: Option<(String, String, u64)> = None;
-            for target in &workers {
-                let (out, lat) = mp_run_one(
-                    target,
-                    &reduce_prompt,
-                    &bench,
-                    &p2p,
-                    &model,
-                    decentraai_distributed::mp::REDUCE_MAX_TOKENS,
-                    cpu_cores,
-                    ram_mb,
-                    lease_seconds,
-                )
-                .await;
-                if !out.trim().is_empty() {
-                    let reducer = match target {
-                        MpTarget::Local => "local".to_string(),
-                        MpTarget::Peer(p) => p.to_string(),
-                    };
-                    reduce_result = Some((out, reducer, lat));
+            let mut runs: Vec<decentraai_distributed::mp::ShardRun> = (0..plan.shards.len())
+                .map(decentraai_distributed::mp::ShardRun::new)
+                .collect();
+
+            let dist_start = std::time::Instant::now();
+            let max_rounds = decentraai_distributed::mp::MAX_SHARD_ATTEMPTS as usize;
+            let mut map_ms = 0u64;
+            let mut round = 0usize;
+            loop {
+                let pending: Vec<usize> = runs
+                    .iter()
+                    .filter(|r| r.needs_dispatch())
+                    .map(|r| r.index)
+                    .collect();
+                if pending.is_empty() || round >= max_rounds {
                     break;
                 }
-            }
-            let distributed_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
-            let (final_result, reduce_ms) = match &reduce_result {
-                Some((out, _reducer, lat)) => (out.clone(), *lat),
-                None => (String::new(), 0),
-            };
+                // Dispatch pending shards round-robin over the workers.
+                let assignments = decentraai_distributed::mp::replan(&mut runs, &labels);
+                let map_start = std::time::Instant::now();
+                // Group by worker, run each worker's batch in parallel.
+                let mut by_worker: std::collections::BTreeMap<String, Vec<usize>> =
+                    Default::default();
+                for (si, w) in &assignments {
+                    by_worker.entry(w.clone()).or_default().push(*si);
+                }
+                let futs: Vec<_> = by_worker
+                    .into_iter()
+                    .map(|(label, idxs)| {
+                        let bench_c = bench.clone();
+                        let p2p_c = p2p.clone();
+                        let model_c = model.clone();
+                        let instruction_c = instruction.clone();
+                        let shards_c = plan.shards.clone();
+                        let target = workers
+                            .iter()
+                            .position(|w| matches!(w, MpTarget::Local) && label == "local")
+                            .and_then(|i| Some(workers[i].clone()))
+                            .or_else(|| {
+                                label
+                                    .parse::<libp2p::PeerId>()
+                                    .ok()
+                                    .map(|p| MpTarget::Peer(p))
+                            })
+                            .unwrap_or(MpTarget::Local);
+                        async move {
+                            let mut out = Vec::new();
+                            for si in idxs {
+                                let prompt = decentraai_distributed::mp::map_prompt(
+                                    &instruction_c,
+                                    &shards_c[si],
+                                );
+                                let (o, lat) = mp_run_one(
+                                    &target,
+                                    &prompt,
+                                    &bench_c,
+                                    &p2p_c,
+                                    &model_c,
+                                    max_tokens,
+                                    cpu_cores,
+                                    ram_mb,
+                                    lease_seconds,
+                                )
+                                .await;
+                                out.push((si, o, lat));
+                            }
+                            (label, out)
+                        }
+                    })
+                    .collect();
+                let results = futures::future::join_all(futs).await;
+                map_ms += (std::time::Instant::now() - map_start).as_millis() as u64;
 
-            // EvidenceChain: verdict + per-worker map entries + reduce.
+                // Record transitions in EvidenceChain and update shard states.
+                if let Some(evidence) = &state.evidence {
+                    let mut idx = evidence.index().lock().expect("evidence lock");
+                    for (label, outs) in &results {
+                        for (si, output, lat) in outs {
+                            let ok = !output.trim().is_empty();
+                            runs[*si].output = output.clone();
+                            runs[*si].latency_ms = *lat;
+                            runs[*si].state = if ok {
+                                decentraai_distributed::mp::ShardState::Completed
+                            } else {
+                                decentraai_distributed::mp::ShardState::Failed
+                            };
+                            idx.add(
+                                decentraai_agents::evidence::EvidenceEntry::new(
+                                    format!(
+                                        "gov:{task_id}:shard:{}:{}:{now}",
+                                        runs[*si].index, label
+                                    ),
+                                    decentraai_agents::evidence::EvidenceFamily::Execution,
+                                    format!(
+                                        "governor map shard {} on worker {} latency {lat}ms task {task_id}",
+                                        runs[*si].index,
+                                        label
+                                    ),
+                                    now,
+                                )
+                                .tagged(format!("gov:{task_id}"))
+                                .tagged(format!("worker:{label}")),
+                            );
+                        }
+                    }
+                }
+                round += 1;
+                // Replan pass: failed shards go to alternative workers; record
+                // failure + lease release + replan as explicit evidence.
+                let failed: Vec<(usize, String)> = runs
+                    .iter()
+                    .filter(|r| r.state == decentraai_distributed::mp::ShardState::Failed)
+                    .map(|r| (r.index, r.worker.clone()))
+                    .collect();
+                if failed.is_empty() || round >= max_rounds {
+                    break;
+                }
+                for (si, w) in &failed {
+                    if let Some(evidence) = &state.evidence {
+                        let mut idx = evidence.index().lock().expect("evidence lock");
+                        idx.add(
+                            decentraai_agents::evidence::EvidenceEntry::new(
+                                format!("gov:{task_id}:shard-failed:{si}:{now}"),
+                                decentraai_agents::evidence::EvidenceFamily::Execution,
+                                format!("governor shard {si} FAILED on worker {w}; lease released task {task_id}"),
+                                now,
+                            )
+                            .tagged(format!("gov:{task_id}"))
+                            .tagged("lease-release"),
+                        );
+                    }
+                }
+                let replanned = decentraai_distributed::mp::replan(&mut runs, &labels);
+                for (si, w) in &replanned {
+                    if let Some(evidence) = &state.evidence {
+                        let mut idx = evidence.index().lock().expect("evidence lock");
+                        idx.add(
+                            decentraai_agents::evidence::EvidenceEntry::new(
+                                format!("gov:{task_id}:shard-replan:{si}:{now}"),
+                                decentraai_agents::evidence::EvidenceFamily::Execution,
+                                format!("governor replanned shard {si} to alternative worker {w} task {task_id}"),
+                                now,
+                            )
+                            .tagged(format!("gov:{task_id}"))
+                            .tagged("replan"),
+                        );
+                    }
+                }
+                let _ = replanned;
+            }
+
+            // Reduce accepts ONLY completed shards.
+            let completed: Vec<&decentraai_distributed::mp::ShardRun> =
+                runs.iter().filter(|r| r.is_completed()).collect();
+            let incomplete_count = runs.len() - completed.len();
+            let partial_texts: Vec<String> = completed.iter().map(|r| r.output.clone()).collect();
+            let reduce_prompt =
+                decentraai_distributed::mp::reduce_prompt(&instruction, &partial_texts);
+            let reduce_target = workers.get(1).cloned().unwrap_or(MpTarget::Local);
+            let (final_result, reduce_ms) = mp_run_one(
+                &reduce_target,
+                &reduce_prompt,
+                &bench,
+                &p2p,
+                &model,
+                decentraai_distributed::mp::REDUCE_MAX_TOKENS,
+                cpu_cores,
+                ram_mb,
+                lease_seconds,
+            )
+            .await;
+            let reduce_valid = !final_result.trim().is_empty();
+            let distributed_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
+
+            // Economic attribution: credit only workers whose shards COMPLETED.
+            let mut credited: Vec<String> = Vec::new();
+            if let Some(cm) = &state.compute {
+                let mut seen = std::collections::BTreeSet::new();
+                for r in runs.iter().filter(|r| r.is_completed()) {
+                    if let Ok(peer_id) = r.worker.parse::<libp2p::PeerId>() {
+                        if seen.insert(peer_id) {
+                            cm.record_credited_contribution(
+                                &peer_id,
+                                &format!("gov-{task_id}-{now}"),
+                                true,
+                                None,
+                                Some(u32::try_from(r.latency_ms).unwrap_or(u32::MAX)),
+                            );
+                            credited.push(r.worker.clone());
+                        }
+                    }
+                }
+            }
+
+            // EvidenceChain: decision + per-worker completion + reduce + status.
             if let Some(evidence) = &state.evidence {
                 let mut idx = evidence.index().lock().expect("evidence lock");
                 idx.add(
@@ -8986,16 +9119,34 @@ async fn governor_execute_handler(
                     .tagged(format!("gov:{task_id}"))
                     .tagged("governor"),
                 );
-                for (label, _, lat) in &dist_partials {
+                for r in runs.iter().filter(|r| r.is_completed()) {
                     idx.add(
                         decentraai_agents::evidence::EvidenceEntry::new(
-                            format!("gov:{task_id}:{label}:{now}"),
+                            format!("gov:{task_id}:{}:completed:{now}", r.index),
                             decentraai_agents::evidence::EvidenceFamily::Execution,
-                            format!("governor map shard worker {label} latency {lat}ms task {task_id}"),
+                            format!(
+                                "governor shard {} COMPLETED on worker {} latency {}ms task {task_id}",
+                                r.index, r.worker, r.latency_ms
+                            ),
                             now,
                         )
                         .tagged(format!("gov:{task_id}"))
-                        .tagged(format!("worker:{label}")),
+                        .tagged(format!("worker:{}", r.worker)),
+                    );
+                }
+                for r in runs.iter().filter(|r| !r.is_completed()) {
+                    idx.add(
+                        decentraai_agents::evidence::EvidenceEntry::new(
+                            format!("gov:{task_id}:{}:incomplete:{now}", r.index),
+                            decentraai_agents::evidence::EvidenceFamily::Execution,
+                            format!(
+                                "governor shard {} INCOMPLETE after {} attempts task {task_id}",
+                                r.index, r.attempts
+                            ),
+                            now,
+                        )
+                        .tagged(format!("gov:{task_id}"))
+                        .tagged("incomplete"),
                     );
                 }
                 idx.add(
@@ -9003,10 +9154,13 @@ async fn governor_execute_handler(
                         format!("gov:{task_id}:reduce:{now}"),
                         decentraai_agents::evidence::EvidenceFamily::Execution,
                         format!(
-                            "governor reduce fused {} shards task {task_id} reducer {} status {}",
-                            plan.n_shards,
-                            reduce_result.as_ref().map(|(_, r, _)| r.as_str()).unwrap_or("none"),
-                            if reduce_result.is_some() { "valid" } else { "empty-failed" }
+                            "governor reduce fused {} shards task {task_id} reducer status {}",
+                            completed.len(),
+                            if reduce_valid {
+                                "valid"
+                            } else {
+                                "empty-failed"
+                            }
                         ),
                         now,
                     )
@@ -9019,68 +9173,44 @@ async fn governor_execute_handler(
             response["map_ms"] = serde_json::json!(map_ms);
             response["reduce_ms"] = serde_json::json!(reduce_ms);
             response["distributed_ms"] = serde_json::json!(distributed_ms);
-            response["reducer"] = serde_json::json!(
-                reduce_result.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default()
-            );
-            response["reduce_status"] = serde_json::json!(
-                if reduce_result.is_some() { "valid" } else { "empty-failed" }
-            );
-            // ---- Model Intelligence: reducer selection from verified evidence ----
-            // The reduce model is chosen from measured benchmark facts, never
-            // hardcoded. A reasoner (Qwen3) is penalised for the empty-output
-            // risk; faster non-reasoners win on evidence.
-            let candidates = [
-                decentraai_distributed::mp::ModelEvidence {
-                    model: "Phi-4-mini-instruct-Q4_K_M.gguf",
-                    accuracy: 0.33,
-                    latency_ms: 803,
-                    reasoner: false,
-                },
-                decentraai_distributed::mp::ModelEvidence {
-                    model: "Qwen3-1.7B-Q4_K_M.gguf",
-                    accuracy: 0.25,
-                    latency_ms: 4624,
-                    reasoner: true,
-                },
-                decentraai_distributed::mp::ModelEvidence {
-                    model: "Gemma-3-1B-it-Q4_K_M.gguf",
-                    accuracy: 0.33,
-                    latency_ms: 578,
-                    reasoner: false,
-                },
-            ];
-            let reducer_selected =
-                decentraai_distributed::mp::select_reducer(&candidates)
-                    .map(|m| m.model)
-                    .unwrap_or_default();
-            response["reducer_selected"] = serde_json::json!(reducer_selected);
+            response["reduce_status"] = serde_json::json!(if reduce_valid {
+                "valid"
+            } else {
+                "empty-failed"
+            });
+            response["completed_shards"] = serde_json::json!(completed.len());
+            response["reduce_ms"] = serde_json::json!(reduce_ms);
+            response["incomplete_shards"] = serde_json::json!(incomplete_count);
+            response["status"] = serde_json::json!(if incomplete_count == 0 && reduce_valid {
+                "complete"
+            } else {
+                "incomplete"
+            });
             response["per_worker"] = serde_json::json!(
-                per_worker
-                    .iter()
-                    .map(|(w, (s, l))| serde_json::json!({"worker": w, "shards": s, "latency_ms": l}))
+                runs.iter()
+                    .fold(
+                        std::collections::BTreeMap::<String, (usize, u64)>::new(),
+                        |mut m, r| {
+                            let e = m.entry(r.worker.clone()).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 += r.latency_ms;
+                            m
+                        }
+                    )
+                    .into_iter()
+                    .map(
+                        |(w, (s, l))| serde_json::json!({"worker": w, "shards": s, "latency_ms": l})
+                    )
                     .collect::<Vec<_>>()
             );
-            // ---- Economic loop: verified remote contribution -> credit ----
-            // Reuses the existing ledger: each remote worker that actually
-            // processed a shard earns contribution credit (synthetic
-            // bookkeeping, never money). RewardEngine reads this ledger.
-            let mut credited: Vec<String> = Vec::new();
-            if let Some(cm) = &state.compute {
-                for (label, _, lat) in &dist_partials {
-                    if let Ok(peer_id) = label.parse::<libp2p::PeerId>() {
-                        cm.record_credited_contribution(
-                            &peer_id,
-                            &format!("gov-{task_id}-{now}"),
-                            true,
-                            None,
-                            Some(u32::try_from(*lat).unwrap_or(u32::MAX)),
-                        );
-                        credited.push(label.clone());
-                    }
-                }
-            }
             response["credited_workers"] = serde_json::json!(credited);
-            serde_json::json!({"result": final_result})
+
+            let status_flag = if incomplete_count == 0 && reduce_valid {
+                "complete"
+            } else {
+                "incomplete"
+            };
+            serde_json::json!({"result": final_result, "status": status_flag})
         }
     };
     response["output"] = result_payload;
@@ -9257,7 +9387,10 @@ async fn collective_workflow_handler(
                 .timeout(std::time::Duration::from_secs(240))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
-            let gov_url = format!("http://127.0.0.1:{}/v1/governor/execute", state.info.api_port);
+            let gov_url = format!(
+                "http://127.0.0.1:{}/v1/governor/execute",
+                state.info.api_port
+            );
             let gov_resp = gov_client
                 .post(&gov_url)
                 .bearer_auth(state.master_token().unwrap_or_default())
