@@ -346,7 +346,7 @@ pub struct ApiState {
     /// Optional RAG retrieval manager (index + query over embeddings).
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
     /// Optional collective memory store (persistent scopes/entries).
-    memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
+    pub memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
     /// Model Colony registry (M-I): governance stages persist across
     /// restarts via db/model_intel.json; shared with the intel/route/
     /// governance handlers.
@@ -8680,31 +8680,66 @@ async fn governor_execute_handler(
         let snap = decentraai_system_probe::SystemSnapshot::collect();
         snap.available_memory_bytes / (1024 * 1024 * 1024)
     };
+    // Model Colony from REAL evidence in Memory (aggregate_model), with seed
+    // fallback until observations accumulate. This is the loop the agent
+    // asked for: pressure decides how much compute, Model Colony decides
+    // which model, backed by measured performance, not hardcoded winners.
+    let mem = state.memory.clone();
+    let profile_for = |model: &'static str,
+                       caps: &'static [&'static str],
+                       ram: u32,
+                       seed_acc: f64,
+                       seed_lat: u64,
+                       reasoner: bool| {
+        let mut acc = seed_acc;
+        let mut lat = seed_lat;
+        if let Some(mem) = &mem {
+            if let Ok(summary) = decentraai_distributed::model_performance::aggregate_model(mem, model)
+            {
+                if summary.samples > 0 {
+                    if summary.success_percent > 0 {
+                        acc = f64::from(summary.success_percent) / 100.0;
+                    }
+                    if summary.mean_latency_ms > 0 {
+                        lat = summary.mean_latency_ms;
+                    }
+                }
+            }
+        }
+        decentraai_distributed::mp::ModelProfile {
+            model,
+            capabilities: caps,
+            ram_needed_gb: ram,
+            accuracy: acc,
+            latency_ms: lat,
+            reasoner,
+        }
+    };
     let colony = [
-        decentraai_distributed::mp::ModelProfile {
-            model: "Qwen3-1.7B-Q4_K_M.gguf",
-            capabilities: &["chat", "reasoning", "coding", "tool_calling"],
-            ram_needed_gb: 3,
-            accuracy: 0.25,
-            latency_ms: 4624,
-            reasoner: true,
-        },
-        decentraai_distributed::mp::ModelProfile {
-            model: "Gemma-3-1B-it-Q4_K_M.gguf",
-            capabilities: &["chat", "summarization", "classification"],
-            ram_needed_gb: 2,
-            accuracy: 0.33,
-            latency_ms: 578,
-            reasoner: false,
-        },
-        decentraai_distributed::mp::ModelProfile {
-            model: "Phi-4-mini-instruct-Q4_K_M.gguf",
-            capabilities: &["chat", "reasoning", "structured_output"],
-            ram_needed_gb: 3,
-            accuracy: 0.33,
-            latency_ms: 803,
-            reasoner: false,
-        },
+        profile_for(
+            "Qwen3-1.7B-Q4_K_M.gguf",
+            &["chat", "reasoning", "coding", "tool_calling"],
+            3,
+            0.25,
+            4624,
+            true,
+        ),
+        profile_for(
+            "Gemma-3-1B-it-Q4_K_M.gguf",
+            &["chat", "summarization", "classification"],
+            2,
+            0.33,
+            578,
+            false,
+        ),
+        profile_for(
+            "Phi-4-mini-instruct-Q4_K_M.gguf",
+            &["chat", "reasoning", "structured_output"],
+            3,
+            0.33,
+            803,
+            false,
+        ),
     ];
     let model = decentraai_distributed::mp::choose_model(&task_kind, &colony, avail_ram_gb)
         .map(|p| p.model)
@@ -9015,6 +9050,28 @@ async fn governor_execute_handler(
         }
     };
     response["output"] = result_payload;
+
+    // ---- Model Colony evidence: record this execution as a verified
+    // observation in Memory, so future Model Colony decisions are backed by
+    // measured performance instead of seeds. Skips when no Memory is attached.
+    if let Some(mem) = &state.memory {
+        let (obs_latency, obs_success) = match &response["reduce_status"] {
+            serde_json::Value::String(s) if s == "valid" => {
+                (response["reduce_ms"].as_u64().unwrap_or(0), true)
+            }
+            _ => (response["distributed_ms"].as_u64().unwrap_or(0), true),
+        };
+        let _ = decentraai_distributed::model_performance::record_observation(
+            mem,
+            &decentraai_distributed::model_performance::ExecutionObservation {
+                model_id: model.clone(),
+                task_id: task_id.clone(),
+                success: obs_success,
+                latency_ms: obs_latency,
+                evidence_ref: format!("gov:{task_id}:{now}"),
+            },
+        );
+    }
 
     (
         [(header::CONTENT_TYPE, "application/json")],
