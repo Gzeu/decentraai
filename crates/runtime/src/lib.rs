@@ -13,6 +13,7 @@ pub mod api;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod fabric_dashboard;
+pub mod fabric_flow;
 pub mod intel_assist;
 pub mod mcp;
 pub mod providers_api;
