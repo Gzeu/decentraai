@@ -24,11 +24,13 @@ h1 .dot{color:var(--accent)}
 .pill b{color:var(--ok)}
 .pipeline{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:16px}
 svg{width:100%;height:auto;display:block}
-.stage{fill:var(--panel);stroke:var(--line);stroke-width:1.5;rx:12}
+.stage{fill:var(--panel);stroke:var(--line);stroke-width:1.5;rx:12;transition:.2s}
+.stage:hover{stroke:var(--accent);fill:#0f1a30}
 .stage-label{fill:var(--muted);font-size:12px;font-weight:600}
 .stage-sub{fill:var(--muted);font-size:10px;opacity:.8}
 .flow{stroke:var(--accent2);stroke-width:2.5;fill:none;stroke-dasharray:6 6;opacity:.0}
-.flow.on{opacity:.95;animation:dash 1.4s linear infinite}
+.flow.on{opacity:.98;animation:dash 1.1s linear infinite}
+.flow.hot{stroke:var(--ok)}
 @keyframes dash{to{stroke-dashoffset:-24}}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px}
@@ -48,7 +50,7 @@ svg{width:100%;height:auto;display:block}
     <div class="pill">pipeline: <b id="pl">…</b></div>
   </header>
 
-  <div class="pipeline" id="pipe">
+  <div class="pipeline" id="pipe"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span style="font-size:12px;color:var(--muted)">live pipeline</span><span id="flowcount" style="font-size:12px;color:var(--accent)">…</span></div>
     <svg viewBox="0 0 1200 190" xmlns="http://www.w3.org/2000/svg">
       <g id="stages"></g>
       <g id="flows"></g>
@@ -93,7 +95,7 @@ const stageDef=()=>{
   // direct human->governor + agent->governor highlight handled below
 };
 
-function pulse(){ for(let i=0;i<STAGES.length-1;i++){const f=$('flow-'+i); if(f) f.classList.add('on');} }
+function pulse(){ for(let i=0;i<STAGES.length-1;i++){const f=$('flow-'+i); if(f){f.classList.add('on'); f.classList.toggle('hot',i===STAGES.length-2);} } }
 function idle(){ for(let i=0;i<STAGES.length-1;i++){const f=$('flow-'+i); if(f) f.classList.remove('on');} }
 
 async function tick(){
@@ -118,6 +120,7 @@ async function tick(){
     const jobs=(ev&&ev.recent||[]).filter(e=>String(e.id||'').startsWith('gov:'));
     $('jobs').innerHTML=jobs.slice(0,6).map(e=>`<div class="row"><span class="l mono">${(e.id||'').slice(8,26)}</span><span class="v">${(e.text||'').slice(0,22)}</span></div>`).join('')+(jobs.length?'':'<div class="row"><span class="l">no jobs yet</span></div>');
     if(jobs.length) pulse(); else idle();
+    $('flowcount').textContent = jobs.length?`${jobs.length} jobs · flowing`:'idle · awaiting pressure';
   }catch(_){}
 
   // Model colony

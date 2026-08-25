@@ -30,7 +30,8 @@ h1 .dot{color:var(--accent)}
 .enter .d{color:var(--muted);font-size:12px;margin-top:4px}
 .enter .k{display:inline-block;background:#0a1a2e;border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:11px;color:var(--accent)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:8px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;overflow:hidden}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;overflow:hidden;transition:.18s}
+.card:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:0 8px 30px rgba(34,211,238,.08)}
 .card h3{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:12px;display:flex;align-items:center;gap:8px}
 .card h3 .n{color:var(--accent2)}
 .mono{font-family:ui-monospace,SFMono-Regular,monospace}
@@ -45,13 +46,18 @@ h1 .dot{color:var(--accent)}
 .statelist{max-height:220px;overflow:auto}
 .foot{color:var(--muted);font-size:11px;margin-top:22px;text-align:center}
 .tag{font-size:10px;border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--muted)}
+.dot.pulse{animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.bignum{font-size:28px;font-weight:700;color:var(--accent)}
+.cpubar{display:flex;align-items:center;gap:8px}
+.cpubar .fill{height:8px;border-radius:4px;background:linear-gradient(90deg,var(--accent),var(--accent2));flex:1}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <h1>DecentraAI <span class="dot">●</span> Compute Fabric</h1>
+      <h1>DecentraAI <span class="dot" id="livedot">●</span> Compute Fabric</h1>
       <div class="sub">An autonomous compute fabric where humans and AI agents discover, request, contribute and orchestrate compute.</div>
     </div>
     <div class="pill">Fabric status: <b id="fab-status">…</b></div>
@@ -90,9 +96,10 @@ async function tick(){
   // Nodes + CPU
   try{
     const s=await (await fetch('/status')).json();
-    $('fab-status').textContent = s.model_loaded?`live · ${s.model_name||'model'}`:'degraded';
+    $('fab-status').textContent = s.model_loaded?`live · ${s.model_name||'model'}`:'degraded'; const ld=$('livedot'); if(ld){ld.classList.toggle('pulse',s.model_loaded);}
     const peers=(await j('/v1/peers'))||[];
-    let nodes=`<div class="row"><span class="l">this node</span><span class="v acc">${s.model_loaded?'online':'…'}</span></div>`;
+    const cpuPct=Math.round((s.cpu_percent??0));
+    let nodes=`<div class="cpubar"><span class="l">this node CPU</span><div class="fill" style="width:${Math.max(6,cpuPct)}%"></div><span class="v">${cpuPct}%</span></div><div class="row"><span class="l">this node</span><span class="v acc">${s.model_loaded?'online':'…'}</span></div>`;
     (peers.length?peers:[]).slice(0,6).forEach(p=>{
       nodes+=`<div class="row"><span class="l mono">${String(p.peer_id||'').slice(0,14)}…</span><span class="v ${p.banned?'warn':'ok'}">${p.banned?'banned':'ok'}</span></div>`;
     });
@@ -147,7 +154,7 @@ async function tick(){
     const bal=await j('/v1/credits/balance');
     const accts=(bal&&bal.accounts)||{};
     const rows=Object.entries(accts).map(([k,v])=>`<div class="row"><span class="l mono">${k.slice(0,16)}…</span><span class="v ok">${v.balance??0}</span></div>`);
-    $('economy').innerHTML=rows.join('')+(rows.length===0?'<div class="row"><span class="l">no credits yet</span></div>':'');
+    $('economy').innerHTML=`<div class="bignum">${Object.values(accts).reduce((a,b)=>a+(b.balance||0),0)}</div><div class="row"><span class="l">workers</span><span class="v">${Object.keys(accts).length}</span></div>`+rows.join('');
   }catch(_){}
 }
 setInterval(tick,4000); tick();
