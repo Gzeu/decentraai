@@ -2301,11 +2301,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             if auto_cfg.enabled && auto_cfg.profile.is_some() {
                 let auto = std::sync::Arc::new(auto_cfg.clone());
                 let api_port = config.inference.api_port;
-                let master_token = std::fs::read_to_string(
-                    std::path::Path::new(&config.node.data_dir).join("runtime/api.token"),
-                )
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
+                let data_dir = std::path::PathBuf::from(config.node.data_dir.clone());
                 let p2p_auto = distributed.p2p_node().clone();
                 let state_auto = state.clone();
                 tokio::spawn(async move {
@@ -2423,7 +2419,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         let gov_url = format!("http://127.0.0.1:{api_port}/v1/governor/execute");
                         let gov_resp = client
                             .post(&gov_url)
-                            .bearer_auth(&master_token)
+                            .bearer_auth(
+                                std::fs::read_to_string(data_dir.join("runtime/api.token"))
+                                    .map(|s| s.trim().to_string())
+                                    .unwrap_or_default(),
+                            )
                             .json(&gov_body)
                             .send()
                             .await;
