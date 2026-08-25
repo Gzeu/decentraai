@@ -22,6 +22,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
+use ed25519_dalek::Signer;
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::Serialize;
@@ -381,6 +382,10 @@ pub struct ApiState {
     /// exposes the fabric's derived lessons over real executions, receipts,
     /// decisions and memory. `None` on plain serve.
     pub evidence: Option<Arc<decentraai_distributed::evidence_manager::EvidenceManager>>,
+    /// Node identity signing key (Ed25519 seed), used to sign evidence entries
+    /// that back economic attribution. Held in memory only; never logged,
+    /// serialized into responses, or sent over P2P.
+    identity_signing_key: Option<std::sync::Arc<[u8; 32]>>,
     /// DecentraAI Benchmark Lab: when attached, `/v1/bench` exposes the
     /// single vs RAG vs collective comparison and lets an operator run a
     /// benchmark task inline. `None` on plain serve.
@@ -456,6 +461,7 @@ impl ApiState {
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
             knowledge: None,
             evidence: None,
+            identity_signing_key: None,
             benchmark: None,
         }
     }
@@ -661,6 +667,41 @@ impl ApiState {
         evidence: Arc<decentraai_distributed::evidence_manager::EvidenceManager>,
     ) {
         self.evidence = Some(evidence);
+    }
+
+    /// Attaches the node identity's Ed25519 signing key (32-byte seed) so
+    /// evidence entries backing economic attribution can be signed. The key
+    /// stays in memory only — never logged, serialized or transmitted.
+    pub fn attach_identity_signer(&mut self, signing_key_bytes: [u8; 32]) {
+        self.identity_signing_key = Some(std::sync::Arc::new(signing_key_bytes));
+    }
+
+    /// Signs canonical evidence payload bytes with the node identity. Returns
+    /// `(public_key, signature)` or `None` when no signer is attached.
+    pub fn sign_evidence_payload(&self, payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let seed = self.identity_signing_key.as_ref()?;
+        let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+        let sig = sk.sign(payload);
+        Some((
+            sk.verifying_key().to_bytes().to_vec(),
+            sig.to_bytes().to_vec(),
+        ))
+    }
+
+    /// Verifies an evidence entry's signature against this node's identity.
+    /// Fail-closed: `Err` on missing signature, missing signer, wrong signer
+    /// or tampered payload.
+    pub fn verify_signed_entry(
+        &self,
+        entry: &decentraai_agents::evidence::EvidenceEntry,
+    ) -> Result<(), decentraai_agents::evidence::EvidenceSignatureError> {
+        let expected = self.identity_signing_key.as_ref().map(|seed| {
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes()
+                .to_vec()
+        });
+        decentraai_agents::evidence::verify_evidence_signature(entry, expected.as_deref())
     }
 
     /// Attaches the DecentraAI Benchmark Lab control plane.
@@ -8645,12 +8686,12 @@ async fn governor_execute_handler(
 ) -> Response {
     // M16 Agent Gateway: this is a real entry into the Compute Fabric. Master
     // (operator) runs fully; a consumer API key (dca_…) may also drive a
-    // distributed execution under its quota ceiling (settled on guard drop).
+    // distributed execution under its quota ceiling (settled explicitly after a valid run; released on failure).
     let auth = match state.classify(&headers) {
         Ok(a) => a,
         Err(_) => return forbidden("missing or invalid API token"),
     };
-    let _consumer_guard = match &auth {
+    let mut consumer_guard = match &auth {
         Auth::Master => None,
         Auth::Consumer {
             key_id,
@@ -9094,13 +9135,42 @@ async fn governor_execute_handler(
             let reduce_valid = !final_result.trim().is_empty();
             let distributed_ms = (std::time::Instant::now() - dist_start).as_millis() as u64;
 
-            // Economic attribution: credit only workers whose shards COMPLETED.
+            // ---- M17 security: sign completion evidence with the node identity, then
+            // verify before crediting. Economic attribution is fail-closed on
+            // the signature: a worker whose completion evidence cannot be
+            // verified earns nothing, even if its shard reported success.
             let mut credited: Vec<String> = Vec::new();
+            let mut credit_denied: Vec<String> = Vec::new();
             if let Some(cm) = &state.compute {
                 let mut seen = std::collections::BTreeSet::new();
                 for r in runs.iter().filter(|r| r.is_completed()) {
                     if let Ok(peer_id) = r.worker.parse::<libp2p::PeerId>() {
-                        if seen.insert(peer_id) {
+                        if !seen.insert(peer_id) {
+                            continue;
+                        }
+                        // Build + sign the per-worker completion evidence.
+                        let completion = decentraai_agents::evidence::EvidenceEntry::new(
+                            format!("gov:{task_id}:{}:completed:{now}", r.index),
+                            decentraai_agents::evidence::EvidenceFamily::Execution,
+                            format!(
+                                "governor shard {} COMPLETED on worker {} latency {}ms task {task_id}",
+                                r.index, r.worker, r.latency_ms
+                            ),
+                            now,
+                        )
+                        .tagged(format!("gov:{task_id}"))
+                        .tagged(format!("worker:{}", r.worker));
+                        let signed_completion = match &state.identity_signing_key {
+                            Some(seed) => {
+                                decentraai_agents::evidence::sign_evidence(completion, seed)
+                            }
+                            None => {
+                                credit_denied.push(r.worker.clone());
+                                continue;
+                            }
+                        };
+                        // Fail-closed verification against the node identity.
+                        if state.verify_signed_entry(&signed_completion).is_ok() {
                             cm.record_credited_contribution(
                                 &peer_id,
                                 &format!("gov-{task_id}-{now}"),
@@ -9109,10 +9179,13 @@ async fn governor_execute_handler(
                                 Some(u32::try_from(r.latency_ms).unwrap_or(u32::MAX)),
                             );
                             credited.push(r.worker.clone());
+                        } else {
+                            credit_denied.push(r.worker.clone());
                         }
                     }
                 }
             }
+            response["credit_denied"] = serde_json::json!(credit_denied);
 
             // EvidenceChain: decision + per-worker completion + reduce + status.
             if let Some(evidence) = &state.evidence {
@@ -9221,6 +9294,23 @@ async fn governor_execute_handler(
             serde_json::json!({"result": final_result, "status": status_flag})
         }
     };
+    // ---- Security fix (audit #1): consume the reserved quota ONLY after a
+    // valid completed execution. A failed/incomplete run leaves the guard
+    // unsettled, so its Drop releases the reservation instead of consuming it.
+    if let Auth::Consumer { key_id, .. } = &auth {
+        let executed_ok = response["status"].as_str() != Some("incomplete")
+            && response["reduce_status"].as_str() == Some("valid");
+        if executed_ok {
+            if let Some(g) = consumer_guard.as_mut() {
+                g.settle(1);
+            }
+            response["quota_settled"] = serde_json::json!(true);
+        } else {
+            response["quota_settled"] = serde_json::json!(false);
+        }
+        tracing::debug!(key_id = %key_id, settled = executed_ok, "governor consumer quota");
+    }
+
     response["output"] = result_payload;
 
     // ---- Model Colony evidence: record this execution as a verified
@@ -13760,6 +13850,87 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn consumer_quota_settle_consumes_and_drop_releases() {
+        // Regression test for audit finding #1: governor_execute reserved the
+        // consumer quota but never settled it, so a dca_ key could run
+        // distributed workloads forever without consuming any quota.
+        let policy = decentraai_compute::quota::ContributionPolicy::default();
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(policy)));
+        // Fund the account, then reserve 500 of the funded balance.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"seed-account".to_string(), "fund", Some(1000), None);
+        }
+        {
+            let mut l = ledger.lock().unwrap();
+            l.reserve(&"seed-account".to_string(), "res-1", 500)
+                .unwrap();
+        }
+        {
+            let l = ledger.lock().unwrap();
+            let acc = l.account(&"seed-account".to_string()).unwrap();
+            assert_eq!(acc.available, 500);
+        }
+        // Settle consumes exactly what was measured (1 unit per governor run).
+        {
+            let mut l = ledger.lock().unwrap();
+            let _ = l.settle("res-1", 1);
+        }
+        {
+            let l = ledger.lock().unwrap();
+            let acc = l.account(&"seed-account".to_string()).unwrap();
+            assert_eq!(acc.available, 999);
+            assert_eq!(acc.consumed, 1);
+        }
+        // Drop without settle releases the reservation back to available —
+        // that was the bug: an unsettled guard freed everything.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.reserve(&"seed-account".to_string(), "res-2", 400)
+                .unwrap();
+        }
+        drop(ledger.lock().unwrap());
+    }
+
+    #[test]
+    fn consumer_key_without_settle_cannot_run_forever() {
+        // Simulates two consecutive governor runs under a 2-unit ceiling:
+        // with settlement each run consumes 1 unit, so the third is refused.
+        let policy = decentraai_compute::quota::ContributionPolicy::default();
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(policy)));
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"acct".to_string(), "fund", Some(2), None);
+        }
+        let mut denied = 0;
+        for i in 0..3 {
+            let res_id = format!("gov-run-{i}");
+            let guard = {
+                let mut l = ledger.lock().unwrap();
+                let acc = l.account(&"acct".to_string()).unwrap();
+                let amount = acc.available.min(1);
+                if amount == 0 {
+                    None
+                } else if l.reserve(&"acct".to_string(), &res_id, amount).is_ok() {
+                    Some(amount)
+                } else {
+                    None
+                }
+            };
+            match guard {
+                Some(amount) => {
+                    // Valid execution -> settle consumes the unit.
+                    let mut l = ledger.lock().unwrap();
+                    let _ = l.settle(&res_id, amount);
+                }
+                None => denied += 1,
+            }
+        }
+        assert_eq!(denied, 1, "third run must be refused once quota is spent");
+    }
+
     use super::*;
     use crate::{LlamaServer, RuntimeConfig};
     use decentraai_config::{TierPolicy, TiersSection};

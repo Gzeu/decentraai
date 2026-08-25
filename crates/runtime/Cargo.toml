@@ -20,6 +20,8 @@ decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
 decentraai-distributed = { path = "../distributed" }
 decentraai-fabric = { path = "../fabric" }
+ed25519-dalek.workspace = true
+decentraai-identity = { path = "../identity" }
 decentraai-hub = { path = "../hub" }
 decentraai-inference-adapter = { path = "../inference-adapter" }
 decentraai-p2p = { path = "../p2p" }
