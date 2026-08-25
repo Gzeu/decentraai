@@ -380,7 +380,7 @@ pub struct ApiState {
     /// Evidence RAG (experimental memory): when attached, `/v1/evidence`
     /// exposes the fabric's derived lessons over real executions, receipts,
     /// decisions and memory. `None` on plain serve.
-    evidence: Option<Arc<decentraai_distributed::evidence_manager::EvidenceManager>>,
+    pub evidence: Option<Arc<decentraai_distributed::evidence_manager::EvidenceManager>>,
     /// DecentraAI Benchmark Lab: when attached, `/v1/bench` exposes the
     /// single vs RAG vs collective comparison and lets an operator run a
     /// benchmark task inline. `None` on plain serve.

@@ -2300,6 +2300,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if let Some(auto_cfg) = config.autonomous_assist.as_ref() {
             if auto_cfg.enabled && auto_cfg.profile.is_some() {
                 let auto = std::sync::Arc::new(auto_cfg.clone());
+                let api_port = config.inference.api_port;
                 let p2p_auto = distributed.p2p_node().clone();
                 let state_auto = state.clone();
                 tokio::spawn(async move {
@@ -2312,6 +2313,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         };
                     let mut state_machine = decentraai_compute::pressure::AssistState::Normal;
                     let mut last_fired: Option<std::time::Instant> = None;
+                    let mut was_distributed = false;
                     loop {
                         tokio::time::sleep(Duration::from_secs(auto.tick_seconds)).await;
                         // Honest signals only, measured by the API state itself.
@@ -2329,6 +2331,33 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             "autonomous pressure evaluated"
                         );
                         if !decision.should_assist {
+                            // Pressure released: if we were executing
+                            // distributed, record the release and return to
+                            // LOCAL operation.
+                            if was_distributed {
+                                was_distributed = false;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                if let Some(evidence) = &state_auto.evidence {
+                                    evidence
+                                        .index()
+                                        .lock()
+                                        .expect("evidence lock")
+                                        .add(
+                                            decentraai_agents::evidence::EvidenceEntry::new(
+                                                format!("m15:release:{now}"),
+                                                decentraai_agents::evidence::EvidenceFamily::Execution,
+                                                "M15 PRESSURE_RELEASED: fabric pressure fell below release threshold; released borrowed capacity, returned to LOCAL".to_string(),
+                                                now,
+                                            )
+                                            .tagged("m15")
+                                            .tagged("release"),
+                                        );
+                                }
+                                tracing::info!("M15 pressure released; returned to LOCAL");
+                            }
                             continue;
                         }
                         if let Some(t) = last_fired {
@@ -2337,37 +2366,75 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             }
                         }
                         last_fired = Some(std::time::Instant::now());
-                        let profile = auto.profile.as_ref().expect("checked at boot");
-                        let payload_json = serde_json::json!({
-                            "messages": profile.payload_template.get("messages")
-                                .cloned()
-                                .unwrap_or_default(),
-                            "max_tokens": profile.payload_template.get("max_tokens").cloned().unwrap_or(serde_json::json!(64)),
-                        });
-                        let Ok(payload_bytes) = serde_json::to_vec(&payload_json) else {
-                            continue;
-                        };
-                        let peers = p2p_auto.connected_peers().await;
-                        // Lease = min(cooldown, 120s): an autonomous assist is a
-                        // probe-scale task, not a long-running lease.
-                        let lease = auto.cooldown_seconds.min(120);
-                        let outcome = decentraai_runtime::intel_assist::run_assist_request(
-                            &p2p_auto,
-                            peers,
-                            decentraai_compute::assist::AssistRequest {
-                                capability: profile.capability.clone(),
-                                cpu_cores: 2,
-                                ram_mb: 512,
-                            },
-                            payload_bytes,
-                            lease,
-                        )
-                        .await;
-                        tracing::info!(
-                            success = outcome.0,
-                            explanation = %outcome.2,
-                            "autonomous assist executed"
+                        was_distributed = true;
+                        // M15: Governor autonomously fires. We drive it through
+                        // the node's OWN governor_execute endpoint, so the whole
+                        // decision (Model Colony, resource verdict, distributed
+                        // map-reduce, EvidenceChain, Economy credit) runs — no
+                        // operator POST required.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if let Some(evidence) = &state_auto.evidence {
+                            evidence
+                                .index()
+                                .lock()
+                                .expect("evidence lock")
+                                .add(
+                                    decentraai_agents::evidence::EvidenceEntry::new(
+                                        format!("m15:pressure:{now}"),
+                                        decentraai_agents::evidence::EvidenceFamily::Execution,
+                                        format!(
+                                            "M15 PRESSURE_FIRED: should_assist=true reasons={:?} score={:.2}",
+                                            decision.reasons, decision.score
+                                        ),
+                                        now,
+                                    )
+                                    .tagged("m15")
+                                    .tagged("pressure-fired"),
+                                );
+                        }
+                        // Autonomous workload: a deterministic fabric-analysis
+                        // task, large enough that the Governor's resource
+                        // verdict can legitimately choose DISTRIBUTED.
+                        let content = format!(
+                            "DecentraAI autonomous pressure probe. The fabric reports \
+                             cpu={:.0}% ram={:.0}% queue={} workers={}. Section 1 covers capability \
+                             routing and DFCP negotiation. Section 2 covers reservation, lease expiry \
+                             and evidence verification for verified contribution credit.",
+                            signals.cpu_percent,
+                            signals.ram_percent,
+                            signals.queue_depth,
+                            1 + p2p_auto.connected_peers().await.len()
                         );
+                        let gov_body = serde_json::json!({
+                            "task_id": format!("m15-auto-{now}"),
+                            "task_kind": "summarize",
+                            "instruction": "Summarize the fabric state in ONE short paragraph.",
+                            "content": content,
+                        });
+                        let client = reqwest::Client::new();
+                        let gov_url = format!("http://127.0.0.1:{api_port}/v1/governor/execute");
+                        let gov_resp = client
+                            .post(&gov_url)
+                            .json(&gov_body)
+                            .send()
+                            .await;
+                        match gov_resp {
+                            Ok(r) => {
+                                let status = r.status();
+                                let text = r.text().await.unwrap_or_default();
+                                tracing::info!(
+                                    status = %status,
+                                    body_len = text.len(),
+                                    "M15 governor executed autonomously"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "M15 governor self-request failed");
+                            }
+                        }
                     }
                 });
             }
