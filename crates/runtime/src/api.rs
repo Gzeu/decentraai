@@ -9171,6 +9171,19 @@ async fn collective_workflow_handler(
         })
         .collect();
 
+    // Hardening: bound the workflow size so a workflow cannot generate an
+    // unbounded number of Governor executions / leases.
+    const MAX_WORKFLOW_STAGES: usize = 8;
+    if proposed.len() > MAX_WORKFLOW_STAGES {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": format!("workflow exceeds {} stages", MAX_WORKFLOW_STAGES)
+            })),
+        )
+            .into_response();
+    }
+
     // Build and validate the DAG
     let dag = match decentraai_agents::collective_bridge::task_plan_to_dag(
         &format!("wf-{}", now_nanos()),
@@ -9228,7 +9241,15 @@ async fn collective_workflow_handler(
                 "instruction": "Produce the requested stage output concisely.",
                 "content": prompt_text,
             });
-            let gov_client = reqwest::Client::new();
+            // Hardening: the self-call is loopback-only (fixed 127.0.0.1, no SSRF /
+            // redirect — api_port is a u16, not a URL) and has a bounded
+            // timeout so a hung Governor can never wedge the workflow task.
+            // The master token travels only in the Authorization header and is
+            // never logged.
+            let gov_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(240))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let gov_url = format!("http://127.0.0.1:{}/v1/governor/execute", state.info.api_port);
             let gov_resp = gov_client
                 .post(&gov_url)

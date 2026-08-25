@@ -2425,7 +2425,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             "instruction": "Summarize the fabric state in ONE short paragraph.",
                             "content": content,
                         });
-                        let client = reqwest::Client::new();
+                        let client = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(240))
+                            .build()
+                            .unwrap_or_else(|_| reqwest::Client::new());
                         let gov_url = format!("http://127.0.0.1:{api_port}/v1/governor/execute");
                         let gov_resp = client
                             .post(&gov_url)
