@@ -9072,13 +9072,12 @@ async fn governor_execute_handler(
             let reduce_target = runs
                 .iter()
                 .find(|r| r.is_completed() && r.worker != "local")
-                .map(|r| {
+                .and_then(|r| {
                     workers
                         .iter()
                         .find(|w| matches!(w, MpTarget::Peer(p) if p.to_string() == r.worker))
                         .cloned()
                 })
-                .flatten()
                 .unwrap_or(MpTarget::Local);
             let (final_result, reduce_ms) = mp_run_one(
                 &reduce_target,
