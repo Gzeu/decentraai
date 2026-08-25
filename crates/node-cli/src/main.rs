@@ -2411,7 +2411,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                              choosing LOCAL, DISTRIBUTED, QUEUE or REJECT from real pressure signals. Section 7 covers distributed map-reduce \
                              inference where a single logical workload is split into shards, mapped across workers and reduced into one final \
                              answer, with the honest boundary that llama-server cannot split a forward pass across nodes. Section 8 covers \
-                             deterministic ordering, stable ids for batched tasks, retries, and how worker failure must never corrupt results.",
+                             deterministic ordering, stable ids for batched tasks, retries, and how worker failure must never corrupt results. \
+                             Section 9 covers the economic loop where a remote worker earns verified contribution credit only after the evidence \
+                             chain records a successful execution, and how the reward ledger is separate from any real token registry.",
                             signals.cpu_percent,
                             signals.ram_percent,
                             signals.queue_depth,
