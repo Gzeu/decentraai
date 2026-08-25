@@ -598,7 +598,24 @@ pub async fn run_assist_request(
         )
         .await
     else {
-        // Lease will expire on the worker side (TTL backstop).
+        // ASSIGN never reached the worker: release the reserved lease NOW,
+        // best-effort, instead of waiting for the TTL backstop. The worker's
+        // own expiry remains the safety net if this release also fails.
+        let _ = p2p
+            .request(
+                winner_peer,
+                decentraai_protocol::serialize_message(&ResourceRelease {
+                    protocol_version: decentraai_protocol::dfcp::DFCP_VERSION,
+                    reservation_id: reserved.reservation_id.clone(),
+                })
+                .unwrap_or_default(),
+            )
+            .await;
+        tracing::warn!(
+            reservation = %reserved.reservation_id,
+            worker = %winner.peer_id,
+            "ASSIGN delivery failed; lease released immediately"
+        );
         return (
             false,
             Vec::new(),

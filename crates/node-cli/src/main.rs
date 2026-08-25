@@ -2713,6 +2713,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // background task and never falls out of step with the sources. The
         // same runtime is shared with the Benchmark Lab (bench runs feed it).
         state.attach_evidence(evidence_rag);
+        // M16/M17 security: sign evidence entries backing economic attribution
+        // with the node identity (fail-closed credit verification).
+        state.attach_identity_signer(identity.signing_key_bytes());
         // Benchmark Lab: expose `/v1/bench` when an inference executor was
         // wired (the lab needs a real model to run tasks).
         if let Some(benchmark) = benchmark_manager {

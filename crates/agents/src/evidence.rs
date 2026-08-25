@@ -74,6 +74,15 @@ pub struct EvidenceEntry {
     /// embedding backend is configured. Empty = semantic query will not match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding: Vec<f32>,
+    /// Ed25519 public key of the signer (32 bytes), when this entry is signed.
+    /// Present only on entries that back economic attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_public_key: Option<Vec<u8>>,
+    /// Ed25519 signature over `canonical_evidence_payload(self)` (64 bytes).
+    /// Verified before the entry may back economic credit; missing or invalid
+    /// signatures fail closed for attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
 }
 
 impl EvidenceEntry {
@@ -95,6 +104,8 @@ impl EvidenceEntry {
             tags,
             created_at_ms,
             embedding: Vec::new(),
+            signer_public_key: None,
+            signature: None,
         }
     }
 
@@ -332,6 +343,87 @@ fn median(v: &mut [f64]) -> Option<f64> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Evidence signing (Ed25519) — economic attribution fails closed
+// ---------------------------------------------------------------------------
+
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+
+/// Version of the evidence signature scheme.
+pub const EVIDENCE_SIGNATURE_VERSION: u16 = 1;
+
+/// Deterministic canonical bytes an EvidenceEntry is signed over. Excludes the
+/// signer/signature themselves and the embedding vector, so sign and verify
+/// agree byte-for-byte on the same facts.
+pub fn canonical_evidence_payload(e: &EvidenceEntry) -> Vec<u8> {
+    serde_json::json!({
+        "id": e.id,
+        "kind": e.kind,
+        "text": e.text,
+        "tags": e.tags,
+        "created_at_ms": e.created_at_ms,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Signs an entry with the node's Ed25519 identity: fills `signer_public_key`
+/// and `signature` over the canonical payload. The entry is consumed so a
+/// caller cannot keep an unsigned copy that would later pass as signed.
+pub fn sign_evidence(mut entry: EvidenceEntry, signing_key_bytes: &[u8; 32]) -> EvidenceEntry {
+    let signing_key = SigningKey::from_bytes(signing_key_bytes);
+    let payload = canonical_evidence_payload(&entry);
+    let sig: Signature = signing_key.sign(&payload);
+    entry.signer_public_key = Some(signing_key.verifying_key().to_bytes().to_vec());
+    entry.signature = Some(sig.to_bytes().to_vec());
+    entry
+}
+
+/// Why an evidence entry failed signature verification. Fail-closed reasons —
+/// economic attribution must not accept any of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSignatureError {
+    MissingSignature,
+    MissingSignerKey,
+    MalformedSignature,
+    MalformedSignerKey,
+    InvalidSignature,
+}
+
+/// Verifies an entry's signature against its own embedded public key. Fails
+/// closed on missing signature, missing key, malformed key/signature, or a
+/// tampered payload. `expected_public_key` optionally pins the signer.
+pub fn verify_evidence_signature(
+    entry: &EvidenceEntry,
+    expected_public_key: Option<&[u8]>,
+) -> Result<(), EvidenceSignatureError> {
+    let Some(sig_bytes) = &entry.signature else {
+        return Err(EvidenceSignatureError::MissingSignature);
+    };
+    let Some(pub_bytes) = &entry.signer_public_key else {
+        return Err(EvidenceSignatureError::MissingSignerKey);
+    };
+    if let Some(expected) = expected_public_key {
+        if pub_bytes != expected {
+            return Err(EvidenceSignatureError::InvalidSignature);
+        }
+    }
+    let Ok(pub_arr) = <[u8; 32]>::try_from(pub_bytes.as_slice()) else {
+        return Err(EvidenceSignatureError::MalformedSignerKey);
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pub_arr) else {
+        return Err(EvidenceSignatureError::MalformedSignerKey);
+    };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return Err(EvidenceSignatureError::MalformedSignature);
+    };
+    vk.verify_strict(
+        canonical_evidence_payload(entry).as_slice(),
+        &Signature::from_bytes(&sig_arr),
+    )
+    .map_err(|_| EvidenceSignatureError::InvalidSignature)
+}
+
 /// Derives the deterministic lesson set from real evidence. Zero evidence in,
 /// zero lessons out (the `sample` fields stay 0 and values stay 0.0 — never an
 /// invented number). Pure and testable.
@@ -511,6 +603,50 @@ impl EvidenceIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_signature_roundtrip_and_fail_closed() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let entry = EvidenceEntry::new(
+            "gov:job:decision:1",
+            EvidenceFamily::Execution,
+            "governor DISTRIBUTED: 3 workers",
+            1234,
+        )
+        .tagged("governor");
+
+        // Valid signature verifies.
+        let signed = sign_evidence(entry.clone(), &sk.to_bytes());
+        assert!(verify_evidence_signature(&signed, None).is_ok());
+
+        // Tampered payload (text changed after signing) fails.
+        let mut tampered = signed.clone();
+        tampered.text = "fabricated".into();
+        assert_eq!(
+            verify_evidence_signature(&tampered, None),
+            Err(EvidenceSignatureError::InvalidSignature)
+        );
+
+        // Wrong signer key fails.
+        assert_eq!(
+            verify_evidence_signature(&signed, Some(other.verifying_key().to_bytes().as_slice())),
+            Err(EvidenceSignatureError::InvalidSignature)
+        );
+
+        // Missing signature / missing signer fail closed.
+        let unsigned = entry.clone();
+        assert_eq!(
+            verify_evidence_signature(&unsigned, None),
+            Err(EvidenceSignatureError::MissingSignature)
+        );
+        let mut half = sign_evidence(entry.clone(), &sk.to_bytes());
+        half.signer_public_key = None;
+        assert_eq!(
+            verify_evidence_signature(&half, None),
+            Err(EvidenceSignatureError::MissingSignerKey)
+        );
+    }
 
     fn exec(id: &str, outcome: &str, duration_ms: u64, rtt_ms: u32, at_ms: u64) -> EvidenceEntry {
         EvidenceEntry::new(
