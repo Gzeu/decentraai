@@ -300,7 +300,7 @@ pub fn choose_model<'a>(
     };
     models
         .iter()
-        .filter(|m| m.capabilities.iter().any(|c| *c == cap))
+        .filter(|m| m.capabilities.contains(&cap))
         .filter(|m| u64::from(m.ram_needed_gb) <= available_ram_gb)
         .max_by_key(|m| evidence_score(m))
 }
