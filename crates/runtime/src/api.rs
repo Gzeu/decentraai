@@ -9138,6 +9138,11 @@ async fn collective_workflow_handler(
     let proposed: Vec<ProposedStage> = stages_val
         .iter()
         .map(|s| ProposedStage {
+            stage_id: s
+                .get("stage_id")
+                .and_then(|v| v.as_str())
+                .filter(|x| !x.is_empty())
+                .map(str::to_string),
             capability: s
                 .get("capability")
                 .and_then(|c| c.as_str())

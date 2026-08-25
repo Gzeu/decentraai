@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 /// A proposed stage from Fabric Intelligence's TaskPlan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposedStage {
+    /// Explicit stage id; falls back to `capability` when absent so existing
+    /// callers (and tests) keep working.
+    #[serde(default)]
+    pub stage_id: Option<String>,
     pub capability: String,
     pub prompt: String,
     pub depends_on: Vec<String>,
@@ -27,7 +31,10 @@ pub fn task_plan_to_dag(
     let dag_stages: Vec<DagStage> = stages
         .iter()
         .map(|s| DagStage {
-            stage_id: s.capability.clone(),
+            stage_id: s
+                .stage_id
+                .clone()
+                .unwrap_or_else(|| s.capability.clone()),
             capability: s.capability.clone(),
             prompt: s.prompt.clone(),
             depends_on: s.depends_on.clone(),
@@ -51,11 +58,13 @@ mod tests {
     fn sequential_plan_builds_valid_dag() {
         let stages = vec![
             ProposedStage {
+                stage_id: None,
                 capability: "research".into(),
                 prompt: "search".into(),
                 depends_on: vec![],
             },
             ProposedStage {
+                stage_id: None,
                 capability: "summarization".into(),
                 prompt: "summarize".into(),
                 depends_on: vec!["research".into()],
@@ -69,16 +78,19 @@ mod tests {
     fn parallel_plan_builds_fan_out() {
         let stages = vec![
             ProposedStage {
+                stage_id: None,
                 capability: "a".into(),
                 prompt: "p".into(),
                 depends_on: vec![],
             },
             ProposedStage {
+                stage_id: None,
                 capability: "b".into(),
                 prompt: "p".into(),
                 depends_on: vec![],
             },
             ProposedStage {
+                stage_id: None,
                 capability: "synth".into(),
                 prompt: "s".into(),
                 depends_on: vec!["a".into(), "b".into()],
