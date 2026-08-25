@@ -8678,7 +8678,7 @@ async fn governor_execute_handler(
     // (e.g. embeddings, which is served by the dedicated backend).
     let avail_ram_gb = {
         let snap = decentraai_system_probe::SystemSnapshot::collect();
-        (snap.available_memory_bytes / (1024 * 1024 * 1024))
+        snap.available_memory_bytes / (1024 * 1024 * 1024)
     };
     let colony = [
         decentraai_distributed::mp::ModelProfile {
