@@ -8580,6 +8580,7 @@ async fn model_parallel_handler(
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({
             "task_id": task_id,
+            "execution_id": format!("gov:{task_id}"),
             "instruction": instruction,
             "content_chars": content_chars,
             "distributed": plan.distributed,
@@ -8789,6 +8790,7 @@ async fn governor_execute_handler(
 
     let mut response = serde_json::json!({
         "task_id": task_id,
+        "execution_id": format!("gov:{task_id}"),
         "verdict": verdict,
         "reasoning": reasoning,
         "available_workers": available_workers,
