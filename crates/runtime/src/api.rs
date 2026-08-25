@@ -5137,6 +5137,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/fabric", get(fabric_dashboard_handler))
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
+        .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
@@ -5341,6 +5342,92 @@ async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
 /// GET /landing — agent-first hero linking the live views.
 async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::fabric_dashboard::fabric_landing_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /bench/report — a print-friendly benchmark report generated from the
+/// live fabric (nodes, model, evidence totals + lessons, economy credits) and
+/// the Benchmark Lab comparison when available. Read-only, print/PDF friendly.
+async fn bench_report_handler(State(state): State<ApiState>) -> Response {
+    let mut html = String::from(
+        "<!doctype html><html><head><meta charset='utf-8'><title>DecentraAI — Benchmark Report</title>\
+        <style>body{font:13px/1.5 ui-sans-serif,system-ui,sans-serif;color:#111;padding:32px;max-width:860px;margin:0 auto}\
+        h1{font-size:22px}h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:#555;margin:24px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px}\
+        table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid #eee}th{color:#666;font-weight:600}\
+        .muted{color:#777;font-size:12px}.ok{color:#0a7d3a}.num{font-variant-numeric:tabular-nums}</style></head><body>",
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_millis(now);
+    let date = stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    html.push_str(&format!(
+        "<h1>DecentraAI — Benchmark Report</h1><p class='muted'>Generated from the live fabric · {date}</p>",
+    ));
+
+    // Nodes + model
+    let snap = decentraai_system_probe::SystemSnapshot::collect();
+    let peers = if let Some(p2p) = &state.p2p {
+        p2p.connected_peers().await.len()
+    } else {
+        0
+    };
+    html.push_str("<h2>Fabric</h2><table><tr><th>Nodes reachable</th><td class='num'>1 + ");
+    html.push_str(&peers.to_string());
+    html.push_str("</td></tr><tr><th>Model</th><td>");
+    html.push_str(&state.info.model_name);
+    html.push_str("</td></tr><tr><th>CPU %</th><td class='num'>");
+    html.push_str(&format!("{:.0}", snap.cpu_usage_percent));
+    html.push_str("</td></tr></table>");
+
+    // Evidence totals + lessons
+    if let Some(evidence) = &state.evidence {
+        let summary = evidence.summary(20);
+        html.push_str("<h2>Evidence</h2><table><tr><th>Total entries</th><td class='num'>");
+        html.push_str(&summary.total.to_string());
+        html.push_str("</td></tr>");
+        for (k, v) in &summary.counts {
+            html.push_str(&format!(
+                "<tr><th>{:?}</th><td class='num'>{v}</td></tr>",
+                k
+            ));
+        }
+        html.push_str("</table>");
+        if !summary.lessons.is_empty() {
+            html.push_str("<h2>Lessons</h2><ul>");
+            for l in summary.lessons.iter().take(8) {
+                html.push_str(&format!("<li>{}</li>", l.label));
+            }
+            html.push_str("</ul>");
+        }
+    }
+
+    // Economy
+    if let Some(cm) = &state.compute {
+        let accts = cm.credit_accounts();
+        let mut total = 0u64;
+        for acc in accts.values() {
+            total = total.saturating_add(acc.balance);
+        }
+        html.push_str(
+            "<h2>Economy</h2><table><tr><th>Total verified credit</th><td class='num ok'>",
+        );
+        html.push_str(&total.to_string());
+        html.push_str("</td></tr><tr><th>Contributing workers</th><td class='num'>");
+        html.push_str(&accts.len().to_string());
+        html.push_str("</td></tr></table>");
+    }
+
+    html.push_str("</body></html>");
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,

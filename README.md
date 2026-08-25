@@ -16,7 +16,7 @@
 
 > **DecentraAI is not just an AI endpoint. It is a cooperative compute fabric.** A Governor observes real resource pressure, selects the right model, borrows verified capacity from trusted peers, executes work across the fabric, records evidence, and credits the contributors.
 
-> 🧠 **It is a compute fabric natively agentic** — humans and AI agents enter through the same fabric. Watch it live at `/fabric` (dashboard) or drive it as an agent via a scoped `dca_` key, `/v1/governor/execute`, MCP on `/mcp`, and BYOA.
+> 🧠 **It is a compute fabric natively agentic** — humans and AI agents enter through the same fabric. Watch it live at `/flow` (animated pipeline), `/fabric` (dashboard), `/landing` (hero), or `/bench/report` (printable benchmark). Drive it as an agent via a scoped `dca_` key, `/v1/governor/execute`, MCP on `/mcp`, and BYOA.
 
 > 📘 **Full product documentation: [`docs/PRODUCT.md`](docs/PRODUCT.md)** — what DecentraAI is, how the Compute Fabric / Model Colony / Governor / EvidenceChain / Economy work together, validated live results (100k embeddings @ 42.1×, autonomous pressure trigger, BYOA gateway, shard-failure recovery), security boundaries and operations guide.
 
