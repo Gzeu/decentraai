@@ -8946,17 +8946,13 @@ async fn governor_execute_handler(
                         let model_c = model.clone();
                         let instruction_c = instruction.clone();
                         let shards_c = plan.shards.clone();
-                        let target = workers
-                            .iter()
-                            .position(|w| matches!(w, MpTarget::Local) && label == "local")
-                            .and_then(|i| Some(workers[i].clone()))
-                            .or_else(|| {
-                                label
-                                    .parse::<libp2p::PeerId>()
-                                    .ok()
-                                    .map(|p| MpTarget::Peer(p))
-                            })
-                            .unwrap_or(MpTarget::Local);
+                        let target = if label == "local" {
+                            MpTarget::Local
+                        } else {
+                            label
+                                .parse::<libp2p::PeerId>()
+                                .map_or(MpTarget::Local, MpTarget::Peer)
+                        };
                         async move {
                             let mut out = Vec::new();
                             for si in idxs {

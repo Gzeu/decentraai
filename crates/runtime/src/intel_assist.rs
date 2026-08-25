@@ -334,7 +334,10 @@ async fn execute_capability(
                 Err(e) => return (false, Vec::new(), Some(format!("bad payload: {e}"))),
             };
             if let Some(inputs) = body.get("inputs").and_then(|v| v.as_array()) {
-                let model = body.get("model").cloned().unwrap_or(serde_json::Value::Null);
+                let model = body
+                    .get("model")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let max_tokens = body
                     .get("max_tokens")
                     .cloned()
@@ -391,7 +394,11 @@ async fn execute_capability(
                     !failed,
                     serde_json::to_vec(&serde_json::json!({ "responses": responses }))
                         .unwrap_or_default(),
-                    if failed { Some("some batch prompts failed".into()) } else { None },
+                    if failed {
+                        Some("some batch prompts failed".into())
+                    } else {
+                        None
+                    },
                 )
             } else {
                 let res = state
