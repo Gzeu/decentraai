@@ -205,6 +205,14 @@ The current stack includes:
 
 DecentraAI includes an Agent Operating System for specialized roles and external agents.
 
+**External agents** (openclaw-style or any autonomous agent) enter the fabric
+through a scoped `dca_` key — see [`.agents/skills/fabric-agent.md`](.agents/skills/fabric-agent.md)
+for the complete onboarding skill, or the live entry points:
+
+- **Live fabric** — `/landing`, `/flow` (animated pipeline), `/fabric` (dashboard), `/bench/report`
+- **Drive it** — `POST /v1/governor/execute` with `Authorization: Bearer dca_…`
+- **MCP** — `/mcp` (tools: decide, execute_decision, fabric graph, evidence, compute)
+
 Core concepts:
 
 - Governor
@@ -404,15 +412,23 @@ Current baseline: **1386 tests passing** in the reported live state.
 
 ## 🗺️ What comes next
 
-The next major frontier is **true model parallelism across machines**: a backend capable of splitting the actual model execution itself across nodes, rather than the current context-split map/reduce strategy.
+**Architecture is frozen at a security baseline** (all milestones live on a
+3-node fabric). The current focus is **Product / Launch**: live fabric
+surfaces (`/flow`, `/fabric`, `/landing`, `/bench/report`), agent onboarding
+(`.agents/skills/fabric-agent.md`), UX polish, deployment packaging and a
+formal benchmark report.
 
-Other active engineering work includes:
+Active engineering candidates (post-launch, no active work yet):
 
-- finishing operational edge cases around cross-network P2P;
-- increasing real model deployment coverage on workers;
-- deeper resource/pressure feedback into routing;
-- extending the Model Colony from profiles to continuously refreshed measured evidence;
-- progressing the MultiversX settlement path in a controlled testnet-first manner.
+- **reducer quality** — prefer a non-reasoning model (Phi/qwen2.5) for the
+  reduce step, addressing Qwen3 empty-output variability;
+- **retry/replan hardening** — extend shard lifecycle guarantees to the
+  embeddings pool at industrial scale;
+- **automated reward settlement** — link verified credit to automatic
+  consumer-quota top-up;
+- **true model parallelism** — a separate future compute class (needs
+  accelerators + fast interconnects; not feasible on the current CPU-only
+  fabric, GGUF/safetensors mismatch). Out of scope for this fabric.
 
 ---
 
@@ -421,6 +437,12 @@ Other active engineering work includes:
 Start here:
 
 - [`AGENTS.md`](AGENTS.md) — Agent Operating Contract
+- [`docs/PRODUCT.md`](docs/PRODUCT.md) — **product documentation** (compute fabric, Model Colony, Governor, evidence, economy, failure recovery, operations)
+- [`docs/API.md`](docs/API.md) — live API reference (endpoints, BYOA flow)
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — 3-node operations guide + troubleshooting
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — measured results (100k embeddings 42.1×, chat 4.3×, map-reduce, economy)
+- [`docs/SECURITY_AUDIT_VERIFICATION.md`](docs/SECURITY_AUDIT_VERIFICATION.md) — security audit verification (confirmed findings + fixes)
+- [`.agents/skills/fabric-agent.md`](.agents/skills/fabric-agent.md) — **skill for autonomous agents** entering the fabric
 - [`docs/AGENT_ORGANIZATION.md`](docs/AGENT_ORGANIZATION.md) — Agent OS roles and RBAC
 - [`docs/AGENT_MEMORY.md`](docs/AGENT_MEMORY.md) — Obsidian / collective memory model
 - [`docs/MULTIVERSX_MX8004_WRITE_PATH.md`](docs/MULTIVERSX_MX8004_WRITE_PATH.md) — MX-8004 protocol research
