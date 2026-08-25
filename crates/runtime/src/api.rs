@@ -5134,6 +5134,7 @@ pub fn build_router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(root_dashboard_handler))
         .route("/ui2", get(dashboard_v2_handler))
+        .route("/fabric", get(fabric_dashboard_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
@@ -5319,6 +5320,18 @@ async fn root_dashboard_handler(State(state): State<ApiState>) -> Response {
 /// `node.dashboard`, allowing a risk-free browser review at any time.
 async fn dashboard_v2_handler(State(state): State<ApiState>) -> Response {
     dashboard_v2_response(&state)
+}
+
+/// GET /fabric — the live compute-fabric dashboard (agent-first landing).
+/// Read-only projection over the real endpoints; never proxies inference.
+async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::fabric_dashboard::fabric_dashboard_html().0;
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 fn dashboard_v2_response(state: &ApiState) -> Response {
