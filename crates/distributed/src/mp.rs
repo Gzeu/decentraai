@@ -260,6 +260,51 @@ pub fn select_model(task_kind: &str) -> &'static str {
     }
 }
 
+/// A candidate model for Model Colony: its capabilities, RAM footprint and
+/// measured evidence. Capability strings mirror `CapabilityKind` tags
+/// ("summarization", "classification", "reasoning", "structured_output",
+/// "chat", "embeddings").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelProfile {
+    pub model: &'static str,
+    pub capabilities: &'static [&'static str],
+    pub ram_needed_gb: u32,
+    pub accuracy: f64,
+    pub latency_ms: u64,
+    pub reasoner: bool,
+}
+
+fn evidence_score(m: &ModelProfile) -> i64 {
+    let quality = (m.accuracy * 100.0).round() as i64;
+    let reasoner_penalty = if m.reasoner { 30 } else { 0 };
+    let speed_penalty = (m.latency_ms / 1000) as i64;
+    quality - reasoner_penalty - speed_penalty
+}
+
+/// Model Colony: picks the best model for a task from the candidate colony,
+/// constrained by capability match and available RAM, scored on verified
+/// evidence. Not hardcoded — the profile evidence decides. `None` when no
+/// candidate fits both the capability and the RAM budget.
+pub fn choose_model<'a>(
+    task_kind: &str,
+    models: &'a [ModelProfile],
+    available_ram_gb: u64,
+) -> Option<&'a ModelProfile> {
+    let cap = match task_kind {
+        "embeddings" | "embed" => "embeddings",
+        "summarize" | "summarization" => "summarization",
+        "classify" | "classification" => "classification",
+        "reason" | "reasoning" => "reasoning",
+        "structure" | "structured_output" => "structured_output",
+        _ => "chat",
+    };
+    models
+        .iter()
+        .filter(|m| m.capabilities.iter().any(|c| *c == cap))
+        .filter(|m| u64::from(m.ram_needed_gb) <= available_ram_gb)
+        .max_by_key(|m| evidence_score(m))
+}
+
 /// Benchmark/evidence facts about one candidate model, used by Model
 /// Intelligence to pick a reducer. Evidence is measured, never assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -438,6 +483,45 @@ mod tests {
         assert_eq!(select_model("chat"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("summarize"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("anything"), "Qwen3-1.7B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn model_colony_chooses_best_fit_on_capability_ram_and_evidence() {
+        let qwen = ModelProfile {
+            model: "Qwen3-1.7B-Q4_K_M.gguf",
+            capabilities: &["chat", "reasoning", "coding"],
+            ram_needed_gb: 3,
+            accuracy: 0.25,
+            latency_ms: 4624,
+            reasoner: true,
+        };
+        let gemma = ModelProfile {
+            model: "Gemma-3-1B-it-Q4_K_M.gguf",
+            capabilities: &["chat", "summarization", "classification"],
+            ram_needed_gb: 2,
+            accuracy: 0.33,
+            latency_ms: 578,
+            reasoner: false,
+        };
+        let phi = ModelProfile {
+            model: "Phi-4-mini-instruct-Q4_K_M.gguf",
+            capabilities: &["chat", "reasoning", "structured_output"],
+            ram_needed_gb: 3,
+            accuracy: 0.33,
+            latency_ms: 803,
+            reasoner: false,
+        };
+        let colony = [qwen, gemma, phi];
+        // Summarization: only Gemma has the capability -> Gemma.
+        assert_eq!(choose_model("summarize", &colony, 8).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        // Classification: only Gemma.
+        assert_eq!(choose_model("classify", &colony, 8).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        // Reasoning: Qwen3 and Phi, RAM fits both -> Phi (non-reasoner, faster on evidence).
+        assert_eq!(choose_model("reason", &colony, 8).unwrap().model, "Phi-4-mini-instruct-Q4_K_M.gguf");
+        // RAM constraint: only 2GB available -> Qwen3/Phi excluded, Gemma stays.
+        assert_eq!(choose_model("summarize", &colony, 2).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        // Embeddings: no candidate has it -> None.
+        assert!(choose_model("embeddings", &colony, 8).is_none());
     }
 
     #[test]

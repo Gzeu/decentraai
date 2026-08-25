@@ -8673,7 +8673,43 @@ async fn governor_execute_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("chat")
         .to_string();
-    let model = decentraai_distributed::mp::select_model(&task_kind).to_string();
+    // Model Colony: pick the best model for the task from capabilities + RAM
+    // fit + verified evidence. Falls back to select_model when no profile fits
+    // (e.g. embeddings, which is served by the dedicated backend).
+    let avail_ram_gb = {
+        let snap = decentraai_system_probe::SystemSnapshot::collect();
+        (snap.available_memory_bytes / (1024 * 1024 * 1024)) as u64
+    };
+    let colony = [
+        decentraai_distributed::mp::ModelProfile {
+            model: "Qwen3-1.7B-Q4_K_M.gguf",
+            capabilities: &["chat", "reasoning", "coding", "tool_calling"],
+            ram_needed_gb: 3,
+            accuracy: 0.25,
+            latency_ms: 4624,
+            reasoner: true,
+        },
+        decentraai_distributed::mp::ModelProfile {
+            model: "Gemma-3-1B-it-Q4_K_M.gguf",
+            capabilities: &["chat", "summarization", "classification"],
+            ram_needed_gb: 2,
+            accuracy: 0.33,
+            latency_ms: 578,
+            reasoner: false,
+        },
+        decentraai_distributed::mp::ModelProfile {
+            model: "Phi-4-mini-instruct-Q4_K_M.gguf",
+            capabilities: &["chat", "reasoning", "structured_output"],
+            ram_needed_gb: 3,
+            accuracy: 0.33,
+            latency_ms: 803,
+            reasoner: false,
+        },
+    ];
+    let model = decentraai_distributed::mp::choose_model(&task_kind, &colony, avail_ram_gb)
+        .map(|p| p.model)
+        .unwrap_or_else(|| decentraai_distributed::mp::select_model(&task_kind))
+        .to_string();
     let max_tokens = 256u64;
     let cpu_cores = 2u16;
     let ram_mb = 512u64;
@@ -8693,6 +8729,7 @@ async fn governor_execute_handler(
         "cpu_percent": ps.cpu_percent,
         "ram_percent": ps.ram_percent,
         "queue_depth": ps.queue_depth,
+        "model_selected": model,
     });
 
     let result_payload = match verdict {
