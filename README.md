@@ -67,6 +67,13 @@
 | **Trusted Admission** | ✅ Production | Opt-in sharing, trust chain: discovered → approved → connected |
 | **Subscription Tiers** | ✅ Production | Free by default; tier reflects contribution level |
 | **Distributed Fabric** | ✅ LAN Verified | Multi-node planner, reservations, KV-aware routing |
+| **CPU Pool (Sharing is Caring)** | ✅ Live 3-node | `POST /v1/pool/bench` — partition workloads across nodes, DFCP batching |
+| **Distributed Embeddings** | ✅ Live | 100k embeddings over 3 nodes → **42.1× speedup**, 0 failures |
+| **Chat Batch** | ✅ Live | Batched chat over one DFCP round-trip (~4.3× speedup) |
+| **Model-Parallel (Map/Reduce)** | ✅ Live | `POST /v1/model-parallel` — one logical workload split+aggregated |
+| **Governor Autonomous Loop** | ✅ Live | `POST /v1/governor/execute` — resource-aware LOCAL/DISTRIBUTED/QUEUE/REJECT |
+| **Model Colony** | ✅ Live | `choose_model` — capability + RAM + evidence based model selection |
+| **Economic Attribution** | ✅ Live | Remote contribution → verified credit → RewardEngine (synthetic, never money) |
 
 ---
 
@@ -297,7 +304,7 @@ User Prompt
 | `node-cli` | Complete CLI command menu | 6,000+ |
 | `runtime` | llama-server manager + dashboard + API proxy | 8,000+ |
 | `agents` | Collective intelligence substrate (pure logic) | 4,000+ |
-| `distributed` | P2P orchestration + agent runtime bindings | 3,000+ |
+| `distributed` | P2P orchestration + agent runtime bindings + pool/mp | 3,000+ |
 | `fabric` | Execution planner + reservation system | 2,500+ |
 | `p2p` | libp2p transport + verified transfer + reputation | 3,500+ |
 | `config` | Typed YAML config with validation | 800+ |
@@ -306,6 +313,74 @@ User Prompt
 | `registry` | Local model storage with path safety | 400+ |
 | `audit` | Append-only security logging | 500+ |
 | `system-probe` | Hardware probing + admission decisions | 600+ |
+
+---
+
+## 🧠 Distributed Compute / CPU Pool
+
+DecentraAI lets a node treat its trusted peers as one shared compute pool.
+The core invariant is unchanged: **AI proposes → deterministic Rust decides →
+workers execute**. Every distributed action reuses the existing DFCP
+negotiation and Sharing is Caring rules — nothing is rebuilt.
+
+### Governor autonomous loop
+
+```
+workload
+   ↓
+Governor (resource-aware: cpu/ram/queue/workers/content)
+   ↓
+Model Colony (which model: capability + RAM + evidence)
+   ↓
+LOCAL │ DISTRIBUTED │ QUEUE │ REJECT
+   ↓ (DISTRIBUTED)
+CPU Pool → DFCP → Desktop + Laptop + VPS
+   ↓
+map (shards) → reduce (one result)
+   ↓
+EvidenceChain → verified contribution → credit
+```
+
+**`POST /v1/governor/execute`** — submit only the workload; the Governor
+decides deterministically from real state and borrows compute automatically:
+- `LOCAL` — fits the node, one call.
+- `DISTRIBUTED` — exceeds local capacity and workers are reachable (map-reduce).
+- `QUEUE` / `REJECT` — honest refusals, never fabricated.
+
+### Distributed inference (map-reduce)
+
+llama-server cannot split one forward pass across separate nodes
+(`--split-mode {layer,row,tensor}` is intra-machine only). For a single
+logical workload too large for one worker's context budget, DecentraAI runs
+**map-reduce / context-split inference**:
+
+- planner splits content into deterministic shards (`distributed::mp`),
+- workers map each shard to a partial result (batched via DFCP),
+- a reduce step fuses all partials into **ONE** final answer,
+- EvidenceChain records every participating worker + the reducer + status.
+
+**`POST /v1/model-parallel`** — explicit map-reduce with serial baseline,
+speedup, per-worker metrics and EvidenceChain.
+
+### Pool benchmarks & embeddings at scale
+
+**`POST /v1/pool/bench`** — partitions a workload of many independent tasks
+across the requesting node + connected workers, executes in parallel (local
+via the benchmark executor, remote via DFCP), grades + aggregates.
+
+- **Distributed embeddings**: `capability: "embeddings"` with a dedicated
+  embeddings backend (`nomic-embed-text`) on each node. Batched DFCP carries
+  ~24 vectors per round-trip. **Verified: 100k embeddings over 3 nodes →
+  42.1× speedup, 0 failures, 31.6 emb/s.**
+- **Chat batch**: `capability: "chat"` with `inputs:[...]` batches.
+
+### Model Colony
+
+`distributed::mp::{ModelProfile, choose_model}` picks the best model for a
+task from the colony by **capability match**, **RAM fit** and **verified
+evidence** (accuracy/latency, reasoner penalty). Not hardcoded — e.g.
+summarization → Gemma, reasoning → Phi (non-reasoner beats Qwen3), embeddings
+→ dedicated backend. `model_selected` is reported by `/v1/governor/execute`.
 
 ### Security Model
 
