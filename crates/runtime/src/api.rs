@@ -5135,6 +5135,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/", get(root_dashboard_handler))
         .route("/ui2", get(dashboard_v2_handler))
         .route("/fabric", get(fabric_dashboard_handler))
+        .route("/landing", get(fabric_landing_handler))
+        .route("/flow", get(fabric_flow_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
@@ -5326,6 +5328,29 @@ async fn dashboard_v2_handler(State(state): State<ApiState>) -> Response {
 /// Read-only projection over the real endpoints; never proxies inference.
 async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::fabric_dashboard::fabric_dashboard_html().0;
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /flow — animated, live fabric pipeline (Agents → Governor → Model
+/// Colony → Compute Pool → Evidence → Economy). Read-only.
+/// GET /landing — agent-first hero linking the live views.
+async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::fabric_dashboard::fabric_landing_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn fabric_flow_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::fabric_flow::fabric_flow_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,

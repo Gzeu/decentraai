@@ -160,6 +160,51 @@ function agentGuide(e){
 </body>
 </html>"#;
 
+/// The agent-first landing hero: a compact, premium page that frames the
+/// fabric and links to the live views.
+pub const FABRIC_LANDING_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DecentraAI — Compute Fabric</title><style>
+:root{--bg:#05080f;--panel:#0b111f;--line:#16233c;--text:#e8eef9;--muted:#7c8faa;--accent:#22d3ee;--accent2:#818cf8;--ok:#34d399}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1100px 600px at 18% -5%,#0e2340 0%,#05080f 60%);color:var(--text);font:15px/1.6 ui-sans-serif,system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px}
+.hero{max-width:880px;text-align:center}
+.badge{display:inline-block;border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:6px 14px;font-size:12px;color:var(--muted);margin-bottom:22px;letter-spacing:1px}
+h1{font-size:44px;font-weight:800;letter-spacing:-1px;line-height:1.1}
+h1 .grad{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.tagline{color:var(--muted);font-size:17px;max-width:640px;margin:18px auto 30px}
+.flow{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:34px;color:var(--muted);font-size:12.5px;letter-spacing:.5px}
+.flow span{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px 12px}
+.flow b{color:var(--accent)}
+.cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:13px 26px;border-radius:12px;text-decoration:none;font-weight:700;font-size:15px;transition:.2s}
+.btn.human{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04101f}
+.btn.agent{background:var(--panel);border:1px solid var(--line);color:var(--text)}
+.btn:hover{transform:translateY(-2px)}
+.btn small{display:block;font-weight:500;font-size:11px;opacity:.8;margin-top:3px}
+.docs{margin-top:40px;color:var(--muted);font-size:12px}
+.docs a{color:var(--accent);text-decoration:none;margin:0 6px}
+</style></head><body><div class="hero">
+<div class="badge">● LIVE COMPUTE FABRIC</div>
+<h1>DecentraAI — <span class="grad">compute fabric natively agentic</span></h1>
+<div class="tagline">An autonomous fabric where humans and AI agents discover, request, contribute and orchestrate compute — through the same door.</div>
+<div class="flow"><span>Agents</span><b>→</b><span>Governor</span><b>→</b><span>Models</span><b>→</b><span>Nodes · CPU</span><b>→</b><span>Evidence</span><b>→</b><span>Economy</span></div>
+<div class="cta">
+<a class="btn human" href="/flow">Watch it live<small>animated fabric pipeline</small></a>
+<a class="btn human" href="/fabric">Fabric dashboard<small>live panels</small></a>
+<a class="btn agent" href="/v1/token" onclick="agentGuide(event)">Enter as an Agent<small>scoped dca_ key · /v1/governor/execute</small></a>
+<a class="btn agent" href="/">Operator console<small>node dashboard</small></a>
+</div>
+<div class="docs">Docs: <a href="/docs/PRODUCT.md">Product</a> · <a href="/docs/API.md">API</a> · <a href="/docs/DEPLOYMENT.md">Deploy</a> · <a href="/docs/BENCHMARKS.md">Benchmarks</a></div>
+</div>
+<script>function agentGuide(e){e.preventDefault();alert('Agent entry:\n1) decentraai consumer-key create --account my-agent --quota-ceiling 5000 --scopes inference\n2) POST /api/admin/quota/grant {account, amount}\n3) POST /v1/governor/execute with Bearer dca_…\nOr MCP on /mcp.');}</script>
+</body></html>"#;
+
+/// Renders the agent-first landing hero.
+pub fn fabric_landing_html() -> String {
+    FABRIC_LANDING_HTML.to_string()
+}
+
 /// Renders the fabric dashboard HTML (no-store).
 pub fn fabric_dashboard_html() -> (String, bool) {
     (FABRIC_DASHBOARD_HTML.to_string(), true)
