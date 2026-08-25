@@ -809,6 +809,12 @@ impl ApiState {
         }
     }
 
+    /// The master admin token, when configured. Used by internal self-calls
+    /// (e.g. collective stages driving the Governor) that need operator auth.
+    pub fn master_token(&self) -> Option<String> {
+        self.auth_token.as_ref().map(|t| t.to_string())
+    }
+
     /// Per-tier model allowlist. The request body's `model` field is
     /// advisory (llama-server serves what it loaded), but we enforce it
     /// anyway: it is honest about what the tier may use, and it protects
@@ -4857,12 +4863,12 @@ fn parse_worker_peer_id(body: &Bytes) -> Result<decentraai_p2p::PeerId, String> 
 /// worker earned its suggested tier, then apply it.
 async fn admin_contribution_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(e) = state.require_master(&headers) {
-        return e.into_response();
+return e.into_response();
     }
     let Some(compute) = &state.compute else {
         return (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "rows": [], "note": "no compute manager attached" }).to_string(),
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "compute manager not attached"})),
         )
             .into_response();
     };
@@ -9109,7 +9115,7 @@ async fn collective_workflow_handler(
     if let Err(e) = state.require_operator_or_admin(&headers) {
         return e.into_response();
     }
-    let Some(p2p) = state.p2p.clone() else {
+    let Some(_p2p) = state.p2p.clone() else {
         return (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"error": "p2p not attached"})),
@@ -9212,45 +9218,43 @@ async fn collective_workflow_handler(
 
             tracing::info!(stage = %stage.stage_id, capability = %stage.capability, "executing collective stage");
 
-            // Use the existing assist path
-            let peers = p2p.connected_peers().await;
-            if peers.is_empty() {
-                stage_results.insert(
-                    stage.stage_id.clone(),
-                    serde_json::json!({"error": "no connected peers"}),
-                );
-                all_success = false;
-                executed_count += 1;
-                continue;
-            }
-
-            let payload = serde_json::json!({
-                "messages": [{"role": "user", "content": prompt_text}],
-                "max_tokens": 300,
+            // M17 Governor per stage: route this stage through the Governor
+            // (Model Colony + resource verdict + distributed map-reduce +
+            // EvidenceChain + economic credit). Self-call with the master
+            // token so no external operator is needed.
+            let gov_body = serde_json::json!({
+                "task_id": format!("{}-{}", stage.stage_id, now_nanos()),
+                "task_kind": stage.capability,
+                "instruction": "Produce the requested stage output concisely.",
+                "content": prompt_text,
             });
-            let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-            let request = decentraai_compute::assist::AssistRequest {
-                capability: stage.capability.clone(),
-                cpu_cores: 2,
-                ram_mb: 512,
+            let gov_client = reqwest::Client::new();
+            let gov_url = format!("http://127.0.0.1:{}/v1/governor/execute", state.info.api_port);
+            let gov_resp = gov_client
+                .post(&gov_url)
+                .bearer_auth(state.master_token().unwrap_or_default())
+                .json(&gov_body)
+                .send()
+                .await;
+            let gov_outcome: serde_json::Value = match gov_resp {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+                Ok(r) => serde_json::json!({ "error": format!("governor HTTP {}", r.status()) }),
+                Err(e) => serde_json::json!({ "error": format!("governor unreachable: {e}") }),
             };
-            let lease = stage.lease_seconds.min(120);
-
-            let outcome =
-                crate::intel_assist::run_assist_request(&p2p, peers, request, payload_bytes, lease)
-                    .await;
-
-            if outcome.0 {
-                stage_results.insert(
-                    stage.stage_id.clone(),
-                    serde_json::from_slice(&outcome.1).unwrap_or(serde_json::Value::Null),
-                );
+            let result = gov_outcome
+                .get("output")
+                .and_then(|o| o.get("result"))
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+                .unwrap_or_default();
+            if !result.trim().is_empty() {
+                stage_results.insert(stage.stage_id.clone(), serde_json::json!(result));
                 completed.insert(stage.stage_id.clone());
-                tracing::info!(stage = %stage.stage_id, "collective stage completed");
+                tracing::info!(stage = %stage.stage_id, "collective stage completed via Governor");
             } else {
                 stage_results.insert(
                     stage.stage_id.clone(),
-                    serde_json::json!({"error": outcome.2}),
+                    serde_json::json!({ "error": gov_outcome.get("reasoning").cloned().unwrap_or(serde_json::json!("governor stage returned empty")) }),
                 );
                 all_success = false;
                 executed_count += 1;
