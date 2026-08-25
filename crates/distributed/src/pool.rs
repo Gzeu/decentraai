@@ -138,8 +138,8 @@ pub fn aggregate_pool(outcomes: &[PoolOutcome]) -> PoolAggregate {
             .copied()
             .unwrap_or(0)
             .saturating_add(lat);
-        let is_graded = o.verdict == BenchmarkVerdict::Correct
-            || o.verdict == BenchmarkVerdict::Incorrect;
+        let is_graded =
+            o.verdict == BenchmarkVerdict::Correct || o.verdict == BenchmarkVerdict::Incorrect;
         let is_correct = o.verdict == BenchmarkVerdict::Correct;
         if is_graded {
             graded += 1;

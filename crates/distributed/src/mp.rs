@@ -73,7 +73,10 @@ pub fn needs_distributed(content_chars: usize) -> bool {
 pub fn split_shards(content: &str, max_chars: usize) -> Vec<MpShard> {
     let content = content.trim();
     if content.is_empty() {
-        return vec![MpShard { index: 0, content: String::new() }];
+        return vec![MpShard {
+            index: 0,
+            content: String::new(),
+        }];
     }
     let max_chars = max_chars.max(1);
     let mut shards: Vec<MpShard> = Vec::new();
@@ -87,9 +90,7 @@ pub fn split_shards(content: &str, max_chars: usize) -> Vec<MpShard> {
         if end < len {
             let mut cut = start;
             for i in (start..end).rev() {
-                if (chars[i] == '.' && i + 1 < len && chars[i + 1] == ' ')
-                    || chars[i] == '\n'
-                {
+                if (chars[i] == '.' && i + 1 < len && chars[i + 1] == ' ') || chars[i] == '\n' {
                     cut = i + 1;
                     break;
                 }
@@ -109,7 +110,10 @@ pub fn split_shards(content: &str, max_chars: usize) -> Vec<MpShard> {
         start = end;
     }
     if shards.is_empty() {
-        shards.push(MpShard { index: 0, content: content.to_string() });
+        shards.push(MpShard {
+            index: 0,
+            content: content.to_string(),
+        });
     }
     shards
 }
@@ -120,7 +124,10 @@ pub fn plan(w: &MpWorkload) -> MpPlan {
     let shards = if distributed {
         split_shards(&w.content, MAX_SHARD_CHARS)
     } else {
-        vec![MpShard { index: 0, content: w.content.trim().to_string() }]
+        vec![MpShard {
+            index: 0,
+            content: w.content.trim().to_string(),
+        }]
     };
     MpPlan {
         distributed,
@@ -305,6 +312,108 @@ pub fn choose_model<'a>(
         .max_by_key(|m| evidence_score(m))
 }
 
+// ---------------------------------------------------------------------------
+// Shard lifecycle tracking (map-reduce resilience)
+// ---------------------------------------------------------------------------
+
+/// Explicit lifecycle state of one shard during map-reduce execution.
+/// A lost shard becomes `Failed` — it is never silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardState {
+    Assigned,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// One shard's execution bookkeeping: deterministic index + explicit state,
+/// so a lost shard is retried on an alternative worker and a completed shard
+/// is never executed twice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardRun {
+    pub index: usize,
+    pub state: ShardState,
+    /// Worker this shard is currently assigned to / last ran on.
+    pub worker: String,
+    pub output: String,
+    pub latency_ms: u64,
+    /// How many times this shard was dispatched (initial + replans).
+    pub attempts: u32,
+}
+
+/// Max dispatches per shard: the initial assignment plus one replan on an
+/// alternative worker. Beyond that the run reports honestly incomplete.
+pub const MAX_SHARD_ATTEMPTS: u32 = 2;
+
+impl ShardRun {
+    pub fn new(index: usize) -> Self {
+        Self {
+            index,
+            state: ShardState::Assigned,
+            worker: String::new(),
+            output: String::new(),
+            latency_ms: 0,
+            attempts: 0,
+        }
+    }
+
+    /// A shard that must be dispatched to a worker: never dispatched yet, or
+    /// failed with attempts remaining. (`Running`/`Completed` shards are in
+    /// flight or done.)
+    pub fn needs_dispatch(&self) -> bool {
+        if self.attempts >= MAX_SHARD_ATTEMPTS {
+            return false;
+        }
+        match self.state {
+            // Freshly created, never dispatched.
+            ShardState::Assigned => self.attempts == 0,
+            // Failed: retry on an alternative worker.
+            ShardState::Failed => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.state == ShardState::Completed
+    }
+}
+
+/// Replans pending shards round-robin over the given workers, deterministically
+/// preferring a worker DIFFERENT from where the shard last failed (when other
+/// workers exist). Marks each reassigned shard as Assigned and counts the
+/// attempt. Returns `(shard_index, new_worker)` pairs in shard order.
+///
+/// Completed shards are never re-assigned; shards past their attempt budget
+/// stay Failed (honest failure). With an empty worker list nothing changes.
+pub fn replan(shards: &mut [ShardRun], workers: &[String]) -> Vec<(usize, String)> {
+    let n = workers.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut w = 0usize;
+    for s in shards.iter_mut() {
+        if !s.needs_dispatch() {
+            continue;
+        }
+        // Round-robin start; skip the failed worker when an alternative exists.
+        let mut pick = workers[w % n].clone();
+        let mut k = 0;
+        while n > 1 && pick == s.worker && s.attempts > 0 && k < n {
+            w += 1;
+            pick = workers[w % n].clone();
+            k += 1;
+        }
+        s.worker = pick.clone();
+        s.state = ShardState::Assigned;
+        s.attempts += 1;
+        out.push((s.index, pick));
+        w += 1;
+    }
+    out
+}
+
 /// Benchmark/evidence facts about one candidate model, used by Model
 /// Intelligence to pick a reducer. Evidence is measured, never assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -366,16 +475,31 @@ mod tests {
         // ~40 chars each sentence * 40 sentences > MAX_SHARD_CHARS.
         let mut content = String::new();
         for i in 0..40 {
-            content.push_str(&format!("Sentence number {i} has enough words to be a real unit. "));
+            content.push_str(&format!(
+                "Sentence number {i} has enough words to be a real unit. "
+            ));
         }
-        let w = MpWorkload { task_id: "t".into(), instruction: "summarize".into(), content };
+        let w = MpWorkload {
+            task_id: "t".into(),
+            instruction: "summarize".into(),
+            content,
+        };
         let p = plan(&w);
         assert!(p.distributed);
-        assert!(p.n_shards >= 2, "expected multiple shards, got {}", p.n_shards);
+        assert!(
+            p.n_shards >= 2,
+            "expected multiple shards, got {}",
+            p.n_shards
+        );
         // Determinism: same input → same shards.
         assert_eq!(plan(&w).shards, p.shards);
         // Shards reconstruct the content roughly (whitespace-trimmed).
-        let joined: String = p.shards.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(" ");
+        let joined: String = p
+            .shards
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(joined.contains("Sentence number 0"));
         assert!(joined.contains("Sentence number 39"));
     }
@@ -405,7 +529,10 @@ mod tests {
 
     #[test]
     fn map_prompt_applies_instruction_to_shard() {
-        let shard = MpShard { index: 0, content: "the section".into() };
+        let shard = MpShard {
+            index: 0,
+            content: "the section".into(),
+        };
         let p = map_prompt("summarize", &shard);
         assert!(p.contains("summarize"));
         assert!(p.contains("the section"));
@@ -479,7 +606,10 @@ mod tests {
 
     #[test]
     fn model_intelligence_selects_served_model() {
-        assert_eq!(select_model("embeddings"), "nomic-embed-text-v1.5.Q4_K_M.gguf");
+        assert_eq!(
+            select_model("embeddings"),
+            "nomic-embed-text-v1.5.Q4_K_M.gguf"
+        );
         assert_eq!(select_model("chat"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("summarize"), "Qwen3-1.7B-Q4_K_M.gguf");
         assert_eq!(select_model("anything"), "Qwen3-1.7B-Q4_K_M.gguf");
@@ -513,13 +643,25 @@ mod tests {
         };
         let colony = [qwen, gemma, phi];
         // Summarization: only Gemma has the capability -> Gemma.
-        assert_eq!(choose_model("summarize", &colony, 8).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        assert_eq!(
+            choose_model("summarize", &colony, 8).unwrap().model,
+            "Gemma-3-1B-it-Q4_K_M.gguf"
+        );
         // Classification: only Gemma.
-        assert_eq!(choose_model("classify", &colony, 8).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        assert_eq!(
+            choose_model("classify", &colony, 8).unwrap().model,
+            "Gemma-3-1B-it-Q4_K_M.gguf"
+        );
         // Reasoning: Qwen3 and Phi, RAM fits both -> Phi (non-reasoner, faster on evidence).
-        assert_eq!(choose_model("reason", &colony, 8).unwrap().model, "Phi-4-mini-instruct-Q4_K_M.gguf");
+        assert_eq!(
+            choose_model("reason", &colony, 8).unwrap().model,
+            "Phi-4-mini-instruct-Q4_K_M.gguf"
+        );
         // RAM constraint: only 2GB available -> Qwen3/Phi excluded, Gemma stays.
-        assert_eq!(choose_model("summarize", &colony, 2).unwrap().model, "Gemma-3-1B-it-Q4_K_M.gguf");
+        assert_eq!(
+            choose_model("summarize", &colony, 2).unwrap().model,
+            "Gemma-3-1B-it-Q4_K_M.gguf"
+        );
         // Embeddings: no candidate has it -> None.
         assert!(choose_model("embeddings", &colony, 8).is_none());
     }
@@ -528,9 +670,24 @@ mod tests {
     fn model_intelligence_picks_best_reducer_from_evidence_not_hardcoded() {
         // Real measured benchmark facts (VPS): Phi is faster+non-reasoner,
         // Qwen3 is a slow reasoner, Gemma is fast non-reasoner.
-        let phi = ModelEvidence { model: "Phi-4-mini", accuracy: 0.33, latency_ms: 803, reasoner: false };
-        let qwen = ModelEvidence { model: "Qwen3-1.7B", accuracy: 0.25, latency_ms: 4624, reasoner: true };
-        let gemma = ModelEvidence { model: "Gemma-3-1B", accuracy: 0.33, latency_ms: 578, reasoner: false };
+        let phi = ModelEvidence {
+            model: "Phi-4-mini",
+            accuracy: 0.33,
+            latency_ms: 803,
+            reasoner: false,
+        };
+        let qwen = ModelEvidence {
+            model: "Qwen3-1.7B",
+            accuracy: 0.25,
+            latency_ms: 4624,
+            reasoner: true,
+        };
+        let gemma = ModelEvidence {
+            model: "Gemma-3-1B",
+            accuracy: 0.33,
+            latency_ms: 578,
+            reasoner: false,
+        };
         let candidates = [phi, qwen, gemma];
         let best = select_reducer(&candidates).unwrap();
         // Gemma (same accuracy as Phi, faster, non-reasoner) should win on
@@ -542,5 +699,85 @@ mod tests {
         assert_eq!(only.model, "Qwen3-1.7B");
         // Empty -> None.
         assert!(select_reducer(&[]).is_none());
+    }
+
+    #[test]
+    fn failed_shard_is_replanned_on_an_alternative_worker() {
+        let workers = vec!["desktop".into(), "laptop".into()];
+        let mut runs = vec![ShardRun::new(0), ShardRun::new(1)];
+        // Initial round-robin assignment via replan.
+        let a = replan(&mut runs, &workers);
+        assert_eq!(a.len(), 2);
+        assert_eq!(runs[0].state, ShardState::Assigned);
+        assert_eq!(runs[0].attempts, 1);
+
+        // Both shards run; shard 0 FAILS, shard 1 COMPLETES.
+        runs[0].state = ShardState::Failed;
+        runs[1].state = ShardState::Completed;
+        assert_eq!(runs[0].state, ShardState::Failed);
+
+        // Replan: only the FAILED shard goes back out, to the OTHER worker.
+        let b = replan(&mut runs, &workers);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].0, 0);
+        assert_ne!(runs[0].worker, "desktop");
+        assert_eq!(runs[0].attempts, 2);
+        assert_eq!(runs[0].state, ShardState::Assigned);
+    }
+
+    #[test]
+    fn completed_shard_is_never_executed_twice() {
+        let workers = vec!["a".into(), "b".into()];
+        let mut runs = vec![ShardRun::new(0)];
+        replan(&mut runs, &workers);
+        runs[0].state = ShardState::Completed;
+        // A completed shard is not pending: replan must skip it entirely.
+        let again = replan(&mut runs, &workers);
+        assert!(again.is_empty(), "completed shard was re-assigned");
+        assert_eq!(runs[0].state, ShardState::Completed);
+    }
+
+    #[test]
+    fn no_workers_means_honest_failure_not_fabricated() {
+        let mut one = [ShardRun::new(0)];
+        one[0].state = ShardState::Failed;
+        one[0].attempts = 2; // past budget
+        // No workers at all -> nothing changes (honest failure).
+        assert!(replan(&mut one, &[]).is_empty());
+        assert_eq!(one[0].state, ShardState::Failed);
+    }
+
+    #[test]
+    fn attempts_budget_stops_infinite_retries() {
+        let workers = vec!["w".into()];
+        let mut run = ShardRun::new(0);
+        // Burn through the attempt budget.
+        for i in 0..MAX_SHARD_ATTEMPTS {
+            run.state = ShardState::Failed;
+            assert!(run.needs_dispatch(), "attempt {i} should be retryable");
+            let mut one = [run.clone()];
+            replan(&mut one, &workers);
+            run = one[0].clone();
+            run.state = ShardState::Failed;
+        }
+        assert!(
+            !run.needs_dispatch(),
+            "budget exhausted but still retryable"
+        );
+        let mut one = [run];
+        let out = replan(&mut one, &workers);
+        assert!(out.is_empty(), "replanned past the attempt budget");
+    }
+
+    #[test]
+    fn shard_states_serialize_explicitly() {
+        assert_eq!(
+            serde_json::to_string(&ShardState::Assigned).unwrap(),
+            "\"assigned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ShardState::Completed).unwrap(),
+            "\"completed\""
+        );
     }
 }

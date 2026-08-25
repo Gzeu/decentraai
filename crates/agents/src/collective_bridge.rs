@@ -31,10 +31,7 @@ pub fn task_plan_to_dag(
     let dag_stages: Vec<DagStage> = stages
         .iter()
         .map(|s| DagStage {
-            stage_id: s
-                .stage_id
-                .clone()
-                .unwrap_or_else(|| s.capability.clone()),
+            stage_id: s.stage_id.clone().unwrap_or_else(|| s.capability.clone()),
             capability: s.capability.clone(),
             prompt: s.prompt.clone(),
             depends_on: s.depends_on.clone(),
