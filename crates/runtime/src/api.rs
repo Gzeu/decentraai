@@ -13876,7 +13876,7 @@ mod tests {
         // Settle consumes exactly what was measured (1 unit per governor run).
         {
             let mut l = ledger.lock().unwrap();
-            l.settle("res-1", 1);
+            let _ = l.settle("res-1", 1);
         }
         {
             let l = ledger.lock().unwrap();
@@ -13923,7 +13923,7 @@ mod tests {
                 Some(amount) => {
                     // Valid execution -> settle consumes the unit.
                     let mut l = ledger.lock().unwrap();
-                    l.settle(&res_id, amount);
+                    let _ = l.settle(&res_id, amount);
                 }
                 None => denied += 1,
             }
