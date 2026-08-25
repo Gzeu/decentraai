@@ -2301,7 +2301,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             if auto_cfg.enabled && auto_cfg.profile.is_some() {
                 let auto = std::sync::Arc::new(auto_cfg.clone());
                 let api_port = config.inference.api_port;
-                let data_dir = std::path::PathBuf::from(config.node.data_dir.clone());
+                let data_dir = expand_tilde(&config.node.data_dir);
                 let p2p_auto = distributed.p2p_node().clone();
                 let state_auto = state.clone();
                 tokio::spawn(async move {
