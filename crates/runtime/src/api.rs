@@ -8608,9 +8608,30 @@ async fn governor_execute_handler(
     headers: HeaderMap,
     body: axum::Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = state.require_operator_or_admin(&headers) {
-        return e.into_response();
-    }
+    // M16 Agent Gateway: this is a real entry into the Compute Fabric. Master
+    // (operator) runs fully; a consumer API key (dca_…) may also drive a
+    // distributed execution under its quota ceiling (settled on guard drop).
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(_) => return forbidden("missing or invalid API token"),
+    };
+    let _consumer_guard = match &auth {
+        Auth::Master => None,
+        Auth::Consumer { key_id, account, quota_ceiling, .. } => {
+            let rid = format!(
+                "gov-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            match state.reserve_consumer_quota(account, key_id, &rid, *quota_ceiling) {
+                Some(g) => Some(g),
+                None => return forbidden("no spendable consumer quota"),
+            }
+        }
+        _ => return forbidden("operator or consumer key required"),
+    };
     let b = body.0;
     let task_id = b
         .get("task_id")
