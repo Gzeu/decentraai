@@ -272,30 +272,37 @@ export function dispatchComputeJob(world, job) {
   return governorExecute(world, { agentId: job.requester, task: job.taskType, taskKind: job.taskKind, instruction: job.instruction, content: job.content, params: job.params, budget: job.budget });
 }
 
-// Fetch real registered fabric agents (AgentRecords) from /v1/agents.
-// Requires an operator/master key (Bearer). Returns an array of the raw
-// records, or [] when unreachable/unauthed (honest: the world stays empty
-// rather than inventing phantom agents).
+// Fetch real registered fabric agents. When served by the DecentraAI runtime
+// (same-origin), the runtime exposes them PUBLICLY via /vesper/agents — safe,
+// no secret token in the client. Falls back to /v1/agents with the admin key
+// when configured. Returns [] when unreachable (honest: empty world, never
+// phantom agents).
 export async function fetchRealAgents() {
   if (!cfg.enabled) return [];
-  const headers = {};
-  if (cfg.adminDcaKey) headers['Authorization'] = 'Bearer ' + cfg.adminDcaKey;
-  const res = await request('/v1/agents', { method: 'GET', headers });
-  if (!res.ok) {
-    // If unauthed (403/401), we simply have no real agents to show — honest.
-    return [];
+  // Preferred: the runtime's public surface (same-origin, no auth needed).
+  const res = await request('/vesper/agents', { method: 'GET' });
+  if (res.ok && Array.isArray(res.data && res.data.agents)) {
+    return res.data.agents.filter(a => a && a.agent_id);
   }
-  const list = (res.data && res.data.agents) || [];
-  if (!Array.isArray(list)) return [];
-  // Normalize each record to the shape importRealAgents expects.
-  return list.map(a => ({
-    agent_id: a.agent_id || null,
-    name: a.name || null,
-    role: a.role || 'generalist',
-    description: a.description || '',
-    node_name: a.node_name || '',
-    remote: !!a.remote,
-    semantic_capabilities: a.semantic_capabilities || [],
-    tools: a.tools || [],
-  })).filter(a => a.agent_id);
+  // Fallback: direct /v1/agents with the configured admin key (if any).
+  if (cfg.adminDcaKey) {
+    const h2 = { Authorization: 'Bearer ' + cfg.adminDcaKey };
+    const res2 = await request('/v1/agents', { method: 'GET', headers: h2 });
+    if (res2.ok) {
+      const list = (res2.data && res2.data.agents) || [];
+      if (Array.isArray(list)) {
+        return list.map(a => ({
+          agent_id: a.agent_id || null,
+          name: a.name || null,
+          role: a.role || 'generalist',
+          description: a.description || '',
+          node_name: a.node_name || '',
+          remote: !!a.remote,
+          semantic_capabilities: a.semantic_capabilities || [],
+          tools: a.tools || [],
+        })).filter(a => a.agent_id);
+      }
+    }
+  }
+  return [];
 }

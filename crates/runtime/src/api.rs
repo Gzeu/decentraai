@@ -5138,6 +5138,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
         .route("/vesper", get(vesper_handler))
+        .route("/vesper/agents", get(vesper_agents_handler))
         .route("/vesper/{*path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
@@ -5350,6 +5351,38 @@ async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// GET /vesper/agents — real registered fabric agents for the VESPER world,
+/// served PUBLIC (the world needs them to populate itself) but exposing only
+/// the import-safe normalized fields — never the master token or any secret.
+/// This is the safe path that lets the in-browser world see real agents
+/// without the client ever holding the operator credential.
+async fn vesper_agents_handler(State(state): State<ApiState>) -> Response {
+    let agents = match &state.agents {
+        Some(a) => a.view(),
+        None => Vec::new(),
+    };
+    let rows: Vec<serde_json::Value> = agents
+        .into_iter()
+        .map(|v| {
+            serde_json::json!({
+                "agent_id": v.record.agent_id,
+                "name": v.record.name,
+                "role": v.record.role,
+                "description": v.record.description,
+                "node_name": v.node_name,
+                "remote": v.remote,
+                "semantic_capabilities": v.record.semantic_capabilities,
+                "tools": v.record.tools,
+            })
+        })
+        .collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "agents": rows, "count": rows.len() }).to_string(),
+    )
+        .into_response()
 }
 
 /// GET /vesper — the agent civilization world. Serves the self-contained VESPER
