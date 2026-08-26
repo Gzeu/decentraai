@@ -5485,6 +5485,25 @@ async fn vesper_dispatch_handler(
     if let Ok(hv) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
         headers.insert(header::AUTHORIZATION, hv);
     }
+    // Ensure the agent's account has spendable quota (credit a per-agent budget
+    // lazily the first time, so a fresh key can actually run fabric work).
+    if let Some(ledger) = &state.quota_ledger {
+        let owner = format!("vesper:{agent_id}");
+        let mut l = ledger.lock().unwrap();
+        let has = l.account(&owner).map_or(0, |a| a.spendable()) > 0;
+        if !has {
+            let ref_id = format!(
+                "vesper-seed-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            l.credit(&owner, &ref_id, Some(5000), None);
+            tracing::info!(account = %owner, "vesper: seeded agent quota");
+        }
+        drop(l);
+    }
     let mut gov = serde_json::json!({
         "instruction": instruction,
         "content": content,
