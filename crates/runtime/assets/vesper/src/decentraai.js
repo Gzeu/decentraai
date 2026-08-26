@@ -114,10 +114,22 @@ export function statusOf(world) {
     lastProbe: st.lastProbe || null,
     latencyMs: st.latencyMs || null,
     capabilities: st.capabilities || null,
+    realEconomy: (f && f.realEconomy) || null,
     calls: (f && f.calls) || 0,
     ok: (f && f.ok) || 0,
     fail: (f && f.fail) || 0,
   };
+}
+
+// Real fabric economy mirror: per-agent spendable quota (server-side truth
+// from the quota ledger). Grounds the world's wallets in real balances.
+export async function fetchEconomy() {
+  if (!cfg.enabled) return { attached: false, agents: {}, total_spendable: 0 };
+  const res = await request('/vesper/economy', { method: 'GET' });
+  if (res.ok && res.data && typeof res.data === 'object') {
+    return { attached: !!res.data.attached, agents: res.data.agents || {}, total_spendable: res.data.total_spendable || 0 };
+  }
+  return { attached: false, agents: {}, total_spendable: 0 };
 }
 
 export async function probe(world) {
@@ -125,6 +137,8 @@ export async function probe(world) {
   const st = f.status = f.status || {};
   st.lastProbe = Date.now();
   if (!cfg.enabled) { st.state = 'disabled'; st.reachable = false; st.note = 'fabric bridge disabled'; return statusOf(world); }
+  // Real economy mirror: per-agent spendable quota (server-side truth).
+  fetchEconomy().then(e => { f.realEconomy = e; }).catch(() => {});
   if (!cfg.baseUrl) {
     // Same-origin: probe the local fabric directly (no CORS needed).
     st.state = 'probing';

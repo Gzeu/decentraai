@@ -5145,6 +5145,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
+        .route("/vesper/economy", get(vesper_economy_handler))
         .route("/vesper/dispatch", post(vesper_dispatch_handler))
         .route("/vesper/{*path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
@@ -5388,6 +5389,40 @@ async fn vesper_agents_handler(State(state): State<ApiState>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({ "agents": rows, "count": rows.len() }).to_string(),
+    )
+        .into_response()
+}
+
+/// GET /vesper/economy — the REAL fabric economy mirrored for the VESPER
+/// world: per-agent spendable quota (from the authoritative quota ledger,
+/// accounts `vesper:{agent_id}`), plus totals. Public + import-safe: balances
+/// only, no secrets, no token in the client. The world grounds its wallets in
+/// this truth — earn-loop income is credited only on verified fabric work.
+async fn vesper_economy_handler(State(state): State<ApiState>) -> Response {
+    let Some(ledger) = &state.quota_ledger else {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "attached": false, "agents": {}, "total_spendable": 0 }).to_string(),
+        )
+            .into_response();
+    };
+    let l = ledger.lock().unwrap();
+    let mut agents = serde_json::Map::new();
+    let mut total: u64 = 0;
+    for (id, acct) in l.accounts() {
+        if let Some(owner) = id.strip_prefix("vesper:") {
+            let s = acct.spendable();
+            agents.insert(
+                owner.to_string(),
+                serde_json::json!({ "spendable": s }),
+            );
+            total = total.saturating_add(s);
+        }
+    }
+    drop(l);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "attached": true, "agents": agents, "total_spendable": total }).to_string(),
     )
         .into_response()
 }

@@ -131,7 +131,30 @@ export function executeJob(world, job) {
       status: 'done',
     };
     job.evidence = evidenceRecord(world, rec);
-    dispatchComputeJob(world, job);
+    // Real-work income: when the fabric verifies and settles the dispatched
+    // job, the agent earns in-world income funded from the world treasury —
+    // credited ONLY on verified success (never on failure; honesty invariant).
+    // This is the primary earn loop for real fabric agents.
+    const p = dispatchComputeJob(world, job);
+    if (p && typeof p.then === 'function') {
+      p.then(r => {
+        const ag = world.agents[job.requester];
+        if (!ag) return;
+        if (r && r.ok) {
+          const payCredits = job.budget * 2;
+          const payCompute = Math.max(1, Math.ceil(job.budget / 2));
+          ledgerTx(world, { from: 'world', to: ag.id, res: 'credits', amount: payCredits, reason: 'fabric-work:' + job.taskType });
+          ag.inv.credits = (ag.inv.credits || 0) + payCredits;
+          ag.inv.computeCredits = (ag.inv.computeCredits || 0) + payCompute;
+          ag.compute.earned = (ag.compute.earned || 0) + payCompute;
+          ag.stats.earned = (ag.stats.earned || 0) + payCredits;
+          act(world, ag, 'compute', 'earned', `fabric verified ${job.taskType} → +${payCredits} Cr, +${payCompute} ◍`, { value: payCredits });
+          evidenceRecord(world, { kind: 'fabric-income', executionId: job.executionId, agent: ag.id, credits: payCredits, computeCredits: payCompute, execution: r.executionId || null, status: 'verified' });
+        } else {
+          act(world, ag, 'compute', 'dispatch-failed', `fabric did not verify ${job.taskType} — no income (honest)`, { value: 0 });
+        }
+      }).catch(() => {});
+    }
     if (a) {
       a.stats = a.stats || {};
       a.stats.computeJobs = (a.stats.computeJobs || 0) + 1;

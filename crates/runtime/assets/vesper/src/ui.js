@@ -927,6 +927,15 @@ export function createUI(deps) {
     eco.appendChild(kv('World fund', fmtMoney((w.balances['world'] || {}).credits || 0)));
     eco.appendChild(kv('Compute pool', '◍' + ((w.balances['compute-pool'] || {}).computeCredits || 0)));
     eco.appendChild(kv('Ledger entries', w.ledger.count));
+    // Real fabric balances mirrored server-side (authoritative quota ledger).
+    const re = fs.realEconomy;
+    if (re) {
+      eco.appendChild(kv('REAL quota total', fmt(re.total_spendable || 0) + ' units'));
+      const realAgents = Object.entries(re.agents || {}).slice(0, 5);
+      for (const [aid, b] of realAgents) {
+        eco.appendChild(kv('◉ ' + aid.split(':').pop() + ' (' + aid.split(':')[0].slice(0, 12) + ')', fmt(b.spendable || 0) + ' units'));
+      }
+    }
     const topW = [...w.agentOrder].map(id => w.agents[id]).sort((x, y) => (y.inv.computeCredits || 0) - (x.inv.computeCredits || 0)).slice(0, 5);
     for (const a of topW) eco.appendChild(kv(a.name, '◍' + Math.round(a.inv.computeCredits || 0)));
     grid.appendChild(eco);
@@ -1368,6 +1377,11 @@ export function createUI(deps) {
       fab.appendChild(kv('Role', a.role || 'generalist'));
       fab.appendChild(kv('Node', a.nodeName || (a.remote ? 'remote' : 'local')));
       fab.appendChild(kv('Source', a.remote ? 'remote fabric node' : 'this node'));
+      // REAL wallet: spendable quota from the fabric's authoritative ledger.
+      const eco = (w.fabric && w.fabric.realEconomy) || null;
+      const realBal = eco && eco.agents && eco.agents[a.agentId || a.id];
+      fab.appendChild(kv('REAL quota (fabric)', realBal ? fmt(realBal.spendable) + ' units' : (eco && eco.attached ? '0 units' : '—')));
+      fab.appendChild(h('div', 'dim small mt8', 'Income is credited only for verified fabric work. Upkeep, taxes and compute spend drain the wallet.'));
       if (a.description) fab.appendChild(h('div', 'dim small mt8', a.description));
       if (a.capabilities && a.capabilities.length) {
         const capRow = h('div', 'mt8');

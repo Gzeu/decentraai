@@ -2,7 +2,7 @@ import { createWorld, advanceTicks } from './sim.js';
 import { createVesper } from './console.js';
 import { createUI } from './ui.js';
 import { pointInPoly, rebuildPolys } from './core.js';
-import { configure as configureFabric, probe as probeFabric, fetchRealAgents } from './decentraai.js';
+import { configure as configureFabric, probe as probeFabric, fetchRealAgents, fetchEconomy } from './decentraai.js';
 
 // ---- Self-contained config (no external pjs/plugin dependency) ----
 // World + DecentraAI fabric bridge. Set `fabric.baseUrl` to the live fabric
@@ -240,6 +240,10 @@ async function boot() {
 
   setInterval(tickLoop, 150);
   setInterval(() => { if (ui) ui.refresh(); }, 900);
+  // Real-economy mirror refresh (slow — the ledger changes on real work only).
+  const refreshEconomy = () => { fetchEconomy().then(e => { if (world) world.fabric = world.fabric || { log: [], calls: 0, ok: 0, fail: 0, sinceTick: world.clock.t, status: null }; if (world) world.fabric.realEconomy = e; }).catch(() => {}); };
+  refreshEconomy();
+  setInterval(refreshEconomy, 30000);
 }
 
 boot();
