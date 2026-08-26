@@ -1765,6 +1765,37 @@ impl ComputeManager {
         self.scheduler.lock().await.ledger().reserved_ram(peer)
     }
 
+    /// Books a single reservation on the live ledger. Returns `None` when
+    /// `peer` is already at the per-worker reservation cap so callers can
+    /// decide to skip bookkeeping rather than fabricate a placement. Used
+    /// by paths that need a real `reservation_id` (e.g. the VESPER Governor
+    /// execution record) without going through the full
+    /// `plan_and_reserve` flow.
+    pub async fn book_reservation(
+        &self,
+        peer: PeerId,
+        est_ram_mb: u64,
+        est_vram_mb: u64,
+    ) -> Option<decentraai_compute::ResourceReservation> {
+        self.scheduler
+            .lock()
+            .await
+            .ledger_mut()
+            .reserve(peer, est_ram_mb, est_vram_mb)
+    }
+
+    /// Releases a reservation by id. No-op when the id is unknown; safe to
+    /// call from any handler. Used to back out a bookkeeping reservation
+    /// that was booked solely to attach a real `reservation_id` to an
+    /// `ExecutedPlan` (capacity accounting must stay accurate).
+    pub async fn release_reservation(&self, reservation_id: uuid::Uuid) {
+        self.scheduler
+            .lock()
+            .await
+            .ledger_mut()
+            .release(reservation_id);
+    }
+
     /// Selects the best eligible worker and books a reservation.
     pub async fn select(&self, req: &WorkloadRequirements) -> Option<Placement> {
         self.scheduler.lock().await.select(req, Instant::now())

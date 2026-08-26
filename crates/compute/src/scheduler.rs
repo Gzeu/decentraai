@@ -86,6 +86,16 @@ impl ComputeScheduler {
         &self.ledger
     }
 
+    /// Mutable handle to the reservation ledger. Mirrors [`registry_mut`]:
+    /// callers that need to book / release / prune reservations must go
+    /// through here so the ledger's invariants (cap, TTL) stay in one place.
+    /// Used by paths that book a temporary reservation for bookkeeping
+    /// purposes (e.g. VESPER Governor execution records) and need to release
+    /// it without waiting for natural TTL expiry.
+    pub fn ledger_mut(&mut self) -> &mut ReservationLedger {
+        &mut self.ledger
+    }
+
     /// Adds or replaces the latest advertisement from a peer.
     pub fn upsert(&mut self, adv: ComputeAdvertisement) {
         self.registry.upsert(adv, Instant::now());

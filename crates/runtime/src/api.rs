@@ -9282,6 +9282,26 @@ async fn governor_execute_handler(
                     .tagged("local"),
                 );
             }
+            // ---- Real execution record (Part 23): route the local run through
+            // `ComputeManager::record_execution` so the fabric ring, the JSONL
+            // history and the evidence sync all see the same fact. Skips
+            // silently when the ledger refuses a reservation (worker at cap)
+            // so we never fabricate an `ExecutedPlan` for bookkeeping only.
+            if let Some(cm) = &state.compute {
+                if let Some(mut exec) = crate::governor_execution::build_local(
+                    cm,
+                    &p2p,
+                    &task_id,
+                    &model,
+                    ram_mb,
+                )
+                .await
+                {
+                    exec.processing_time_ms = u32::try_from(latency_ms).unwrap_or(u32::MAX);
+                    exec.outcome = crate::governor_execution::local_outcome(&out);
+                    let _ = crate::governor_execution::record(cm, &task_id, exec, None).await;
+                }
+            }
             response["latency_ms"] = serde_json::json!(latency_ms);
             serde_json::json!({"result": out})
         }
@@ -9646,6 +9666,36 @@ async fn governor_execute_handler(
             } else {
                 "incomplete"
             };
+            // ---- Real execution record (Part 23): the run produced a fact
+            // (succeeded / failed / incomplete) plus a real worker identity
+            // (first peer that completed a shard) and a real wall-clock
+            // duration. Route it through `ComputeManager::record_execution`
+            // so the fabric ring + JSONL + evidence sync reflect the run;
+            // skips silently when the ledger refuses a reservation.
+            if let Some(cm) = &state.compute {
+                let completed_remote = runs
+                    .iter()
+                    .find(|r| r.is_completed() && r.worker != "local")
+                    .map(|r| r.worker.clone());
+                if let Some(mut exec) = crate::governor_execution::build_distributed(
+                    cm,
+                    &p2p,
+                    &task_id,
+                    &model,
+                    completed_remote,
+                    ram_mb,
+                )
+                .await
+                {
+                    exec.processing_time_ms = u32::try_from(distributed_ms).unwrap_or(u32::MAX);
+                    exec.outcome = crate::governor_execution::distributed_outcome(
+                        incomplete_count,
+                        reduce_valid,
+                        &credit_denied,
+                    );
+                    let _ = crate::governor_execution::record(cm, &task_id, exec, None).await;
+                }
+            }
             serde_json::json!({"result": final_result, "status": status_flag})
         }
     };
@@ -9667,6 +9717,19 @@ async fn governor_execute_handler(
     }
 
     response["output"] = result_payload;
+
+    // ---- Evidence sync (Part 23): pull the just-recorded execution into the
+    // EvidenceIndex in the SAME request, so a settlement path that runs after
+    // the response — or any consumer of `/v1/evidence` in the same call chain
+    // — sees the fresh fact without waiting for a read-time sync. Idempotent
+    // (keyed on `exec:<request_id>`), best-effort (never breaks the request).
+    if let Some(evidence) = &state.evidence {
+        evidence.sync_all(
+            state.compute.as_deref(),
+            state.knowledge.as_deref(),
+            state.memory.as_deref(),
+        );
+    }
 
     // ---- Model Colony evidence: record this execution as a verified
     // observation in Memory, so future Model Colony decisions are backed by

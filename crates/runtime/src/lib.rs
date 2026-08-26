@@ -15,6 +15,7 @@ pub mod dashboard_v2;
 pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;
+pub mod governor_execution;
 pub mod vesper;
 pub mod intel_assist;
 pub mod mcp;
