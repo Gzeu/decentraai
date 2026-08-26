@@ -44,6 +44,39 @@ function payAgent(world, who, a, res, amount, reason) {
   ledgerTx(world, { from: who, to: a.id, res, amount, reason });
 }
 
+// World-economy inventory helpers. Personal `a.energy` (0-100) stays on the
+// flat field; tradable materials and economic energy live on `a.inventory`
+// to avoid a name collision and to keep the resource-listing pattern
+// consistent (`credit`/`payAgent` already key on string `res`).
+const INVENTORY_RES = new Set(['materials', 'energy']);
+function stockOf(a, res) {
+  if (INVENTORY_RES.has(res)) return (a.inventory && a.inventory[res]) || 0;
+  return (a[res] || 0);
+}
+function gainResource(a, res, amount) {
+  if (!(amount > 0)) return;
+  if (INVENTORY_RES.has(res)) {
+    a.inventory = a.inventory || { materials: 0, energy: 0 };
+    a.inventory[res] = (a.inventory[res] || 0) + amount;
+  } else {
+    a[res] = (a[res] || 0) + amount;
+  }
+}
+function spendResource(a, res, amount) {
+  if (!(amount > 0)) return false;
+  if (INVENTORY_RES.has(res)) {
+    a.inventory = a.inventory || { materials: 0, energy: 0 };
+    const have = a.inventory[res] || 0;
+    if (have < amount) return false;
+    a.inventory[res] = have - amount;
+    return true;
+  }
+  const have = a[res] || 0;
+  if (have < amount) return false;
+  a[res] = have - amount;
+  return true;
+}
+
 // Experience is per-capability progression (layer 2): work changes what the
 // agent can do next. Reputation is social capital (layer 1): earned only
 // through verified outcomes.
@@ -210,6 +243,10 @@ function createAgents(world, count, cfg) {
       relations: {},
       org: null,
       orgRole: null,
+      // World-economy inventory: materials and economic energy live on the
+      // agent under `a.inventory` so they don't collide with personal
+      // `a.energy` (0-100) or the existing flat `a.{credits,compute,data}`.
+      inventory: { materials: 0, energy: 0 },
       rep: { reliability: 50, cooperation: 50, contribution: 50, disputes: 0, score: 50 },
       computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
@@ -292,6 +329,10 @@ function importRealAgents(world, realAgents) {
       relations: {},
       org: null,
       orgRole: null,
+      // World-economy inventory: materials and economic energy live on the
+      // agent under `a.inventory` so they don't collide with personal
+      // `a.energy` (0-100) or the existing flat `a.{credits,compute,data}`.
+      inventory: { materials: 0, energy: 0 },
       rep: { reliability: 60, cooperation: 60, contribution: 60, disputes: 0, score: 60 },
       computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
@@ -989,6 +1030,10 @@ function doGather(world, a, st, rng) {
 }
 
 // Contract extraction work (v2): heavier labor at resource nodes, better pay.
+// Slice 1: pulls now credit the agent with a real inventory of materials /
+// energy (the world-economy commodities) and inject a fraction of the
+// extracted volume into the local market's supply, so the resources are
+// observable on the trade side and not just consumed-and-vanished.
 function doMine(world, a, st, rng) {
   const r = world.regions.find(x => x.id === st.regionId);
   if (!r) { a.planDone = true; return; }
@@ -996,10 +1041,27 @@ function doMine(world, a, st, rng) {
   const amount = node ? Math.min(1.2 + a.skills.engineering * 0.5, 3) : 1.5;
   if (node) {
     const per = amount / 4;
+    // Snapshot pre-depletion so we can credit the agent with what we
+    // actually pulled (vs. what the node had but was capped to 0).
+    const pulledMaterials = Math.min(per, Math.max(0, node.stock.materials || 0));
+    const pulledEnergy    = Math.min(per, Math.max(0, node.stock.energy    || 0));
     for (const k of ['rare', 'materials', 'energy', 'food']) {
       node.stock[k] = Math.max(0, (node.stock[k] || 0) - per);
     }
     if (node.stock.rare <= 0 && node.stock.materials <= 0 && node.stock.energy <= 0 && node.stock.food <= 0) node.exhausted = 1;
+    // Honest inventory credit: the agent physically extracted this much
+    // material / energy from the node, so they carry it. Do NOT touch
+    // `a.energy` (the personal 0-100 state).
+    if (pulledMaterials > 0) gainResource(a, 'materials', pulledMaterials);
+    if (pulledEnergy    > 0) gainResource(a, 'energy',    pulledEnergy);
+    // Inject a fraction of the extraction into the local market supply,
+    // but only when the region hosts a market (cities only). Matches the
+    // existing `region.prod[res] * 0.6` factor used by marketTick.
+    const m = r.cityId ? world.markets[r.cityId] : null;
+    if (m) {
+      if (pulledMaterials > 0) m.supply.materials = (m.supply.materials || 0) + pulledMaterials * 0.6;
+      if (pulledEnergy    > 0) m.supply.energy    = (m.supply.energy    || 0) + pulledEnergy    * 0.6;
+    }
   }
   const pay = amount * 4.5; // extraction pays more than field work
   a.credits += pay;
@@ -1455,6 +1517,9 @@ function orgTick(world, rng, t) {
     const income = org.territory.length * 4 + org.members.length;
     org.treasury.credits += income;
     org.treasury.materials += org.territory.length * 0.4;
+    // Slice 1: world-energy income mirrors materials at a slightly higher
+    // rate (biomes are energy-rich). Same upkeep budget covers it.
+    org.treasury.energy = (org.treasury.energy || 0) + org.territory.length * 0.5;
     const upkeepCost = org.territory.length * 3 + org.members.length * 0.5;
     org.treasury.credits -= upkeepCost;
     org.treasury.materials -= org.territory.length * 0.5;

@@ -223,6 +223,16 @@ async function boot() {
     delete a.inv;
   }
   if (!world.fabric) world.fabric = { log: [], calls: 0, ok: 0, fail: 0, sinceTick: world.clock.t, status: null };
+  // Slice 1: world-economy inventory defaults. Forward-compatible: any
+  // pre-existing world (saved before this change) gets empty inventory
+  // slots so reads (`a.inventory[res] || 0`) never blow up.
+  for (const id of world.agentOrder) {
+    const a = world.agents[id];
+    if (!a) continue;
+    a.inventory = a.inventory || {};
+    a.inventory.materials = a.inventory.materials || 0;
+    a.inventory.energy    = a.inventory.energy    || 0;
+  }
   world.meta.narrativeEngine = world.meta.narrativeEngine || cfg.narrativeEngine;
   catchUpOffline();
   await saveWorld();
