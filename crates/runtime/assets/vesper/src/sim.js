@@ -51,8 +51,22 @@ function gainXp(a, skill, amount) {
   a.experience[skill] = (a.experience[skill] || 0) + amount;
 }
 
-export const BASE_PRICES = { data: 15, compute: 40 };
-export const SUPPLY_TARGET = { data: 90, compute: 120 };
+// Calibration notes:
+//   - materials: cheap intermediate good; baseline 8 Cr/unit. Mines replenish
+//     supply generously, so SUPPLY_TARGET is high to avoid pinning to the
+//     3.3x ceiling.
+//   - energy: cheapest commodity (most biomes produce it); baseline 6
+//     Cr/unit. SUPPLY_TARGET is the highest of the four tradables because
+//     energy is biome-cheap and demand-driven.
+export const BASE_PRICES = { data: 15, compute: 40, materials: 8, energy: 6 };
+export const SUPPLY_TARGET = { data: 90, compute: 120, materials: 200, energy: 240 };
+
+// PR-A gate: the agent inventory (`a.inventory.{materials,energy}`) is
+// wired in PR-B, so the agent decision loop must NOT propose trade-buy /
+// trade-sell candidates for those two resources until the inventory
+// field exists. PR-C removes this gate once doTrade and bestSellTarget
+// route through `a.inventory` correctly.
+export const RES_TRADE_ENABLED = ['data', 'compute'];
 export const SKILLS = ['trade', 'science', 'engineering', 'social', 'navigation', 'combat', 'stealth', 'analysis'];
 const PERSONALITY = ['openness', 'consc', 'extra', 'agree', 'neuro', 'risk', 'ambition', 'greed', 'curiosity', 'caution', 'loyalty'];
 
@@ -651,7 +665,7 @@ function evaluate(world, a, facts, rng) {
   const city = cityAt(world, regionOf(world, a));
   if (city) {
     const m = world.markets[city.id];
-    const cheap = MKT_RES.find(res => m.prices[res] < BASE_PRICES[res] * 0.72);
+    const cheap = MKT_RES.find(res => RES_TRADE_ENABLED.includes(res) && m.prices[res] < BASE_PRICES[res] * 0.72);
     if (cheap) pushCand('trade-buy', `Buy cheap ${RES_LABEL[cheap].toLowerCase()} here`, 1.4 * a.w.market * (0.6 + a.skills.trade * 0.12), ['market']);
   }
   const bestSell = bestSellTarget(world, a);
@@ -784,7 +798,7 @@ function buildPlan(world, a, c, rng) {
       const city = cityAt(world, regionOf(world, a));
       if (!city) break;
       const m = world.markets[city.id];
-      const res = MKT_RES.find(x => m.prices[x] < BASE_PRICES[x] * 0.72);
+      const res = MKT_RES.find(x => RES_TRADE_ENABLED.includes(x) && m.prices[x] < BASE_PRICES[x] * 0.72);
       if (!res) break;
       steps.push({ kind: 'buy', res, qty: Math.round(Math.min(40, a.credits / (m.prices[res] * 1.2))), cityId: city.id });
       break;

@@ -2,11 +2,21 @@
 //   AGENT state:  energy/focus/morale (operational, non-tradable)
 //   AGENT stocks: credits/compute/data (economic, ledger-tracked)
 //   AGENT social: reputation/trust/experience (earned through verified work)
-// World economy trades only what has a producer and a consumer: data + compute.
-export const RES = ['credits', 'compute', 'data'];
-export const MKT_RES = ['data', 'compute'];
-export const RES_LABEL = { credits: 'Credits', compute: 'Compute', data: 'Research Data' };
-export const RES_SYM = { credits: 'Cr', compute: '◍', data: '◉' };
+// World economy trades everything that has a real producer and a real
+// consumer: data + compute + materials + economic energy. Personal
+// `a.energy` is the operational state (0..100) and is *distinct* from the
+// world-energy commodity carried in `a.inventory.energy` — the two are
+// deliberately not merged.
+export const RES = ['credits', 'compute', 'data', 'materials', 'energy'];
+export const MKT_RES = ['data', 'compute', 'materials', 'energy'];
+export const RES_LABEL = {
+  credits: 'Credits',
+  compute: 'Compute',
+  data: 'Research Data',
+  materials: 'Materials',
+  energy: 'Energy',
+};
+export const RES_SYM = { credits: 'Cr', compute: '◍', data: '◉', materials: '▣', energy: '⚡' };
 export const TICK_HOURS = 1;
 export const DAY_HOURS = 24;
 
