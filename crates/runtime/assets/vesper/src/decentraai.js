@@ -281,6 +281,7 @@ export async function fetchRealAgents() {
   if (!cfg.enabled) return [];
   // Preferred: the runtime's public surface (same-origin, no auth needed).
   const res = await request('/vesper/agents', { method: 'GET' });
+  console.log('vesper: fetchRealAgents /vesper/agents ->', res.ok, res.err || '', res.status || '');
   if (res.ok && Array.isArray(res.data && res.data.agents)) {
     return res.data.agents.filter(a => a && a.agent_id);
   }

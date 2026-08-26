@@ -155,12 +155,10 @@ function tickLoop() {
 }
 
 async function boot() {
-  // Fetch real fabric agents (same-origin /v1/agents) so the world is populated
-  // ONLY with real registered agents — no procedural/phantom agents. When the
-  // endpoint is unreachable/unauthed, we keep an empty world (honest) and the
-  // Fabric screen reports it.
+  console.log('vesper: boot start');
   configureFabric(cfg.decentraai);
   realAgents = await fetchRealAgents();
+  console.log('vesper: fetched realAgents =', realAgents.length);
   if (realAgents.length) {
     console.log('vesper: importing ' + realAgents.length + ' real fabric agents');
   }
@@ -245,3 +243,9 @@ async function boot() {
 }
 
 boot();
+
+// Keep the boot error visible instead of dying silently (unhandled rejection
+// otherwise vanishes in a module context).
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('vesper: unhandled rejection', e && e.reason);
+});

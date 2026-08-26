@@ -5138,6 +5138,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
         .route("/vesper", get(vesper_handler))
+        .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
         .route("/vesper/{*path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
