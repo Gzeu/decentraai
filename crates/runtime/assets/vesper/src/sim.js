@@ -690,6 +690,28 @@ function evaluate(world, a, facts, rng) {
   if (myOrg && a.w.power > 0.8 && myOrg.members.length < 4) pushCand('recruit', `Recruit for ${myOrg.name}`, 1.2 * a.w.power, ['org']);
   if (a.w.protect > 0.9 && a.energy > 40) pushCand('patrol', 'Patrol for safety', 1.4 * a.w.protect, ['drive']);
   if (a.personality.risk > 0.6 && a.skills.stealth > 2.5 && a.energy > 40) pushCand('sabotage', 'Disrupt a rival', 1.2 * (a.personality.risk - 0.4), ['conflict']);
+
+  // Energy-gated behavior: fix agent decision first, not economy parameters
+  if (a.energy <= 5) {
+    // Force rest/recovery only
+    for (const c of cands) {
+      if (c.key !== 'rest') c.score = -1e9;
+    }
+  } else if (a.energy < 15) {
+    // Almost mandatory rest: heavily penalize high-consumption activities
+    const banned = new Set(['contract','work','mine','explore','research','build','contest','accumulate','patrol','sabotage','recruit','explore-far','trade-buy','trade-sell']);
+    for (const c of cands) {
+      if (banned.has(c.key)) c.score -= 12.0;
+      if (c.key === 'rest') c.score += 10.0;
+    }
+  } else if (a.energy < 30) {
+    // Prioritize rest over contract/work
+    for (const c of cands) {
+      if (c.key === 'rest') c.score += 8.0;
+      if (c.key === 'contract' || c.key === 'work' || c.key === 'mine' || c.key === 'research') c.score -= 6.0;
+    }
+  }
+
   for (const c of cands) {
     c.score += (rng.float() - 0.5) * 0.6;
     c.score *= 0.85 + a.personality.ambition * 0.3;
@@ -764,13 +786,13 @@ function buildPlan(world, a, c, rng) {
       const m = world.markets[city.id];
       const res = MKT_RES.find(x => m.prices[x] < BASE_PRICES[x] * 0.72);
       if (!res) break;
-      steps.push({ kind: 'buy', res, qty: Math.round(Math.min(40, credits / (m.prices[res] * 1.2))), cityId: city.id });
+      steps.push({ kind: 'buy', res, qty: Math.round(Math.min(40, a.credits / (m.prices[res] * 1.2))), cityId: city.id });
       break;
     }
     case 'trade-sell': {
       const target = bestSellTarget(world, a);
       if (!target) break;
-      steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(40, credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
+      steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(40, a.credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
       add(steps, target.buyCityId, [{ kind: 'sell', res: target.res, qty: 60, cityId: target.city.id }]);
       break;
     }
@@ -1317,11 +1339,11 @@ function marketTick(world, m, t) {
   const pop = city ? city.population : 20;
   for (const res of MKT_RES) {
     if (region) {
-      m.supply[res] += region.prod[res] * 0.6;
+      m.supply[res] += (region.prod[res] || 0) * 0.6;
       const nodeIn = region.nodes.reduce((s, n) => s + (n.stock[res] || 0) * 0.01, 0);
       m.supply[res] += nodeIn;
     }
-    const demand = pop * 0.025 * (res === 'food' || res === 'energy' ? 1 : 0.4);
+    const demand = pop * 0.025 * 0.4;
     m.demand[res] += demand;
     m.supply[res] = Math.max(0, m.supply[res] - demand);
     const target = SUPPLY_TARGET[res];
