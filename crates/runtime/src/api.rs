@@ -5138,7 +5138,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
         .route("/vesper", get(vesper_handler))
-        .route("/vesper/{path}", get(vesper_handler))
+        .route("/vesper/{*path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
@@ -5355,8 +5355,9 @@ async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
 /// GET /vesper — the agent civilization world. Serves the self-contained VESPER
 /// app (index + ES modules) from embedded assets. The world runs in-browser and
 /// bridges to the real fabric same-origin (no CORS). Read-only surface.
-async fn vesper_handler(State(_state): State<ApiState>, path: Option<axum::extract::Path<String>>) -> Response {
-    let p = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
+async fn vesper_handler(State(_state): State<ApiState>, path: Option<axum::extract::Path<Vec<String>>>) -> Response {
+    // Axum `{*path}` wildcard yields the segments as Vec<String>.
+    let p = path.map(|axum::extract::Path(segs)| segs.join("/")).unwrap_or_default();
     match crate::vesper::resolve(&p) {
         Some((body, mime)) => {
             axum::response::Response::builder()
