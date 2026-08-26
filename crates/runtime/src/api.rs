@@ -5137,6 +5137,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/fabric", get(fabric_dashboard_handler))
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
+        .route("/vesper", get(vesper_handler))
+        .route("/vesper/{path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
         .route("/status", get(status_handler))
@@ -5348,6 +5350,27 @@ async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// GET /vesper — the agent civilization world. Serves the self-contained VESPER
+/// app (index + ES modules) from embedded assets. The world runs in-browser and
+/// bridges to the real fabric same-origin (no CORS). Read-only surface.
+async fn vesper_handler(State(_state): State<ApiState>, path: Option<axum::extract::Path<String>>) -> Response {
+    let p = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
+    match crate::vesper::resolve(&p) {
+        Some((body, mime)) => {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        }
+        None => axum::response::Response::builder()
+            .status(axum::http::StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("not found"))
+            .unwrap(),
+    }
 }
 
 /// GET /bench/report — a print-friendly benchmark report generated from the
