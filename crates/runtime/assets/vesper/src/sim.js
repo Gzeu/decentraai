@@ -94,12 +94,11 @@ function gainXp(a, skill, amount) {
 export const BASE_PRICES = { data: 15, compute: 40, materials: 8, energy: 6 };
 export const SUPPLY_TARGET = { data: 90, compute: 120, materials: 200, energy: 240 };
 
-// PR-A gate: the agent inventory (`a.inventory.{materials,energy}`) is
-// wired in PR-B, so the agent decision loop must NOT propose trade-buy /
-// trade-sell candidates for those two resources until the inventory
-// field exists. PR-C removes this gate once doTrade and bestSellTarget
-// route through `a.inventory` correctly.
-export const RES_TRADE_ENABLED = ['data', 'compute'];
+// Slice 1 — trade is now enabled for all four `MKT_RES` commodities.
+// `RES_TRADE_ENABLED` is kept as an explicit allowlist so future slices
+// (services, infra-as-resource) can opt new resources in without
+// touching the decision loop. PR-C lifts the PR-A gate.
+export const RES_TRADE_ENABLED = ['data', 'compute', 'materials', 'energy'];
 export const SKILLS = ['trade', 'science', 'engineering', 'social', 'navigation', 'combat', 'stealth', 'analysis'];
 const PERSONALITY = ['openness', 'consc', 'extra', 'agree', 'neuro', 'risk', 'ambition', 'greed', 'curiosity', 'caution', 'loyalty'];
 
@@ -1095,7 +1094,10 @@ function doSellStep(world, a, st) {
   const hereCity = cityAt(world, regionOf(world, a));
   if (!hereCity || hereCity.id !== st.cityId) { const city = world.map.cities.find(c => c.id === st.cityId); const target = city && city.regionId; if (target) a.plans.splice(a.stepIx, 0, { kind: 'travel', target }); else a.planDone = true; return; }
   const m = world.markets[st.cityId];
-  const q = Math.min(st.qty, 25, a[st.res]);
+  // Slice 1: read inventory field for materials / energy, flat field for
+  // credits / compute / data. doTrade does the same and rejects on
+  // insufficient stock — this read is just the bound.
+  const q = Math.min(st.qty, 25, stockOf(a, st.res));
   if (q <= 0) { advanceStep(a); return; }
   doTrade(world, a, m, 'sell', st.res, q);
   st.qty -= q;
@@ -1109,7 +1111,10 @@ export function doTrade(world, a, m, side, res, qty) {
     if (q <= 0) return null;
     const cost = Math.round(q * price * 100) / 100;
     a.credits -= cost;
-    a[res] += q;
+    // Slice 1: materials / energy live on `a.inventory`; flat fields
+    // continue to carry credits / compute / data. Routing through the
+    // helper keeps the field location consistent for every resource.
+    gainResource(a, res, q);
     m.supply[res] = Math.max(0, (m.supply[res] || 0) - q);
     m.buyVol[res] += q;
     m.credits += cost;
@@ -1127,10 +1132,11 @@ export function doTrade(world, a, m, side, res, qty) {
     }
     return { side, q, price, cost };
   }
-  const q = Math.min(qty, a[res] || 0, Math.floor(m.credits / price));
+  // sell: use stockOf to read the right field (flat or inventory).
+  const q = Math.min(qty, stockOf(a, res), Math.floor(m.credits / price));
   if (q <= 0) return null;
   const pay = Math.round(q * price * 100) / 100;
-  a[res] -= q;
+  if (!spendResource(a, res, q)) return null;
   a.credits += pay;
   m.supply[res] += q;
   m.sellVol[res] += q;
@@ -1259,8 +1265,45 @@ function doBuild(world, a, st, rng) {
   if (!r) { a.planDone = true; return; }
   const cost = { relays: 6, labs: 12, factories: 16, refineries: 10, defense: 8 };
   const need = cost[st.facility] || 6;
-  const creditsCost = need * 12; // materials bought on market — folded into a credits cost
+  const creditsCost = need * 12; // the dead "folded into a credits cost" comment is now real: see materials block below
   if (a.credits < creditsCost || a.energy < need * 0.5) { a.planDone = true; return; }
+  // Slice 1: consume real materials from the agent's inventory, with
+  // auto-purchase from the local market if inventory is short. This
+  // lifts the original "materials bought on market — folded into a
+  // credits cost" intent into a real economic loop. Energy is personal
+  // operational state (recovered in rest, decayed in upkeep) and is
+  // unchanged here.
+  const materialsPerTick = need * 0.4;
+  if (stockOf(a, 'materials') < materialsPerTick) {
+    const m = r.cityId ? world.markets[r.cityId] : null;
+    if (m) {
+      const shortage = materialsPerTick - stockOf(a, 'materials');
+      const affordable = Math.floor(a.credits / Math.max(0.1, m.prices.materials || 0.1));
+      const q = Math.max(0, Math.min(shortage, m.supply.materials || 0, affordable));
+      if (q > 0) {
+        const cost = Math.round(q * (m.prices.materials || 0) * 100) / 100;
+        if (a.credits >= cost) {
+          a.credits -= cost;
+          gainResource(a, 'materials', q);
+          m.supply.materials = Math.max(0, (m.supply.materials || 0) - q);
+          m.buyVol.materials = (m.buyVol.materials || 0) + q;
+          m.credits += cost;
+          const factor = 1 + (q / Math.max(1, SUPPLY_TARGET.materials)) * 0.25;
+          m.prices.materials = Math.min(BASE_PRICES.materials * 3.4, m.prices.materials * factor);
+          ledgerTx(world, { from: a.id, to: 'market:' + m.cityId, res: 'materials', amount: q, reason: 'build-purchase' });
+          ledgerTx(world, { from: a.id, to: 'market:' + m.cityId, res: 'credits', amount: cost, reason: 'build-payment' });
+          world.stats.trades++;
+          a.stats.spent += cost;
+          a.stats.tradedVol += q;
+        }
+      }
+    }
+  }
+  if (stockOf(a, 'materials') < materialsPerTick) {
+    // still short after attempted purchase — pause this tick and try again
+    return;
+  }
+  spendResource(a, 'materials', materialsPerTick);
   st.progress = (st.progress || 0) + (0.5 + a.skills.engineering * 0.3);
   a.credits -= creditsCost * 0.2;
   a.energy = Math.max(0, a.energy - need * 0.3);
@@ -1957,7 +2000,9 @@ function bestSellTarget(world, a) {
     const m = world.markets[city.id];
     if (!m) continue;
     for (const res of MKT_RES) {
-      if ((a[res] || 0) < 3) continue; // must actually hold the stock
+      // Slice 1: read the right field (flat or `a.inventory`) — personal
+      // `a.energy` is operational state, not a tradable stock.
+      if (stockOf(a, res) < 3) continue; // must actually hold the stock
       if (m.prices[res] < BASE_PRICES[res] * 0.85) continue;
       const score = (m.prices[res] - BASE_PRICES[res]) * 10;
       if (!best || score > best.score) best = { score, city, res, buyCityId: city.id };
