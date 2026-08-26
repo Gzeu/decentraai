@@ -5337,11 +5337,11 @@ async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
     response
 }
 
-/// GET /flow — animated, live fabric pipeline (Agents → Governor → Model
-/// Colony → Compute Pool → Evidence → Economy). Read-only.
-/// GET /landing — agent-first hero linking the live views.
+/// GET /landing — cinematic, scroll-driven WebGL landing page of the fabric.
+/// Self-contained (no external sources); the final beat renders the live
+/// /status snapshot. Read-only.
 async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
-    let html = crate::fabric_dashboard::fabric_landing_html();
+    let html = crate::fabric_landing::fabric_landing_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
