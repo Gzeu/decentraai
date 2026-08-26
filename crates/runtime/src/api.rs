@@ -284,6 +284,10 @@ pub struct ApiState {
     /// Contribution & Quota consumer path (Q2). When set, `dca_…` keys are
     /// accepted as an inference credential with a quota ceiling + rate limit.
     consumer_keys_path: Option<PathBuf>,
+    /// VESPER agent → consumer key (plaintext `dca_…`) mapping, resolved
+    /// server-side so the browser world never holds a fabric credential.
+    /// Populated lazily on first dispatch per agent; keyed by agent_id.
+    vesper_keys: Arc<StdMutex<HashMap<String, String>>>,
     /// The authoritative quota ledger, `Arc`-shared with the compute manager
     /// (Q2: worker credits and consumer reserve/settle are one ledger). `None`
     /// when running without compute; consumer quota enforcement is skipped.
@@ -428,6 +432,7 @@ impl ApiState {
             dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
+            vesper_keys: Arc::new(StdMutex::new(HashMap::new())),
             quota_ledger: None,
             consumer_rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             consumer_usage: Arc::new(StdMutex::new(HashMap::new())),
@@ -5140,6 +5145,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
+        .route("/vesper/dispatch", post(vesper_dispatch_handler))
         .route("/vesper/{*path}", get(vesper_handler))
         .route("/bench/report", get(bench_report_handler))
         .route("/openapi.json", get(openapi_handler))
@@ -5384,6 +5390,118 @@ async fn vesper_agents_handler(State(state): State<ApiState>) -> Response {
         serde_json::json!({ "agents": rows, "count": rows.len() }).to_string(),
     )
         .into_response()
+}
+
+/// POST /vesper/dispatch — the VESPER world's bridge to real fabric work.
+/// The browser sends only `{agent_id, task, instruction, content, task_kind}`;
+/// this handler resolves (provisioning lazily) a consumer key for that agent
+/// server-side, calls the Governor with it, and returns the result — so the
+/// client never holds a fabric credential. The key is minted into the node's
+/// consumer registry with a modest quota + inference scope.
+async fn vesper_dispatch_handler(
+    State(state): State<ApiState>,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    let agent_id = match body
+        .0
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "agent_id required"}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let task = body.0.get("task").and_then(|v| v.as_str()).unwrap_or("task");
+    let instruction = body
+        .0
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Compute task from VESPER");
+    let content = body
+        .0
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let task_kind = body.0.get("task_kind").and_then(|v| v.as_str());
+
+    // Resolve (provision lazily) a consumer key for this agent.
+    let key = {
+        let mut map = state.vesper_keys.lock().unwrap();
+        if let Some(k) = map.get(agent_id) {
+            k.clone()
+        } else {
+            let Some(path) = &state.consumer_keys_path else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({"error": "consumer key store not configured"}).to_string(),
+                )
+                    .into_response();
+            };
+            let mut store = match decentraai_tokens::ConsumerKeyStore::load(path) {
+                Ok(s) => s,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error": "load consumer key store"}).to_string(),
+                    )
+                        .into_response();
+                }
+            };
+            // Mint a key under this node's registry so the Governor recognizes it.
+            let owner = format!("vesper:{agent_id}");
+            match store.create(
+                &owner,
+                5000,
+                30,
+                vec!["inference".to_string()],
+            ) {
+                Ok(plaintext) => {
+                    if let Err(e) = store.save() {
+                        tracing::warn!("vesper: failed to persist consumer key: {e}");
+                    }
+                    map.insert(agent_id.to_string(), plaintext.clone());
+                    plaintext
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error": format!("mint key: {e}")}).to_string(),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Build a Bearer request and forward to the Governor.
+    let mut headers = HeaderMap::new();
+    if let Ok(hv) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
+        headers.insert(header::AUTHORIZATION, hv);
+    }
+    let mut gov = serde_json::json!({
+        "instruction": instruction,
+        "content": content,
+    });
+    if let Some(tk) = task_kind {
+        gov["task_kind"] = serde_json::json!(tk);
+    }
+    let resp = governor_execute_handler(State(state.clone()), headers, axum::Json(gov)).await;
+    // Enrich with agent + task for the VESPER call log.
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024).await.unwrap_or_default();
+    let mut out: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    if let Some(m) = out.as_object_mut() {
+        m.insert("agent_id".to_string(), serde_json::json!(agent_id));
+        m.insert("task".to_string(), serde_json::json!(task));
+    }
+    axum::response::Response::from_parts(parts, axum::body::Body::from(out.to_string()))
 }
 
 /// GET /vesper — the agent civilization world. Serves the self-contained VESPER

@@ -269,7 +269,42 @@ export async function mcpCall(world, o) {
 
 export function dispatchComputeJob(world, job) {
   if (!cfg.enabled) return null;
-  return governorExecute(world, { agentId: job.requester, task: job.taskType, taskKind: job.taskKind, instruction: job.instruction, content: job.content, params: job.params, budget: job.budget });
+  // Server-side dispatch: the browser sends only the agent identity + task;
+  // the runtime resolves the real consumer key and calls the Governor, so the
+  // client never holds a fabric credential.
+  return vesperDispatch(world, { agentId: job.requester, task: job.taskType, taskKind: job.taskKind, instruction: job.instruction, content: job.content, params: job.params, budget: job.budget });
+}
+
+// POST /vesper/dispatch — real fabric work executed server-side with the
+// agent's resolved consumer key. The client holds no secret.
+export async function vesperDispatch(world, o) {
+  const f = ensureFabric(world);
+  const agentId = o.agentId || o.agent_key || null;
+  const entry = logCall(world, { at: Date.now(), tick: world.clock.t, op: 'vesper/dispatch', agentKey: agentId || null, agentId, task: o.task || o.taskType || null, status: 'pending' });
+  const body = {
+    agent_id: agentId,
+    task: o.task || o.taskType || 'task',
+    instruction: o.instruction || ('Compute task: ' + (o.task || 'task')),
+    content: o.content || (o.params && o.params.text) || JSON.stringify(o.params || {}),
+  };
+  if (o.taskKind) body.task_kind = o.taskKind;
+  const res = await request('/vesper/dispatch', { method: 'POST', body });
+  f.calls++;
+  entry.ms = res.ms;
+  if (res.ok) {
+    f.ok++;
+    entry.status = 'ok';
+    const d = res.data || {};
+    entry.executionId = d.execution_id || d.executionId || null;
+    entry.mode = d.decision || d.mode || 'local';
+    entry.detail = 'execution ' + (entry.executionId || 'ok');
+    entry.result = d.result != null ? String(d.result).slice(0, 120) : null;
+  } else {
+    f.fail++;
+    entry.status = 'fail';
+    entry.detail = res.err || ('http-' + res.status);
+  }
+  return { ok: res.ok, executionId: entry.executionId || null, mode: entry.mode || 'local', err: res.ok ? null : (entry.detail || null), ms: res.ms, response: res.data || null };
 }
 
 // Fetch real registered fabric agents. When served by the DecentraAI runtime
