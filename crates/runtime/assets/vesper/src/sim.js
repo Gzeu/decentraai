@@ -99,6 +99,64 @@ export const SUPPLY_TARGET = { data: 90, compute: 120, materials: 200, energy: 2
 // (services, infra-as-resource) can opt new resources in without
 // touching the decision loop. PR-C lifts the PR-A gate.
 export const RES_TRADE_ENABLED = ['data', 'compute', 'materials', 'energy'];
+
+// Slice 2 — infrastructure as productive economic asset.
+// Each facility has:
+//   - `inputs`        : resources it consumes from the local market per tick
+//                       (added to `m.demand[res]`, so prices react);
+//   - `outputs`       : resources it adds to the local market per tick
+//                       (added to `m.supply[res]`, supplied by the org's
+//                       territory and realised only when the facility is
+//                       active, i.e. maintenance has been paid);
+//   - `maint`         : per-facility maintenance cost per maintenance tick
+//                       (debited from `org.treasury[res]` of the region's
+//                       owner org, or from `world` for unowned regions).
+// The numbers are deliberately small so the existing market price-EMA
+// (12% pull toward target) absorbs the change smoothly; nothing
+// exponential. `doBuild` consumes the same materials + energy at
+// construction time; this table is the operating cost.
+export const FACILITY_ECONOMY = {
+  relays:    { inputs: { energy: 0.05 },                       outputs: { data: 0.08 },            maint: { materials: 0.2, energy: 0.3 } },
+  labs:      { inputs: { materials: 0.15, energy: 0.05 },      outputs: { data: 0.30 },            maint: { materials: 0.6, energy: 0.4 } },
+  factories: { inputs: { materials: 0.10, energy: 0.20 },      outputs: { materials: 0.40 },       maint: { materials: 0.8, energy: 0.6 } },
+  refineries:{ inputs: { materials: 0.10, energy: 0.10 },      outputs: { energy: 0.60 },           maint: { materials: 0.4, energy: 0.8 } },
+  defense:   { inputs: { energy: 0.04 },                       outputs: {},                        maint: { materials: 0.3, energy: 0.2 } },
+};
+
+// Construction cost extension. Slice 1 added `materials`; Slice 2 adds
+// `energy` for `factories` and `refineries` (the productive facilities
+// that need power to run). `relays` and `labs` stay materials-only;
+// `defense` stays materials + energy. The numeric factor scales with
+// the original `need` (relays=6, labs=12, factories=16, refineries=10,
+// defense=8) so heavier facilities demand proportionally more.
+export const FACILITY_ENERGY_BUILD_COST = {
+  relays: 0,
+  labs: 0,
+  factories: 0.6,
+  refineries: 0.4,
+  defense: 0.3,
+};
+
+// How many ticks of grace a facility gets after maintenance is missed
+// before it goes inactive. A small buffer absorbs per-tick jitter; long
+// enough that an org with a temporary treasury dip doesn't immediately
+// lose productivity, short enough that the cost of inattention is
+// real and visible on the market within a few hours of world time.
+const FACILITY_MAINT_GRACE_TICKS = 6;
+
+// Slice 2 — is the facility currently active? Active = the structure
+// exists (`r.infra[f] > 0`) AND its maintenance is paid (or still inside
+// the grace window since the last payment). All in-region effects in
+// `marketTick` and `orgTick` route through this single function so the
+// semantics stay consistent.
+function infraActive(r, facility, t) {
+  if (!r || !r.infra) return false;
+  if ((r.infra[facility] || 0) <= 0) return false;
+  if (!r.infraPaidAt) return true; // uninitialised: assume paid (legacy worlds)
+  const last = r.infraPaidAt[facility];
+  if (last == null) return true;
+  return (t - last) <= FACILITY_MAINT_GRACE_TICKS;
+}
 export const SKILLS = ['trade', 'science', 'engineering', 'social', 'navigation', 'combat', 'stealth', 'analysis'];
 const PERSONALITY = ['openness', 'consc', 'extra', 'agree', 'neuro', 'risk', 'ambition', 'greed', 'curiosity', 'caution', 'loyalty'];
 
@@ -1304,6 +1362,42 @@ function doBuild(world, a, st, rng) {
     return;
   }
   spendResource(a, 'materials', materialsPerTick);
+  // Slice 2: productive facilities also draw on the world-energy
+  // commodity. Same auto-purchase pattern as materials, gated on
+  // FACILITY_ENERGY_BUILD_COST[facility] * `need` to scale with size.
+  const energyPerTick = (FACILITY_ENERGY_BUILD_COST[st.facility] || 0) * need;
+  if (energyPerTick > 0) {
+    if (stockOf(a, 'energy') < energyPerTick) {
+      const m = r.cityId ? world.markets[r.cityId] : null;
+      if (m) {
+        const shortage = energyPerTick - stockOf(a, 'energy');
+        const affordable = Math.floor(a.credits / Math.max(0.1, m.prices.energy || 0.1));
+        const q = Math.max(0, Math.min(shortage, m.supply.energy || 0, affordable));
+        if (q > 0) {
+          const cost = Math.round(q * (m.prices.energy || 0) * 100) / 100;
+          if (a.credits >= cost) {
+            a.credits -= cost;
+            gainResource(a, 'energy', q);
+            m.supply.energy = Math.max(0, (m.supply.energy || 0) - q);
+            m.buyVol.energy = (m.buyVol.energy || 0) + q;
+            m.credits += cost;
+            const factor = 1 + (q / Math.max(1, SUPPLY_TARGET.energy)) * 0.25;
+            m.prices.energy = Math.min(BASE_PRICES.energy * 3.4, m.prices.energy * factor);
+            ledgerTx(world, { from: a.id, to: 'market:' + m.cityId, res: 'energy', amount: q, reason: 'build-purchase' });
+            ledgerTx(world, { from: a.id, to: 'market:' + m.cityId, res: 'credits', amount: cost, reason: 'build-payment' });
+            world.stats.trades++;
+            a.stats.spent += cost;
+            a.stats.tradedVol += q;
+          }
+        }
+      }
+    }
+    if (stockOf(a, 'energy') < energyPerTick) {
+      // still short after attempted purchase — pause this tick and try again
+      return;
+    }
+    spendResource(a, 'energy', energyPerTick);
+  }
   st.progress = (st.progress || 0) + (0.5 + a.skills.engineering * 0.3);
   a.credits -= creditsCost * 0.2;
   a.energy = Math.max(0, a.energy - need * 0.3);
@@ -1456,13 +1550,35 @@ function marketTick(world, m, t) {
   const region = world.regions.find(r => r.id === m.regionId);
   const city = world.map.cities.find(c => c.id === m.cityId);
   const pop = city ? city.population : 20;
+  // Slice 2: aggregate infrastructure inputs (demand) and outputs
+  // (supply) over every facility in this region, weighted by active
+  // count and the per-facility economic profile. The same per-res
+  // supply/demand/EMA logic below then sees them.
+  let infraDemand = { materials: 0, energy: 0, data: 0, compute: 0 };
+  let infraSupply = { materials: 0, energy: 0, data: 0, compute: 0 };
+  if (region) {
+    for (const f of Object.keys(FACILITY_ECONOMY)) {
+      const n = region.infra && region.infra[f];
+      if (!n) continue;
+      const active = infraActive(region, f, t);
+      const fac = FACILITY_ECONOMY[f];
+      for (const res of Object.keys(fac.inputs)) {
+        infraDemand[res] = (infraDemand[res] || 0) + (active ? n * fac.inputs[res] : 0);
+      }
+      for (const res of Object.keys(fac.outputs)) {
+        infraSupply[res] = (infraSupply[res] || 0) + (active ? n * fac.outputs[res] : 0);
+      }
+    }
+  }
   for (const res of MKT_RES) {
     if (region) {
       m.supply[res] += (region.prod[res] || 0) * 0.6;
       const nodeIn = region.nodes.reduce((s, n) => s + (n.stock[res] || 0) * 0.01, 0);
       m.supply[res] += nodeIn;
+      // Slice 2: infrastructure adds to supply / demand.
+      m.supply[res] += infraSupply[res] || 0;
     }
-    const demand = pop * 0.025 * 0.4;
+    const demand = pop * 0.025 * 0.4 + (infraDemand[res] || 0);
     m.demand[res] += demand;
     m.supply[res] = Math.max(0, m.supply[res] - demand);
     const target = SUPPLY_TARGET[res];
@@ -1563,6 +1679,43 @@ function orgTick(world, rng, t) {
     // Slice 1: world-energy income mirrors materials at a slightly higher
     // rate (biomes are energy-rich). Same upkeep budget covers it.
     org.treasury.energy = (org.treasury.energy || 0) + org.territory.length * 0.5;
+    // Slice 2: per-region infrastructure maintenance. Each territory
+    // region pays `maint[res] * count` per facility; if the org can't
+    // cover the cost, the affected facility goes inactive (its
+    // `infraPaidAt` is not refreshed) and the market sees no supply or
+    // demand from it. The structure stays in place — the slice spec is
+    // explicit that maintenance must NOT destroy infrastructure.
+    let maintMats = 0, maintEnergy = 0;
+    for (const rid of org.territory) {
+      const r = world.regions.find(x => x.id === rid);
+      if (!r || !r.infra) continue;
+      r.infraPaidAt = r.infraPaidAt || {};
+      for (const f of Object.keys(FACILITY_ECONOMY)) {
+        const n = r.infra[f] || 0;
+        if (n <= 0) continue;
+        const m = FACILITY_ECONOMY[f].maint;
+        maintMats   += n * (m.materials || 0);
+        maintEnergy += n * (m.energy    || 0);
+      }
+    }
+    // Org may be short — pay what it can, mark the rest as overdue by
+    // leaving `r.infraPaidAt[f]` unchanged. infraActive then drives the
+    // inactivity window via FACILITY_MAINT_GRACE_TICKS.
+    const paidMats   = Math.min(maintMats,   org.treasury.materials || 0);
+    const paidEnergy = Math.min(maintEnergy, org.treasury.energy    || 0);
+    if (paidMats   > 0) org.treasury.materials -= paidMats;
+    if (paidEnergy > 0) org.treasury.energy    -= paidEnergy;
+    const fullyPaid = (paidMats + 1e-9 >= maintMats) && (paidEnergy + 1e-9 >= maintEnergy);
+    if (fullyPaid) {
+      for (const rid of org.territory) {
+        const r = world.regions.find(x => x.id === rid);
+        if (!r || !r.infra) continue;
+        r.infraPaidAt = r.infraPaidAt || {};
+        for (const f of Object.keys(FACILITY_ECONOMY)) {
+          if ((r.infra[f] || 0) > 0) r.infraPaidAt[f] = t;
+        }
+      }
+    }
     const upkeepCost = org.territory.length * 3 + org.members.length * 0.5;
     org.treasury.credits -= upkeepCost;
     org.treasury.materials -= org.territory.length * 0.5;

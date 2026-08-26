@@ -233,6 +233,13 @@ async function boot() {
     a.inventory.materials = a.inventory.materials || 0;
     a.inventory.energy    = a.inventory.energy    || 0;
   }
+  // Slice 2: infrastructure-maintenance state. `infraActive()` returns
+  // `true` when `r.infraPaidAt` is uninitialised, so legacy worlds keep
+  // their existing facilities running until the owning org next pays
+  // maintenance. This seed only materialises the field.
+  for (const r of (world.regions || [])) {
+    if (r && r.infra) r.infraPaidAt = r.infraPaidAt || {};
+  }
   world.meta.narrativeEngine = world.meta.narrativeEngine || cfg.narrativeEngine;
   catchUpOffline();
   await saveWorld();
