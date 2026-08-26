@@ -29,10 +29,14 @@ export function fabricCfg() {
   return { baseUrl: cfg.baseUrl, enabled: cfg.enabled, hasAdminKey: !!cfg.adminDcaKey };
 }
 
-// Stable per-agent identity derived from the world seed + agent id. This is a
-// deterministic local identifier; the real fabric may resolve it against its
-// own consumer-key registry when an operator maps it.
+// Stable per-agent identity. Real fabric agents carry their AgentRecord
+// agent_id (e.g. "dca-JJjXhh:generalist"); prefer it verbatim so the fabric
+// recognizes the real credential. Fall back to a deterministic derivation from
+// seed+agentId for legacy/non-real agents.
 export function agentKey(world, agentId) {
+  const a = world && world.agents && world.agents[agentId];
+  if (a && a.agentId) return a.agentId;
+  if (a && a.real) return String(agentId);
   return 'dca_' + hashFnv((world.meta.seed || 'vesper') + '::' + agentId).toString(16).slice(0, 10);
 }
 
@@ -67,7 +71,9 @@ function absUrl(path) {
 }
 
 async function request(path, opts = {}) {
-  if (!configured() && cfg.baseUrl !== '') return { ok: false, err: 'fabric-not-configured' };
+  // Same-origin (empty baseUrl) works for any local path; a configured remote
+  // baseUrl also works. Only a disabled bridge blocks.
+  if (!cfg.enabled) return { ok: false, err: 'fabric-not-configured' };
   const t0 = performance.now();
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 8000);
@@ -262,6 +268,34 @@ export async function mcpCall(world, o) {
 }
 
 export function dispatchComputeJob(world, job) {
-  if (!configured() && cfg.baseUrl !== '') return null;
+  if (!cfg.enabled) return null;
   return governorExecute(world, { agentId: job.requester, task: job.taskType, taskKind: job.taskKind, instruction: job.instruction, content: job.content, params: job.params, budget: job.budget });
+}
+
+// Fetch real registered fabric agents (AgentRecords) from /v1/agents.
+// Requires an operator/master key (Bearer). Returns an array of the raw
+// records, or [] when unreachable/unauthed (honest: the world stays empty
+// rather than inventing phantom agents).
+export async function fetchRealAgents() {
+  if (!cfg.enabled) return [];
+  const headers = {};
+  if (cfg.adminDcaKey) headers['Authorization'] = 'Bearer ' + cfg.adminDcaKey;
+  const res = await request('/v1/agents', { method: 'GET', headers });
+  if (!res.ok) {
+    // If unauthed (403/401), we simply have no real agents to show — honest.
+    return [];
+  }
+  const list = (res.data && res.data.agents) || [];
+  if (!Array.isArray(list)) return [];
+  // Normalize each record to the shape importRealAgents expects.
+  return list.map(a => ({
+    agent_id: a.agent_id || null,
+    name: a.name || null,
+    role: a.role || 'generalist',
+    description: a.description || '',
+    node_name: a.node_name || '',
+    remote: !!a.remote,
+    semantic_capabilities: a.semantic_capabilities || [],
+    tools: a.tools || [],
+  })).filter(a => a.agent_id);
 }

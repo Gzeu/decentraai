@@ -451,8 +451,13 @@ export function createUI(deps) {
     const head = h('div', 'flex items-center gap10');
     const av = h('span', 'big-av', a.avatar); av.style.background = a.color; av.style.color = '#061018';
     const nm = h('div', '');
-    nm.appendChild(h('div', 'card-name', a.name));
-    nm.appendChild(h('div', 'dim small', ARCH_LABEL[a.archetype]));
+    nm.appendChild(h('div', 'card-name', a.name + (a.real ? ' · ' : '')));
+    if (a.real) {
+      const rbadge = h('span', 'tag', 'REAL');
+      rbadge.style.color = '#8be0c8'; rbadge.style.borderColor = 'rgba(139,224,200,0.5)';
+      nm.lastChild.appendChild(rbadge);
+    }
+    nm.appendChild(h('div', 'dim small', (a.role ? a.role + (ARCH_LABEL[a.archetype] !== a.role ? ' · ' + ARCH_LABEL[a.archetype] : '') : ARCH_LABEL[a.archetype]) + (a.nodeName ? ' · ' + a.nodeName : '')));
     head.appendChild(av); head.appendChild(nm);
     head.appendChild(h('div', 'f1'));
     head.appendChild(tag(a.status || 'working', statusTagClass(a.status)));
@@ -1355,6 +1360,29 @@ export function createUI(deps) {
     valCard.appendChild(kv('Market volume', Math.round(s.tradedVol || 0) + ' units'));
     valCard.appendChild(kv('Compute jobs run', (s.computeJobs || 0) + ''));
     d.appendChild(valCard);
+
+    if (a.real) {
+      const fab = h('div', 'card mt12');
+      fab.appendChild(h('h4', '', 'Fabric Agent'));
+      fab.appendChild(kv('Agent ID', a.agentId || a.id));
+      fab.appendChild(kv('Role', a.role || 'generalist'));
+      fab.appendChild(kv('Node', a.nodeName || (a.remote ? 'remote' : 'local')));
+      fab.appendChild(kv('Source', a.remote ? 'remote fabric node' : 'this node'));
+      if (a.description) fab.appendChild(h('div', 'dim small mt8', a.description));
+      if (a.capabilities && a.capabilities.length) {
+        const capRow = h('div', 'mt8');
+        for (const c of a.capabilities.slice(0, 10)) {
+          capRow.appendChild(tag(c, ''));
+        }
+        fab.appendChild(capRow);
+      }
+      if (a.tools && a.tools.length) {
+        const tl = h('div', 'mt8 small dim');
+        tl.textContent = 'Tools: ' + a.tools.slice(0, 8).join(' · ');
+        fab.appendChild(tl);
+      }
+      d.appendChild(fab);
+    }
 
     const skCard = h('div', 'card mt12');
     skCard.appendChild(h('h4', '', 'Skills'));

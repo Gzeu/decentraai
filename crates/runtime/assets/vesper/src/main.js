@@ -2,7 +2,7 @@ import { createWorld, advanceTicks } from './sim.js';
 import { createVesper } from './console.js';
 import { createUI } from './ui.js';
 import { pointInPoly, rebuildPolys } from './core.js';
-import { configure as configureFabric, probe as probeFabric } from './decentraai.js';
+import { configure as configureFabric, probe as probeFabric, fetchRealAgents } from './decentraai.js';
 
 // ---- Self-contained config (no external pjs/plugin dependency) ----
 // World + DecentraAI fabric bridge. Set `fabric.baseUrl` to the live fabric
@@ -90,6 +90,7 @@ async function dbSet(value) {
 }
 
 let world = null;
+let realAgents = [];
 let speed = cfg.baseSpeed || 1;
 let ui = null;
 let saveQueued = false;
@@ -98,7 +99,7 @@ let curRoute = 'world';
 function getWorld() { return world; }
 
 function freshWorld(seedStr) {
-  const w = createWorld(seedStr || cfg.seed, cfg);
+  const w = createWorld(seedStr || cfg.seed, Object.assign({}, cfg, { realAgents: realAgents }));
   w.meta.lastTickReal = Date.now();
   world = w;
   return w;
@@ -154,6 +155,16 @@ function tickLoop() {
 }
 
 async function boot() {
+  // Fetch real fabric agents (same-origin /v1/agents) so the world is populated
+  // ONLY with real registered agents — no procedural/phantom agents. When the
+  // endpoint is unreachable/unauthed, we keep an empty world (honest) and the
+  // Fabric screen reports it.
+  configureFabric(cfg.decentraai);
+  realAgents = await fetchRealAgents();
+  if (realAgents.length) {
+    console.log('vesper: importing ' + realAgents.length + ' real fabric agents');
+  }
+
   const saved = await dbGet();
   if (saved && saved.meta && saved.meta.id) { world = saved; }
 
@@ -196,7 +207,6 @@ async function boot() {
   catchUpOffline();
   await saveWorld();
 
-  configureFabric(cfg.decentraai);
   probeFabric(world).then(() => { if (ui) ui.refresh(); });
 
   window.Vesper = createVesper(getWorld);

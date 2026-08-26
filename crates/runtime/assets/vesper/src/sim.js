@@ -87,9 +87,18 @@ export function createWorld(seedStr, cfg) {
   evidenceInit(world);
   computeInit(world, cfg);
   initMarkets(world);
-  createAgents(world, cfg.initialAgents || 24, cfg);
-  seedOrganizations(world, cfg.seedOrganizations || 3);
-  seedContracts(world);
+  // Real fabric agents take priority: when cfg.realAgents (AgentRecords from
+  // /v1/agents) are provided, the world is populated ONLY with them — no
+  // procedural agents, orgs or contracts. Otherwise fall back to the legacy
+  // procedural civilization.
+  const real = (cfg.realAgents || []).filter(Boolean);
+  if (real.length > 0) {
+    importRealAgents(world, real);
+  } else {
+    createAgents(world, cfg.initialAgents || 24, cfg);
+    seedOrganizations(world, cfg.seedOrganizations || 3);
+    seedContracts(world);
+  }
   pushEvent(world, { type: 'genesis', source: 'world', detail: 'The world wakes. A civilization of autonomous agents begins.' });
   world.stats.agents = world.agentOrder.length;
   world.stats.orgs = world.orgOrder.length;
@@ -191,6 +200,100 @@ function createAgents(world, count, cfg) {
   }
   world.agentOrder.sort();
 }
+
+/// Import real fabric agents (AgentRecords from /v1/agents) as the world's
+/// entities. Each becomes a first-class agent whose identity, role and
+/// capabilities come from the REAL fabric record; the world keeps only a thin
+/// deterministic economic shell around them. No names/orgs/contracts are
+/// invented.
+function importRealAgents(world, realAgents) {
+  const rng = createRng(world.meta.seed + '::realagents');
+  const cityRegions = world.map.cities.map(c => c.regionId);
+  realAgents.forEach((r, i) => {
+    const rec = r.record || r;
+    const id = rec.agent_id || ('agent-' + i);
+    const name = rec.name || rec.agent_id || ('Agent ' + i);
+    const role = (rec.role || 'generalist').toLowerCase();
+    // Map a fabric role to a compatible agent archetype so the decision loop
+    // has a shape; generalist is the common real role.
+    const archetype = ROLE_ARCH[role] || 'explorer';
+    const arch = ARCH[archetype] || ARCH.explorer;
+    const home = cityRegions.length ? cityRegions[Math.floor(hashFnv(id) % cityRegions.length)] : 0;
+    const skills = {};
+    for (const s of SKILLS) skills[s] = 1.5 + ((hashFnv(id + s) % 30) / 10);
+    const personality = {};
+    for (const p of PERSONALITY) personality[p] = Math.round((0.3 + ((hashFnv(id + p) % 40) / 100)) * 100) / 100;
+    const caps = (rec.semantic_capabilities || []).map(c => (c.capability || c)).filter(Boolean);
+    const tools = (rec.tools || []).map(t => t.name || t).filter(Boolean);
+    const agent = {
+      id,
+      name,
+      avatar: '◆',
+      color: '#5cc8ff',
+      archetype,
+      real: true,                       // flagged as a real fabric agent
+      agentId: id,                      // the real AgentRecord id (dca_…)
+      role,
+      capabilities: caps,
+      tools,
+      description: rec.description || '',
+      nodeName: rec.node_name || '',
+      remote: !!rec.remote,
+      personality,
+      skills,
+      w: Object.assign({}, DEFAULT_W, arch.w),
+      goals: [],
+      plan: null,
+      stepIx: 0,
+      planKey: 'start',
+      planGoal: 'Begin',
+      planStuckTicks: 0,
+      replanCooldown: 0,
+      loc: { type: 'region', regionId: home, travel: null },
+      status: 'working',
+      inv: { credits: 1000, energy: 30, food: 20, materials: 12, rare: 1, data: 2, computeCredits: 100 },
+      health: 1, morale: 0.8,
+      memory: [],
+      relations: {},
+      org: null,
+      orgRole: null,
+      rep: { reliability: 60, cooperation: 60, contribution: 60, disputes: 0, score: 60 },
+      compute: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
+      achievements: [],
+      history: [],
+      createdTick: 0,
+      homeRegion: home,
+      lastThought: { text: 'Enters the world from the fabric.', source: 'local', tick: 0 },
+      contracts: [],
+      wealth: 0,
+      stats: { earned: 0, spent: 0, taxesPaid: 0, contracts: 0, discoveries: 0, research: 0, breakthroughs: 0, built: 0, produced: 0, tradedVol: 0, computeJobs: 0 },
+    };
+    world.agents[id] = agent;
+    world.agentOrder.push(id);
+    addMemory(world, agent, { type: 'location', importance: 0.7, tags: ['region', home], regionId: home, text: 'Home region.' });
+    const homeCity = world.map.cities.find(c => c.regionId === home);
+    if (homeCity) addMemory(world, agent, { type: 'economic', importance: 0.6, tags: ['price', homeCity.id], cityId: homeCity.id, prices: { ...world.markets[homeCity.id].prices }, text: 'Home market prices.' });
+    agent.lastThought = { text: `${agent.name} (${archetype}) arrives at ${regionName(world, home)} from the fabric.`, source: 'local', tick: 0 };
+  });
+  world.agentOrder.sort();
+}
+
+// Fabric role -> agent archetype mapping. All map to real ARCH entries.
+const ROLE_ARCH = {
+  generalist: 'explorer',
+  trader: 'trader',
+  merchant: 'trader',
+  engineer: 'engineer',
+  builder: 'builder',
+  scientist: 'scientist',
+  researcher: 'scientist',
+  strategist: 'strategist',
+  diplomat: 'diplomat',
+  explorer: 'explorer',
+  mercenary: 'mercenary',
+  guardian: 'guardian',
+  opportunist: 'opportunist',
+};
 
 function weightedPick(rng, items, wf) {
   let total = 0;
