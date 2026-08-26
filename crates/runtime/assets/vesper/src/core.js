@@ -1,7 +1,12 @@
-export const RES = ['credits', 'energy', 'food', 'materials', 'rare', 'data'];
-export const MKT_RES = ['food', 'energy', 'materials', 'rare', 'data'];
-export const RES_LABEL = { credits: 'Credits', energy: 'Energy', food: 'Food', materials: 'Materials', rare: 'Rare Elements', data: 'Research Data', computeCredits: 'Compute Credits' };
-export const RES_SYM = { credits: 'Cr', energy: '⚡', food: '◈', materials: '◆', rare: '✦', data: '◉', computeCredits: '◍' };
+// VESPER Resource Model v2 — three layers:
+//   AGENT state:  energy/focus/morale (operational, non-tradable)
+//   AGENT stocks: credits/compute/data (economic, ledger-tracked)
+//   AGENT social: reputation/trust/experience (earned through verified work)
+// World economy trades only what has a producer and a consumer: data + compute.
+export const RES = ['credits', 'compute', 'data'];
+export const MKT_RES = ['data', 'compute'];
+export const RES_LABEL = { credits: 'Credits', compute: 'Compute', data: 'Research Data' };
+export const RES_SYM = { credits: 'Cr', compute: '◍', data: '◉' };
 export const TICK_HOURS = 1;
 export const DAY_HOURS = 24;
 
@@ -441,7 +446,7 @@ export function balance(world, who) {
 export function grant(world, who, res, amount, reason) {
   if (amount === 0) return;
   balance(world, who)[res] = (balance(world, who)[res] || 0) + amount;
-  if (res === 'credits' || res === 'computeCredits') ledgerTx(world, { from: 'world', to: who, res, amount, reason });
+  if (res === 'credits' || res === 'compute') ledgerTx(world, { from: 'world', to: who, res, amount, reason });
 }
 export function transfer(world, from, to, res, amount, reason) {
   if (amount <= 0) return null;

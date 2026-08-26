@@ -29,7 +29,7 @@ function credit(world, who, res, amount, reason) {
     if (m) { m.credits += amount; ledgerTx(world, { from: 'world', to: who, res, amount, reason }); return; }
   } else if (world.agents[who]) {
     const a = world.agents[who];
-    a.inv[res] = (a.inv[res] || 0) + amount;
+    a[res] = (a[res] || 0) + amount;
     ledgerTx(world, { from: 'world', to: who, res, amount, reason });
     return;
   }
@@ -40,12 +40,19 @@ function payAgent(world, who, a, res, amount, reason) {
   if (!(amount > 0)) return;
   const bf = balance(world, who);
   bf[res] = (bf[res] || 0) - amount;
-  a.inv[res] = (a.inv[res] || 0) + amount;
+  a[res] = (a[res] || 0) + amount;
   ledgerTx(world, { from: who, to: a.id, res, amount, reason });
 }
 
-export const BASE_PRICES = { food: 3.5, energy: 6, materials: 9, rare: 60, data: 15 };
-export const SUPPLY_TARGET = { food: 320, energy: 260, materials: 260, rare: 60, data: 90 };
+// Experience is per-capability progression (layer 2): work changes what the
+// agent can do next. Reputation is social capital (layer 1): earned only
+// through verified outcomes.
+function gainXp(a, skill, amount) {
+  a.experience[skill] = (a.experience[skill] || 0) + amount;
+}
+
+export const BASE_PRICES = { data: 15, compute: 40 };
+export const SUPPLY_TARGET = { data: 90, compute: 120 };
 export const SKILLS = ['trade', 'science', 'engineering', 'social', 'navigation', 'combat', 'stealth', 'analysis'];
 const PERSONALITY = ['openness', 'consc', 'extra', 'agree', 'neuro', 'risk', 'ambition', 'greed', 'curiosity', 'caution', 'loyalty'];
 
@@ -81,9 +88,7 @@ export function createWorld(seedStr, cfg) {
     narrative: { queue: [], processed: 0 },
   };
   grant(world, 'world', 'credits', 2e6, 'genesis-fund');
-  grant(world, 'world', 'materials', 20000, 'genesis-fund');
-  grant(world, 'world', 'energy', 50000, 'genesis-fund');
-  grant(world, 'world', 'computeCredits', 20000, 'genesis-fund');
+  grant(world, 'world', 'compute', 20000, 'genesis-fund');
   evidenceInit(world);
   computeInit(world, cfg);
   initMarkets(world);
@@ -119,10 +124,10 @@ function initMarkets(world) {
       cityId: city.id,
       regionId: region.id,
       prices, supply,
-      demand: { food: 0, energy: 0, materials: 0, rare: 0, data: 0 },
-      history: { food: [], energy: [], materials: [], rare: [], data: [] },
-      buyVol: { food: 0, energy: 0, materials: 0, rare: 0, data: 0 },
-      sellVol: { food: 0, energy: 0, materials: 0, rare: 0, data: 0 },
+      demand: { data: 0, compute: 0 },
+      history: { data: [], compute: [] },
+      buyVol: { data: 0, compute: 0 },
+      sellVol: { data: 0, compute: 0 },
       credits: 8000,
       priceIdx: 1,
     };
@@ -163,6 +168,18 @@ function createAgents(world, count, cfg) {
       archetype,
       personality,
       skills,
+      // Layer 1 — personal state (0-100): operational capacity, not life bars.
+      energy: 70 + Math.round(rng.float() * 25),
+      focus: 60 + Math.round(rng.float() * 30),
+      morale: 55 + Math.round(rng.float() * 30),
+      // Layer 1 — economic stocks (flat fields; ledger-tracked via credit()).
+      credits: Math.round(250 + rng.float() * 650),
+      compute: 20,
+      data: 2,
+      // Layer 1 — social capital.
+      reputation: 50,
+      trust: {},
+      experience: {},
       w: Object.assign({}, DEFAULT_W, arch.w),
       goals: [],
       plan: null,
@@ -173,14 +190,14 @@ function createAgents(world, count, cfg) {
       replanCooldown: 0,
       loc: { type: 'region', regionId: home, travel: null },
       status: 'working',
-      inv: { credits: Math.round(250 + rng.float() * 650), energy: 22, food: 18, materials: 10, rare: 1, data: 2, computeCredits: 20 },
-      health: 1, morale: 0.8,
+      health: 1, // kept as a derived 0-1 read-only projection of energy+morale
+      morale1: null,
       memory: [],
       relations: {},
       org: null,
       orgRole: null,
       rep: { reliability: 50, cooperation: 50, contribution: 50, disputes: 0, score: 50 },
-      compute: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
+      computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
       history: [],
       createdTick: 0,
@@ -192,7 +209,6 @@ function createAgents(world, count, cfg) {
     };
     world.agents[agent.id] = agent;
     world.agentOrder.push(agent.id);
-    for (const res of ['food', 'materials']) { agent.inv[res] = Math.round(agent.inv[res]); }
     addMemory(world, agent, { type: 'location', importance: 0.7, tags: ['region', home], regionId: home, text: 'Home region.' });
     const homeCity = world.map.cities.find(c => c.regionId === home);
     if (homeCity) addMemory(world, agent, { type: 'economic', importance: 0.6, tags: ['price', homeCity.id], cityId: homeCity.id, prices: { ...world.markets[homeCity.id].prices }, text: 'Home market prices.' });
@@ -251,14 +267,19 @@ function importRealAgents(world, realAgents) {
       replanCooldown: 0,
       loc: { type: 'region', regionId: home, travel: null },
       status: 'working',
-      inv: { credits: 1000, energy: 30, food: 20, materials: 12, rare: 1, data: 2, computeCredits: 100 },
-      health: 1, morale: 0.8,
+      // Layer 1 — personal state (0-100)
+      energy: 85, focus: 80, morale: 75,
+      // Layer 1 — economic stocks (flat)
+      credits: 1000, compute: 100, data: 2,
+      // Layer 1 — social capital
+      reputation: 60, trust: {}, experience: {},
+      health: 1,
       memory: [],
       relations: {},
       org: null,
       orgRole: null,
       rep: { reliability: 60, cooperation: 60, contribution: 60, disputes: 0, score: 60 },
-      compute: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
+      computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
       history: [],
       createdTick: 0,
@@ -334,7 +355,7 @@ function seedOrganizations(world, n) {
       founderId,
       leaderId: founderId,
       members,
-      treasury: { credits: 1200, materials: 200, energy: 200, rare: 5 },
+      treasury: { credits: 1200, compute: 40 },
       territory: [homeRegion.id],
       assets: { facilities: 0, relays: 0, labs: 0 },
       rep: 50,
@@ -354,9 +375,8 @@ function seedOrganizations(world, n) {
       a.org = org.id;
       a.orgRole = m === founderId ? 'leader' : 'member';
       addMemory(world, a, { type: 'relationship', importance: 0.6, tags: ['org', org.id], orgId: org.id, text: `Joined ${org.name}.` });
-      const inv = a.inv;
-      const contrib = Math.round(inv.credits * 0.1);
-      inv.credits -= contrib;
+      const contrib = Math.round(a.credits * 0.1);
+      a.credits -= contrib;
       org.treasury.credits += contrib;
       ledgerTx(world, { from: a.id, to: 'org:' + org.id, res: 'credits', amount: contrib, reason: 'org-contribution' });
     }
@@ -379,16 +399,16 @@ function seedContracts(world) {
     list.push(c.id);
   };
   for (let i = 0; i < 2 && i < explored.length; i++) {
-    mk({ type: 'explore', title: 'Chart the ' + regionName(world, explored[i].id), objective: { kind: 'explore', regionId: explored[i].id }, reward: { credits: 380, rep: 6, computeCredits: 5 }, risk: 0.35, reqSkills: ['navigation'], deadline: 140 });
+    mk({ type: 'explore', title: 'Chart the ' + regionName(world, explored[i].id), objective: { kind: 'explore', regionId: explored[i].id }, reward: { credits: 380, rep: 6, compute: 5 }, risk: 0.35, reqSkills: ['navigation'], deadline: 140 });
   }
   for (let i = 0; i < 2 && i < cities.length; i++) {
-    mk({ type: 'deliver', title: 'Supply ' + cities[i].name + ' with food', objective: { kind: 'deliver', res: 'food', qty: 80, toCityId: cities[i].id }, reward: { credits: 420, rep: 5, computeCredits: 4 }, risk: 0.2, reqSkills: ['trade', 'navigation'], deadline: 160 });
+    mk({ type: 'deliver', title: 'Deliver research data to ' + cities[i].name, objective: { kind: 'deliver', res: 'data', qty: 12, toCityId: cities[i].id }, reward: { credits: 420, rep: 5, compute: 4 }, risk: 0.2, reqSkills: ['trade', 'navigation'], deadline: 160 });
   }
   const builderCities = [...world.map.cities].slice(0, 3);
-  mk({ type: 'build', title: 'Erect a relay station', objective: { kind: 'build', facility: 'relays', regionId: world.map.cities[0].regionId }, reward: { credits: 900, rep: 12, computeCredits: 6 }, risk: 0.4, reqSkills: ['engineering'], deadline: 200 });
-  mk({ type: 'research', title: 'Foundational analysis', objective: { kind: 'research', tech: 'materials' }, reward: { credits: 1100, rep: 14, computeCredits: 15 }, risk: 0.5, reqSkills: ['science'], deadline: 260 });
+  mk({ type: 'build', title: 'Erect a relay station', objective: { kind: 'build', facility: 'relays', regionId: world.map.cities[0].regionId }, reward: { credits: 900, rep: 12, compute: 6 }, risk: 0.4, reqSkills: ['engineering'], deadline: 200 });
+  mk({ type: 'research', title: 'Foundational analysis', objective: { kind: 'research', tech: 'data' }, reward: { credits: 1100, rep: 14, compute: 15 }, risk: 0.5, reqSkills: ['science'], deadline: 260 });
   if (world.map.zones[0]) {
-    mk({ type: 'investigate', title: 'Investigate the anomaly at ' + regionName(world, world.map.zones[0].regionId), objective: { kind: 'investigate', regionId: world.map.zones[0].regionId }, reward: { credits: 1400, rep: 18, computeCredits: 12 }, risk: 0.75, reqSkills: ['navigation', 'analysis', 'combat'], deadline: 300 });
+    mk({ type: 'investigate', title: 'Investigate the anomaly at ' + regionName(world, world.map.zones[0].regionId), objective: { kind: 'investigate', regionId: world.map.zones[0].regionId }, reward: { credits: 1400, rep: 18, compute: 12 }, risk: 0.75, reqSkills: ['navigation', 'analysis', 'combat'], deadline: 300 });
   }
   return list;
 }
@@ -473,51 +493,55 @@ function agentTick(world, a, rng, t) {
     else a.planStuckTicks = 0;
   }
   if (a.planStuckTicks > 14) { a.planDone = true; }
-  a.inv.energy = Math.max(0, a.inv.energy - 0.02);
-  a.inv.food = Math.max(0, a.inv.food - 0.02);
-  if (a.inv.food < 2) a.health = Math.max(0.05, a.health - 0.02);
-  if (a.inv.energy < 2) a.health = Math.max(0.05, a.health - 0.015);
-  if (a.health < 1 && a.inv.food > 5 && a.inv.energy > 5) a.health = Math.min(1, a.health + 0.008);
-  a.morale = Math.max(0, Math.min(1, a.morale + (a.health - 0.5) * 0.002 + (a.planKey === 'rest' ? 0.01 : 0)));
+  // State dynamics (layer 1): energy/focus are operational capacity — they
+  // regenerate with rest and are spent by action. Morale follows economic
+  // security and outcomes. Health is a derived projection, not a resource.
+  if (a.planKey === 'rest' || a.status === 'resting') {
+    a.energy = Math.min(100, a.energy + 1.6);
+    a.focus = Math.min(100, a.focus + 1.1);
+    a.morale = Math.min(100, a.morale + 0.4);
+  } else {
+    a.energy = Math.max(0, a.energy - 0.06);
+    a.focus = Math.min(100, a.focus + 0.03);
+  }
+  a.health = Math.max(0.2, Math.min(1, 0.45 + a.energy / 250 + a.morale / 400));
+  a.reputation = Math.round(repScore(a));
   if (a.replanCooldown > 0) a.replanCooldown--;
-  const wealth = a.inv.credits + a.inv.rare * 40 + a.inv.materials * 5 + a.inv.energy * 3 + a.inv.food * 2;
+  const wealth = a.credits + a.compute * 2 + a.data * BASE_PRICES.data;
   a.wealth = Math.max(a.wealth || 0, wealth);
 }
 
 function upkeep(world, a) {
   const r = regionOf(world, a);
-  a.inv.food = Math.max(0, a.inv.food - 0.05);
-  a.inv.energy = Math.max(0, a.inv.energy - 0.08);
-  a.inv.credits = Math.max(0, a.inv.credits - 0.2);
+  // Operating cost: every agent pays for lodging, bandwidth and tooling each
+  // tick — the economic reason work exists. No arbitrary "food" bar.
+  a.credits = Math.max(0, a.credits - 0.2);
+  a.energy = Math.max(0, a.energy - 0.1);
   if (r && r.owner && a.org && r.owner !== a.org && r.infra.defense > 0) {
-    a.inv.credits = Math.max(0, a.inv.credits - 0.1);
+    a.credits = Math.max(0, a.credits - 0.1);
   }
   if (a.org) {
     const org = world.orgs[a.org];
     if (org) {
       const tax = 0.05 * (org.policies.taxRate || 0.06);
-      const amt = a.inv.credits * tax;
+      const amt = a.credits * tax;
       if (amt > 0.1) {
-        a.inv.credits -= amt;
+        a.credits -= amt;
         org.treasury.credits += amt;
         ledgerTx(world, { from: a.id, to: 'org:' + org.id, res: 'credits', amount: Math.round(amt * 100) / 100, reason: 'org-tax' });
         a.stats.taxesPaid += Math.round(amt * 100) / 100;
       }
     }
   }
-  if (a.inv.energy < 3 && r) {
-    const m = world.markets[a.loc && world.regions.find(x => x.id === a.loc.regionId) && a.loc.regionId ? (world.map.cities.find(c => c.regionId === a.loc.regionId) || {}).id : null];
-    if (m && a.inv.credits > 20) {
-      const q = Math.min(10, m.supply.energy, Math.floor(a.inv.credits / m.prices.energy));
-      if (q > 0) doTrade(world, a, m, 'buy', 'energy', q);
-    }
-  }
+  // Morale follows economic security: solvency calms, poverty stresses.
+  if (a.credits > 200) a.morale = Math.min(100, a.morale + 0.05);
+  else if (a.credits < 20) a.morale = Math.max(0, a.morale - 0.08);
 }
 
 function shouldReplan(world, a, rng, t) {
   if (a.replanCooldown > 0) return false;
-  if (a.health < 0.4) return true;
-  if (a.inv.food < 4 || a.inv.energy < 4) return true;
+  if (a.energy < 18 || a.morale < 18) return true;
+  if (a.credits < 5) return true;
   if (a.contracts && a.contracts.some(id => world.contracts[id] && world.contracts[id].state === 'active' && world.contracts[id].acceptedTick === t)) return true;
   if (a.stepIx > 0 && a.stepIx >= (a.plans ? a.plans.length : 0)) return true;
   const ev = recentRelevantEvent(world, a);
@@ -583,13 +607,13 @@ function observe(world, a) {
   const facts = [];
   const r = regionOf(world, a);
   const city = cityAt(world, r);
-  if (a.inv.food < 6) facts.push({ text: `food low (${a.inv.food.toFixed(1)})`, tags: ['need', 'food'] });
-  if (a.inv.energy < 6) facts.push({ text: `energy low (${a.inv.energy.toFixed(1)})`, tags: ['need', 'energy'] });
-  if (a.health < 0.4) facts.push({ text: 'health low', tags: ['need', 'health'] });
+  if (a.energy < 30) facts.push({ text: `energy low (${Math.round(a.energy)})`, tags: ['need', 'energy'] });
+  if (a.credits < 30) facts.push({ text: `credits low (${Math.round(a.credits)})`, tags: ['need', 'credits'] });
+  if (a.morale < 30) facts.push({ text: `morale low (${Math.round(a.morale)})`, tags: ['need', 'morale'] });
   if (city) {
     const m = world.markets[city.id];
     facts.push({ text: `at ${city.name}; ${resList(m.prices)}`, tags: ['city', city.id] });
-    for (const res of ['materials', 'rare']) {
+    for (const res of MKT_RES) {
       const p = m.prices[res];
       if (p > BASE_PRICES[res] * 1.4) facts.push({ text: `${RES_LABEL[res]} expensive in ${city.name} (${p.toFixed(1)})`, tags: ['opportunity', 'sell', res, city.id] });
       if (p < BASE_PRICES[res] * 0.7) facts.push({ text: `${RES_LABEL[res]} cheap in ${city.name} (${p.toFixed(1)})`, tags: ['opportunity', 'buy', res, city.id] });
@@ -608,22 +632,22 @@ function observe(world, a) {
       if (needs.length) facts.push({ text: `${org.name} territory lacks relay coverage`, tags: ['org', 'build'] });
     }
   }
-  if (a.compute.results && a.compute.results.forecast) {
-    const f = a.compute.results.forecast.result;
+  if (a.computeTrack.results && a.computeTrack.results.forecast) {
+    const f = a.computeTrack.results.forecast.result;
     facts.push({ text: `forecast: ${f.trend} (${f.deltaPct.toFixed(1)}%)`, tags: ['compute', 'market'] });
   }
   return facts;
 }
 
 function evaluate(world, a, facts, rng) {
-  const inv = a.inv;
   const cands = [];
   const pushCand = (key, label, baseScore, tags) => {
     cands.push({ key, label, score: baseScore, tags: tags || [] });
   };
-  if (inv.food < 6) pushCand('gather-food', 'Secure food supply', 2.2 + (1 - inv.food / 6) * 1.5, ['need']);
-  if (inv.energy < 6) pushCand('gather-energy', 'Secure energy', 2.0 + (1 - inv.energy / 6) * 1.5, ['need']);
-  if (a.health < 0.4) pushCand('rest', 'Recover health', 3.0, ['need']);
+  // Needs are economic now: recover capacity or earn a living.
+  if (a.energy < 30) pushCand('rest', 'Recover energy', 2.6 + (30 - a.energy) / 12, ['need']);
+  if (a.credits < 40) pushCand('work', 'Take paid work', 2.4 + (40 - a.credits) / 14, ['need']);
+  if (a.morale < 30) pushCand('rest', 'Restore morale', 1.8, ['need']);
   const city = cityAt(world, regionOf(world, a));
   if (city) {
     const m = world.markets[city.id];
@@ -642,30 +666,30 @@ function evaluate(world, a, facts, rng) {
     pushCand('contract', `Take contract: ${best.title}`, (0.8 + a.w.contract) * (1 + best.reward.credits / 800), ['contract']);
   }
   const unexplored = adjacentRegions(world, a).filter(x => !x.explored);
-  if (unexplored.length) pushCand('explore', `Explore ${unexplored[0].name}`, 1.1 * a.w.discover * (0.5 + a.personality.curiosity), ['explore']);
+  if (unexplored.length && a.energy > 35) pushCand('explore', `Explore ${unexplored[0].name}`, 1.1 * a.w.discover * (0.5 + a.personality.curiosity), ['explore']);
   const rich = richRegionMemory(world, a);
-  if (rich && inv.energy > 8) pushCand('mine', `Mine ${rich.name} (rare)`, 1.3 * a.w.wealth * (0.4 + a.skills.navigation * 0.1), ['gather']);
+  if (rich && a.energy > 35) pushCand('mine', `Contract work at ${rich.name}`, 1.3 * a.w.wealth * (0.4 + a.skills.navigation * 0.1), ['gather']);
   const lab = labRegion(world);
-  if (lab && inv.data > 3 && inv.computeCredits > 6) pushCand('research', `Research at ${lab.name}`, 1.5 * a.w.research * (0.4 + a.skills.science * 0.15), ['research']);
+  if (lab && a.data > 2 && a.compute > 6) pushCand('research', `Research at ${lab.name}`, 1.5 * a.w.research * (0.4 + a.skills.science * 0.15), ['research']);
   if (a.org) {
     const org = world.orgs[a.org];
     if (org) {
       const needRelay = org.territory.find(rid => world.regions.find(x => x.id === rid) && world.regions.find(x => x.id === rid).infra.relays === 0);
-      if (needRelay && inv.materials > 15) pushCand('build', `Build relay in ${regionName(world, needRelay)} for ${org.name}`, 1.6 * a.w.build * (0.5 + a.skills.engineering * 0.12), ['org', 'build']);
+      if (needRelay && a.credits > 150) pushCand('build', `Build relay in ${regionName(world, needRelay)} for ${org.name}`, 1.6 * a.w.build * (0.5 + a.skills.engineering * 0.12), ['org', 'build']);
       const dispute = world.fact.disputes.find(d => d.state === 'active' && (d.orgA === a.org || d.orgB === a.org));
       if (dispute) pushCand('contest', `Press claim in ${regionName(world, dispute.regionId)}`, 1.7 * a.w.conflict * (0.5 + a.skills.combat * 0.1), ['conflict']);
     }
   }
   if (world.fact.disputes.some(d => d.state === 'active') && (a.archetype === 'mercenary' || a.archetype === 'opportunist')) pushCand('contract', 'Take a conflict contract', 1.4 * a.w.conflict, ['conflict']);
   const driveWealth = a.w.wealth * (0.4 + a.personality.greed * 0.5);
-  pushCand('accumulate', 'Build wealth', driveWealth * 1.1, ['drive']);
-  if (a.w.discover > 0.8) pushCand('explore-far', 'Chart distant lands', 1.0 * a.w.discover, ['drive']);
-  if (a.w.research > 0.8) pushCand('research', 'Advance research', 1.0 * a.w.research, ['drive']);
-  if (a.w.power > 0.7 && !a.org) pushCand('found-org', 'Found an organization', 1.4 * a.w.power, ['drive']);
+  if (a.energy > 40) pushCand('accumulate', 'Build wealth', driveWealth * 1.1, ['drive']);
+  if (a.w.discover > 0.8 && a.energy > 40) pushCand('explore-far', 'Chart distant lands', 1.0 * a.w.discover, ['drive']);
+  if (a.w.research > 0.8 && a.compute > 6) pushCand('research', 'Advance research', 1.0 * a.w.research, ['drive']);
+  if (a.w.power > 0.7 && !a.org && a.credits >= 800) pushCand('found-org', 'Found an organization', 1.4 * a.w.power, ['drive']);
   const myOrg = a.org && world.orgs[a.org];
   if (myOrg && a.w.power > 0.8 && myOrg.members.length < 4) pushCand('recruit', `Recruit for ${myOrg.name}`, 1.2 * a.w.power, ['org']);
-  if (a.w.protect > 0.9) pushCand('patrol', 'Patrol for safety', 1.4 * a.w.protect, ['drive']);
-  if (a.personality.risk > 0.6 && a.skills.stealth > 2.5) pushCand('sabotage', 'Disrupt a rival', 1.2 * (a.personality.risk - 0.4), ['conflict']);
+  if (a.w.protect > 0.9 && a.energy > 40) pushCand('patrol', 'Patrol for safety', 1.4 * a.w.protect, ['drive']);
+  if (a.personality.risk > 0.6 && a.skills.stealth > 2.5 && a.energy > 40) pushCand('sabotage', 'Disrupt a rival', 1.2 * (a.personality.risk - 0.4), ['conflict']);
   for (const c of cands) {
     c.score += (rng.float() - 0.5) * 0.6;
     c.score *= 0.85 + a.personality.ambition * 0.3;
@@ -684,7 +708,7 @@ function contractSteps(world, a, ct) {
     case 'deliver': {
       const tr = cityRegion(obj.toCityId);
       const hereCity = cityAt(world, here);
-      const needBuy = (a.inv[obj.res] || 0) < obj.qty * 0.8;
+      const needBuy = (a[obj.res] || 0) < obj.qty * 0.8;
       if (needBuy && hereCity && hereCity.id !== obj.toCityId) {
         steps.push({ kind: 'buy', res: obj.res, qty: obj.qty, cityId: hereCity.id });
       } else if (needBuy) {
@@ -694,7 +718,7 @@ function contractSteps(world, a, ct) {
           steps.push({ kind: 'buy', res: obj.res, qty: obj.qty, cityId: source.id });
         }
       }
-      add(steps, tr, [{ kind: 'sell', res: obj.res, qty: Math.max(obj.qty, (a.inv[obj.res] || 0)) + 10, cityId: obj.toCityId }]);
+      add(steps, tr, [{ kind: 'sell', res: obj.res, qty: Math.max(obj.qty, (a[obj.res] || 0)) + 10, cityId: obj.toCityId }]);
       break;
     }
     case 'explore': add(steps, obj.regionId, [{ kind: 'explore', regionId: obj.regionId }]); break;
@@ -712,7 +736,6 @@ function contractSteps(world, a, ct) {
 }
 
 function buildPlan(world, a, c, rng) {
-  const inv = a.inv;
   const steps = [];
   const here = a.loc.regionId;
   const add = (arr, targetRegion, inner) => {
@@ -720,14 +743,16 @@ function buildPlan(world, a, c, rng) {
     arr.push(...inner);
   };
   switch (c.key) {
-    case 'gather-food': {
-      const r = nearestRegionWith(world, here, r => r.prod.food > 1.5);
-      add(steps, r ? r.id : here, [{ kind: 'gather', res: 'food', qty: Math.round(12 + rng.float() * 10), regionId: r ? r.id : here }]);
+    case 'work': {
+      // Paid labor: energy → credits + experience. The economic baseline.
+      const r = nearestRegionWith(world, here, r => r.prod.food > 1 || r.prod.materials > 1 || (r.nodes && r.nodes.length));
+      const city = cityAt(world, regionOf(world, a));
+      add(steps, r ? r.id : (city ? city.regionId : here), [{ kind: 'work', ticks: 6 + rng.int(0, 6), regionId: r ? r.id : here }]);
       break;
     }
-    case 'gather-energy': {
-      const r = nearestRegionWith(world, here, r => r.prod.energy > 2);
-      add(steps, r ? r.id : here, [{ kind: 'gather', res: 'energy', qty: Math.round(14 + rng.float() * 8), regionId: r ? r.id : here }]);
+    case 'mine': {
+      const r = nearestRegionWith(world, here, r => r.nodes && r.nodes.length);
+      add(steps, r ? r.id : here, [{ kind: 'mine', ticks: 6 + rng.int(0, 6), regionId: r ? r.id : here }]);
       break;
     }
     case 'rest':
@@ -739,13 +764,13 @@ function buildPlan(world, a, c, rng) {
       const m = world.markets[city.id];
       const res = MKT_RES.find(x => m.prices[x] < BASE_PRICES[x] * 0.72);
       if (!res) break;
-      steps.push({ kind: 'buy', res, qty: Math.round(Math.min(40, inv.credits / (m.prices[res] * 1.2))), cityId: city.id });
+      steps.push({ kind: 'buy', res, qty: Math.round(Math.min(40, credits / (m.prices[res] * 1.2))), cityId: city.id });
       break;
     }
     case 'trade-sell': {
       const target = bestSellTarget(world, a);
       if (!target) break;
-      steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(40, inv.credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
+      steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(40, credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
       add(steps, target.buyCityId, [{ kind: 'sell', res: target.res, qty: 60, cityId: target.city.id }]);
       break;
     }
@@ -800,17 +825,17 @@ function buildPlan(world, a, c, rng) {
     case 'accumulate': {
       const target = bestSellTarget(world, a);
       if (target) {
-        steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(30, inv.credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
-        add(steps, target.buyCityId, [{ kind: 'sell', res: target.res, qty: 50, cityId: target.city.id }]);
+        steps.push({ kind: 'buy', res: target.res, qty: Math.round(Math.min(30, a.credits / (world.markets[target.buyCityId].prices[target.res] * 1.2))), cityId: target.buyCityId });
+        add(steps, target.city.id, [{ kind: 'sell', res: target.res, qty: 50, cityId: target.city.id }]);
       } else {
-        const r = nearestRegionWith(world, here, r => r.prod.materials > 2);
-        add(steps, r ? r.id : here, [{ kind: 'gather', res: 'materials', qty: 20, regionId: r ? r.id : here }]);
+        const r = nearestRegionWith(world, here, r => r.prod.materials > 2 || r.prod.food > 1);
+        add(steps, r ? r.id : here, [{ kind: 'work', ticks: 8, regionId: r ? r.id : here }]);
       }
       break;
     }
     case 'found-org': {
-      if (inv.credits >= 800) steps.push({ kind: 'found-org' });
-      else { const r = nearestRegionWith(world, here, r => r.prod.materials > 2); add(steps, r ? r.id : here, [{ kind: 'gather', res: 'materials', qty: 20, regionId: r ? r.id : here }]); }
+      if (a.credits >= 800) steps.push({ kind: 'found-org' });
+      else { const r = nearestRegionWith(world, here, r => r.prod.materials > 2 || r.prod.food > 1); add(steps, r ? r.id : here, [{ kind: 'work', ticks: 10, regionId: r ? r.id : here }]); }
       break;
     }
     case 'recruit': {
@@ -841,6 +866,7 @@ function executeStep(world, a, rng, t) {
   if (!st) { a.planDone = true; return; }
   switch (st.kind) {
     case 'travel': doTravel(world, a, st, t); break;
+    case 'work': doGather(world, a, st, rng); break;
     case 'gather': doGather(world, a, st, rng); break;
     case 'mine': doMine(world, a, st, rng); break;
     case 'buy': doBuyStep(world, a, st); break;
@@ -849,7 +875,7 @@ function executeStep(world, a, rng, t) {
     case 'research': doResearch(world, a, st, rng); break;
     case 'build': doBuild(world, a, st, rng); break;
     case 'contract': doContractWork(world, a, st, rng); break;
-    case 'rest': { st.ticks--; if (st.ticks <= 0) advanceStep(a); a.health = Math.min(1, a.health + 0.02); a.morale = Math.min(1, a.morale + 0.02); a.status = 'resting'; break; }
+    case 'rest': { st.ticks--; if (st.ticks <= 0) advanceStep(a); a.energy = Math.min(100, a.energy + 1.8); a.focus = Math.min(100, a.focus + 1.2); a.morale = Math.min(100, a.morale + 0.5); a.status = 'resting'; break; }
     case 'contest': doContest(world, a, st, rng); break;
     case 'patrol': { st.ticks--; const r = world.regions.find(x => x.id === st.regionId); if (r) { r.infra.defense = Math.min(10, r.infra.defense + 0.5); } if (st.ticks <= 0) advanceStep(a); a.status = 'patrolling'; break; }
     case 'recruit': doRecruit(world, a, st); advanceStep(a); break;
@@ -900,46 +926,57 @@ function doTravel(world, a, st, t) {
       }
     }
   }
-  a.inv.energy = Math.max(0, a.inv.energy - 0.06);
+  a.energy = Math.max(0, a.energy - 0.06);
 }
 
+// Paid field work (v2): labor converts energy into credits + experience.
+// The region's economy buys the harvest — agents hold no material inventory.
 function doGather(world, a, st, rng) {
   const r = world.regions.find(x => x.id === st.regionId);
   if (!r) { a.planDone = true; return; }
-  const skill = st.res === 'food' ? 1 + a.skills.navigation * 0.15 : 1 + a.skills.trade * 0.1;
-  const amount = Math.min(r.resources[st.res] || 0, (0.7 + rng.float() * 0.6) * skill);
-  r.resources[st.res] = Math.max(0, (r.resources[st.res] || 0) - amount);
-  a.inv[st.res] += amount;
-  a.inv.energy = Math.max(0, a.inv.energy - 0.3);
-  a.inv.food = Math.max(0, a.inv.food - 0.02);
-  a.status = 'gathering';
-  st.acc = (st.acc || 0) + amount;
-  if ((a.inv[st.res] || 0) >= st.qty) {
+  const skill = 1 + a.skills.navigation * 0.15 + a.skills.trade * 0.1;
+  const yieldUnits = (0.7 + rng.float() * 0.6) * skill;
+  const pay = yieldUnits * 2.2; // credits per unit of field work
+  a.credits += pay;
+  a.stats.earned += pay;
+  gainXp(a, 'navigation', 1);
+  a.energy = Math.max(0, a.energy - 1.4);
+  a.focus = Math.max(0, a.focus - 0.3);
+  a.status = 'working';
+  st.acc = (st.acc || 0) + pay;
+  st.ticksLeft = (st.ticksLeft == null ? (st.ticks || 8) : st.ticksLeft) - 1;
+  if (st.ticksLeft <= 0) {
     const got = Math.round(st.acc);
-    a.stats.produced += got;
-    act(world, a, 'gather', 'gathered', `gathered ${got} ${RES_LABEL[st.res]} in ${r.name}`, { regionId: r.id, value: got });
+    act(world, a, 'work', 'worked', `field work in ${r.name} → +${got} Cr`, { regionId: r.id, value: got });
     advanceStep(a);
   }
 }
 
+// Contract extraction work (v2): heavier labor at resource nodes, better pay.
 function doMine(world, a, st, rng) {
   const r = world.regions.find(x => x.id === st.regionId);
   if (!r) { a.planDone = true; return; }
-  const node = r.nodes.find(n => n.stock[st.res] > 0) || r.nodes[0];
-  const amount = Math.min(node ? node.stock[st.res] : 0, 1.2 + a.skills.engineering * 0.5);
+  const node = r.nodes && r.nodes.find(n => (n.stock.rare + n.stock.materials + n.stock.energy + n.stock.food) > 0);
+  const amount = node ? Math.min(1.2 + a.skills.engineering * 0.5, 3) : 1.5;
   if (node) {
-    node.stock[st.res] = Math.max(0, node.stock[st.res] - amount);
+    const per = amount / 4;
+    for (const k of ['rare', 'materials', 'energy', 'food']) {
+      node.stock[k] = Math.max(0, (node.stock[k] || 0) - per);
+    }
     if (node.stock.rare <= 0 && node.stock.materials <= 0 && node.stock.energy <= 0 && node.stock.food <= 0) node.exhausted = 1;
   }
-  a.inv[st.res] += amount;
-  a.inv.energy = Math.max(0, a.inv.energy - 0.5);
-  a.inv.food = Math.max(0, a.inv.food - 0.02);
-  a.status = 'mining';
-  st.acc = (st.acc || 0) + amount;
-  if ((a.inv[st.res] || 0) >= st.qty) {
+  const pay = amount * 4.5; // extraction pays more than field work
+  a.credits += pay;
+  a.stats.earned += pay;
+  gainXp(a, 'engineering', 1.2);
+  a.energy = Math.max(0, a.energy - 2.2);
+  a.focus = Math.max(0, a.focus - 0.5);
+  a.status = 'working';
+  st.acc = (st.acc || 0) + pay;
+  st.ticksLeft = (st.ticksLeft == null ? (st.ticks || 8) : st.ticksLeft) - 1;
+  if (st.ticksLeft <= 0) {
     const got = Math.round(st.acc);
-    a.stats.produced += got;
-    act(world, a, 'mine', 'mined', `mined ${got} ${RES_LABEL[st.res]} at ${r.name}`, { regionId: r.id, value: got });
+    act(world, a, 'work', 'extracted', `extraction work at ${r.name} → +${got} Cr`, { regionId: r.id, value: got });
     advanceStep(a);
   }
 }
@@ -949,7 +986,7 @@ function doBuyStep(world, a, st) {
   const hereCity = cityAt(world, regionOf(world, a));
   if (!hereCity || hereCity.id !== st.cityId) { const target = city && city.regionId; if (target) a.plans.splice(a.stepIx, 0, { kind: 'travel', target }); else a.planDone = true; return; }
   const m = world.markets[st.cityId];
-  const q = Math.min(st.qty, 25, m.supply[st.res], Math.floor(a.inv.credits / m.prices[st.res]));
+  const q = Math.min(st.qty, 25, m.supply[st.res], Math.floor(a.credits / m.prices[st.res]));
   if (q <= 0) { advanceStep(a); return; }
   doTrade(world, a, m, 'buy', st.res, q);
   st.qty -= q;
@@ -960,7 +997,7 @@ function doSellStep(world, a, st) {
   const hereCity = cityAt(world, regionOf(world, a));
   if (!hereCity || hereCity.id !== st.cityId) { const city = world.map.cities.find(c => c.id === st.cityId); const target = city && city.regionId; if (target) a.plans.splice(a.stepIx, 0, { kind: 'travel', target }); else a.planDone = true; return; }
   const m = world.markets[st.cityId];
-  const q = Math.min(st.qty, 25, a.inv[st.res]);
+  const q = Math.min(st.qty, 25, a[st.res]);
   if (q <= 0) { advanceStep(a); return; }
   doTrade(world, a, m, 'sell', st.res, q);
   st.qty -= q;
@@ -970,11 +1007,11 @@ function doSellStep(world, a, st) {
 export function doTrade(world, a, m, side, res, qty) {
   const price = m.prices[res];
   if (side === 'buy') {
-    const q = Math.min(qty, m.supply[res] || 0, Math.floor(a.inv.credits / price));
+    const q = Math.min(qty, m.supply[res] || 0, Math.floor(a.credits / price));
     if (q <= 0) return null;
     const cost = Math.round(q * price * 100) / 100;
-    a.inv.credits -= cost;
-    a.inv[res] += q;
+    a.credits -= cost;
+    a[res] += q;
     m.supply[res] = Math.max(0, (m.supply[res] || 0) - q);
     m.buyVol[res] += q;
     m.credits += cost;
@@ -992,11 +1029,11 @@ export function doTrade(world, a, m, side, res, qty) {
     }
     return { side, q, price, cost };
   }
-  const q = Math.min(qty, a.inv[res] || 0, Math.floor(m.credits / price));
+  const q = Math.min(qty, a[res] || 0, Math.floor(m.credits / price));
   if (q <= 0) return null;
   const pay = Math.round(q * price * 100) / 100;
-  a.inv[res] -= q;
-  a.inv.credits += pay;
+  a[res] -= q;
+  a.credits += pay;
   m.supply[res] += q;
   m.sellVol[res] += q;
   m.credits -= pay;
@@ -1037,7 +1074,7 @@ function doExplore(world, a, st, rng) {
   a.stats.discoveries++;
   a.stats.earned += reward;
   act(world, a, 'explore', 'discovered', `discovered ${r.name} — ${BIOME_INFO[r.biome].label}, ${Math.round(r.resources.rare)} rare reserves`, { regionId: r.id, value: reward });
-  a.inv.data = (a.inv.data || 0) + 1 + rng.int(0, 3);
+  a.data = (a.data || 0) + 1 + rng.int(0, 3);
   a.rep.cooperation = Math.min(100, a.rep.cooperation + 1);
   a.rep.score = repScore(a);
   addMemory(world, a, { type: 'location', importance: 0.9, tags: ['region', r.id, 'discovered'], regionId: r.id, text: `Discovered ${r.name} (${BIOME_INFO[r.biome].label}).` });
@@ -1060,25 +1097,25 @@ function doResearch(world, a, st, rng) {
   const tech = world.fact.tech[techName] || (world.fact.tech[techName] = { name: techName, level: 0, progress: 0, target: 120 });
   const job = st.execId ? world.compute.jobs[st.execId] : null;
   if (job && job.status === 'queued') {
-    a.inv.energy = Math.max(0, (a.inv.energy || 0) - 0.5);
+    a.energy = Math.max(0, (a.energy || 0) - 0.5);
     a.status = 'researching (compute)';
     return;
   }
-  if (a.inv.data < 1.2 || a.inv.computeCredits < 1 || a.inv.energy < 1) { a.planDone = true; return; }
-  if (!st.execId && !st.boostApplied && (a.inv.computeCredits || 0) >= 15) {
-    const req = requestCompute(world, a.id, 'researchsim', { tech: techName, region: r.id, data: Math.min(8, a.inv.data || 0), techLevel: tech.level, quality: 0.6 + a.skills.science * 0.15 }, 15);
+  if (a.data < 1.2 || a.compute < 1 || a.energy < 1) { a.planDone = true; return; }
+  if (!st.execId && !st.boostApplied && (a.compute || 0) >= 15) {
+    const req = requestCompute(world, a.id, 'researchsim', { tech: techName, region: r.id, data: Math.min(8, a.data || 0), techLevel: tech.level, quality: 0.6 + a.skills.science * 0.15 }, 15);
     if (req.ok) st.execId = req.executionId;
   }
-  a.inv.data -= 1.2;
-  a.inv.computeCredits -= 1;
-  a.inv.energy -= 1;
+  a.data -= 1.2;
+  a.compute -= 1;
+  a.energy -= 1;
   let gain = (0.6 + a.skills.science * 0.35) * (1 + tech.level * 0.12);
-  const res = st.execId && a.compute.results && a.compute.results.researchsim;
+  const res = st.execId && a.computeTrack.results && a.computeTrack.results.researchsim;
   if (res && res.executionId === st.execId && !st.boostApplied) {
     st.boostApplied = true;
     const boost = (res.result.progress || 0);
     gain += boost;
-    a.inv.data = Math.max(0, (a.inv.data || 0) - (res.result.applied || 0));
+    a.data = Math.max(0, (a.data || 0) - (res.result.applied || 0));
     a.achievements.push({ tick: world.clock.t, kind: 'compute', detail: `Computed research simulation on ${techName} (+${Math.round(boost)} progress).` });
     pushEvent(world, { type: 'compute-used', source: 'agent', actor: a.id, executionId: st.execId, detail: `${a.name} runs a research simulation (${st.execId}) on ${techName}.` });
   }
@@ -1091,7 +1128,7 @@ function doResearch(world, a, st, rng) {
     tech.progress = 0;
     tech.target = Math.round(tech.target * 1.6);
     payAgent(world, 'world', a, 'credits', 260 + tech.level * 140, 'breakthrough');
-    payAgent(world, 'world', a, 'computeCredits', 8, 'breakthrough');
+    payAgent(world, 'world', a, 'compute', 8, 'breakthrough');
     a.stats.breakthroughs++;
     a.stats.earned += 260 + tech.level * 140;
     act(world, a, 'research', 'breakthrough', `advanced ${techName} to level ${tech.level}`, { regionId: r.id, value: 260 + tech.level * 140 });
@@ -1124,10 +1161,12 @@ function doBuild(world, a, st, rng) {
   if (!r) { a.planDone = true; return; }
   const cost = { relays: 6, labs: 12, factories: 16, refineries: 10, defense: 8 };
   const need = cost[st.facility] || 6;
-  if (a.inv.materials < need || a.inv.energy < need * 0.5) { a.planDone = true; return; }
+  const creditsCost = need * 12; // materials bought on market — folded into a credits cost
+  if (a.credits < creditsCost || a.energy < need * 0.5) { a.planDone = true; return; }
   st.progress = (st.progress || 0) + (0.5 + a.skills.engineering * 0.3);
-  a.inv.materials -= need * 0.2;
-  a.inv.energy -= need * 0.3;
+  a.credits -= creditsCost * 0.2;
+  a.energy = Math.max(0, a.energy - need * 0.3);
+  gainXp(a, 'engineering', 1);
   a.status = 'building';
   if (st.progress >= st.ticks || !st.ticks) {
     r.infra[st.facility] = (r.infra[st.facility] || 0) + 1;
@@ -1224,7 +1263,7 @@ export function completeContract(world, a, ct) {
     const org = world.orgs[issuer.slice(4)];
     if (org && org.treasury.credits >= pay) {
       org.treasury.credits -= pay;
-      a.inv.credits += pay;
+      a.credits += pay;
       paid = true;
     }
   }
@@ -1232,7 +1271,7 @@ export function completeContract(world, a, ct) {
     payAgent(world, 'world', a, 'credits', pay, 'contract-reward:' + ct.id);
     paid = true;
   }
-  if (reward.computeCredits) payAgent(world, 'world', a, 'computeCredits', reward.computeCredits, 'contract-reward');
+  if (reward.compute) payAgent(world, 'world', a, 'compute', reward.compute, 'contract-reward');
   a.rep.reliability = Math.min(100, a.rep.reliability + (reward.rep || 3) * 1.5);
   a.rep.cooperation = Math.min(100, a.rep.cooperation + (reward.rep || 2));
   a.rep.score = repScore(a);
@@ -1304,7 +1343,7 @@ function marketTick(world, m, t) {
           type: 'deliver',
           title: `Relieve the ${RES_LABEL[res].toLowerCase()} shortage at ${city.name}`,
           objective: { kind: 'deliver', res, qty: 120, toCityId: m.cityId },
-          reward: { credits: Math.round(BASE_PRICES[res] * 120 * 1.6), rep: 8, computeCredits: 6 },
+          reward: { credits: Math.round(BASE_PRICES[res] * 120 * 1.6), rep: 8, compute: 6 },
           risk: 0.3,
           reqSkills: ['trade', 'navigation'],
           deadline: 140,
@@ -1524,8 +1563,8 @@ export function leaveOrg(world, a) {
 
 export function foundOrg(world, a, name, type, rng) {
   if (a.org) return { ok: false, err: 'already-in-org' };
-  if (a.inv.credits < 800) return { ok: false, err: 'need-800-credits' };
-  a.inv.credits -= 800;
+  if (a.credits < 800) return { ok: false, err: 'need-800-credits' };
+  a.credits -= 800;
   const orgId = 'org' + (world.stats.founded++);
   const homeRegion = regionOf(world, a);
   const orgName = name || rng.pick(ORG_NAME) + ' ' + rng.pick(ORG_SUFFIX);
@@ -1816,7 +1855,8 @@ function bestSellTarget(world, a) {
   for (const city of knownCities) {
     const m = world.markets[city.id];
     if (!m) continue;
-    for (const res of ['materials', 'food', 'energy']) {
+    for (const res of MKT_RES) {
+      if ((a[res] || 0) < 3) continue; // must actually hold the stock
       if (m.prices[res] < BASE_PRICES[res] * 0.85) continue;
       const score = (m.prices[res] - BASE_PRICES[res]) * 10;
       if (!best || score > best.score) best = { score, city, res, buyCityId: city.id };

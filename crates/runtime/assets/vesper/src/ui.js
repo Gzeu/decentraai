@@ -80,7 +80,7 @@ export function createUI(deps) {
   }
   function money(n) { return fmt(n) + ' <span class="faint">Cr</span>'; }
   function resOf(a, res) {
-    const v = a.inv[res] || 0;
+    const v = a[res] || 0;
     const sym = RES_SYM[res] || '';
     return sym + ' ' + (Number.isInteger(v) ? v : v.toFixed(1));
   }
@@ -470,7 +470,7 @@ export function createUI(deps) {
     c.appendChild(obj);
     const row = h('div', 'kv-row mt8');
     row.appendChild(h('span', 'k', 'Wealth'));
-    row.appendChild(h('span', 'v', fmtMoney(a.inv.credits || 0)));
+    row.appendChild(h('span', 'v', fmtMoney(a.credits || 0)));
     const row2 = h('div', 'kv-row');
     row2.appendChild(h('span', 'k', 'Reputation'));
     row2.appendChild(h('span', 'v', a.rep.score + ''));
@@ -552,7 +552,7 @@ export function createUI(deps) {
         const t4 = h('td', 'num');
         const rewardParts = [];
         if (c.reward.credits) rewardParts.push(fmt(c.reward.credits) + ' Cr');
-        if (c.reward.computeCredits) rewardParts.push('◍' + c.reward.computeCredits);
+        if (c.reward.compute) rewardParts.push('◍' + c.reward.compute);
         if (c.reward.data) rewardParts.push('◉' + c.reward.data);
         t4.innerHTML = rewardParts.join('<br>');
         const t5 = h('td'); t5.textContent = fmtTick(c.deadlineTick) + (c.deadlineTick < w.clock.t ? ' <span class="bad">overdue</span>' : '');
@@ -595,7 +595,7 @@ export function createUI(deps) {
       selCity.appendChild(o);
     }
     const selRes = h('select', 'select');
-    for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+    for (const r of MKT_RES) {
       const o = h('option', '', RES_LABEL[r]);
       o.value = r;
       selRes.appendChild(o);
@@ -614,7 +614,7 @@ export function createUI(deps) {
       const grid = h('div', 'grid cols-3');
       const priceCard = h('div', 'card');
       priceCard.appendChild(h('h4', '', 'Prices'));
-      for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+      for (const r of MKT_RES) {
         const rw = h('div', 'kv-row');
         rw.appendChild(h('span', 'k', RES_LABEL[r]));
         const v = h('span', 'v');
@@ -627,7 +627,7 @@ export function createUI(deps) {
       grid.appendChild(priceCard);
       const supCard = h('div', 'card');
       supCard.appendChild(h('h4', '', 'Supply / Demand'));
-      for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+      for (const r of MKT_RES) {
         const rw = h('div', 'kv-row');
         rw.appendChild(h('span', 'k', RES_LABEL[r]));
         const v = h('span', 'v');
@@ -641,7 +641,7 @@ export function createUI(deps) {
       flowCard.appendChild(kv('Credits reserve', fmtMoney(m.credits)));
       flowCard.appendChild(kv('Price index', m.priceIdx.toFixed(2)));
       const vols = h('div', 'mt8');
-      for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+      for (const r of MKT_RES) {
         const rw = h('div', 'kv-row');
         rw.appendChild(h('span', 'k', RES_LABEL[r] + ' traded'));
         rw.appendChild(h('span', 'v', (m.buyVol[r] + m.sellVol[r]).toFixed(0)));
@@ -781,7 +781,7 @@ export function createUI(deps) {
       ['Executions', w.compute.stats.execs],
       ['Failed', w.compute.stats.failed],
       ['Credits paid', w.compute.stats.creditsPaid],
-      ['Pool balance', (w.balances['compute-pool'] || {}).computeCredits || 0],
+      ['Pool balance', (w.balances['compute-pool'] || {}).compute || 0],
       ['Contributors', w.compute.contributors.length],
     ];
     for (const [k, v] of stats) {
@@ -805,7 +805,7 @@ export function createUI(deps) {
     if (!w.compute.contributors.length) conCard.appendChild(h('div', 'empty', 'No agents contributing compute yet.'));
     for (const cid of w.compute.contributors) {
       const a = w.agents[cid];
-      if (a) conCard.appendChild(kv(a.name, 'contributing · earned ◍' + Math.round(a.compute.earned || 0)));
+      if (a) conCard.appendChild(kv(a.name, 'contributing · earned ◍' + Math.round(a.computeTrack.earned || 0)));
     }
     grid.appendChild(conCard);
     view.appendChild(grid);
@@ -858,7 +858,7 @@ export function createUI(deps) {
       [short ? 'MODEL' : 'Model Colony', modelJobs.length ? modelJobs.length + ' jobs' : 'IDLE'],
       [short ? 'CPU' : 'CPU Pool', w.compute.stats.execs + ' execs'],
       [short ? 'EVID' : 'Evidence', w.evidence.count + ' recs'],
-      [short ? 'ECON' : 'Economy', fmt((w.balances['compute-pool'] || {}).computeCredits || 0)],
+      [short ? 'ECON' : 'Economy', fmt((w.balances['compute-pool'] || {}).compute || 0)],
     ];
     if (short) {
       const pills = h('div', 'pipe-pills');
@@ -910,7 +910,7 @@ export function createUI(deps) {
     }
     for (const cid of w.compute.contributors.slice(0, 6)) {
       const ca = w.agents[cid];
-      if (ca) cp.appendChild(kv(ca.name, 'contributing · ◍' + Math.round(ca.compute.earned || 0)));
+      if (ca) cp.appendChild(kv(ca.name, 'contributing · ◍' + Math.round(ca.computeTrack.earned || 0)));
     }
     grid.appendChild(cp);
 
@@ -925,7 +925,7 @@ export function createUI(deps) {
     const eco = h('div', 'card');
     eco.appendChild(h('h4', '', 'Economy'));
     eco.appendChild(kv('World fund', fmtMoney((w.balances['world'] || {}).credits || 0)));
-    eco.appendChild(kv('Compute pool', '◍' + ((w.balances['compute-pool'] || {}).computeCredits || 0)));
+    eco.appendChild(kv('Compute pool', '◍' + ((w.balances['compute-pool'] || {}).compute || 0)));
     eco.appendChild(kv('Ledger entries', w.ledger.count));
     // Real fabric balances mirrored server-side (authoritative quota ledger).
     const re = fs.realEconomy;
@@ -936,8 +936,8 @@ export function createUI(deps) {
         eco.appendChild(kv('◉ ' + aid.split(':').pop() + ' (' + aid.split(':')[0].slice(0, 12) + ')', fmt(b.spendable || 0) + ' units'));
       }
     }
-    const topW = [...w.agentOrder].map(id => w.agents[id]).sort((x, y) => (y.inv.computeCredits || 0) - (x.inv.computeCredits || 0)).slice(0, 5);
-    for (const a of topW) eco.appendChild(kv(a.name, '◍' + Math.round(a.inv.computeCredits || 0)));
+    const topW = [...w.agentOrder].map(id => w.agents[id]).sort((x, y) => (y.compute || 0) - (x.compute || 0)).slice(0, 5);
+    for (const a of topW) eco.appendChild(kv(a.name, '◍' + Math.round(a.compute || 0)));
     grid.appendChild(eco);
     view.appendChild(grid);
 
@@ -1036,11 +1036,11 @@ export function createUI(deps) {
     const avgs = {};
     for (const mid of w.marketOrder) {
       const m = w.markets[mid];
-      for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+      for (const r of MKT_RES) {
         avgs[r] = (avgs[r] || 0) + m.prices[r];
       }
     }
-    for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+    for (const r of MKT_RES) {
       priceCard.appendChild(kv(RES_LABEL[r], (avgs[r] / w.marketOrder.length).toFixed(1) + ' Cr'));
     }
     grid.appendChild(priceCard);
@@ -1332,12 +1332,29 @@ export function createUI(deps) {
     d.appendChild(objCard);
 
     const grid = h('div', 'grid cols-2 mt12');
+    // Wallet v2 — three layers: personal state, economic stocks, social capital.
     const invCard = h('div', 'card');
-    invCard.appendChild(h('h4', '', 'Resources'));
-    const inv = a.inv;
-    for (const res of ['credits', 'energy', 'food', 'materials', 'rare', 'data', 'computeCredits']) {
-      invCard.appendChild(kv(RES_LABEL[res] || res, inv[res] == null ? '—' : (Number.isInteger(inv[res]) ? inv[res] : inv[res].toFixed(1))));
-    }
+    invCard.appendChild(h('h4', '', 'Wallet'));
+    const state = h('div', 'mt8');
+    state.appendChild(h('div', 'dim small tt-dim', 'STATE'));
+    state.appendChild(kv('Energy', Math.round(a.energy || 0) + '/100'));
+    state.appendChild(kv('Focus', Math.round(a.focus || 0) + '/100'));
+    state.appendChild(kv('Morale', Math.round(a.morale || 0) + '/100'));
+    const eco = h('div', 'mt8');
+    eco.appendChild(h('div', 'dim small tt-dim', 'ECONOMIC'));
+    eco.appendChild(kv('Credits', fmtMoney(a.credits || 0)));
+    eco.appendChild(kv('Compute', Math.round(a.compute || 0) + ' ◍'));
+    eco.appendChild(kv('Data', Math.round(a.data || 0) + ' ◉'));
+    const soc = h('div', 'mt8');
+    soc.appendChild(h('div', 'dim small tt-dim', 'SOCIAL'));
+    soc.appendChild(kv('Reputation', Math.round(a.reputation || 0) + '/100'));
+    const expTop = Object.entries(a.experience || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => k + ' ' + Math.round(v)).join(' · ');
+    soc.appendChild(kv('Top experience', expTop || '—'));
+    const trustPartners = Object.keys(a.trust || {}).slice(0, 3).map(id => id.slice(-8)).join(' · ');
+    soc.appendChild(kv('Trusted', trustPartners || '—'));
+    invCard.appendChild(state);
+    invCard.appendChild(eco);
+    invCard.appendChild(soc);
     grid.appendChild(invCard);
     const repCard = h('div', 'card');
     repCard.appendChild(h('h4', '', 'Reputation'));
@@ -1522,15 +1539,15 @@ export function createUI(deps) {
     const grid = h('div', 'grid cols-2');
     const usg = h('div', 'card');
     usg.appendChild(h('h4', '', 'Usage'));
-    usg.appendChild(kv('Compute credits spent', a.compute.usage));
-    usg.appendChild(kv('Earned contributing', a.compute.earned));
+    usg.appendChild(kv('Compute credits spent', a.computeTrack.usage));
+    usg.appendChild(kv('Earned contributing', a.computeTrack.earned));
     usg.appendChild(kv('Is contributor', contributing(w, a.id) ? 'yes' : 'no'));
-    usg.appendChild(kv('Last result tick', a.compute.lastResultTick));
+    usg.appendChild(kv('Last result tick', a.computeTrack.lastResultTick));
     grid.appendChild(usg);
     const res = h('div', 'card');
     res.appendChild(h('h4', '', 'Job results'));
-    if (!Object.keys(a.compute.results || {}).length) res.appendChild(h('div', 'empty', 'No compute results.'));
-    for (const [task, r] of Object.entries(a.compute.results || {})) {
+    if (!Object.keys(a.computeTrack.results || {}).length) res.appendChild(h('div', 'empty', 'No compute results.'));
+    for (const [task, r] of Object.entries(a.computeTrack.results || {})) {
       res.appendChild(kv(task, r.executionId + ' · ' + JSON.stringify(r.result).slice(0, 60)));
     }
     grid.appendChild(res);
@@ -1635,7 +1652,7 @@ export function createUI(deps) {
       const av = h('span', 'av', a.avatar); av.style.background = a.color;
       const nm = h('span', 'nm');
       nm.innerHTML = `<b>${esc(a.name)}</b> <span class="dim">${ARCH_LABEL[a.archetype]}</span>`;
-      const val = h('span', 'num'); val.innerHTML = fmt(a.inv.credits || 0) + ' <span class="faint">Cr</span>';
+      const val = h('span', 'num'); val.innerHTML = fmt(a.credits || 0) + ' <span class="faint">Cr</span>';
       row.appendChild(av); row.appendChild(nm); row.appendChild(h('div', 'f1')); row.appendChild(val);
       row.title = a.status || 'working';
       row.addEventListener('click', () => { sel = { kind: 'agent', id: a.id }; openInspector(); });
@@ -1676,11 +1693,11 @@ export function createUI(deps) {
     const d = h('div', '');
     const c = h('div', 'card');
     c.appendChild(h('h4', '', 'Prices'));
-    for (const r of ['food', 'energy', 'materials', 'rare', 'data']) c.appendChild(kv(RES_LABEL[r], m.prices[r].toFixed(1) + ' Cr'));
+    for (const r of MKT_RES) c.appendChild(kv(RES_LABEL[r], m.prices[r].toFixed(1) + ' Cr'));
     d.appendChild(c);
     const s = h('div', 'card mt12');
     s.appendChild(h('h4', '', 'History'));
-    for (const r of ['food', 'energy', 'materials', 'rare', 'data']) {
+    for (const r of MKT_RES) {
       s.appendChild(sparkSvg(m.history[r] || [], 400, 120, '#5cc8ff'));
     }
     d.appendChild(s);
@@ -1693,7 +1710,7 @@ export function createUI(deps) {
     c.appendChild(kv('State', ct.state));
     c.appendChild(kv('Issuer', ct.issuer === 'world' ? 'World' : (w.agents[ct.issuer] ? w.agents[ct.issuer].name : ct.issuer)));
     c.appendChild(kv('Objective', JSON.stringify(ct.objective)));
-    c.appendChild(kv('Reward', fmtMoney(ct.reward.credits || 0) + (ct.reward.computeCredits ? ' · ◍' + ct.reward.computeCredits : '') + (ct.reward.data ? ' · ◉' + ct.reward.data : '')));
+    c.appendChild(kv('Reward', fmtMoney(ct.reward.credits || 0) + (ct.reward.compute ? ' · ◍' + ct.reward.compute : '') + (ct.reward.data ? ' · ◉' + ct.reward.data : '')));
     c.appendChild(kv('Deadline', fmtTick(ct.deadlineTick)));
     c.appendChild(kv('Risk', Math.round(ct.risk * 100) + '%'));
     c.appendChild(kv('Progress', Math.round(ct.progress) + ' / ' + ct.target));

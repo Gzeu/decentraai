@@ -41,12 +41,18 @@ export function createVesper(getWorld) {
       personality: a.personality, skills: a.skills,
       objective: a.planGoal, planKey: a.planKey, plan: (a.plans || []).map(s => s.kind + (s.target || s.res || s.contractId || '')),
       status: a.status,
-      inventory: { ...a.inv },
+      // Layer 1 — state + economic + social (v2)
+      state: { energy: Math.round(a.energy || 0), focus: Math.round(a.focus || 0), morale: Math.round(a.morale || 0) },
+      economy: { credits: Math.round(a.credits || 0), compute: Math.round(a.compute || 0), data: Math.round(a.data || 0) },
+      social: { reputation: Math.round(a.reputation || 0), trust: a.trust || {}, experience: a.experience || {} },
+      // Back-compat flat + legacy inventory mirror
+      inventory: { credits: Math.round(a.credits || 0), compute: Math.round(a.compute || 0), data: Math.round(a.data || 0), energy: Math.round(a.energy || 0) },
       org: a.org, orgRole: a.orgRole,
-      reputation: a.rep, repScore: a.rep.score,
+      reputation: a.reputation, repScore: (a.rep && a.rep.score) || a.reputation,
+      reputationDetail: a.rep,
       relationships: a.relations,
       wealth: a.wealth,
-      compute: { usage: Math.round(a.compute.usage), earned: Math.round(a.compute.earned), contributed: a.compute.contributed, results: a.compute.results },
+      compute: { usage: Math.round(a.computeTrack.usage), earned: Math.round(a.computeTrack.earned), contributed: a.computeTrack.contributed, results: a.computeTrack.results },
       achievements: a.achievements.slice(-20),
       tick: w().clock.t,
     };
@@ -213,7 +219,7 @@ export function createVesper(getWorld) {
     const world = w();
     return world.agentOrder.map(id => {
       const a = world.agents[id];
-      return { id, name: a.name, archetype: a.archetype, credits: Math.round(a.inv.credits || 0), rep: a.rep.score, regionId: regionOfId(world, a), org: a.org, status: a.status };
+      return { id, name: a.name, archetype: a.archetype, credits: Math.round(a.credits || 0), rep: a.reputation || (a.rep && a.rep.score) || 0, regionId: regionOfId(world, a), org: a.org, status: a.status };
     });
   };
 

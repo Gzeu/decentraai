@@ -34,9 +34,9 @@ export function requestCompute(world, agentId, taskType, params, budget, priorit
   const a = world.agents[agentId];
   if (!a) return { ok: false, err: 'unknown-agent' };
   budget = Math.max(0, Math.round(budget || defaultBudget(taskType)));
-  const credits = a.inv.computeCredits || 0;
-  if (credits < budget) return { ok: false, err: 'insufficient-compute-credits', need: budget - credits };
-  a.inv.computeCredits = credits - budget;
+  const have = a.compute || 0;
+  if (have < budget) return { ok: false, err: 'insufficient-compute', need: budget - have };
+  a.compute = have - budget;
   const seq = ++world.compute.seq;
   const job = {
     executionId: 'exec' + seq,
@@ -55,8 +55,8 @@ export function requestCompute(world, agentId, taskType, params, budget, priorit
   world.compute.jobs[job.executionId] = job;
   world.compute.jobOrder.push(job.executionId);
   world.compute.stats.queued++;
-  a.compute.usage += budget;
-  ledgerTx(world, { from: agentId, to: 'compute-pool', res: 'computeCredits', amount: budget, reason: 'compute:' + taskType, meta: { executionId: job.executionId } });
+  a.computeTrack.usage += budget;
+  ledgerTx(world, { from: agentId, to: 'compute-pool', res: 'compute', amount: budget, reason: 'compute:' + taskType, meta: { executionId: job.executionId } });
   return { ok: true, executionId: job.executionId, estimateTicks: job.ticksRemaining };
 }
 
@@ -98,9 +98,9 @@ export function executeJob(world, job) {
     job.status = 'done';
     job.result = out;
     if (a) {
-      a.compute.results = a.compute.results || {};
-      a.compute.results[job.taskType] = { tick: world.clock.t, result: out, executionId: job.executionId };
-      a.compute.lastResultTick = world.clock.t;
+      a.computeTrack.results = a.computeTrack.results || {};
+      a.computeTrack.results[job.taskType] = { tick: world.clock.t, result: out, executionId: job.executionId };
+      a.computeTrack.lastResultTick = world.clock.t;
     }
     world.compute.stats.execs++;
     world.compute.stats.ms += ms;
@@ -108,13 +108,13 @@ export function executeJob(world, job) {
     const poolGain = Math.round(cost * world.compute.feeShare);
     const contribShare = Math.round((cost - poolGain) / Math.max(1, world.compute.contributors.length));
     const pool = world.balances['compute-pool'] || (world.balances['compute-pool'] = {});
-    pool.computeCredits = (pool.computeCredits || 0) + poolGain;
+    pool.compute = (pool.compute || 0) + poolGain;
     for (const cid of world.compute.contributors) {
       const ca = world.agents[cid];
       if (ca) {
-        ca.inv.computeCredits = (ca.inv.computeCredits || 0) + contribShare;
-        ca.compute.earned = (ca.compute.earned || 0) + contribShare;
-        ledgerTx(world, { from: 'compute-pool', to: cid, res: 'computeCredits', amount: contribShare, reason: 'compute-contribution', meta: { executionId: job.executionId } });
+        ca.compute = (ca.compute || 0) + contribShare;
+        ca.computeTrack.earned = (ca.computeTrack.earned || 0) + contribShare;
+        ledgerTx(world, { from: 'compute-pool', to: cid, res: 'compute', amount: contribShare, reason: 'compute-contribution', meta: { executionId: job.executionId } });
       }
     }
     world.compute.stats.creditsPaid += cost;
@@ -144,12 +144,12 @@ export function executeJob(world, job) {
           const payCredits = job.budget * 2;
           const payCompute = Math.max(1, Math.ceil(job.budget / 2));
           ledgerTx(world, { from: 'world', to: ag.id, res: 'credits', amount: payCredits, reason: 'fabric-work:' + job.taskType });
-          ag.inv.credits = (ag.inv.credits || 0) + payCredits;
-          ag.inv.computeCredits = (ag.inv.computeCredits || 0) + payCompute;
-          ag.compute.earned = (ag.compute.earned || 0) + payCompute;
+          ag.credits = (ag.credits || 0) + payCredits;
+          ag.compute = (ag.compute || 0) + payCompute;
+          ag.computeTrack.earned = (ag.computeTrack.earned || 0) + payCompute;
           ag.stats.earned = (ag.stats.earned || 0) + payCredits;
           act(world, ag, 'compute', 'earned', `fabric verified ${job.taskType} → +${payCredits} Cr, +${payCompute} ◍`, { value: payCredits });
-          evidenceRecord(world, { kind: 'fabric-income', executionId: job.executionId, agent: ag.id, credits: payCredits, computeCredits: payCompute, execution: r.executionId || null, status: 'verified' });
+          evidenceRecord(world, { kind: 'fabric-income', executionId: job.executionId, agent: ag.id, credits: payCredits, compute: payCompute, execution: r.executionId || null, status: 'verified' });
         } else {
           act(world, ag, 'compute', 'dispatch-failed', `fabric did not verify ${job.taskType} — no income (honest)`, { value: 0 });
         }
@@ -165,8 +165,8 @@ export function executeJob(world, job) {
     job.result = out;
     world.compute.stats.failed++;
     const refund = Math.round(job.budget * 0.9);
-    if (a) a.inv.computeCredits = (a.inv.computeCredits || 0) + refund;
-    ledgerTx(world, { from: 'compute-pool', to: job.requester, res: 'computeCredits', amount: refund, reason: 'compute-refund:' + job.taskType, meta: { executionId: job.executionId } });
+    if (a) a.compute = (a.compute || 0) + refund;
+    ledgerTx(world, { from: 'compute-pool', to: job.requester, res: 'compute', amount: refund, reason: 'compute-refund:' + job.taskType, meta: { executionId: job.executionId } });
     evidenceRecord(world, { kind: 'compute', executionId: job.executionId, agent: job.requester, taskType: job.taskType, status: 'failed', err: out.err, durationMs: Math.round(ms) });
   }
 }
@@ -176,7 +176,7 @@ export function cancelCompute(world, executionId) {
   if (!job || job.status !== 'queued') return false;
   job.status = 'failed';
   const a = world.agents[job.requester];
-  if (a) a.inv.computeCredits = (a.inv.computeCredits || 0) + Math.round(job.budget * 0.9);
+  if (a) a.compute = (a.compute || 0) + Math.round(job.budget * 0.9);
   return true;
 }
 
@@ -291,7 +291,7 @@ export function powerOf(world, who) {
   return agentPower(a);
 }
 function agentPower(a) {
-  return Math.round(3 + a.skills.combat * 1.4 + a.skills.social * 0.4 + (a.inv.credits || 0) / 200 + (a.org ? a.skills.combat * 0.5 : 0));
+  return Math.round(3 + a.skills.combat * 1.4 + a.skills.social * 0.4 + (a.credits || 0) / 200 + (a.org ? a.skills.combat * 0.5 : 0));
 }
 
 export function routePlan(world, fromId, toId) {

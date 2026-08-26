@@ -200,6 +200,28 @@ async function boot() {
     const a = world.agents[id];
     if (a && !a.stats) a.stats = { earned: 0, spent: 0, taxesPaid: 0, contracts: 0, discoveries: 0, research: 0, breakthroughs: 0, built: 0, produced: 0, tradedVol: 0, computeJobs: 0 };
   }
+  // v2 migration: old worlds carry inv/food/materials/rare/health/morale-0-1; new
+  // schema uses flat state (energy/focus/morale 0-100) + economic stocks
+  // (credits/compute/data) + social (reputation/trust/experience). Backfill
+  // deterministically; history is preserved (gather/mine work becomes credits+experience).
+  for (const id of world.agentOrder) {
+    const a = world.agents[id];
+    if (!a || !a.inv) continue;
+    // v1 inventory → flat (sell lingering materials/rare at base price into credits)
+    const foodCredits = (a.inv.food || 0) * 2 + (a.inv.materials || 0) * 5 + (a.inv.rare || 0) * 40;
+    a.credits = (a.credits || Math.round(a.inv.credits || 200)) + Math.round(foodCredits);
+    a.data = a.data || Math.round(a.inv.data || 0);
+    a.compute = a.compute || Math.round(a.inv.computeCredits || a.inv.compute || 20);
+    a.energy = Math.round(((a.inv.energy || 22) / 22) * 60 + 20);
+    a.focus = a.focus != null ? a.focus : Math.round((a.morale != null && a.morale <= 1 ? a.morale : 0.7) * 60 + 20);
+    a.morale = Math.round((a.morale != null && a.morale <= 1 ? a.morale : 0.7) * 60 + 20);
+    if (a.morale > 100) a.morale = Math.min(100, a.morale);
+    a.reputation = Math.round(a.reputation || (a.rep && a.rep.score) || 50);
+    a.trust = a.trust || {};
+    a.experience = a.experience || {};
+    if (a.computeTrack == null && a.compute != null) { a.computeTrack = a.compute; a.compute = Math.round(a.inv.computeCredits || 20); }
+    delete a.inv;
+  }
   if (!world.fabric) world.fabric = { log: [], calls: 0, ok: 0, fail: 0, sinceTick: world.clock.t, status: null };
   world.meta.narrativeEngine = world.meta.narrativeEngine || cfg.narrativeEngine;
   catchUpOffline();
