@@ -7294,10 +7294,7 @@ async fn job_summarize_pdf_handler(
         .await;
         let mut extracted_via_pdftotext: Option<String> = pdftotext_extract;
         // If pdftotext returned very little text (<5 words), treat as scanned and force OCR via pdftoppm.
-        let should_try_ocr = match &extracted_via_pdftotext {
-            Some(t) if t.split_whitespace().count() >= 5 => false,
-            _ => true,
-        };
+        let should_try_ocr = !matches!(&extracted_via_pdftotext, Some(t) if t.split_whitespace().count() >= 5);
         if let Some(t) = extracted_via_pdftotext.take() {
             if !should_try_ocr {
                 t
@@ -7339,7 +7336,7 @@ async fn job_summarize_pdf_handler(
                         if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
                             cur.push(b as char);
                         } else {
-                            if cur.len() >= 4 { if s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); } }
+                            if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
                             cur.clear();
                         }
                     }
@@ -7380,7 +7377,7 @@ async fn job_summarize_pdf_handler(
                     if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
                         cur.push(b as char);
                     } else {
-                        if cur.len() >= 4 { if s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); } }
+                        if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
                         cur.clear();
                     }
                 }
