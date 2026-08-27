@@ -190,7 +190,9 @@ pub async fn record(
     // does not leak; the ExecutedPlan retains the `reservation_id` for audit.
     cm.release_reservation(exec.placement.reservation.reservation_id)
         .await;
-    cm.executions().into_iter().find(|p| p.request_id == task_id)
+    cm.executions()
+        .into_iter()
+        .find(|p| p.request_id == task_id)
 }
 
 /// Books a single reservation on the live ledger. Returns `None` when the
@@ -211,10 +213,12 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use decentraai_compute::requirements::WorkloadRequirements;
     use decentraai_compute::ServedModel;
-    use decentraai_distributed::compute::{build_advertisement, ComputeManager, ENGINE_LLAMA_SERVER};
+    use decentraai_compute::requirements::WorkloadRequirements;
     use decentraai_distributed::LivePerf;
+    use decentraai_distributed::compute::{
+        ComputeManager, ENGINE_LLAMA_SERVER, build_advertisement,
+    };
     use decentraai_system_probe::{GpuProbeStatus, SystemSnapshot};
 
     fn peer() -> libp2p::PeerId {
@@ -257,10 +261,7 @@ mod tests {
         assert_eq!(distributed_outcome(0, true, &[]), "succeeded");
         assert_eq!(distributed_outcome(1, true, &[]), "failed");
         assert_eq!(distributed_outcome(0, false, &[]), "failed");
-        assert_eq!(
-            distributed_outcome(0, true, &["peer-a".into()]),
-            "failed"
-        );
+        assert_eq!(distributed_outcome(0, true, &["peer-a".into()]), "failed");
     }
 
     /// Replays the fabric's own canonical `plan_and_reserve` path to obtain

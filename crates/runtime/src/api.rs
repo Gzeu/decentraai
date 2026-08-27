@@ -21,8 +21,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
 use base64::Engine as _;
+use decentraai_config::{DashboardVersion, GenerationSection, ResourceSection, TiersSection};
 use ed25519_dalek::Signer;
 use futures::StreamExt;
 use rand_core::RngCore;
@@ -5404,7 +5404,8 @@ async fn vesper_economy_handler(State(state): State<ApiState>) -> Response {
     let Some(ledger) = &state.quota_ledger else {
         return (
             [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "attached": false, "agents": {}, "total_spendable": 0 }).to_string(),
+            serde_json::json!({ "attached": false, "agents": {}, "total_spendable": 0 })
+                .to_string(),
         )
             .into_response();
     };
@@ -5414,17 +5415,15 @@ async fn vesper_economy_handler(State(state): State<ApiState>) -> Response {
     for (id, acct) in l.accounts() {
         if let Some(owner) = id.strip_prefix("vesper:") {
             let s = acct.spendable();
-            agents.insert(
-                owner.to_string(),
-                serde_json::json!({ "spendable": s }),
-            );
+            agents.insert(owner.to_string(), serde_json::json!({ "spendable": s }));
             total = total.saturating_add(s);
         }
     }
     drop(l);
     (
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "attached": true, "agents": agents, "total_spendable": total }).to_string(),
+        serde_json::json!({ "attached": true, "agents": agents, "total_spendable": total })
+            .to_string(),
     )
         .into_response()
 }
@@ -5455,17 +5454,17 @@ async fn vesper_dispatch_handler(
                 .into_response();
         }
     };
-    let task = body.0.get("task").and_then(|v| v.as_str()).unwrap_or("task");
+    let task = body
+        .0
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("task");
     let instruction = body
         .0
         .get("instruction")
         .and_then(|v| v.as_str())
         .unwrap_or("Compute task from VESPER");
-    let content = body
-        .0
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let content = body.0.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let task_kind = body.0.get("task_kind").and_then(|v| v.as_str());
 
     // Resolve (provision lazily) a consumer key for this agent.
@@ -5493,12 +5492,7 @@ async fn vesper_dispatch_handler(
             };
             // Mint a key under this node's registry so the Governor recognizes it.
             let owner = format!("vesper:{agent_id}");
-            match store.create(
-                &owner,
-                5000,
-                30,
-                vec!["inference".to_string()],
-            ) {
+            match store.create(&owner, 5000, 30, vec!["inference".to_string()]) {
                 Ok(plaintext) => {
                     if let Err(e) = store.save() {
                         tracing::warn!("vesper: failed to persist consumer key: {e}");
@@ -5551,8 +5545,11 @@ async fn vesper_dispatch_handler(
     let resp = governor_execute_handler(State(state.clone()), headers, axum::Json(gov)).await;
     // Enrich with agent + task for the VESPER call log.
     let (parts, body) = resp.into_parts();
-    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024).await.unwrap_or_default();
-    let mut out: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let mut out: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     if let Some(m) = out.as_object_mut() {
         m.insert("agent_id".to_string(), serde_json::json!(agent_id));
         m.insert("task".to_string(), serde_json::json!(task));
@@ -5563,18 +5560,21 @@ async fn vesper_dispatch_handler(
 /// GET /vesper — the agent civilization world. Serves the self-contained VESPER
 /// app (index + ES modules) from embedded assets. The world runs in-browser and
 /// bridges to the real fabric same-origin (no CORS). Read-only surface.
-async fn vesper_handler(State(_state): State<ApiState>, path: Option<axum::extract::Path<Vec<String>>>) -> Response {
+async fn vesper_handler(
+    State(_state): State<ApiState>,
+    path: Option<axum::extract::Path<Vec<String>>>,
+) -> Response {
     // Axum `{*path}` wildcard yields the segments as Vec<String>.
-    let p = path.map(|axum::extract::Path(segs)| segs.join("/")).unwrap_or_default();
+    let p = path
+        .map(|axum::extract::Path(segs)| segs.join("/"))
+        .unwrap_or_default();
     match crate::vesper::resolve(&p) {
-        Some((body, mime)) => {
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap()
-        }
+        Some((body, mime)) => axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap(),
         None => axum::response::Response::builder()
             .status(axum::http::StatusCode::NOT_FOUND)
             .body(axum::body::Body::from("not found"))
@@ -7152,7 +7152,7 @@ async fn job_summarize_pdf_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    use crate::job::{MAX_PDF_BYTES, MAX_PAGES, QUOTA_PER_PAGE, count_pdf_pages, evidence_id_for};
+    use crate::job::{MAX_PAGES, MAX_PDF_BYTES, QUOTA_PER_PAGE, count_pdf_pages, evidence_id_for};
     // 1. Auth — reuse existing classify (Bearer dca_ / master / open).
     let auth = match state.classify(&headers) {
         Ok(a) => a,
@@ -7162,7 +7162,12 @@ async fn job_summarize_pdf_handler(
         return e.into_response();
     }
     // Consumer rate-limit for dca_ keys (separate window).
-    if let Auth::Consumer { key_id, rate_limit_per_minute, .. } = &auth {
+    if let Auth::Consumer {
+        key_id,
+        rate_limit_per_minute,
+        ..
+    } = &auth
+    {
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
         }
@@ -7182,7 +7187,8 @@ async fn job_summarize_pdf_handler(
     if body.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": {"code":"empty_pdf","message":"PDF body is required"}}).to_string(),
+            serde_json::json!({"error": {"code":"empty_pdf","message":"PDF body is required"}})
+                .to_string(),
         )
             .into_response();
     }
@@ -7205,7 +7211,8 @@ async fn job_summarize_pdf_handler(
     if pages == 0 {
         return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": {"code":"invalid_pdf","message":"No pages detected"}}).to_string(),
+            serde_json::json!({"error": {"code":"invalid_pdf","message":"No pages detected"}})
+                .to_string(),
         )
             .into_response();
     }
@@ -7220,12 +7227,19 @@ async fn job_summarize_pdf_handler(
     // 4. Quota pre-check (atomic: check only, no reservation yet).
     // For Consumer keys, ensure spendable >= needed; otherwise 402.
     let (account_opt, key_id_opt) = match &auth {
-        Auth::Consumer { account, key_id, .. } => (Some(account.clone()), Some(key_id.clone())),
+        Auth::Consumer {
+            account, key_id, ..
+        } => (Some(account.clone()), Some(key_id.clone())),
         _ => (None, None),
     };
     if let Some(account) = &account_opt {
         if let Some(ledger) = &state.quota_ledger {
-            let available = ledger.lock().unwrap().account(account).map(|a| a.available).unwrap_or(0);
+            let available = ledger
+                .lock()
+                .unwrap()
+                .account(account)
+                .map(|a| a.available)
+                .unwrap_or(0);
             if available < needed {
                 return (
                     StatusCode::PAYMENT_REQUIRED,
@@ -7246,14 +7260,16 @@ async fn job_summarize_pdf_handler(
     if body.windows(8).any(|w| w == b"FAIL_OCR") {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::json!({"error": {"code":"ocr_failed","message":"OCR failed (simulated)"}}).to_string(),
+            serde_json::json!({"error": {"code":"ocr_failed","message":"OCR failed (simulated)"}})
+                .to_string(),
         )
             .into_response();
     }
     if body.windows(8).any(|w| w == b"FAIL_LLM") {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::json!({"error": {"code":"llm_failed","message":"LLM failed (simulated)"}}).to_string(),
+            serde_json::json!({"error": {"code":"llm_failed","message":"LLM failed (simulated)"}})
+                .to_string(),
         )
             .into_response();
     }
@@ -7289,40 +7305,72 @@ async fn job_summarize_pdf_handler(
             let _ = tokio::fs::remove_file(&pdf_path).await;
             let _ = tokio::fs::remove_file(&txt_path).await;
             let trimmed = txt.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         }
         .await;
         let mut extracted_via_pdftotext: Option<String> = pdftotext_extract;
         // If pdftotext returned very little text (<5 words), treat as scanned and force OCR via pdftoppm.
-        let should_try_ocr = !matches!(&extracted_via_pdftotext, Some(t) if t.split_whitespace().count() >= 5);
+        let should_try_ocr =
+            !matches!(&extracted_via_pdftotext, Some(t) if t.split_whitespace().count() >= 5);
         if let Some(t) = extracted_via_pdftotext.take() {
             if !should_try_ocr {
                 t
             } else {
                 // Try OCR via pdftoppm -> image -> RapidOCR
                 let ocr_text = async {
-                    if !state.ocr.enabled() { return None; }
+                    if !state.ocr.enabled() {
+                        return None;
+                    }
                     let base = state.ocr.base_url()?;
                     let dir = std::env::temp_dir();
                     let pdf_path = dir.join(format!("job_{}_ocr.pdf", job_id));
                     let out_prefix = dir.join(format!("job_{}_page", job_id));
-                    if tokio::fs::write(&pdf_path, &body).await.is_err() { return None; }
+                    if tokio::fs::write(&pdf_path, &body).await.is_err() {
+                        return None;
+                    }
                     let out = tokio::process::Command::new("pdftoppm")
-                        .arg("-png").arg("-f").arg("1").arg("-l").arg("1").arg("-r").arg("150")
-                        .arg(&pdf_path).arg(&out_prefix)
-                        .output().await.ok()?;
-                    if !out.status.success() { let _ = tokio::fs::remove_file(&pdf_path).await; return None; }
+                        .arg("-png")
+                        .arg("-f")
+                        .arg("1")
+                        .arg("-l")
+                        .arg("1")
+                        .arg("-r")
+                        .arg("150")
+                        .arg(&pdf_path)
+                        .arg(&out_prefix)
+                        .output()
+                        .await
+                        .ok()?;
+                    if !out.status.success() {
+                        let _ = tokio::fs::remove_file(&pdf_path).await;
+                        return None;
+                    }
                     let img_path = dir.join(format!("job_{}_page-1.png", job_id));
                     let img_bytes = tokio::fs::read(&img_path).await.ok()?;
                     let _ = tokio::fs::remove_file(&pdf_path).await;
                     let _ = tokio::fs::remove_file(&img_path).await;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
                     let payload = serde_json::json!({"image_b64": b64, "lang": "en"});
-                    let resp = state.client.post(format!("{}/v1/ocr", base)).json(&payload).send().await.ok()?;
+                    let resp = state
+                        .client
+                        .post(format!("{}/v1/ocr", base))
+                        .json(&payload)
+                        .send()
+                        .await
+                        .ok()?;
                     let v: serde_json::Value = resp.json().await.ok()?;
                     let txt = v.get("text").and_then(|x| x.as_str())?.trim().to_string();
-                    if txt.is_empty() || txt.split_whitespace().count() < 3 { None } else { Some(txt) }
-                }.await;
+                    if txt.is_empty() || txt.split_whitespace().count() < 3 {
+                        None
+                    } else {
+                        Some(txt)
+                    }
+                }
+                .await;
                 if let Some(ocr_t) = ocr_text {
                     ocr_t
                 } else if t.split_whitespace().count() >= 3 {
@@ -7336,38 +7384,80 @@ async fn job_summarize_pdf_handler(
                         if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
                             cur.push(b as char);
                         } else {
-                            if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                            if cur.len() >= 4 && s.len() < 8000 {
+                                if !s.is_empty() {
+                                    s.push(' ');
+                                }
+                                s.push_str(&cur);
+                            }
                             cur.clear();
                         }
                     }
-                    if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                    if cur.len() >= 4 && s.len() < 8000 {
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(&cur);
+                    }
                     if s.trim().is_empty() {
-                        format!("PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.", pages, body.len())
-                    } else { s.chars().take(4000).collect() }
+                        format!(
+                            "PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.",
+                            pages,
+                            body.len()
+                        )
+                    } else {
+                        s.chars().take(4000).collect()
+                    }
                 }
             }
         } else {
             // No pdftotext at all -> try OCR via pdftoppm, else fallback strings
             let ocr_text = async {
-                if !state.ocr.enabled() { return None; }
+                if !state.ocr.enabled() {
+                    return None;
+                }
                 let base = state.ocr.base_url()?;
                 let dir = std::env::temp_dir();
                 let pdf_path = dir.join(format!("job_{}_ocr2.pdf", job_id));
                 let out_prefix = dir.join(format!("job_{}_page2", job_id));
-                if tokio::fs::write(&pdf_path, &body).await.is_err() { return None; }
-                let out = tokio::process::Command::new("pdftoppm").arg("-png").arg("-f").arg("1").arg("-l").arg("1").arg("-r").arg("150").arg(&pdf_path).arg(&out_prefix).output().await.ok()?;
-                if !out.status.success() { let _ = tokio::fs::remove_file(&pdf_path).await; return None; }
+                if tokio::fs::write(&pdf_path, &body).await.is_err() {
+                    return None;
+                }
+                let out = tokio::process::Command::new("pdftoppm")
+                    .arg("-png")
+                    .arg("-f")
+                    .arg("1")
+                    .arg("-l")
+                    .arg("1")
+                    .arg("-r")
+                    .arg("150")
+                    .arg(&pdf_path)
+                    .arg(&out_prefix)
+                    .output()
+                    .await
+                    .ok()?;
+                if !out.status.success() {
+                    let _ = tokio::fs::remove_file(&pdf_path).await;
+                    return None;
+                }
                 let img_path = dir.join(format!("job_{}_page2-1.png", job_id));
                 let img_bytes = tokio::fs::read(&img_path).await.ok()?;
                 let _ = tokio::fs::remove_file(&pdf_path).await;
                 let _ = tokio::fs::remove_file(&img_path).await;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
                 let payload = serde_json::json!({"image_b64": b64, "lang": "en"});
-                let resp = state.client.post(format!("{}/v1/ocr", base)).json(&payload).send().await.ok()?;
+                let resp = state
+                    .client
+                    .post(format!("{}/v1/ocr", base))
+                    .json(&payload)
+                    .send()
+                    .await
+                    .ok()?;
                 let v: serde_json::Value = resp.json().await.ok()?;
                 let txt = v.get("text").and_then(|x| x.as_str())?.trim().to_string();
                 if txt.is_empty() { None } else { Some(txt) }
-            }.await;
+            }
+            .await;
             if let Some(ocr_t) = ocr_text {
                 ocr_t
             } else {
@@ -7377,14 +7467,30 @@ async fn job_summarize_pdf_handler(
                     if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
                         cur.push(b as char);
                     } else {
-                        if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                        if cur.len() >= 4 && s.len() < 8000 {
+                            if !s.is_empty() {
+                                s.push(' ');
+                            }
+                            s.push_str(&cur);
+                        }
                         cur.clear();
                     }
                 }
-                if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                if cur.len() >= 4 && s.len() < 8000 {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&cur);
+                }
                 if s.trim().is_empty() {
-                    format!("PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.", pages, body.len())
-                } else { s.chars().take(4000).collect() }
+                    format!(
+                        "PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.",
+                        pages,
+                        body.len()
+                    )
+                } else {
+                    s.chars().take(4000).collect()
+                }
             }
         }
     };
@@ -7402,7 +7508,11 @@ async fn job_summarize_pdf_handler(
         mgr.base_url().unwrap_or_else(|| state.backend_url.clone())
     };
     let model = state.active_model.read().await.clone();
-    let prompt = format!("You are a document summarizer. Summarize the following PDF text ({} pages) in 3-5 concise sentences and extract key entities.\n\nText:\n{}\n\nSummary:", pages, &extracted[..extracted.len().min(3000)]);
+    let prompt = format!(
+        "You are a document summarizer. Summarize the following PDF text ({} pages) in 3-5 concise sentences and extract key entities.\n\nText:\n{}\n\nSummary:",
+        pages,
+        &extracted[..extracted.len().min(3000)]
+    );
     let llm_payload = serde_json::json!({
         "model": model,
         "messages": [{"role":"user","content": prompt}],
@@ -7411,11 +7521,14 @@ async fn job_summarize_pdf_handler(
     });
     let llm_resp = tokio::time::timeout(
         std::time::Duration::from_secs(50),
-        state.client.post(format!("{}/v1/chat/completions", backend))
+        state
+            .client
+            .post(format!("{}/v1/chat/completions", backend))
             .header(header::CONTENT_TYPE, "application/json")
             .json(&llm_payload)
-            .send()
-    ).await;
+            .send(),
+    )
+    .await;
     let (summary, entities) = match llm_resp {
         Ok(Ok(resp)) => {
             if resp.status() != StatusCode::OK {
@@ -7427,15 +7540,44 @@ async fn job_summarize_pdf_handler(
                     .into_response();
             }
             let v: serde_json::Value = resp.json().await.unwrap_or_default();
-            let mut content = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+            let mut content = v
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if content.is_empty() {
-                content = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("reasoning_content")).and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+                content = v
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("reasoning_content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
             }
             if content.is_empty() {
-                (format!("Summary (fallback) of {}-page PDF via DecentraAI DOCS-JOB ({} bytes extracted)", pages, extracted.len()), vec![])
+                (
+                    format!(
+                        "Summary (fallback) of {}-page PDF via DecentraAI DOCS-JOB ({} bytes extracted)",
+                        pages,
+                        extracted.len()
+                    ),
+                    vec![],
+                )
             } else {
                 // Very small entity extraction: split summary into words that look like entities (capitalized).
-                let ents: Vec<String> = content.split_whitespace().filter(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)).take(5).map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string()).filter(|s| !s.is_empty()).collect();
+                let ents: Vec<String> = content
+                    .split_whitespace()
+                    .filter(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+                    .take(5)
+                    .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 (content, ents)
             }
         }
@@ -7449,7 +7591,8 @@ async fn job_summarize_pdf_handler(
         Err(_) => {
             return (
                 StatusCode::GATEWAY_TIMEOUT,
-                serde_json::json!({"error": {"code":"llm_failed","message":"LLM timeout (50s)"}}).to_string(),
+                serde_json::json!({"error": {"code":"llm_failed","message":"LLM timeout (50s)"}})
+                    .to_string(),
             )
                 .into_response();
         }
@@ -9673,14 +9816,8 @@ async fn governor_execute_handler(
             // silently when the ledger refuses a reservation (worker at cap)
             // so we never fabricate an `ExecutedPlan` for bookkeeping only.
             if let Some(cm) = &state.compute {
-                if let Some(mut exec) = crate::governor_execution::build_local(
-                    cm,
-                    &p2p,
-                    &task_id,
-                    &model,
-                    ram_mb,
-                )
-                .await
+                if let Some(mut exec) =
+                    crate::governor_execution::build_local(cm, &p2p, &task_id, &model, ram_mb).await
                 {
                     exec.processing_time_ms = u32::try_from(latency_ms).unwrap_or(u32::MAX);
                     exec.outcome = crate::governor_execution::local_outcome(&out);

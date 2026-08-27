@@ -16,13 +16,13 @@ pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;
 pub mod governor_execution;
-pub mod vesper;
 pub mod intel_assist;
-pub mod mcp;
 pub mod job;
+pub mod mcp;
 pub mod providers_api;
 pub mod queue;
 pub mod tools;
+pub mod vesper;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};
