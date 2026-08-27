@@ -749,6 +749,21 @@ pub fn compensation_request(raw: &str) -> bool {
         == Some("get_compensation")
 }
 
+pub fn arena_state_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("arena_state")
+}
+
+pub fn arena_act_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    if name != "arena_act" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned();
+    Some(args.unwrap_or(json!({})))
+}
+
 /// Extract `decentraai_embeddings` parameters (L1 ASSIST). Pure.
 pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;

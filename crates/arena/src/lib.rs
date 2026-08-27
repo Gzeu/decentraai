@@ -104,7 +104,14 @@ pub struct ArenaEvent {
     pub detail: String,
 }
 
-/// Deterministic world — single season/match, grid, tick counter, agent map, event log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Building {
+    pub owner: String,
+    pub built_tick: u64,
+    pub kind: String,
+}
+
+/// Deterministic world — single season/match, grid, tick counter, agent map, event log, shared structures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArenaWorld {
     pub tick: u64,
@@ -113,6 +120,12 @@ pub struct ArenaWorld {
     pub agents: BTreeMap<String, ArenaAgent>,
     pub events: VecDeque<ArenaEvent>,
     pub max_events: usize,
+    #[serde(default)]
+    pub buildings: BTreeMap<String, Building>,
+    #[serde(default)]
+    pub alliances: std::collections::BTreeSet<(String, String)>,
+    #[serde(default)]
+    pub trades: Vec<String>,
 }
 
 impl Default for ArenaWorld {
@@ -124,6 +137,9 @@ impl Default for ArenaWorld {
             agents: BTreeMap::new(),
             events: VecDeque::new(),
             max_events: 1000,
+            buildings: BTreeMap::new(),
+            alliances: std::collections::BTreeSet::new(),
+            trades: Vec::new(),
         }
     }
 }
@@ -182,66 +198,142 @@ impl ArenaWorld {
         rationale: String,
         evidence_id: Option<String>,
     ) -> Result<ArenaEvent, ArenaError> {
-        let agent = self.agents.get_mut(agent_id).ok_or(ArenaError::UnknownAgent)?;
-        // cooldown — skip if never acted before (u64::MAX sentinel)
+        // Phase 1: immutable checks
+        let (from_x, from_y, agent_resources, agent_last) = {
+            let a = self.agents.get(agent_id).ok_or(ArenaError::UnknownAgent)?;
+            (a.x, a.y, a.resources, a.last_action_tick)
+        };
         let need_wait = action.cooldown_ticks();
-        if need_wait > 0 && agent.has_acted() && self.tick < agent.last_action_tick + need_wait {
-            let wait = (agent.last_action_tick + need_wait) - self.tick;
+        let has_acted = agent_last != u64::MAX;
+        if need_wait > 0 && has_acted && self.tick < agent_last + need_wait {
+            let wait = (agent_last + need_wait) - self.tick;
             return Err(ArenaError::Cooldown(wait));
         }
-        // resources
         let cost = action.cost_quota();
-        if agent.resources < cost {
-            return Err(ArenaError::InsufficientResources { need: cost, have: agent.resources });
+        if agent_resources < cost {
+            return Err(ArenaError::InsufficientResources { need: cost, have: agent_resources });
         }
-        let from = (agent.x, agent.y);
+        let from = (from_x, from_y);
         let mut to = None;
         let mut success = true;
         let detail: String;
+        // Precompute nearest for actions needing it (immutable)
+        let nearest_trade: Option<String> = if matches!(action, ActionKind::Trade) {
+            let mut best = 999;
+            let mut nearest = None;
+            for (oid, other) in self.agents.iter() {
+                if oid == agent_id { continue; }
+                let d = (other.x - from_x).abs() + (other.y - from_y).abs();
+                if d < best && d <= 3 {
+                    best = d;
+                    nearest = Some(oid.clone());
+                }
+            }
+            nearest
+        } else { None };
+        let nearest_ally: Option<String> = if matches!(action, ActionKind::Negotiate | ActionKind::Cooperate) {
+            let mut best = 999;
+            let mut nearest = None;
+            for (oid, other) in self.agents.iter() {
+                if oid == agent_id { continue; }
+                let d = (other.x - from_x).abs() + (other.y - from_y).abs();
+                if d < best && d <= 5 {
+                    best = d;
+                    nearest = Some(oid.clone());
+                }
+            }
+            nearest
+        } else { None };
         match action {
             ActionKind::Move => {
                 let (tx, ty) = target.ok_or_else(|| ArenaError::ActionNotAllowed("move requires target".into()))?;
                 if tx < 0 || tx >= self.width || ty < 0 || ty >= self.height {
                     return Err(ArenaError::OutOfBounds);
                 }
-                // move cost already checked, now check adjacency (king move)
-                if (tx - agent.x).abs() > 1 || (ty - agent.y).abs() > 1 {
+                if (tx - from_x).abs() > 1 || (ty - from_y).abs() > 1 {
                     return Err(ArenaError::ActionNotAllowed("move too far (max 1)".into()));
                 }
-                agent.x = tx;
-                agent.y = ty;
-                agent.resources = agent.resources.saturating_sub(cost);
+                {
+                    let agent = self.agents.get_mut(agent_id).unwrap();
+                    agent.x = tx;
+                    agent.y = ty;
+                    agent.resources = agent.resources.saturating_sub(cost);
+                }
                 to = Some((tx, ty));
                 detail = format!("moved to {},{}", tx, ty);
             }
-            ActionKind::Observe | ActionKind::Scout | ActionKind::Rest | ActionKind::Negotiate | ActionKind::Cooperate | ActionKind::Compete | ActionKind::Defend => {
-                detail = format!("{:?} at {},{}", action, agent.x, agent.y);
+            ActionKind::Observe | ActionKind::Scout | ActionKind::Rest | ActionKind::Compete | ActionKind::Defend => {
+                detail = format!("{:?} at {},{}", action, from_x, from_y);
             }
             ActionKind::RequestCompute => {
-                // caller must provide evidence_id on success; we record it
                 if evidence_id.is_some() {
-                    agent.resources = agent.resources.saturating_add(5); // reward on verified compute
-                    agent.reputation += 1;
+                    {
+                        let agent = self.agents.get_mut(agent_id).unwrap();
+                        agent.resources = agent.resources.saturating_add(5);
+                        agent.reputation += 1;
+                    }
                     detail = "compute verified".to_string();
                 } else {
                     success = false;
                     detail = "compute failed/unverified".to_string();
                 }
-                agent.resources = agent.resources.saturating_sub(cost);
+                {
+                    let agent = self.agents.get_mut(agent_id).unwrap();
+                    agent.resources = agent.resources.saturating_sub(cost);
+                }
             }
             ActionKind::Build => {
-                agent.resources = agent.resources.saturating_sub(cost);
-                agent.reputation += 1;
-                detail = format!("built at {},{}", agent.x, agent.y);
+                let key = format!("{},{}", from_x, from_y);
+                if self.buildings.contains_key(&key) {
+                    return Err(ArenaError::ActionNotAllowed("already built there".into()));
+                }
+                {
+                    let agent = self.agents.get_mut(agent_id).unwrap();
+                    agent.resources = agent.resources.saturating_sub(cost);
+                    agent.reputation += 1;
+                }
+                self.buildings.insert(key.clone(), Building { owner: agent_id.to_string(), built_tick: self.tick, kind: "outpost".to_string() });
+                detail = format!("built outpost at {} (total {})", key, self.buildings.len());
             }
             ActionKind::Trade => {
-                // deterministic: trade always succeeds if resources allow, +2 net
-                agent.resources = agent.resources.saturating_sub(cost);
-                agent.resources = agent.resources.saturating_add(2);
-                detail = "traded".to_string();
+                {
+                    let agent = self.agents.get_mut(agent_id).unwrap();
+                    agent.resources = agent.resources.saturating_sub(cost);
+                }
+                if let Some(partner) = nearest_trade.clone() {
+                    if let Some(p) = self.agents.get_mut(&partner) {
+                        p.resources = p.resources.saturating_add(2);
+                    }
+                    {
+                        let agent = self.agents.get_mut(agent_id).unwrap();
+                        agent.resources = agent.resources.saturating_add(1);
+                    }
+                    self.trades.push(format!("{}->{}:1", agent_id, partner));
+                    detail = format!("traded with {} ({} trades)", partner, self.trades.len());
+                } else {
+                    {
+                        let agent = self.agents.get_mut(agent_id).unwrap();
+                        agent.resources = agent.resources.saturating_add(2);
+                    }
+                    self.trades.push(format!("{}:solo", agent_id));
+                    detail = format!("traded solo ({} trades)", self.trades.len());
+                }
+            }
+            ActionKind::Negotiate | ActionKind::Cooperate => {
+                if let Some(partner) = nearest_ally.clone() {
+                    let mut pair = (agent_id.to_string(), partner.clone());
+                    if pair.0 > pair.1 { pair = (pair.1, pair.0); }
+                    self.alliances.insert(pair.clone());
+                    detail = format!("{:?} with {} (alliances {})", action, partner, self.alliances.len());
+                } else {
+                    detail = format!("{:?} alone at {},{}", action, from_x, from_y);
+                }
             }
         }
-        agent.last_action_tick = self.tick;
+        {
+            let agent = self.agents.get_mut(agent_id).unwrap();
+            agent.last_action_tick = self.tick;
+        }
         let ev = ArenaEvent {
             tick: self.tick,
             agent_id: agent_id.to_string(),

@@ -255,18 +255,18 @@ pub struct DashboardInfo {
 #[derive(Clone)]
 pub struct ApiState {
     /// Base URL of the managed llama-server (e.g. http://127.0.0.1:41501).
-    backend_url: String,
+    pub(crate) backend_url: String,
     /// Optional master Bearer token; admin when set.
     auth_token: Option<Arc<str>>,
     /// Lifecycle handle; activity is recorded per request.
-    manager: Arc<Mutex<ServeManager>>,
-    client: reqwest::Client,
+    pub(crate) manager: Arc<Mutex<ServeManager>>,
+    pub(crate) client: reqwest::Client,
     pub(crate) info: DashboardInfo,
     /// Live name of the model this node actually serves. `info.model_name` is
     /// the model requested at startup (immutable); the admin model selector
     /// respawns the engine live, so every surface that must reflect the
     /// *current* model (status, dashboard, metrics, skills) reads this.
-    active_model: Arc<tokio::sync::RwLock<String>>,
+    pub(crate) active_model: Arc<tokio::sync::RwLock<String>>,
     /// Root dashboard choice from `node.dashboard`. `/ui2` always remains a
     /// preview route, so an operator can switch back without losing access.
     dashboard: DashboardVersion,
@@ -412,6 +412,10 @@ impl ApiState {
         compute: Option<Arc<decentraai_distributed::ComputeManager>>,
         p2p: Option<decentraai_p2p::P2PNode>,
     ) -> Self {
+        let arena_world = {
+            let arena_path = crate::arena::arena_path_for(&info.repo_root);
+            crate::arena::load_arena_world(&arena_path)
+        };
         Self {
             backend_url,
             auth_token: auth_token.map(Into::into),
@@ -471,7 +475,7 @@ impl ApiState {
             evidence: None,
             identity_signing_key: None,
             benchmark: None,
-            arena: Arc::new(tokio::sync::Mutex::new(decentraai_arena::ArenaWorld::new(20, 20))),
+            arena: Arc::new(tokio::sync::Mutex::new(arena_world)),
         }
     }
 
@@ -6333,6 +6337,74 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             }
         };
     }
+    // Arena act via MCP (M3): mutating, same validation/quota/LLM as HTTP
+    if let Some(args) = crate::mcp::arena_act_request(&raw) {
+        let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("observe");
+        let action: decentraai_arena::ActionKind = serde_json::from_value(serde_json::Value::String(action_str.to_string())).unwrap_or(decentraai_arena::ActionKind::Observe);
+        let target = args.get("target").and_then(|v| v.as_array()).and_then(|a| if a.len()==2 { Some((a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)) } else { None });
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("arena_act via MCP").to_string();
+        // Use operator account for master MCP
+        let account_id = "operator".to_string();
+        let agent_id = format!("arena:{}:{}", account_id, account_id);
+        {
+            let mut arena = state.arena.lock().await;
+            if !arena.agents.contains_key(&agent_id) {
+                let agent = decentraai_arena::ArenaAgent::new(agent_id.clone(), account_id.clone(), account_id.clone(), 5, 5);
+                let _ = arena.join(agent);
+            }
+        }
+        let tick_for_evidence = { state.arena.lock().await.tick };
+        let mut evidence_id: Option<String> = None;
+        let mut reservation_id: Option<String> = None;
+        let _ = reservation_id.is_none();
+        if action == decentraai_arena::ActionKind::RequestCompute {
+            let cost = action.cost_quota();
+            if let Some(ledger) = &state.quota_ledger {
+                let rid = format!("arena:{}:{}", agent_id, tick_for_evidence);
+                {
+                    let mut lg = ledger.lock().unwrap();
+                    if lg.reserve(&account_id, &rid, cost).is_ok() {
+                        reservation_id = Some(rid.clone());
+                    }
+                }
+                if reservation_id.is_some() {
+                    let backend = { let mgr = state.manager.lock().await; mgr.base_url().unwrap_or_else(|| state.backend_url.clone()) };
+                    let model = state.active_model.read().await.clone();
+                    let prompt = format!("Arena MCP {} at tick {}: {}. 1-sentence insight.", agent_id, tick_for_evidence, rationale);
+                    let client = state.client.clone();
+                    let llm: Option<String> = async {
+                        let resp = client.post(format!("{}/v1/chat/completions", backend)).json(&serde_json::json!({"model": model, "messages": [{"role":"user","content": prompt}], "max_tokens": 64})).send().await.ok()?;
+                        if !resp.status().is_success() { return None; }
+                        let v: serde_json::Value = resp.json().await.ok()?;
+                        v.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.chars().take(200).collect())
+                    }.await;
+                    if let Some(txt) = llm {
+                        evidence_id = Some(blake3::hash(txt.as_bytes()).to_hex().to_string());
+                    } else {
+                        evidence_id = Some(blake3::hash(format!("{}:{}:{:?}:{}", agent_id, tick_for_evidence, action, reservation_id.clone().unwrap()).as_bytes()).to_hex().to_string());
+                    }
+                    if let Some(ledger) = &state.quota_ledger {
+                        let mut lg = ledger.lock().unwrap();
+                        let _ = lg.settle(&reservation_id.clone().unwrap(), cost);
+                    }
+                }
+            } else {
+                evidence_id = Some(blake3::hash(format!("{}:{}:{:?}", agent_id, tick_for_evidence, action).as_bytes()).to_hex().to_string());
+            }
+        }
+        let mut arena = state.arena.lock().await;
+        match arena.apply(&agent_id, action, target, rationale, evidence_id.clone()) {
+            Ok(ev) => {
+                arena.advance_tick();
+                let path = crate::arena::arena_path_for(&state.info.repo_root);
+                crate::arena::save_arena_world(&path, &arena);
+                ctx.arena_action = serde_json::json!({"event": ev, "world_tick": arena.tick});
+            }
+            Err(e) => {
+                ctx.arena_action = serde_json::json!({"error": e.to_string()});
+            }
+        }
+    }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
             Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
@@ -6569,13 +6641,76 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
             "body": payload,
         });
-    } else if raw.contains("arena_state") || raw.contains("arena_act") {
-        // Arena read + act: consumer may observe and act in the shared world (Issue #63).
-        // arena_state is read-only; arena_act is quota-gated but reuses the same reservation path as arena_action_handler.
-        // For M2, we serve the snapshot already in ctx.arena_state; arena_act via MCP is currently read-only projection
-        // (mutating via POST /v1/arena/action with dca_ is the authoritative path).
-        // No extra handling needed — fall through to generic handle_message which returns ctx.arena_state / ctx.arena_action.
-        // allowed - no extra handling, will return ctx via handle_message below
+    } else if let Some(args) = crate::mcp::arena_act_request(&raw) {
+        // Arena act via consumer MCP — mutating, same as HTTP, quota-gated
+        let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("observe");
+        let action: decentraai_arena::ActionKind = serde_json::from_value(serde_json::Value::String(action_str.to_string())).unwrap_or(decentraai_arena::ActionKind::Observe);
+        let target = args.get("target").and_then(|v| v.as_array()).and_then(|a| if a.len()==2 { Some((a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)) } else { None });
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("arena_act via MCP").to_string();
+        let tick_for_evidence = { state.arena.lock().await.tick };
+        let mut evidence_id: Option<String> = None;
+        let mut reservation_id: Option<String> = None;
+        let _ = reservation_id.is_none();
+        if action == decentraai_arena::ActionKind::RequestCompute {
+            let cost = action.cost_quota();
+            if let Some(ledger) = &state.quota_ledger {
+                let rid = format!("arena:{}:{}", account, tick_for_evidence);
+                {
+                    let mut lg = ledger.lock().unwrap();
+                    if lg.reserve(account, &rid, cost).is_ok() {
+                        reservation_id = Some(rid.clone());
+                    } else {
+                        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+                        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "quota insufficient"}});
+                        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+                    }
+                }
+                if reservation_id.is_some() {
+                    let backend = { let mgr = state.manager.lock().await; mgr.base_url().unwrap_or_else(|| state.backend_url.clone()) };
+                    let model = state.active_model.read().await.clone();
+                    let prompt = format!("Arena MCP {} at tick {}: {}. 1-sentence.", account, tick_for_evidence, rationale);
+                    let client = state.client.clone();
+                    let llm: Option<String> = async {
+                        let resp = client.post(format!("{}/v1/chat/completions", backend)).json(&serde_json::json!({"model": model, "messages": [{"role":"user","content": prompt}], "max_tokens": 64})).send().await.ok()?;
+                        if !resp.status().is_success() { return None; }
+                        let v: serde_json::Value = resp.json().await.ok()?;
+                        v.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.chars().take(200).collect())
+                    }.await;
+                    if let Some(txt) = llm {
+                        evidence_id = Some(blake3::hash(txt.as_bytes()).to_hex().to_string());
+                    } else {
+                        evidence_id = Some(blake3::hash(format!("{}:{}:{:?}:{}", account, tick_for_evidence, action, reservation_id.clone().unwrap()).as_bytes()).to_hex().to_string());
+                    }
+                    {
+                        let mut lg = ledger.lock().unwrap();
+                        let _ = lg.settle(&reservation_id.clone().unwrap(), cost);
+                    }
+                }
+            } else {
+                evidence_id = Some(blake3::hash(format!("{}:{}:{:?}", account, tick_for_evidence, action).as_bytes()).to_hex().to_string());
+            }
+        }
+        let agent_id = format!("arena:{}:{}", account, account);
+        {
+            let mut arena = state.arena.lock().await;
+            if !arena.agents.contains_key(&agent_id) {
+                let agent = decentraai_arena::ArenaAgent::new(agent_id.clone(), account.clone(), account.clone(), 5, 5);
+                let _ = arena.join(agent);
+            }
+        }
+        let mut arena = state.arena.lock().await;
+        let res = match arena.apply(&agent_id, action, target, rationale, evidence_id.clone()) {
+            Ok(ev) => {
+                arena.advance_tick();
+                let path = crate::arena::arena_path_for(&state.info.repo_root);
+                crate::arena::save_arena_world(&path, &arena);
+                serde_json::json!({"event": ev, "world_tick": arena.tick})
+            }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
     } else if raw.contains("\"method\":\"tools/list\"") {
         // RBAC-filtered tool list: consumer sees only tools matching its scopes.
         let response = crate::mcp::handle_message(&ctx, &raw);
