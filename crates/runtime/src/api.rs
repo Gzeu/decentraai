@@ -7377,7 +7377,10 @@ async fn job_summarize_pdf_handler(
                     .into_response();
             }
             let v: serde_json::Value = resp.json().await.unwrap_or_default();
-            let content = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+            let mut content = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+            if content.is_empty() {
+                content = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("reasoning_content")).and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
+            }
             if content.is_empty() {
                 (format!("Summary (fallback) of {}-page PDF via DecentraAI DOCS-JOB ({} bytes extracted)", pages, extracted.len()), vec![])
             } else {
