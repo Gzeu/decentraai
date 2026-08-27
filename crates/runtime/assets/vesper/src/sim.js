@@ -301,15 +301,25 @@ function initMarkets(world) {
       prices[res] = BASE_PRICES[res] * (0.85 + ((hashFnv(city.id + res) % 40) / 100));
       supply[res] = Math.round(SUPPLY_TARGET[res] * (0.6 + ((hashFnv(city.id + res + 's') % 50) / 100)));
     }
+    const demand = {};
+    const history = {};
+    const buyVol = {};
+    const sellVol = {};
+    for (const res of MKT_RES) {
+      demand[res] = 0;
+      history[res] = [];
+      buyVol[res] = 0;
+      sellVol[res] = 0;
+    }
     const market = {
       id: city.id,
       cityId: city.id,
       regionId: region.id,
       prices, supply,
-      demand: { data: 0, compute: 0 },
-      history: { data: [], compute: [] },
-      buyVol: { data: 0, compute: 0 },
-      sellVol: { data: 0, compute: 0 },
+      demand,
+      history,
+      buyVol,
+      sellVol,
       credits: 8000,
       priceIdx: 1,
     };
