@@ -7347,8 +7347,10 @@ async fn job_summarize_pdf_handler(
     }
     // --- Real LLM call (Qwen3-1.7B on CPU) ---
     let llm_start = std::time::Instant::now();
-    let backend = state.backend_url.clone();
-    // Use active_model or fallback to info.model_name
+    let backend = {
+        let mgr = state.manager.lock().await;
+        mgr.base_url().unwrap_or_else(|| state.backend_url.clone())
+    };
     let model = state.active_model.read().await.clone();
     let prompt = format!("You are a document summarizer. Summarize the following PDF text ({} pages) in 3-5 concise sentences and extract key entities.\n\nText:\n{}\n\nSummary:", pages, &extracted[..extracted.len().min(3000)]);
     let llm_payload = serde_json::json!({
