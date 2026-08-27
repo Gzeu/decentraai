@@ -7292,49 +7292,102 @@ async fn job_summarize_pdf_handler(
             if trimmed.is_empty() { None } else { Some(trimmed) }
         }
         .await;
-        if let Some(t) = pdftotext_extract {
-            t
-        } else {
-            // Fallback: extract printable ASCII strings (for text PDFs without pdftotext).
-            // Also try OCR sidecar if enabled and text is empty.
-            let mut s = String::new();
-            let mut cur = String::new();
-            for &b in body.iter() {
-                if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
-                    cur.push(b as char);
-                } else {
-                    if cur.len() >= 4 {
-                        if s.len() < 8000 {
-                            if !s.is_empty() { s.push(' '); }
-                            s.push_str(&cur);
-                        }
-                    }
-                    cur.clear();
-                }
-            }
-            if cur.len() >= 4 && s.len() < 8000 {
-                if !s.is_empty() { s.push(' '); }
-                s.push_str(&cur);
-            }
-            // If still empty and OCR is enabled, proxy to OCR sidecar (expects image, will likely fail for PDF, but we try).
-            if s.trim().is_empty() && state.ocr.enabled() {
-                if let Some(base) = state.ocr.base_url() {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
-                    let payload = serde_json::json!({"image_b64": b64, "lang": "en"});
-                    if let Ok(resp) = state.client.post(format!("{}/v1/ocr", base)).json(&payload).send().await {
-                        if let Ok(v) = resp.json::<serde_json::Value>().await {
-                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                                if !t.trim().is_empty() { s = t.to_string(); }
-                            }
-                        }
-                    }
-                }
-            }
-            if s.trim().is_empty() {
-                // Absolute fallback for the MVP: use PDF metadata + page count.
-                format!("PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.", pages, body.len())
+        let mut extracted_via_pdftotext: Option<String> = pdftotext_extract;
+        // If pdftotext returned very little text (<5 words), treat as scanned and force OCR via pdftoppm.
+        let should_try_ocr = match &extracted_via_pdftotext {
+            Some(t) if t.split_whitespace().count() >= 5 => false,
+            _ => true,
+        };
+        if let Some(t) = extracted_via_pdftotext.take() {
+            if !should_try_ocr {
+                t
             } else {
-                s.chars().take(4000).collect()
+                // Try OCR via pdftoppm -> image -> RapidOCR
+                let ocr_text = async {
+                    if !state.ocr.enabled() { return None; }
+                    let base = state.ocr.base_url()?;
+                    let dir = std::env::temp_dir();
+                    let pdf_path = dir.join(format!("job_{}_ocr.pdf", job_id));
+                    let out_prefix = dir.join(format!("job_{}_page", job_id));
+                    if tokio::fs::write(&pdf_path, &body).await.is_err() { return None; }
+                    let out = tokio::process::Command::new("pdftoppm")
+                        .arg("-png").arg("-f").arg("1").arg("-l").arg("1").arg("-r").arg("150")
+                        .arg(&pdf_path).arg(&out_prefix)
+                        .output().await.ok()?;
+                    if !out.status.success() { let _ = tokio::fs::remove_file(&pdf_path).await; return None; }
+                    let img_path = dir.join(format!("job_{}_page-1.png", job_id));
+                    let img_bytes = tokio::fs::read(&img_path).await.ok()?;
+                    let _ = tokio::fs::remove_file(&pdf_path).await;
+                    let _ = tokio::fs::remove_file(&img_path).await;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+                    let payload = serde_json::json!({"image_b64": b64, "lang": "en"});
+                    let resp = state.client.post(format!("{}/v1/ocr", base)).json(&payload).send().await.ok()?;
+                    let v: serde_json::Value = resp.json().await.ok()?;
+                    let txt = v.get("text").and_then(|x| x.as_str())?.trim().to_string();
+                    if txt.is_empty() || txt.split_whitespace().count() < 3 { None } else { Some(txt) }
+                }.await;
+                if let Some(ocr_t) = ocr_text {
+                    ocr_t
+                } else if t.split_whitespace().count() >= 3 {
+                    // pdftotext had a little text but not enough for 5 words, use it as fallback
+                    t
+                } else {
+                    // Fallback to printable strings
+                    let mut s = String::new();
+                    let mut cur = String::new();
+                    for &b in body.iter() {
+                        if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                            cur.push(b as char);
+                        } else {
+                            if cur.len() >= 4 { if s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); } }
+                            cur.clear();
+                        }
+                    }
+                    if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                    if s.trim().is_empty() {
+                        format!("PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.", pages, body.len())
+                    } else { s.chars().take(4000).collect() }
+                }
+            }
+        } else {
+            // No pdftotext at all -> try OCR via pdftoppm, else fallback strings
+            let ocr_text = async {
+                if !state.ocr.enabled() { return None; }
+                let base = state.ocr.base_url()?;
+                let dir = std::env::temp_dir();
+                let pdf_path = dir.join(format!("job_{}_ocr2.pdf", job_id));
+                let out_prefix = dir.join(format!("job_{}_page2", job_id));
+                if tokio::fs::write(&pdf_path, &body).await.is_err() { return None; }
+                let out = tokio::process::Command::new("pdftoppm").arg("-png").arg("-f").arg("1").arg("-l").arg("1").arg("-r").arg("150").arg(&pdf_path).arg(&out_prefix).output().await.ok()?;
+                if !out.status.success() { let _ = tokio::fs::remove_file(&pdf_path).await; return None; }
+                let img_path = dir.join(format!("job_{}_page2-1.png", job_id));
+                let img_bytes = tokio::fs::read(&img_path).await.ok()?;
+                let _ = tokio::fs::remove_file(&pdf_path).await;
+                let _ = tokio::fs::remove_file(&img_path).await;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+                let payload = serde_json::json!({"image_b64": b64, "lang": "en"});
+                let resp = state.client.post(format!("{}/v1/ocr", base)).json(&payload).send().await.ok()?;
+                let v: serde_json::Value = resp.json().await.ok()?;
+                let txt = v.get("text").and_then(|x| x.as_str())?.trim().to_string();
+                if txt.is_empty() { None } else { Some(txt) }
+            }.await;
+            if let Some(ocr_t) = ocr_text {
+                ocr_t
+            } else {
+                let mut s = String::new();
+                let mut cur = String::new();
+                for &b in body.iter() {
+                    if (32..=126).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                        cur.push(b as char);
+                    } else {
+                        if cur.len() >= 4 { if s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); } }
+                        cur.clear();
+                    }
+                }
+                if cur.len() >= 4 && s.len() < 8000 { if !s.is_empty() { s.push(' '); } s.push_str(&cur); }
+                if s.trim().is_empty() {
+                    format!("PDF document with {} pages ({} bytes), no extractable text via OCR/pdftotext fallback.", pages, body.len())
+                } else { s.chars().take(4000).collect() }
             }
         }
     };
