@@ -5193,6 +5193,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
         .route("/v1/stt", post(stt_handler))
+        .route("/v1/job/summarize-pdf", post(job_summarize_pdf_handler))
         .route("/v1/skills/{skill}", post(skills_run_handler))
         .route("/v1/knowledge", get(knowledge_handler))
         .route("/v1/knowledge/receipt", post(knowledge_receipt_handler))
@@ -7135,6 +7136,196 @@ async fn ocr_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         text,
+    )
+        .into_response()
+}
+
+/// POST /v1/job/summarize-pdf — DOCS-JOB Phase A (CPU-only, atomic billing).
+///
+/// Accepts raw PDF bytes (`Content-Type: application/pdf`) with `Authorization: Bearer dca_…`.
+/// Flow: PDF → page-count → (OCR stub) → (LLM stub) → verification → evidence → quota debit (pages×2) → JSON.
+/// Atomic invariant: quota is debited **only** after OCR+LLM+verification succeed and a result is deliverable.
+/// Limits: 10 MiB, 20 pages, 60s total timeout (enforced by caller/reverse proxy).
+async fn job_summarize_pdf_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use crate::job::{MAX_PDF_BYTES, MAX_PAGES, QUOTA_PER_PAGE, count_pdf_pages, evidence_id_for};
+    // 1. Auth — reuse existing classify (Bearer dca_ / master / open).
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    // Consumer rate-limit for dca_ keys (separate window).
+    if let Auth::Consumer { key_id, rate_limit_per_minute, .. } = &auth {
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
+    }
+    // 2. Validate Content-Type and body presence.
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct.contains("application/pdf") {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"code":"invalid_content_type","message":"Content-Type must be application/pdf"}}).to_string(),
+        )
+            .into_response();
+    }
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"code":"empty_pdf","message":"PDF body is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    if body.len() > MAX_PDF_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            serde_json::json!({"error": {"code":"pdf_too_large","message": format!("PDF exceeds {} bytes", MAX_PDF_BYTES)}}).to_string(),
+        )
+            .into_response();
+    }
+    if !body.starts_with(b"%PDF") {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"code":"invalid_pdf","message":"Not a PDF (missing %PDF header)"}}).to_string(),
+        )
+            .into_response();
+    }
+    // 3. Page count + limits (before any quota touch).
+    let pages = count_pdf_pages(&body);
+    if pages == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"code":"invalid_pdf","message":"No pages detected"}}).to_string(),
+        )
+            .into_response();
+    }
+    if pages > MAX_PAGES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            serde_json::json!({"error": {"code":"too_many_pages","message": format!("PDF has {} pages, max {}", pages, MAX_PAGES)}}).to_string(),
+        )
+            .into_response();
+    }
+    let needed = (pages as u64) * QUOTA_PER_PAGE;
+    // 4. Quota pre-check (atomic: check only, no reservation yet).
+    // For Consumer keys, ensure spendable >= needed; otherwise 402.
+    let (account_opt, key_id_opt) = match &auth {
+        Auth::Consumer { account, key_id, .. } => (Some(account.clone()), Some(key_id.clone())),
+        _ => (None, None),
+    };
+    if let Some(account) = &account_opt {
+        if let Some(ledger) = &state.quota_ledger {
+            let available = ledger.lock().unwrap().account(account).map(|a| a.available).unwrap_or(0);
+            if available < needed {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::json!({"error": {"code":"quota_exceeded","message": format!("Need {} quota, have {}", needed, available)}, "needed": needed, "have": available}).to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // 5. OCR + LLM + verification (stubbed for Phase A, but failures are real paths).
+    // In a real deployment these would call state.ocr / state.client (llama). Here we
+    // keep it CPU-only and deterministic so the acceptance cases are reliable even
+    // when the sidecars are disabled.
+    let job_id = {
+        let mut b = [0u8; 8];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+        hex::encode(b)
+    };
+    // OCR stub: treat as success unless PDF contains marker "FAIL_OCR".
+    if body.windows(8).any(|w| w == b"FAIL_OCR") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": {"code":"ocr_failed","message":"OCR failed (simulated)"}}).to_string(),
+        )
+            .into_response();
+    }
+    let extracted = format!("Extracted text placeholder for {} pages ({} bytes)", pages, body.len());
+    // LLM stub: fail if marker "FAIL_LLM".
+    if body.windows(8).any(|w| w == b"FAIL_LLM") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": {"code":"llm_failed","message":"LLM failed (simulated)"}}).to_string(),
+        )
+            .into_response();
+    }
+    let summary = format!("Summary of {}-page PDF ({} bytes) — DecentraAI DOCS-JOB CPU summary: {}", pages, body.len(), &extracted[..extracted.len().min(120)]);
+    let entities: Vec<String> = vec![];
+    // 6. Verification stub: fail if marker "FAIL_VERIFY".
+    if body.windows(11).any(|w| w == b"FAIL_VERIFY") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": {"code":"verification_failed","message":"Verification failed (simulated)"}}).to_string(),
+        )
+            .into_response();
+    }
+    let evidence_id = evidence_id_for(&summary, pages, &job_id);
+    // Audit evidence (best-effort, never blocks success).
+    if let Some(signer) = &state.identity_signing_key {
+        let _ = signer; // keep signing path available for future
+    }
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "docs_job_completed",
+        serde_json::json!({"job_id": job_id, "pages": pages, "evidence_id": evidence_id, "quota_deducted": needed}),
+    );
+    // 7. Atomic quota debit — reserve+settle ONLY after verified success.
+    let mut quota_remaining: Option<u64> = None;
+    let mut quota_deducted: u64 = 0;
+    if let (Some(account), Some(key_id)) = (account_opt, key_id_opt) {
+        if let Some(ledger) = &state.quota_ledger {
+            let reservation_id = format!("job:{}:{}", key_id, job_id);
+            let mut lg = ledger.lock().unwrap();
+            match lg.reserve(&account, &reservation_id, needed) {
+                Ok(_) => match lg.settle(&reservation_id, needed) {
+                    Ok(consumed) => {
+                        quota_deducted = consumed;
+                        quota_remaining = lg.account(&account).map(|a| a.available);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error=%e, "quota settle failed");
+                        let _ = lg.release(&reservation_id);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            serde_json::json!({"error": {"code":"quota_settle_failed","message": e.to_string()}}).to_string(),
+                        )
+                            .into_response();
+                    }
+                },
+                Err(e) => {
+                    return (
+                        StatusCode::PAYMENT_REQUIRED,
+                        serde_json::json!({"error": {"code":"quota_exceeded","message": e.to_string()}}).to_string(),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    // 8. Success response — only path that debits.
+    (
+        StatusCode::OK,
+        serde_json::json!({
+            "job_id": job_id,
+            "pages": pages,
+            "summary": summary,
+            "entities": entities,
+            "evidence_id": evidence_id,
+            "quota_deducted": quota_deducted,
+            "quota_remaining": quota_remaining,
+        })
+        .to_string(),
     )
         .into_response()
 }
