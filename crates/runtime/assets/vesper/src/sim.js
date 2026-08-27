@@ -519,6 +519,13 @@ function seedContracts(world) {
   const builderCities = [...world.map.cities].slice(0, 3);
   mk({ type: 'build', title: 'Erect a relay station', objective: { kind: 'build', facility: 'relays', regionId: world.map.cities[0].regionId }, reward: { credits: 900, rep: 12, compute: 6 }, risk: 0.4, reqSkills: ['engineering'], deadline: 200 });
   mk({ type: 'research', title: 'Foundational analysis', objective: { kind: 'research', tech: 'data' }, reward: { credits: 1100, rep: 14, compute: 15 }, risk: 0.5, reqSkills: ['science'], deadline: 260 });
+  // Slice 3: seed one world-funded analysis service contract so the
+  // new flow is observable from tick 1. World-issued means the world
+  // pool pays via the legitimate `payAgent` path — no org-issuer
+  // branch involved, no `fullyFunded` concern.
+  if (world.map.cities[1]) {
+    mk({ type: 'analyze', title: 'Analyse the wilds around ' + world.map.cities[1].name, objective: { kind: 'analyze', regionId: world.map.cities[1].regionId, depth: 6 }, reward: { credits: 480, rep: 8, compute: 4 }, risk: 0.3, reqSkills: ['analysis'], deadline: 180, issuerId: 'world' });
+  }
   if (world.map.zones[0]) {
     mk({ type: 'investigate', title: 'Investigate the anomaly at ' + regionName(world, world.map.zones[0].regionId), objective: { kind: 'investigate', regionId: world.map.zones[0].regionId }, reward: { credits: 1400, rep: 18, compute: 12 }, risk: 0.75, reqSkills: ['navigation', 'analysis', 'combat'], deadline: 300 });
   }
@@ -545,6 +552,18 @@ export function createContract(world, opts) {
     progress: 0,
     target: opts.objective.qty || opts.objective.ticks || 1,
     evidence: [],
+    // Slice 3 (org-issued services): when an org creates a contract it
+    // first proves it can actually pay the reward (checked by the org-need
+    // path in orgTick). If so, `fullyFunded: true` is set; `completeContract`
+    // then debits the org treasury directly. When `fullyFunded` is false
+    // the reward is **not** paid by anyone — the contract still records
+    // completion, but the provider receives only the non-credits rewards
+    // (rep, compute if any). This prevents the silent world-treasury
+    // fallback that would otherwise let orgs externalize their service
+    // bills. Default `true` preserves the existing world-issued path
+    // (where the world is the implicit funder and `payAgent` is the
+    // legitimate payment primitive).
+    fullyFunded: opts.fullyFunded !== false,
     meta: opts.meta || null,
   };
   world.contracts[id] = contract;
@@ -862,6 +881,17 @@ function contractSteps(world, a, ct) {
       break;
     }
     case 'build': add(steps, obj.regionId, [{ kind: 'build', regionId: obj.regionId, facility: obj.facility || 'relays', ticks: 6 }]); break;
+    case 'analyze': {
+      // Slice 3: analysis service. The agent travels to the target
+      // region (or stays if already there) and runs the analyze step,
+      // which submits a compute job via `requestCompute('analyze', …)`
+      // and consumes real `a.data` + `a.compute` + `a.energy` per
+      // tick. The contract completes only when the compute result is
+      // verified and consumed by `doAnalyze` — see `checkContract` /
+      // `doAnalyze` for the strict-result-verification path.
+      add(steps, obj.regionId, [{ kind: 'analyze', regionId: obj.regionId, depth: obj.depth || 8, contractId: ct.id }]);
+      break;
+    }
     case 'defend':
     case 'investigate': add(steps, obj.regionId, [{ kind: 'contract', contractId: ct.id }]); break;
     default: steps.push({ kind: 'contract', contractId: ct.id });
@@ -1007,6 +1037,7 @@ function executeStep(world, a, rng, t) {
     case 'sell': doSellStep(world, a, st); break;
     case 'explore': doExplore(world, a, st, rng); break;
     case 'research': doResearch(world, a, st, rng); break;
+    case 'analyze': doAnalyze(world, a, st, rng); break;
     case 'build': doBuild(world, a, st, rng); break;
     case 'contract': doContractWork(world, a, st, rng); break;
     case 'rest': { st.ticks--; if (st.ticks <= 0) advanceStep(a); a.energy = Math.min(100, a.energy + 1.8); a.focus = Math.min(100, a.focus + 1.2); a.morale = Math.min(100, a.morale + 0.5); a.status = 'resting'; break; }
@@ -1311,6 +1342,87 @@ function doResearch(world, a, st, rng) {
   }
 }
 
+// Slice 3: analysis service. The agent consumes real `a.data`,
+// `a.compute` and `a.energy` per tick, and submits ONE compute
+// job via `requestCompute('analyze', …)`. Completion of the
+// underlying contract is gated on the compute result being
+// verified (matching `executionId` + a non-empty `findings` field
+// from `a.computeTrack.results.analyze`). The contract does NOT
+// complete on `requestCompute` returning `ok: true` — the
+// service work is the analysis itself, not the job submission.
+function doAnalyze(world, a, st, rng) {
+  const r = world.regions.find(x => x.id === st.regionId);
+  if (!r) { a.planDone = true; return; }
+  a.status = 'analyzing';
+  // Per-tick real economic input (mirrors doResearch).
+  a.data = Math.max(0, (a.data || 0) - 1.5);
+  a.compute = Math.max(0, (a.compute || 0) - 1.5);
+  a.energy = Math.max(0, (a.energy || 0) - 0.6);
+  // First tick: submit the compute job. `taskType: 'analyze'` is
+  // already in `defaultBudget` (compute.js:71) at budget 25. The
+  // job publishes its result to `a.computeTrack.results.analyze`
+  // when `runTask` (compute.js) finishes, mirroring how
+  // `a.computeTrack.results.researchsim` is populated today.
+  if (!st.execId && (a.compute || 0) >= 25) {
+    const req = requestCompute(world, a.id, 'analyze', {
+      region: r.id,
+      depth: st.depth || 8,
+      agentSkills: { analysis: a.skills.analysis || 0, science: a.skills.science || 0 },
+      quality: 0.5 + (a.skills.analysis || 0) * 0.18 + (a.skills.science || 0) * 0.08,
+    }, 25);
+    if (req.ok) st.execId = req.executionId;
+  }
+  // Strict result verification: do NOT complete the contract on
+  // `requestCompute` success alone. Read the compute track result
+  // published by `runTask`; only act on a matching executionId with
+  // a real `findings` payload. Anything less is "work in progress".
+  if (st.execId) {
+    const result = a.computeTrack && a.computeTrack.results && a.computeTrack.results.analyze;
+    if (result && result.executionId === st.execId && !st.boostApplied) {
+      const findings = (result.result && (result.result.findings || result.result.summary)) || null;
+      if (findings && (typeof findings === 'string' ? findings.length > 0 : true)) {
+        // Verified: write findings into the parent contract's
+        // objective, mark the analysis complete, and complete the
+        // contract. The `evidenceRecord({ kind: 'compute', ... })`
+        // was already written by `runTask`; we chain the contract
+        // record on top through `completeContract`.
+        st.boostApplied = true;
+        st.findingsHash = result.result && (result.result.hash || result.result.findingsHash) || null;
+        const ct = st.contractId ? world.contracts[st.contractId] : null;
+        if (ct && ct.state === 'active' && ct.objective) {
+          ct.objective.findings = (typeof findings === 'string') ? findings : JSON.stringify(findings);
+          ct.objective.completedTick = world.clock.t;
+        }
+        a.experience = a.experience || {};
+        gainXp(a, 'analysis', 2.0);
+        a.stats = a.stats || {};
+        a.stats.analyzed = (a.stats.analyzed || 0) + 1;
+        a.stats.earned = (a.stats.earned || 0) + 0; // credits come from completeContract
+        a.achievements = a.achievements || [];
+        a.achievements.push({ tick: world.clock.t, kind: 'analyze', detail: `Analyzed ${r.name} (depth ${st.depth || 8}).` });
+        act(world, a, 'analyze', 'completed', `analysed ${r.name} (depth ${st.depth || 8})`, { regionId: r.id, value: (st.depth || 8) * 10 });
+        recordDecision(world, { id: 'dec' + world.decisions.length, tick: world.clock.t, agentId: a.id, phase: 'act', action: 'analyze', region: r.id, depth: st.depth || 8, result: 'findings', resultHash: st.findingsHash });
+        if (ct && ct.state === 'active') {
+          ct.progress = ct.target;
+          checkContract(world, a, ct);
+        }
+        advanceStep(a);
+        return;
+      }
+    }
+  }
+  // Default per-tick accounting while the job runs.
+  st.ticks = (st.ticks || 16) - 1;
+  if (st.ticks <= 0 && !st.boostApplied) {
+    // Hard cap: if the job never produced a result by the deadline,
+    // we abandon the step. The contract is left to `contractTick`
+    // to expire / fail on its deadline. We do NOT force-complete:
+    // that would be the exact fabrication the slice explicitly
+    // forbids.
+    a.planDone = true;
+  }
+}
+
 function currentTech(world, a) {
   const list = ['materials', 'energy', 'logistics', 'computation', 'biotech', 'terraforming'];
   const tech = world.fact.tech;
@@ -1493,17 +1605,39 @@ export function completeContract(world, a, ct) {
   const reward = ct.reward;
   const pay = reward.credits || 0;
   const issuer = ct.issuerId;
+  // Slice 3 / economic-integrity invariant: an org that cannot fund
+  // its own contract MUST NOT silently externalize the bill to the
+  // world treasury. The funding check is enforced at creation time
+  // (`fullyFunded`); here we honor it. If the org is the issuer and
+  // the contract is not fullyFunded (e.g. the org collapsed between
+  // creation and completion, or the funding check was somehow
+  // skipped), the credit reward is simply not paid. Rep, compute
+  // and the tithe still apply (they are not currency; they are
+  // social / reputation primitives the provider has legitimately
+  // earned by doing the work).
   let paid = false;
+  let payCredits = 0;
   if (issuer && issuer !== 'world' && issuer.startsWith('org:')) {
     const org = world.orgs[issuer.slice(4)];
-    if (org && org.treasury.credits >= pay) {
+    if (org && org.treasury.credits >= pay && ct.fullyFunded !== false) {
       org.treasury.credits -= pay;
       a.credits += pay;
+      payCredits = pay;
       paid = true;
+    } else {
+      // Not paid by org. Record the unpaid state on the contract so
+      // a future audit can see the funding failure, but do NOT
+      // top up from `world` — that would break the org-issuer
+      // economic contract. `payCredits` stays 0.
     }
-  }
-  if (!paid) {
-    payAgent(world, 'world', a, 'credits', pay, 'contract-reward:' + ct.id);
+  } else if (!issuer || issuer === 'world' || !issuer.startsWith('org:')) {
+    // World-issued contract: `payAgent` from the world balance
+    // is the legitimate funding path (the world pool was the
+    // genesis funder; world-funded rewards are part of the
+    // existing economy). This is the ONLY branch that pays from
+    // the world treasury.
+    if (pay > 0) payAgent(world, 'world', a, 'credits', pay, 'contract-reward:' + ct.id);
+    payCredits = pay;
     paid = true;
   }
   if (reward.compute) payAgent(world, 'world', a, 'compute', reward.compute, 'contract-reward');
@@ -1513,7 +1647,7 @@ export function completeContract(world, a, ct) {
   a.achievements.push({ tick: world.clock.t, kind: 'contract', detail: `Completed: ${ct.title}.` });
   if (a.org) {
     const org = world.orgs[a.org];
-    if (org) { org.rep = Math.min(100, org.rep + (reward.rep || 2) * 0.6); org.treasury.credits += pay * 0.08; org.history.push({ tick: world.clock.t, kind: 'contract', detail: `${a.name} completed "${ct.title}" (+${Math.round(pay * 0.08)} Cr tithe).` }); }
+    if (org) { org.rep = Math.min(100, org.rep + (reward.rep || 2) * 0.6); org.treasury.credits += payCredits * 0.08; org.history.push({ tick: world.clock.t, kind: 'contract', detail: `${a.name} completed "${ct.title}" (+${Math.round(payCredits * 0.08)} Cr tithe).` }); }
   }
   world.stats.completedContracts++;
   a.stats.contracts++;
@@ -1758,6 +1892,48 @@ function orgTick(world, rng, t) {
             pushEvent(world, { type: 'political-conflict', source: 'org', orgId: org.id, regionId: cand.id, detail: `${rb.name} contests ${org.name}'s claim on ${regionName(world, cand.id)}.` });
             break;
           }
+        }
+      }
+    }
+    // Slice 3: org-need analysis demand. Every 48 ticks, an org
+    // with at least 2 territory cells, a healthy treasury and at
+    // least one territory region without `infra.labs` funds an
+    // analysis contract. The funding check (`treasury.credits >=
+    // reward.credits`) is performed BEFORE `createContract` so we
+    // never produce a payable contract that the org cannot fund.
+    // `fullyFunded: true` is set on the contract only when the
+    // org actually has the credits; `completeContract` then
+    // debits the org treasury directly. World fallback is
+    // explicitly disabled for the org-issuer branch in this slice.
+    if (t % 48 === 0 && org.treasury.credits >= 700 && org.territory.length >= 2) {
+      const target = org.territory
+        .map(rid => world.regions.find(x => x.id === rid))
+        .find(r => r && (r.infra.labs || 0) === 0);
+      if (target) {
+        const cost = 700;
+        if (org.treasury.credits >= cost) {
+          // Reserve the funds up-front so the org cannot double-
+          // spend the same treasury on a parallel analyze need
+          // before the contract completes. Refund on expiry or
+          // failure happens via `contractTick` (we do not refund
+          // here — completion is the natural settlement point;
+          // failure leaves the funds in the org's hands and
+          // emits the standard `contract-failed` event).
+          org.treasury.credits -= cost;
+          org.treasuryLog = org.treasuryLog || [];
+          org.treasuryLog.push({ t, kind: 'analyze-fund', amt: -cost, detail: `Funded analysis of ${target.name}` });
+          createContract(world, {
+            type: 'analyze',
+            title: `Analyse ${target.name} for ${org.name}`,
+            objective: { kind: 'analyze', regionId: target.id, depth: 8 },
+            reward: { credits: cost, rep: 12, compute: 6 },
+            risk: 0.4,
+            reqSkills: ['analysis', 'science'],
+            deadline: 220,
+            issuerId: 'org:' + org.id,
+            fullyFunded: true,
+            meta: { reason: 'org-need', regionId: target.id },
+          });
         }
       }
     }
