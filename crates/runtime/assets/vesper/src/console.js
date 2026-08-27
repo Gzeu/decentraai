@@ -80,6 +80,26 @@ export function createVesper(getWorld) {
     return out;
   };
 
+  // Slice 4: provenance lots for an agent. Observational only — does
+  // not mutate state. Returns the flat total and the FIFO lots array.
+  api.inspect_lots = (agentId, res) => {
+    const world = w();
+    const a = world.agents[agentId];
+    if (!a) return null;
+    const lots = (a.inventory && a.inventory[res + 'Lots']) || [];
+    return {
+      total: (a.inventory && a.inventory[res]) || 0,
+      lots: lots.map(l => ({
+        qty: l.qty,
+        source: l.source,
+        regionId: l.regionId,
+        producer: l.producer,
+        facility: l.facility,
+        tick: l.tick,
+      })),
+    };
+  };
+
   api.inspect_contracts = (filter) => {
     const world = w();
     return Object.values(world.contracts).filter(c => !filter || c.state === filter).map(c => ({

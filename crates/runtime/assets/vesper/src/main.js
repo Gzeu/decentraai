@@ -233,6 +233,14 @@ async function boot() {
     a.inventory.materials = a.inventory.materials || 0;
     a.inventory.energy    = a.inventory.energy    || 0;
   }
+  // Slice 4: provenance lot arrays. Empty defaults — pre-existing
+  // inventory has no historical provenance (we never fabricate).
+  for (const id of world.agentOrder) {
+    const a = world.agents[id];
+    if (!a) continue;
+    a.inventory.materialsLots = a.inventory.materialsLots || [];
+    a.inventory.energyLots    = a.inventory.energyLots    || [];
+  }
   // Slice 2: infrastructure-maintenance state. `infraActive()` returns
   // `true` when `r.infraPaidAt` is uninitialised, so legacy worlds keep
   // their existing facilities running until the owning org next pays

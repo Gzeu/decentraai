@@ -48,24 +48,53 @@ function payAgent(world, who, a, res, amount, reason) {
 // flat field; tradable materials and economic energy live on `a.inventory`
 // to avoid a name collision and to keep the resource-listing pattern
 // consistent (`credit`/`payAgent` already key on string `res`).
+//
+// Slice 4: provenance lot model. Each unit of `materials` / `energy` in
+// `a.inventory[res]` is paired with an entry in `a.inventory[res + 'Lots']`
+// carrying where it came from. The flat counter is preserved for
+// backward compat with all existing reads; the lots array is the
+// per-unit provenance used at sell time to route producer royalties.
 const INVENTORY_RES = new Set(['materials', 'energy']);
 function stockOf(a, res) {
   if (INVENTORY_RES.has(res)) return (a.inventory && a.inventory[res]) || 0;
   return (a[res] || 0);
 }
-function gainResource(a, res, amount) {
+
+// gainResource: increments the flat counter and, if opts is supplied,
+// pushes a provenance lot onto the corresponding lots array. The flat
+// counter remains the source of truth for every existing read; the lots
+// array is FIFO-consumed at sell time by `spendUnits`. Backward compat:
+// callers that pass `amount` only get the old behavior (no lot pushed).
+function gainResource(a, res, amount, opts) {
   if (!(amount > 0)) return;
   if (INVENTORY_RES.has(res)) {
-    a.inventory = a.inventory || { materials: 0, energy: 0 };
+    a.inventory = a.inventory || { materials: 0, energy: 0, materialsLots: [], energyLots: [] };
     a.inventory[res] = (a.inventory[res] || 0) + amount;
+    if (opts && opts.provenance !== false) {
+      const lotsKey = res + 'Lots';
+      a.inventory[lotsKey] = a.inventory[lotsKey] || [];
+      a.inventory[lotsKey].push({
+        qty: amount,
+        source: opts.source || 'unknown',
+        regionId: opts.regionId || null,
+        producer: opts.producer || null,
+        facility: opts.facility || null,
+        tick: world.clock.t,
+      });
+    }
   } else {
     a[res] = (a[res] || 0) + amount;
   }
 }
+
+// spendResource: pure flat-counter decrement. Used by build consumption
+// (no royalty, no sale). Build does NOT need lots; the lots array is
+// untouched here. (consumed units are tracked by the flat counter
+// only; FIFO lot state is only consulted at sell time.)
 function spendResource(a, res, amount) {
   if (!(amount > 0)) return false;
   if (INVENTORY_RES.has(res)) {
-    a.inventory = a.inventory || { materials: 0, energy: 0 };
+    a.inventory = a.inventory || { materials: 0, energy: 0, materialsLots: [], energyLots: [] };
     const have = a.inventory[res] || 0;
     if (have < amount) return false;
     a.inventory[res] = have - amount;
@@ -75,6 +104,47 @@ function spendResource(a, res, amount) {
   if (have < amount) return false;
   a[res] = have - amount;
   return true;
+}
+
+// spendUnits: FIFO sweep over a.inventory[res + 'Lots']. Returns
+// { ok, lots: [{qty, source, regionId, producer, facility, tick}], spentFlat }.
+// Each lot may be partially consumed; lots with qty === 0 are filtered
+// out at the end. Used by doTrade sell to attribute sales to producers.
+// Backward compat: callers without a lots array get ok=true with lots=[]
+// — the flat counter is still decremented.
+function spendUnits(a, res, q) {
+  if (!(q > 0)) return { ok: false, lots: [], spentFlat: false };
+  if (!INVENTORY_RES.has(res)) {
+    return spendResource(a, res, q)
+      ? { ok: true, lots: [], spentFlat: true }
+      : { ok: false, lots: [], spentFlat: false };
+  }
+  a.inventory = a.inventory || { materials: 0, energy: 0, materialsLots: [], energyLots: [] };
+  const have = a.inventory[res] || 0;
+  if (have < q) return { ok: false, lots: [], spentFlat: false };
+  a.inventory[res] = have - q;
+  const lotsKey = res + 'Lots';
+  const lots = a.inventory[lotsKey] = a.inventory[lotsKey] || [];
+  const spent = [];
+  let remaining = q;
+  for (const lot of lots) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, lot.qty);
+    if (take > 0) {
+      spent.push({
+        qty: take,
+        source: lot.source,
+        regionId: lot.regionId,
+        producer: lot.producer,
+        facility: lot.facility,
+        tick: lot.tick,
+      });
+      lot.qty -= take;
+      remaining -= take;
+    }
+  }
+  a.inventory[lotsKey] = lots.filter(l => l.qty > 0);
+  return { ok: true, lots: spent, spentFlat: true };
 }
 
 // Experience is per-capability progression (layer 2): work changes what the
@@ -136,6 +206,14 @@ export const FACILITY_ENERGY_BUILD_COST = {
   refineries: 0.4,
   defense: 0.3,
 };
+
+// Slice 4: producer-revenue royalty on attributed inventory lots.
+// When an agent sells a lot whose `producer` is non-null (set at mining
+// time to the territorial owner `r.owner`), a fraction of the sale
+// `pay` flows to the producer org. The seller keeps the remainder.
+// Conservation: seller gets pay - royalty, producer gets royalty,
+// total = pay. Zero world mint, zero market tax.
+const PRODUCTION_ROYALTY = 0.30;
 
 // How many ticks of grace a facility gets after maintenance is missed
 // before it goes inactive. A small buffer absorbs per-tick jitter; long
@@ -303,7 +381,7 @@ function createAgents(world, count, cfg) {
       // World-economy inventory: materials and economic energy live on the
       // agent under `a.inventory` so they don't collide with personal
       // `a.energy` (0-100) or the existing flat `a.{credits,compute,data}`.
-      inventory: { materials: 0, energy: 0 },
+      inventory: { materials: 0, energy: 0, materialsLots: [], energyLots: [] },
       rep: { reliability: 50, cooperation: 50, contribution: 50, disputes: 0, score: 50 },
       computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
@@ -389,7 +467,7 @@ function importRealAgents(world, realAgents) {
       // World-economy inventory: materials and economic energy live on the
       // agent under `a.inventory` so they don't collide with personal
       // `a.energy` (0-100) or the existing flat `a.{credits,compute,data}`.
-      inventory: { materials: 0, energy: 0 },
+      inventory: { materials: 0, energy: 0, materialsLots: [], energyLots: [] },
       rep: { reliability: 60, cooperation: 60, contribution: 60, disputes: 0, score: 60 },
       computeTrack: { usage: 0, contributed: 0, earned: 0, results: {}, lastResultTick: 0 },
       achievements: [],
@@ -1140,8 +1218,18 @@ function doMine(world, a, st, rng) {
     // Honest inventory credit: the agent physically extracted this much
     // material / energy from the node, so they carry it. Do NOT touch
     // `a.energy` (the personal 0-100 state).
-    if (pulledMaterials > 0) gainResource(a, 'materials', pulledMaterials);
-    if (pulledEnergy    > 0) gainResource(a, 'energy',    pulledEnergy);
+    // Slice 4: tag each pulled unit with provenance. Producer = territorial
+    // owner (`r.owner`'s org id, or the miner's own org if the territory
+    // is unowned). This is the only place mining creates attributed lots.
+    const mineProducer = (r.owner && r.owner.startsWith('org:'))
+      ? r.owner.slice(4)
+      : (a.org || null);
+    if (pulledMaterials > 0) gainResource(a, 'materials', pulledMaterials, {
+      source: 'mine', regionId: r.id, producer: mineProducer, facility: null,
+    });
+    if (pulledEnergy    > 0) gainResource(a, 'energy',    pulledEnergy, {
+      source: 'mine', regionId: r.id, producer: mineProducer, facility: null,
+    });
     // Inject a fraction of the extraction into the local market supply,
     // but only when the region hosts a market (cities only). Matches the
     // existing `region.prod[res] * 0.6` factor used by marketTick.
@@ -1203,7 +1291,10 @@ export function doTrade(world, a, m, side, res, qty) {
     // Slice 1: materials / energy live on `a.inventory`; flat fields
     // continue to carry credits / compute / data. Routing through the
     // helper keeps the field location consistent for every resource.
-    gainResource(a, res, q);
+    // Slice 4: market buy creates a `producer: null` lot. The market
+    // pool has no per-unit provenance; subsequent resales of these
+    // units generate zero producer royalty (first-sale rule).
+    gainResource(a, res, q, { source: 'market', regionId: m.regionId, producer: null, facility: null });
     m.supply[res] = Math.max(0, (m.supply[res] || 0) - q);
     m.buyVol[res] += q;
     m.credits += cost;
@@ -1225,18 +1316,53 @@ export function doTrade(world, a, m, side, res, qty) {
   const q = Math.min(qty, stockOf(a, res), Math.floor(m.credits / price));
   if (q <= 0) return null;
   const pay = Math.round(q * price * 100) / 100;
-  if (!spendResource(a, res, q)) return null;
+  // Slice 4: FIFO sweep over a.inventory[res + 'Lots'] via spendUnits.
+  // Returns { ok, lots: [{qty, source, regionId, producer, facility, tick}] }.
+  const spend = spendUnits(a, res, q);
+  if (!spend.ok) return null;
   a.credits += pay;
   m.supply[res] += q;
   m.sellVol[res] += q;
   m.credits -= pay;
   const factor = 1 - (q / Math.max(1, SUPPLY_TARGET[res])) * 0.2;
   m.prices[res] = Math.max(BASE_PRICES[res] * 0.35, m.prices[res] * factor);
+  // Slice 4: producer royalty. The seller pays a fraction of `pay` to
+  // each attributed lot's `producer` (territorial owner for mine
+  // lots, null for market-bought lots). Royalty is debited from the
+  // seller's `a.credits` and credited to the producer's
+  // `org.treasury.credits`. Conservation: seller gets pay - royalty,
+  // producer gets royalty, total = pay. Zero world mint.
+  for (const lot of spend.lots) {
+    if (!lot.producer) continue;
+    const prodOrg = world.orgs[lot.producer];
+    if (!prodOrg) continue;
+    const royalty = Math.round(pay * (lot.qty / q) * PRODUCTION_ROYALTY * 100) / 100;
+    if (royalty <= 0) continue;
+    a.credits = Math.max(0, a.credits - royalty);
+    prodOrg.treasury.credits = (prodOrg.treasury.credits || 0) + royalty;
+    ledgerTx(world, {
+      from: a.id,
+      to: 'org:' + prodOrg.id,
+      res: 'credits',
+      amount: royalty,
+      reason: 'producer-royalty',
+      meta: { regionId: lot.regionId, source: lot.source, qty: lot.qty, fraction: PRODUCTION_ROYALTY },
+    });
+    pushEvent(world, { type: 'producer-royalty', orgId: prodOrg.id, regionId: lot.regionId, source: lot.source, amount: royalty });
+  }
   ledgerTx(world, { from: 'market:' + m.cityId, to: a.id, res: 'credits', amount: pay, reason: 'trade-sale' });
   ledgerTx(world, { from: a.id, to: 'market:' + m.cityId, res, amount: q, reason: 'trade-sell' });
   touchRelation(world, a, 'market:' + m.cityId, 0.02, 'trade');
   world.stats.trades++;
-  a.stats.earned += pay;
+  // Stats `earned` reflects net credits the seller keeps after royalty.
+  // Sum royalties debited in this very tx (mirrors the loop above).
+  let royaltyThisTx = 0;
+  for (const lot of spend.lots) {
+    if (!lot.producer) continue;
+    if (!world.orgs[lot.producer]) continue;
+    royaltyThisTx += Math.round(pay * (lot.qty / q) * PRODUCTION_ROYALTY * 100) / 100;
+  }
+  a.stats.earned += (pay - royaltyThisTx);
   a.stats.tradedVol += q;
   if (q >= 5) {
     const cn = (world.map.cities.find(c => c.id === m.cityId) || {}).name || m.cityId;
@@ -1473,7 +1599,10 @@ function doBuild(world, a, st, rng) {
     // still short after attempted purchase — pause this tick and try again
     return;
   }
-  spendResource(a, 'materials', materialsPerTick);
+  // Slice 4: spendUnits keeps the lots array in sync with the flat
+  // counter. Build consumption is not a sale — no royalty, no lot
+  // re-creation, just decrement.
+  spendUnits(a, 'materials', materialsPerTick);
   // Slice 2: productive facilities also draw on the world-energy
   // commodity. Same auto-purchase pattern as materials, gated on
   // FACILITY_ENERGY_BUILD_COST[facility] * `need` to scale with size.
@@ -1508,7 +1637,7 @@ function doBuild(world, a, st, rng) {
       // still short after attempted purchase — pause this tick and try again
       return;
     }
-    spendResource(a, 'energy', energyPerTick);
+    spendUnits(a, 'energy', energyPerTick);
   }
   st.progress = (st.progress || 0) + (0.5 + a.skills.engineering * 0.3);
   a.credits -= creditsCost * 0.2;
