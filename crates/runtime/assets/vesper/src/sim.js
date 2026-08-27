@@ -1580,7 +1580,12 @@ function doBuild(world, a, st, rng) {
         const cost = Math.round(q * (m.prices.materials || 0) * 100) / 100;
         if (a.credits >= cost) {
           a.credits -= cost;
-          gainResource(a, 'materials', q);
+          // Slice 4: auto-purchase is an anonymous market transaction —
+          // tag the units with provenance `source: 'market', producer:
+          // null`. This keeps the flat counter and the lots array in sync
+          // and ensures subsequent sells of these units generate zero
+          // producer royalty (first-sale rule).
+          gainResource(a, 'materials', q, { source: 'market', regionId: m.regionId, producer: null, facility: null });
           m.supply.materials = Math.max(0, (m.supply.materials || 0) - q);
           m.buyVol.materials = (m.buyVol.materials || 0) + q;
           m.credits += cost;
@@ -1618,7 +1623,9 @@ function doBuild(world, a, st, rng) {
           const cost = Math.round(q * (m.prices.energy || 0) * 100) / 100;
           if (a.credits >= cost) {
             a.credits -= cost;
-            gainResource(a, 'energy', q);
+            // Slice 4: same as materials — anonymous market lot, no
+            // producer attribution. See comment at sim.js:1583.
+            gainResource(a, 'energy', q, { source: 'market', regionId: m.regionId, producer: null, facility: null });
             m.supply.energy = Math.max(0, (m.supply.energy || 0) - q);
             m.buyVol.energy = (m.buyVol.energy || 0) + q;
             m.credits += cost;
