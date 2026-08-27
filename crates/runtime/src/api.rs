@@ -398,6 +398,7 @@ pub struct ApiState {
     /// Agent Arena — persistent deterministic world (Issue #63). Always present (in-memory default 20x20).
     pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
     pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
+    pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
 }
 
 impl ApiState {
@@ -482,6 +483,7 @@ impl ApiState {
             benchmark: None,
             arena: Arc::new(tokio::sync::Mutex::new(arena_world)),
             hub: Arc::new(tokio::sync::Mutex::new(hub_state)),
+            society: Arc::new(tokio::sync::Mutex::new(decentraai_agent_society::SocietyState::with_tick(0))),
         }
     }
 
@@ -6540,6 +6542,108 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
         ctx.hub_action = res;
     }
+    // Society MCP handlers (M2 Society)
+    if crate::mcp::society_state_request(&raw) {
+        let society = state.society.lock().await;
+        let account_id = "operator".to_string();
+        ctx.society_action = decentraai_agent_society::mcp::build_society_state_response(&society, &account_id);
+    }
+    if let Some((observer, subject)) = crate::mcp::society_trust_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_trust_response(&society, &observer, &subject);
+    }
+    if let Some((agent_id, capability)) = crate::mcp::society_reputation_request(&raw) {
+        let society = state.society.lock().await;
+        // Build ReputationStore from society events
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        ctx.society_action = decentraai_agent_society::mcp::build_reputation_response(&rep_store, &agent_id, capability.as_deref());
+    }
+    if let Some((agent_id, as_observer)) = crate::mcp::society_relationships_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_relationships_response(&society, &agent_id, as_observer);
+    }
+    if let Some(task_id) = crate::mcp::society_contributions_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_contributions_response(&society, &task_id);
+    }
+    if let Some((agent_id, limit)) = crate::mcp::society_outcomes_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_outcomes_response(&society, &agent_id, limit);
+    }
+    if let Some((agent_id, _hub_state_json, resources)) = crate::mcp::society_decision_hints_request(&raw) {
+        let society = state.society.lock().await;
+        let hub = state.hub.lock().await;
+        // Build proper HubSnapshot
+        let hub_snapshot = decentraai_agent_society::rules::HubSnapshot {
+            tick: hub.tick,
+            open_tasks: hub.tasks.values().filter(|t| t.status == decentraai_agent_hub::TaskStatus::Open || t.status == decentraai_agent_hub::TaskStatus::Bidding).cloned().collect::<Vec<_>>(),
+            my_tasks: hub.tasks.values().filter(|t| t.issuer == agent_id).cloned().collect::<Vec<_>>(),
+            my_bids: hub.bids.values().filter(|b| b.bidder == agent_id).cloned().collect::<Vec<_>>(),
+            pending_proposals: hub.proposals.values().filter(|p| p.to == agent_id && p.status == decentraai_agent_hub::ProposalStatus::Pending).cloned().collect::<Vec<_>>(),
+            my_teams: hub.teams.values().filter(|t| t.members.iter().any(|(a, _)| a == &agent_id)).cloned().collect::<Vec<_>>(),
+            recent_events: hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+            total_tasks: hub.tasks.len(),
+            total_bids: hub.bids.len(),
+        };
+        // Build ReputationStore from society events
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        // Build decision context
+        let rules = decentraai_agent_society::SocietyRules::default();
+        let ctx_decision = decentraai_agent_society::DecisionContext {
+            agent_id: agent_id.clone(),
+            tick: society.tick,
+            hub: hub_snapshot,
+            society: decentraai_agent_society::rules::SocietySnapshot {
+                tick: society.tick,
+                trust_scores: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for subject in society.relationships.get(&agent_id).unwrap_or(&std::collections::HashMap::new()).keys() {
+                        let score = society.trust_score(&agent_id, subject);
+                        map.insert(subject.clone(), score);
+                    }
+                    map
+                },
+                other_reputations: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for (agent, events) in &society.reputation {
+                        let mut rep = decentraai_agent_society::reputation::SocialReputation::new(agent.clone(), None, society.tick);
+                        for event in events {
+                            rep.apply_event(event);
+                        }
+                        if rep.sample_count > 0 {
+                            map.insert(agent.clone(), rep);
+                        }
+                    }
+                    map
+                },
+                recent_outcomes: society.recent_outcomes(&agent_id, 10).into_iter().cloned().collect(),
+                my_contributions: society.contributions.values().flatten().filter(|c| c.agent_id == agent_id).cloned().collect(),
+                relationships: society.get_all_for_agent(&agent_id).into_iter().cloned().collect(),
+            },
+            own_reputation: None,
+            resources: {
+                let r = resources;
+                decentraai_agent_society::rules::ResourceState {
+                    quota_available: r.get("quota_available").and_then(|v| v.as_u64()).unwrap_or(1000),
+                    quota_ceiling: r.get("quota_ceiling").and_then(|v| v.as_u64()).unwrap_or(10000),
+                    capacity_used: r.get("capacity_used").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    max_concurrent_tasks: r.get("max_concurrent_tasks").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
+                    current_tasks: r.get("current_tasks").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                }
+            },
+        };
+        ctx.society_action = decentraai_agent_society::mcp::build_decision_hints_response(&rules, &ctx_decision);
+    }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
             Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
@@ -6995,8 +7099,41 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call decide, execute_decision, decentraai_embeddings or decentraai_compute_request",
+            "consumer API keys may only call decide, execute_decision, decentraai_embeddings, decentraai_compute_request, or society read-only tools",
         );
+    }
+
+    // Society read-only tools for consumers
+    if crate::mcp::society_state_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_society_state_response(&society, account);
+    }
+    if let Some((observer, subject)) = crate::mcp::society_trust_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_trust_response(&society, &observer, &subject);
+    }
+    if let Some((agent_id, capability)) = crate::mcp::society_reputation_request(&raw) {
+        let society = state.society.lock().await;
+        // Build ReputationStore from society events
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        ctx.society_action = decentraai_agent_society::mcp::build_reputation_response(&rep_store, &agent_id, capability.as_deref());
+    }
+    if let Some((agent_id, as_observer)) = crate::mcp::society_relationships_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_relationships_response(&society, &agent_id, as_observer);
+    }
+    if let Some(task_id) = crate::mcp::society_contributions_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_contributions_response(&society, &task_id);
+    }
+    if let Some((agent_id, limit)) = crate::mcp::society_outcomes_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_outcomes_response(&society, &agent_id, limit);
     }
 
     let response = crate::mcp::handle_message(&ctx, &raw);
@@ -7150,6 +7287,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             })
         },
         hub_action: serde_json::json!({}),
+        society_action: serde_json::json!({}),
     }
 }
 

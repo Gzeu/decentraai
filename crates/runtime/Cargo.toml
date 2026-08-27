@@ -31,6 +31,7 @@ decentraai-system-probe = { path = "../system-probe" }
 decentraai-tokens = { path = "../tokens" }
 decentraai-arena = { path = "../arena" }
 decentraai-agent-hub = { path = "../agent-hub" }
+decentraai-agent-society = { path = "../agent-society" }
 blake3.workspace = true
 futures.workspace = true
 base64.workspace = true

@@ -1036,6 +1036,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-agent-society"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "decentraai-agent-hub",
+ "decentraai-agents",
+ "decentraai-arena",
+ "decentraai-compute",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "decentraai-agents"
 version = "1.0.0"
 dependencies = [
@@ -1381,6 +1397,7 @@ dependencies = [
  "blake3",
  "chrono",
  "decentraai-agent-hub",
+ "decentraai-agent-society",
  "decentraai-agents",
  "decentraai-arena",
  "decentraai-audit",

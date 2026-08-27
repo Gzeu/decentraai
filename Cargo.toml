@@ -24,6 +24,7 @@ members = [
   "crates/system-probe",
   "crates/tokens",
   "crates/arena",
+  "crates/agent-society",
 ]
 resolver = "2"
 
