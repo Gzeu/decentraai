@@ -397,6 +397,7 @@ pub struct ApiState {
     benchmark: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>>,
     /// Agent Arena — persistent deterministic world (Issue #63). Always present (in-memory default 20x20).
     pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
+    pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
 }
 
 impl ApiState {
@@ -415,6 +416,10 @@ impl ApiState {
         let arena_world = {
             let arena_path = crate::arena::arena_path_for(&info.repo_root);
             crate::arena::load_arena_world(&arena_path)
+        };
+        let hub_state = {
+            let hub_path = crate::hub::hub_path_for(&info.repo_root);
+            crate::hub::load_hub_state(&hub_path)
         };
         Self {
             backend_url,
@@ -476,6 +481,7 @@ impl ApiState {
             identity_signing_key: None,
             benchmark: None,
             arena: Arc::new(tokio::sync::Mutex::new(arena_world)),
+            hub: Arc::new(tokio::sync::Mutex::new(hub_state)),
         }
     }
 
@@ -5156,6 +5162,18 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/arena/action", post(crate::arena::arena_action_handler))
         .route("/v1/arena/events", get(crate::arena::arena_events_handler))
         .route("/v1/arena/stream", get(crate::arena::arena_stream_handler))
+        .route("/hub", get(hub_dashboard_handler))
+        .route("/v1/hub/state", get(crate::hub::hub_state_handler))
+        .route("/v1/hub/tasks", get(crate::hub::hub_tasks_handler))
+        .route("/v1/hub/task", post(crate::hub::hub_publish_handler))
+        .route("/v1/hub/bid", post(crate::hub::hub_bid_handler))
+        .route("/v1/hub/bids", get(crate::hub::hub_bids_handler))
+        .route("/v1/hub/proposal", post(crate::hub::hub_proposal_handler))
+        .route("/v1/hub/proposal/{id}/decide", post(crate::hub::hub_decide_handler))
+        .route("/v1/hub/team", post(crate::hub::hub_team_handler))
+        .route("/v1/hub/execute", post(crate::hub::hub_execute_handler))
+        .route("/v1/hub/events", get(crate::hub::hub_events_handler))
+        .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -5379,6 +5397,17 @@ async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
 /// GET /arena — Agent Arena spectator (Issue #63). Premium grid + live events.
 async fn arena_dashboard_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::arena::arena_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /hub — Agent Hub spectator (Issue #63 Hub). Task market + auction + teams.
+async fn hub_dashboard_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::hub::hub_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,

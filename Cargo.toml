@@ -10,6 +10,7 @@ members = [
   "crates/fabric",
   "crates/fabric-intelligence",
   "crates/hub",
+  "crates/agent-hub",
   "crates/identity",
   "crates/inference-adapter",
   "crates/manifest",

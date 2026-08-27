@@ -19,6 +19,7 @@ pub mod governor_execution;
 pub mod intel_assist;
 pub mod job;
 pub mod arena;
+pub mod hub;
 pub mod mcp;
 pub mod providers_api;
 pub mod queue;
