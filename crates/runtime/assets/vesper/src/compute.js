@@ -214,7 +214,16 @@ const TASKS = {
         return { id: r.id, name: r.name, score: Math.round((wealth + access) * Math.max(0.1, safety)), wealth: Math.round(wealth), danger: r.danger };
       })
       .sort((a, b) => b.score - a.score);
-    return { ok: true, top: scored.slice(0, 5), count: scored.length };
+    const top = scored.slice(0, 5);
+    // Slice 3: emit a non-empty `findings` string so the contract-side
+    // strict-result-verification path (doAnalyze, sim.js:1382) can
+    // confirm the service work was actually performed. The string
+    // is the machine-readable top-5 ranking; `summary` is the
+    // shorter headline. Both are non-empty on success.
+    const findings = top.length === 0
+      ? 'analysis: no land regions found'
+      : top.map((r, i) => `#${i + 1} ${r.name} (score ${r.score}, wealth ${r.wealth}, danger ${r.danger})`).join(' | ');
+    return { ok: true, top, count: scored.length, findings, summary: findings };
   },
   simulate(world, p, seed) {
     const rng = createRng(seed);
