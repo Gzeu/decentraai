@@ -1897,14 +1897,18 @@ function orgTick(world, rng, t) {
     }
     // Slice 3: org-need analysis demand. Every 48 ticks, an org
     // with at least 2 territory cells, a healthy treasury and at
-    // least one territory region without `infra.labs` funds an
+    // least one territory region without `infra.labs` emits an
     // analysis contract. The funding check (`treasury.credits >=
     // reward.credits`) is performed BEFORE `createContract` so we
     // never produce a payable contract that the org cannot fund.
-    // `fullyFunded: true` is set on the contract only when the
-    // org actually has the credits; `completeContract` then
-    // debits the org treasury directly. World fallback is
-    // explicitly disabled for the org-issuer branch in this slice.
+    // `fullyFunded: true` is set on the contract; `completeContract`
+    // is the SOLE place that debits the org treasury on completion.
+    // We do NOT debit upfront here — that would cause a double
+    // deduction (creation + completion) on the same contract. The
+    // risk between emission and completion is carried by the org
+    // (collapsing orgs leave `world.orgs[orgId]` undefined, which
+    // `completeContract` already handles by skipping the org-treasury
+    // branch entirely).
     if (t % 48 === 0 && org.treasury.credits >= 700 && org.territory.length >= 2) {
       const target = org.territory
         .map(rid => world.regions.find(x => x.id === rid))
@@ -1912,16 +1916,6 @@ function orgTick(world, rng, t) {
       if (target) {
         const cost = 700;
         if (org.treasury.credits >= cost) {
-          // Reserve the funds up-front so the org cannot double-
-          // spend the same treasury on a parallel analyze need
-          // before the contract completes. Refund on expiry or
-          // failure happens via `contractTick` (we do not refund
-          // here — completion is the natural settlement point;
-          // failure leaves the funds in the org's hands and
-          // emits the standard `contract-failed` event).
-          org.treasury.credits -= cost;
-          org.treasuryLog = org.treasuryLog || [];
-          org.treasuryLog.push({ t, kind: 'analyze-fund', amt: -cost, detail: `Funded analysis of ${target.name}` });
           createContract(world, {
             type: 'analyze',
             title: `Analyse ${target.name} for ${org.name}`,
