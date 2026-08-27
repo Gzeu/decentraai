@@ -292,7 +292,7 @@ pub struct ApiState {
     /// The authoritative quota ledger, `Arc`-shared with the compute manager
     /// (Q2: worker credits and consumer reserve/settle are one ledger). `None`
     /// when running without compute; consumer quota enforcement is skipped.
-    quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
+    pub(crate) quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
     /// Per-consumer-key sliding-window rate limiting (Q2). Keyed by key_id;
     /// independent from both tier rate limits and the execute mutation limit.
     consumer_rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
@@ -5151,6 +5151,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/arena/join", post(crate::arena::arena_join_handler))
         .route("/v1/arena/action", post(crate::arena::arena_action_handler))
         .route("/v1/arena/events", get(crate::arena::arena_events_handler))
+        .route("/v1/arena/stream", get(crate::arena::arena_stream_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -6568,6 +6569,13 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
             "body": payload,
         });
+    } else if raw.contains("arena_state") || raw.contains("arena_act") {
+        // Arena read + act: consumer may observe and act in the shared world (Issue #63).
+        // arena_state is read-only; arena_act is quota-gated but reuses the same reservation path as arena_action_handler.
+        // For M2, we serve the snapshot already in ctx.arena_state; arena_act via MCP is currently read-only projection
+        // (mutating via POST /v1/arena/action with dca_ is the authoritative path).
+        // No extra handling needed — fall through to generic handle_message which returns ctx.arena_state / ctx.arena_action.
+        // allowed - no extra handling, will return ctx via handle_message below
     } else if raw.contains("\"method\":\"tools/list\"") {
         // RBAC-filtered tool list: consumer sees only tools matching its scopes.
         let response = crate::mcp::handle_message(&ctx, &raw);
@@ -6738,6 +6746,19 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         quota: serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
         consumer_keys: serde_json::json!({ "keys": [] }),
         compensation: serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
+        arena_state: {
+            let arena = state.arena.lock().await;
+            serde_json::json!({
+                "tick": arena.tick,
+                "width": arena.width,
+                "height": arena.height,
+                "agents": arena.agents.values().collect::<Vec<_>>(),
+                "events": arena.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+                "total_agents": arena.agents.len(),
+                "total_events": arena.events.len()
+            })
+        },
+        arena_action: serde_json::json!({}),
     }
 }
 

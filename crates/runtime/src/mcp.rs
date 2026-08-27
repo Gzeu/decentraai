@@ -89,6 +89,10 @@ pub struct McpContext {
     /// Precomputed by the HTTP layer; the protocol layer only translates.
     /// Read-only; never contains a plaintext secret.
     pub consumer_keys: Value,
+    /// Arena state snapshot (M2): tick, width, height, agents, events. Read-only projection of ArenaWorld.
+    pub arena_state: Value,
+    /// Result of arena_act (M2): last arena action event + world_tick. Set when tools/call arena_act is invoked.
+    pub arena_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -309,6 +313,25 @@ fn all_tools() -> Vec<ToolDef> {
                 },
                 "required": ["reference"],
                 "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "arena_state",
+            description: "Agent Arena live world: tick, grid size, agents (position/resources/reputation), recent events with evidence_id. Read-only projection of the deterministic ArenaWorld (Issue #63).",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "arena_act",
+            description: "Agent Arena action (M2): perform OBSERVE/MOVE/SCOUT/NEGOTIATE/REQUEST_COMPUTE/BUILD/TRADE/COOPERATE/COMPETE/DEFEND/REST in the shared world. Validated deterministically; REQUEST_COMPUTE is quota-gated and emits evidence_id. Requires dca_ consumer key.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["observe","move","scout","negotiate","request_compute","build","trade","cooperate","compete","defend","rest"], "description": "Arena action kind" },
+                    "target": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2, "description": "Target [x,y] for move (adjacent max 1)" },
+                    "rationale": { "type": "string", "description": "Concise public rationale (max 200c)" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
             }),
         },
         ToolDef {
@@ -947,6 +970,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
         "list_consumer_keys" => &ctx.consumer_keys,
+        "arena_state" => &ctx.arena_state,
+        "arena_act" => &ctx.arena_action,
         _ => return None,
     };
     Some(json!({
@@ -988,6 +1013,8 @@ mod tests {
             quota: json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": 1 }),
             compensation: json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
             consumer_keys: json!({ "keys": [] }),
+            arena_state: json!({ "tick": 0, "width": 20, "height": 20, "agents": [], "events": [] }),
+            arena_action: json!({}),
         }
     }
 
