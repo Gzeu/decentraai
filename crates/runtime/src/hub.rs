@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use axum::{extract::State, http::HeaderMap, response::{IntoResponse, sse::{Event as SseEvent, Sse}}, Json};
 use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
-use decentraai_agent_hub::{HubState, TaskStatus, ProposalStatus};
+use decentraai_agent_hub::{HubState, TaskStatus};
 use crate::api::{ApiState, Auth};
 
 pub type SharedHub = Arc<Mutex<HubState>>;
@@ -18,7 +18,7 @@ pub fn new_shared_hub() -> SharedHub { Arc::new(Mutex::new(HubState::new())) }
 pub fn hub_path_for(repo_root: &Path) -> PathBuf { repo_root.join("db/hub.json") }
 
 pub fn load_hub_state(path: &Path) -> HubState {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(HubState::new)
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 pub fn save_hub_state(path: &Path, state: &HubState) {
     if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
@@ -127,7 +127,7 @@ pub async fn hub_bid_handler(State(state): State<ApiState>, headers: HeaderMap, 
 pub async fn hub_bids_handler(State(state): State<ApiState>, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String,String>>) -> impl IntoResponse {
     let task_id = params.get("task_id").cloned();
     let hub = state.hub.lock().await;
-    let bids: Vec<_> = hub.bids.values().filter(|b| task_id.as_ref().map_or(true, |id| &b.task_id == id)).cloned().collect();
+    let bids: Vec<_> = hub.bids.values().filter(|b| task_id.as_ref().is_none_or(|id| &b.task_id == id)).cloned().collect();
     Json(serde_json::json!({"bids": bids}))
 }
 
