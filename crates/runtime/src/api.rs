@@ -184,7 +184,7 @@ impl GateError {
 
 /// How the caller authenticated on this request.
 #[derive(Debug)]
-enum Auth {
+pub(crate) enum Auth {
     /// No token configured on the node at all (api_auth_required=false).
     Open,
     /// The master admin token: unlimited.
@@ -395,6 +395,8 @@ pub struct ApiState {
     /// single vs RAG vs collective comparison and lets an operator run a
     /// benchmark task inline. `None` on plain serve.
     benchmark: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>>,
+    /// Agent Arena — persistent deterministic world (Issue #63). Always present (in-memory default 20x20).
+    pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
 }
 
 impl ApiState {
@@ -469,6 +471,7 @@ impl ApiState {
             evidence: None,
             identity_signing_key: None,
             benchmark: None,
+            arena: Arc::new(tokio::sync::Mutex::new(decentraai_arena::ArenaWorld::new(20, 20))),
         }
     }
 
@@ -750,7 +753,7 @@ impl ApiState {
     /// Classifies the caller: master token, issued subscription token
     /// (resolved through the registry on every request), a consumer API key
     /// (`dca_…`, resolved through the consumer key store — Q2), or open.
-    fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
+    pub(crate) fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
         let presented = Self::presented_token(headers);
         match &self.auth_token {
             None => Ok(Auth::Open),
@@ -5143,6 +5146,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/fabric", get(fabric_dashboard_handler))
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
+        .route("/arena", get(arena_dashboard_handler))
+        .route("/v1/arena/state", get(crate::arena::arena_state_handler))
+        .route("/v1/arena/join", post(crate::arena::arena_join_handler))
+        .route("/v1/arena/action", post(crate::arena::arena_action_handler))
+        .route("/v1/arena/events", get(crate::arena::arena_events_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -5355,6 +5363,17 @@ async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
 /// /status snapshot. Read-only.
 async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::fabric_landing::fabric_landing_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /arena — Agent Arena spectator (Issue #63). Premium grid + live events.
+async fn arena_dashboard_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::arena::arena_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
