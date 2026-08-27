@@ -93,6 +93,10 @@ pub struct McpContext {
     pub arena_state: Value,
     /// Result of arena_act (M2): last arena action event + world_tick. Set when tools/call arena_act is invoked.
     pub arena_action: Value,
+    /// Hub state snapshot (M2 Hub): tick, tasks, bids, proposals, teams, events. Read-only projection of HubState.
+    pub hub_state: Value,
+    /// Result of last Hub mutation (task/bid/proposal/team/execute) via MCP.
+    pub hub_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -331,6 +335,93 @@ fn all_tools() -> Vec<ToolDef> {
                     "rationale": { "type": "string", "description": "Concise public rationale (max 200c)" }
                 },
                 "required": ["action"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_state",
+            description: "Agent Hub live state: tasks, bids, proposals, teams, events, tick. Read-only projection of the task market (Issue #63 Hub).",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "hub_publish_task",
+            description: "Publish a Hub task (MCP-first, dca_ required): title, reward, description, required_capability. Creates TASK → BIDDING. Reward is quota credits distributed on settlement.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Task title" },
+                    "description": { "type": "string", "description": "Task description" },
+                    "reward": { "type": "integer", "description": "Reward in quota credits (1..10000)" },
+                    "required_capability": { "type": "string", "description": "Required capability snake_case, e.g. analysis, ocr" }
+                },
+                "required": ["title", "reward"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_place_bid",
+            description: "Place a bid on a Hub task (MCP, dca_): task_id, price (must be <= reward), rationale. Competing bids create auction.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id, e.g. task-0001" },
+                    "price": { "type": "integer", "description": "Bid price in credits (<= task reward)" },
+                    "rationale": { "type": "string", "description": "Why you bid" }
+                },
+                "required": ["task_id", "price"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_propose",
+            description: "Propose collaboration on a task (MCP, dca_): to (account), task_id, offer_price, workshare. Creates proposal PENDING.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Recipient account, e.g. arena-gamma" },
+                    "task_id": { "type": "string", "description": "Task id" },
+                    "offer_price": { "type": "integer", "description": "Offer price" },
+                    "workshare": { "type": "integer", "description": "Workshare 1..100" }
+                },
+                "required": ["to", "task_id", "offer_price"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_decide_proposal",
+            description: "Decide a proposal (MCP, dca_ must be recipient): proposal_id, accept (true/false). Acceptance creates alliance.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "proposal_id": { "type": "string", "description": "Proposal id, e.g. prop-0001" },
+                    "accept": { "type": "boolean", "description": "Accept true/false" }
+                },
+                "required": ["proposal_id", "accept"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_form_team",
+            description: "Form a team for a task (MCP, dca_): task_id, members as [[account, share], ...] sum 100.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id" },
+                    "members": { "type": "array", "items": { "type": "array", "items": [{ "type": "string" }, { "type": "integer" }], "minItems": 2, "maxItems": 2 }, "description": "Members [[account, share], ...] sum 100" }
+                },
+                "required": ["task_id", "members"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_execute",
+            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id to execute" }
+                },
+                "required": ["task_id"],
                 "additionalProperties": false
             }),
         },
@@ -764,6 +855,96 @@ pub fn arena_act_request(raw: &str) -> Option<serde_json::Value> {
     Some(args.unwrap_or(json!({})))
 }
 
+pub fn hub_state_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("hub_state")
+}
+pub fn hub_publish_task_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_publish_task" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_place_bid_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_place_bid" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_propose_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_propose" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_decide_proposal_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_decide_proposal" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_form_team_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_form_team" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_execute_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_execute" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+
 /// Extract `decentraai_embeddings` parameters (L1 ASSIST). Pure.
 pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
@@ -987,6 +1168,13 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "list_consumer_keys" => &ctx.consumer_keys,
         "arena_state" => &ctx.arena_state,
         "arena_act" => &ctx.arena_action,
+        "hub_state" => &ctx.hub_state,
+        "hub_publish_task" => &ctx.hub_action,
+        "hub_place_bid" => &ctx.hub_action,
+        "hub_propose" => &ctx.hub_action,
+        "hub_decide_proposal" => &ctx.hub_action,
+        "hub_form_team" => &ctx.hub_action,
+        "hub_execute" => &ctx.hub_action,
         _ => return None,
     };
     Some(json!({
@@ -1030,6 +1218,8 @@ mod tests {
             consumer_keys: json!({ "keys": [] }),
             arena_state: json!({ "tick": 0, "width": 20, "height": 20, "agents": [], "events": [] }),
             arena_action: json!({}),
+            hub_state: json!({ "tick": 0, "tasks": [], "bids": [], "proposals": [], "teams": [], "events": [] }),
+            hub_action: json!({}),
         }
     }
 

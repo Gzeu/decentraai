@@ -6434,6 +6434,112 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             }
         }
     }
+    // Hub mutating via MCP (M2 Hub): publish/bid/propose/team/execute
+    if let Some(args) = crate::mcp::hub_publish_task_request(&raw) {
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("MCP Task").to_string();
+        let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reward = args.get("reward").and_then(|v| v.as_u64()).unwrap_or(100);
+        let cap = args.get("required_capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = hub.publish_task(account_id, title, description, reward, cap);
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        ctx.hub_action = serde_json::to_value(&task).unwrap_or(serde_json::json!({}));
+    }
+    if let Some(args) = crate::mcp::hub_place_bid_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let price = args.get("price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("MCP bid").to_string();
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.place_bid(account_id, task_id, price, rationale) {
+            Ok(bid) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&bid).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_propose_request(&raw) {
+        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let offer_price = args.get("offer_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let workshare = args.get("workshare").and_then(|v| v.as_u64()).unwrap_or(100) as u8;
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.propose(account_id, to, task_id, offer_price, workshare) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_decide_proposal_request(&raw) {
+        let proposal_id = args.get("proposal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let accept = args.get("accept").and_then(|v| v.as_bool()).unwrap_or(false);
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator");
+        let mut hub = state.hub.lock().await;
+        let res = match hub.decide_proposal(&proposal_id, account_id, accept) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_form_team_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let members: Vec<(String, u8)> = args.get("members").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+            let arr = e.as_array()?;
+            if arr.len()!=2 { return None; }
+            Some((arr[0].as_str()?.to_string(), arr[1].as_u64()? as u8))
+        }).collect()).unwrap_or_default();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.form_team(task_id, members) {
+            Ok(t) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&t).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_execute_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = match hub.tasks.get(&task_id).cloned() {
+            Some(t) => t,
+            None => {
+                ctx.hub_action = serde_json::json!({"error": "task not found"});
+                return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&ctx.hub_action).unwrap_or_default()).into_response();
+            }
+        };
+        hub.mark_executing(&task_id);
+        let team_members: Vec<(String, u8)> = hub.teams.values().find(|t| t.task_id == task_id).map(|t| t.members.clone()).unwrap_or_else(|| {
+            if let Some(best) = hub.best_bid(&task_id) { vec![(best.bidder.clone(), 100)] } else { vec![(task.issuer.clone(), 100)] }
+        });
+        let executor = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator");
+        let evidence_id = blake3::hash(format!("hub:{}:{}:{}", task_id, executor, hub.tick).as_bytes()).to_hex().to_string();
+        if let Some(ledger) = &state.quota_ledger {
+            let mut lg = ledger.lock().unwrap();
+            for (member, share) in &team_members {
+                let amount = (task.reward as u128 * *share as u128 / 100) as u64;
+                if amount > 0 {
+                    let ref_id = format!("hub-settle-{}-{}", task_id, member);
+                    let _ = lg.credit(member, &ref_id, Some(amount as u32), None);
+                }
+            }
+        }
+        hub.settle(&task_id, Some(evidence_id.clone()));
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        {
+            let mut arena = state.arena.lock().await;
+            let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", executor), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
+            arena.events.push_back(ev);
+            while arena.events.len() > arena.max_events { arena.events.pop_front(); }
+            arena.advance_tick();
+            let apath = crate::arena::arena_path_for(&state.info.repo_root);
+            crate::arena::save_arena_world(&apath, &arena);
+        }
+        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        ctx.hub_action = res;
+    }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
             Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
@@ -6740,6 +6846,113 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
         let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
         return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_publish_task_request(&raw) {
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("MCP Task").to_string();
+        let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reward = args.get("reward").and_then(|v| v.as_u64()).unwrap_or(100);
+        let cap = args.get("required_capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let mut hub = state.hub.lock().await;
+        let task = hub.publish_task(account.clone(), title, description, reward, cap);
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&task).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_place_bid_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let price = args.get("price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("MCP bid").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.place_bid(account.clone(), task_id, price, rationale) {
+            Ok(bid) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&bid).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_propose_request(&raw) {
+        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let offer_price = args.get("offer_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let workshare = args.get("workshare").and_then(|v| v.as_u64()).unwrap_or(100) as u8;
+        let mut hub = state.hub.lock().await;
+        let res = match hub.propose(account.clone(), to, task_id, offer_price, workshare) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_decide_proposal_request(&raw) {
+        let proposal_id = args.get("proposal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let accept = args.get("accept").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut hub = state.hub.lock().await;
+        let res = match hub.decide_proposal(&proposal_id, account, accept) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_form_team_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let members: Vec<(String, u8)> = args.get("members").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+            let arr = e.as_array()?;
+            if arr.len()!=2 { return None; }
+            Some((arr[0].as_str()?.to_string(), arr[1].as_u64()? as u8))
+        }).collect()).unwrap_or_default();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.form_team(task_id, members) {
+            Ok(t) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&t).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_execute_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = match hub.tasks.get(&task_id).cloned() {
+            Some(t) => t,
+            None => {
+                let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "task not found"}});
+                return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+            }
+        };
+        hub.mark_executing(&task_id);
+        let team_members: Vec<(String, u8)> = hub.teams.values().find(|t| t.task_id == task_id).map(|t| t.members.clone()).unwrap_or_else(|| {
+            if let Some(best) = hub.best_bid(&task_id) { vec![(best.bidder.clone(), 100)] } else { vec![(task.issuer.clone(), 100)] }
+        });
+        let evidence_id = blake3::hash(format!("hub:{}:{}:{}", task_id, account, hub.tick).as_bytes()).to_hex().to_string();
+        if let Some(ledger) = &state.quota_ledger {
+            let mut lg = ledger.lock().unwrap();
+            for (member, share) in &team_members {
+                let amount = (task.reward as u128 * *share as u128 / 100) as u64;
+                if amount > 0 {
+                    let ref_id = format!("hub-settle-{}-{}", task_id, member);
+                    let _ = lg.credit(member, &ref_id, Some(amount as u32), None);
+                }
+            }
+        }
+        hub.settle(&task_id, Some(evidence_id.clone()));
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        {
+            let mut arena = state.arena.lock().await;
+            let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", account), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
+            arena.events.push_back(ev);
+            while arena.events.len() > arena.max_events { arena.events.pop_front(); }
+            arena.advance_tick();
+            let apath = crate::arena::arena_path_for(&state.info.repo_root);
+            crate::arena::save_arena_world(&apath, &arena);
+        }
+        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
     } else if raw.contains("\"method\":\"tools/list\"") {
         // RBAC-filtered tool list: consumer sees only tools matching its scopes.
         let response = crate::mcp::handle_message(&ctx, &raw);
@@ -6923,6 +7136,20 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             })
         },
         arena_action: serde_json::json!({}),
+        hub_state: {
+            let hub = state.hub.lock().await;
+            serde_json::json!({
+                "tick": hub.tick,
+                "tasks": hub.tasks.values().collect::<Vec<_>>(),
+                "bids": hub.bids.values().collect::<Vec<_>>(),
+                "proposals": hub.proposals.values().collect::<Vec<_>>(),
+                "teams": hub.teams.values().collect::<Vec<_>>(),
+                "events": hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+                "total_tasks": hub.tasks.len(),
+                "total_bids": hub.bids.len()
+            })
+        },
+        hub_action: serde_json::json!({}),
     }
 }
 
