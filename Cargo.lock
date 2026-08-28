@@ -1036,6 +1036,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-agent-personal-memory"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "decentraai-agents",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "decentraai-agent-society"
 version = "1.0.0"
 dependencies = [
@@ -1097,6 +1113,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "decentraai-agent-personal-memory",
  "decentraai-agents",
  "decentraai-audit",
  "decentraai-compute",
@@ -1397,6 +1414,7 @@ dependencies = [
  "blake3",
  "chrono",
  "decentraai-agent-hub",
+ "decentraai-agent-personal-memory",
  "decentraai-agent-society",
  "decentraai-agents",
  "decentraai-arena",

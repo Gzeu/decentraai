@@ -1,4 +1,6 @@
 //! Social state: relationships, contributions, task outcomes
+use std::path::PathBuf;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -314,6 +316,29 @@ impl SocietyState {
     pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
+}
+
+
+/// Get the path for the society state file
+pub fn society_path_for(repo_root: &Path) -> PathBuf {
+    repo_root.join("db/society.json")
+}
+
+/// Load society state from disk
+pub fn load_society_state(path: &Path) -> SocietyState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Save society state to disk
+pub fn save_society_state(path: &Path, state: &SocietyState) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(state).unwrap_or_default();
+    let _ = std::fs::write(path, json);
 }
 
 /// Reputation event from verified outcomes

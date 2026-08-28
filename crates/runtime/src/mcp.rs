@@ -99,6 +99,8 @@ pub struct McpContext {
     pub hub_action: Value,
     /// Result of last Society mutation (trust/reputation/relationship) via MCP.
     pub society_action: Value,
+    /// Result of last personal memory operation via MCP.
+    pub personal_memory_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -509,6 +511,85 @@ fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id", "hub_state", "resources"],
                 "additionalProperties": false
             }),
+        },
+        ToolDef {
+            name: "society_record_relationship",
+            description: "Record a social relationship (observer -> subject with kind). Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "observer": { "type": "string", "description": "Observing agent" },
+            "subject": { "type": "string", "description": "Subject agent" },
+            "kind": { "type": "string", "enum": ["worked_with", "accepted", "rejected", "countered", "successful", "failed", "trust_signal", "distrust_signal"], "description": "Relationship kind" },
+            "task_id": { "type": "string", "description": "Optional task context" },
+            "detail": { "type": "string", "description": "Optional detail" },
+            "strength": { "type": "number", "description": "Strength -1.0 to 1.0" }
+        },
+        "required": ["observer", "subject", "kind"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_contribution",
+            description: "Record a contribution for a task. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "task_id": { "type": "string", "description": "Task ID" },
+            "agent_id": { "type": "string", "description": "Contributing agent" },
+            "planned_share": { "type": "integer", "description": "Planned share 1-100" },
+            "verified_contribution": { "type": "number", "description": "Verified contribution 0.0-1.0" },
+            "evidence_id": { "type": "string", "description": "Evidence ID" },
+            "quality": { "type": "number", "description": "Quality 0.0-1.0" },
+            "met_sla": { "type": "boolean", "description": "Met SLA" }
+        },
+        "required": ["task_id", "agent_id", "planned_share"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_outcome",
+            description: "Record a task outcome with distributions. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "task_id": { "type": "string", "description": "Task ID" },
+            "issuer": { "type": "string", "description": "Task issuer" },
+            "team_members": { "type": "array", "items": { "type": "string" } },
+            "status": { "type": "string", "enum": ["completed", "settled", "failed", "disputed"] },
+            "evidence_id": { "type": "string" },
+            "total_reward": { "type": "integer" },
+            "distributions": { "type": "array", "items": { "type": "object", "properties": { "agent_id": { "type": "string" }, "amount": { "type": "integer" }, "share_basis": { "type": "string", "enum": ["planned", "verified", "hybrid"] } }, "required": ["agent_id", "amount", "share_basis"] } },
+            "contributor_records": { "type": "array", "items": { "type": "object", "properties": { "task_id": { "type": "string" }, "agent_id": { "type": "string" }, "planned_share": { "type": "integer" }, "verified_contribution": { "type": "number" }, "evidence_id": { "type": "string" }, "quality": { "type": "number", "description": "Quality 0.0-1.0" }, "met_sla": { "type": "boolean" } } } }
+        },
+        "required": ["task_id", "issuer", "team_members", "status", "total_reward", "distributions"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_reputation_event",
+            description: "Record a reputation event. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "agent_id": { "type": "string" },
+            "event_type": { "type": "string", "enum": ["task_completed", "task_failed", "quality_high", "quality_low", "sla_met", "sla_missed", "contribution_verified", "contribution_missing", "proposal_accepted", "proposal_rejected", "bid_accepted", "bid_rejected"] },
+            "task_id": { "type": "string" },
+            "delta": { "type": "number" },
+            "evidence_id": { "type": "string" },
+            "detail": { "type": "string" }
+        },
+        "required": ["agent_id", "event_type"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
         },
         ToolDef {
             name: "list_consumer_keys",
@@ -1088,7 +1169,83 @@ pub fn society_decision_hints_request(raw: &str) -> Option<(String, Value, Value
     Some((agent_id, hub_state, resources))
 }
 
-/// Extract `decentraai_embeddings` parameters (L1 ASSIST). Pure.
+pub fn society_record_relationship_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_relationship" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_contribution_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_contribution" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_outcome_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_outcome" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_reputation_event_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_reputation_event" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+
+pub fn agent_memory_write_request(raw: &str) -> Option<(String, String, Value)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_write" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let category = args.get("category").and_then(|v| v.as_str())?.to_string();
+    let entry = args.get("entry").cloned().unwrap_or(json!({}));
+    Some((agent_id, category, entry))
+}
+
+
+/// Extract request parameters for agent_memory_read
+pub fn agent_memory_read_request(raw: &str) -> Option<(String, Option<Vec<String>>)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_read" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    Some((agent_id, categories))
+}
+
+/// Extract request parameters for agent_memory_search
+pub fn agent_memory_search_request(raw: &str) -> Option<(String, String, Option<Vec<String>>, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_search" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let query = args.get("query").and_then(|v| v.as_str())?.to_string();
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    Some((agent_id, query, categories, limit))
+}
+
+/// Extract request parameters for agent_memory_snapshot
+pub fn agent_memory_snapshot_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_snapshot" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Extract request parameters for agent_memory_export
+pub fn agent_memory_export_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_export" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
 pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
@@ -1371,6 +1528,7 @@ mod tests {
             hub_state: json!({ "tick": 0, "tasks": [], "bids": [], "proposals": [], "teams": [], "events": [] }),
             hub_action: json!({}),
             society_action: json!({}),
+            personal_memory_action: json!({}),
         }
     }
 
