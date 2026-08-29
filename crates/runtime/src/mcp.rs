@@ -104,13 +104,13 @@ pub struct McpContext {
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
-struct ToolDef {
-    name: &'static str,
-    description: &'static str,
-    input_schema: Value,
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
 }
 
-fn all_tools() -> Vec<ToolDef> {
+pub fn all_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "get_status",
@@ -622,6 +622,77 @@ fn all_tools() -> Vec<ToolDef> {
                 "required": ["capability", "payload"],
                 "additionalProperties": false
             }),
+        },
+        ToolDef {
+            name: "agent_memory_read",
+            description: "Read own personal memory (Identity, Goals, Capabilities, People, Tasks, Relationships, Experiences, Decisions, Lessons). Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID (must equal your account)" },
+                    "categories": { "type": "array", "items": { "type": "string" }, "description": "Categories to read (default: all)" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_write",
+            description: "Write/update own personal memory entry (experiences, lessons, people, etc.). Requires memory scope. Agent_id must equal your account.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID (must equal your account)" },
+                    "category": { "type": "string", "enum": ["identity", "goals", "capabilities", "people", "tasks", "relationships", "experiences", "decisions", "lessons"], "description": "Memory category" },
+                    "entry": { "type": "object", "description": "Entry data (schema depends on category)" }
+                },
+                "required": ["agent_id", "category", "entry"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_search",
+            description: "Search own personal memory by text query. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" },
+                    "query": { "type": "string", "description": "Search query" },
+                    "categories": { "type": "array", "items": { "type": "string" }, "description": "Categories to search (default: all)" },
+                    "limit": { "type": "integer", "description": "Max results (default: 10)" }
+                },
+                "required": ["agent_id", "query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_snapshot",
+            description: "Get decision-ready snapshot of own personal memory. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_export",
+            description: "Export full personal memory as Obsidian-compatible Markdown. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "discover_capabilities",
+            description: "Discover all available capabilities/tools on this node and their required scopes. Essential for external agent onboarding — call this first to learn what you can do and what scopes to request.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
     ]
 }
@@ -1270,6 +1341,14 @@ pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     Some((input, model))
 }
 
+
+/// Extract request parameters for discover_capabilities
+pub fn discover_capabilities_request(raw: &str) -> bool {
+    let msg: Value = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => return false };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("discover_capabilities")
+}
+
 /// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).
 pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
@@ -1482,6 +1561,12 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "society_contributions" => &ctx.society_action,
         "society_outcomes" => &ctx.society_action,
         "society_decision_hints" => &ctx.society_action,
+        "agent_memory_read" => &ctx.personal_memory_action,
+        "agent_memory_write" => &ctx.personal_memory_action,
+        "agent_memory_search" => &ctx.personal_memory_action,
+        "agent_memory_snapshot" => &ctx.personal_memory_action,
+        "agent_memory_export" => &ctx.personal_memory_action,
+        "discover_capabilities" => &ctx.personal_memory_action,
         _ => return None,
     };
     Some(json!({
