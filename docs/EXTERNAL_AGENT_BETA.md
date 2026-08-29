@@ -101,6 +101,10 @@ curl -X POST $ENDPOINT/mcp -H "Authorization: Bearer $KEY_A" \
   -d '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"hub_execute","arguments":{"task_id":"task-0001"}}}'
 # → {task_id:"task-0001", evidence_id:"abc123...", team:[...], reward:300}
 # Settlement: QuotaLedger credit 40%→A, 60%→B (verificabil via /v1/compute sau society)
+# Auto side-effects (nou, 201015e): după evidence+settlement, node-ul scrie automat
+#  - Society: ContributionRecord + TaskOutcome + ReputationEvent (TaskCompleted + ContributionVerified) per membru, idempotent per task_id
+#  - Personal Memory: Experience "hub-task-0001-<agent>" (success) în memoria proprie a fiecărui participant (izolat)
+#  → următoarea decizie vede istoricul fără niciun write manual (vezi demo external_agent_gateway_three_agent_economy)
 ```
 
 ### SOCIETY ca serviciu (society scope)
