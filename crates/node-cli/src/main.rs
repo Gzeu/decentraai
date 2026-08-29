@@ -2270,6 +2270,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(distributed.p2p_node().clone()),
         );
         state.set_dashboard(config.node.dashboard);
+        // Personal Memory store (per-agent Markdown workspaces)
+        let pm_store = std::sync::Arc::new(
+            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir)
+        );
+        state.attach_personal_memory(pm_store);
         // Fabric Intelligence: reasoning layer between a task and the
         // deterministic planner. Opt-in via config; disabled/absent = no-op.
         if let Some(intel_cfg) = config.fabric_intelligence.as_ref() {
@@ -2293,6 +2298,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // workers that advertise the requested model (fabric chat routing).
         let dist_handle = std::sync::Arc::new(distributed.clone());
         state.attach_distributed(dist_handle.clone());
+        // Personal Memory store (per-agent Markdown workspaces)
+        let pm_store = std::sync::Arc::new(
+            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir)
+        );
+        state.attach_personal_memory(pm_store);
         // M15 — Autonomous Compute Pressure: observe own signals; when the
         // pressure engine fires, request assist through the EXISTING DFCP
         // flow. The pressure layer only PROPOSES; the planner still routes.

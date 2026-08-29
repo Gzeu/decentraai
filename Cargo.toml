@@ -10,6 +10,7 @@ members = [
   "crates/fabric",
   "crates/fabric-intelligence",
   "crates/hub",
+  "crates/agent-hub",
   "crates/identity",
   "crates/inference-adapter",
   "crates/manifest",
@@ -22,6 +23,9 @@ members = [
   "crates/runtime",
   "crates/system-probe",
   "crates/tokens",
+  "crates/arena",
+  "crates/agent-society",
+  "crates/agent-personal-memory",
 ]
 resolver = "2"
 
@@ -49,7 +53,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "blocking"] }
 rusqlite = "0.32"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = "1.0.151"
 serde_yaml = "0.9"
 sha2 = "0.10"
 sysinfo = "0.39"

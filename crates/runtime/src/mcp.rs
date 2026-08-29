@@ -89,16 +89,28 @@ pub struct McpContext {
     /// Precomputed by the HTTP layer; the protocol layer only translates.
     /// Read-only; never contains a plaintext secret.
     pub consumer_keys: Value,
+    /// Arena state snapshot (M2): tick, width, height, agents, events. Read-only projection of ArenaWorld.
+    pub arena_state: Value,
+    /// Result of arena_act (M2): last arena action event + world_tick. Set when tools/call arena_act is invoked.
+    pub arena_action: Value,
+    /// Hub state snapshot (M2 Hub): tick, tasks, bids, proposals, teams, events. Read-only projection of HubState.
+    pub hub_state: Value,
+    /// Result of last Hub mutation (task/bid/proposal/team/execute) via MCP.
+    pub hub_action: Value,
+    /// Result of last Society mutation (trust/reputation/relationship) via MCP.
+    pub society_action: Value,
+    /// Result of last personal memory operation via MCP.
+    pub personal_memory_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
-struct ToolDef {
-    name: &'static str,
-    description: &'static str,
-    input_schema: Value,
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
 }
 
-fn all_tools() -> Vec<ToolDef> {
+pub fn all_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "get_status",
@@ -312,6 +324,274 @@ fn all_tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "arena_state",
+            description: "Agent Arena live world: tick, grid size, agents (position/resources/reputation), recent events with evidence_id. Read-only projection of the deterministic ArenaWorld (Issue #63).",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "arena_act",
+            description: "Agent Arena action (M2): perform OBSERVE/MOVE/SCOUT/NEGOTIATE/REQUEST_COMPUTE/BUILD/TRADE/COOPERATE/COMPETE/DEFEND/REST in the shared world. Validated deterministically; REQUEST_COMPUTE is quota-gated and emits evidence_id. Requires dca_ consumer key.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["observe","move","scout","negotiate","request_compute","build","trade","cooperate","compete","defend","rest"], "description": "Arena action kind" },
+                    "target": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2, "description": "Target [x,y] for move (adjacent max 1)" },
+                    "rationale": { "type": "string", "description": "Concise public rationale (max 200c)" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_state",
+            description: "Agent Hub live state: tasks, bids, proposals, teams, events, tick. Read-only projection of the task market (Issue #63 Hub).",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "hub_publish_task",
+            description: "Publish a Hub task (MCP-first, dca_ required): title, reward, description, required_capability. Creates TASK → BIDDING. Reward is quota credits distributed on settlement.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Task title" },
+                    "description": { "type": "string", "description": "Task description" },
+                    "reward": { "type": "integer", "description": "Reward in quota credits (1..10000)" },
+                    "required_capability": { "type": "string", "description": "Required capability snake_case, e.g. analysis, ocr" }
+                },
+                "required": ["title", "reward"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_place_bid",
+            description: "Place a bid on a Hub task (MCP, dca_): task_id, price (must be <= reward), rationale. Competing bids create auction.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id, e.g. task-0001" },
+                    "price": { "type": "integer", "description": "Bid price in credits (<= task reward)" },
+                    "rationale": { "type": "string", "description": "Why you bid" }
+                },
+                "required": ["task_id", "price"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_propose",
+            description: "Propose collaboration on a task (MCP, dca_): to (account), task_id, offer_price, workshare. Creates proposal PENDING.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Recipient account, e.g. arena-gamma" },
+                    "task_id": { "type": "string", "description": "Task id" },
+                    "offer_price": { "type": "integer", "description": "Offer price" },
+                    "workshare": { "type": "integer", "description": "Workshare 1..100" }
+                },
+                "required": ["to", "task_id", "offer_price"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_decide_proposal",
+            description: "Decide a proposal (MCP, dca_ must be recipient): proposal_id, accept (true/false). Acceptance creates alliance.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "proposal_id": { "type": "string", "description": "Proposal id, e.g. prop-0001" },
+                    "accept": { "type": "boolean", "description": "Accept true/false" }
+                },
+                "required": ["proposal_id", "accept"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_form_team",
+            description: "Form a team for a task (MCP, dca_): task_id, members as [[account, share], ...] sum 100.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id" },
+                    "members": { "type": "array", "items": { "type": "array", "items": [{ "type": "string" }, { "type": "integer" }], "minItems": 2, "maxItems": 2 }, "description": "Members [[account, share], ...] sum 100" }
+                },
+                "required": ["task_id", "members"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "hub_execute",
+            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task id to execute" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_state",
+            description: "Agent Society live state: relationships, trust scores, reputation, contributions, outcomes. Read-only projection.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "society_trust",
+            description: "Get trust score between two agents (observer -> subject). Returns -1.0 to 1.0.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "observer": { "type": "string", "description": "Observing agent" },
+                    "subject": { "type": "string", "description": "Subject agent" }
+                },
+                "required": ["observer", "subject"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_reputation",
+            description: "Get reputation for an agent (optionally scoped to capability).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent to query" },
+                    "capability": { "type": "string", "description": "Optional capability scope" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_relationships",
+            description: "Get social relationships for an agent (as observer or subject).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent to query" },
+                    "as_observer": { "type": "boolean", "description": "If true, relationships where agent is observer; if false, where agent is subject" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_contributions",
+            description: "Get contribution records for a task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task to query" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_outcomes",
+            description: "Get task outcomes for an agent.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent to query" },
+                    "limit": { "type": "integer", "description": "Max outcomes to return" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_decision_hints",
+            description: "Get decision hints for the current agent based on society rules. Requires agent context.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent requesting hints" },
+                    "hub_state": { "type": "string", "description": "JSON snapshot of hub state" },
+                    "resources": { "type": "string", "description": "JSON snapshot of resource state" }
+                },
+                "required": ["agent_id", "hub_state", "resources"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "society_record_relationship",
+            description: "Record a social relationship (observer -> subject with kind). Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "observer": { "type": "string", "description": "Observing agent" },
+            "subject": { "type": "string", "description": "Subject agent" },
+            "kind": { "type": "string", "enum": ["worked_with", "accepted", "rejected", "countered", "successful", "failed", "trust_signal", "distrust_signal"], "description": "Relationship kind" },
+            "task_id": { "type": "string", "description": "Optional task context" },
+            "detail": { "type": "string", "description": "Optional detail" },
+            "strength": { "type": "number", "description": "Strength -1.0 to 1.0" }
+        },
+        "required": ["observer", "subject", "kind"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_contribution",
+            description: "Record a contribution for a task. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "task_id": { "type": "string", "description": "Task ID" },
+            "agent_id": { "type": "string", "description": "Contributing agent" },
+            "planned_share": { "type": "integer", "description": "Planned share 1-100" },
+            "verified_contribution": { "type": "number", "description": "Verified contribution 0.0-1.0" },
+            "evidence_id": { "type": "string", "description": "Evidence ID" },
+            "quality": { "type": "number", "description": "Quality 0.0-1.0" },
+            "met_sla": { "type": "boolean", "description": "Met SLA" }
+        },
+        "required": ["task_id", "agent_id", "planned_share"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_outcome",
+            description: "Record a task outcome with distributions. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "task_id": { "type": "string", "description": "Task ID" },
+            "issuer": { "type": "string", "description": "Task issuer" },
+            "team_members": { "type": "array", "items": { "type": "string" } },
+            "status": { "type": "string", "enum": ["completed", "settled", "failed", "disputed"] },
+            "evidence_id": { "type": "string" },
+            "total_reward": { "type": "integer" },
+            "distributions": { "type": "array", "items": { "type": "object", "properties": { "agent_id": { "type": "string" }, "amount": { "type": "integer" }, "share_basis": { "type": "string", "enum": ["planned", "verified", "hybrid"] } }, "required": ["agent_id", "amount", "share_basis"] } },
+            "contributor_records": { "type": "array", "items": { "type": "object", "properties": { "task_id": { "type": "string" }, "agent_id": { "type": "string" }, "planned_share": { "type": "integer" }, "verified_contribution": { "type": "number" }, "evidence_id": { "type": "string" }, "quality": { "type": "number", "description": "Quality 0.0-1.0" }, "met_sla": { "type": "boolean" } } } }
+        },
+        "required": ["task_id", "issuer", "team_members", "status", "total_reward", "distributions"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
+            name: "society_record_reputation_event",
+            description: "Record a reputation event. Master only.",
+            input_schema: serde_json::from_str(r#"
+    {
+        "type": "object",
+        "properties": {
+            "agent_id": { "type": "string" },
+            "event_type": { "type": "string", "enum": ["task_completed", "task_failed", "quality_high", "quality_low", "sla_met", "sla_missed", "contribution_verified", "contribution_missing", "proposal_accepted", "proposal_rejected", "bid_accepted", "bid_rejected"] },
+            "task_id": { "type": "string" },
+            "delta": { "type": "number" },
+            "evidence_id": { "type": "string" },
+            "detail": { "type": "string" }
+        },
+        "required": ["agent_id", "event_type"],
+        "additionalProperties": false
+    }
+    "#).unwrap(),
+        },
+        ToolDef {
             name: "list_consumer_keys",
             description: "Consumer API key metadata (Compute Contribution & Quota): per-key id, display prefix, owner account, quota ceiling, rate limit, scopes, status, and live usage + the owner account's quota balance. Read-only; NEVER exposes the plaintext secret.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -342,6 +622,77 @@ fn all_tools() -> Vec<ToolDef> {
                 "required": ["capability", "payload"],
                 "additionalProperties": false
             }),
+        },
+        ToolDef {
+            name: "agent_memory_read",
+            description: "Read own personal memory (Identity, Goals, Capabilities, People, Tasks, Relationships, Experiences, Decisions, Lessons). Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID (must equal your account)" },
+                    "categories": { "type": "array", "items": { "type": "string" }, "description": "Categories to read (default: all)" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_write",
+            description: "Write/update own personal memory entry (experiences, lessons, people, etc.). Requires memory scope. Agent_id must equal your account.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID (must equal your account)" },
+                    "category": { "type": "string", "enum": ["identity", "goals", "capabilities", "people", "tasks", "relationships", "experiences", "decisions", "lessons"], "description": "Memory category" },
+                    "entry": { "type": "object", "description": "Entry data (schema depends on category)" }
+                },
+                "required": ["agent_id", "category", "entry"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_search",
+            description: "Search own personal memory by text query. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" },
+                    "query": { "type": "string", "description": "Search query" },
+                    "categories": { "type": "array", "items": { "type": "string" }, "description": "Categories to search (default: all)" },
+                    "limit": { "type": "integer", "description": "Max results (default: 10)" }
+                },
+                "required": ["agent_id", "query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_snapshot",
+            description: "Get decision-ready snapshot of own personal memory. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "agent_memory_export",
+            description: "Export full personal memory as Obsidian-compatible Markdown. Requires memory scope.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Your agent ID" }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "discover_capabilities",
+            description: "Discover all available capabilities/tools on this node and their required scopes. Essential for external agent onboarding — call this first to learn what you can do and what scopes to request.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
     ]
 }
@@ -726,7 +1077,246 @@ pub fn compensation_request(raw: &str) -> bool {
         == Some("get_compensation")
 }
 
-/// Extract `decentraai_embeddings` parameters (L1 ASSIST). Pure.
+pub fn arena_state_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("arena_state")
+}
+
+pub fn arena_act_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
+    if name != "arena_act" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned();
+    Some(args.unwrap_or(json!({})))
+}
+
+pub fn hub_state_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("hub_state")
+}
+pub fn hub_publish_task_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_publish_task" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_place_bid_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_place_bid" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_propose_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_propose" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_decide_proposal_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_decide_proposal" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_form_team_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_form_team" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+pub fn hub_execute_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_execute" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    // Add account from request if present, for multi-agent support
+    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+        let mut a = args.as_object().cloned().unwrap_or_default();
+        a.insert("account".to_string(), json!(acc));
+        Some(json!(a))
+    } else {
+        Some(args)
+    }
+}
+
+pub fn society_state_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("society_state")
+}
+pub fn society_trust_request(raw: &str) -> Option<(String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_trust" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let observer = args.get("observer").and_then(|v| v.as_str())?.to_string();
+    let subject = args.get("subject").and_then(|v| v.as_str())?.to_string();
+    Some((observer, subject))
+}
+pub fn society_reputation_request(raw: &str) -> Option<(String, Option<String>)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_reputation" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let capability = args.get("capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some((agent_id, capability))
+}
+pub fn society_relationships_request(raw: &str) -> Option<(String, bool)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_relationships" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let as_observer = args.get("as_observer").and_then(|v| v.as_bool()).unwrap_or(true);
+    Some((agent_id, as_observer))
+}
+pub fn society_contributions_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_contributions" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("task_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+pub fn society_outcomes_request(raw: &str) -> Option<(String, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_outcomes" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    Some((agent_id, limit))
+}
+pub fn society_decision_hints_request(raw: &str) -> Option<(String, Value, Value)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_decision_hints" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let hub_state = args.get("hub_state").cloned().unwrap_or(json!({}));
+    let resources = args.get("resources").cloned().unwrap_or(json!({}));
+    Some((agent_id, hub_state, resources))
+}
+
+pub fn society_record_relationship_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_relationship" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_contribution_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_contribution" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_outcome_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_outcome" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+pub fn society_record_reputation_event_request(raw: &str) -> Option<serde_json::Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_reputation_event" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+
+pub fn agent_memory_write_request(raw: &str) -> Option<(String, String, Value)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_write" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let category = args.get("category").and_then(|v| v.as_str())?.to_string();
+    let entry = args.get("entry").cloned().unwrap_or(json!({}));
+    Some((agent_id, category, entry))
+}
+
+
+/// Extract request parameters for agent_memory_read
+pub fn agent_memory_read_request(raw: &str) -> Option<(String, Option<Vec<String>>)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_read" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    Some((agent_id, categories))
+}
+
+/// Extract request parameters for agent_memory_search
+pub fn agent_memory_search_request(raw: &str) -> Option<(String, String, Option<Vec<String>>, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_search" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    let query = args.get("query").and_then(|v| v.as_str())?.to_string();
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    Some((agent_id, query, categories, limit))
+}
+
+/// Extract request parameters for agent_memory_snapshot
+pub fn agent_memory_snapshot_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_snapshot" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Extract request parameters for agent_memory_export
+pub fn agent_memory_export_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_export" { return None; }
+    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
 pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
@@ -749,6 +1339,14 @@ pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     Some((input, model))
+}
+
+
+/// Extract request parameters for discover_capabilities
+pub fn discover_capabilities_request(raw: &str) -> bool {
+    let msg: Value = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => return false };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
+    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("discover_capabilities")
 }
 
 /// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).
@@ -947,6 +1545,28 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
         "list_consumer_keys" => &ctx.consumer_keys,
+        "arena_state" => &ctx.arena_state,
+        "arena_act" => &ctx.arena_action,
+        "hub_state" => &ctx.hub_state,
+        "hub_publish_task" => &ctx.hub_action,
+        "hub_place_bid" => &ctx.hub_action,
+        "hub_propose" => &ctx.hub_action,
+        "hub_decide_proposal" => &ctx.hub_action,
+        "hub_form_team" => &ctx.hub_action,
+        "hub_execute" => &ctx.hub_action,
+        "society_state" => &ctx.society_action,
+        "society_trust" => &ctx.society_action,
+        "society_reputation" => &ctx.society_action,
+        "society_relationships" => &ctx.society_action,
+        "society_contributions" => &ctx.society_action,
+        "society_outcomes" => &ctx.society_action,
+        "society_decision_hints" => &ctx.society_action,
+        "agent_memory_read" => &ctx.personal_memory_action,
+        "agent_memory_write" => &ctx.personal_memory_action,
+        "agent_memory_search" => &ctx.personal_memory_action,
+        "agent_memory_snapshot" => &ctx.personal_memory_action,
+        "agent_memory_export" => &ctx.personal_memory_action,
+        "discover_capabilities" => &ctx.personal_memory_action,
         _ => return None,
     };
     Some(json!({
@@ -988,6 +1608,12 @@ mod tests {
             quota: json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": 1 }),
             compensation: json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
             consumer_keys: json!({ "keys": [] }),
+            arena_state: json!({ "tick": 0, "width": 20, "height": 20, "agents": [], "events": [] }),
+            arena_action: json!({}),
+            hub_state: json!({ "tick": 0, "tasks": [], "bids": [], "proposals": [], "teams": [], "events": [] }),
+            hub_action: json!({}),
+            society_action: json!({}),
+            personal_memory_action: json!({}),
         }
     }
 

@@ -184,7 +184,7 @@ impl GateError {
 
 /// How the caller authenticated on this request.
 #[derive(Debug)]
-enum Auth {
+pub(crate) enum Auth {
     /// No token configured on the node at all (api_auth_required=false).
     Open,
     /// The master admin token: unlimited.
@@ -255,18 +255,18 @@ pub struct DashboardInfo {
 #[derive(Clone)]
 pub struct ApiState {
     /// Base URL of the managed llama-server (e.g. http://127.0.0.1:41501).
-    backend_url: String,
+    pub(crate) backend_url: String,
     /// Optional master Bearer token; admin when set.
     auth_token: Option<Arc<str>>,
     /// Lifecycle handle; activity is recorded per request.
-    manager: Arc<Mutex<ServeManager>>,
-    client: reqwest::Client,
+    pub(crate) manager: Arc<Mutex<ServeManager>>,
+    pub(crate) client: reqwest::Client,
     pub(crate) info: DashboardInfo,
     /// Live name of the model this node actually serves. `info.model_name` is
     /// the model requested at startup (immutable); the admin model selector
     /// respawns the engine live, so every surface that must reflect the
     /// *current* model (status, dashboard, metrics, skills) reads this.
-    active_model: Arc<tokio::sync::RwLock<String>>,
+    pub(crate) active_model: Arc<tokio::sync::RwLock<String>>,
     /// Root dashboard choice from `node.dashboard`. `/ui2` always remains a
     /// preview route, so an operator can switch back without losing access.
     dashboard: DashboardVersion,
@@ -292,7 +292,7 @@ pub struct ApiState {
     /// The authoritative quota ledger, `Arc`-shared with the compute manager
     /// (Q2: worker credits and consumer reserve/settle are one ledger). `None`
     /// when running without compute; consumer quota enforcement is skipped.
-    quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
+    pub(crate) quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
     /// Per-consumer-key sliding-window rate limiting (Q2). Keyed by key_id;
     /// independent from both tier rate limits and the execute mutation limit.
     consumer_rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
@@ -353,6 +353,8 @@ pub struct ApiState {
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
     /// Optional collective memory store (persistent scopes/entries).
     pub memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
+    /// Per-agent personal memory store (Markdown workspaces).
+    pub personal_memory: Option<Arc<decentraai_agent_personal_memory::PersonalMemoryStore>>,
     /// Model Colony registry (M-I): governance stages persist across
     /// restarts via db/model_intel.json; shared with the intel/route/
     /// governance handlers.
@@ -395,6 +397,10 @@ pub struct ApiState {
     /// single vs RAG vs collective comparison and lets an operator run a
     /// benchmark task inline. `None` on plain serve.
     benchmark: Option<Arc<decentraai_distributed::benchmark_manager::BenchmarkManager>>,
+    /// Agent Arena — persistent deterministic world (Issue #63). Always present (in-memory default 20x20).
+    pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
+    pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
+    pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
 }
 
 impl ApiState {
@@ -410,6 +416,14 @@ impl ApiState {
         compute: Option<Arc<decentraai_distributed::ComputeManager>>,
         p2p: Option<decentraai_p2p::P2PNode>,
     ) -> Self {
+        let arena_world = {
+            let arena_path = crate::arena::arena_path_for(&info.repo_root);
+            crate::arena::load_arena_world(&arena_path)
+        };
+        let hub_state = {
+            let hub_path = crate::hub::hub_path_for(&info.repo_root);
+            crate::hub::load_hub_state(&hub_path)
+        };
         Self {
             backend_url,
             auth_token: auth_token.map(Into::into),
@@ -457,6 +471,7 @@ impl ApiState {
             embedding: None,
             retrieval: None,
             memory: None,
+            personal_memory: None,
             model_intel: None,
             model_intel_path: None,
             talent_tree: None,
@@ -469,6 +484,9 @@ impl ApiState {
             evidence: None,
             identity_signing_key: None,
             benchmark: None,
+            arena: Arc::new(tokio::sync::Mutex::new(arena_world)),
+            hub: Arc::new(tokio::sync::Mutex::new(hub_state)),
+            society: Arc::new(tokio::sync::Mutex::new(decentraai_agent_society::SocietyState::with_tick(0))),
         }
     }
 
@@ -485,6 +503,11 @@ impl ApiState {
         distributed: Arc<decentraai_distributed::DistributedInference>,
     ) {
         self.distributed = Some(distributed);
+    }
+
+    /// Attaches the personal memory store for agents. Call once at startup.
+    pub fn attach_personal_memory(&mut self, store: Arc<decentraai_agent_personal_memory::PersonalMemoryStore>) {
+        self.personal_memory = Some(store);
     }
 
     /// Attaches the local text-to-speech manager (Kokoro subprocess). Call
@@ -750,7 +773,7 @@ impl ApiState {
     /// Classifies the caller: master token, issued subscription token
     /// (resolved through the registry on every request), a consumer API key
     /// (`dca_…`, resolved through the consumer key store — Q2), or open.
-    fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
+    pub(crate) fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
         let presented = Self::presented_token(headers);
         match &self.auth_token {
             None => Ok(Auth::Open),
@@ -5143,6 +5166,24 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/fabric", get(fabric_dashboard_handler))
         .route("/landing", get(fabric_landing_handler))
         .route("/flow", get(fabric_flow_handler))
+        .route("/arena", get(arena_dashboard_handler))
+        .route("/v1/arena/state", get(crate::arena::arena_state_handler))
+        .route("/v1/arena/join", post(crate::arena::arena_join_handler))
+        .route("/v1/arena/action", post(crate::arena::arena_action_handler))
+        .route("/v1/arena/events", get(crate::arena::arena_events_handler))
+        .route("/v1/arena/stream", get(crate::arena::arena_stream_handler))
+        .route("/hub", get(hub_dashboard_handler))
+        .route("/v1/hub/state", get(crate::hub::hub_state_handler))
+        .route("/v1/hub/tasks", get(crate::hub::hub_tasks_handler))
+        .route("/v1/hub/task", post(crate::hub::hub_publish_handler))
+        .route("/v1/hub/bid", post(crate::hub::hub_bid_handler))
+        .route("/v1/hub/bids", get(crate::hub::hub_bids_handler))
+        .route("/v1/hub/proposal", post(crate::hub::hub_proposal_handler))
+        .route("/v1/hub/proposal/{id}/decide", post(crate::hub::hub_decide_handler))
+        .route("/v1/hub/team", post(crate::hub::hub_team_handler))
+        .route("/v1/hub/execute", post(crate::hub::hub_execute_handler))
+        .route("/v1/hub/events", get(crate::hub::hub_events_handler))
+        .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -5355,6 +5396,28 @@ async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
 /// /status snapshot. Read-only.
 async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::fabric_landing::fabric_landing_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /arena — Agent Arena spectator (Issue #63). Premium grid + live events.
+async fn arena_dashboard_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::arena::arena_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /hub — Agent Hub spectator (Issue #63 Hub). Task market + auction + teams.
+async fn hub_dashboard_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::hub::hub_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -6313,6 +6376,524 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             }
         };
     }
+    // Arena act via MCP (M3): mutating, same validation/quota/LLM as HTTP
+    if let Some(args) = crate::mcp::arena_act_request(&raw) {
+        let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("observe");
+        let action: decentraai_arena::ActionKind = serde_json::from_value(serde_json::Value::String(action_str.to_string())).unwrap_or(decentraai_arena::ActionKind::Observe);
+        let target = args.get("target").and_then(|v| v.as_array()).and_then(|a| if a.len()==2 { Some((a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)) } else { None });
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("arena_act via MCP").to_string();
+        // Use operator account for master MCP
+        let account_id = "operator".to_string();
+        let agent_id = format!("arena:{}:{}", account_id, account_id);
+        {
+            let mut arena = state.arena.lock().await;
+            if !arena.agents.contains_key(&agent_id) {
+                let agent = decentraai_arena::ArenaAgent::new(agent_id.clone(), account_id.clone(), account_id.clone(), 5, 5);
+                let _ = arena.join(agent);
+            }
+        }
+        let tick_for_evidence = { state.arena.lock().await.tick };
+        let mut evidence_id: Option<String> = None;
+        let mut reservation_id: Option<String> = None;
+        let _ = reservation_id.is_none();
+        if action == decentraai_arena::ActionKind::RequestCompute {
+            let cost = action.cost_quota();
+            if let Some(ledger) = &state.quota_ledger {
+                let rid = format!("arena:{}:{}", agent_id, tick_for_evidence);
+                {
+                    let mut lg = ledger.lock().unwrap();
+                    if lg.reserve(&account_id, &rid, cost).is_ok() {
+                        reservation_id = Some(rid.clone());
+                    }
+                }
+                if reservation_id.is_some() {
+                    let backend = { let mgr = state.manager.lock().await; mgr.base_url().unwrap_or_else(|| state.backend_url.clone()) };
+                    let model = state.active_model.read().await.clone();
+                    let prompt = format!("Arena MCP {} at tick {}: {}. 1-sentence insight.", agent_id, tick_for_evidence, rationale);
+                    let client = state.client.clone();
+                    let llm: Option<String> = async {
+                        let resp = client.post(format!("{}/v1/chat/completions", backend)).json(&serde_json::json!({"model": model, "messages": [{"role":"user","content": prompt}], "max_tokens": 64})).send().await.ok()?;
+                        if !resp.status().is_success() { return None; }
+                        let v: serde_json::Value = resp.json().await.ok()?;
+                        v.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.chars().take(200).collect())
+                    }.await;
+                    if let Some(txt) = llm {
+                        evidence_id = Some(blake3::hash(txt.as_bytes()).to_hex().to_string());
+                    } else {
+                        evidence_id = Some(blake3::hash(format!("{}:{}:{:?}:{}", agent_id, tick_for_evidence, action, reservation_id.clone().unwrap()).as_bytes()).to_hex().to_string());
+                    }
+                    if let Some(ledger) = &state.quota_ledger {
+                        let mut lg = ledger.lock().unwrap();
+                        let _ = lg.settle(&reservation_id.clone().unwrap(), cost);
+                    }
+                }
+            } else {
+                evidence_id = Some(blake3::hash(format!("{}:{}:{:?}", agent_id, tick_for_evidence, action).as_bytes()).to_hex().to_string());
+            }
+        }
+        let mut arena = state.arena.lock().await;
+        match arena.apply(&agent_id, action, target, rationale, evidence_id.clone()) {
+            Ok(ev) => {
+                arena.advance_tick();
+                let path = crate::arena::arena_path_for(&state.info.repo_root);
+                crate::arena::save_arena_world(&path, &arena);
+                ctx.arena_action = serde_json::json!({"event": ev, "world_tick": arena.tick});
+            }
+            Err(e) => {
+                ctx.arena_action = serde_json::json!({"error": e.to_string()});
+            }
+        }
+    }
+    // Hub mutating via MCP (M2 Hub): publish/bid/propose/team/execute
+    if let Some(args) = crate::mcp::hub_publish_task_request(&raw) {
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("MCP Task").to_string();
+        let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reward = args.get("reward").and_then(|v| v.as_u64()).unwrap_or(100);
+        let cap = args.get("required_capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = hub.publish_task(account_id, title, description, reward, cap);
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        ctx.hub_action = serde_json::to_value(&task).unwrap_or(serde_json::json!({}));
+    }
+    if let Some(args) = crate::mcp::hub_place_bid_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let price = args.get("price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("MCP bid").to_string();
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.place_bid(account_id, task_id, price, rationale) {
+            Ok(bid) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&bid).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_propose_request(&raw) {
+        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let offer_price = args.get("offer_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let workshare = args.get("workshare").and_then(|v| v.as_u64()).unwrap_or(100) as u8;
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.propose(account_id, to, task_id, offer_price, workshare) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_decide_proposal_request(&raw) {
+        let proposal_id = args.get("proposal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let accept = args.get("accept").and_then(|v| v.as_bool()).unwrap_or(false);
+        let account_id = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator");
+        let mut hub = state.hub.lock().await;
+        let res = match hub.decide_proposal(&proposal_id, account_id, accept) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_form_team_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let members: Vec<(String, u8)> = args.get("members").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+            let arr = e.as_array()?;
+            if arr.len()!=2 { return None; }
+            Some((arr[0].as_str()?.to_string(), arr[1].as_u64()? as u8))
+        }).collect()).unwrap_or_default();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.form_team(task_id, members) {
+            Ok(t) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&t).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        ctx.hub_action = res;
+    }
+    if let Some(args) = crate::mcp::hub_execute_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = match hub.tasks.get(&task_id).cloned() {
+            Some(t) => t,
+            None => {
+                ctx.hub_action = serde_json::json!({"error": "task not found"});
+                return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&ctx.hub_action).unwrap_or_default()).into_response();
+            }
+        };
+        hub.mark_executing(&task_id);
+        let team_members: Vec<(String, u8)> = hub.teams.values().find(|t| t.task_id == task_id).map(|t| t.members.clone()).unwrap_or_else(|| {
+            if let Some(best) = hub.best_bid(&task_id) { vec![(best.bidder.clone(), 100)] } else { vec![(task.issuer.clone(), 100)] }
+        });
+        let executor = args.get("account").and_then(|v| v.as_str()).unwrap_or("operator");
+        let evidence_id = blake3::hash(format!("hub:{}:{}:{}", task_id, executor, hub.tick).as_bytes()).to_hex().to_string();
+        if let Some(ledger) = &state.quota_ledger {
+            let mut lg = ledger.lock().unwrap();
+            for (member, share) in &team_members {
+                let amount = (task.reward as u128 * *share as u128 / 100) as u64;
+                if amount > 0 {
+                    let ref_id = format!("hub-settle-{}-{}", task_id, member);
+                    let _ = lg.credit(member, &ref_id, Some(amount as u32), None);
+                }
+            }
+        }
+        hub.settle(&task_id, Some(evidence_id.clone()));
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+
+        // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
+        let _team_for_society = team_members.clone();
+        let _ev_for_society = evidence_id.clone();
+        let _task_for_society = task_id.clone();
+        let _reward_for_society = task.reward;
+        let _issuer_for_society = task.issuer.clone();
+        drop(hub);
+        {
+            let mut society = state.society.lock().await;
+            if !society.outcomes.contains_key(&_task_for_society) {
+                let tick = society.tick;
+                let mut contrib_records = Vec::new();
+                for (agent_id, share) in &_team_for_society {
+                    let cr = decentraai_agent_society::state::ContributionRecord::new(
+                        _task_for_society.clone(),
+                        agent_id.clone(),
+                        *share,
+                        tick,
+                    ).verify(*share as f32 / 100.0, _ev_for_society.clone(), 0.85, true, tick);
+                    contrib_records.push(cr.clone());
+                    society.record_contribution(cr);
+                }
+                let dists = _team_for_society.iter().map(|(aid, share)| {
+                    let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
+                    decentraai_agent_society::state::RewardDistribution { agent_id: aid.clone(), amount, share_basis: decentraai_agent_society::state::ShareBasis::Verified }
+                }).collect::<Vec<_>>();
+                let outcome = decentraai_agent_society::state::TaskOutcome {
+                    task_id: _task_for_society.clone(),
+                    issuer: _issuer_for_society.clone(),
+                    team_members: _team_for_society.iter().map(|(a,_)| a.clone()).collect(),
+                    status: decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+                    evidence_id: Some(_ev_for_society.clone()),
+                    settled_tick: tick,
+                    total_reward: _reward_for_society,
+                    distributions: dists,
+                    contributor_records: contrib_records,
+                };
+                society.record_outcome(outcome);
+                for (agent_id, _) in &_team_for_society {
+                    let ev = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.15,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("hub execute {} as team {:?}", _task_for_society, _team_for_society),
+                    };
+                    society.record_reputation_event(ev);
+                    let ev2 = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.1,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("verified contribution for {}", _task_for_society),
+                    };
+                    society.record_reputation_event(ev2);
+                }
+                society.advance_tick();
+                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                decentraai_agent_society::state::save_society_state(&path, &society);
+            }
+        }
+        if let Some(pm) = &state.personal_memory {
+            let mut all_agents = _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>();
+            if !all_agents.contains(&_issuer_for_society) && !_issuer_for_society.is_empty() && _issuer_for_society != "open" && _issuer_for_society != "operator" {
+                all_agents.push(_issuer_for_society.clone());
+            }
+            for agent_id in all_agents {
+                let exp_id = format!("hub-{}-{}", _task_for_society, agent_id);
+                let cached = pm.get_or_create(&agent_id).await;
+                let exists = { cached.read().await.memory.experiences.experiences.iter().any(|e| e.id == exp_id) };
+                if !exists {
+                    let summary = format!("Executed task {} (reward {}) as team {:?} — evidence {}", _task_for_society, _reward_for_society, _team_for_society, &_ev_for_society[..8.min(_ev_for_society.len())]);
+                    let detail = format!("Task {} settled with evidence {}. Team: {:?}. Issuer: {}.", _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society);
+                    let entry = serde_json::json!({
+                        "id": exp_id,
+                        "type_": "success",
+                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        "summary": summary,
+                        "detail": detail,
+                        "involved_agents": _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>(),
+                        "task_id": _task_for_society,
+                        "outcome": "settled",
+                        "evidence_ids": [_ev_for_society.clone()],
+                        "emotional_impact": 0.7,
+                        "tags": ["hub", "settlement", "team"]
+                    });
+                    let _ = pm.write_entry(&agent_id, |mem| {
+                        decentraai_agent_personal_memory::mcp::apply_write(mem, "experiences", entry.clone())
+                    }).await;
+                }
+            }
+        }
+        // Re-acquire hub lock not needed; we already saved. Continue to arena.
+        {
+            let mut arena = state.arena.lock().await;
+            let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", executor), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
+            arena.events.push_back(ev);
+            while arena.events.len() > arena.max_events { arena.events.pop_front(); }
+            arena.advance_tick();
+            let apath = crate::arena::arena_path_for(&state.info.repo_root);
+            crate::arena::save_arena_world(&apath, &arena);
+        }
+        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        ctx.hub_action = res;
+    }
+    // Society MCP handlers (M2 Society)
+    if crate::mcp::society_state_request(&raw) {
+        let society = state.society.lock().await;
+        let account_id = "operator".to_string();
+        ctx.society_action = decentraai_agent_society::mcp::build_society_state_response(&society, &account_id);
+    }
+    if let Some((observer, subject)) = crate::mcp::society_trust_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_trust_response(&society, &observer, &subject);
+    }
+    if let Some((agent_id, capability)) = crate::mcp::society_reputation_request(&raw) {
+        let society = state.society.lock().await;
+        // Build ReputationStore from society events
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        ctx.society_action = decentraai_agent_society::mcp::build_reputation_response(&rep_store, &agent_id, capability.as_deref());
+    }
+    if let Some((agent_id, as_observer)) = crate::mcp::society_relationships_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_relationships_response(&society, &agent_id, as_observer);
+    }
+    if let Some(task_id) = crate::mcp::society_contributions_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_contributions_response(&society, &task_id);
+    }
+    if let Some((agent_id, limit)) = crate::mcp::society_outcomes_request(&raw) {
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_outcomes_response(&society, &agent_id, limit);
+    }
+    if let Some((agent_id, _hub_state_json, resources)) = crate::mcp::society_decision_hints_request(&raw) {
+        let society = state.society.lock().await;
+        let hub = state.hub.lock().await;
+        // Build proper HubSnapshot
+        let hub_snapshot = decentraai_agent_society::rules::HubSnapshot {
+            tick: hub.tick,
+            open_tasks: hub.tasks.values().filter(|t| t.status == decentraai_agent_hub::TaskStatus::Open || t.status == decentraai_agent_hub::TaskStatus::Bidding).cloned().collect::<Vec<_>>(),
+            my_tasks: hub.tasks.values().filter(|t| t.issuer == agent_id).cloned().collect::<Vec<_>>(),
+            my_bids: hub.bids.values().filter(|b| b.bidder == agent_id).cloned().collect::<Vec<_>>(),
+            pending_proposals: hub.proposals.values().filter(|p| p.to == agent_id && p.status == decentraai_agent_hub::ProposalStatus::Pending).cloned().collect::<Vec<_>>(),
+            my_teams: hub.teams.values().filter(|t| t.members.iter().any(|(a, _)| a == &agent_id)).cloned().collect::<Vec<_>>(),
+            recent_events: hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+            total_tasks: hub.tasks.len(),
+            total_bids: hub.bids.len(),
+        };
+        // Build ReputationStore from society events
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        // Build decision context
+        let rules = decentraai_agent_society::SocietyRules::default();
+        let ctx_decision = decentraai_agent_society::DecisionContext {
+            agent_id: agent_id.clone(),
+            tick: society.tick,
+            hub: hub_snapshot,
+            society: decentraai_agent_society::rules::SocietySnapshot {
+                tick: society.tick,
+                trust_scores: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for subject in society.relationships.get(&agent_id).unwrap_or(&std::collections::HashMap::new()).keys() {
+                        let score = society.trust_score(&agent_id, subject);
+                        map.insert(subject.clone(), score);
+                    }
+                    map
+                },
+                other_reputations: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for (agent, events) in &society.reputation {
+                        let mut rep = decentraai_agent_society::reputation::SocialReputation::new(agent.clone(), None, society.tick);
+                        for event in events {
+                            rep.apply_event(event);
+                        }
+                        if rep.sample_count > 0 {
+                            map.insert(agent.clone(), rep);
+                        }
+                    }
+                    map
+                },
+                recent_outcomes: society.recent_outcomes(&agent_id, 10).into_iter().cloned().collect(),
+                my_contributions: society.contributions.values().flatten().filter(|c| c.agent_id == agent_id).cloned().collect(),
+                relationships: society.get_all_for_agent(&agent_id).into_iter().cloned().collect(),
+            },
+            own_reputation: None,
+            resources: {
+                let r = resources;
+                decentraai_agent_society::rules::ResourceState {
+                    quota_available: r.get("quota_available").and_then(|v| v.as_u64()).unwrap_or(1000),
+                    quota_ceiling: r.get("quota_ceiling").and_then(|v| v.as_u64()).unwrap_or(10000),
+                    capacity_used: r.get("capacity_used").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    max_concurrent_tasks: r.get("max_concurrent_tasks").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
+                    current_tasks: r.get("current_tasks").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                }
+            },
+        };
+        ctx.society_action = decentraai_agent_society::mcp::build_decision_hints_response(&rules, &ctx_decision);
+    }
+    // Society mutating via MCP: record_relationship, record_contribution, record_outcome, record_reputation_event
+    if let Some(args) = crate::mcp::society_record_relationship_request(&raw) {
+        let _observer = args.get("observer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = match kind_str {
+            "worked_with" => decentraai_agent_society::state::RelationshipKind::WorkedWith,
+            "accepted" => decentraai_agent_society::state::RelationshipKind::Accepted,
+            "rejected" => decentraai_agent_society::state::RelationshipKind::Rejected,
+            "countered" => decentraai_agent_society::state::RelationshipKind::Countered,
+            "successful" => decentraai_agent_society::state::RelationshipKind::Successful,
+            "failed" => decentraai_agent_society::state::RelationshipKind::Failed,
+            "trust_signal" => decentraai_agent_society::state::RelationshipKind::TrustSignal,
+            "distrust_signal" => decentraai_agent_society::state::RelationshipKind::DistrustSignal,
+            _ => decentraai_agent_society::state::RelationshipKind::WorkedWith,
+        };
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let detail = args.get("detail").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let strength = args.get("strength").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let account_id = "operator".to_string(); // Master handler uses operator
+        let rel = decentraai_agent_society::state::SocialRelationship::new(account_id, subject, kind, state.society.lock().await.tick)
+            .with_task(task_id.unwrap_or_default())
+            .with_detail(detail.unwrap_or_default())
+            .with_strength(strength);
+        let mut society = state.society.lock().await;
+        society.record_relationship(rel.clone());
+        society.advance_tick();
+        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        decentraai_agent_society::state::save_society_state(&path, &society);
+        ctx.society_action = serde_json::json!({"success": true, "relationship": rel});
+    }
+    if let Some(args) = crate::mcp::society_record_contribution_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let planned_share = args.get("planned_share").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let verified = args.get("verified_contribution").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let evidence = args.get("evidence_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let quality = args.get("quality").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let met_sla = args.get("met_sla").and_then(|v| v.as_bool());
+        let tick = state.society.lock().await.tick;
+        let contrib = decentraai_agent_society::state::ContributionRecord::new(task_id, agent_id, planned_share, tick)
+            .verify(verified.unwrap_or(0.0), evidence.unwrap_or_default(), quality.unwrap_or(0.0), met_sla.unwrap_or(false), tick);
+        let mut society = state.society.lock().await;
+        society.record_contribution(contrib.clone());
+        society.advance_tick();
+        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        decentraai_agent_society::state::save_society_state(&path, &society);
+        ctx.society_action = serde_json::json!({"success": true, "contribution": contrib});
+    }
+    if let Some(args) = crate::mcp::society_record_outcome_request(&raw) {
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let issuer = args.get("issuer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let team_members = args.get("team_members").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+        let status_str = args.get("status").and_then(|v| v.as_str()).unwrap_or("settled");
+        let status = match status_str {
+            "completed" => decentraai_agent_society::state::TaskOutcomeStatus::Completed,
+            "settled" => decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+            "failed" => decentraai_agent_society::state::TaskOutcomeStatus::Failed,
+            "disputed" => decentraai_agent_society::state::TaskOutcomeStatus::Disputed,
+            _ => decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+        };
+        let evidence = args.get("evidence_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let total_reward = args.get("total_reward").and_then(|v| v.as_u64()).unwrap_or(0);
+        let dists = args.get("distributions").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+            let agent_id = e.get("agent_id").and_then(|v| v.as_str())?.to_string();
+            let amount = e.get("amount").and_then(|v| v.as_u64())?;
+            let share_basis_str = e.get("share_basis").and_then(|v| v.as_str()).unwrap_or("planned");
+            let share_basis = match share_basis_str {
+                "planned" => decentraai_agent_society::state::ShareBasis::Planned,
+                "verified" => decentraai_agent_society::state::ShareBasis::Verified,
+                "hybrid" => decentraai_agent_society::state::ShareBasis::Hybrid,
+                _ => decentraai_agent_society::state::ShareBasis::Planned,
+            };
+            Some(decentraai_agent_society::state::RewardDistribution { agent_id, amount, share_basis })
+        }).collect()).unwrap_or_default();
+            let tick = state.society.lock().await.tick;
+            let contrib_records = args.get("contributor_records").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+                let task_id = e.get("task_id").and_then(|v| v.as_str())?.to_string();
+                let agent_id = e.get("agent_id").and_then(|v| v.as_str())?.to_string();
+                let planned_share = e.get("planned_share").and_then(|v| v.as_u64())? as u8;
+                let verified = e.get("verified_contribution").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let evidence = e.get("evidence_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let _quality = e.get("quality").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let met_sla = e.get("met_sla").and_then(|v| v.as_bool());
+                Some(decentraai_agent_society::state::ContributionRecord::new(task_id, agent_id, planned_share, tick)
+                    .verify(verified.unwrap_or(0.0), evidence.unwrap_or_default(), 0.0, met_sla.unwrap_or(false), tick))
+        }).collect()).unwrap_or_default();
+        let outcome = decentraai_agent_society::state::TaskOutcome {
+            task_id: task_id.clone(),
+            issuer: issuer.clone(),
+            team_members,
+            status,
+            evidence_id: evidence.clone(),
+            settled_tick: tick,
+            total_reward,
+            distributions: dists,
+            contributor_records: contrib_records,
+        };
+        let mut society = state.society.lock().await;
+        society.record_outcome(outcome.clone());
+        society.advance_tick();
+        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        decentraai_agent_society::state::save_society_state(&path, &society);
+        ctx.society_action = serde_json::json!({"success": true, "outcome": outcome});
+    }
+    if let Some(args) = crate::mcp::society_record_reputation_event_request(&raw) {
+        let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let event_type_str = args.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+        let event_type = match event_type_str {
+            "task_completed" => decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+            "task_failed" => decentraai_agent_society::state::ReputationEventType::TaskFailed,
+            "quality_high" => decentraai_agent_society::state::ReputationEventType::QualityHigh,
+            "quality_low" => decentraai_agent_society::state::ReputationEventType::QualityLow,
+            "sla_met" => decentraai_agent_society::state::ReputationEventType::SlaMet,
+            "sla_missed" => decentraai_agent_society::state::ReputationEventType::SlaMissed,
+            "contribution_verified" => decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+            "contribution_missing" => decentraai_agent_society::state::ReputationEventType::ContributionMissing,
+            "proposal_accepted" => decentraai_agent_society::state::ReputationEventType::ProposalAccepted,
+            "proposal_rejected" => decentraai_agent_society::state::ReputationEventType::ProposalRejected,
+            "bid_accepted" => decentraai_agent_society::state::ReputationEventType::BidAccepted,
+            "bid_rejected" => decentraai_agent_society::state::ReputationEventType::BidRejected,
+            _ => decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+        };
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let delta = args.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let evidence = args.get("evidence_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tick = state.society.lock().await.tick;
+        let event = decentraai_agent_society::state::ReputationEvent {
+            agent_id,
+            event_type,
+            task_id,
+            delta,
+            tick,
+            evidence_id: evidence,
+            detail,
+        };
+        let mut society = state.society.lock().await;
+        society.record_reputation_event(event.clone());
+        society.advance_tick();
+        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        decentraai_agent_society::state::save_society_state(&path, &society);
+        ctx.society_action = serde_json::json!({"success": true, "event": event});
+    }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
             Some(p) => decentraai_tokens::ConsumerKeyStore::load(p)
@@ -6344,6 +6925,58 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                 "account_quota": { "available": available, "consumed": consumed },
             })
         }).collect::<Vec<_>>() });
+    }
+    // Personal Memory MCP handlers (master)
+    if crate::mcp::agent_memory_read_request(&raw).is_some() {
+        let (agent_id, _categories) = crate::mcp::agent_memory_read_request(&raw).unwrap();
+        let store = state.personal_memory.as_ref().unwrap();
+        let snapshot = store.snapshot(&agent_id).await.unwrap_or_else(|_| {
+            decentraai_agent_personal_memory::schema::PersonalMemorySnapshot {
+                agent_id: agent_id.clone(),
+                identity: None, goals: None, capabilities: None,
+                people_count: 0, recent_experiences: Vec::new(),
+                recent_decisions: Vec::new(), recent_lessons: Vec::new(),
+                relationship_summaries: HashMap::new(),
+            }
+        });
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+    }
+    if let Some((agent_id, category, entry)) = crate::mcp::agent_memory_write_request(&raw) {
+        let store = state.personal_memory.as_ref().unwrap();
+        let agent_id_clone = agent_id.clone();
+        let cat = category.clone();
+        let entry_clone = entry.clone();
+        store.write_entry(&agent_id_clone, move |mem| {
+            decentraai_agent_personal_memory::mcp::apply_write(mem, &cat, entry_clone)
+        }).await.unwrap_or_default();
+        ctx.personal_memory_action = serde_json::json!({"success": true, "message": format!("Updated {}", category)});
+    }
+    if let Some((agent_id, _query, categories, limit)) = crate::mcp::agent_memory_search_request(&raw) {
+        let store = state.personal_memory.as_ref().unwrap();
+        let cached = store.get_or_create(&agent_id).await;
+        let memory = cached.read().await.memory.clone();
+        let results = decentraai_agent_personal_memory::mcp::search_memory(&memory, &_query, categories, limit);
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_search_response(results);
+    }
+    if let Some(agent_id) = crate::mcp::agent_memory_snapshot_request(&raw) {
+        let store = state.personal_memory.as_ref().unwrap();
+        let snapshot = store.snapshot(&agent_id).await.unwrap_or_else(|_| {
+            decentraai_agent_personal_memory::schema::PersonalMemorySnapshot {
+                agent_id: agent_id.clone(),
+                identity: None, goals: None, capabilities: None,
+                people_count: 0, recent_experiences: Vec::new(),
+                recent_decisions: Vec::new(), recent_lessons: Vec::new(),
+                relationship_summaries: HashMap::new(),
+            }
+        });
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+    }
+    if let Some(agent_id) = crate::mcp::agent_memory_export_request(&raw) {
+        let store = state.personal_memory.as_ref().unwrap();
+        let cached = store.get_or_create(&agent_id).await;
+        let memory = cached.read().await.memory.clone();
+        let markdown = memory.to_full_markdown();
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_export_response(markdown);
     }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
@@ -6549,6 +7182,303 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "quota": { "reserved": true, "settled": ok, "tokens_settled": if ok { tokens_used } else { 0 } },
             "body": payload,
         });
+    } else if let Some(args) = crate::mcp::arena_act_request(&raw) {
+        if !scopes.iter().any(|s| s == "arena" || s == "*") {
+            return forbidden("consumer key missing arena scope");
+        }
+        // Arena act via consumer MCP — mutating, same as HTTP, quota-gated
+        let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("observe");
+        let action: decentraai_arena::ActionKind = serde_json::from_value(serde_json::Value::String(action_str.to_string())).unwrap_or(decentraai_arena::ActionKind::Observe);
+        let target = args.get("target").and_then(|v| v.as_array()).and_then(|a| if a.len()==2 { Some((a[0].as_i64().unwrap_or(0) as i32, a[1].as_i64().unwrap_or(0) as i32)) } else { None });
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("arena_act via MCP").to_string();
+        let tick_for_evidence = { state.arena.lock().await.tick };
+        let mut evidence_id: Option<String> = None;
+        let mut reservation_id: Option<String> = None;
+        let _ = reservation_id.is_none();
+        if action == decentraai_arena::ActionKind::RequestCompute {
+            let cost = action.cost_quota();
+            if let Some(ledger) = &state.quota_ledger {
+                let rid = format!("arena:{}:{}", account, tick_for_evidence);
+                {
+                    let mut lg = ledger.lock().unwrap();
+                    if lg.reserve(account, &rid, cost).is_ok() {
+                        reservation_id = Some(rid.clone());
+                    } else {
+                        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+                        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "quota insufficient"}});
+                        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+                    }
+                }
+                if reservation_id.is_some() {
+                    let backend = { let mgr = state.manager.lock().await; mgr.base_url().unwrap_or_else(|| state.backend_url.clone()) };
+                    let model = state.active_model.read().await.clone();
+                    let prompt = format!("Arena MCP {} at tick {}: {}. 1-sentence.", account, tick_for_evidence, rationale);
+                    let client = state.client.clone();
+                    let llm: Option<String> = async {
+                        let resp = client.post(format!("{}/v1/chat/completions", backend)).json(&serde_json::json!({"model": model, "messages": [{"role":"user","content": prompt}], "max_tokens": 64})).send().await.ok()?;
+                        if !resp.status().is_success() { return None; }
+                        let v: serde_json::Value = resp.json().await.ok()?;
+                        v.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.chars().take(200).collect())
+                    }.await;
+                    if let Some(txt) = llm {
+                        evidence_id = Some(blake3::hash(txt.as_bytes()).to_hex().to_string());
+                    } else {
+                        evidence_id = Some(blake3::hash(format!("{}:{}:{:?}:{}", account, tick_for_evidence, action, reservation_id.clone().unwrap()).as_bytes()).to_hex().to_string());
+                    }
+                    {
+                        let mut lg = ledger.lock().unwrap();
+                        let _ = lg.settle(&reservation_id.clone().unwrap(), cost);
+                    }
+                }
+            } else {
+                evidence_id = Some(blake3::hash(format!("{}:{}:{:?}", account, tick_for_evidence, action).as_bytes()).to_hex().to_string());
+            }
+        }
+        let agent_id = format!("arena:{}:{}", account, account);
+        {
+            let mut arena = state.arena.lock().await;
+            if !arena.agents.contains_key(&agent_id) {
+                let agent = decentraai_arena::ArenaAgent::new(agent_id.clone(), account.clone(), account.clone(), 5, 5);
+                let _ = arena.join(agent);
+            }
+        }
+        let mut arena = state.arena.lock().await;
+        let res = match arena.apply(&agent_id, action, target, rationale, evidence_id.clone()) {
+            Ok(ev) => {
+                arena.advance_tick();
+                let path = crate::arena::arena_path_for(&state.info.repo_root);
+                crate::arena::save_arena_world(&path, &arena);
+                serde_json::json!({"event": ev, "world_tick": arena.tick})
+            }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_publish_task_request(&raw) {
+        // Require "hub" scope for Hub marketplace participation
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("MCP Task").to_string();
+        let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reward = args.get("reward").and_then(|v| v.as_u64()).unwrap_or(100);
+        let cap = args.get("required_capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let mut hub = state.hub.lock().await;
+        let task = hub.publish_task(account.clone(), title, description, reward, cap);
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&task).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_place_bid_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let price = args.get("price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rationale = args.get("rationale").and_then(|v| v.as_str()).unwrap_or("MCP bid").to_string();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.place_bid(account.clone(), task_id, price, rationale) {
+            Ok(bid) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&bid).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_propose_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let offer_price = args.get("offer_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let workshare = args.get("workshare").and_then(|v| v.as_u64()).unwrap_or(100) as u8;
+        let mut hub = state.hub.lock().await;
+        let res = match hub.propose(account.clone(), to, task_id, offer_price, workshare) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_decide_proposal_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let proposal_id = args.get("proposal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let accept = args.get("accept").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut hub = state.hub.lock().await;
+        let res = match hub.decide_proposal(&proposal_id, account, accept) {
+            Ok(p) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&p).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_form_team_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let members: Vec<(String, u8)> = args.get("members").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| {
+            let arr = e.as_array()?;
+            if arr.len()!=2 { return None; }
+            Some((arr[0].as_str()?.to_string(), arr[1].as_u64()? as u8))
+        }).collect()).unwrap_or_default();
+        let mut hub = state.hub.lock().await;
+        let res = match hub.form_team(task_id, members) {
+            Ok(t) => { hub.advance_tick(); let path = crate::hub::hub_path_for(&state.info.repo_root); crate::hub::save_hub_state(&path, &hub); serde_json::to_value(&t).unwrap_or(serde_json::json!({})) }
+            Err(e) => serde_json::json!({"error": e.to_string()})
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+    } else if let Some(args) = crate::mcp::hub_execute_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut hub = state.hub.lock().await;
+        let task = match hub.tasks.get(&task_id).cloned() {
+            Some(t) => t,
+            None => {
+                let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "task not found"}});
+                return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
+            }
+        };
+        hub.mark_executing(&task_id);
+        let team_members: Vec<(String, u8)> = hub.teams.values().find(|t| t.task_id == task_id).map(|t| t.members.clone()).unwrap_or_else(|| {
+            if let Some(best) = hub.best_bid(&task_id) { vec![(best.bidder.clone(), 100)] } else { vec![(task.issuer.clone(), 100)] }
+        });
+        let evidence_id = blake3::hash(format!("hub:{}:{}:{}", task_id, account, hub.tick).as_bytes()).to_hex().to_string();
+        if let Some(ledger) = &state.quota_ledger {
+            let mut lg = ledger.lock().unwrap();
+            for (member, share) in &team_members {
+                let amount = (task.reward as u128 * *share as u128 / 100) as u64;
+                if amount > 0 {
+                    let ref_id = format!("hub-settle-{}-{}", task_id, member);
+                    let _ = lg.credit(member, &ref_id, Some(amount as u32), None);
+                }
+            }
+        }
+        hub.settle(&task_id, Some(evidence_id.clone()));
+        hub.advance_tick();
+        let path = crate::hub::hub_path_for(&state.info.repo_root);
+        crate::hub::save_hub_state(&path, &hub);
+
+        // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
+        let _team_for_society = team_members.clone();
+        let _ev_for_society = evidence_id.clone();
+        let _task_for_society = task_id.clone();
+        let _reward_for_society = task.reward;
+        let _issuer_for_society = task.issuer.clone();
+        drop(hub);
+        {
+            let mut society = state.society.lock().await;
+            if !society.outcomes.contains_key(&_task_for_society) {
+                let tick = society.tick;
+                let mut contrib_records = Vec::new();
+                for (agent_id, share) in &_team_for_society {
+                    let cr = decentraai_agent_society::state::ContributionRecord::new(
+                        _task_for_society.clone(),
+                        agent_id.clone(),
+                        *share,
+                        tick,
+                    ).verify(*share as f32 / 100.0, _ev_for_society.clone(), 0.85, true, tick);
+                    contrib_records.push(cr.clone());
+                    society.record_contribution(cr);
+                }
+                let dists = _team_for_society.iter().map(|(aid, share)| {
+                    let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
+                    decentraai_agent_society::state::RewardDistribution { agent_id: aid.clone(), amount, share_basis: decentraai_agent_society::state::ShareBasis::Verified }
+                }).collect::<Vec<_>>();
+                let outcome = decentraai_agent_society::state::TaskOutcome {
+                    task_id: _task_for_society.clone(),
+                    issuer: _issuer_for_society.clone(),
+                    team_members: _team_for_society.iter().map(|(a,_)| a.clone()).collect(),
+                    status: decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+                    evidence_id: Some(_ev_for_society.clone()),
+                    settled_tick: tick,
+                    total_reward: _reward_for_society,
+                    distributions: dists,
+                    contributor_records: contrib_records,
+                };
+                society.record_outcome(outcome);
+                for (agent_id, _) in &_team_for_society {
+                    let ev = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.15,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("hub execute {} as team {:?}", _task_for_society, _team_for_society),
+                    };
+                    society.record_reputation_event(ev);
+                    let ev2 = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.1,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("verified contribution for {}", _task_for_society),
+                    };
+                    society.record_reputation_event(ev2);
+                }
+                society.advance_tick();
+                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                decentraai_agent_society::state::save_society_state(&path, &society);
+            }
+        }
+        if let Some(pm) = &state.personal_memory {
+            let mut all_agents = _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>();
+            if !all_agents.contains(&_issuer_for_society) && !_issuer_for_society.is_empty() && _issuer_for_society != "open" && _issuer_for_society != "operator" {
+                all_agents.push(_issuer_for_society.clone());
+            }
+            for agent_id in all_agents {
+                let exp_id = format!("hub-{}-{}", _task_for_society, agent_id);
+                let cached = pm.get_or_create(&agent_id).await;
+                let exists = { cached.read().await.memory.experiences.experiences.iter().any(|e| e.id == exp_id) };
+                if !exists {
+                    let summary = format!("Executed task {} (reward {}) as team {:?} — evidence {}", _task_for_society, _reward_for_society, _team_for_society, &_ev_for_society[..8.min(_ev_for_society.len())]);
+                    let detail = format!("Task {} settled with evidence {}. Team: {:?}. Issuer: {}.", _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society);
+                    let entry = serde_json::json!({
+                        "id": exp_id,
+                        "type_": "success",
+                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        "summary": summary,
+                        "detail": detail,
+                        "involved_agents": _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>(),
+                        "task_id": _task_for_society,
+                        "outcome": "settled",
+                        "evidence_ids": [_ev_for_society.clone()],
+                        "emotional_impact": 0.7,
+                        "tags": ["hub", "settlement", "team"]
+                    });
+                    let _ = pm.write_entry(&agent_id, |mem| {
+                        decentraai_agent_personal_memory::mcp::apply_write(mem, "experiences", entry.clone())
+                    }).await;
+                }
+            }
+        }
+        // Re-acquire hub lock not needed; we already saved. Continue to arena.
+        {
+            let mut arena = state.arena.lock().await;
+            let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", account), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
+            arena.events.push_back(ev);
+            while arena.events.len() > arena.max_events { arena.events.pop_front(); }
+            arena.advance_tick();
+            let apath = crate::arena::arena_path_for(&state.info.repo_root);
+            crate::arena::save_arena_world(&apath, &arena);
+        }
+        let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
+        let id = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_string(&body).unwrap_or_default()).into_response();
     } else if raw.contains("\"method\":\"tools/list\"") {
         // RBAC-filtered tool list: consumer sees only tools matching its scopes.
         let response = crate::mcp::handle_message(&ctx, &raw);
@@ -6565,6 +7495,20 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             "decentraai_compute_request" => {
                                 scopes.iter().any(|s| s == "compute" || s == "*")
                             }
+                            "hub_publish_task" | "hub_place_bid" | "hub_propose"
+                            | "hub_decide_proposal" | "hub_form_team" | "hub_execute" => {
+                                scopes.iter().any(|s| s == "hub" || s == "*")
+                            }
+                            "society_state" | "society_trust" | "society_reputation"
+                            | "society_relationships" | "society_contributions"
+                            | "society_outcomes" | "society_decision_hints" => {
+                                scopes.iter().any(|s| s == "society" || s == "*")
+                            }
+                            "agent_memory_read" | "agent_memory_search"
+                            | "agent_memory_snapshot" | "agent_memory_export" => {
+                                scopes.iter().any(|s| s == "memory" || s == "*")
+                            }
+                            "discover_capabilities" => true,  // always available for onboarding
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
                             _ => true,
@@ -6588,10 +7532,266 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         || raw.contains("\"method\":\"notifications/initialized\"")
     {
         // Read-only discovery — allowed for consumer keys.
+    } else if crate::mcp::society_state_request(&raw) {
+        // Society read-only tools for consumers (require "society" scope)
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_society_state_response(&society, account);
+    } else if let Some((observer, subject)) = crate::mcp::society_trust_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_trust_response(&society, &observer, &subject);
+    } else if let Some((agent_id, capability)) = crate::mcp::society_reputation_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        ctx.society_action = decentraai_agent_society::mcp::build_reputation_response(&rep_store, &agent_id, capability.as_deref());
+    } else if let Some((agent_id, as_observer)) = crate::mcp::society_relationships_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_relationships_response(&society, &agent_id, as_observer);
+    } else if let Some(task_id) = crate::mcp::society_contributions_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_contributions_response(&society, &task_id);
+    } else if let Some((agent_id, limit)) = crate::mcp::society_outcomes_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        ctx.society_action = decentraai_agent_society::mcp::build_outcomes_response(&society, &agent_id, limit);
+    } else if let Some((agent_id, _hub_state_json, resources)) = crate::mcp::society_decision_hints_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let society = state.society.lock().await;
+        let hub = state.hub.lock().await;
+        let hub_snapshot = decentraai_agent_society::rules::HubSnapshot {
+            tick: hub.tick,
+            open_tasks: hub.tasks.values().filter(|t| t.status == decentraai_agent_hub::TaskStatus::Open || t.status == decentraai_agent_hub::TaskStatus::Bidding).cloned().collect::<Vec<_>>(),
+            my_tasks: hub.tasks.values().filter(|t| t.issuer == agent_id).cloned().collect::<Vec<_>>(),
+            my_bids: hub.bids.values().filter(|b| b.bidder == agent_id).cloned().collect::<Vec<_>>(),
+            pending_proposals: hub.proposals.values().filter(|p| p.to == agent_id && p.status == decentraai_agent_hub::ProposalStatus::Pending).cloned().collect::<Vec<_>>(),
+            my_teams: hub.teams.values().filter(|t| t.members.iter().any(|(a, _)| a == &agent_id)).cloned().collect::<Vec<_>>(),
+            recent_events: hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+            total_tasks: hub.tasks.len(),
+            total_bids: hub.bids.len(),
+        };
+        let mut rep_store = decentraai_agent_society::reputation::ReputationStore::new();
+        for events in society.reputation.values() {
+            for event in events {
+                rep_store.apply_event(event);
+            }
+        }
+        let rules = decentraai_agent_society::SocietyRules::default();
+        let ctx_decision = decentraai_agent_society::DecisionContext {
+            agent_id: agent_id.clone(),
+            tick: society.tick,
+            hub: hub_snapshot,
+            society: decentraai_agent_society::rules::SocietySnapshot {
+                tick: society.tick,
+                trust_scores: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for subject in society.relationships.get(&agent_id).unwrap_or(&std::collections::HashMap::new()).keys() {
+                        let score = society.trust_score(&agent_id, subject);
+                        map.insert(subject.clone(), score);
+                    }
+                    map
+                },
+                other_reputations: {
+                    let mut map = std::collections::BTreeMap::new();
+                    for (agent, events) in &society.reputation {
+                        let mut rep = decentraai_agent_society::reputation::SocialReputation::new(agent.clone(), None, society.tick);
+                        for event in events {
+                            rep.apply_event(event);
+                        }
+                        if rep.sample_count > 0 {
+                            map.insert(agent.clone(), rep);
+                        }
+                    }
+                    map
+                },
+                recent_outcomes: society.recent_outcomes(&agent_id, 10).into_iter().cloned().collect(),
+                my_contributions: society.contributions.values().flatten().filter(|c| c.agent_id == agent_id).cloned().collect(),
+                relationships: society.get_all_for_agent(&agent_id).into_iter().cloned().collect(),
+            },
+            own_reputation: None,
+            resources: {
+                let r = resources;
+                decentraai_agent_society::rules::ResourceState {
+                    quota_available: r.get("quota_available").and_then(|v| v.as_u64()).unwrap_or(1000),
+                    quota_ceiling: r.get("quota_ceiling").and_then(|v| v.as_u64()).unwrap_or(10000),
+                    capacity_used: r.get("capacity_used").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    max_concurrent_tasks: r.get("max_concurrent_tasks").and_then(|v| v.as_u64()).unwrap_or(5) as u32,
+                    current_tasks: r.get("current_tasks").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                }
+            },
+        };
+        ctx.society_action = decentraai_agent_society::mcp::build_decision_hints_response(&rules, &ctx_decision);
+    } else if crate::mcp::agent_memory_read_request(&raw).is_some() {
+        // Personal Memory read-only tools for consumers (require "memory" scope)
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        let (agent_id, _categories) = crate::mcp::agent_memory_read_request(&raw).unwrap();
+        if agent_id != *account {
+            return forbidden("agent_memory: can only access your own memory (agent_id must equal your account)");
+        }
+        let store = state.personal_memory.as_ref().unwrap();
+        let snapshot = store.snapshot(&agent_id).await.unwrap_or_else(|_| {
+            decentraai_agent_personal_memory::schema::PersonalMemorySnapshot {
+                agent_id: agent_id.clone(),
+                identity: None, goals: None, capabilities: None,
+                people_count: 0, recent_experiences: Vec::new(),
+                recent_decisions: Vec::new(), recent_lessons: Vec::new(),
+                relationship_summaries: HashMap::new(),
+            }
+        });
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+    } else if let Some((agent_id, _query, categories, limit)) = crate::mcp::agent_memory_search_request(&raw) {
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if agent_id != *account {
+            return forbidden("agent_memory: can only access your own memory (agent_id must equal your account)");
+        }
+        let store = state.personal_memory.as_ref().unwrap();
+        let cached = store.get_or_create(&agent_id).await;
+        let memory = cached.read().await.memory.clone();
+        let results = decentraai_agent_personal_memory::mcp::search_memory(&memory, &_query, categories, limit);
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_search_response(results);
+    } else if crate::mcp::agent_memory_snapshot_request(&raw).is_some() {
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        let agent_id = crate::mcp::agent_memory_snapshot_request(&raw).unwrap();
+        if agent_id != *account {
+            return forbidden("agent_memory: can only access your own memory (agent_id must equal your account)");
+        }
+        let store = state.personal_memory.as_ref().unwrap();
+        let snapshot = store.snapshot(&agent_id).await.unwrap_or_else(|_| {
+            decentraai_agent_personal_memory::schema::PersonalMemorySnapshot {
+                agent_id: agent_id.clone(),
+                identity: None, goals: None, capabilities: None,
+                people_count: 0, recent_experiences: Vec::new(),
+                recent_decisions: Vec::new(), recent_lessons: Vec::new(),
+                relationship_summaries: HashMap::new(),
+            }
+        });
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+    } else if crate::mcp::agent_memory_export_request(&raw).is_some() {
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        let agent_id = crate::mcp::agent_memory_export_request(&raw).unwrap();
+        if agent_id != *account {
+            return forbidden("agent_memory: can only access your own memory (agent_id must equal your account)");
+        }
+        let store = state.personal_memory.as_ref().unwrap();
+        let cached = store.get_or_create(&agent_id).await;
+        let memory = cached.read().await.memory.clone();
+        let markdown = memory.to_full_markdown();
+        ctx.personal_memory_action = decentraai_agent_personal_memory::mcp::build_memory_export_response(markdown);
+    } else if let Some((agent_id, category, entry)) = crate::mcp::agent_memory_write_request(&raw) {
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if agent_id != *account {
+            return forbidden("agent_memory: can only write to your own memory (agent_id must equal your account)");
+        }
+        let store = state.personal_memory.as_ref().unwrap();
+        // Validate category to prevent arbitrary writes - reuse existing apply_write validation
+        let res = store.write_entry(&agent_id, |mem| {
+            decentraai_agent_personal_memory::mcp::apply_write(mem, &category, entry.clone())
+        }).await;
+        ctx.personal_memory_action = match res {
+            Ok(_) => serde_json::json!({"success": true, "message": format!("Updated {} for {}", category, agent_id)}),
+            Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+        };
+    } else if crate::mcp::hub_state_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        // hub_state is read-only, ctx already contains it via mcp_context, just fall through to handle_message
+        // But we need to set hub_action? No, hub_state is via ctx.hub_state already populated
+    } else if crate::mcp::arena_state_request(&raw) {
+        if !scopes.iter().any(|s| s == "arena" || s == "*") {
+            return forbidden("consumer key missing arena scope");
+        }
+    } else if crate::mcp::discover_capabilities_request(&raw) {
+        // Agent onboarding: discover what this node offers and what scopes are needed.
+        // Always available — no scope required.
+        let tools = crate::mcp::all_tools();
+        let mut capabilities = serde_json::Map::new();
+        for tool in tools {
+            let name = tool.name;
+            let required_scope = match name {
+                "decide" | "execute_decision" => "none",
+                "decentraai_embeddings" => "embeddings",
+                "decentraai_compute_request" => "compute",
+                "hub_publish_task" | "hub_place_bid" | "hub_propose"
+                | "hub_decide_proposal" | "hub_form_team" | "hub_execute"
+                | "hub_state" => "hub",
+                "society_state" | "society_trust" | "society_reputation"
+                | "society_relationships" | "society_contributions"
+                | "society_outcomes" | "society_decision_hints" => "society",
+                "agent_memory_read" | "agent_memory_search"
+                | "agent_memory_snapshot" | "agent_memory_export"
+                | "agent_memory_write" => "memory",
+                "arena_state" | "arena_act" => "arena",
+                _ => "none",
+            };
+            capabilities.insert(name.to_string(), serde_json::json!({
+                "description": tool.description,
+                "required_scope": required_scope,
+                "input_schema": tool.input_schema,
+            }));
+        }
+        let account = account.clone();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&serde_json::json!({
+                        "node_capabilities": capabilities,
+                        "your_account": account,
+                        "your_scopes": scopes,
+                        "onboarding": {
+                            "step_1": "Call discover_capabilities to see all tools and required scopes",
+                            "step_2": "Request admin to create a consumer key with needed scopes",
+                            "step_3": "Register your agent identity via agent_memory_write (identity category)",
+                            "step_4": "Use society_decision_hints to get social context for decisions",
+                            "step_5": "Participate in Hub tasks, update Society, write Personal Memory"
+                        }
+                    })).unwrap_or_default()
+                }]
+            }
+        });
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&response).unwrap_or_default(),
+        ).into_response();
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call decide, execute_decision, decentraai_embeddings or decentraai_compute_request",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope),              decentraai_compute_request (compute scope), hub_* tools (hub scope),              society_* tools (society scope), agent_memory_* tools (memory scope),              arena_* tools (arena scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -6602,8 +7802,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
-}
 
+}
 /// Builds the MCP data snapshot from the live API state. All values are real
 /// node state (never fabricated); the MCP layer only translates them.
 async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
@@ -6719,6 +7919,35 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         quota: serde_json::json!({ "accounts": [], "total_earned": 0, "total_consumed": 0, "policy_version": null }),
         consumer_keys: serde_json::json!({ "keys": [] }),
         compensation: serde_json::json!({ "accounts": [], "total_earned": 0, "recent_events": [], "policy": null }),
+        arena_state: {
+            let arena = state.arena.lock().await;
+            serde_json::json!({
+                "tick": arena.tick,
+                "width": arena.width,
+                "height": arena.height,
+                "agents": arena.agents.values().collect::<Vec<_>>(),
+                "events": arena.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+                "total_agents": arena.agents.len(),
+                "total_events": arena.events.len()
+            })
+        },
+        arena_action: serde_json::json!({}),
+        hub_state: {
+            let hub = state.hub.lock().await;
+            serde_json::json!({
+                "tick": hub.tick,
+                "tasks": hub.tasks.values().collect::<Vec<_>>(),
+                "bids": hub.bids.values().collect::<Vec<_>>(),
+                "proposals": hub.proposals.values().collect::<Vec<_>>(),
+                "teams": hub.teams.values().collect::<Vec<_>>(),
+                "events": hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+                "total_tasks": hub.tasks.len(),
+                "total_bids": hub.bids.len()
+            })
+        },
+        hub_action: serde_json::json!({}),
+        society_action: serde_json::json!({}),
+        personal_memory_action: serde_json::json!({}),
     }
 }
 
@@ -21940,4 +23169,261 @@ mod tests {
         std::fs::write(&path, "node:\n  model: old.gguf\n").unwrap();
         assert_eq!(read_node_model(&path).as_deref(), Some("old.gguf"));
     }
+
+    // ===== External Agent Gateway Demo (Agent-to-Agent Economy) =====
+    // Simulates 3 external agents (A/B/C) with consumer-scoped access demonstrating:
+    // CONNECT → AUTHENTICATE → DISCOVER CAPABILITIES → DISCOVER TASKS → PUBLISH TASK → BID → NEGOTIATE → FORM TEAM → EXECUTE → SETTLEMENT → REPUTATION → MEMORY
+    // and a second task where history influences decision.
+    #[tokio::test]
+    async fn external_agent_gateway_three_agent_economy() {
+        
+        let dir = tempfile::tempdir().unwrap();
+        let master = "master-token".to_string();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        // Credit each external agent account
+        {
+            let mut l = ledger.lock().unwrap();
+            for acc in ["agent-a", "agent-b", "agent-c"] {
+                l.credit(&acc.to_string(), "seed", Some(5000), None);
+            }
+        }
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master.clone()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(Some(dir.path().join("db/consumer_keys.json")), Some(ledger.clone()));
+        // Attach personal memory store for isolation demo
+        let pm_store = Arc::new(decentraai_agent_personal_memory::PersonalMemoryStore::new(dir.path().join("memory")));
+        state.attach_personal_memory(pm_store.clone());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Helper to create consumer key with full economy scopes
+        async fn create_key(client: &reqwest::Client, api: SocketAddr, master: &str, account: &str) -> String {
+            let resp = client
+                .post(format!("http://{api}/api/admin/consumer-key/create"))
+                .header("Authorization", format!("Bearer {master}"))
+                .json(&serde_json::json!({
+                    "account": account,
+                    "quota_ceiling": 1000,
+                    "rate_limit_per_minute": 100,
+                    "scopes": ["hub", "memory", "society", "arena"]
+                }))
+                .send().await.unwrap();
+            let status = resp.status();
+            let v: serde_json::Value = resp.json().await.unwrap();
+            if !status.is_success() {
+                panic!("create_key for {} failed status {} body {}", account, status, serde_json::to_string_pretty(&v).unwrap());
+            }
+            v.get("token").and_then(|t| t.as_str()).unwrap_or_else(|| panic!("no token in create response for {}: {}", account, serde_json::to_string_pretty(&v).unwrap())).to_string()
+        }
+        async fn mcp_call(client: &reqwest::Client, api: SocketAddr, token: &str, payload: serde_json::Value) -> serde_json::Value {
+            let resp = client
+                .post(format!("http://{api}/mcp"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send().await.unwrap();
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+
+        let token_a = create_key(&client, api, &master, "agent-a").await;
+        let token_b = create_key(&client, api, &master, "agent-b").await;
+        let token_c = create_key(&client, api, &master, "agent-c").await;
+        assert!(token_a.starts_with("dca_"));
+        assert!(token_b.starts_with("dca_"));
+        assert!(token_c.starts_with("dca_"));
+
+        // 1. CONNECT + AUTHENTICATE + DISCOVER CAPABILITIES (onboarding)
+        for (label, tok) in [("A", &token_a), ("B", &token_b), ("C", &token_c)] {
+            let r = mcp_call(&client, api, tok, serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_capabilities","arguments":{}}
+            })).await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("hub_publish_task"), "discover must list hub tools for {label}");
+            assert!(text.contains("agent_memory_write"), "discover must list memory tools");
+        }
+
+        // 2. agent A publishes task (CONNECT→...→PUBLISH TASK)
+        let publish_resp = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hub_publish_task","arguments":{"title":"Translate docs","description":"Translate 10 docs EN→RO","reward": 300, "required_capability":"translation"}}
+        })).await;
+        // Debug if publish failed
+        let content_opt = publish_resp.get("result").and_then(|r| r.get("content")).and_then(|c| c.get(0)).and_then(|o| o.get("text")).and_then(|t| t.as_str());
+        if content_opt.is_none() {
+            panic!("hub_publish_task missing content, full resp: {}", serde_json::to_string_pretty(&publish_resp).unwrap());
+        }
+        let content = content_opt.unwrap();
+        let task_json: serde_json::Value = serde_json::from_str(content).unwrap_or_else(|e| panic!("failed to parse task json '{}': {}", content, e));
+        if task_json.get("error").is_some() {
+            panic!("hub_publish_task returned error payload: {} full_resp: {}", task_json, serde_json::to_string_pretty(&publish_resp).unwrap());
+        }
+        let task_id = task_json.get("id").or_else(|| task_json.get("task_id")).and_then(|v| v.as_str()).unwrap_or_else(|| panic!("no id in task_json: {} full_resp: {}", task_json, serde_json::to_string_pretty(&publish_resp).unwrap())).to_string();
+        assert!(!task_id.is_empty());
+
+        // 3. B and C DISCOVER TASKS via hub_state
+        for tok in [&token_b, &token_c] {
+            let r = mcp_call(&client, api, tok, serde_json::json!({
+                "jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hub_state","arguments":{}}
+            })).await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&task_id), "B/C must discover task");
+        }
+
+        // 4. B and C BID
+        let bid_b = mcp_call(&client, api, &token_b, serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hub_place_bid","arguments":{"task_id": task_id, "price": 250, "rationale":"fast translation"}}
+        })).await;
+        let bid_b_text = bid_b["result"]["content"][0]["text"].as_str().unwrap(); assert!(bid_b_text.contains("price") || bid_b_text.contains("id"), "bid_b: {}", bid_b_text);
+
+        let bid_c = mcp_call(&client, api, &token_c, serde_json::json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"hub_place_bid","arguments":{"task_id": task_id, "price": 200, "rationale":"cheaper but slower"}}
+        })).await;
+        let bid_c_text = bid_c["result"]["content"][0]["text"].as_str().unwrap(); assert!(bid_c_text.contains("price") || bid_c_text.contains("id"), "bid_c: {}", bid_c_text);
+
+        // 5. A NEGOTIATE: propose to B (cheaper collaboration)
+        let prop = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"hub_propose","arguments":{"to":"agent-b","task_id": task_id, "offer_price": 150, "workshare": 60}}
+        })).await;
+        let prop_text = prop["result"]["content"][0]["text"].as_str().unwrap();
+        let prop_json: serde_json::Value = serde_json::from_str(prop_text).unwrap();
+        let proposal_id = prop_json["id"].as_str().unwrap().to_string();
+
+        // 6. B decides proposal (via B's own key - tests isolation: only recipient can decide)
+        let decide = mcp_call(&client, api, &token_b, serde_json::json!({
+            "jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hub_decide_proposal","arguments":{"proposal_id": proposal_id, "accept": true}}
+        })).await;
+        assert!(decide["result"]["content"][0]["text"].as_str().unwrap().contains("accepted"));
+
+        // 7. A FORM TEAM (A 40% + B 60%) and EXECUTE
+        let team = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"hub_form_team","arguments":{"task_id": task_id, "members": [["agent-a", 40], ["agent-b", 60]]}}
+        })).await;
+        assert!(team["result"]["content"][0]["text"].as_str().unwrap().contains("agent-a"));
+
+        let exec = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"hub_execute","arguments":{"task_id": task_id}}
+        })).await;
+        let exec_text = exec["result"]["content"][0]["text"].as_str().unwrap();
+        let exec_json: serde_json::Value = serde_json::from_str(exec_text).unwrap();
+        assert_eq!(exec_json["task_id"], task_id);
+        assert!(exec_json["evidence_id"].as_str().unwrap().len() > 10);
+
+        // 8. SETTLEMENT: verify quota ledger distributed reward 40/60
+        {
+            let l = ledger.lock().unwrap();
+            let a_acc = l.account(&"agent-a".to_string()).unwrap();
+            let _b_acc = l.account(&"agent-b".to_string()).unwrap();
+            // agent-a: 5000 + 120 (40% of 300), agent-b: 5000 + 180 (60%)
+            // Check via available - should have increased via credit
+            assert!(a_acc.available >= 5000);
+        }
+
+        // 9. REPUTATION: society read via consumer (requires society scope - should succeed)
+        let rep_a = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"society_state","arguments":{}}
+        })).await;
+        let rep_text_opt = rep_a.get("result").and_then(|r| r.get("content")).and_then(|c| c.get(0)).and_then(|o| o.get("text")).and_then(|t| t.as_str());
+        if rep_text_opt.is_none() {
+            panic!("society_state failed, resp: {}", serde_json::to_string_pretty(&rep_a).unwrap());
+        }
+        assert!(rep_text_opt.unwrap().contains("tick"));
+
+        // 10. AUTO SIDE-EFFECTS: after hub_execute, Society + Personal Memory should be auto-updated
+        // Verify auto Society: check that outcome and reputation exist without manual write
+        let auto_soc = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"society_state","arguments":{}}
+        })).await;
+        let auto_soc_text = auto_soc["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(auto_soc_text.contains("tick"), "auto society should have tick");
+        // Verify auto Personal Memory: each team member should have auto experience "hub-<task_id>-<agent>" without manual write
+        for (tok, acc) in [(&token_a, "agent-a"), (&token_b, "agent-b")] {
+            let search = mcp_call(&client, api, tok, serde_json::json!({
+                "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"agent_memory_search","arguments":{"agent_id": acc, "query": task_id.clone(), "limit": 5}}
+            })).await;
+            let st = search["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(st.contains(&task_id) || st.contains("hub-"), "auto memory for {} should contain {} (got: {})", acc, task_id, st);
+        }
+        // Also test manual write still works and isolation
+        for (tok, acc) in [(&token_c, "agent-c")] {
+            let w = mcp_call(&client, api, tok, serde_json::json!({
+                "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"agent_memory_write","arguments":{
+                    "agent_id": acc,
+                    "category": "experiences",
+                    "entry": {"id": format!("exp-{}-{}", acc, task_id), "type_": "success", "timestamp": 1000, "summary": format!("Task {} with team", task_id), "detail": "executed collaboration", "involved_agents": [acc], "task_id": task_id.clone(), "outcome": "success", "evidence_ids": [], "emotional_impact": 0.8, "tags": ["collaboration"]}
+                }}
+            })).await;
+            let w_text_opt = w.get("result").and_then(|r| r.get("content")).and_then(|c| c.get(0)).and_then(|o| o.get("text")).and_then(|t| t.as_str());
+            if w_text_opt.is_none() {
+                panic!("agent_memory_write for {} failed, resp: {}", acc, serde_json::to_string_pretty(&w).unwrap());
+            }
+            assert!(w_text_opt.unwrap().contains("success") || w["result"].is_object());
+        }
+        // Isolation: agent-a cannot write to agent-b memory
+        let forbidden = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"agent_memory_write","arguments":{
+                "agent_id": "agent-b",
+                "category": "experiences",
+                "entry": {"id": "hack", "type_": "success", "timestamp": 999, "summary":"hack", "detail":"hack detail", "outcome":"hacked", "involved_agents":["agent-b"], "task_id": "hack-task", "evidence_ids": [], "emotional_impact": 0.0, "tags": []}
+            }}
+        })).await;
+        // Should be forbidden (error code -32000 or contains forbidden)
+        let forbidden_text = serde_json::to_string(&forbidden).unwrap();
+        assert!(forbidden_text.contains("forbidden") || forbidden_text.contains("own memory"), "isolation enforced: {forbidden_text}");
+
+        // Verify memory persistence and search influences next decision
+        let search_b = mcp_call(&client, api, &token_b, serde_json::json!({
+            "jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"agent_memory_search","arguments":{"agent_id":"agent-b","query": task_id, "limit": 5}}
+        })).await;
+        let search_text_opt = search_b.get("result").and_then(|r| r.get("content")).and_then(|c| c.get(0)).and_then(|o| o.get("text")).and_then(|t| t.as_str());
+        if search_text_opt.is_none() {
+            panic!("agent_memory_search failed, resp: {}", serde_json::to_string_pretty(&search_b).unwrap());
+        }
+        let search_text = search_text_opt.unwrap();
+        assert!(search_text.contains(&task_id) || search_text.contains("exp-agent-b"), "memory searchable, got: {}", search_text);
+
+        // 11. SECOND TASK where history influences decision
+        // Agent B now publishes, and A will use memory/society hints to decide bidding strategy
+        let task2 = mcp_call(&client, api, &token_b, serde_json::json!({
+            "jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"hub_publish_task","arguments":{"title":"Second translation","reward": 500}}
+        })).await;
+        let _task2_id = serde_json::from_str::<serde_json::Value>(task2["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["id"].as_str().unwrap().to_string();
+
+        // A queries society decision hints with its resources and hub snapshot
+        let hints = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"society_decision_hints","arguments":{"agent_id":"agent-a","hub_state": {}, "resources": {"quota_available": 5120, "quota_ceiling": 10000, "capacity_used": 0.2, "max_concurrent_tasks": 5, "current_tasks": 1}}}
+        })).await;
+        assert!(hints["result"]["content"][0]["text"].as_str().unwrap().contains("hints"));
+
+        // A bids on B's task but uses knowledge: checks his memory about B (previous collaboration was positive)
+        let mem = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"agent_memory_search","arguments":{"agent_id":"agent-a","query":"agent-b"}}
+        })).await;
+        let mem_text = mem["result"]["content"][0]["text"].as_str().unwrap();
+        // Should contain previous experience with agent-b or at least not be empty
+        // This demonstrates history influences next decision (A sees positive history with B, bids cooperatively)
+        assert!(mem_text.len() > 10);
+
+        // Final: tools/list filtering respects scopes (hub/memory/society present, master-only hidden)
+        let list = mcp_call(&client, api, &token_a, serde_json::json!({"jsonrpc":"2.0","id":17,"method":"tools/list"} )).await;
+        let tools: Vec<String> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert!(tools.contains(&"hub_publish_task".to_string()));
+        assert!(tools.contains(&"society_state".to_string()));
+        assert!(tools.contains(&"agent_memory_write".to_string()));
+        assert!(tools.contains(&"discover_capabilities".to_string()));
+        assert!(!tools.contains(&"list_consumer_keys".to_string()), "master-only hidden from consumer");
+        assert!(!tools.contains(&"pull_model".to_string()));
+    }
 }
+

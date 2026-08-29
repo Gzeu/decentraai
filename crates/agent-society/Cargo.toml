@@ -1,0 +1,23 @@
+[package]
+name = "decentraai-agent-society"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Agent Society Rules v0.1: social state, reputation, refusal, counter-offer, team contribution, autonomy invariants — layer over Hub + Arena"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+tokio.workspace = true
+decentraai-agent-hub = { path = "../agent-hub" }
+decentraai-agents = { path = "../agents" }
+decentraai-arena = { path = "../arena" }
+decentraai-compute = { path = "../compute" }
+
+[dev-dependencies]
+rand_core.workspace = true

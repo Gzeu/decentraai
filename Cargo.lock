@@ -1024,6 +1024,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-agent-hub"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "decentraai-hub",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "decentraai-agent-personal-memory"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "decentraai-agents",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "decentraai-agent-society"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "decentraai-agent-hub",
+ "decentraai-agents",
+ "decentraai-arena",
+ "decentraai-compute",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "decentraai-agents"
 version = "1.0.0"
 dependencies = [
@@ -1033,6 +1077,17 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "libp2p",
  "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "decentraai-arena"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1058,6 +1113,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "decentraai-agent-personal-memory",
  "decentraai-agents",
  "decentraai-audit",
  "decentraai-compute",
@@ -1355,8 +1411,13 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "blake3",
  "chrono",
+ "decentraai-agent-hub",
+ "decentraai-agent-personal-memory",
+ "decentraai-agent-society",
  "decentraai-agents",
+ "decentraai-arena",
  "decentraai-audit",
  "decentraai-compute",
  "decentraai-config",
