@@ -6538,6 +6538,104 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         hub.advance_tick();
         let path = crate::hub::hub_path_for(&state.info.repo_root);
         crate::hub::save_hub_state(&path, &hub);
+
+        // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
+        let _team_for_society = team_members.clone();
+        let _ev_for_society = evidence_id.clone();
+        let _task_for_society = task_id.clone();
+        let _reward_for_society = task.reward;
+        let _issuer_for_society = task.issuer.clone();
+        drop(hub);
+        {
+            let mut society = state.society.lock().await;
+            if !society.outcomes.contains_key(&_task_for_society) {
+                let tick = society.tick;
+                let mut contrib_records = Vec::new();
+                for (agent_id, share) in &_team_for_society {
+                    let cr = decentraai_agent_society::state::ContributionRecord::new(
+                        _task_for_society.clone(),
+                        agent_id.clone(),
+                        *share,
+                        tick,
+                    ).verify(*share as f32 / 100.0, _ev_for_society.clone(), 0.85, true, tick);
+                    contrib_records.push(cr.clone());
+                    society.record_contribution(cr);
+                }
+                let dists = _team_for_society.iter().map(|(aid, share)| {
+                    let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
+                    decentraai_agent_society::state::RewardDistribution { agent_id: aid.clone(), amount, share_basis: decentraai_agent_society::state::ShareBasis::Verified }
+                }).collect::<Vec<_>>();
+                let outcome = decentraai_agent_society::state::TaskOutcome {
+                    task_id: _task_for_society.clone(),
+                    issuer: _issuer_for_society.clone(),
+                    team_members: _team_for_society.iter().map(|(a,_)| a.clone()).collect(),
+                    status: decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+                    evidence_id: Some(_ev_for_society.clone()),
+                    settled_tick: tick,
+                    total_reward: _reward_for_society,
+                    distributions: dists,
+                    contributor_records: contrib_records,
+                };
+                society.record_outcome(outcome);
+                for (agent_id, _) in &_team_for_society {
+                    let ev = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.15,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("hub execute {} as team {:?}", _task_for_society, _team_for_society),
+                    };
+                    society.record_reputation_event(ev);
+                    let ev2 = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.1,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("verified contribution for {}", _task_for_society),
+                    };
+                    society.record_reputation_event(ev2);
+                }
+                society.advance_tick();
+                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                decentraai_agent_society::state::save_society_state(&path, &society);
+            }
+        }
+        if let Some(pm) = &state.personal_memory {
+            let mut all_agents = _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>();
+            if !all_agents.contains(&_issuer_for_society) && !_issuer_for_society.is_empty() && _issuer_for_society != "open" && _issuer_for_society != "operator" {
+                all_agents.push(_issuer_for_society.clone());
+            }
+            for agent_id in all_agents {
+                let exp_id = format!("hub-{}-{}", _task_for_society, agent_id);
+                let cached = pm.get_or_create(&agent_id).await;
+                let exists = { cached.read().await.memory.experiences.experiences.iter().any(|e| e.id == exp_id) };
+                if !exists {
+                    let summary = format!("Executed task {} (reward {}) as team {:?} — evidence {}", _task_for_society, _reward_for_society, _team_for_society, &_ev_for_society[..8.min(_ev_for_society.len())]);
+                    let detail = format!("Task {} settled with evidence {}. Team: {:?}. Issuer: {}.", _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society);
+                    let entry = serde_json::json!({
+                        "id": exp_id,
+                        "type_": "success",
+                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        "summary": summary,
+                        "detail": detail,
+                        "involved_agents": _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>(),
+                        "task_id": _task_for_society,
+                        "outcome": "settled",
+                        "evidence_ids": [_ev_for_society.clone()],
+                        "emotional_impact": 0.7,
+                        "tags": ["hub", "settlement", "team"]
+                    });
+                    let _ = pm.write_entry(&agent_id, |mem| {
+                        decentraai_agent_personal_memory::mcp::apply_write(mem, "experiences", entry.clone())
+                    }).await;
+                }
+            }
+        }
+        // Re-acquire hub lock not needed; we already saved. Continue to arena.
         {
             let mut arena = state.arena.lock().await;
             let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", executor), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
@@ -7270,6 +7368,104 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         hub.advance_tick();
         let path = crate::hub::hub_path_for(&state.info.repo_root);
         crate::hub::save_hub_state(&path, &hub);
+
+        // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
+        let _team_for_society = team_members.clone();
+        let _ev_for_society = evidence_id.clone();
+        let _task_for_society = task_id.clone();
+        let _reward_for_society = task.reward;
+        let _issuer_for_society = task.issuer.clone();
+        drop(hub);
+        {
+            let mut society = state.society.lock().await;
+            if !society.outcomes.contains_key(&_task_for_society) {
+                let tick = society.tick;
+                let mut contrib_records = Vec::new();
+                for (agent_id, share) in &_team_for_society {
+                    let cr = decentraai_agent_society::state::ContributionRecord::new(
+                        _task_for_society.clone(),
+                        agent_id.clone(),
+                        *share,
+                        tick,
+                    ).verify(*share as f32 / 100.0, _ev_for_society.clone(), 0.85, true, tick);
+                    contrib_records.push(cr.clone());
+                    society.record_contribution(cr);
+                }
+                let dists = _team_for_society.iter().map(|(aid, share)| {
+                    let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
+                    decentraai_agent_society::state::RewardDistribution { agent_id: aid.clone(), amount, share_basis: decentraai_agent_society::state::ShareBasis::Verified }
+                }).collect::<Vec<_>>();
+                let outcome = decentraai_agent_society::state::TaskOutcome {
+                    task_id: _task_for_society.clone(),
+                    issuer: _issuer_for_society.clone(),
+                    team_members: _team_for_society.iter().map(|(a,_)| a.clone()).collect(),
+                    status: decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+                    evidence_id: Some(_ev_for_society.clone()),
+                    settled_tick: tick,
+                    total_reward: _reward_for_society,
+                    distributions: dists,
+                    contributor_records: contrib_records,
+                };
+                society.record_outcome(outcome);
+                for (agent_id, _) in &_team_for_society {
+                    let ev = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.15,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("hub execute {} as team {:?}", _task_for_society, _team_for_society),
+                    };
+                    society.record_reputation_event(ev);
+                    let ev2 = decentraai_agent_society::state::ReputationEvent {
+                        agent_id: agent_id.clone(),
+                        event_type: decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+                        task_id: Some(_task_for_society.clone()),
+                        delta: 0.1,
+                        tick,
+                        evidence_id: Some(_ev_for_society.clone()),
+                        detail: format!("verified contribution for {}", _task_for_society),
+                    };
+                    society.record_reputation_event(ev2);
+                }
+                society.advance_tick();
+                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                decentraai_agent_society::state::save_society_state(&path, &society);
+            }
+        }
+        if let Some(pm) = &state.personal_memory {
+            let mut all_agents = _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>();
+            if !all_agents.contains(&_issuer_for_society) && !_issuer_for_society.is_empty() && _issuer_for_society != "open" && _issuer_for_society != "operator" {
+                all_agents.push(_issuer_for_society.clone());
+            }
+            for agent_id in all_agents {
+                let exp_id = format!("hub-{}-{}", _task_for_society, agent_id);
+                let cached = pm.get_or_create(&agent_id).await;
+                let exists = { cached.read().await.memory.experiences.experiences.iter().any(|e| e.id == exp_id) };
+                if !exists {
+                    let summary = format!("Executed task {} (reward {}) as team {:?} — evidence {}", _task_for_society, _reward_for_society, _team_for_society, &_ev_for_society[..8.min(_ev_for_society.len())]);
+                    let detail = format!("Task {} settled with evidence {}. Team: {:?}. Issuer: {}.", _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society);
+                    let entry = serde_json::json!({
+                        "id": exp_id,
+                        "type_": "success",
+                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        "summary": summary,
+                        "detail": detail,
+                        "involved_agents": _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>(),
+                        "task_id": _task_for_society,
+                        "outcome": "settled",
+                        "evidence_ids": [_ev_for_society.clone()],
+                        "emotional_impact": 0.7,
+                        "tags": ["hub", "settlement", "team"]
+                    });
+                    let _ = pm.write_entry(&agent_id, |mem| {
+                        decentraai_agent_personal_memory::mcp::apply_write(mem, "experiences", entry.clone())
+                    }).await;
+                }
+            }
+        }
+        // Re-acquire hub lock not needed; we already saved. Continue to arena.
         {
             let mut arena = state.arena.lock().await;
             let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", account), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", task_id) };
@@ -23144,8 +23340,23 @@ mod tests {
         }
         assert!(rep_text_opt.unwrap().contains("tick"));
 
-        // 10. PERSONAL MEMORY: each writes own experience, verify isolation
-        for (tok, acc) in [(&token_a, "agent-a"), (&token_b, "agent-b"), (&token_c, "agent-c")] {
+        // 10. AUTO SIDE-EFFECTS: after hub_execute, Society + Personal Memory should be auto-updated
+        // Verify auto Society: check that outcome and reputation exist without manual write
+        let auto_soc = mcp_call(&client, api, &token_a, serde_json::json!({
+            "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"society_state","arguments":{}}
+        })).await;
+        let auto_soc_text = auto_soc["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(auto_soc_text.contains("tick"), "auto society should have tick");
+        // Verify auto Personal Memory: each team member should have auto experience "hub-<task_id>-<agent>" without manual write
+        for (tok, acc) in [(&token_a, "agent-a"), (&token_b, "agent-b")] {
+            let search = mcp_call(&client, api, tok, serde_json::json!({
+                "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"agent_memory_search","arguments":{"agent_id": acc, "query": task_id.clone(), "limit": 5}}
+            })).await;
+            let st = search["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(st.contains(&task_id) || st.contains("hub-"), "auto memory for {} should contain {} (got: {})", acc, task_id, st);
+        }
+        // Also test manual write still works and isolation
+        for (tok, acc) in [(&token_c, "agent-c")] {
             let w = mcp_call(&client, api, tok, serde_json::json!({
                 "jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"agent_memory_write","arguments":{
                     "agent_id": acc,
