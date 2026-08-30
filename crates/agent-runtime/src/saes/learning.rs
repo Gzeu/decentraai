@@ -38,8 +38,8 @@ pub struct LearningEntry {
 /// The effects of learning that the runtime must apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningEffect {
-    /// Goal state transitions to apply.
-    pub goal_transitions: Vec<(GoalId, GoalState)>,
+    /// Goal state transitions to apply: (goal_id, new_state, failure_reason).
+    pub goal_transitions: Vec<(GoalId, GoalState, Option<String>)>,
     /// Goal progress updates: (goal_id, new_progress).
     pub goal_progress_updates: Vec<(GoalId, f32)>,
     /// The learning entry to record.
@@ -75,11 +75,11 @@ pub fn compute_learning_effect(
                 let new_progress = (goal.progress + 0.2).min(1.0);
                 goal_progress_updates.push((gid.clone(), new_progress));
                 if new_progress >= 1.0 {
-                    goal_transitions.push((gid.clone(), GoalState::Completed));
+                    goal_transitions.push((gid.clone(), GoalState::Completed, None));
                 }
             } else {
-                // Failed outcome → fail the goal
-                goal_transitions.push((gid.clone(), GoalState::Failed));
+                // Failed outcome → fail the goal with the error reason
+                goal_transitions.push((gid.clone(), GoalState::Failed, outcome.error.clone()));
             }
         }
     }
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(effect.goal_progress_updates[0], ("g1".into(), 1.0));
         assert_eq!(
             effect.goal_transitions[0],
-            ("g1".into(), GoalState::Completed)
+            ("g1".into(), GoalState::Completed, None)
         );
     }
 
@@ -227,7 +227,10 @@ mod tests {
         let goal = make_goal("g1", GoalState::Active, 0.3);
         let o = failure_outcome(Some("g1".into()));
         let effect = compute_learning_effect(&o, &[goal], 3000);
-        assert_eq!(effect.goal_transitions[0], ("g1".into(), GoalState::Failed));
+        assert_eq!(
+            effect.goal_transitions[0],
+            ("g1".into(), GoalState::Failed, Some("timeout".into()))
+        );
         assert!(effect.goal_progress_updates.is_empty());
         assert_eq!(effect.metrics_delta, (0, 1, 0));
     }

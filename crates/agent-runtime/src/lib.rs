@@ -490,4 +490,231 @@ mod integration_tests {
         assert_eq!(metrics.tasks_completed, 5);
         assert_eq!(metrics.total_reward_earned, 150); // 10+20+30+40+50
     }
+
+    /// SAES 0.2 integration test: full cycle with goal tracking + behavior adaptation.
+    #[tokio::test]
+    async fn saes_full_cycle_goals_and_adaptation() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "available_capabilities": ["Chat", "Analysis"],
+                "node_id": "dca-test",
+                "tasks": [
+                    {"id": "task-001", "status": "open", "required_capability": "Chat", "reward": 500}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // Spawn agent with initial goals
+        let config = AgentConfig {
+            agent_id: "dca-saes:worker".to_string(),
+            name: "SAES Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve 5 requests".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let handle = runtime.spawn(config).await.unwrap();
+        assert_eq!(handle.status, AgentStatus::Ready);
+
+        // Verify goals were created
+        let state = runtime
+            .get_state(&"dca-saes:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(state.current_goals.len(), 1);
+        let goal_id = state.current_goals[0].clone();
+
+        // Run 3 lifecycle cycles with success
+        for i in 0..3 {
+            let obs = runtime
+                .observe(&"dca-saes:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-saes:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-saes:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(100 * (i + 1)),
+                reputation_delta: Some(0.05),
+            };
+            runtime
+                .learn(&"dca-saes:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Verify metrics updated
+        let metrics = runtime
+            .get_metrics(&"dca-saes:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(metrics.tasks_completed, 3);
+        assert_eq!(metrics.total_reward_earned, 600); // 100+200+300
+        assert!((metrics.reputation_score - 0.15).abs() < 1e-6); // 0.05 * 3
+
+        // Verify behavior profile was updated
+        let profile = runtime
+            .behavior_store()
+            .get_or_create("dca-saes:worker")
+            .await;
+        assert_eq!(profile.entries_processed, 3);
+        // DefaultBidPolicy produces HubBid actions, so outcome kind is "HubBid"
+        assert!(
+            profile.preferred_strategies.contains(&"HubBid".to_string())
+                || profile.success_counts.contains_key("HubBid")
+        );
+
+        // Verify goal progress advanced (3 successes × 0.2 = 0.6)
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert!((goal.progress - 0.6).abs() < 1e-6);
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Active);
+    }
+
+    /// SAES 0.2: failure path — goal fails when action fails.
+    #[tokio::test]
+    async fn saes_failure_fails_goal() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-fail:worker".to_string(),
+            name: "Fail Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["complete task".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        let state = runtime
+            .get_state(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+
+        // Run one cycle with failure
+        let obs = runtime
+            .observe(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        let decision = runtime
+            .decide(&"dca-fail:worker".to_string(), &obs)
+            .await
+            .unwrap();
+        let action = runtime
+            .act(&"dca-fail:worker".to_string(), &decision)
+            .await
+            .unwrap();
+        let outcome = ActionResult {
+            success: false,
+            output: None,
+            error: Some("timeout".to_string()),
+            evidence_id: None,
+            reward: None,
+            reputation_delta: Some(-0.1),
+        };
+        runtime
+            .learn(&"dca-fail:worker".to_string(), &action, &outcome)
+            .await
+            .unwrap();
+
+        // Verify goal failed
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Failed);
+        assert_eq!(goal.failure_reason.as_deref(), Some("timeout"));
+
+        // Verify metrics
+        let metrics = runtime
+            .get_metrics(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(metrics.tasks_failed, 1);
+        assert_eq!(metrics.tasks_completed, 0);
+    }
+
+    /// SAES 0.2: goal completion — progress reaches 1.0 after 5 successes.
+    #[tokio::test]
+    async fn saes_goal_completion_after_enough_successes() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-complete:worker".to_string(),
+            name: "Complete Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve requests".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+        let state = runtime
+            .get_state(&"dca-complete:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+
+        // 5 successes: 0.2 * 5 = 1.0 → goal completes
+        for i in 0..5 {
+            let obs = runtime
+                .observe(&"dca-complete:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-complete:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-complete:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(10),
+                reputation_delta: None,
+            };
+            runtime
+                .learn(&"dca-complete:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+            // Verify progress after each cycle
+            let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+            if i < 4 {
+                assert_eq!(goal.state, crate::saes::goals::GoalState::Active);
+                assert!((goal.progress - (0.2 * (i + 1) as f32)).abs() < 1e-6);
+            } else {
+                // 5th success: progress = 1.0, goal completed
+                assert_eq!(goal.state, crate::saes::goals::GoalState::Completed);
+                assert!((goal.progress - 1.0).abs() < 1e-6);
+            }
+        }
+    }
 }

@@ -43,6 +43,7 @@ impl ActionOutcome {
         agent_id: String,
         goal_id: Option<String>,
         result: &crate::ActionResult,
+        action_kind: &str,
         now_ms: u64,
     ) -> Self {
         Self {
@@ -50,11 +51,7 @@ impl ActionOutcome {
             agent_id,
             goal_id,
             success: result.success,
-            kind: if result.success {
-                "success".to_string()
-            } else {
-                "failure".to_string()
-            },
+            kind: action_kind.to_string(),
             reward: result.reward,
             reputation_delta: result.reputation_delta,
             duration_ms: None,
@@ -99,28 +96,45 @@ mod tests {
             "agent-1".into(),
             Some("goal-1".into()),
             &r,
+            "bid_won",
             1000,
         );
         assert!(o.success);
         assert!(o.is_positive());
         assert_eq!(o.reward, Some(100));
         assert_eq!(o.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(o.kind, "bid_won");
     }
 
     #[test]
     fn outcome_from_failed_result() {
         let r = sample_result(false);
-        let o = ActionOutcome::from_action_result("act-2".into(), "agent-1".into(), None, &r, 2000);
+        let o = ActionOutcome::from_action_result(
+            "act-2".into(),
+            "agent-1".into(),
+            None,
+            &r,
+            "task_failed",
+            2000,
+        );
         assert!(!o.success);
         assert!(!o.is_positive());
         assert_eq!(o.error.as_deref(), Some("boom"));
         assert!(o.goal_id.is_none());
+        assert_eq!(o.kind, "task_failed");
     }
 
     #[test]
     fn outcome_serialization_roundtrip() {
         let r = sample_result(true);
-        let o = ActionOutcome::from_action_result("act-3".into(), "agent-1".into(), None, &r, 3000);
+        let o = ActionOutcome::from_action_result(
+            "act-3".into(),
+            "agent-1".into(),
+            None,
+            &r,
+            "test_action",
+            3000,
+        );
         let json = serde_json::to_string(&o).unwrap();
         let back: ActionOutcome = serde_json::from_str(&json).unwrap();
         assert_eq!(o.action_id, back.action_id);
