@@ -285,3 +285,163 @@ pub mod policy;
 // specific registry or policy-engine crate.
 #[cfg(test)]
 mod capability_proof;
+
+/// Integration test: full spawn → observe → decide → act → learn pipeline
+/// with a realistic daemon-like setup (StaticObservationBuilder + DefaultBidPolicy).
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::local::{LocalAgentRuntime, StaticObservationBuilder};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn full_lifecycle_pipeline() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+
+        // Simulate a node with two agents and available capabilities.
+        // Include open tasks so DefaultBidPolicy can find matching bids.
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "available_capabilities": ["Coding", "Chat", "Analysis"],
+                "node_id": "dca-test",
+                "tasks": [
+                    {
+                        "id": "task-001",
+                        "status": "open",
+                        "required_capability": "Chat",
+                        "reward": 500
+                    },
+                    {
+                        "id": "task-002",
+                        "status": "open",
+                        "required_capability": "Coding",
+                        "reward": 800
+                    }
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // 1. SPAWN two agents
+        let config_a = AgentConfig {
+            agent_id: "dca-test:generalist".to_string(),
+            name: "Generalist".to_string(),
+            capabilities: vec!["Chat".to_string(), "Analysis".to_string()],
+            initial_goals: vec!["serve requests".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let config_b = AgentConfig {
+            agent_id: "dca-test:coder".to_string(),
+            name: "Coder".to_string(),
+            capabilities: vec!["Coding".to_string()],
+            initial_goals: vec!["write code".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+
+        let handle_a = runtime.spawn(config_a).await.unwrap();
+        let handle_b = runtime.spawn(config_b).await.unwrap();
+        assert_eq!(handle_a.status, AgentStatus::Ready);
+        assert_eq!(handle_b.status, AgentStatus::Ready);
+
+        // 2. OBSERVE both agents
+        let obs_a = runtime.observe(&"dca-test:generalist".to_string()).await.unwrap();
+        assert_eq!(obs_a.agent_id, "dca-test:generalist");
+        assert!(!obs_a.available_capabilities.is_empty());
+
+        let obs_b = runtime.observe(&"dca-test:coder".to_string()).await.unwrap();
+        assert_eq!(obs_b.agent_id, "dca-test:coder");
+
+        // 3. DECIDE — DefaultBidPolicy bids when capability matches
+        let decision_a = runtime.decide(&"dca-test:generalist".to_string(), &obs_a).await.unwrap();
+        assert_eq!(decision_a.agent_id, "dca-test:generalist");
+        // Generalist has Chat+Analysis, hub has Coding+Chat+Analysis → should bid
+        assert_eq!(decision_a.decision_type, DecisionType::Bid);
+
+        let decision_b = runtime.decide(&"dca-test:coder".to_string(), &obs_b).await.unwrap();
+        assert_eq!(decision_b.decision_type, DecisionType::Bid);
+
+        // 4. ACT
+        let action_a = runtime.act(&"dca-test:generalist".to_string(), &decision_a).await.unwrap();
+        assert_eq!(action_a.action_type, ActionType::HubBid);
+        // act() creates the action but doesn't execute it (execution is the
+        // daemon's responsibility). Result is None until execute() is called.
+        assert!(action_a.result.is_none());
+
+        let action_b = runtime.act(&"dca-test:coder".to_string(), &decision_b).await.unwrap();
+        assert_eq!(action_b.action_type, ActionType::HubBid);
+
+        // 5. LEARN — metrics should increment
+        let metrics_before = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
+        let outcome = ActionResult {
+            success: true,
+            output: Some(serde_json::json!({"result": "ok"})),
+            error: None,
+            evidence_id: Some("ev-001".to_string()),
+            reward: Some(100),
+            reputation_delta: Some(0.1),
+        };
+        runtime
+            .learn(&"dca-test:generalist".to_string(), &action_a, &outcome)
+            .await
+            .unwrap();
+        let metrics_after = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
+        assert_eq!(metrics_after.tasks_completed, metrics_before.tasks_completed + 1);
+
+        // 6. Verify full agent list
+        let agents = runtime.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 2);
+        assert!(agents.contains(&"dca-test:generalist".to_string()));
+        assert!(agents.contains(&"dca-test:coder".to_string()));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_multiple_cycles() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-loop".to_string(),
+            name: "Loop Agent".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        runtime.spawn(config).await.unwrap();
+
+        // Run 5 lifecycle cycles
+        for i in 0..5 {
+            let obs = runtime.observe(&"dca-loop".to_string()).await.unwrap();
+            let decision = runtime.decide(&"dca-loop".to_string(), &obs).await.unwrap();
+            let action = runtime.act(&"dca-loop".to_string(), &decision).await.unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(10 * (i + 1)),
+                reputation_delta: None,
+            };
+            runtime
+                .learn(&"dca-loop".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        let metrics = runtime.get_metrics(&"dca-loop".to_string()).await.unwrap();
+        assert_eq!(metrics.tasks_completed, 5);
+        assert_eq!(metrics.total_reward_earned, 150); // 10+20+30+40+50
+    }
+}

@@ -76,14 +76,13 @@ pub fn attach_audit_bridge(
             tokio::select! {
                 _ = &mut cancel_rx => break,
                 ev = receiver.recv() => {
-                    if let Ok(ev) = ev {
-                        if should_record(&ev) {
+                    if let Ok(ev) = ev
+                        && should_record(&ev) {
                             let rec = record_from_event(&ev);
                             if tx.send(rec).await.is_err() {
                                 break;
                             }
                         }
-                    }
                 }
             }
         }
@@ -112,6 +111,7 @@ pub fn attach_audit_bridge(
     });
 
     // Keep the forwarder running until cancellation.
+    #[allow(clippy::let_underscore_future)]
     let _ = forwarder;
     Ok(AuditBridge {
         log_path,

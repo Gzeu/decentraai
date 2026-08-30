@@ -17,14 +17,14 @@
 //!    capability — without any v1 enum variant knowing about it.
 //! 4. The action is recorded and emitted on the bus.
 
-use crate::policy::{DefaultBidPolicy, DecisionPolicy, JsonSpecPolicyLite};
+use crate::policy::JsonSpecPolicyLite;
 use crate::{
-    ActionResult, ActionType, AgentAction, AgentConfig, AgentDecision, AgentHandle, AgentId,
-    AgentObservation, AgentRuntime, AgentRuntimeError, AgentState, AgentStatus,
+    AgentConfig,
+    AgentObservation, AgentRuntime, AgentStatus,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use decentraai_event_bus::{Event, EventBus, EventPriority, Topic};
+use decentraai_event_bus::EventBus;
 use decentraai_protocol::AgentId as ProtocolAgentId;
 use serde_json::Value;
 use std::sync::Arc;

@@ -37,6 +37,7 @@ pub enum PolicyEngineError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub struct PolicyId(pub String);
 
 impl PolicyId {
@@ -45,14 +46,11 @@ impl PolicyId {
     }
 }
 
-impl Default for PolicyId {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum PolicyType {
+    #[default]
     AccessControl,
     ResourceLimit,
     RateLimit,
@@ -64,14 +62,11 @@ pub enum PolicyType {
     Custom(String),
 }
 
-impl Default for PolicyType {
-    fn default() -> Self {
-        PolicyType::AccessControl
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum PolicyEffect {
+    #[default]
     Allow,
     Deny,
     RequireApproval,
@@ -81,11 +76,6 @@ pub enum PolicyEffect {
     Custom(String),
 }
 
-impl Default for PolicyEffect {
-    fn default() -> Self {
-        PolicyEffect::Allow
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyContext {
@@ -194,6 +184,7 @@ pub struct Policy {
 /// substring matching (not CEL — that dependency was unused).
 pub struct PolicyEngine {
     policies: HashMap<PolicyId, Policy>,
+    #[allow(dead_code)]
     default_policies: Vec<PolicyId>,
 }
 

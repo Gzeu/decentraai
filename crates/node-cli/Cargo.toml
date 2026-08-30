@@ -34,7 +34,10 @@ decentraai-registry = { path = "../registry" }
 decentraai-runtime = { path = "../runtime" }
 # Fabric Intelligence CLI (`decentraai intel …`) + node daemon wiring.
 decentraai-fabric-intelligence = { path = "../fabric-intelligence" }
+decentraai-agent-runtime = { path = "../agent-runtime" }
 decentraai-agent-personal-memory = { path = "../agent-personal-memory" }
+decentraai-agent-society = { path = "../agent-society" }
+decentraai-event-bus = { path = "../event-bus" }
 decentraai-system-probe = { path = "../system-probe" }
 decentraai-tokens = { path = "../tokens" }
 blake3.workspace = true

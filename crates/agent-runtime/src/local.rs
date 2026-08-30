@@ -814,7 +814,7 @@ mod tests {
         )));
         let mut hub_rx = bus.subscribe_broadcast();
         let obs = Arc::new(StaticObservationBuilder::empty());
-        let r = LocalAgentRuntime::new(bus.clone(), obs);
+        let _runtime = LocalAgentRuntime::new(bus.clone(), obs);
         // Simulate a hub publishing a task (not via runtime; just
         // publish the event directly, as v1's runtime does).
         let event = Event {

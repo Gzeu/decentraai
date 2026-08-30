@@ -1,4 +1,3 @@
-use async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -24,6 +23,12 @@ pub enum EventBusError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EventId(pub String);
+
+impl Default for EventId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl EventId {
     pub fn new() -> Self {
@@ -85,20 +90,18 @@ pub struct EventMetadata {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default)]
 pub enum EventPriority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
 }
 
-impl Default for EventPriority {
-    fn default() -> Self {
-        EventPriority::Normal
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct EventFilter {
     pub topics: Option<Vec<Topic>>,
     pub sources: Option<Vec<AgentId>>,
@@ -151,19 +154,6 @@ impl EventFilter {
     }
 }
 
-impl Default for EventFilter {
-    fn default() -> Self {
-        Self {
-            topics: None,
-            sources: None,
-            event_types: None,
-            since_timestamp: None,
-            until_timestamp: None,
-            min_priority: None,
-            tags: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
@@ -197,6 +187,7 @@ pub struct EventBus {
     topic_subscribers: Arc<DashMap<Topic, Vec<String>>>,
     broadcast_tx: broadcast::Sender<Event>,
     event_store: Arc<dyn EventStore>,
+    #[allow(dead_code)]
     max_history: usize,
 }
 
@@ -216,6 +207,7 @@ impl EventBus {
         let stored_event = event.clone();
         self.event_store.append(&stored_event).await?;
 
+        #[allow(clippy::let_underscore_future)]
         let _ = self.broadcast_tx.send(event.clone());
 
         if let Some(subscriber_ids) = self.topic_subscribers.get(&event.topic) {
@@ -232,41 +224,34 @@ impl EventBus {
     }
 
     fn matches_filter(event: &Event, filter: &EventFilter) -> bool {
-        if let Some(topics) = &filter.topics {
-            if !topics.contains(&event.topic) {
+        if let Some(topics) = &filter.topics
+            && !topics.contains(&event.topic) {
                 return false;
             }
-        }
-        if let Some(sources) = &filter.sources {
-            if !sources.contains(&event.source) {
+        if let Some(sources) = &filter.sources
+            && !sources.contains(&event.source) {
                 return false;
             }
-        }
-        if let Some(event_types) = &filter.event_types {
-            if !event_types.contains(&event.event_type) {
+        if let Some(event_types) = &filter.event_types
+            && !event_types.contains(&event.event_type) {
                 return false;
             }
-        }
-        if let Some(since) = filter.since_timestamp {
-            if event.timestamp < since {
+        if let Some(since) = filter.since_timestamp
+            && event.timestamp < since {
                 return false;
             }
-        }
-        if let Some(until) = filter.until_timestamp {
-            if event.timestamp > until {
+        if let Some(until) = filter.until_timestamp
+            && event.timestamp > until {
                 return false;
             }
-        }
-        if let Some(min_priority) = filter.min_priority {
-            if event.metadata.priority < min_priority {
+        if let Some(min_priority) = filter.min_priority
+            && event.metadata.priority < min_priority {
                 return false;
             }
-        }
-        if let Some(tags) = &filter.tags {
-            if !tags.iter().any(|t| event.metadata.tags.contains(t)) {
+        if let Some(tags) = &filter.tags
+            && !tags.iter().any(|t| event.metadata.tags.contains(t)) {
                 return false;
             }
-        }
         true
     }
 
@@ -289,11 +274,10 @@ impl EventBus {
     }
 
     pub async fn unsubscribe(&self, subscription_id: &str) -> Result<(), EventBusError> {
-        if let Some((_, sub)) = self.subscriptions.remove(subscription_id) {
-            if let Some(mut topics) = self.topic_subscribers.get_mut(&EventFilter::primary_topic(&sub.filter).unwrap_or(Topic::system())) {
+        if let Some((_, sub)) = self.subscriptions.remove(subscription_id)
+            && let Some(mut topics) = self.topic_subscribers.get_mut(&EventFilter::primary_topic(&sub.filter).unwrap_or(Topic::system())) {
                 topics.retain(|id| id != subscription_id);
             }
-        }
         Ok(())
     }
 
@@ -330,6 +314,7 @@ impl EventBus {
         // Broadcast is synchronous and bounded. If the channel is
         // full or has no receivers, send returns Err — we treat that
         // as a dropped event (the bus does not block callers).
+        #[allow(clippy::let_underscore_future)]
         let _ = self.broadcast_tx.send(event);
         Ok(())
     }
@@ -426,7 +411,7 @@ mod tests {
         let store = Arc::new(InMemoryEventStore::new(1000));
         let bus = EventBus::new(store.clone());
 
-        let sub_id = bus.subscribe(
+        let _sub_id = bus.subscribe(
             AgentId::from("agent-1"),
             EventFilter::for_topic(Topic::hub()),
         ).await.unwrap();

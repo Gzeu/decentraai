@@ -1,14 +1,11 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use decentraai_agent_runtime::{AgentRuntime, AgentState, AgentMetrics, AgentConfig};
-use decentraai_agent_society::{AgentId, SocietyState};
-use decentraai_agent_society::HubState;
+use decentraai_agent_runtime::{AgentRuntime, AgentState};
+use decentraai_agent_society::SocietyState;
 use decentraai_arena::ArenaWorld;
 use decentraai_compute::QuotaLedger;
-use decentraai_tokens::ConsumerKeyStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -167,6 +164,7 @@ pub struct IntrospectionService {
     society: Arc<RwLock<SocietyState>>,
     arena: Arc<RwLock<ArenaWorld>>,
     quota_ledger: Arc<Mutex<QuotaLedger>>,
+    #[allow(dead_code)]
     agent_metadata: Arc<DashMap<String, AgentMetadata>>,
 }
 
@@ -403,18 +401,16 @@ impl IntrospectionProvider for IntrospectionService {
 
         // Also check reverse relationships
         for (observer, subjects) in &society.relationships {
-            if subjects.contains_key(agent_id) {
-                if let Some(rels) = subjects.get(agent_id) {
-                    for rel in rels {
-                        connections.push(AgentConnection {
-                            from: observer.clone(),
-                            to: agent_id.to_string(),
-                            relationship_type: format!("{:?}", rel.kind),
-                            trust_score: rel.strength,
-                            interaction_count: 1,
-                            last_interaction: rel.tick,
-                        });
-                    }
+            if let Some(rels) = subjects.get(agent_id) {
+                for rel in rels {
+                    connections.push(AgentConnection {
+                        from: observer.clone(),
+                        to: agent_id.to_string(),
+                        relationship_type: format!("{:?}", rel.kind),
+                        trust_score: rel.strength,
+                        interaction_count: 1,
+                        last_interaction: rel.tick,
+                    });
                 }
             }
         }
