@@ -143,6 +143,103 @@ impl LocalAgentRuntime {
         &self.behavior_store
     }
 
+    /// SAES 0.2: filter observation to prefer tasks aligned with active goals.
+    ///
+    /// When the agent has active goals, this method reorders tasks in the
+    /// observation so that tasks matching the highest-priority goal appear
+    /// first. The DefaultBidPolicy picks the first matching task, so this
+    /// effectively makes it prefer goal-aligned work.
+    ///
+    /// Goal matching is done by checking if the goal description contains
+    /// a keyword that matches the task's required_capability. This is a
+    /// heuristic — production implementations should use explicit capability
+    /// mappings.
+    fn filter_observation_by_goals(
+        &self,
+        obs: &AgentObservation,
+        active_goals: &[&AgentGoal],
+    ) -> AgentObservation {
+        let tasks = match obs
+            .hub_state_summary
+            .get("tasks")
+            .and_then(|t| t.as_array())
+        {
+            Some(arr) => arr,
+            None => return obs.clone(),
+        };
+
+        if tasks.is_empty() {
+            return obs.clone();
+        }
+
+        // Sort goals by priority descending.
+        let mut sorted_goals: Vec<&AgentGoal> = active_goals.to_vec();
+        sorted_goals.sort_by_key(|b| std::cmp::Reverse(b.priority));
+
+        // Build a priority map: task_id → goal priority (higher = more important).
+        // A task matches a goal if the goal description contains a keyword
+        // that appears in the task's required_capability.
+        let mut task_priorities: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
+
+        for task in tasks {
+            let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let cap = task
+                .get("required_capability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            for goal in &sorted_goals {
+                // Check if the goal description or kind matches the capability.
+                let desc_lower = goal.description.to_lowercase();
+                let kind_lower = goal.kind.to_lowercase();
+                let cap_lower = cap.to_lowercase();
+
+                if desc_lower.contains(&cap_lower)
+                    || kind_lower.contains(&cap_lower)
+                    || cap_lower.contains(desc_lower.split_whitespace().next().unwrap_or(""))
+                {
+                    let priority = goal.priority.0;
+                    // Keep the highest priority for this task.
+                    let entry = task_priorities.entry(task_id.to_string()).or_insert(0);
+                    if priority > *entry {
+                        *entry = priority;
+                    }
+                }
+            }
+        }
+
+        // If no tasks matched any goal, return the original observation.
+        if task_priorities.is_empty() {
+            return obs.clone();
+        }
+
+        // Sort tasks by goal priority descending, then by original order.
+        let mut indexed_tasks: Vec<(usize, &serde_json::Value)> =
+            tasks.iter().enumerate().collect();
+        indexed_tasks.sort_by(|a, b| {
+            let pa = task_priorities
+                .get(a.1.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            let pb = task_priorities
+                .get(b.1.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            pb.cmp(&pa).then(a.0.cmp(&b.0))
+        });
+
+        // Rebuild the observation with reordered tasks.
+        let sorted_tasks: Vec<serde_json::Value> =
+            indexed_tasks.into_iter().map(|(_, t)| t.clone()).collect();
+        let mut new_obs = obs.clone();
+        new_obs.hub_state_summary = serde_json::json!({
+            "tasks": sorted_tasks,
+            "available_capabilities": obs.available_capabilities,
+        });
+        new_obs
+    }
+
     /// Validate that the declared capabilities have a well-formed
     /// shape. Each capability must be a non-empty string. The
     /// runtime does not verify the capability exists in any registry
@@ -275,7 +372,6 @@ impl AgentRuntime for LocalAgentRuntime {
             .get(agent_id)
             .map(|p| p.value().clone())
             .unwrap_or_else(|| self.default_policy.clone());
-        let mut decision = policy.decide(observation);
 
         // SAES 0.2: check deadline monitoring — auto-fail overdue goals.
         let now = now_ms();
@@ -295,9 +391,24 @@ impl AgentRuntime for LocalAgentRuntime {
             }
         }
 
+        // SAES 0.2: goal-aware observation filtering.
+        // If there are active goals, filter tasks to prefer those aligned
+        // with the highest-priority goal. This makes the policy naturally
+        // favor goal-aligned tasks without needing goal-awareness.
+        let active_goals_filtered: Vec<_> = active_goals
+            .iter()
+            .filter(|g| g.state == GoalState::Active)
+            .collect();
+
+        let effective_obs = if !active_goals_filtered.is_empty() {
+            self.filter_observation_by_goals(observation, &active_goals_filtered)
+        } else {
+            observation.clone()
+        };
+
+        let mut decision = policy.decide(&effective_obs);
+
         // SAES 0.2: adapt decision based on behavior profile.
-        // If the agent has a behavior profile, use it to override
-        // decisions based on past success/failure rates.
         let profile = self
             .behavior_store
             .get_or_create(&agent_id.to_string())
@@ -437,13 +548,15 @@ impl AgentRuntime for LocalAgentRuntime {
 
         // Find active goals for this agent to link to the outcome.
         let active_goals = self.goal_store.list_by_agent(agent_id).await;
-        let active_goals_filtered: Vec<_> = active_goals
+        let mut active_goals_filtered: Vec<_> = active_goals
             .iter()
             .filter(|g| g.state == GoalState::Active)
             .cloned()
             .collect();
 
-        // Link the outcome to the first active goal (if any).
+        // Link the outcome to the highest-priority active goal (not FIFO).
+        // Sort by priority descending so the first element is the most important.
+        active_goals_filtered.sort_by_key(|b| std::cmp::Reverse(b.priority));
         let mut outcome_with_goal = action_outcome;
         if let Some(goal) = active_goals_filtered.first() {
             outcome_with_goal.goal_id = Some(goal.id.clone());
