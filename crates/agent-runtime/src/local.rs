@@ -78,6 +78,8 @@ pub struct LocalAgentRuntime {
     goal_store: Arc<dyn GoalStore>,
     /// SAES 0.2: behavior profiles for adaptation.
     behavior_store: Arc<dyn BehaviorStore>,
+    /// SAES 0.4: collective goal coordination.
+    collective_goal_store: Arc<dyn crate::saes::collective::CollectiveGoalStore>,
 }
 
 impl std::fmt::Debug for LocalAgentRuntime {
@@ -101,6 +103,9 @@ impl LocalAgentRuntime {
             observation_builder,
             goal_store: Arc::new(InMemoryGoalStore::new()),
             behavior_store: Arc::new(InMemoryBehaviorStore::new()),
+            collective_goal_store: Arc::new(
+                crate::saes::collective::InMemoryCollectiveGoalStore::new(),
+            ),
         }
     }
 
@@ -119,6 +124,15 @@ impl LocalAgentRuntime {
     /// SAES 0.2: inject a custom behavior store.
     pub fn with_behavior_store(mut self, behavior_store: Arc<dyn BehaviorStore>) -> Self {
         self.behavior_store = behavior_store;
+        self
+    }
+
+    /// SAES 0.4: inject a custom collective goal store.
+    pub fn with_collective_goal_store(
+        mut self,
+        collective_goal_store: Arc<dyn crate::saes::collective::CollectiveGoalStore>,
+    ) -> Self {
+        self.collective_goal_store = collective_goal_store;
         self
     }
 
@@ -141,6 +155,11 @@ impl LocalAgentRuntime {
     /// SAES 0.2: access the behavior store (for inspection/testing).
     pub fn behavior_store(&self) -> &Arc<dyn BehaviorStore> {
         &self.behavior_store
+    }
+
+    /// SAES 0.4: access the collective goal store (for inspection/testing).
+    pub fn collective_goal_store(&self) -> &Arc<dyn crate::saes::collective::CollectiveGoalStore> {
+        &self.collective_goal_store
     }
 
     /// SAES 0.2: filter observation to prefer tasks aligned with active goals.
@@ -526,6 +545,14 @@ impl AgentRuntime for LocalAgentRuntime {
     ) -> Result<(), AgentRuntimeError> {
         let now = now_ms();
 
+        // SAES 0.4: check if this action was linked to a collective goal sub-goal.
+        // We can check if the action parameters contain a `sub_goal_id`.
+        let sub_goal_id = action
+            .parameters
+            .get("sub_goal_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // SAES 0.2: build structured outcome and compute learning effect.
         // Use the task's required_capability as the action_kind for behavior tracking,
         // so the profile tracks success/failure per capability (what matters for adaptation).
@@ -615,6 +642,37 @@ impl AgentRuntime for LocalAgentRuntime {
             .get_or_create(&agent_id.to_string())
             .await;
         profile.incorporate(&effect.entry);
+
+        // SAES 0.4: propagate progress to collective goals.
+        if let Some(sid) = sub_goal_id {
+            let cg_list = self.collective_goal_store.list_all().await;
+            for mut cg in cg_list {
+                if let Some(sg) = cg.sub_goals.get_mut(&sid) {
+                    // Map AgentGoal state/progress to SubGoal
+                    for (gid, progress) in &effect.goal_progress_updates {
+                        if gid == &sg.id {
+                            sg.set_progress(*progress, now);
+                        }
+                    }
+
+                    // Check for completion
+                    for (gid, state, _) in &effect.goal_transitions {
+                        if gid == &sg.id {
+                            if *state == GoalState::Completed {
+                                sg.complete(now);
+                            } else if *state == GoalState::Failed {
+                                sg.fail("Learning outcome failure".to_string(), now);
+                            }
+                        }
+                    }
+
+                    cg.recompute_progress(now);
+                    let _ = self.collective_goal_store.update(cg).await;
+                    break;
+                }
+            }
+        }
+
         // Update goal stats.
         let completed = self
             .goal_store

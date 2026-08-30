@@ -25,3 +25,5 @@ persistence = ["dep:rusqlite"]
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+tempfile = { workspace = true }
+decentraai-agent-runtime = { path = ".", features = ["persistence"] }

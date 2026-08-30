@@ -84,6 +84,29 @@ CREATE TABLE IF NOT EXISTS agent_goals (
 );
 CREATE INDEX IF NOT EXISTS idx_goals_agent_id ON agent_goals(agent_id);
 CREATE INDEX IF NOT EXISTS idx_goals_agent_state ON agent_goals(agent_id, state);
+
+CREATE TABLE IF NOT EXISTS collective_goals (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    proposer_id TEXT NOT NULL,
+    participants TEXT NOT NULL,
+    sub_goals TEXT NOT NULL,
+    progress REAL NOT NULL,
+    failure_policy TEXT NOT NULL,
+    dependencies TEXT NOT NULL,
+    deadline INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    failure_reason TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    correlation_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cg_proposer ON collective_goals(proposer_id);
 ";
 
 /// SQL schema for behavior profiles.
