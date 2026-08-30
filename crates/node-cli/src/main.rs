@@ -1974,6 +1974,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             use decentraai_agent_runtime::local::{
                 LocalAgentRuntime, ObservationBuilder, StaticObservationBuilder,
             };
+            use decentraai_agent_runtime::saes::persistence::{
+                SqliteBehaviorStore, SqliteGoalStore,
+            };
             use decentraai_agent_runtime::{AgentConfig, AgentRuntime as _, ResourceLimits};
 
             let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(10000));
@@ -1988,18 +1991,58 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                         .map(|c| format!("{:?}", c.capability))
                 })
                 .collect();
-            let obs_builder: Arc<dyn ObservationBuilder> = Arc::new(
-                StaticObservationBuilder {
-                    hub_state: serde_json::json!({
-                        "available_capabilities": all_caps,
-                        "node_id": short_id,
-                    }),
-                    society_state: serde_json::json!({}),
-                    arena_state: None,
-                    personal_memory: serde_json::json!({}),
-                },
-            );
-            let local_runtime = LocalAgentRuntime::new(event_bus.clone(), obs_builder);
+            let obs_builder: Arc<dyn ObservationBuilder> = Arc::new(StaticObservationBuilder {
+                hub_state: serde_json::json!({
+                    "available_capabilities": all_caps,
+                    "node_id": short_id,
+                }),
+                society_state: serde_json::json!({}),
+                arena_state: None,
+                personal_memory: serde_json::json!({}),
+            });
+
+            // SAES 0.3: open file-backed SQLite stores for persistence.
+            // Agent goals, progress, and behavior profiles survive restarts.
+            let goals_db_path = data_dir.join("db/agent_goals.sqlite");
+            let behavior_db_path = data_dir.join("db/agent_behavior.sqlite");
+            let goal_store = match SqliteGoalStore::open(&goals_db_path) {
+                Ok(s) => {
+                    info!(path = %goals_db_path.display(), "saes: goal store opened");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %goals_db_path.display(),
+                        "saes: failed to open goal store, falling back to in-memory"
+                    );
+                    Arc::new(
+                        SqliteGoalStore::new_in_memory()
+                            .expect("in-memory goal store must not fail"),
+                    )
+                }
+            };
+            let behavior_store = match SqliteBehaviorStore::open(&behavior_db_path) {
+                Ok(s) => {
+                    info!(path = %behavior_db_path.display(), "saes: behavior store opened");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %behavior_db_path.display(),
+                        "saes: failed to open behavior store, falling back to in-memory"
+                    );
+                    Arc::new(
+                        SqliteBehaviorStore::new_in_memory()
+                            .expect("in-memory behavior store must not fail"),
+                    )
+                }
+            };
+
+            let local_runtime = LocalAgentRuntime::new(event_bus.clone(), obs_builder)
+                .with_goal_store(goal_store)
+                .with_behavior_store(behavior_store);
 
             for record in &local_agents {
                 let caps: Vec<String> = record
@@ -2087,17 +2130,22 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                             }
                         };
                         // Learn (best-effort)
-                        let _ = rt.learn(agent_id, &action, &action.result.clone().unwrap_or(
-                            decentraai_agent_runtime::ActionResult {
-                                success: true,
-                                output: None,
-                                error: None,
-                                evidence_id: None,
-                                reward: None,
-                                reputation_delta: None,
-                            },
-                        ))
-                        .await;
+                        let _ = rt
+                            .learn(
+                                agent_id,
+                                &action,
+                                &action.result.clone().unwrap_or(
+                                    decentraai_agent_runtime::ActionResult {
+                                        success: true,
+                                        output: None,
+                                        error: None,
+                                        evidence_id: None,
+                                        reward: None,
+                                        reputation_delta: None,
+                                    },
+                                ),
+                            )
+                            .await;
                         tracing::debug!(
                             agent = agent_id,
                             decision = ?decision.decision_type,
@@ -2420,7 +2468,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         state.set_dashboard(config.node.dashboard);
         // Personal Memory store (per-agent Markdown workspaces)
         let pm_store = std::sync::Arc::new(
-            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir)
+            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir),
         );
         state.attach_personal_memory(pm_store);
         // Fabric Intelligence: reasoning layer between a task and the
@@ -2448,7 +2496,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         state.attach_distributed(dist_handle.clone());
         // Personal Memory store (per-agent Markdown workspaces)
         let pm_store = std::sync::Arc::new(
-            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir)
+            decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir),
         );
         state.attach_personal_memory(pm_store);
         // M15 — Autonomous Compute Pressure: observe own signals; when the
