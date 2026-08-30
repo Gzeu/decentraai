@@ -32,7 +32,7 @@ use crate::saes::outcomes::ActionOutcome;
 use crate::{
     ActionResult, ActionType, AgentAction, AgentConfig, AgentDecision, AgentHandle, AgentId,
     AgentMetrics, AgentObservation, AgentRuntime, AgentRuntimeError, AgentState, AgentStatus,
-    ResourceUsage,
+    DecisionType, ResourceUsage,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -275,10 +275,69 @@ impl AgentRuntime for LocalAgentRuntime {
             .get(agent_id)
             .map(|p| p.value().clone())
             .unwrap_or_else(|| self.default_policy.clone());
-        let decision = policy.decide(observation);
+        let mut decision = policy.decide(observation);
+
+        // SAES 0.2: check deadline monitoring — auto-fail overdue goals.
+        let now = now_ms();
+        let active_goals = self.goal_store.list_by_agent(agent_id).await;
+        for goal in &active_goals {
+            if goal.is_overdue(now) {
+                tracing::info!(
+                    agent = %agent_id,
+                    goal = %goal.id,
+                    deadline = goal.deadline.unwrap_or(0),
+                    "saes: goal overdue, auto-failing"
+                );
+                if let Ok(mut g) = self.goal_store.get(&goal.id).await {
+                    let _ = g.fail("deadline exceeded".to_string(), now);
+                    let _ = self.goal_store.update(g).await;
+                }
+            }
+        }
+
+        // SAES 0.2: adapt decision based on behavior profile.
+        // If the agent has a behavior profile, use it to override
+        // decisions based on past success/failure rates.
+        let profile = self
+            .behavior_store
+            .get_or_create(&agent_id.to_string())
+            .await;
+
+        if decision.decision_type == DecisionType::Bid {
+            // Extract the task's required capability from the decision context.
+            if let Some(task_cap) = decision
+                .context
+                .get("task")
+                .and_then(|t| t.get("required_capability"))
+                .and_then(|v| v.as_str())
+            {
+                let (use_strategy, conf, reason) = profile.should_use_strategy(task_cap);
+                if !use_strategy {
+                    // Override: don't bid on avoided strategies.
+                    decision.decision_type = DecisionType::Wait;
+                    decision.reasoning =
+                        format!("{} [saes: overridden — {}]", decision.reasoning, reason);
+                    decision.confidence = conf;
+                    tracing::debug!(
+                        agent = %agent_id,
+                        capability = task_cap,
+                        reason = %reason,
+                        "saes: bid overridden to wait (avoided strategy)"
+                    );
+                } else if conf > 0.6 {
+                    // Boost confidence for preferred strategies.
+                    decision.confidence = (decision.confidence + conf) / 2.0;
+                    decision.reasoning = format!(
+                        "{} [saes: preferred strategy — {}]",
+                        decision.reasoning, reason
+                    );
+                }
+            }
+        }
+
         if let Some(mut s) = self.agents.get_mut(agent_id) {
-            s.last_active_at = now_ms();
-            s.updated_at = now_ms();
+            s.last_active_at = now;
+            s.updated_at = now;
         }
         Ok(decision)
     }
@@ -357,13 +416,22 @@ impl AgentRuntime for LocalAgentRuntime {
         let now = now_ms();
 
         // SAES 0.2: build structured outcome and compute learning effect.
-        let action_kind = format!("{:?}", action.action_type);
+        // Use the task's required_capability as the action_kind for behavior tracking,
+        // so the profile tracks success/failure per capability (what matters for adaptation).
+        let fallback_kind = format!("{:?}", action.action_type);
+        let action_kind = action
+            .parameters
+            .get("context")
+            .and_then(|c| c.get("task"))
+            .and_then(|t| t.get("required_capability"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&fallback_kind);
         let action_outcome = ActionOutcome::from_action_result(
             action.agent_id.clone(), // action_id
             agent_id.clone(),
             None, // goal_id — linked below if we find an active goal
             outcome,
-            &action_kind,
+            action_kind,
             now,
         );
 

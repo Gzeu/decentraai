@@ -576,10 +576,11 @@ mod integration_tests {
             .get_or_create("dca-saes:worker")
             .await;
         assert_eq!(profile.entries_processed, 3);
-        // DefaultBidPolicy produces HubBid actions, so outcome kind is "HubBid"
+        // Behavior profile tracks by capability (from task context), not action type.
+        // The hub_state has a task requiring "Chat", so the outcome kind is "Chat".
         assert!(
-            profile.preferred_strategies.contains(&"HubBid".to_string())
-                || profile.success_counts.contains_key("HubBid")
+            profile.preferred_strategies.contains(&"Chat".to_string())
+                || profile.success_counts.contains_key("Chat")
         );
 
         // Verify goal progress advanced (3 successes × 0.2 = 0.6)
@@ -716,5 +717,177 @@ mod integration_tests {
                 assert!((goal.progress - 1.0).abs() < 1e-6);
             }
         }
+    }
+
+    /// SAES 0.2: behavior adaptation — avoided strategy overrides bid to wait.
+    #[tokio::test]
+    async fn saes_avoided_strategy_overrides_bid() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "tasks": [
+                    {"id": "t1", "status": "open", "required_capability": "Chat", "reward": 100}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-avoid:worker".to_string(),
+            name: "Avoid Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        // Simulate 5 failures on Chat → "Chat" becomes avoided strategy.
+        for _ in 0..5 {
+            let obs = runtime
+                .observe(&"dca-avoid:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-avoid:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-avoid:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: false,
+                output: None,
+                error: Some("failed".to_string()),
+                evidence_id: None,
+                reward: None,
+                reputation_delta: None,
+            };
+            runtime
+                .learn(&"dca-avoid:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Verify Chat is now avoided
+        let profile = runtime
+            .behavior_store()
+            .get_or_create("dca-avoid:worker")
+            .await;
+        assert!(profile.avoided_strategies.contains(&"Chat".to_string()));
+
+        // Next decide: should override bid to wait because Chat is avoided
+        let obs = runtime
+            .observe(&"dca-avoid:worker".to_string())
+            .await
+            .unwrap();
+        let decision = runtime
+            .decide(&"dca-avoid:worker".to_string(), &obs)
+            .await
+            .unwrap();
+        assert_eq!(decision.decision_type, DecisionType::Wait);
+        assert!(decision.reasoning.contains("overridden"));
+    }
+
+    /// SAES 0.2: deadline monitoring — overdue goals get auto-failed.
+    #[tokio::test]
+    async fn saes_deadline_auto_fails_goal() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-deadline:worker".to_string(),
+            name: "Deadline Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["urgent task".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        // Get the goal and set a deadline in the past.
+        let state = runtime
+            .get_state(&"dca-deadline:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+        let mut goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        goal.deadline = Some(100); // deadline long past
+        runtime.goal_store().update(goal).await.unwrap();
+
+        // Next decide should auto-fail the overdue goal.
+        let obs = runtime
+            .observe(&"dca-deadline:worker".to_string())
+            .await
+            .unwrap();
+        let _decision = runtime
+            .decide(&"dca-deadline:worker".to_string(), &obs)
+            .await
+            .unwrap();
+
+        // Verify the goal was auto-failed.
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Failed);
+        assert_eq!(goal.failure_reason.as_deref(), Some("deadline exceeded"));
+    }
+
+    /// SAES 0.2: goal priority — higher priority goals are created first.
+    #[tokio::test]
+    async fn saes_goal_priority_in_spawn() {
+        use crate::saes::goals::GoalPriority;
+
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // Create a goal directly with high priority to verify store works.
+        let high_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "critical task".to_string(),
+            "urgent".to_string(),
+            GoalPriority::CRITICAL,
+            1000,
+        );
+        let low_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "minor task".to_string(),
+            "routine".to_string(),
+            GoalPriority::LOW,
+            1000,
+        );
+
+        runtime.goal_store().add(high_goal.clone()).await.unwrap();
+        runtime.goal_store().add(low_goal.clone()).await.unwrap();
+
+        // Verify both goals exist and have correct priorities.
+        let goals = runtime
+            .goal_store()
+            .list_by_agent(&"dca-priority:worker".to_string())
+            .await;
+        assert_eq!(goals.len(), 2);
+        let high = goals
+            .iter()
+            .find(|g| g.priority == GoalPriority::CRITICAL)
+            .unwrap();
+        let low = goals
+            .iter()
+            .find(|g| g.priority == GoalPriority::LOW)
+            .unwrap();
+        assert_eq!(high.description, "critical task");
+        assert_eq!(low.description, "minor task");
+        assert!(high.priority > low.priority);
     }
 }

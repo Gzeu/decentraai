@@ -35,7 +35,7 @@ impl DecisionPolicy for DefaultBidPolicy {
 
         let task = pick_open_task(&obs.hub_state_summary, &capabilities);
 
-        let (decision_type, reasoning) = match task {
+        let (decision_type, reasoning, context) = match task {
             Some(t) => {
                 let tid = t
                     .get("id")
@@ -54,11 +54,16 @@ impl DecisionPolicy for DefaultBidPolicy {
                         "default: open task {} matches capability '{}' with reward {}",
                         tid, cap, reward
                     ),
+                    serde_json::json!({
+                        "policy": "default_v1",
+                        "task": t,
+                    }),
                 )
             }
             None => (
                 DecisionType::Wait,
                 "default: no open task matches a declared capability".to_string(),
+                serde_json::json!({"policy": "default_v1"}),
             ),
         };
 
@@ -69,7 +74,7 @@ impl DecisionPolicy for DefaultBidPolicy {
             reasoning,
             confidence: 0.5,
             expected_outcome: serde_json::Value::Null,
-            context: serde_json::json!({"policy": "default_v1"}),
+            context,
         }
     }
 }
