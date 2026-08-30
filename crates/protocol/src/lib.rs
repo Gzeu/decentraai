@@ -18,6 +18,11 @@ pub use infer_protocol::{
 
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 
+/// Canonical agent identifier. Currently a `String` (UUID or other
+/// fabric-assigned value); centralised here so the rest of the workspace
+/// has a single, non-circular way to refer to agents.
+pub type AgentId = String;
+
 // Serde helper modules for base64 encoding/decoding
 mod b64 {
     use super::*;

@@ -1,0 +1,22 @@
+[package]
+name = "decentraai-agent-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+decentraai-protocol = { path = "../protocol" }
+decentraai-identity = { path = "../identity" }
+decentraai-tokens = { path = "../tokens" }
+decentraai-event-bus = { path = "../event-bus" }
+decentraai-agent-society = { path = "../agent-society" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }

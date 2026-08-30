@@ -1965,6 +1965,154 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             agents = local_agents.len(),
             "node is a live agent host (inference executor wired)"
         );
+
+        // ═══ Sprint 0.1: LocalAgentRuntime lifecycle integration ═══
+        // Wire the tested foundation (spawn → observe → decide → act → learn)
+        // into the live daemon. Each AgentRecord becomes a managed agent in the
+        // LocalAgentRuntime. A periodic task drives the lifecycle loop.
+        {
+            use decentraai_agent_runtime::local::{
+                LocalAgentRuntime, ObservationBuilder, StaticObservationBuilder,
+            };
+            use decentraai_agent_runtime::{AgentConfig, AgentRuntime as _, ResourceLimits};
+
+            let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(10000));
+            let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+
+            // Build the observation from the node's available capabilities.
+            let all_caps: Vec<String> = local_agents
+                .iter()
+                .flat_map(|a| {
+                    a.semantic_capabilities
+                        .iter()
+                        .map(|c| format!("{:?}", c.capability))
+                })
+                .collect();
+            let obs_builder: Arc<dyn ObservationBuilder> = Arc::new(
+                StaticObservationBuilder {
+                    hub_state: serde_json::json!({
+                        "available_capabilities": all_caps,
+                        "node_id": short_id,
+                    }),
+                    society_state: serde_json::json!({}),
+                    arena_state: None,
+                    personal_memory: serde_json::json!({}),
+                },
+            );
+            let local_runtime = LocalAgentRuntime::new(event_bus.clone(), obs_builder);
+
+            for record in &local_agents {
+                let caps: Vec<String> = record
+                    .semantic_capabilities
+                    .iter()
+                    .map(|c| format!("{:?}", c.capability))
+                    .collect();
+                let goals: Vec<String> = if caps.is_empty() {
+                    vec!["serve requests".to_string()]
+                } else {
+                    caps.iter()
+                        .map(|c| format!("fulfill {c} requests"))
+                        .collect()
+                };
+                let agent_config = AgentConfig {
+                    agent_id: record.agent_id.clone(),
+                    name: record.name.clone(),
+                    capabilities: caps,
+                    initial_goals: goals,
+                    initial_memory: None,
+                    policy_overrides: None,
+                    resource_limits: ResourceLimits::default(),
+                };
+                match local_runtime.spawn(agent_config).await {
+                    Ok(_handle) => {
+                        info!(agent = %record.agent_id, "sprint-0.1 agent spawned");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %record.agent_id,
+                            error = %e,
+                            "sprint-0.1: failed to spawn agent"
+                        );
+                    }
+                }
+            }
+
+            // Periodic lifecycle loop: observe → decide → act → learn for each
+            // agent. Runs every 30 seconds. Builds observations from the node's
+            // available capabilities; the decision policy selects an action.
+            let runtime_for_loop = Arc::new(tokio::sync::RwLock::new(local_runtime));
+            let agents_for_loop: Vec<String> =
+                local_agents.iter().map(|a| a.agent_id.clone()).collect();
+            let agent_count = agents_for_loop.len();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let rt = runtime_for_loop.read().await;
+                    for agent_id in &agents_for_loop {
+                        // Observe
+                        let observation = match rt.observe(agent_id).await {
+                            Ok(obs) => obs,
+                            Err(e) => {
+                                tracing::debug!(
+                                    agent = agent_id,
+                                    error = %e,
+                                    "sprint-0.1: observe failed"
+                                );
+                                continue;
+                            }
+                        };
+                        // Decide
+                        let decision = match rt.decide(agent_id, &observation).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::debug!(
+                                    agent = agent_id,
+                                    error = %e,
+                                    "sprint-0.1: decide failed"
+                                );
+                                continue;
+                            }
+                        };
+                        // Act
+                        let action = match rt.act(agent_id, &decision).await {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::debug!(
+                                    agent = agent_id,
+                                    error = %e,
+                                    "sprint-0.1: act failed"
+                                );
+                                continue;
+                            }
+                        };
+                        // Learn (best-effort)
+                        let _ = rt.learn(agent_id, &action, &action.result.clone().unwrap_or(
+                            decentraai_agent_runtime::ActionResult {
+                                success: true,
+                                output: None,
+                                error: None,
+                                evidence_id: None,
+                                reward: None,
+                                reputation_delta: None,
+                            },
+                        ))
+                        .await;
+                        tracing::debug!(
+                            agent = agent_id,
+                            decision = ?decision.decision_type,
+                            "sprint-0.1: lifecycle cycle complete"
+                        );
+                    }
+                }
+            });
+            info!(
+                agents = agent_count,
+                "sprint-0.1: agent lifecycle loop started (30s interval)"
+            );
+        }
+        // ═══ End Sprint 0.1 lifecycle integration ═══
+
         // Benchmark Lab: run single vs RAG vs collective tasks through the
         // live executor, graded deterministically, feeding evidence. The
         // executor is consumed here — the agent runtimes above each hold
