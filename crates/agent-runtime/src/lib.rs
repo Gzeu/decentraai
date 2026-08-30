@@ -178,9 +178,22 @@ pub trait AgentRuntime: Send + Sync {
     async fn spawn(&self, config: AgentConfig) -> Result<AgentHandle, AgentRuntimeError>;
     async fn get_state(&self, agent_id: &AgentId) -> Result<AgentState, AgentRuntimeError>;
     async fn observe(&self, agent_id: &AgentId) -> Result<AgentObservation, AgentRuntimeError>;
-    async fn decide(&self, agent_id: &AgentId, observation: &AgentObservation) -> Result<AgentDecision, AgentRuntimeError>;
-    async fn act(&self, agent_id: &AgentId, decision: &AgentDecision) -> Result<AgentAction, AgentRuntimeError>;
-    async fn learn(&self, agent_id: &AgentId, action: &AgentAction, outcome: &ActionResult) -> Result<(), AgentRuntimeError>;
+    async fn decide(
+        &self,
+        agent_id: &AgentId,
+        observation: &AgentObservation,
+    ) -> Result<AgentDecision, AgentRuntimeError>;
+    async fn act(
+        &self,
+        agent_id: &AgentId,
+        decision: &AgentDecision,
+    ) -> Result<AgentAction, AgentRuntimeError>;
+    async fn learn(
+        &self,
+        agent_id: &AgentId,
+        action: &AgentAction,
+        outcome: &ActionResult,
+    ) -> Result<(), AgentRuntimeError>;
     async fn pause(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
     async fn resume(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
     async fn stop(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
@@ -286,6 +299,9 @@ pub mod policy;
 #[cfg(test)]
 mod capability_proof;
 
+// SAES 0.2: structured agent evolution system (goals, outcomes, learning, adaptation).
+pub mod saes;
+
 /// Integration test: full spawn → observe → decide → act → learn pipeline
 /// with a realistic daemon-like setup (StaticObservationBuilder + DefaultBidPolicy).
 #[cfg(test)]
@@ -353,34 +369,55 @@ mod integration_tests {
         assert_eq!(handle_b.status, AgentStatus::Ready);
 
         // 2. OBSERVE both agents
-        let obs_a = runtime.observe(&"dca-test:generalist".to_string()).await.unwrap();
+        let obs_a = runtime
+            .observe(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
         assert_eq!(obs_a.agent_id, "dca-test:generalist");
         assert!(!obs_a.available_capabilities.is_empty());
 
-        let obs_b = runtime.observe(&"dca-test:coder".to_string()).await.unwrap();
+        let obs_b = runtime
+            .observe(&"dca-test:coder".to_string())
+            .await
+            .unwrap();
         assert_eq!(obs_b.agent_id, "dca-test:coder");
 
         // 3. DECIDE — DefaultBidPolicy bids when capability matches
-        let decision_a = runtime.decide(&"dca-test:generalist".to_string(), &obs_a).await.unwrap();
+        let decision_a = runtime
+            .decide(&"dca-test:generalist".to_string(), &obs_a)
+            .await
+            .unwrap();
         assert_eq!(decision_a.agent_id, "dca-test:generalist");
         // Generalist has Chat+Analysis, hub has Coding+Chat+Analysis → should bid
         assert_eq!(decision_a.decision_type, DecisionType::Bid);
 
-        let decision_b = runtime.decide(&"dca-test:coder".to_string(), &obs_b).await.unwrap();
+        let decision_b = runtime
+            .decide(&"dca-test:coder".to_string(), &obs_b)
+            .await
+            .unwrap();
         assert_eq!(decision_b.decision_type, DecisionType::Bid);
 
         // 4. ACT
-        let action_a = runtime.act(&"dca-test:generalist".to_string(), &decision_a).await.unwrap();
+        let action_a = runtime
+            .act(&"dca-test:generalist".to_string(), &decision_a)
+            .await
+            .unwrap();
         assert_eq!(action_a.action_type, ActionType::HubBid);
         // act() creates the action but doesn't execute it (execution is the
         // daemon's responsibility). Result is None until execute() is called.
         assert!(action_a.result.is_none());
 
-        let action_b = runtime.act(&"dca-test:coder".to_string(), &decision_b).await.unwrap();
+        let action_b = runtime
+            .act(&"dca-test:coder".to_string(), &decision_b)
+            .await
+            .unwrap();
         assert_eq!(action_b.action_type, ActionType::HubBid);
 
         // 5. LEARN — metrics should increment
-        let metrics_before = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
+        let metrics_before = runtime
+            .get_metrics(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
         let outcome = ActionResult {
             success: true,
             output: Some(serde_json::json!({"result": "ok"})),
@@ -393,8 +430,14 @@ mod integration_tests {
             .learn(&"dca-test:generalist".to_string(), &action_a, &outcome)
             .await
             .unwrap();
-        let metrics_after = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
-        assert_eq!(metrics_after.tasks_completed, metrics_before.tasks_completed + 1);
+        let metrics_after = runtime
+            .get_metrics(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics_after.tasks_completed,
+            metrics_before.tasks_completed + 1
+        );
 
         // 6. Verify full agent list
         let agents = runtime.list_agents().await.unwrap();
@@ -425,7 +468,10 @@ mod integration_tests {
         for i in 0..5 {
             let obs = runtime.observe(&"dca-loop".to_string()).await.unwrap();
             let decision = runtime.decide(&"dca-loop".to_string(), &obs).await.unwrap();
-            let action = runtime.act(&"dca-loop".to_string(), &decision).await.unwrap();
+            let action = runtime
+                .act(&"dca-loop".to_string(), &decision)
+                .await
+                .unwrap();
             let outcome = ActionResult {
                 success: true,
                 output: None,
