@@ -35,11 +35,16 @@ impl DecisionPolicy for DefaultBidPolicy {
 
         let task = pick_open_task(&obs.hub_state_summary, &capabilities);
 
-        let (decision_type, reasoning) = match task {
+        let (decision_type, reasoning, context) = match task {
             Some(t) => {
-                let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                let tid = t
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
                 let reward = t.get("reward").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cap = t.get("required_capability")
+                let cap = t
+                    .get("required_capability")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -49,11 +54,16 @@ impl DecisionPolicy for DefaultBidPolicy {
                         "default: open task {} matches capability '{}' with reward {}",
                         tid, cap, reward
                     ),
+                    serde_json::json!({
+                        "policy": "default_v1",
+                        "task": t,
+                    }),
                 )
             }
             None => (
                 DecisionType::Wait,
                 "default: no open task matches a declared capability".to_string(),
+                serde_json::json!({"policy": "default_v1"}),
             ),
         };
 
@@ -64,7 +74,7 @@ impl DecisionPolicy for DefaultBidPolicy {
             reasoning,
             confidence: 0.5,
             expected_outcome: serde_json::Value::Null,
-            context: serde_json::json!({"policy": "default_v1"}),
+            context,
         }
     }
 }
@@ -95,8 +105,8 @@ fn pick_open_task(
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_millis() as u64)
-    .unwrap_or(0)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A policy that always waits. Useful for tests and as a "do
@@ -172,7 +182,10 @@ impl DecisionPolicy for JsonSpecPolicyLite {
                     timestamp: now_ms(),
                     decision_type: dt,
                     reasoning: if rule.rationale.is_empty() {
-                        format!("spec rule '{}' matched (substring '{}')", rule.name, rule.condition_contains)
+                        format!(
+                            "spec rule '{}' matched (substring '{}')",
+                            rule.name, rule.condition_contains
+                        )
                     } else {
                         rule.rationale.clone()
                     },
@@ -365,7 +378,10 @@ mod tests {
     fn empty_spec_falls_back_to_wait() {
         // A spec with zero rules must not panic; it must return Wait.
         let o = obs(vec!["x"], serde_json::json!({}));
-        let spec = JsonSpecPolicyLite { name: "empty".to_string(), rules: vec![] };
+        let spec = JsonSpecPolicyLite {
+            name: "empty".to_string(),
+            rules: vec![],
+        };
         let d = JsonSpecPolicyLite::from_spec(spec).decide(&o);
         assert!(matches!(d.decision_type, DecisionType::Wait));
         assert!(d.reasoning.contains("no rule matched"));
@@ -392,6 +408,9 @@ mod tests {
             assert_eq!(parse_decision_type(s), expected, "mismatch for {s}");
         }
         // Unknown -> Wait, never panic.
-        assert!(matches!(parse_decision_type("totally_new_action"), DecisionType::Wait));
+        assert!(matches!(
+            parse_decision_type("totally_new_action"),
+            DecisionType::Wait
+        ));
     }
 }

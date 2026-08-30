@@ -178,9 +178,22 @@ pub trait AgentRuntime: Send + Sync {
     async fn spawn(&self, config: AgentConfig) -> Result<AgentHandle, AgentRuntimeError>;
     async fn get_state(&self, agent_id: &AgentId) -> Result<AgentState, AgentRuntimeError>;
     async fn observe(&self, agent_id: &AgentId) -> Result<AgentObservation, AgentRuntimeError>;
-    async fn decide(&self, agent_id: &AgentId, observation: &AgentObservation) -> Result<AgentDecision, AgentRuntimeError>;
-    async fn act(&self, agent_id: &AgentId, decision: &AgentDecision) -> Result<AgentAction, AgentRuntimeError>;
-    async fn learn(&self, agent_id: &AgentId, action: &AgentAction, outcome: &ActionResult) -> Result<(), AgentRuntimeError>;
+    async fn decide(
+        &self,
+        agent_id: &AgentId,
+        observation: &AgentObservation,
+    ) -> Result<AgentDecision, AgentRuntimeError>;
+    async fn act(
+        &self,
+        agent_id: &AgentId,
+        decision: &AgentDecision,
+    ) -> Result<AgentAction, AgentRuntimeError>;
+    async fn learn(
+        &self,
+        agent_id: &AgentId,
+        action: &AgentAction,
+        outcome: &ActionResult,
+    ) -> Result<(), AgentRuntimeError>;
     async fn pause(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
     async fn resume(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
     async fn stop(&self, agent_id: &AgentId) -> Result<(), AgentRuntimeError>;
@@ -286,6 +299,9 @@ pub mod policy;
 #[cfg(test)]
 mod capability_proof;
 
+// SAES 0.2: structured agent evolution system (goals, outcomes, learning, adaptation).
+pub mod saes;
+
 /// Integration test: full spawn → observe → decide → act → learn pipeline
 /// with a realistic daemon-like setup (StaticObservationBuilder + DefaultBidPolicy).
 #[cfg(test)]
@@ -353,34 +369,55 @@ mod integration_tests {
         assert_eq!(handle_b.status, AgentStatus::Ready);
 
         // 2. OBSERVE both agents
-        let obs_a = runtime.observe(&"dca-test:generalist".to_string()).await.unwrap();
+        let obs_a = runtime
+            .observe(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
         assert_eq!(obs_a.agent_id, "dca-test:generalist");
         assert!(!obs_a.available_capabilities.is_empty());
 
-        let obs_b = runtime.observe(&"dca-test:coder".to_string()).await.unwrap();
+        let obs_b = runtime
+            .observe(&"dca-test:coder".to_string())
+            .await
+            .unwrap();
         assert_eq!(obs_b.agent_id, "dca-test:coder");
 
         // 3. DECIDE — DefaultBidPolicy bids when capability matches
-        let decision_a = runtime.decide(&"dca-test:generalist".to_string(), &obs_a).await.unwrap();
+        let decision_a = runtime
+            .decide(&"dca-test:generalist".to_string(), &obs_a)
+            .await
+            .unwrap();
         assert_eq!(decision_a.agent_id, "dca-test:generalist");
         // Generalist has Chat+Analysis, hub has Coding+Chat+Analysis → should bid
         assert_eq!(decision_a.decision_type, DecisionType::Bid);
 
-        let decision_b = runtime.decide(&"dca-test:coder".to_string(), &obs_b).await.unwrap();
+        let decision_b = runtime
+            .decide(&"dca-test:coder".to_string(), &obs_b)
+            .await
+            .unwrap();
         assert_eq!(decision_b.decision_type, DecisionType::Bid);
 
         // 4. ACT
-        let action_a = runtime.act(&"dca-test:generalist".to_string(), &decision_a).await.unwrap();
+        let action_a = runtime
+            .act(&"dca-test:generalist".to_string(), &decision_a)
+            .await
+            .unwrap();
         assert_eq!(action_a.action_type, ActionType::HubBid);
         // act() creates the action but doesn't execute it (execution is the
         // daemon's responsibility). Result is None until execute() is called.
         assert!(action_a.result.is_none());
 
-        let action_b = runtime.act(&"dca-test:coder".to_string(), &decision_b).await.unwrap();
+        let action_b = runtime
+            .act(&"dca-test:coder".to_string(), &decision_b)
+            .await
+            .unwrap();
         assert_eq!(action_b.action_type, ActionType::HubBid);
 
         // 5. LEARN — metrics should increment
-        let metrics_before = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
+        let metrics_before = runtime
+            .get_metrics(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
         let outcome = ActionResult {
             success: true,
             output: Some(serde_json::json!({"result": "ok"})),
@@ -393,8 +430,14 @@ mod integration_tests {
             .learn(&"dca-test:generalist".to_string(), &action_a, &outcome)
             .await
             .unwrap();
-        let metrics_after = runtime.get_metrics(&"dca-test:generalist".to_string()).await.unwrap();
-        assert_eq!(metrics_after.tasks_completed, metrics_before.tasks_completed + 1);
+        let metrics_after = runtime
+            .get_metrics(&"dca-test:generalist".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics_after.tasks_completed,
+            metrics_before.tasks_completed + 1
+        );
 
         // 6. Verify full agent list
         let agents = runtime.list_agents().await.unwrap();
@@ -425,7 +468,10 @@ mod integration_tests {
         for i in 0..5 {
             let obs = runtime.observe(&"dca-loop".to_string()).await.unwrap();
             let decision = runtime.decide(&"dca-loop".to_string(), &obs).await.unwrap();
-            let action = runtime.act(&"dca-loop".to_string(), &decision).await.unwrap();
+            let action = runtime
+                .act(&"dca-loop".to_string(), &decision)
+                .await
+                .unwrap();
             let outcome = ActionResult {
                 success: true,
                 output: None,
@@ -443,5 +489,624 @@ mod integration_tests {
         let metrics = runtime.get_metrics(&"dca-loop".to_string()).await.unwrap();
         assert_eq!(metrics.tasks_completed, 5);
         assert_eq!(metrics.total_reward_earned, 150); // 10+20+30+40+50
+    }
+
+    /// SAES 0.2 integration test: full cycle with goal tracking + behavior adaptation.
+    #[tokio::test]
+    async fn saes_full_cycle_goals_and_adaptation() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "available_capabilities": ["Chat", "Analysis"],
+                "node_id": "dca-test",
+                "tasks": [
+                    {"id": "task-001", "status": "open", "required_capability": "Chat", "reward": 500}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // Spawn agent with initial goals
+        let config = AgentConfig {
+            agent_id: "dca-saes:worker".to_string(),
+            name: "SAES Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve 5 requests".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let handle = runtime.spawn(config).await.unwrap();
+        assert_eq!(handle.status, AgentStatus::Ready);
+
+        // Verify goals were created
+        let state = runtime
+            .get_state(&"dca-saes:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(state.current_goals.len(), 1);
+        let goal_id = state.current_goals[0].clone();
+
+        // Run 3 lifecycle cycles with success
+        for i in 0..3 {
+            let obs = runtime
+                .observe(&"dca-saes:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-saes:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-saes:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(100 * (i + 1)),
+                reputation_delta: Some(0.05),
+            };
+            runtime
+                .learn(&"dca-saes:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Verify metrics updated
+        let metrics = runtime
+            .get_metrics(&"dca-saes:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(metrics.tasks_completed, 3);
+        assert_eq!(metrics.total_reward_earned, 600); // 100+200+300
+        assert!((metrics.reputation_score - 0.15).abs() < 1e-6); // 0.05 * 3
+
+        // Verify behavior profile was updated
+        let profile = runtime
+            .behavior_store()
+            .get_or_create("dca-saes:worker")
+            .await;
+        assert_eq!(profile.entries_processed, 3);
+        // Behavior profile tracks by capability (from task context), not action type.
+        // The hub_state has a task requiring "Chat", so the outcome kind is "Chat".
+        assert!(
+            profile.preferred_strategies.contains(&"Chat".to_string())
+                || profile.success_counts.contains_key("Chat")
+        );
+
+        // Verify goal progress advanced (3 successes × 0.2 = 0.6)
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert!((goal.progress - 0.6).abs() < 1e-6);
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Active);
+    }
+
+    /// SAES 0.2: failure path — goal fails when action fails.
+    #[tokio::test]
+    async fn saes_failure_fails_goal() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-fail:worker".to_string(),
+            name: "Fail Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["complete task".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        let state = runtime
+            .get_state(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+
+        // Run one cycle with failure
+        let obs = runtime
+            .observe(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        let decision = runtime
+            .decide(&"dca-fail:worker".to_string(), &obs)
+            .await
+            .unwrap();
+        let action = runtime
+            .act(&"dca-fail:worker".to_string(), &decision)
+            .await
+            .unwrap();
+        let outcome = ActionResult {
+            success: false,
+            output: None,
+            error: Some("timeout".to_string()),
+            evidence_id: None,
+            reward: None,
+            reputation_delta: Some(-0.1),
+        };
+        runtime
+            .learn(&"dca-fail:worker".to_string(), &action, &outcome)
+            .await
+            .unwrap();
+
+        // Verify goal failed
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Failed);
+        assert_eq!(goal.failure_reason.as_deref(), Some("timeout"));
+
+        // Verify metrics
+        let metrics = runtime
+            .get_metrics(&"dca-fail:worker".to_string())
+            .await
+            .unwrap();
+        assert_eq!(metrics.tasks_failed, 1);
+        assert_eq!(metrics.tasks_completed, 0);
+    }
+
+    /// SAES 0.2: goal completion — progress reaches 1.0 after 5 successes.
+    #[tokio::test]
+    async fn saes_goal_completion_after_enough_successes() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-complete:worker".to_string(),
+            name: "Complete Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve requests".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+        let state = runtime
+            .get_state(&"dca-complete:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+
+        // 5 successes: 0.2 * 5 = 1.0 → goal completes
+        for i in 0..5 {
+            let obs = runtime
+                .observe(&"dca-complete:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-complete:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-complete:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(10),
+                reputation_delta: None,
+            };
+            runtime
+                .learn(&"dca-complete:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+            // Verify progress after each cycle
+            let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+            if i < 4 {
+                assert_eq!(goal.state, crate::saes::goals::GoalState::Active);
+                assert!((goal.progress - (0.2 * (i + 1) as f32)).abs() < 1e-6);
+            } else {
+                // 5th success: progress = 1.0, goal completed
+                assert_eq!(goal.state, crate::saes::goals::GoalState::Completed);
+                assert!((goal.progress - 1.0).abs() < 1e-6);
+            }
+        }
+    }
+
+    /// SAES 0.2: behavior adaptation — avoided strategy overrides bid to wait.
+    #[tokio::test]
+    async fn saes_avoided_strategy_overrides_bid() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "tasks": [
+                    {"id": "t1", "status": "open", "required_capability": "Chat", "reward": 100}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-avoid:worker".to_string(),
+            name: "Avoid Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["serve".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        // Simulate 5 failures on Chat → "Chat" becomes avoided strategy.
+        for _ in 0..5 {
+            let obs = runtime
+                .observe(&"dca-avoid:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime
+                .decide(&"dca-avoid:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime
+                .act(&"dca-avoid:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: false,
+                output: None,
+                error: Some("failed".to_string()),
+                evidence_id: None,
+                reward: None,
+                reputation_delta: None,
+            };
+            runtime
+                .learn(&"dca-avoid:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Verify Chat is now avoided
+        let profile = runtime
+            .behavior_store()
+            .get_or_create("dca-avoid:worker")
+            .await;
+        assert!(profile.avoided_strategies.contains(&"Chat".to_string()));
+
+        // Next decide: should override bid to wait because Chat is avoided
+        let obs = runtime
+            .observe(&"dca-avoid:worker".to_string())
+            .await
+            .unwrap();
+        let decision = runtime
+            .decide(&"dca-avoid:worker".to_string(), &obs)
+            .await
+            .unwrap();
+        assert_eq!(decision.decision_type, DecisionType::Wait);
+        assert!(decision.reasoning.contains("overridden"));
+    }
+
+    /// SAES 0.2: deadline monitoring — overdue goals get auto-failed.
+    #[tokio::test]
+    async fn saes_deadline_auto_fails_goal() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        let config = AgentConfig {
+            agent_id: "dca-deadline:worker".to_string(),
+            name: "Deadline Worker".to_string(),
+            capabilities: vec!["Chat".to_string()],
+            initial_goals: vec!["urgent task".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        let _handle = runtime.spawn(config).await.unwrap();
+
+        // Get the goal and set a deadline in the past.
+        let state = runtime
+            .get_state(&"dca-deadline:worker".to_string())
+            .await
+            .unwrap();
+        let goal_id = state.current_goals[0].clone();
+        let mut goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        goal.deadline = Some(100); // deadline long past
+        runtime.goal_store().update(goal).await.unwrap();
+
+        // Next decide should auto-fail the overdue goal.
+        let obs = runtime
+            .observe(&"dca-deadline:worker".to_string())
+            .await
+            .unwrap();
+        let _decision = runtime
+            .decide(&"dca-deadline:worker".to_string(), &obs)
+            .await
+            .unwrap();
+
+        // Verify the goal was auto-failed.
+        let goal = runtime.goal_store().get(&goal_id).await.unwrap();
+        assert_eq!(goal.state, crate::saes::goals::GoalState::Failed);
+        assert_eq!(goal.failure_reason.as_deref(), Some("deadline exceeded"));
+    }
+
+    /// SAES 0.2: goal priority — higher priority goals are created first.
+    #[tokio::test]
+    async fn saes_goal_priority_in_spawn() {
+        use crate::saes::goals::GoalPriority;
+
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder::empty());
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // Create a goal directly with high priority to verify store works.
+        let high_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "critical task".to_string(),
+            "urgent".to_string(),
+            GoalPriority::CRITICAL,
+            1000,
+        );
+        let low_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "minor task".to_string(),
+            "routine".to_string(),
+            GoalPriority::LOW,
+            1000,
+        );
+
+        runtime.goal_store().add(high_goal.clone()).await.unwrap();
+        runtime.goal_store().add(low_goal.clone()).await.unwrap();
+
+        // Verify both goals exist and have correct priorities.
+        let goals = runtime
+            .goal_store()
+            .list_by_agent(&"dca-priority:worker".to_string())
+            .await;
+        assert_eq!(goals.len(), 2);
+        let high = goals
+            .iter()
+            .find(|g| g.priority == GoalPriority::CRITICAL)
+            .unwrap();
+        let low = goals
+            .iter()
+            .find(|g| g.priority == GoalPriority::LOW)
+            .unwrap();
+        assert_eq!(high.description, "critical task");
+        assert_eq!(low.description, "minor task");
+        assert!(high.priority > low.priority);
+    }
+
+    /// SAES 0.2: adaptive behavior — same situation, different history → different decisions.
+    /// This is the key test that proves the cycle produces "changed behaviour".
+    #[tokio::test]
+    async fn saes_same_situation_different_history_different_decisions() {
+        let event_store_a = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus_a = Arc::new(decentraai_event_bus::EventBus::new(event_store_a));
+        let obs_builder_a = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "tasks": [
+                    {"id": "t1", "status": "open", "required_capability": "Analysis", "reward": 200}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        // Agent A: successful history on Analysis
+        let runtime_a = LocalAgentRuntime::new(event_bus_a, obs_builder_a);
+        let config_a = AgentConfig {
+            agent_id: "dca-adapt-a:worker".to_string(),
+            name: "Successful Worker".to_string(),
+            capabilities: vec!["Analysis".to_string()],
+            initial_goals: vec!["serve".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        runtime_a.spawn(config_a).await.unwrap();
+
+        // Give Agent A 5 successes on Analysis
+        for _ in 0..5 {
+            let obs = runtime_a
+                .observe(&"dca-adapt-a:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime_a
+                .decide(&"dca-adapt-a:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime_a
+                .act(&"dca-adapt-a:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: true,
+                output: None,
+                error: None,
+                evidence_id: None,
+                reward: Some(100),
+                reputation_delta: None,
+            };
+            runtime_a
+                .learn(&"dca-adapt-a:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Agent B: same setup, but 5 failures on Analysis
+        let event_store_b = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus_b = Arc::new(decentraai_event_bus::EventBus::new(event_store_b));
+        let obs_builder_b = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "tasks": [
+                    {"id": "t1", "status": "open", "required_capability": "Analysis", "reward": 200}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime_b = LocalAgentRuntime::new(event_bus_b, obs_builder_b);
+        let config_b = AgentConfig {
+            agent_id: "dca-adapt-b:worker".to_string(),
+            name: "Failing Worker".to_string(),
+            capabilities: vec!["Analysis".to_string()],
+            initial_goals: vec!["serve".to_string()],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        runtime_b.spawn(config_b).await.unwrap();
+
+        // Give Agent B 5 failures on Analysis
+        for _ in 0..5 {
+            let obs = runtime_b
+                .observe(&"dca-adapt-b:worker".to_string())
+                .await
+                .unwrap();
+            let decision = runtime_b
+                .decide(&"dca-adapt-b:worker".to_string(), &obs)
+                .await
+                .unwrap();
+            let action = runtime_b
+                .act(&"dca-adapt-b:worker".to_string(), &decision)
+                .await
+                .unwrap();
+            let outcome = ActionResult {
+                success: false,
+                output: None,
+                error: Some("failed".to_string()),
+                evidence_id: None,
+                reward: None,
+                reputation_delta: None,
+            };
+            runtime_b
+                .learn(&"dca-adapt-b:worker".to_string(), &action, &outcome)
+                .await
+                .unwrap();
+        }
+
+        // Now both agents face the SAME situation: Analysis task available.
+        let obs_a = runtime_a
+            .observe(&"dca-adapt-a:worker".to_string())
+            .await
+            .unwrap();
+        let obs_b = runtime_b
+            .observe(&"dca-adapt-b:worker".to_string())
+            .await
+            .unwrap();
+
+        let decision_a = runtime_a
+            .decide(&"dca-adapt-a:worker".to_string(), &obs_a)
+            .await
+            .unwrap();
+        let decision_b = runtime_b
+            .decide(&"dca-adapt-b:worker".to_string(), &obs_b)
+            .await
+            .unwrap();
+
+        // Agent A (successful) should BID — Analysis is a preferred strategy.
+        assert_eq!(decision_a.decision_type, DecisionType::Bid);
+        assert!(decision_a.reasoning.contains("preferred"));
+
+        // Agent B (failing) should WAIT — Analysis is an avoided strategy.
+        assert_eq!(decision_b.decision_type, DecisionType::Wait);
+        assert!(decision_b.reasoning.contains("overridden"));
+
+        // SAME situation, DIFFERENT decisions based on history.
+        // This is the proof that SAES produces "changed behaviour".
+    }
+
+    /// SAES 0.2: priority-based goal selection — highest priority goal's task is preferred.
+    #[tokio::test]
+    async fn saes_priority_based_goal_selection() {
+        let event_store = Arc::new(decentraai_event_bus::InMemoryEventStore::new(1000));
+        let event_bus = Arc::new(decentraai_event_bus::EventBus::new(event_store));
+        let obs_builder = Arc::new(StaticObservationBuilder {
+            hub_state: serde_json::json!({
+                "tasks": [
+                    {"id": "t-low", "status": "open", "required_capability": "Chat", "reward": 50},
+                    {"id": "t-high", "status": "open", "required_capability": "Analysis", "reward": 500}
+                ]
+            }),
+            society_state: serde_json::json!({}),
+            arena_state: None,
+            personal_memory: serde_json::json!({}),
+        });
+
+        let runtime = LocalAgentRuntime::new(event_bus, obs_builder);
+
+        // Spawn agent with both capabilities
+        let config = AgentConfig {
+            agent_id: "dca-priority:worker".to_string(),
+            name: "Priority Worker".to_string(),
+            capabilities: vec!["Chat".to_string(), "Analysis".to_string()],
+            initial_goals: vec![],
+            initial_memory: None,
+            policy_overrides: None,
+            resource_limits: ResourceLimits::default(),
+        };
+        runtime.spawn(config).await.unwrap();
+
+        // Create a CRITICAL goal for Analysis and a LOW goal for Chat
+        let mut high_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "urgent analysis".to_string(),
+            "analysis".to_string(),
+            crate::saes::goals::GoalPriority::CRITICAL,
+            1000,
+        );
+        high_goal
+            .transition_to(crate::saes::goals::GoalState::Active, 1000)
+            .unwrap();
+        runtime.goal_store().add(high_goal).await.unwrap();
+
+        let mut low_goal = crate::saes::goals::AgentGoal::new(
+            "dca-priority:worker".to_string(),
+            "casual chat".to_string(),
+            "chat".to_string(),
+            crate::saes::goals::GoalPriority::LOW,
+            1000,
+        );
+        low_goal
+            .transition_to(crate::saes::goals::GoalState::Active, 1000)
+            .unwrap();
+        runtime.goal_store().add(low_goal).await.unwrap();
+
+        // Decide: should prefer the Analysis task (aligned with CRITICAL goal)
+        let obs = runtime
+            .observe(&"dca-priority:worker".to_string())
+            .await
+            .unwrap();
+        let decision = runtime
+            .decide(&"dca-priority:worker".to_string(), &obs)
+            .await
+            .unwrap();
+        assert_eq!(decision.decision_type, DecisionType::Bid);
+        // The task in context should be the Analysis task (aligned with CRITICAL goal)
+        let task_cap = decision
+            .context
+            .get("task")
+            .and_then(|t| t.get("required_capability"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(task_cap, "Analysis");
     }
 }

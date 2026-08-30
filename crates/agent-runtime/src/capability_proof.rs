@@ -18,10 +18,7 @@
 //! 4. The action is recorded and emitted on the bus.
 
 use crate::policy::JsonSpecPolicyLite;
-use crate::{
-    AgentConfig,
-    AgentObservation, AgentRuntime, AgentStatus,
-};
+use crate::{AgentConfig, AgentObservation, AgentRuntime, AgentStatus};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use decentraai_event_bus::EventBus;
@@ -39,7 +36,9 @@ pub struct TinyRegistry {
 
 impl TinyRegistry {
     pub fn new() -> Self {
-        Self { ids: DashMap::new() }
+        Self {
+            ids: DashMap::new(),
+        }
     }
     pub fn register(&self, id: &str) {
         self.ids.insert(id.to_string(), ());
@@ -103,10 +102,8 @@ mod tests {
                 ]
             }),
         });
-        let runtime: Arc<dyn AgentRuntime> = Arc::new(LocalAgentRuntime::new(
-            bus.clone(),
-            observer,
-        ));
+        let runtime: Arc<dyn AgentRuntime> =
+            Arc::new(LocalAgentRuntime::new(bus.clone(), observer));
 
         // 2. A tiny in-test registry declares the new capability.
         //    This is the call-site validation pattern: the runtime
@@ -131,7 +128,10 @@ mod tests {
         let h = runtime.spawn(cfg.clone()).await.unwrap();
         assert_eq!(h.status, AgentStatus::Ready);
         let state = runtime.get_state(&cfg.agent_id).await.unwrap();
-        assert_eq!(state.config.capabilities, vec!["quantum_simulation_v0".to_string()]);
+        assert_eq!(
+            state.config.capabilities,
+            vec!["quantum_simulation_v0".to_string()]
+        );
 
         // 4. Install a custom policy that branches on the new
         //    capability. The runtime does not interpret the
@@ -164,10 +164,7 @@ mod tests {
                 }),
             }),
         ));
-        concrete.install_json_spec_for(
-            &cfg.agent_id,
-            policy,
-        );
+        concrete.install_json_spec_for(&cfg.agent_id, policy);
         let h2 = concrete.spawn(cfg.clone()).await.unwrap();
         let observation = concrete.observe(&h2.agent_id).await.unwrap();
         let decision = concrete.decide(&h2.agent_id, &observation).await.unwrap();

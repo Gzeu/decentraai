@@ -24,16 +24,20 @@
 //! This keeps the runtime decoupled from any specific registry
 //! implementation.
 
-use crate::policy::{DefaultBidPolicy, DecisionPolicy, JsonSpecPolicyLite};
+use crate::policy::{DecisionPolicy, DefaultBidPolicy, JsonSpecPolicyLite};
+use crate::saes::adaptation::{BehaviorStore, InMemoryBehaviorStore};
+use crate::saes::goals::{AgentGoal, GoalPriority, GoalState, GoalStore, InMemoryGoalStore};
+use crate::saes::learning::compute_learning_effect;
+use crate::saes::outcomes::ActionOutcome;
 use crate::{
     ActionResult, ActionType, AgentAction, AgentConfig, AgentDecision, AgentHandle, AgentId,
     AgentMetrics, AgentObservation, AgentRuntime, AgentRuntimeError, AgentState, AgentStatus,
-    ResourceUsage,
+    DecisionType, ResourceUsage,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use decentraai_event_bus::{Event, EventBus, EventPriority, Topic};
 use decentraai_agent_society::AgentId as ProtocolAgentId;
+use decentraai_event_bus::{Event, EventBus, EventPriority, Topic};
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
@@ -54,14 +58,14 @@ pub enum LocalRuntimeError {
 /// agent's declared capabilities.
 #[async_trait]
 pub trait ObservationBuilder: Send + Sync {
-    async fn build(
-        &self,
-        agent_id: &ProtocolAgentId,
-        capabilities: &[String],
-    ) -> AgentObservation;
+    async fn build(&self, agent_id: &ProtocolAgentId, capabilities: &[String]) -> AgentObservation;
 }
 
 /// Local, in-memory implementation of the `AgentRuntime` trait.
+///
+/// SAES 0.2: the runtime now maintains per-agent `GoalStore` and
+/// `BehaviorStore` so the autonomous cycle (goals → observe → decide →
+/// act → outcome → learning → adaptation) is real, not just tested.
 pub struct LocalAgentRuntime {
     agents: DashMap<ProtocolAgentId, AgentState>,
     event_bus: Arc<EventBus>,
@@ -70,6 +74,12 @@ pub struct LocalAgentRuntime {
     /// Per-agent policy override.
     agent_policies: DashMap<ProtocolAgentId, Arc<dyn DecisionPolicy>>,
     observation_builder: Arc<dyn ObservationBuilder>,
+    /// SAES 0.2: structured goal tracking per agent.
+    goal_store: Arc<dyn GoalStore>,
+    /// SAES 0.2: behavior profiles for adaptation.
+    behavior_store: Arc<dyn BehaviorStore>,
+    /// SAES 0.4: collective goal coordination.
+    collective_goal_store: Arc<dyn crate::saes::collective::CollectiveGoalStore>,
 }
 
 impl std::fmt::Debug for LocalAgentRuntime {
@@ -77,21 +87,25 @@ impl std::fmt::Debug for LocalAgentRuntime {
         f.debug_struct("LocalAgentRuntime")
             .field("agent_count", &self.agents.len())
             .field("default_policy", &self.default_policy.name())
+            .field("goal_store", &"Arc<dyn GoalStore>")
+            .field("behavior_store", &"Arc<dyn BehaviorStore>")
             .finish()
     }
 }
 
 impl LocalAgentRuntime {
-    pub fn new(
-        event_bus: Arc<EventBus>,
-        observation_builder: Arc<dyn ObservationBuilder>,
-    ) -> Self {
+    pub fn new(event_bus: Arc<EventBus>, observation_builder: Arc<dyn ObservationBuilder>) -> Self {
         Self {
             agents: DashMap::new(),
             event_bus,
             default_policy: Arc::new(DefaultBidPolicy),
             agent_policies: DashMap::new(),
             observation_builder,
+            goal_store: Arc::new(InMemoryGoalStore::new()),
+            behavior_store: Arc::new(InMemoryBehaviorStore::new()),
+            collective_goal_store: Arc::new(
+                crate::saes::collective::InMemoryCollectiveGoalStore::new(),
+            ),
         }
     }
 
@@ -101,24 +115,148 @@ impl LocalAgentRuntime {
         self
     }
 
+    /// SAES 0.2: inject a custom goal store (e.g. SQLite-backed for production).
+    pub fn with_goal_store(mut self, goal_store: Arc<dyn GoalStore>) -> Self {
+        self.goal_store = goal_store;
+        self
+    }
+
+    /// SAES 0.2: inject a custom behavior store.
+    pub fn with_behavior_store(mut self, behavior_store: Arc<dyn BehaviorStore>) -> Self {
+        self.behavior_store = behavior_store;
+        self
+    }
+
+    /// SAES 0.4: inject a custom collective goal store.
+    pub fn with_collective_goal_store(
+        mut self,
+        collective_goal_store: Arc<dyn crate::saes::collective::CollectiveGoalStore>,
+    ) -> Self {
+        self.collective_goal_store = collective_goal_store;
+        self
+    }
+
     /// Install a per-agent policy override. The override is used
     /// instead of the default for this agent.
-    pub fn install_policy_for(
-        &self,
-        agent_id: &ProtocolAgentId,
-        policy: Arc<dyn DecisionPolicy>,
-    ) {
+    pub fn install_policy_for(&self, agent_id: &ProtocolAgentId, policy: Arc<dyn DecisionPolicy>) {
         self.agent_policies.insert(agent_id.clone(), policy);
     }
 
     /// Install a JSON-Spec policy for one specific agent.
-    pub fn install_json_spec_for(
+    pub fn install_json_spec_for(&self, agent_id: &ProtocolAgentId, spec: JsonSpecPolicyLite) {
+        self.agent_policies.insert(agent_id.clone(), Arc::new(spec));
+    }
+
+    /// SAES 0.2: access the goal store (for inspection/testing).
+    pub fn goal_store(&self) -> &Arc<dyn GoalStore> {
+        &self.goal_store
+    }
+
+    /// SAES 0.2: access the behavior store (for inspection/testing).
+    pub fn behavior_store(&self) -> &Arc<dyn BehaviorStore> {
+        &self.behavior_store
+    }
+
+    /// SAES 0.4: access the collective goal store (for inspection/testing).
+    pub fn collective_goal_store(&self) -> &Arc<dyn crate::saes::collective::CollectiveGoalStore> {
+        &self.collective_goal_store
+    }
+
+    /// SAES 0.2: filter observation to prefer tasks aligned with active goals.
+    ///
+    /// When the agent has active goals, this method reorders tasks in the
+    /// observation so that tasks matching the highest-priority goal appear
+    /// first. The DefaultBidPolicy picks the first matching task, so this
+    /// effectively makes it prefer goal-aligned work.
+    ///
+    /// Goal matching is done by checking if the goal description contains
+    /// a keyword that matches the task's required_capability. This is a
+    /// heuristic — production implementations should use explicit capability
+    /// mappings.
+    fn filter_observation_by_goals(
         &self,
-        agent_id: &ProtocolAgentId,
-        spec: JsonSpecPolicyLite,
-    ) {
-        self.agent_policies
-            .insert(agent_id.clone(), Arc::new(spec));
+        obs: &AgentObservation,
+        active_goals: &[&AgentGoal],
+    ) -> AgentObservation {
+        let tasks = match obs
+            .hub_state_summary
+            .get("tasks")
+            .and_then(|t| t.as_array())
+        {
+            Some(arr) => arr,
+            None => return obs.clone(),
+        };
+
+        if tasks.is_empty() {
+            return obs.clone();
+        }
+
+        // Sort goals by priority descending.
+        let mut sorted_goals: Vec<&AgentGoal> = active_goals.to_vec();
+        sorted_goals.sort_by_key(|b| std::cmp::Reverse(b.priority));
+
+        // Build a priority map: task_id → goal priority (higher = more important).
+        // A task matches a goal if the goal description contains a keyword
+        // that appears in the task's required_capability.
+        let mut task_priorities: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
+
+        for task in tasks {
+            let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let cap = task
+                .get("required_capability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            for goal in &sorted_goals {
+                // Check if the goal description or kind matches the capability.
+                let desc_lower = goal.description.to_lowercase();
+                let kind_lower = goal.kind.to_lowercase();
+                let cap_lower = cap.to_lowercase();
+
+                if desc_lower.contains(&cap_lower)
+                    || kind_lower.contains(&cap_lower)
+                    || cap_lower.contains(desc_lower.split_whitespace().next().unwrap_or(""))
+                {
+                    let priority = goal.priority.0;
+                    // Keep the highest priority for this task.
+                    let entry = task_priorities.entry(task_id.to_string()).or_insert(0);
+                    if priority > *entry {
+                        *entry = priority;
+                    }
+                }
+            }
+        }
+
+        // If no tasks matched any goal, return the original observation.
+        if task_priorities.is_empty() {
+            return obs.clone();
+        }
+
+        // Sort tasks by goal priority descending, then by original order.
+        let mut indexed_tasks: Vec<(usize, &serde_json::Value)> =
+            tasks.iter().enumerate().collect();
+        indexed_tasks.sort_by(|a, b| {
+            let pa = task_priorities
+                .get(a.1.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            let pb = task_priorities
+                .get(b.1.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .copied()
+                .unwrap_or(0);
+            pb.cmp(&pa).then(a.0.cmp(&b.0))
+        });
+
+        // Rebuild the observation with reordered tasks.
+        let sorted_tasks: Vec<serde_json::Value> =
+            indexed_tasks.into_iter().map(|(_, t)| t.clone()).collect();
+        let mut new_obs = obs.clone();
+        new_obs.hub_state_summary = serde_json::json!({
+            "tasks": sorted_tasks,
+            "available_capabilities": obs.available_capabilities,
+        });
+        new_obs
     }
 
     /// Validate that the declared capabilities have a well-formed
@@ -158,8 +296,8 @@ impl LocalAgentRuntime {
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_millis() as u64)
-    .unwrap_or(0)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -172,11 +310,39 @@ impl AgentRuntime for LocalAgentRuntime {
             return Err(AgentRuntimeError::AlreadyExists(id));
         }
         let now = now_ms();
+
+        // SAES 0.2: create structured goals from initial_goals strings.
+        let mut goal_ids = Vec::new();
+        for goal_desc in &config.initial_goals {
+            let kind = if goal_desc.contains("serve") || goal_desc.contains("request") {
+                "serve_request".to_string()
+            } else if goal_desc.contains("code") || goal_desc.contains("write") {
+                "code_generation".to_string()
+            } else {
+                "general".to_string()
+            };
+            let mut goal = AgentGoal::new(
+                id.clone(),
+                goal_desc.clone(),
+                kind,
+                GoalPriority::NORMAL,
+                now,
+            );
+            // Auto-activate initial goals.
+            if let Err(e) = goal.transition_to(GoalState::Active, now) {
+                tracing::debug!(agent = %id, error = %e, "saes: failed to activate initial goal");
+            }
+            goal_ids.push(goal.id.clone());
+            if let Err(e) = self.goal_store.add(goal).await {
+                tracing::debug!(agent = %id, error = %e, "saes: failed to store initial goal");
+            }
+        }
+
         let state = AgentState {
             agent_id: id.clone(),
             status: AgentStatus::Initializing,
             config,
-            current_goals: vec![],
+            current_goals: goal_ids,
             current_beliefs: serde_json::Value::Null,
             resource_usage: ResourceUsage::default(),
             metrics: AgentMetrics::default(),
@@ -225,10 +391,83 @@ impl AgentRuntime for LocalAgentRuntime {
             .get(agent_id)
             .map(|p| p.value().clone())
             .unwrap_or_else(|| self.default_policy.clone());
-        let decision = policy.decide(observation);
+
+        // SAES 0.2: check deadline monitoring — auto-fail overdue goals.
+        let now = now_ms();
+        let active_goals = self.goal_store.list_by_agent(agent_id).await;
+        for goal in &active_goals {
+            if goal.is_overdue(now) {
+                tracing::info!(
+                    agent = %agent_id,
+                    goal = %goal.id,
+                    deadline = goal.deadline.unwrap_or(0),
+                    "saes: goal overdue, auto-failing"
+                );
+                if let Ok(mut g) = self.goal_store.get(&goal.id).await {
+                    let _ = g.fail("deadline exceeded".to_string(), now);
+                    let _ = self.goal_store.update(g).await;
+                }
+            }
+        }
+
+        // SAES 0.2: goal-aware observation filtering.
+        // If there are active goals, filter tasks to prefer those aligned
+        // with the highest-priority goal. This makes the policy naturally
+        // favor goal-aligned tasks without needing goal-awareness.
+        let active_goals_filtered: Vec<_> = active_goals
+            .iter()
+            .filter(|g| g.state == GoalState::Active)
+            .collect();
+
+        let effective_obs = if !active_goals_filtered.is_empty() {
+            self.filter_observation_by_goals(observation, &active_goals_filtered)
+        } else {
+            observation.clone()
+        };
+
+        let mut decision = policy.decide(&effective_obs);
+
+        // SAES 0.2: adapt decision based on behavior profile.
+        let profile = self
+            .behavior_store
+            .get_or_create(&agent_id.to_string())
+            .await;
+
+        if decision.decision_type == DecisionType::Bid {
+            // Extract the task's required capability from the decision context.
+            if let Some(task_cap) = decision
+                .context
+                .get("task")
+                .and_then(|t| t.get("required_capability"))
+                .and_then(|v| v.as_str())
+            {
+                let (use_strategy, conf, reason) = profile.should_use_strategy(task_cap);
+                if !use_strategy {
+                    // Override: don't bid on avoided strategies.
+                    decision.decision_type = DecisionType::Wait;
+                    decision.reasoning =
+                        format!("{} [saes: overridden — {}]", decision.reasoning, reason);
+                    decision.confidence = conf;
+                    tracing::debug!(
+                        agent = %agent_id,
+                        capability = task_cap,
+                        reason = %reason,
+                        "saes: bid overridden to wait (avoided strategy)"
+                    );
+                } else if conf > 0.6 {
+                    // Boost confidence for preferred strategies.
+                    decision.confidence = (decision.confidence + conf) / 2.0;
+                    decision.reasoning = format!(
+                        "{} [saes: preferred strategy — {}]",
+                        decision.reasoning, reason
+                    );
+                }
+            }
+        }
+
         if let Some(mut s) = self.agents.get_mut(agent_id) {
-            s.last_active_at = now_ms();
-            s.updated_at = now_ms();
+            s.last_active_at = now;
+            s.updated_at = now;
         }
         Ok(decision)
     }
@@ -254,9 +493,7 @@ impl AgentRuntime for LocalAgentRuntime {
             }
             crate::DecisionType::Wait | crate::DecisionType::Rest => ActionType::HubState,
             crate::DecisionType::Search => ActionType::MemorySearch,
-            crate::DecisionType::Learn | crate::DecisionType::Reflect => {
-                ActionType::MemoryWrite
-            }
+            crate::DecisionType::Learn | crate::DecisionType::Reflect => ActionType::MemoryWrite,
             crate::DecisionType::Dream => ActionType::MemoryWrite,
         };
         // Pack the full decision into the action's parameters so the
@@ -306,37 +543,188 @@ impl AgentRuntime for LocalAgentRuntime {
         action: &AgentAction,
         outcome: &ActionResult,
     ) -> Result<(), AgentRuntimeError> {
+        let now = now_ms();
+
+        // SAES 0.4: check if this action was linked to a collective goal sub-goal.
+        // We can check if the action parameters contain a `sub_goal_id`.
+        let sub_goal_id = action
+            .parameters
+            .get("sub_goal_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // SAES 0.2: build structured outcome and compute learning effect.
+        // Use the task's required_capability as the action_kind for behavior tracking,
+        // so the profile tracks success/failure per capability (what matters for adaptation).
+        let fallback_kind = format!("{:?}", action.action_type);
+        let action_kind = action
+            .parameters
+            .get("context")
+            .and_then(|c| c.get("task"))
+            .and_then(|t| t.get("required_capability"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&fallback_kind);
+        let action_outcome = ActionOutcome::from_action_result(
+            action.agent_id.clone(), // action_id
+            agent_id.clone(),
+            None, // goal_id — linked below if we find an active goal
+            outcome,
+            action_kind,
+            now,
+        );
+
+        // Find active goals for this agent to link to the outcome.
+        let active_goals = self.goal_store.list_by_agent(agent_id).await;
+        let mut active_goals_filtered: Vec<_> = active_goals
+            .iter()
+            .filter(|g| g.state == GoalState::Active)
+            .cloned()
+            .collect();
+
+        // Link the outcome to the highest-priority active goal (not FIFO).
+        // Sort by priority descending so the first element is the most important.
+        active_goals_filtered.sort_by_key(|b| std::cmp::Reverse(b.priority));
+        let mut outcome_with_goal = action_outcome;
+        if let Some(goal) = active_goals_filtered.first() {
+            outcome_with_goal.goal_id = Some(goal.id.clone());
+        }
+
+        // Compute learning effect (pure function).
+        let effect = compute_learning_effect(&outcome_with_goal, &active_goals_filtered, now);
+
+        // Apply goal transitions.
+        for (goal_id, new_state, failure_reason) in &effect.goal_transitions {
+            if let Ok(mut goal) = self.goal_store.get(goal_id).await {
+                // Set failure reason before transitioning if failing.
+                if *new_state == GoalState::Failed
+                    && let Some(reason) = failure_reason
+                {
+                    goal.failure_reason = Some(reason.clone());
+                }
+                if let Err(e) = goal.transition_to(*new_state, now) {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        goal = %goal_id,
+                        error = %e,
+                        "saes: goal transition failed"
+                    );
+                } else {
+                    if let Err(e) = self.goal_store.update(goal).await {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            goal = %goal_id,
+                            error = %e,
+                            "saes: goal update failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Apply goal progress updates.
+        for (goal_id, new_progress) in &effect.goal_progress_updates {
+            if let Ok(mut goal) = self.goal_store.get(goal_id).await {
+                goal.set_progress(*new_progress, now);
+                if let Err(e) = self.goal_store.update(goal).await {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        goal = %goal_id,
+                        error = %e,
+                        "saes: goal progress update failed"
+                    );
+                }
+            }
+        }
+
+        // Update behavior profile.
+        let mut profile = self
+            .behavior_store
+            .get_or_create(&agent_id.to_string())
+            .await;
+        profile.incorporate(&effect.entry);
+
+        // SAES 0.4: propagate progress to collective goals.
+        if let Some(sid) = sub_goal_id {
+            let cg_list = self.collective_goal_store.list_all().await;
+            for mut cg in cg_list {
+                if let Some(sg) = cg.sub_goals.get_mut(&sid) {
+                    // Map AgentGoal state/progress to SubGoal
+                    for (gid, progress) in &effect.goal_progress_updates {
+                        if gid == &sg.id {
+                            sg.set_progress(*progress, now);
+                        }
+                    }
+
+                    // Check for completion
+                    for (gid, state, _) in &effect.goal_transitions {
+                        if gid == &sg.id {
+                            if *state == GoalState::Completed {
+                                sg.complete(now);
+                            } else if *state == GoalState::Failed {
+                                sg.fail("Learning outcome failure".to_string(), now);
+                            }
+                        }
+                    }
+
+                    cg.recompute_progress(now);
+                    let _ = self.collective_goal_store.update(cg).await;
+                    break;
+                }
+            }
+        }
+
+        // Update goal stats.
+        let completed = self
+            .goal_store
+            .count_by_state(agent_id, GoalState::Completed)
+            .await;
+        let failed = self
+            .goal_store
+            .count_by_state(agent_id, GoalState::Failed)
+            .await;
+        let abandoned = self
+            .goal_store
+            .count_by_state(agent_id, GoalState::Abandoned)
+            .await;
+        profile.update_goal_stats(completed as u64, failed as u64, abandoned as u64, now);
+        self.behavior_store.save(profile).await;
+
+        // Update agent metrics from learning effect.
         if let Some(mut s) = self.agents.get_mut(agent_id) {
-            if outcome.success {
-                s.metrics.tasks_completed = s.metrics.tasks_completed.saturating_add(1);
-            } else {
-                s.metrics.tasks_failed = s.metrics.tasks_failed.saturating_add(1);
-            }
-            if let Some(r) = outcome.reward {
-                s.metrics.total_reward_earned =
-                    s.metrics.total_reward_earned.saturating_add(r);
-            }
+            let (dc, df, dr) = effect.metrics_delta;
+            s.metrics.tasks_completed = s.metrics.tasks_completed.saturating_add(dc);
+            s.metrics.tasks_failed = s.metrics.tasks_failed.saturating_add(df);
+            s.metrics.total_reward_earned = s.metrics.total_reward_earned.saturating_add(dr);
             if let Some(d) = outcome.reputation_delta {
                 s.metrics.reputation_score += d;
             }
-            s.last_active_at = now_ms();
-            s.updated_at = now_ms();
+            s.last_active_at = now;
+            s.updated_at = now;
         }
+
+        // Emit structured learning event.
         let event = Event {
             id: decentraai_event_bus::EventId::new(),
             topic: Topic::agent(&agent_id.to_string()),
             source: agent_id.clone(),
-            timestamp: now_ms(),
+            timestamp: now,
             event_type: "agent.learn".to_string(),
             payload: serde_json::json!({
                 "action_type": format!("{:?}", action.action_type),
                 "success": outcome.success,
                 "reward": outcome.reward,
                 "reputation_delta": outcome.reputation_delta,
+                "lesson": effect.entry.lesson,
+                "goal_id": effect.entry.goal_id,
+                "goal_transitions": effect.goal_transitions.iter().map(|(id, s, _)| (id, s.to_string())).collect::<Vec<_>>(),
             }),
             metadata: decentraai_event_bus::EventMetadata {
                 priority: EventPriority::Normal,
-                tags: vec!["agent-runtime".to_string(), "learn".to_string()],
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "learn".to_string(),
+                    "saes-0.2".to_string(),
+                ],
                 ..Default::default()
             },
         };
@@ -376,11 +764,7 @@ impl AgentRuntime for LocalAgentRuntime {
         Ok(())
     }
 
-    async fn retire(
-        &self,
-        agent_id: &AgentId,
-        reason: String,
-    ) -> Result<(), AgentRuntimeError> {
+    async fn retire(&self, agent_id: &AgentId, reason: String) -> Result<(), AgentRuntimeError> {
         if let Some(mut s) = self.agents.get_mut(agent_id) {
             s.status = AgentStatus::Retired;
             s.updated_at = now_ms();
@@ -437,11 +821,7 @@ impl StaticObservationBuilder {
 
 #[async_trait]
 impl ObservationBuilder for StaticObservationBuilder {
-    async fn build(
-        &self,
-        agent_id: &ProtocolAgentId,
-        capabilities: &[String],
-    ) -> AgentObservation {
+    async fn build(&self, agent_id: &ProtocolAgentId, capabilities: &[String]) -> AgentObservation {
         AgentObservation {
             agent_id: agent_id.clone(),
             timestamp: now_ms(),
@@ -635,11 +1015,20 @@ mod tests {
         let r = LocalAgentRuntime::new(bus, obs);
         let h = r.spawn(cfg(vec!["a".into()])).await.unwrap();
         r.pause(&h.agent_id).await.unwrap();
-        assert_eq!(r.get_state(&h.agent_id).await.unwrap().status, AgentStatus::Paused);
+        assert_eq!(
+            r.get_state(&h.agent_id).await.unwrap().status,
+            AgentStatus::Paused
+        );
         r.resume(&h.agent_id).await.unwrap();
-        assert_eq!(r.get_state(&h.agent_id).await.unwrap().status, AgentStatus::Ready);
+        assert_eq!(
+            r.get_state(&h.agent_id).await.unwrap().status,
+            AgentStatus::Ready
+        );
         r.stop(&h.agent_id).await.unwrap();
-        assert_eq!(r.get_state(&h.agent_id).await.unwrap().status, AgentStatus::Stopped);
+        assert_eq!(
+            r.get_state(&h.agent_id).await.unwrap().status,
+            AgentStatus::Stopped
+        );
     }
 
     #[tokio::test]
@@ -649,7 +1038,10 @@ mod tests {
         let r = LocalAgentRuntime::new(bus, obs);
         let h = r.spawn(cfg(vec!["a".into()])).await.unwrap();
         r.retire(&h.agent_id, "test".to_string()).await.unwrap();
-        assert_eq!(r.get_state(&h.agent_id).await.unwrap().status, AgentStatus::Retired);
+        assert_eq!(
+            r.get_state(&h.agent_id).await.unwrap().status,
+            AgentStatus::Retired
+        );
     }
 
     #[tokio::test]
@@ -687,7 +1079,11 @@ mod tests {
         c.name = "quantum-bot".to_string();
         let h = r.spawn(c).await.unwrap();
         let observation = r.observe(&h.agent_id).await.unwrap();
-        assert!(observation.available_capabilities.contains(&"quantum_simulation_v0".to_string()));
+        assert!(
+            observation
+                .available_capabilities
+                .contains(&"quantum_simulation_v0".to_string())
+        );
         // Default policy sees the matching task and bids.
         let d = r.decide(&h.agent_id, &observation).await.unwrap();
         assert!(matches!(d.decision_type, crate::DecisionType::Bid));
@@ -740,9 +1136,7 @@ mod tests {
         for _ in 0..10 {
             match rx.try_recv() {
                 Ok(ev) => {
-                    if ev.event_type == "agent.action"
-                        && ev.source == h.agent_id
-                    {
+                    if ev.event_type == "agent.action" && ev.source == h.agent_id {
                         found = Some(ev);
                         break;
                     }
@@ -759,7 +1153,10 @@ mod tests {
             Some("Bid")
         );
         assert_eq!(
-            params.get("reasoning").and_then(|v| v.as_str()).map(|s| s.contains("task t9")),
+            params
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("task t9")),
             Some(true)
         );
         assert!(params.get("confidence").and_then(|v| v.as_f64()).unwrap() > 0.0);
@@ -919,7 +1316,9 @@ mod tests {
         let (bus,) = runtime();
         let obs = Arc::new(StaticObservationBuilder::empty());
         let r = LocalAgentRuntime::new(bus, obs);
-        let result = r.get_metrics(&decentraai_protocol::AgentId::from("ghost")).await;
+        let result = r
+            .get_metrics(&decentraai_protocol::AgentId::from("ghost"))
+            .await;
         assert!(matches!(result, Err(crate::AgentRuntimeError::NotFound(_))));
     }
 }
