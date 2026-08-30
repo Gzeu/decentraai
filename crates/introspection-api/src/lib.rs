@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use decentraai_agent_runtime::{AgentRuntime, AgentState, AgentObservation, AgentDecision, AgentAction, AgentMetrics, AgentConfig, AgentId};
-use decentraai_agent_personal_memory::PersonalMemoryStore;
-use decentraai_agent_society::SocietyState;
-use decentraai_hub::HubState;
+use decentraai_agent_runtime::{AgentRuntime, AgentState, AgentMetrics, AgentConfig};
+use decentraai_agent_society::{AgentId, SocietyState};
+use decentraai_agent_society::HubState;
 use decentraai_arena::ArenaWorld;
 use decentraai_compute::QuotaLedger;
 use decentraai_tokens::ConsumerKeyStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -26,7 +26,7 @@ pub enum IntrospectionError {
     Internal(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentFullState {
     pub agent_state: serde_json::Value,
     pub metrics: serde_json::Value,
@@ -40,7 +40,7 @@ pub struct AgentFullState {
     pub reflections: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentSummary {
     pub agent_id: String,
     pub status: String,
@@ -52,7 +52,7 @@ pub struct AgentSummary {
     pub last_active: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentMetricsSummary {
     pub tasks_completed: u64,
     pub tasks_failed: u64,
@@ -63,7 +63,7 @@ pub struct AgentMetricsSummary {
     pub trust_received: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemorySummary {
     pub total_entries: usize,
     pub categories: HashMap<String, usize>,
@@ -72,7 +72,7 @@ pub struct MemorySummary {
     pub relationships: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SocietySummary {
     pub contributions: u64,
     pub outcomes: u64,
@@ -81,7 +81,7 @@ pub struct SocietySummary {
     pub relationships: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentActivity {
     pub agent_id: String,
     pub timestamp: u64,
@@ -89,7 +89,7 @@ pub struct AgentActivity {
     pub details: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentSearchQuery {
     pub agent_id: Option<String>,
     pub capability: Option<String>,
@@ -98,14 +98,14 @@ pub struct AgentSearchQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkTopology {
     pub agents: Vec<AgentNode>,
     pub connections: Vec<AgentConnection>,
     pub clusters: Vec<AgentCluster>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentNode {
     pub agent_id: String,
     pub name: String,
@@ -115,7 +115,7 @@ pub struct AgentNode {
     pub location: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentConnection {
     pub from: String,
     pub to: String,
@@ -125,7 +125,7 @@ pub struct AgentConnection {
     pub last_interaction: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentCluster {
     pub id: String,
     pub name: String,
@@ -134,16 +134,15 @@ pub struct AgentCluster {
     pub shared_goals: Vec<String>,
 }
 
-#[derive(Debug, Error)]
-pub enum IntrospectionError {
-    #[error("Agent not found: {0}")]
-    NotFound(String),
-    #[error("Permission denied: {0}")]
-    PermissionDenied(String),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("Internal error: {0}")]
-    Internal(String),
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentMetadata {
+    pub agent_id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub last_active: u64,
+    pub total_tasks: u64,
+    pub total_reward: u64,
+    pub tags: Vec<String>,
 }
 
 #[async_trait]
@@ -164,64 +163,46 @@ pub trait IntrospectionProvider: Send + Sync {
 
 pub struct IntrospectionService {
     agent_runtime: Arc<dyn AgentRuntime>,
-    personal_memory: Arc<PersonalMemoryStore>,
+    personal_memory: Arc<decentraai_agent_personal_memory::PersonalMemoryStore>,
     society: Arc<RwLock<SocietyState>>,
-    hub: Arc<tokio::sync::Mutex<HubState>>,
     arena: Arc<RwLock<ArenaWorld>>,
     quota_ledger: Arc<Mutex<QuotaLedger>>,
-    consumer_keys: Arc<ConsumerKeyStore>,
     agent_metadata: Arc<DashMap<String, AgentMetadata>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Clone, Default)]
-pub struct AgentMetadata {
-    pub agent_id: String,
-    pub name: String,
-    pub created_at: u64,
-    pub last_active: u64,
-    pub total_tasks: u64,
-    pub total_reward: u64,
-    pub tags: Vec<String>,
 }
 
 impl IntrospectionService {
     pub fn new(
         agent_runtime: Arc<dyn AgentRuntime>,
-        personal_memory: Arc<PersonalMemoryStore>,
+        personal_memory: Arc<decentraai_agent_personal_memory::PersonalMemoryStore>,
         society: Arc<RwLock<SocietyState>>,
-        hub: Arc<tokio::sync::Mutex<HubState>>,
         arena: Arc<RwLock<ArenaWorld>>,
         quota_ledger: Arc<Mutex<QuotaLedger>>,
-        consumer_keys: Arc<ConsumerKeyStore>,
     ) -> Self {
         Self {
             agent_runtime,
             personal_memory,
             society,
-            hub,
-            arena: Arc::new(RwLock::new(ArenaWorld::new())),
+            arena,
             quota_ledger,
-            consumer_keys: Arc::new(ConsumerKeyStore::new()),
             agent_metadata: Arc::new(DashMap::new()),
         }
     }
 
     async fn get_agent_state(&self, agent_id: &str) -> Result<AgentState, IntrospectionError> {
-        self.agent_runtime.get_state(&AgentId::from(agent_id.to_string()))
+        self.agent_runtime.get_state(&agent_id.to_string())
             .await
             .map_err(|_| IntrospectionError::NotFound(agent_id.to_string()))
     }
 
     async fn get_personal_memory(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
-        let store = self.personal_memory.as_ref();
-        let snapshot = store.snapshot(agent_id).await
-            .map_err(|_| IntrospectionError::Internal("Failed to get memory snapshot".into()))?;
+        let snapshot = self.personal_memory.snapshot(&agent_id.to_string()).await
+            .map_err(|e| IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}")))?;
         Ok(serde_json::to_value(snapshot).unwrap_or(serde_json::json!({})))
     }
 
     async fn get_society_snapshot(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
         let society = self.society.read().await;
-        let snapshot = decentraai_agent_society::mcp::build_society_state_response(&society, agent_id);
+        let snapshot = decentraai_agent_society::mcp::build_society_state_response(&society, &agent_id.to_string());
         Ok(snapshot)
     }
 
@@ -244,7 +225,6 @@ impl IntrospectionService {
                 "consumed": account.consumed,
                 "reserved": account.reserved,
                 "earned": account.earned,
-                "ceiling": account.ceiling,
             }))
         } else {
             Ok(serde_json::json!({
@@ -252,7 +232,6 @@ impl IntrospectionService {
                 "consumed": 0,
                 "reserved": 0,
                 "earned": 0,
-                "ceiling": 0,
             }))
         }
     }
@@ -267,7 +246,6 @@ impl IntrospectionProvider for IntrospectionService {
         let arena = self.get_arena_snapshot().await?;
         let quota = self.get_quota_snapshot(agent_id).await?;
 
-        let state = self.get_agent_state(agent_id).await?;
         let metrics = serde_json::to_value(&state.metrics).unwrap_or_default();
         let state_val = serde_json::to_value(&state).unwrap_or_default();
 
@@ -277,10 +255,10 @@ impl IntrospectionProvider for IntrospectionService {
         Ok(AgentFullState {
             agent_state: state_val,
             metrics,
-            memory: serde_json::json!({}),
+            memory,
             society,
-            arena: serde_json::json!({}),
-            quota: serde_json::json!({}),
+            arena,
+            quota,
             goals,
             beliefs,
             dreams: vec![],
@@ -290,8 +268,6 @@ impl IntrospectionProvider for IntrospectionService {
 
     async fn get_agent_summary(&self, agent_id: &str) -> Result<AgentSummary, IntrospectionError> {
         let state = self.get_agent_state(agent_id).await?;
-        let memory = self.get_personal_memory(agent_id).await?;
-        let society = self.get_society_snapshot(agent_id).await?;
 
         let metrics = AgentMetricsSummary {
             tasks_completed: state.metrics.tasks_completed,
@@ -299,33 +275,14 @@ impl IntrospectionProvider for IntrospectionService {
             success_rate: if state.metrics.tasks_completed + state.metrics.tasks_failed > 0 {
                 state.metrics.tasks_completed as f32 / (state.metrics.tasks_completed + state.metrics.tasks_failed) as f32
             } else { 0.0 },
-            total_reward: state.metrics.total_reward,
+            total_reward: state.metrics.total_reward_earned,
             reputation: state.metrics.reputation_score,
             trust_given: state.metrics.trust_scores_given,
             trust_received: state.metrics.trust_scores_received,
         };
 
-        let mem_val: serde_json::Value = serde_json::from_str(&memory.to_string()).unwrap_or_default();
-        let categories = mem_val.as_object().map(|obj| {
-            obj.iter().map(|(k, v)| (k.clone(), v.as_array().map(|a| a.len()).unwrap_or(1))).collect()
-        }).unwrap_or_default();
-
-        let memory_summary = MemorySummary {
-            total_entries: mem_val.as_object().map(|o| o.len()).unwrap_or(0),
-            categories,
-            recent_experiences: 0,
-            recent_lessons: 0,
-            relationships: 0,
-        };
-
-        let society_val: serde_json::Value = serde_json::from_str(&serde_json::to_string(&serde_json::json!({})).unwrap()).unwrap();
-        let society_summary = SocietySummary {
-            contributions: 0,
-            outcomes: 0,
-            reputation_events: 0,
-            trust_scores: HashMap::new(),
-            relationships: 0,
-        };
+        let memory_summary = MemorySummary::default();
+        let society_summary = SocietySummary::default();
 
         Ok(AgentSummary {
             agent_id: agent_id.to_string(),
@@ -341,19 +298,25 @@ impl IntrospectionProvider for IntrospectionService {
 
     async fn list_agents(&self, query: AgentSearchQuery) -> Result<Vec<AgentSummary>, IntrospectionError> {
         let agents = self.agent_runtime.list_agents().await
-            .map_err(|_| IntrospectionError::Internal("Failed to list agents".into()))?;
+            .map_err(|e| IntrospectionError::Internal(format!("Failed to list agents: {e}")))?;
 
         let mut results = Vec::new();
         for agent_id in agents {
             if let Some(cap) = query.capability.as_ref() {
-                let state = self.get_agent_state(&agent_id).await?;
-                if !state.config.capabilities.iter().any(|c| c == cap) {
+                if let Ok(state) = self.get_agent_state(&agent_id).await {
+                    if !state.config.capabilities.iter().any(|c| c == cap) {
+                        continue;
+                    }
+                } else {
                     continue;
                 }
             }
             if let Some(status) = &query.status {
-                let state = self.get_agent_state(&agent_id).await?;
-                if format!("{:?}", state.status) != *status {
+                if let Ok(state) = self.get_agent_state(&agent_id).await {
+                    if format!("{:?}", state.status) != *status {
+                        continue;
+                    }
+                } else {
                     continue;
                 }
             }
@@ -372,25 +335,25 @@ impl IntrospectionProvider for IntrospectionService {
 
     async fn get_network_topology(&self) -> Result<NetworkTopology, IntrospectionError> {
         let agents = self.agent_runtime.list_agents().await
-            .map_err(|_| IntrospectionError::Internal("Failed to list agents".into()))?;
+            .map_err(|e| IntrospectionError::Internal(format!("Failed to list agents: {e}")))?;
 
         let mut nodes = Vec::new();
-        let mut connections = Vec::new();
 
         for agent_id in &agents {
-            if let Ok(state) = self.get_agent_state(&agent_id).await {
+            if let Ok(state) = self.get_agent_state(agent_id).await {
                 nodes.push(AgentNode {
                     agent_id: agent_id.clone(),
                     name: state.config.name.clone(),
                     status: format!("{:?}", state.status),
                     capabilities: state.config.capabilities.clone(),
-                    reputation: 0.0,
+                    reputation: state.metrics.reputation_score,
                     location: None,
                 });
             }
         }
 
         // Build connections from society relationships
+        let mut connections = Vec::new();
         let society = self.society.read().await;
         for (observer, subjects) in &society.relationships {
             for (subject, relationships) in subjects {
@@ -407,18 +370,15 @@ impl IntrospectionProvider for IntrospectionService {
             }
         }
 
-        // Simple clustering by shared capabilities
-        let mut clusters = Vec::new();
-
         Ok(NetworkTopology {
             agents: nodes,
             connections,
-            clusters,
+            clusters: vec![],
         })
     }
 
-    async fn get_agent_activity(&self, agent_id: &str, since: u64, limit: usize) -> Result<Vec<AgentActivity>, IntrospectionError> {
-        // This would query event store for agent activities
+    async fn get_agent_activity(&self, _agent_id: &str, _since: u64, _limit: usize) -> Result<Vec<AgentActivity>, IntrospectionError> {
+        // Event store not wired yet
         Ok(vec![])
     }
 
@@ -428,29 +388,33 @@ impl IntrospectionProvider for IntrospectionService {
 
         if let Some(subjects) = society.relationships.get(agent_id) {
             for (subject, rels) in subjects {
-                connections.extend(rels.iter().map(|rel| AgentConnection {
-                    from: agent_id.to_string(),
-                    to: subject.clone(),
-                    relationship_type: format!("{:?}", rel.kind),
-                    trust_score: rel.strength,
-                    interaction_count: 1,
-                    last_interaction: rel.tick,
-                }));
+                for rel in rels {
+                    connections.push(AgentConnection {
+                        from: agent_id.to_string(),
+                        to: subject.clone(),
+                        relationship_type: format!("{:?}", rel.kind),
+                        trust_score: rel.strength,
+                        interaction_count: 1,
+                        last_interaction: rel.tick,
+                    });
+                }
             }
         }
 
         // Also check reverse relationships
         for (observer, subjects) in &society.relationships {
             if subjects.contains_key(agent_id) {
-                for rel in subjects.get(agent_id).unwrap_or(&vec![]) {
-                    connections.push(AgentConnection {
-                        from: observer.clone(),
-                        to: agent_id.to_string(),
-                        relationship_type: format!("{:?}", rel.kind),
-                        trust_score: rel.strength,
-                        interaction_count: 1,
-                        last_interaction: rel.tick,
-                    });
+                if let Some(rels) = subjects.get(agent_id) {
+                    for rel in rels {
+                        connections.push(AgentConnection {
+                            from: observer.clone(),
+                            to: agent_id.to_string(),
+                            relationship_type: format!("{:?}", rel.kind),
+                            trust_score: rel.strength,
+                            interaction_count: 1,
+                            last_interaction: rel.tick,
+                        });
+                    }
                 }
             }
         }
@@ -462,17 +426,20 @@ impl IntrospectionProvider for IntrospectionService {
         let society = self.society.read().await;
         let mut connections = Vec::new();
 
-        for (observer, subjects) in &society.trust_scores {
-            for (subject, score) in subjects {
-                if *score > 0.0 {
-                    connections.push(AgentConnection {
-                        from: observer.clone(),
-                        to: subject.clone(),
-                        relationship_type: "trust".to_string(),
-                        trust_score: *score,
-                        interaction_count: 1,
-                        last_interaction: 0,
-                    });
+        // Build trust network from relationships with positive strength
+        for (observer, subjects) in &society.relationships {
+            for (subject, rels) in subjects {
+                for rel in rels {
+                    if rel.strength > 0.0 {
+                        connections.push(AgentConnection {
+                            from: observer.clone(),
+                            to: subject.clone(),
+                            relationship_type: format!("{:?}", rel.kind),
+                            trust_score: rel.strength,
+                            interaction_count: 1,
+                            last_interaction: rel.tick,
+                        });
+                    }
                 }
             }
         }
@@ -485,17 +452,16 @@ impl IntrospectionProvider for IntrospectionService {
     }
 
     async fn search_memory(&self, agent_id: &str, query: &str, limit: usize) -> Result<serde_json::Value, IntrospectionError> {
-        let store = self.personal_memory.as_ref();
-        let cached = store.get_or_create(agent_id).await;
-        let memory = cached.read().await.memory.clone();
-        let results = decentraai_agent_personal_memory::mcp::search_memory(&memory, query, None, limit);
+        let cached = self.personal_memory.get_or_create(&agent_id.to_string()).await;
+        let mem = cached.read().await;
+        let results = decentraai_agent_personal_memory::mcp::search_memory(&mem.memory, query, None, limit);
         Ok(serde_json::json!({
             "results": results,
             "count": results.len()
         }))
     }
 
-    async fn get_agent_dreams(&self, agent_id: &str) -> Result<Vec<String>, IntrospectionError> {
+    async fn get_agent_dreams(&self, _agent_id: &str) -> Result<Vec<String>, IntrospectionError> {
         Ok(vec![])
     }
 
@@ -505,18 +471,10 @@ impl IntrospectionProvider for IntrospectionService {
     }
 
     async fn get_agent_lessons(&self, agent_id: &str) -> Result<Vec<String>, IntrospectionError> {
-        let store = self.personal_memory.as_ref();
-        let snapshot = store.snapshot(agent_id).await
-            .map_err(|_| IntrospectionError::Internal("Failed to get memory snapshot".into()))?;
-        Ok(snapshot.lessons.lessons.iter().map(|l| l.title.clone()).collect())
+        let snapshot = self.personal_memory.snapshot(&agent_id.to_string()).await
+            .map_err(|e| IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}")))?;
+        Ok(snapshot.recent_lessons.iter().map(|l| l.title.clone()).collect())
     }
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]
