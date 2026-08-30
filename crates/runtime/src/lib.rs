@@ -10,16 +10,17 @@
 //! rejections are written to the audit log (M6).
 
 pub mod api;
+pub mod arena;
+pub mod authz;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;
 pub mod governor_execution;
+pub mod hub;
 pub mod intel_assist;
 pub mod job;
-pub mod arena;
-pub mod hub;
 pub mod mcp;
 pub mod providers_api;
 pub mod queue;

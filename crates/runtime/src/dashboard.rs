@@ -1506,6 +1506,12 @@ function toast(msg, bad=false){ const t=document.createElement('div'); t.classNa
 let token = '';
 let isMaster = false;
 
+// SECURITY NOTE: The master token is stored in localStorage for user convenience.
+// This is acceptable for a single-user admin dashboard because:
+//   1. The token is NEVER auto-fetched from the server — user must enter it manually.
+//   2. The token is only sent as a Bearer header to the same-origin API.
+//   3. localStorage is cleared on explicit logout.
+// For multi-user deployments, replace with HttpOnly secure cookies.
 const storedToken = localStorage.getItem('dai_token');
 if (storedToken) {
   token = storedToken;
