@@ -8278,7 +8278,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             | "hub_propose"
                             | "hub_decide_proposal"
                             | "hub_form_team"
-                            | "hub_execute" => scopes.iter().any(|s| s == "hub" || s == "*"),
+                            | "hub_execute"
+                            | "hub_state"
+                            | "hub_events" => scopes.iter().any(|s| s == "hub" || s == "*"),
                             "society_state"
                             | "society_trust"
                             | "society_reputation"
@@ -8630,8 +8632,29 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         if !scopes.iter().any(|s| s == "hub" || s == "*") {
             return forbidden("consumer key missing hub scope");
         }
-        // hub_state is read-only, ctx already contains it via mcp_context, just fall through to handle_message
-        // But we need to set hub_action? No, hub_state is via ctx.hub_state already populated
+        let hub = state.hub.lock().await;
+        ctx.hub_state = serde_json::json!({
+            "tick": hub.tick,
+            "tasks": hub.tasks.values().collect::<Vec<_>>(),
+            "bids": hub.bids.values().collect::<Vec<_>>(),
+            "proposals": hub.proposals.values().collect::<Vec<_>>(),
+            "teams": hub.teams.values().collect::<Vec<_>>(),
+            "events": hub.events.iter().rev().take(20).cloned().collect::<Vec<_>>(),
+            "total_tasks": hub.tasks.len(),
+            "total_bids": hub.bids.len()
+        });
+    } else if let Some((since, limit)) = crate::mcp::hub_events_request(&raw) {
+        if !scopes.iter().any(|s| s == "hub" || s == "*") {
+            return forbidden("consumer key missing hub scope");
+        }
+        let hub = state.hub.lock().await;
+        let events = hub.events_since(since, limit);
+        ctx.hub_events = serde_json::json!({
+            "tick": hub.tick,
+            "since": since,
+            "events": events,
+            "count": events.len()
+        });
     } else if crate::mcp::arena_state_request(&raw) {
         if !scopes.iter().any(|s| s == "arena" || s == "*") {
             return forbidden("consumer key missing arena scope");
@@ -8861,6 +8884,7 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
                 "total_bids": hub.bids.len()
             })
         },
+        hub_events: serde_json::json!({ "tick": 0, "events": [] }),
         hub_action: serde_json::json!({}),
         society_action: serde_json::json!({}),
         personal_memory_action: serde_json::json!({}),

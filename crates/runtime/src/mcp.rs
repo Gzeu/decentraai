@@ -95,6 +95,8 @@ pub struct McpContext {
     pub arena_action: Value,
     /// Hub state snapshot (M2 Hub): tick, tasks, bids, proposals, teams, events. Read-only projection of HubState.
     pub hub_state: Value,
+    /// Hub events delta (job list subscription) since tick.
+    pub hub_events: Value,
     /// Result of last Hub mutation (task/bid/proposal/team/execute) via MCP.
     pub hub_action: Value,
     /// Result of last Society mutation (trust/reputation/relationship) via MCP.
@@ -346,6 +348,18 @@ pub fn all_tools() -> Vec<ToolDef> {
             name: "hub_state",
             description: "Agent Hub live state: tasks, bids, proposals, teams, events, tick. Read-only projection of the task market (Issue #63 Hub).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "hub_events",
+            description: "Subscribe to Hub job list delta: returns Hub events since a given tick (task_published, bid_placed, settlement_done, etc.). Use for job-list subscription without polling full hub_state. Set since to last seen tick, limit 1..200.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "since": { "type": "integer", "description": "Tick since which to return events (0 = from start)" },
+                    "limit": { "type": "integer", "description": "Max events to return (1..200, default 50)" }
+                },
+                "additionalProperties": false
+            }),
         },
         ToolDef {
             name: "hub_publish_task",
@@ -1097,6 +1111,16 @@ pub fn hub_state_request(raw: &str) -> bool {
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
     msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("hub_state")
 }
+
+pub fn hub_events_request(raw: &str) -> Option<(u64, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
+    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_events" { return None; }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let since = args.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    Some((since, limit.min(200)))
+}
 pub fn hub_publish_task_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
     if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
@@ -1548,6 +1572,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "arena_state" => &ctx.arena_state,
         "arena_act" => &ctx.arena_action,
         "hub_state" => &ctx.hub_state,
+        "hub_events" => &ctx.hub_events,
         "hub_publish_task" => &ctx.hub_action,
         "hub_place_bid" => &ctx.hub_action,
         "hub_propose" => &ctx.hub_action,
@@ -1611,6 +1636,7 @@ mod tests {
             arena_state: json!({ "tick": 0, "width": 20, "height": 20, "agents": [], "events": [] }),
             arena_action: json!({}),
             hub_state: json!({ "tick": 0, "tasks": [], "bids": [], "proposals": [], "teams": [], "events": [] }),
+            hub_events: json!({ "tick": 0, "events": [] }),
             hub_action: json!({}),
             society_action: json!({}),
             personal_memory_action: json!({}),
