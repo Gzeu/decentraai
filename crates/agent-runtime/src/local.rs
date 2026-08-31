@@ -347,6 +347,252 @@ impl LocalAgentRuntime {
         decision
     }
 
+    /// SAES 0.5 Phase 3 — gateway onboarding for an external generic agent.
+    ///
+    /// Validates the scoped `dca_` credential shape + scopes, declares
+    /// capabilities, creates a `GatewaySession` with a fresh `correlation_id`,
+    /// and emits `agent.gateway.onboarded`. The real `ConsumerKeyStore::lookup`
+    /// and `QuotaLedger` check happen in the runtime HTTP layer; this decision
+    /// layer validates shape deterministically so the agent knows early why it
+    /// would be rejected.
+    pub async fn gateway_onboard(
+        &self,
+        external_agent_id: &str,
+        plaintext_key: &str,
+        credential: crate::saes::gateway::GatewayCredential,
+        declared_capabilities: Vec<String>,
+        required_scope: &str,
+    ) -> Result<crate::saes::gateway::GatewaySession, crate::saes::gateway::GatewayRejection> {
+        use crate::saes::gateway::{
+            create_session, new_correlation_id, require_scope, validate_credential,
+            validate_credential_shape,
+        };
+        validate_credential_shape(plaintext_key)?;
+        validate_credential(&credential)?;
+        require_scope(&credential, required_scope)?;
+        crate::saes::gateway::validate_capabilities(&declared_capabilities)?;
+        let cid = new_correlation_id();
+        let now = now_ms();
+        let session = create_session(
+            external_agent_id,
+            &credential,
+            declared_capabilities,
+            cid.clone(),
+            now,
+        )?;
+        let event = Event {
+            id: decentraai_event_bus::EventId::new(),
+            topic: Topic::agent(external_agent_id),
+            source: external_agent_id.to_string(),
+            timestamp: now,
+            event_type: "agent.gateway.onboarded".to_string(),
+            payload: serde_json::json!({
+                "key_id": session.key_id,
+                "account": session.account,
+                "scopes": session.scopes,
+                "declared_capabilities": session.declared_capabilities,
+                "correlation_id": session.correlation_id,
+            }),
+            metadata: decentraai_event_bus::EventMetadata {
+                correlation_id: Some(cid.clone()),
+                priority: EventPriority::High,
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "gateway".to_string(),
+                    "saes-0.5".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        let _ = self.event_bus.publish(event).await;
+        Ok(session)
+    }
+
+    /// SAES 0.5 Phase 3 — quota reservation + placement in one gateway step.
+    ///
+    /// Pure reservation sizing (`min(available, ceiling)`) plus the existing
+    /// `select_placement` (no second engine). Emits `agent.gateway.reserved`
+    /// (or `denied` when no spendable quota) and then `agent.placement.*`
+    /// (via `place_collaboration` would double-emit, so we emit the placement
+    /// here directly). Returns the full `GatewayExecutionPlan`.
+    pub async fn gateway_reserve_and_place(
+        &self,
+        session: &crate::saes::gateway::GatewaySession,
+        task_id: &str,
+        task_capability: &str,
+        available: u64,
+        offers: Vec<crate::saes::placement::PlacementOffer>,
+    ) -> crate::saes::gateway::GatewayExecutionPlan {
+        use crate::saes::gateway::plan_gateway_execution;
+        use crate::saes::placement::select_placement;
+        use crate::saes::pressure::{CollaborationSignal, Urgency};
+
+        let plan = plan_gateway_execution(session, task_id, task_capability, available, &offers);
+        let now = now_ms();
+        // Reservation event
+        let res_event_type = if plan.reservation.bookable {
+            "agent.gateway.reserved"
+        } else {
+            "agent.gateway.quota_denied"
+        };
+        let res_event = Event {
+            id: decentraai_event_bus::EventId::new(),
+            topic: Topic::agent(&session.agent_id),
+            source: session.agent_id.clone(),
+            timestamp: now,
+            event_type: res_event_type.to_string(),
+            payload: serde_json::json!({
+                "task_id": task_id,
+                "capability": task_capability,
+                "reservation_id": plan.reservation.reservation_id,
+                "amount": plan.reservation.amount,
+                "bookable": plan.reservation.bookable,
+                "account": plan.reservation.account,
+                "correlation_id": session.correlation_id,
+            }),
+            metadata: decentraai_event_bus::EventMetadata {
+                correlation_id: Some(session.correlation_id.clone()),
+                priority: if plan.reservation.bookable {
+                    EventPriority::High
+                } else {
+                    EventPriority::Normal
+                },
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "gateway".to_string(),
+                    "saes-0.5".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        let _ = self.event_bus.publish(res_event).await;
+
+        // Placement event — reuse placement logic but emit from gateway so the
+        // correlation_id stays the gateway session's (already threaded by plan).
+        let signal = CollaborationSignal {
+            agent_id: session.agent_id.clone(),
+            capability: task_capability.to_string(),
+            reasons: vec!["gateway".to_string()],
+            urgency: Urgency::Elevated,
+            correlation_id: session.correlation_id.clone(),
+            cpu_cores: 0,
+            ram_mb: 0,
+            max_lease_seconds: 30,
+        };
+        let placement = select_placement(&signal, offers.iter());
+        let placed_type = if placement.placed {
+            "agent.gateway.placed"
+        } else {
+            "agent.gateway.no_candidate"
+        };
+        let place_event = Event {
+            id: decentraai_event_bus::EventId::new(),
+            topic: Topic::agent(&session.agent_id),
+            source: session.agent_id.clone(),
+            timestamp: now_ms(),
+            event_type: placed_type.to_string(),
+            payload: serde_json::json!({
+                "task_id": task_id,
+                "capability": placement.capability,
+                "selected_peer": placement.selected_peer,
+                "winner_score": placement.winner_score,
+                "rejected": placement.rejected.iter().map(|(p, r)| serde_json::json!({"peer_id": p, "reason": r.to_string()})).collect::<Vec<_>>(),
+                "placed": placement.placed,
+                "correlation_id": placement.correlation_id,
+                "reservation_id": plan.reservation.reservation_id,
+            }),
+            metadata: decentraai_event_bus::EventMetadata {
+                correlation_id: Some(session.correlation_id.clone()),
+                priority: if placement.placed {
+                    EventPriority::High
+                } else {
+                    EventPriority::Normal
+                },
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "gateway".to_string(),
+                    "placement".to_string(),
+                    "saes-0.5".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        let _ = self.event_bus.publish(place_event).await;
+
+        // Return the plan (placement is same object; callers can inspect)
+        crate::saes::gateway::GatewayExecutionPlan {
+            session: session.clone(),
+            reservation: plan.reservation,
+            placement,
+        }
+    }
+
+    /// SAES 0.5 Phase 3 — settlement after (simulated) execution.
+    ///
+    /// `measured_consumed` is the real usage the caller measured (e.g. tokens).
+    /// Emits `agent.gateway.settled` or `agent.gateway.released` with the same
+    /// `correlation_id`, threading the lifecycle to settlement. For reputation/
+    /// learning the caller should then invoke `learn()` with an `ActionResult`.
+    pub async fn gateway_settle(
+        &self,
+        session: &crate::saes::gateway::GatewaySession,
+        reservation: &crate::saes::gateway::QuotaReservationPlan,
+        measured_consumed: u64,
+        success: bool,
+    ) -> crate::saes::gateway::SettlementKind {
+        use crate::saes::gateway::{SettlementKind, plan_settlement};
+        let kind = if success {
+            plan_settlement(reservation.amount, measured_consumed)
+        } else {
+            SettlementKind::Released
+        };
+        let (event_type, payload) = match &kind {
+            SettlementKind::Settled { consumed, released } => (
+                "agent.gateway.settled",
+                serde_json::json!({
+                    "reservation_id": reservation.reservation_id,
+                    "account": reservation.account,
+                    "amount": reservation.amount,
+                    "consumed": consumed,
+                    "released": released,
+                    "correlation_id": session.correlation_id,
+                    "success": success,
+                }),
+            ),
+            SettlementKind::Released => (
+                "agent.gateway.released",
+                serde_json::json!({
+                    "reservation_id": reservation.reservation_id,
+                    "account": reservation.account,
+                    "amount": reservation.amount,
+                    "correlation_id": session.correlation_id,
+                    "success": success,
+                }),
+            ),
+        };
+        let event = Event {
+            id: decentraai_event_bus::EventId::new(),
+            topic: Topic::agent(&session.agent_id),
+            source: session.agent_id.clone(),
+            timestamp: now_ms(),
+            event_type: event_type.to_string(),
+            payload,
+            metadata: decentraai_event_bus::EventMetadata {
+                correlation_id: Some(session.correlation_id.clone()),
+                priority: EventPriority::High,
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "gateway".to_string(),
+                    "settlement".to_string(),
+                    "saes-0.5".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        let _ = self.event_bus.publish(event).await;
+        kind
+    }
+
     /// SAES 0.2: filter observation to prefer tasks aligned with active goals.
     ///
     /// When the agent has active goals, this method reorders tasks in the

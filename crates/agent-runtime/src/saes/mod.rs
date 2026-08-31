@@ -19,6 +19,7 @@
 //! (Phase 1 of Pressure Trigger → Placement Fairness → Agent Gateway).
 
 pub mod adaptation;
+pub mod gateway;
 pub mod goals;
 pub mod learning;
 pub mod outcomes;
