@@ -22,6 +22,7 @@ pub mod adaptation;
 pub mod goals;
 pub mod learning;
 pub mod outcomes;
+pub mod placement;
 pub mod pressure;
 
 #[cfg(feature = "persistence")]

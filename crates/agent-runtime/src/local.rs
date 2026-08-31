@@ -291,6 +291,62 @@ impl LocalAgentRuntime {
         Ok(None)
     }
 
+    /// SAES 0.5 Phase 2 — placement for a `CollaborationSignal`.
+    ///
+    /// Deterministically picks the best gate-passing offer for `signal`
+    /// (hard gates → score with capped fairness bias → peer_id tie-break).
+    /// Mirrors `decentraai_compute::assist::select_offer` — no second engine.
+    /// Emits a correlated EventBus event and threads `correlation_id` end-to-end.
+    pub async fn place_collaboration(
+        &self,
+        signal: &crate::saes::pressure::CollaborationSignal,
+        offers: Vec<crate::saes::placement::PlacementOffer>,
+    ) -> crate::saes::placement::PlacementDecision {
+        use crate::saes::placement::select_placement;
+        let decision = select_placement(signal, offers.iter());
+        let now = now_ms();
+        let event_type = if decision.placed {
+            "agent.placement.decided"
+        } else {
+            "agent.placement.no_candidate"
+        };
+        let payload = serde_json::json!({
+            "capability": decision.capability,
+            "correlation_id": decision.correlation_id,
+            "selected_peer": decision.selected_peer,
+            "winner_score": decision.winner_score,
+            "rejected": decision.rejected.iter().map(|(peer, reason)| serde_json::json!({
+                "peer_id": peer,
+                "reason": reason.to_string()
+            })).collect::<Vec<_>>(),
+            "placed": decision.placed,
+        });
+        let event = Event {
+            id: decentraai_event_bus::EventId::new(),
+            topic: Topic::agent(&signal.agent_id),
+            source: signal.agent_id.clone(),
+            timestamp: now,
+            event_type: event_type.to_string(),
+            payload,
+            metadata: decentraai_event_bus::EventMetadata {
+                correlation_id: Some(decision.correlation_id.clone()),
+                priority: if decision.placed {
+                    EventPriority::High
+                } else {
+                    EventPriority::Normal
+                },
+                tags: vec![
+                    "agent-runtime".to_string(),
+                    "placement".to_string(),
+                    "saes-0.5".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+        let _ = self.event_bus.publish(event).await;
+        decision
+    }
+
     /// SAES 0.2: filter observation to prefer tasks aligned with active goals.
     ///
     /// When the agent has active goals, this method reorders tasks in the
