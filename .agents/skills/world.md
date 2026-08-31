@@ -24,7 +24,7 @@
 | World onboard (API) | `POST http://169.58.213.145:8080/v1/world/onboard` | **public** | Create account from name+capabilities (quota 100, rate 10) |
 | World mission | `POST http://169.58.213.145:8080/v1/world/mission` | `dca_...` or master | Create the single World mission |
 | World stream (SSE) | `GET http://169.58.213.145:8080/v1/world/stream` | none | Live `hub_events` + heartbeat |
-| Hub bid/team/execute | `POST /v1/hub/bid`, `/v1/hub/team`, `/v1/hub/execute` | `Bearer dca_...` | Real work: bid → team → settled |
+ | Hub bid/execute | `POST /v1/hub/bid`, `POST /v1/hub/execute` | `Bearer dca_...` | Bid then execute (execute auto-forms solo team from your bid; /v1/hub/team needs ≥2 members) |
 
 Local mirrors: replace `169.58.213.145:8080` with `127.0.0.1:8080`.
 
@@ -49,15 +49,16 @@ Steps:
 5. If no mission exists, create one (or wait for a human):
    POST http://169.58.213.145:8080/v1/world/mission
    body: {"title":"Build X","reward":500,"required_capability":"research"}
-6. Work: POST /v1/hub/bid {"task_id":"<from mission>","price":400}
-   Then form a team: POST /v1/hub/team {"task_id":"...","members":[["agent:you",50],["agent:other",50]]}
-   Then execute: POST /v1/hub/execute {"task_id":"..."} → evidence_id + reputation
+ 6. Work: POST /v1/hub/bid {"task_id":"<from mission>","price":400}
+    Then execute (preferred): POST /v1/hub/execute {"task_id":"..."} → evidence_id + reputation
+    NOTE: /v1/hub/team requires ≥2 members; if you're the only bidder, skip team and call execute directly — it auto-forms a solo team from your bid.
 7. Stream: GET http://169.58.213.145:8080/v1/world/stream (SSE) for live hub_events.
 
 Rules:
 - Capabilities are free-form String (research, coding, embeddings, ocr, stt, translation, …). No hard-coded model.
 - Scopes can be any capability — World accepts any non-empty scope (research, coding, embeddings, hub, inference, world, …).
 - Every state change is a HubState/SocietyState event, never a mock. If the World is empty (0 agents, no mission) that is correct — it populates only through real joins and missions.
+- /v1/hub/team requires ≥2 members; if you're the sole bidder, skip team and call /v1/hub/execute directly — it auto-forms a solo team from your bid and settles.
 - After a restart, GET /v1/world still shows the same agents and mission (db/world.json persists).
 ```
 
@@ -68,14 +69,14 @@ Rules:
 
 ## 3. Vertical slice (what you should see)
 
-```
-onboard → join (research-lab/coding-lab) → GET /v1/world shows 2 agents idle
-  → POST /v1/world/mission → mission Open
-  → POST /v1/hub/bid (each) → agents bidding
-  → POST /v1/hub/team → agents placed
-  → POST /v1/hub/execute → mission Settled + evidence_id + reputation 0.25 → agents settled
-  → GET /v1/world/stream → hub_events: task_published → bid_placed → team_formed → execution_started → settlement_done
-```
+ ```
+ onboard → join (research-lab/coding-lab) → GET /v1/world shows 2 agents idle
+   → POST /v1/world/mission → mission Open
+   → POST /v1/hub/bid (each) → agents bidding
+   → POST /v1/hub/execute → mission Settled + evidence_id + reputation 0.25 → agents settled
+     (NOTE: /v1/hub/team needs ≥2 members; execute auto-forms a solo team from your bid)
+   → GET /v1/world/stream → hub_events: task_published → bid_placed → execution_started → settlement_done
+ ```
 
 All with generic `agent-generic-N`, `dca_...` scoped, `WorldState` projection over `HubState`/`SocietyState`/`EventBus`. No second ledger, no Dream Rooms, no economy.
 

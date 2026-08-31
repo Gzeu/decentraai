@@ -211,13 +211,14 @@ async function join(){
  document.getElementById('joinMsg').textContent=r.ok? `joined ${r.js.room_id} as ${r.js.agent_id}` : JSON.stringify(r.js).slice(0,300)
  tick()
 }
-async function createMission(){
- const title=document.getElementById('missionTitle').value.trim(); if(!title){alert('need title');return}
- const reward=parseInt(document.getElementById('missionReward').value||'500')
- const r=await j('/v1/world/mission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title, reward, required_capability:'research'})})
- document.getElementById('joinMsg').textContent=r.ok? `mission ${r.js.task_id} ${r.js.status}` : JSON.stringify(r.js).slice(0,300)
- tick()
-}
+ async function createMission(){
+  const title=document.getElementById('missionTitle').value.trim(); if(!title){alert('need title');return}
+  const reward=parseInt(document.getElementById('missionReward').value||'500')
+  const cap=document.getElementById('cap').value
+  const r=await j('/v1/world/mission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title, reward, required_capability:cap})})
+  document.getElementById('joinMsg').textContent=r.ok? `mission ${r.js.task_id} ${r.js.status}` : JSON.stringify(r.js).slice(0,300)
+  tick()
+ }
 function addEvents(arr){
  if(!arr||!arr.length) return;
  const c=document.getElementById('events')
