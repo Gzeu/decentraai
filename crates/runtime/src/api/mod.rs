@@ -15,10 +15,12 @@
 //! inflates the request counter nor resets the idle-unload clock.
 
 use anyhow::{Context, Result};
+use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
@@ -356,6 +358,8 @@ pub struct ApiState {
     pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
     pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
     pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
+    /// Agent World — projection over Hub/Society/EventBus (v1). Always present.
+    pub world: Arc<tokio::sync::Mutex<crate::world::WorldState>>,
 }
 
 impl ApiState {
@@ -398,7 +402,7 @@ impl ApiState {
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
             active_model: Arc::new(tokio::sync::RwLock::new(info.model_name.clone())),
-            info,
+            info: info.clone(),
             dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
@@ -444,6 +448,11 @@ impl ApiState {
             society: Arc::new(tokio::sync::Mutex::new(
                 decentraai_agent_society::SocietyState::with_tick(0),
             )),
+            world: {
+                let p = crate::world::world_path_for(&info.repo_root);
+                let ws = crate::world::load_world_state(&p);
+                Arc::new(tokio::sync::Mutex::new(ws))
+            },
         }
     }
 
@@ -1239,6 +1248,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/hub/execute", post(crate::hub::hub_execute_handler))
         .route("/v1/hub/events", get(crate::hub::hub_events_handler))
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
+        .route("/world", get(world_html_handler))
+        .route("/v1/world", get(world_snapshot_handler))
+        .route("/v1/world/join", post(world_join_handler))
+        .route("/v1/world/mission", post(world_mission_handler))
+        .route("/v1/world/stream", get(world_stream_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -1479,6 +1493,408 @@ async fn hub_dashboard_handler(State(_state): State<ApiState>) -> Response {
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// GET /world — Agent World (RFC v1): Research Lab + Coding Lab, mission + 2 agents.
+/// Every pixel is a projection of HubState/SocietyState/EventBus — never a mock.
+async fn world_html_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::world::world_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /v1/world — JSON snapshot projection (read-only).
+async fn world_snapshot_handler(State(state): State<ApiState>) -> Response {
+    let world = state.world.lock().await.clone();
+    let hub = state.hub.lock().await.clone();
+    let society = state.society.lock().await.clone();
+
+    // Build enriched mission view from HubState
+    let mission = world.mission_task_id.as_ref().and_then(|tid| {
+        hub.tasks.get(tid).map(|task| {
+            let bids: Vec<_> = hub
+                .bids
+                .values()
+                .filter(|b| &b.task_id == tid)
+                .cloned()
+                .collect();
+            let team = hub
+                .teams
+                .values()
+                .find(|t| &t.task_id == tid)
+                .map(|t| t.members.clone())
+                .unwrap_or_default();
+            let evidence = hub.tasks.get(tid).and_then(|_| {
+                // evidence is stored in task settlement; hub.events carries it
+                hub.events
+                    .iter()
+                    .rev()
+                    .find(|e| e.task_id.as_deref() == Some(tid.as_str()) && e.evidence_id.is_some())
+                    .and_then(|e| e.evidence_id.clone())
+            });
+            serde_json::json!({
+                "task": task,
+                "bids": bids,
+                "team": team,
+                "evidence_id": evidence,
+            })
+        })
+    });
+
+    // Enrich agents with live status + reputation (projection, never stored)
+    let agents: Vec<serde_json::Value> = world
+        .agents
+        .iter()
+        .map(|a| {
+            let rep: f32 = society
+                .reputation
+                .get(&a.agent_id)
+                .or_else(|| society.reputation.get(&a.account))
+                .map(|evs| evs.iter().map(|e| e.delta).sum())
+                .unwrap_or(0.0);
+            // Derive status from HubState
+            let status =
+                if let Some(tid) = &world.mission_task_id {
+                    if let Some(team) = hub.teams.values().find(|t| &t.task_id == tid) {
+                        if team
+                            .members
+                            .iter()
+                            .any(|(id, _)| id == &a.account || id == &a.agent_id)
+                        {
+                            if hub
+                                .tasks
+                                .get(tid)
+                                .map(|t| t.status == decentraai_agent_hub::TaskStatus::Settled)
+                                .unwrap_or(false)
+                            {
+                                "settled"
+                            } else {
+                                "placed"
+                            }
+                        } else if hub.bids.values().any(|b| {
+                            &b.task_id == tid && (b.bidder == a.account || b.bidder == a.agent_id)
+                        }) {
+                            "bidding"
+                        } else {
+                            "idle"
+                        }
+                    } else if hub.bids.values().any(|b| {
+                        &b.task_id == tid && (b.bidder == a.account || b.bidder == a.agent_id)
+                    }) {
+                        "bidding"
+                    } else {
+                        "idle"
+                    }
+                } else {
+                    "idle"
+                };
+            serde_json::json!({
+                "agent_id": a.agent_id,
+                "account": a.account,
+                "key_id": a.key_id,
+                "declared_capabilities": a.declared_capabilities,
+                "room_id": a.room_id,
+                "joined_at": a.joined_at,
+                "reputation": rep,
+                "status": status,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "world_id": world.world_id,
+        "tick": world.tick,
+        "mission": mission,
+        "rooms": world.rooms,
+        "agents": agents,
+        "mission_task_id": world.mission_task_id,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// POST /v1/world/join — join world with scoped dca_ (reuse gateway validation, no new ledger).
+async fn world_join_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let (key_id, account, _scopes) = match &auth {
+        Auth::Consumer {
+            key_id,
+            account,
+            scopes,
+            ..
+        } => (key_id.clone(), account.clone(), scopes.clone()),
+        Auth::Master => {
+            // master can join as operator for testing
+            (
+                "master".to_string(),
+                "operator".to_string(),
+                vec!["hub".to_string()],
+            )
+        }
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "requires dca_ consumer key with hub scope"})),
+            )
+                .into_response();
+        }
+    };
+    // For consumer, enforce hub scope via existing gateway validation
+    if let Auth::Consumer { .. } = &auth {
+        // reuse SAES gateway scope gate if available, else simple check
+        let has_hub = _scopes.iter().any(|s| s == "hub" || s == "inference");
+        if !has_hub {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "consumer key missing hub/inference scope"})),
+            )
+                .into_response();
+        }
+    }
+    let caps: Vec<String> = body
+        .get("declared_capabilities")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| {
+            body.get("capabilities")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    if caps.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "declared_capabilities required (e.g. [\"research\"])"})),
+        )
+            .into_response();
+    }
+    // Inline validation (reuse SAES rule without pulling agent-runtime crate)
+    if caps.iter().any(|c| c.trim().is_empty() || c.len() > 128) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "capability must be 1..128 non-empty chars"})),
+        )
+            .into_response();
+    }
+    let mut world = state.world.lock().await;
+    // Idempotent: if already joined, return existing
+    if let Some(existing) = world
+        .agents
+        .iter()
+        .find(|a| a.account == account || a.key_id == key_id)
+    {
+        let agent_id = existing.agent_id.clone();
+        let room_id = existing.room_id.clone();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "agent_id": agent_id,
+                "account": account,
+                "key_id": key_id,
+                "room_id": room_id,
+                "already_joined": true,
+            })),
+        )
+            .into_response();
+    }
+    let agent_id = format!("agent-{}", &key_id[3..7.min(key_id.len())]);
+    // Use account-derived agent_id for generic agents (agent-generic-N style)
+    let agent_id = if account.starts_with("agent:") {
+        account.trim_start_matches("agent:").to_string()
+    } else {
+        agent_id
+    };
+    let room_id = world.room_for_capabilities(&caps);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    world.agents.push(crate::world::WorldAgent {
+        agent_id: agent_id.clone(),
+        key_id: key_id.clone(),
+        account: account.clone(),
+        declared_capabilities: caps.clone(),
+        room_id: room_id.clone(),
+        joined_at: now,
+    });
+    world.advance_tick();
+    let path = crate::world::world_path_for(&state.info.repo_root);
+    crate::world::save_world_state(&path, &world);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "agent_id": agent_id,
+            "account": account,
+            "key_id": key_id,
+            "room_id": room_id,
+            "declared_capabilities": caps,
+            "world_id": world.world_id,
+            "tick": world.tick,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /v1/world/mission — create the single World mission (reuse Hub publish).
+async fn world_mission_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let issuer = match &auth {
+        Auth::Consumer { account, .. } => account.clone(),
+        Auth::Master => "operator".to_string(),
+        Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Open => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "auth required"})),
+            )
+                .into_response();
+        }
+    };
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() || title.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "title must be 1..128 chars"})),
+        )
+            .into_response();
+    }
+    let reward = body.get("reward").and_then(|v| v.as_u64()).unwrap_or(500);
+    if reward == 0 || reward > 100_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reward must be 1..100000"})),
+        )
+            .into_response();
+    }
+    let cap = body
+        .get("required_capability")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mut hub = state.hub.lock().await;
+    // Enforce single mission in v1: if one exists and not settled, reject
+    {
+        let world = state.world.lock().await;
+        if let Some(tid) = &world.mission_task_id {
+            if let Some(task) = hub.tasks.get(tid) {
+                if task.status != decentraai_agent_hub::TaskStatus::Settled {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": format!("mission already exists: {} status {:?}", tid, task.status)})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    let task = hub.publish_task(
+        issuer.clone(),
+        title.clone(),
+        body.get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("World mission")
+            .to_string(),
+        reward,
+        cap.clone(),
+    );
+    let task_id = task.id.clone();
+    let task_status = task.status;
+    hub.advance_tick();
+    let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
+    crate::hub::save_hub_state(&hub_path, &hub);
+    drop(hub);
+    let mut world = state.world.lock().await;
+    world.mission_task_id = Some(task_id.clone());
+    world.advance_tick();
+    let path = crate::world::world_path_for(&state.info.repo_root);
+    crate::world::save_world_state(&path, &world);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "title": title,
+            "reward": reward,
+            "required_capability": cap,
+            "status": format!("{:?}", task_status),
+            "issuer": issuer,
+            "world_id": world.world_id,
+            "tick": world.tick,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /v1/world/stream — SSE projection of Hub events (live world).
+async fn world_stream_handler(
+    State(state): State<ApiState>,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let hub_clone = state.hub.clone();
+    let world_clone = state.world.clone();
+    let stream = futures::stream::unfold(
+        (hub_clone, world_clone, 0u64),
+        |(hub, world, last_tick)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let hub_guard = hub.lock().await;
+            let world_guard = world.lock().await;
+            let hub_events: Vec<_> = hub_guard
+                .events
+                .iter()
+                .filter(|e| e.tick >= last_tick)
+                .cloned()
+                .collect();
+            let world_tick = world_guard.tick;
+            let max_hub = hub_events.iter().map(|e| e.tick).max().unwrap_or(last_tick);
+            let next = max_hub.max(world_tick) + 1;
+            drop(hub_guard);
+            drop(world_guard);
+            if hub_events.is_empty() {
+                Some((
+                    Ok(SseEvent::default().comment("heartbeat")),
+                    (hub, world, next),
+                ))
+            } else {
+                let data = serde_json::to_string(&hub_events).unwrap_or_else(|_| "[]".to_string());
+                Some((
+                    Ok(SseEvent::default().data(data).event("hub_events")),
+                    (hub, world, next),
+                ))
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 /// GET /vesper/agents — real registered fabric agents for the VESPER world,
