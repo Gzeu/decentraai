@@ -80,6 +80,8 @@ pub struct LocalAgentRuntime {
     behavior_store: Arc<dyn BehaviorStore>,
     /// SAES 0.4: collective goal coordination.
     collective_goal_store: Arc<dyn crate::saes::collective::CollectiveGoalStore>,
+    /// SAES 0.5: per-agent pressure episode state (hysteresis + cooldown).
+    pressure_states: DashMap<ProtocolAgentId, crate::saes::pressure::PressureEpisode>,
 }
 
 impl std::fmt::Debug for LocalAgentRuntime {
@@ -106,6 +108,7 @@ impl LocalAgentRuntime {
             collective_goal_store: Arc::new(
                 crate::saes::collective::InMemoryCollectiveGoalStore::new(),
             ),
+            pressure_states: DashMap::new(),
         }
     }
 
@@ -160,6 +163,132 @@ impl LocalAgentRuntime {
     /// SAES 0.4: access the collective goal store (for inspection/testing).
     pub fn collective_goal_store(&self) -> &Arc<dyn crate::saes::collective::CollectiveGoalStore> {
         &self.collective_goal_store
+    }
+
+    /// SAES 0.5 Phase 1 — evaluate this agent's pressure signals.
+    ///
+    /// Integrates the pressure trigger into the `observe → decide` cycle:
+    /// when an agent can no longer continue alone (sustained local pressure,
+    /// with hysteresis), this produces an explicit [`CollaborationSignal`]
+    /// that Phase 2 (Placement Fairness) consumes, and emits a correlated
+    /// EventBus event (`agent.pressure.fired` / `agent.pressure.released`).
+    ///
+    /// Cooldown: even when `should_assist` stays true, the signal is only
+    /// re-emitted after `cooldown_ms` since the last fire — the fabric is
+    /// never flooded with a RESOURCE_REQUEST on every tick.
+    pub async fn evaluate_pressure(
+        &self,
+        agent_id: &ProtocolAgentId,
+        signals: &crate::saes::pressure::PressureSignals,
+        thresholds: &crate::saes::pressure::PressureThresholds,
+        cooldown_ms: u64,
+        capability: &str,
+    ) -> Result<Option<crate::saes::pressure::CollaborationSignal>, String> {
+        use crate::saes::pressure::{AssistState, CollaborationSignal, evaluate_pressure};
+
+        let now = now_ms();
+        let mut episode = self
+            .pressure_states
+            .get(agent_id)
+            .map(|e| e.clone())
+            .unwrap_or_default();
+
+        let prev_corr = episode.correlation_id.clone();
+        let decision = evaluate_pressure(signals, thresholds, episode.state, prev_corr.as_deref());
+
+        // Persist hysteresis state regardless of emission.
+        episode.state = decision.new_state;
+        if decision.should_assist {
+            episode.correlation_id = Some(decision.correlation_id.clone());
+        }
+
+        let agent_str = agent_id.to_string();
+
+        if decision.should_assist {
+            if !episode.cooldown_elapsed(now, cooldown_ms) {
+                // Still under pressure but inside the cooldown window: no new
+                // request, no event. Persist and return None.
+                self.pressure_states.insert(agent_id.clone(), episode);
+                return Ok(None);
+            }
+            episode.last_fired_at_ms = now;
+            self.pressure_states.insert(agent_id.clone(), episode);
+
+            // Emit a correlated EventBus event.
+            let event = Event {
+                id: decentraai_event_bus::EventId::new(),
+                topic: Topic::agent(&agent_str),
+                source: agent_str.clone(),
+                timestamp: now,
+                event_type: "agent.pressure.fired".to_string(),
+                payload: serde_json::json!({
+                    "capability": capability,
+                    "score": decision.score,
+                    "urgency": serde_json::to_string(&decision.urgency).unwrap_or_default(),
+                    "reasons": decision.reasons,
+                    "correlation_id": decision.correlation_id,
+                }),
+                metadata: decentraai_event_bus::EventMetadata {
+                    correlation_id: Some(decision.correlation_id.clone()),
+                    priority: EventPriority::High,
+                    tags: vec![
+                        "agent-runtime".to_string(),
+                        "pressure".to_string(),
+                        "saes-0.5".to_string(),
+                    ],
+                    ..Default::default()
+                },
+            };
+            // Durable publish: appends to the store AND broadcasts, so the
+            // pressure event is observable/traceable (correlation_id) rather
+            // than fire-and-forget.
+            let _ = self.event_bus.publish(event).await;
+
+            return Ok(Some(CollaborationSignal {
+                agent_id: agent_str,
+                capability: capability.to_string(),
+                reasons: decision.reasons.clone(),
+                urgency: decision.urgency,
+                correlation_id: decision.correlation_id.clone(),
+                cpu_cores: 0,
+                ram_mb: 0,
+                max_lease_seconds: 30,
+            }));
+        }
+
+        // Not under pressure. If we were previously assisting, emit a release.
+        let was_under = matches!(
+            self.pressure_states.get(agent_id).map(|e| e.state),
+            Some(AssistState::AssistRequested)
+        );
+        self.pressure_states.insert(agent_id.clone(), episode);
+        if was_under {
+            let event = Event {
+                id: decentraai_event_bus::EventId::new(),
+                topic: Topic::agent(&agent_str),
+                source: agent_str.clone(),
+                timestamp: now,
+                event_type: "agent.pressure.released".to_string(),
+                payload: serde_json::json!({
+                    "score": decision.score,
+                    "correlation_id": decision.correlation_id,
+                }),
+                metadata: decentraai_event_bus::EventMetadata {
+                    correlation_id: prev_corr.clone(),
+                    priority: EventPriority::Normal,
+                    tags: vec![
+                        "agent-runtime".to_string(),
+                        "pressure".to_string(),
+                        "saes-0.5".to_string(),
+                    ],
+                    ..Default::default()
+                },
+            };
+            // Durable publish so the release is observable/traceable too.
+            let _ = self.event_bus.publish(event).await;
+        }
+
+        Ok(None)
     }
 
     /// SAES 0.2: filter observation to prefer tasks aligned with active goals.

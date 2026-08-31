@@ -13,11 +13,16 @@
 //!
 //! SAES 0.4 adds `collective` — collective goal coordination enabling
 //! multiple agents to work on shared objectives with progress propagation.
+//!
+//! SAES 0.5 adds `pressure` — a deterministic pressure trigger that turns
+//! "the agent cannot continue alone" into an explicit collaboration signal
+//! (Phase 1 of Pressure Trigger → Placement Fairness → Agent Gateway).
 
 pub mod adaptation;
 pub mod goals;
 pub mod learning;
 pub mod outcomes;
+pub mod pressure;
 
 #[cfg(feature = "persistence")]
 pub mod persistence;
