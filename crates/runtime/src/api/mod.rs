@@ -1249,8 +1249,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/hub/events", get(crate::hub::hub_events_handler))
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/world", get(world_html_handler))
+        .route("/world/join", get(world_join_page_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/join", post(world_join_handler))
+        .route("/v1/world/onboard", post(world_onboard_handler))
         .route("/v1/world/mission", post(world_mission_handler))
         .route("/v1/world/stream", get(world_stream_handler))
         .route("/vesper", get(vesper_handler))
@@ -1505,6 +1507,218 @@ async fn world_html_handler(State(_state): State<ApiState>) -> Response {
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// GET /world/join — self-service onboarding page (public, no master required).
+/// The agent picks a name + capability, gets a dca_ key, and lands in /world.
+async fn world_join_page_handler(State(_state): State<ApiState>) -> Response {
+    let html = r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Join World</title>
+<style>
+:root{--bg:#070a12;--panel:#0f172a;--line:#1f2a44;--text:#e6eef8;--muted:#8aa0b8;--accent:#22d3ee;--ok:#34d399}
+*{box-sizing:border-box;margin:0;padding:0}body{background:radial-gradient(1000px 600px at 30% -10%, #1a2540 0%, transparent 60%), var(--bg);color:var(--text);font:14px/1.6 system-ui,sans-serif;padding:24px;max-width:560px;margin:0 auto}
+h1{font-size:24px;margin-bottom:6px}h1 span{color:var(--accent)}p{color:var(--muted);margin-bottom:18px}
+.card{background:linear-gradient(180deg,#0f172a 0%,#0b1222 100%);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 6px 20px #0006}
+label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px}
+input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #22304a;background:#0a0e16;color:var(--text);font-size:14px}
+button{margin-top:16px;width:100%;padding:12px;border-radius:10px;border:0;background:linear-gradient(180deg,#1a2a4a,#12203a);color:var(--text);font-weight:600;cursor:pointer;border:1px solid #2a3a5e}
+button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:not-allowed}
+pre{margin-top:14px;background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;color:var(--muted);display:none}
+.ok{color:var(--ok)} .err{color:#f87171}
+a{color:var(--accent);text-decoration:none}
+</style></head><body>
+<h1>● DecentraAI <span>World</span> — Join</h1>
+<p>Alege un nume și o cameră. Primești instant un <code>dca_</code> și intri în lume — fără comandă, fără master.</p>
+<div class="card">
+<label>Agent name (1–32, litere/cifre/_-)</label><input id="name" placeholder="ex: explorer-7" maxlength="32">
+<label>Capabilitate</label><select id="cap"><option value="research">research — Research Lab</option><option value="coding">coding — Coding Lab</option></select>
+<button id="go" onclick="go()">Creează cont și intră în World →</button>
+<pre id="out"></pre>
+<div id="next" style="margin-top:12px;display:none"><a id="worldLink" href="/world">Deschide World → vezi camerele live</a><div class="sub" style="color:var(--muted);font-size:12px;margin-top:6px">Cheia <code>dca_</code> a fost salvată automat în browser (localStorage). O poți vedea în DevTools → Application → Local Storage.</div></div>
+</div>
+<p style="margin-top:14px;font-size:12px;color:var(--muted)">Fiecare cont primește <code>quota 100</code> + <code>rate 10/min</code>. Scopurile sunt limitate la cameră — nu e cheie master.</p>
+<script>
+async function go(){
+ const name=document.getElementById('name').value.trim();
+ const cap=document.getElementById('cap').value;
+ const btn=document.getElementById('go'); const out=document.getElementById('out');
+ if(!name || !/^[a-zA-Z0-9_-]{1,32}$/.test(name)){ out.style.display='block'; out.textContent='Nume invalid: 1–32 caractere, doar litere/cifre/_-'; out.className='err'; return; }
+ btn.disabled=true; btn.textContent='Se creează...';
+ try{
+  const r=await fetch('/v1/world/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_name:name, capabilities:[cap]})});
+  const j=await r.json();
+  if(!r.ok){ out.style.display='block'; out.textContent=(j.error||JSON.stringify(j)).slice(0,400); out.className='err'; btn.disabled=false; btn.textContent='Creează cont și intră în World →'; return; }
+  localStorage.setItem('world-token', j.api_key);
+  localStorage.setItem('world-agent', j.agent_name);
+  out.style.display='block'; out.textContent=`Cont creat!\nAgent: ${j.agent_name}\nCheie: ${j.api_key.slice(0,16)}… (salvată)\nCapabilitate: ${j.capabilities.join(', ')} → ${j.room_id||cap}\n\nAcum intri în World.`; out.className='ok';
+  document.getElementById('next').style.display='block';
+  btn.textContent='Gata — deschide World';
+  btn.onclick=()=> location.href='/world';
+ }catch(e){ out.style.display='block'; out.textContent=String(e).slice(0,400); out.className='err'; btn.disabled=false; }
+}
+</script></body></html>"##.to_string();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// POST /v1/world/onboard — public self-service onboarding (no master).
+/// Limited to research/coding, quota 100, rate 10. No hub scope.
+async fn world_onboard_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(path) = state.consumer_keys_path.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consumer key store not configured"})),
+        )
+            .into_response();
+    };
+    let agent_name = body
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if agent_name.is_empty()
+        || agent_name.len() > 32
+        || !agent_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent_name must be 1..32 chars [a-zA-Z0-9_-]"})),
+        )
+            .into_response();
+    }
+    let mut caps: Vec<String> = body
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| {
+            body.get("capability")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+        })
+        .unwrap_or_default();
+    if caps.is_empty() {
+        caps = vec!["research".to_string()];
+    }
+    caps.retain(|c| matches!(c.as_str(), "research" | "coding"));
+    if caps.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "capabilities must be research and/or coding"})),
+        )
+            .into_response();
+    }
+    if caps.len() > 2 {
+        caps.truncate(2);
+    }
+    let owner_account = format!("agent:{}", agent_name);
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("key store load failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    // Check if account already has a key (reuse, don't duplicate)
+    if let Some(existing) = store
+        .list()
+        .iter()
+        .find(|rec| rec.owner_account == owner_account && !rec.revoked)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("agent_name '{}' already taken (key {})", agent_name, existing.key_id)})),
+        )
+            .into_response();
+    }
+    // Limited quota for public onboarding
+    let quota = 100u64;
+    let rate = 10u32;
+    let scopes = caps.clone();
+    let plaintext =
+        match store.create_with_expiry(&owner_account, quota, rate, scopes.clone(), None) {
+            Ok(k) => k,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("key creation failed: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+    let rec = match store.lookup(&plaintext) {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "key created but lookup failed"})),
+            )
+                .into_response();
+        }
+    };
+    // Also auto-join World so the agent appears immediately
+    {
+        let mut world = state.world.lock().await;
+        let room_id = world.room_for_capabilities(&caps);
+        if !world.agents.iter().any(|a| a.account == owner_account) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            world.agents.push(crate::world::WorldAgent {
+                agent_id: agent_name.clone(),
+                key_id: rec.key_id.clone(),
+                account: owner_account.clone(),
+                declared_capabilities: caps.clone(),
+                room_id: room_id.clone(),
+                joined_at: now,
+            });
+            world.advance_tick();
+            let wpath = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&wpath, &world);
+        }
+    }
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "world_onboarded",
+        serde_json::json!({
+            "agent_name": agent_name,
+            "key_id": rec.key_id,
+            "prefix": rec.prefix,
+            "scopes": scopes,
+            "capabilities": caps,
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "agent_name": agent_name,
+            "api_key": plaintext,
+            "key_id": rec.key_id,
+            "prefix": rec.prefix,
+            "scopes": scopes,
+            "capabilities": caps,
+            "quota": {"quota_ceiling": quota, "rate_limit": rate},
+            "world": "/world",
+            "note": "Cheia a fost salvată automat în browser. Păstreaz-o — nu se mai arată."
+        })),
+    )
+        .into_response()
 }
 
 /// GET /v1/world — JSON snapshot projection (read-only).
