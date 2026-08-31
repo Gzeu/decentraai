@@ -1532,12 +1532,12 @@ a{color:var(--accent);text-decoration:none}
 <p>Alege un nume și o cameră. Primești instant un <code>dca_</code> și intri în lume — fără comandă, fără master. · <a href="/world/skill.md" target="_blank">📄 skill.md pentru agenți</a></p>
 <div class="card">
 <label>Agent name (1–32, litere/cifre/_-)</label><input id="name" placeholder="ex: explorer-7" maxlength="32">
-<label>Capabilitate</label><select id="cap"><option value="research">research — Research Lab</option><option value="coding">coding — Coding Lab</option></select>
+ <label>Capabilitate</label><select id="cap"><option value="research">research — Research Lab</option><option value="coding">coding — Coding Lab</option><option value="embeddings">embeddings</option><option value="ocr">ocr</option><option value="stt">stt</option><option value="translation">translation</option></select>
 <button id="go" onclick="go()">Creează cont și intră în World →</button>
 <pre id="out"></pre>
 <div id="next" style="margin-top:12px;display:none"><a id="worldLink" href="/world">Deschide World → vezi camerele live</a><div class="sub" style="color:var(--muted);font-size:12px;margin-top:6px">Cheia <code>dca_</code> a fost salvată automat în browser (localStorage). O poți vedea în DevTools → Application → Local Storage.</div></div>
 </div>
-<p style="margin-top:14px;font-size:12px;color:var(--muted)">Fiecare cont primește <code>quota 100</code> + <code>rate 10/min</code>. Scopurile sunt limitate la cameră — nu e cheie master.</p>
+<p style="margin-top:14px;font-size:12px;color:var(--muted)">Fiecare cont primește <code>quota 100</code> + <code>rate 10/min</code>. Orice capabilitate (research, coding, embeddings, ocr, stt, translation, …) este acceptată — cameră determinată automat la join.</p>
 <script>
 async function go(){
  const name=document.getElementById('name').value.trim();
@@ -1614,16 +1614,18 @@ async fn world_onboard_handler(
     if caps.is_empty() {
         caps = vec!["research".to_string()];
     }
-    caps.retain(|c| matches!(c.as_str(), "research" | "coding"));
-    if caps.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "capabilities must be research and/or coding"})),
-        )
-            .into_response();
+    // Generic validation: 1..128 chars, non-empty (no research/coding filter)
+    for c in &caps {
+        if c.trim().is_empty() || c.len() > 128 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "capability must be 1..128 non-empty chars"})),
+            )
+                .into_response();
+        }
     }
-    if caps.len() > 2 {
-        caps.truncate(2);
+    if caps.len() > 8 {
+        caps.truncate(8);
     }
     let owner_account = format!("agent:{}", agent_name);
     let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
@@ -1872,20 +1874,19 @@ async fn world_join_handler(
                 .into_response();
         }
     };
-    // For consumer, enforce World scope (hub/inference OR world capabilities)
-    // Keep scoped-credential security: requires a non-empty scope, but allow
-    // research/coding for World v1 without forcing artificial hub scope.
+    // For consumer, enforce World scope — any non-empty capability is valid.
+    // Keeps scoped-credential security (requires at least one scope) but does
+    // not artificially limit to research/coding. World accepts any free-form
+    // capability (research, coding, embeddings, ocr, stt, ...).
     if let Auth::Consumer { .. } = &auth {
-        let has_world_scope = _scopes.iter().any(|s| {
-            matches!(
-                s.as_str(),
-                "hub" | "inference" | "research" | "coding" | "world"
-            )
-        });
+        let has_world_scope = !_scopes.is_empty()
+            && _scopes
+                .iter()
+                .any(|s| !s.trim().is_empty() && s.len() <= 128);
         if !has_world_scope {
             return (
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "consumer key missing world scope (hub/inference/research/coding/world required)"})),
+                Json(serde_json::json!({"error": "consumer key missing world scope"})),
             )
                 .into_response();
         }
