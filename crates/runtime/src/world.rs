@@ -238,3 +238,7 @@ function connectSSE(){
 connectSSE(); setInterval(tick, 2000); tick()
 </script></body></html>"##.to_string()
 }
+
+pub fn world_skill_md() -> &'static str {
+    include_str!("../../../.agents/skills/world.md")
+}

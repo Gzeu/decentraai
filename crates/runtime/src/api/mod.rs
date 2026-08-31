@@ -1250,7 +1250,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/world", get(world_html_handler))
         .route("/world/join", get(world_join_page_handler))
+        .route("/world/skill.md", get(world_skill_handler))
         .route("/v1/world", get(world_snapshot_handler))
+        .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
         .route("/v1/world/onboard", post(world_onboard_handler))
         .route("/v1/world/mission", post(world_mission_handler))
@@ -1715,10 +1717,17 @@ async fn world_onboard_handler(
             "capabilities": caps,
             "quota": {"quota_ceiling": quota, "rate_limit": rate},
             "world": "/world",
+            "skill": "/world/skill.md",
             "note": "Cheia a fost salvată automat în browser. Păstreaz-o — nu se mai arată."
         })),
     )
         .into_response()
+}
+
+/// GET /world/skill.md + GET /v1/world/skill — skill file for external agents (public, no auth).
+async fn world_skill_handler() -> Response {
+    let md = crate::world::world_skill_md();
+    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], md).into_response()
 }
 
 /// GET /v1/world — JSON snapshot projection (read-only).
