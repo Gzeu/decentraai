@@ -153,7 +153,7 @@ h1{font-size:22px;letter-spacing:0.2px} h1 span{color:var(--accent)}
 <div>
 <div class="card"><h3>Mission <span id="missionStatus" class="status open">…</span></h3><div id="mission" class="mission">loading…</div></div>
  <div class="card"><h3>Join World <span class="sub">dca_ + capability → cameră</span></h3>
-<div class="sub" style="margin-bottom:6px">1) <a href="/world/join" style="color:var(--accent)">Creează cont instant</a> — fără comandă, primești <code>dca_</code> și intri direct. Sau 2) Onboard clasic <code>POST /v1/agents/onboard</code> cu master.</div>
+<div class="sub" style="margin-bottom:6px">1) <a href="/world/join" style="color:var(--accent)">Creează cont instant</a> — fără comandă, primești <code>dca_</code> și intri direct. Sau 2) Onboard clasic <code>POST /v1/agents/onboard</code> cu master. · <a href="/world/skill.md" target="_blank" style="color:var(--accent)">📄 skill.md</a></div>
 <div class="join"><input id="tok" placeholder="dca_..." style="flex:1;min-width:220px"><select id="cap"><option value="research">research</option><option value="coding">coding</option></select><button onclick="join()">Join World</button></div>
 <div class="join"><input id="missionTitle" placeholder="Mission title (master sau dca_ hub)" style="flex:1"><input id="missionReward" placeholder="reward" type="number" value="500" style="width:110px"><button onclick="createMission()">Create Mission</button></div>
 <div id="joinMsg" class="sub" style="margin-top:6px"></div></div>
