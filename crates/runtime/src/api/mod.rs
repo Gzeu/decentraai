@@ -4314,7 +4314,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 "result": {"content": [{"type": "text", "text": serde_json::to_string(&result_body).unwrap_or_default()}]}
             }).to_string(),
         ).into_response();
-    } else if crate::mcp::execution_request(&raw).is_some() {
+    } else if let Some(args) = crate::mcp::execution_request(&raw) {
         // `execute_decision`: the mutating consumption step, quota-gated.
         // The confirmation gate is enforced inside `run_execute_decision`.
         // SCOPE CHECK: consumers must have explicit "execute" or "*" scope.
@@ -4327,8 +4327,6 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 return forbidden(&reason.to_string());
             }
         }
-        let args: serde_json::Value =
-            serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
         // Per-key rate limit (frequency), independent from quota.
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
@@ -19494,6 +19492,79 @@ mod tests {
         assert_eq!(
             after.available, before_available,
             "quota fully returned to the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_consumer_execute_decision_honors_confirm_from_arguments() {
+        // Regression (P0/P1 protocol correctness): the consumer MCP path must
+        // extract `arguments` from the JSON-RPC envelope (via execution_request)
+        // and pass it to run_execute_decision. Before the fix, the handler
+        // overwrote args with the FULL JSON-RPC body, so `confirm:true` lived
+        // in the outer envelope and run_execute_decision always refused with
+        // `mutating execution requires "confirm": true` — even when the caller
+        // sent confirm:true inside arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let plaintext = make_consumer_key_with_scopes(api, "consumer-account", &["execute"]).await;
+        let client = reqwest::Client::new();
+
+        // Helper: fire execute_decision with the given arguments object and
+        // return the parsed inner body (result.content[0].text).
+        let call = |arguments: serde_json::Value| {
+            let client = client.clone();
+            let plaintext = plaintext.clone();
+            async move {
+                let r = client
+                    .post(format!("http://{api}/mcp"))
+                    .header("Authorization", format!("Bearer {plaintext}"))
+                    .json(&serde_json::json!({
+                        "jsonrpc":"2.0","id":1,"method":"tools/call",
+                        "params":{"name":"execute_decision","arguments":arguments}
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200, "MCP layer itself responds 200");
+                let j: serde_json::Value = r.json().await.unwrap();
+                let content = j["result"]["content"][0]["text"].as_str().unwrap_or("");
+                serde_json::from_str::<serde_json::Value>(content).unwrap_or_default()
+            }
+        };
+
+        // 1. confirm:false -> refused (mutation safety), regardless of envelope.
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi","confirm":false})).await;
+        assert!(
+            body["body"]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("requires \"confirm\": true"),
+            "confirm:false must be refused: {body}"
+        );
+
+        // 2. missing confirm -> refused (same mutation gate).
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi"})).await;
+        assert!(
+            body["body"]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("requires \"confirm\": true"),
+            "missing confirm must be refused: {body}"
+        );
+
+        // 3. confirm:true (inside arguments) -> must pass the confirm gate and
+        //    reach execution, failing HONESTLY (no fabric model) rather than
+        //    being refused at the confirm gate. The honest message is
+        //    "no runnable decision", NOT "requires confirm".
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi","confirm":true})).await;
+        let inner_msg = body["body"]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !inner_msg.contains("requires \"confirm\": true"),
+            "confirm:true from arguments must NOT hit the confirm gate: {body}"
+        );
+        assert!(
+            inner_msg.contains("no runnable decision") || body["body"]["ok"] == false,
+            "with confirm honored, execution proceeds and fails honestly (no fabric model): {body}"
         );
     }
 
