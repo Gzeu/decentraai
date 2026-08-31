@@ -1649,14 +1649,20 @@ async fn world_join_handler(
                 .into_response();
         }
     };
-    // For consumer, enforce hub scope via existing gateway validation
+    // For consumer, enforce World scope (hub/inference OR world capabilities)
+    // Keep scoped-credential security: requires a non-empty scope, but allow
+    // research/coding for World v1 without forcing artificial hub scope.
     if let Auth::Consumer { .. } = &auth {
-        // reuse SAES gateway scope gate if available, else simple check
-        let has_hub = _scopes.iter().any(|s| s == "hub" || s == "inference");
-        if !has_hub {
+        let has_world_scope = _scopes.iter().any(|s| {
+            matches!(
+                s.as_str(),
+                "hub" | "inference" | "research" | "coding" | "world"
+            )
+        });
+        if !has_world_scope {
             return (
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "consumer key missing hub/inference scope"})),
+                Json(serde_json::json!({"error": "consumer key missing world scope (hub/inference/research/coding/world required)"})),
             )
                 .into_response();
         }
