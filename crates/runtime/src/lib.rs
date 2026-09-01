@@ -26,6 +26,7 @@ pub mod providers_api;
 pub mod queue;
 pub mod tools;
 pub mod vesper;
+pub mod world;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};

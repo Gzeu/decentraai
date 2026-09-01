@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 type AgentId = String;
@@ -89,8 +89,7 @@ pub struct EventMetadata {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum EventPriority {
     Low = 0,
     #[default]
@@ -99,9 +98,7 @@ pub enum EventPriority {
     Critical = 3,
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventFilter {
     pub topics: Option<Vec<Topic>>,
     pub sources: Option<Vec<AgentId>>,
@@ -154,7 +151,6 @@ impl EventFilter {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: String,
@@ -177,7 +173,11 @@ pub trait EventHandler: Send + Sync {
 pub trait EventStore: Send + Sync {
     async fn append(&self, event: &Event) -> Result<(), EventBusError>;
     async fn query(&self, filter: &EventFilter, limit: usize) -> Result<Vec<Event>, EventBusError>;
-    async fn get_since(&self, since_timestamp: u64, limit: usize) -> Result<Vec<Event>, EventBusError>;
+    async fn get_since(
+        &self,
+        since_timestamp: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventBusError>;
     async fn prune_before(&self, timestamp: u64) -> Result<u64, EventBusError>;
     async fn get_latest_timestamp(&self) -> Result<u64, EventBusError>;
 }
@@ -214,8 +214,7 @@ impl EventBus {
             for sub_id in subscriber_ids.value() {
                 if let Some(sub) = self.subscriptions.get(sub_id) {
                     let filter = sub.value().filter.clone();
-                    if Self::matches_filter(&event, &filter) {
-                    }
+                    if Self::matches_filter(&event, &filter) {}
                 }
             }
         }
@@ -225,37 +224,48 @@ impl EventBus {
 
     fn matches_filter(event: &Event, filter: &EventFilter) -> bool {
         if let Some(topics) = &filter.topics
-            && !topics.contains(&event.topic) {
-                return false;
-            }
+            && !topics.contains(&event.topic)
+        {
+            return false;
+        }
         if let Some(sources) = &filter.sources
-            && !sources.contains(&event.source) {
-                return false;
-            }
+            && !sources.contains(&event.source)
+        {
+            return false;
+        }
         if let Some(event_types) = &filter.event_types
-            && !event_types.contains(&event.event_type) {
-                return false;
-            }
+            && !event_types.contains(&event.event_type)
+        {
+            return false;
+        }
         if let Some(since) = filter.since_timestamp
-            && event.timestamp < since {
-                return false;
-            }
+            && event.timestamp < since
+        {
+            return false;
+        }
         if let Some(until) = filter.until_timestamp
-            && event.timestamp > until {
-                return false;
-            }
+            && event.timestamp > until
+        {
+            return false;
+        }
         if let Some(min_priority) = filter.min_priority
-            && event.metadata.priority < min_priority {
-                return false;
-            }
+            && event.metadata.priority < min_priority
+        {
+            return false;
+        }
         if let Some(tags) = &filter.tags
-            && !tags.iter().any(|t| event.metadata.tags.contains(t)) {
-                return false;
-            }
+            && !tags.iter().any(|t| event.metadata.tags.contains(t))
+        {
+            return false;
+        }
         true
     }
 
-    pub async fn subscribe(&self, subscriber: AgentId, filter: EventFilter) -> Result<String, EventBusError> {
+    pub async fn subscribe(
+        &self,
+        subscriber: AgentId,
+        filter: EventFilter,
+    ) -> Result<String, EventBusError> {
         let sub_id = Uuid::new_v4().to_string();
         let subscription = Subscription {
             id: sub_id.clone(),
@@ -265,23 +275,34 @@ impl EventBus {
             last_delivered: None,
         };
 
-        self.subscriptions.insert(sub_id.clone(), subscription.clone());
+        self.subscriptions
+            .insert(sub_id.clone(), subscription.clone());
 
         let topic = EventFilter::primary_topic(&subscription.filter).unwrap_or(Topic::system());
-        self.topic_subscribers.entry(topic).or_default().push(sub_id.clone());
+        self.topic_subscribers
+            .entry(topic)
+            .or_default()
+            .push(sub_id.clone());
 
         Ok(sub_id)
     }
 
     pub async fn unsubscribe(&self, subscription_id: &str) -> Result<(), EventBusError> {
         if let Some((_, sub)) = self.subscriptions.remove(subscription_id)
-            && let Some(mut topics) = self.topic_subscribers.get_mut(&EventFilter::primary_topic(&sub.filter).unwrap_or(Topic::system())) {
-                topics.retain(|id| id != subscription_id);
-            }
+            && let Some(mut topics) = self
+                .topic_subscribers
+                .get_mut(&EventFilter::primary_topic(&sub.filter).unwrap_or(Topic::system()))
+        {
+            topics.retain(|id| id != subscription_id);
+        }
         Ok(())
     }
 
-    pub async fn get_events(&self, filter: EventFilter, limit: usize) -> Result<Vec<Event>, EventBusError> {
+    pub async fn get_events(
+        &self,
+        filter: EventFilter,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventBusError> {
         self.event_store.query(&filter, limit).await
     }
 
@@ -360,7 +381,11 @@ impl EventStore for InMemoryEventStore {
         Ok(results)
     }
 
-    async fn get_since(&self, since_timestamp: u64, limit: usize) -> Result<Vec<Event>, EventBusError> {
+    async fn get_since(
+        &self,
+        since_timestamp: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventBusError> {
         let events = self.events.read().await;
         let mut results = Vec::new();
         for event in events.iter().rev() {
@@ -411,10 +436,13 @@ mod tests {
         let store = Arc::new(InMemoryEventStore::new(1000));
         let bus = EventBus::new(store.clone());
 
-        let _sub_id = bus.subscribe(
-            AgentId::from("agent-1"),
-            EventFilter::for_topic(Topic::hub()),
-        ).await.unwrap();
+        let _sub_id = bus
+            .subscribe(
+                AgentId::from("agent-1"),
+                EventFilter::for_topic(Topic::hub()),
+            )
+            .await
+            .unwrap();
 
         let event = Event {
             id: EventId::new(),
@@ -428,7 +456,10 @@ mod tests {
 
         bus.publish(event).await.unwrap();
 
-        let events = store.query(&EventFilter::for_topic(Topic::hub()), 10).await.unwrap();
+        let events = store
+            .query(&EventFilter::for_topic(Topic::hub()), 10)
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
     }
 

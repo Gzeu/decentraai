@@ -1,10 +1,10 @@
 //! Markdown schemas for each personal memory category
-//! 
+//!
 //! Each category has a defined frontmatter + body structure.
 //! Compatible with Obsidian (YAML frontmatter + Markdown body).
 
-use serde::{Deserialize, Serialize};
 use crate::AgentId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Frontmatter common to all memory files
@@ -26,8 +26,8 @@ pub struct IdentityMemory {
     pub agent_id: String,
     pub name: String,
     pub description: String,
-    pub persona: String,           // e.g. "analytical negotiator", "cautious builder"
-    pub values: Vec<String>,       // e.g. ["reliability", "fairness", "learning"]
+    pub persona: String,     // e.g. "analytical negotiator", "cautious builder"
+    pub values: Vec<String>, // e.g. ["reliability", "fairness", "learning"]
     pub communication_style: String,
 }
 
@@ -60,7 +60,15 @@ impl IdentityMemory {
             self.name,
             self.description,
             self.persona,
-            if self.values.is_empty() { "  (none)".to_string() } else { self.values.iter().map(|v| format!("  - {}", v)).collect::<Vec<_>>().join("\n") },
+            if self.values.is_empty() {
+                "  (none)".to_string()
+            } else {
+                self.values
+                    .iter()
+                    .map(|v| format!("  - {}", v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
             self.communication_style
         )
     }
@@ -72,11 +80,11 @@ pub struct GoalEntry {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub priority: u8,           // 1-10
+    pub priority: u8, // 1-10
     pub status: GoalStatus,
     pub created_at: u64,
     pub target_date: Option<u64>,
-    pub progress: u8,           // 0-100
+    pub progress: u8, // 0-100
     pub related_agents: Vec<String>,
 }
 
@@ -90,7 +98,6 @@ pub enum GoalStatus {
     Completed,
     Abandoned,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GoalsMemory {
@@ -116,8 +123,11 @@ impl GoalsMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Goals\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Goals\n\n",
+            fm
+        );
+
         for goal in &self.goals {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n{}\n\n**Priority**: {}/10 | **Status**: {:?} | **Progress**: {}%\n\n",
@@ -132,7 +142,10 @@ impl GoalsMemory {
                 md.push_str(&format!("**Target**: {}\n\n", crate::format_ts(date)));
             }
             if !goal.related_agents.is_empty() {
-                md.push_str(&format!("**Related Agents**: {}\n\n", goal.related_agents.join(", ")));
+                md.push_str(&format!(
+                    "**Related Agents**: {}\n\n",
+                    goal.related_agents.join(", ")
+                ));
             }
             md.push_str("---\n\n");
         }
@@ -145,7 +158,7 @@ impl GoalsMemory {
 pub struct CapabilityEntry {
     pub name: String,
     pub level: CapabilityLevel,
-    pub evidence: Vec<String>,     // evidence IDs
+    pub evidence: Vec<String>, // evidence IDs
     pub last_used: Option<u64>,
     pub notes: String,
 }
@@ -160,8 +173,6 @@ pub enum CapabilityLevel {
     Expert,
     Master,
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapabilitiesMemory {
@@ -187,8 +198,11 @@ impl CapabilitiesMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Capabilities\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Capabilities\n\n",
+            fm
+        );
+
         for cap in &self.capabilities {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{}\n\n**Level**: {:?}\n\n**Evidence**: {}\n\n**Notes**: {}\n\n---\n\n",
@@ -210,7 +224,7 @@ pub struct PersonMemory {
     pub first_interaction: u64,
     pub last_interaction: u64,
     pub interaction_count: u64,
-    pub trust_score: f32,          // -1.0 to 1.0 (subjective!)
+    pub trust_score: f32, // -1.0 to 1.0 (subjective!)
     pub summary: String,
     pub tags: Vec<String>,
     pub notable_traits: Vec<String>,
@@ -263,8 +277,11 @@ impl PeopleMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]People\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]People\n\n",
+            fm
+        );
+
         for (id, person) in &self.people {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n**Trust**: {:.2} | **Interactions**: {} | **First**: {} | **Last**: {}\n\n**Summary**: {}\n\n**Traits**: {}\n\n**Tags**: {}\n\n---\n\n",
@@ -298,7 +315,7 @@ pub struct TaskMemory {
     pub teammates: Vec<String>,
     pub outcome: String,
     pub lessons: Vec<String>,
-    pub self_rating: Option<u8>,  // 1-10 how well I did
+    pub self_rating: Option<u8>, // 1-10 how well I did
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -347,8 +364,11 @@ impl TasksMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Tasks\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Tasks\n\n",
+            fm
+        );
+
         for (id, task) in &self.tasks {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n**Role**: {:?} | **Status**: {:?} | **Reward**: {} Cr\n\n**Description**: {}\n\n**Teammates**: {}\n\n**Outcome**: {}\n\n**Evidence**: {}\n\n**Self-Rating**: {}/10\n\n**Lessons**: {}\n\n---\n\n",
@@ -370,7 +390,7 @@ impl TasksMemory {
 pub struct RelationshipMemory {
     pub agent_id: String,
     pub relationship_type: RelationshipType,
-    pub strength: f32,             // -1.0 to 1.0
+    pub strength: f32, // -1.0 to 1.0
     pub trust: f32,
     pub respect: f32,
     pub reliability: f32,
@@ -419,8 +439,11 @@ impl RelationshipsMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Relationships\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Relationships\n\n",
+            fm
+        );
+
         for (id, rel) in &self.relationships {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{}\n\n**Type**: {:?} | **Strength**: {:.2} | **Trust**: {:.2} | **Respect**: {:.2} | **Reliability**: {:.2}\n\n**Shared Tasks**: {}\n\n**Successful**: {} | **Failed**: {}\n\n**Notes**: {}\n\n---\n\n",
@@ -446,7 +469,7 @@ pub struct ExperienceEntry {
     pub task_id: Option<String>,
     pub outcome: String,
     pub evidence_ids: Vec<String>,
-    pub emotional_impact: f32,   // -1.0 to 1.0
+    pub emotional_impact: f32, // -1.0 to 1.0
     pub tags: Vec<String>,
 }
 
@@ -488,8 +511,11 @@ impl ExperiencesMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Experiences\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Experiences\n\n",
+            fm
+        );
+
         for exp in &self.experiences {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n**Type**: {:?} | **Impact**: {:.2} | **Agents**: {}\n\n**Summary**: {}\n\n**Detail**: {}\n\n**Outcome**: {}\n\n**Evidence**: {}\n\n**Tags**: {}\n\n---\n\n",
@@ -509,11 +535,11 @@ impl ExperiencesMemory {
 pub struct DecisionEntry {
     pub id: String,
     pub timestamp: u64,
-    pub context: String,           // what I saw
+    pub context: String, // what I saw
     pub options_considered: Vec<OptionConsidered>,
-    pub choice: String,            // what I picked
-    pub rationale: String,         // why
-    pub consequence: String,       // what happened
+    pub choice: String,      // what I picked
+    pub rationale: String,   // why
+    pub consequence: String, // what happened
     pub evidence_ids: Vec<String>,
     pub confidence: f32,           // 0-1 at decision time
     pub hindsight: Option<String>, // reflection after outcome
@@ -552,8 +578,11 @@ impl DecisionsMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Decisions\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Decisions\n\n",
+            fm
+        );
+
         for dec in &self.decisions {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n**Context**: {}\n\n**Options Considered**:\n{}\n\n**Choice**: {}\n\n**Rationale**: {}\n\n**Consequence**: {}\n\n**Confidence**: {:.0}% | **Hindsight**: {}\n\n**Evidence**: {}\n\n**Tags**: {}\n\n---\n\n",
@@ -579,9 +608,9 @@ pub struct LessonEntry {
     pub id: String,
     pub title: String,
     pub content: String,
-    pub applies_to: Vec<String>,      // agent IDs or "all"
+    pub applies_to: Vec<String>,         // agent IDs or "all"
     pub source_experiences: Vec<String>, // experience IDs
-    pub confidence: f32,              // 0-1
+    pub confidence: f32,                 // 0-1
     pub created_at: u64,
     pub validated_at: Option<u64>,
     pub usage_count: u32,
@@ -612,8 +641,11 @@ impl LessonsMemory {
 
     pub fn to_markdown(&self) -> String {
         let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
-        let mut md = format!("---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Lessons\n\n", fm);
-        
+        let mut md = format!(
+            "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Lessons\n\n",
+            fm
+        );
+
         for lesson in &self.lessons {
             md.push_str(&format!(
                 "##[derive(Debug, Clone, Serialize, Deserialize)]{} ({})\n\n**Content**: {}\n\n**Applies To**: {}\n\n**Source**: {}\n\n**Confidence**: {:.0}% | **Usage**: {}\n\n**Tags**: {}\n\n---\n\n",
@@ -648,7 +680,7 @@ impl PersonalMemory {
     pub fn new(agent_id: String) -> Self {
         let mut identity = IdentityMemory::new(agent_id.clone());
         identity.agent_id = agent_id.clone();
-        
+
         Self {
             identity,
             goals: GoalsMemory::new(),

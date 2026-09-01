@@ -28,13 +28,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod mcp;
 pub mod schema;
 pub mod store;
-pub mod mcp;
 
+pub use mcp::{
+    extract_memory_export_request, extract_memory_read_request, extract_memory_search_request,
+    extract_memory_snapshot_request, extract_memory_write_request, handle_tool_call, tool_defs,
+};
 pub use schema::*;
-pub use store::{PersonalMemoryStore, PersonalMemoryError};
-pub use mcp::{tool_defs, extract_memory_read_request, extract_memory_write_request, extract_memory_search_request, extract_memory_snapshot_request, extract_memory_export_request, handle_tool_call};
+pub use store::{PersonalMemoryError, PersonalMemoryStore};
 
 /// Root path for all agent personal memories
 pub fn agents_root(data_dir: &Path) -> PathBuf {
@@ -80,7 +83,10 @@ impl MemoryCategory {
     }
 
     pub fn is_singleton(&self) -> bool {
-        matches!(self, MemoryCategory::Identity | MemoryCategory::Goals | MemoryCategory::Capabilities)
+        matches!(
+            self,
+            MemoryCategory::Identity | MemoryCategory::Goals | MemoryCategory::Capabilities
+        )
     }
 }
 
@@ -144,29 +150,32 @@ mod tests {
     fn agents_root_path() {
         let dir = Path::new("/tmp/test");
         assert_eq!(agents_root(dir), Path::new("/tmp/test/agents"));
-        assert_eq!(agent_memory_dir(dir, "dca_alpha"), Path::new("/tmp/test/agents/dca_alpha"));
+        assert_eq!(
+            agent_memory_dir(dir, "dca_alpha"),
+            Path::new("/tmp/test/agents/dca_alpha")
+        );
     }
 }
 
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    use crate::mcp::{personal_memory_to_snapshot, search_memory};
     use tempfile::tempdir;
-    use crate::mcp::{search_memory, personal_memory_to_snapshot};
 
     #[tokio::test]
     async fn test_personal_memory_persistence_influences_decisions() {
         let dir = tempdir().unwrap();
         let store = PersonalMemoryStore::new(dir.path());
         let _agent = "dca_demo_agent";
-        
+
         // ═══ PHASE 1: Agent acts and writes experience ═══
         println!("PHASE 1: Agent acts and writes experience");
-        
+
         let cached = store.get_or_create(&"dca_demo_agent".to_string()).await;
         {
             let mut mem = cached.write().await;
-            
+
             // Write a negative experience
             mem.memory.experiences.experiences.push(ExperienceEntry {
                 id: "exp-001".to_string(),
@@ -183,7 +192,7 @@ mod persistence_tests {
             });
             mem.memory.experiences.frontmatter.updated_at = 1000;
             mem.memory.experiences.frontmatter.version += 1;
-            
+
             // Distill a lesson
             mem.memory.lessons.lessons.push(LessonEntry {
                 id: "lesson-001".to_string(),
@@ -199,146 +208,184 @@ mod persistence_tests {
             });
             mem.memory.lessons.frontmatter.updated_at = 1000;
             mem.memory.lessons.frontmatter.version += 1;
-            
+
             // Update relationship
-            mem.memory.relationships.relationships.insert("dca_other".to_string(), RelationshipMemory {
-                agent_id: "dca_other".to_string(),
-                relationship_type: RelationshipType::Avoided,
-                strength: -0.7,
-                trust: -0.8,
-                respect: -0.5,
-                reliability: -0.9,
-                started_at: 1000,
-                last_updated: 1000,
-                shared_tasks: vec!["task-001".to_string()],
-                successful_collaborations: 0,
-                failed_collaborations: 1,
-                notes: "Hostile rejection of fair offer. Avoid for time-critical work.".to_string(),
-            });
+            mem.memory.relationships.relationships.insert(
+                "dca_other".to_string(),
+                RelationshipMemory {
+                    agent_id: "dca_other".to_string(),
+                    relationship_type: RelationshipType::Avoided,
+                    strength: -0.7,
+                    trust: -0.8,
+                    respect: -0.5,
+                    reliability: -0.9,
+                    started_at: 1000,
+                    last_updated: 1000,
+                    shared_tasks: vec!["task-001".to_string()],
+                    successful_collaborations: 0,
+                    failed_collaborations: 1,
+                    notes: "Hostile rejection of fair offer. Avoid for time-critical work."
+                        .to_string(),
+                },
+            );
             mem.memory.relationships.frontmatter.updated_at = 1000;
             mem.memory.relationships.frontmatter.version += 1;
-            
+
             mem.dirty = true;
         }
-        
+
         // Also populate PeopleMemory for relationship_summaries in snapshot
         {
             let mut mem = cached.write().await;
-            mem.memory.people.people.insert("dca_other".to_string(), PersonMemory {
-                agent_id: "dca_other".to_string(),
-                display_name: Some("dca_other".to_string()),
-                first_interaction: 1000,
-                last_interaction: 1000,
-                interaction_count: 1,
-                trust_score: -0.8,
-                summary: "Hostile rejection of fair offer. Avoid for time-critical work.".to_string(),
-                tags: vec!["unreliable".to_string(), "toxic".to_string()],
-                notable_traits: vec!["hostile".to_string(), "unreliable".to_string()],
-                interaction_history: vec![InteractionSummary {
-                    timestamp: 1000,
-                    task_id: Some("task-001".to_string()),
-                    type_: InteractionType::Dispute,
-                    outcome: "wasted_time".to_string(),
-                    trust_delta: -0.8,
-                }],
-            });
+            mem.memory.people.people.insert(
+                "dca_other".to_string(),
+                PersonMemory {
+                    agent_id: "dca_other".to_string(),
+                    display_name: Some("dca_other".to_string()),
+                    first_interaction: 1000,
+                    last_interaction: 1000,
+                    interaction_count: 1,
+                    trust_score: -0.8,
+                    summary: "Hostile rejection of fair offer. Avoid for time-critical work."
+                        .to_string(),
+                    tags: vec!["unreliable".to_string(), "toxic".to_string()],
+                    notable_traits: vec!["hostile".to_string(), "unreliable".to_string()],
+                    interaction_history: vec![InteractionSummary {
+                        timestamp: 1000,
+                        task_id: Some("task-001".to_string()),
+                        type_: InteractionType::Dispute,
+                        outcome: "wasted_time".to_string(),
+                        trust_delta: -0.8,
+                    }],
+                },
+            );
             mem.memory.people.frontmatter.updated_at = 1000;
             mem.memory.people.frontmatter.version += 1;
             mem.dirty = true;
         }
-        
+
         // Persist to disk
-        store.save_agent(&"dca_demo_agent".to_string()).await.unwrap();
+        store
+            .save_agent(&"dca_demo_agent".to_string())
+            .await
+            .unwrap();
         println!("✓ PHASE 1: Written experience, lesson, relationship to Markdown");
-        
+
         // ═══ PHASE 2: RESTART (new store instance, same directory) ═══
         println!("\nPHASE 2: RESTART - new store instance, same directory");
-        
+
         // Create NEW store instance pointing to SAME directory (simulating restart)
         let _store2 = PersonalMemoryStore::new(dir.path());
-        
+
         // ═══ PHASE 3: Agent reads past and makes different decision ═══
         println!("\nPHASE 3: Agent reads past and makes different decision");
-        
+
         let cached = store.get_or_create(&"dca_demo_agent".to_string()).await;
         let mem = cached.read().await;
-        
+
         // Verify experience loaded
         assert_eq!(mem.memory.experiences.experiences.len(), 1);
-        assert_eq!(mem.memory.experiences.experiences[0].summary, "dca_other rejected my fair proposal aggressively");
-        println!("✓ Experience loaded: {}", mem.memory.experiences.experiences[0].summary);
-        
+        assert_eq!(
+            mem.memory.experiences.experiences[0].summary,
+            "dca_other rejected my fair proposal aggressively"
+        );
+        println!(
+            "✓ Experience loaded: {}",
+            mem.memory.experiences.experiences[0].summary
+        );
+
         // Verify lesson loaded
         assert_eq!(mem.memory.lessons.lessons.len(), 1);
-        assert_eq!(mem.memory.lessons.lessons[0].title, "Avoid dca_other for time-sensitive tasks");
+        assert_eq!(
+            mem.memory.lessons.lessons[0].title,
+            "Avoid dca_other for time-sensitive tasks"
+        );
         println!("✓ Lesson loaded: {}", mem.memory.lessons.lessons[0].title);
-        
+
         // Verify relationship loaded
         assert_eq!(mem.memory.relationships.relationships.len(), 1);
-        let rel = mem.memory.relationships.relationships.get("dca_other").unwrap();
+        let rel = mem
+            .memory
+            .relationships
+            .relationships
+            .get("dca_other")
+            .unwrap();
         assert_eq!(rel.relationship_type, RelationshipType::Avoided);
         assert!(rel.trust < -0.5);
-        println!("✓ Relationship loaded: dca_other → {:?} (trust: {:.1})", rel.relationship_type, rel.trust);
-        
+        println!(
+            "✓ Relationship loaded: dca_other → {:?} (trust: {:.1})",
+            rel.relationship_type, rel.trust
+        );
+
         // ═══ PHASE 4: Different decision based on memory ═══
         println!("\nPHASE 4: Different decision based on memory");
-        
+
         // Search for dca_other
         let results = search_memory(&mem.memory, "dca_other", None, 5);
         assert!(!results.is_empty());
         println!("✓ Search found {} results for 'dca_other'", results.len());
-        
+
         // Get decision snapshot
         let snapshot = personal_memory_to_snapshot(&mem.memory);
-        
+
         // Verify lesson appears in snapshot
         assert!(!snapshot.recent_lessons.is_empty());
         assert!(snapshot.recent_lessons[0].title.contains("Avoid dca_other"));
-        println!("✓ Snapshot shows lesson: {:?}", snapshot.recent_lessons[0].title);
-        
+        println!(
+            "✓ Snapshot shows lesson: {:?}",
+            snapshot.recent_lessons[0].title
+        );
+
         // Verify relationship appears in snapshot
         assert!(snapshot.relationship_summaries.contains_key("dca_other"));
         let rel_summary = &snapshot.relationship_summaries["dca_other"];
         assert!(rel_summary.contains("-0.80")); // trust score -0.80
         println!("✓ Snapshot shows relationship: {}", rel_summary);
-        
+
         // ═══ DECISION LOGIC DEMONSTRATION ═══
         println!("\n═══ DECISION LOGIC DEMONSTRATION ═══");
-        
+
         // Simulate decision context: new task from dca_other
         let _new_task_from_dca_other = true;
-        
+
         // Agent's decision logic:
         // 1. Check if task is from known agent
         // 2. Check personal memory for relationship
         // 4. Make decision
-        
-        let should_avoid = mem.memory.relationships.relationships.get("dca_other")
+
+        let should_avoid = mem
+            .memory
+            .relationships
+            .relationships
+            .get("dca_other")
             .map(|r| r.relationship_type == RelationshipType::Avoided || r.trust < -0.3)
             .unwrap_or(false);
-        
-        let has_warning_lesson = mem.memory.lessons.lessons.iter().any(|l| {
-            l.applies_to.contains(&"dca_other".to_string()) && l.confidence > 0.7
-        });
-        
+
+        let has_warning_lesson = mem
+            .memory
+            .lessons
+            .lessons
+            .iter()
+            .any(|l| l.applies_to.contains(&"dca_other".to_string()) && l.confidence > 0.7);
+
         println!("  Task from dca_other: true");
         println!("  Should avoid based on relationship: {}", should_avoid);
         println!("  Has warning lesson: {}", has_warning_lesson);
-        
+
         // Different decision: AVOID dca_other
         let decision = if should_avoid || has_warning_lesson {
             "REJECT - Avoid dca_other based on past negative experience"
         } else {
             "ACCEPT - No negative history"
         };
-        
+
         println!("\n  DECISION: {}", decision);
-        
+
         // Verify this is DIFFERENT from what would happen without memory
         let decision_without_memory = "ACCEPT - No negative history";
         assert_ne!(decision, decision_without_memory);
         println!("✓ Decision DIFFERS from no-memory baseline");
-        
+
         println!("\n✓✓✓ PERSONAL MEMORY PERSISTENCE INFLUENCES DECISIONS AFTER RESTART ✓✓✓");
     }
 }

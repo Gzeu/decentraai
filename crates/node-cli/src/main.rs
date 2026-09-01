@@ -2418,7 +2418,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // The dashboard owns the llama-server lifecycle (idle-unload); the worker
     // backend points at the same address. When a node has a model it is fully
     // usable standalone (local inference + dashboard) even with no peers.
-    if is_worker && !backend_url.is_empty() {
+    // World v1 fix: serve API even if backend_url is still empty at this
+    // point (engine may restart on next health probe); is_worker gate keeps
+    // coordinator-only nodes from exposing the API unintentionally, and
+    // api_auth_required remains enforced.
+    if is_worker {
         // ServeManager + M24 supervisor are created above (before the compute
         // broadcaster) so the worker advertises in sync with the LIVE engine
         // port after any respawn. Reuse the same handle here so the dashboard

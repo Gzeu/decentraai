@@ -59,10 +59,7 @@ impl Drop for AuditBridge {
 
 /// Subscribe to the bus and write every event with `priority >=
 /// Normal` to `<log_dir>/audit.jsonl`. Returns a guard.
-pub fn attach_audit_bridge(
-    bus: &crate::EventBus,
-    log_dir: &Path,
-) -> std::io::Result<AuditBridge> {
+pub fn attach_audit_bridge(bus: &crate::EventBus, log_dir: &Path) -> std::io::Result<AuditBridge> {
     std::fs::create_dir_all(log_dir)?;
     let log_path = log_dir.join("audit.jsonl");
     let mut receiver = bus.subscribe_broadcast();

@@ -12,21 +12,31 @@
 //!
 //! Reuses: Hub (task market), Arena (agent world), Agents (reputation/economy), Compute (quota/evidence)
 
-
-pub mod rules;
-pub mod state;
 pub mod mcp;
 pub mod reputation;
+pub mod rules;
+pub mod state;
 
-pub use rules::{SocietyRules, DecisionContext, DecisionHint};
-pub use state::{SocietyState, SocialRelationship, RelationshipKind, ContributionRecord, TaskOutcome, TaskOutcomeStatus, RewardDistribution, ShareBasis};
+pub use mcp::{
+    ToolDef, build_contributions_response, build_decision_hints_response, build_outcomes_response,
+    build_relationships_response, build_reputation_response, build_society_state_response,
+    build_trust_response, society_contributions_request, society_decision_hints_request,
+    society_outcomes_request, society_relationships_request, society_reputation_request,
+    society_state_request, society_tools, society_trust_request,
+};
+pub use reputation::{ReputationSignal, ReputationStore, SocialReputation};
+pub use rules::{DecisionContext, DecisionHint, SocietyRules};
+pub use state::{
+    ContributionRecord, RelationshipKind, RewardDistribution, ShareBasis, SocialRelationship,
+    SocietyState, TaskOutcome, TaskOutcomeStatus,
+};
 pub use state::{ReputationEvent, ReputationEventType};
-pub use reputation::{SocialReputation, ReputationSignal, ReputationStore};
-pub use mcp::{ToolDef, society_tools, society_state_request, society_trust_request, society_reputation_request, society_relationships_request, society_contributions_request, society_outcomes_request, society_decision_hints_request, build_society_state_response, build_trust_response, build_reputation_response, build_relationships_response, build_contributions_response, build_outcomes_response, build_decision_hints_response};
 
 /// Re-exports for convenience
-pub use decentraai_agent_hub::{HubState, HubTask, Bid, Proposal, ProposalStatus, Team, HubEvent, HubError, TaskStatus};
-pub use decentraai_arena::{ArenaAgent, ActionKind};
+pub use decentraai_agent_hub::{
+    Bid, HubError, HubEvent, HubState, HubTask, Proposal, ProposalStatus, TaskStatus, Team,
+};
+pub use decentraai_arena::{ActionKind, ArenaAgent};
 
 /// Agent Society error types
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

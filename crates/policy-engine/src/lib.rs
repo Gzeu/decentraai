@@ -36,8 +36,7 @@ pub enum PolicyEngineError {
     Internal(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub struct PolicyId(pub String);
 
 impl PolicyId {
@@ -46,9 +45,7 @@ impl PolicyId {
     }
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum PolicyType {
     #[default]
     AccessControl,
@@ -62,20 +59,17 @@ pub enum PolicyType {
     Custom(String),
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum PolicyEffect {
     #[default]
     Allow,
     Deny,
     RequireApproval,
     RequireQuota,
-    RequireReputation,  // simplified: no f32 (avoids Eq/Hash bound)
-    RequireTrust,        // simplified: no f32
+    RequireReputation, // simplified: no f32 (avoids Eq/Hash bound)
+    RequireTrust,      // simplified: no f32
     Custom(String),
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyContext {
@@ -263,8 +257,8 @@ impl PolicyEngine {
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_millis() as u64)
-    .unwrap_or(0)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

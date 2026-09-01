@@ -3,15 +3,22 @@
 //! M2: SSE stream, Governor wiring (quota reserve/settle), MCP, persistence snapshot.
 //! M3: LLM wiring for REQUEST_COMPUTE, load at startup, shared consequences (buildings/alliances/trades)
 
-use std::sync::Arc;
-use axum::{extract::{State, Json}, http::HeaderMap, response::{IntoResponse, sse::{Event as SseEvent, Sse}}};
+use crate::api::{ApiState, Auth};
+use axum::{
+    extract::{Json, State},
+    http::HeaderMap,
+    response::{
+        IntoResponse,
+        sse::{Event as SseEvent, Sse},
+    },
+};
+use decentraai_arena::{ActionKind, ArenaAgent, ArenaEvent, ArenaWorld};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use decentraai_arena::{ActionKind, ArenaAgent, ArenaWorld, ArenaEvent};
-use crate::api::{ApiState, Auth};
 
 pub type SharedArena = Arc<Mutex<ArenaWorld>>;
 
@@ -119,9 +126,22 @@ pub async fn arena_join_handler(
             let tick = arena.tick;
             let path = arena_path_for(&state.info.repo_root);
             save_arena_world(&path, &arena);
-            (axum::http::StatusCode::OK, Json(serde_json::json!(JoinResponse{ agent_id, x, y, tick }))).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!(JoinResponse {
+                    agent_id,
+                    x,
+                    y,
+                    tick
+                })),
+            )
+                .into_response()
         }
-        Err(e) => (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -145,7 +165,13 @@ pub async fn arena_action_handler(
     {
         let mut arena = state.arena.lock().await;
         if !arena.agents.contains_key(&agent_id) {
-            let agent = ArenaAgent::new(agent_id.clone(), account_id.clone(), account_id.clone(), 5, 5);
+            let agent = ArenaAgent::new(
+                agent_id.clone(),
+                account_id.clone(),
+                account_id.clone(),
+                5,
+                5,
+            );
             let _ = arena.join(agent);
         }
     }
@@ -163,7 +189,11 @@ pub async fn arena_action_handler(
             {
                 let mut lg = ledger.lock().unwrap();
                 if let Err(e) = lg.reserve(&account_id, &rid, cost) {
-                    return (axum::http::StatusCode::PAYMENT_REQUIRED, Json(serde_json::json!({"error": format!("quota: {}", e)}))).into_response();
+                    return (
+                        axum::http::StatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({"error": format!("quota: {}", e)})),
+                    )
+                        .into_response();
                 }
             }
             reservation_id = Some(rid.clone());
@@ -173,7 +203,10 @@ pub async fn arena_action_handler(
                 mgr.base_url().unwrap_or_else(|| state.backend_url.clone())
             };
             let model = state.active_model.read().await.clone();
-            let prompt = format!("Arena agent {} at tick {} requests compute: {}. Provide a concise 1-sentence insight for the arena.", agent_id, tick_for_evidence, rationale);
+            let prompt = format!(
+                "Arena agent {} at tick {} requests compute: {}. Provide a concise 1-sentence insight for the arena.",
+                agent_id, tick_for_evidence, rationale
+            );
             let client = state.client.clone();
             let llm_result: Option<String> = async {
                 let resp = client.post(format!("{}/v1/chat/completions", backend))
@@ -189,7 +222,10 @@ pub async fn arena_action_handler(
                 let hash = blake3::hash(text.as_bytes());
                 evidence_id = Some(hash.to_hex().to_string());
             } else {
-                let payload = format!("{}:{}:{:?}:{}", agent_id, tick_for_evidence, req.action, rid);
+                let payload = format!(
+                    "{}:{}:{:?}:{}",
+                    agent_id, tick_for_evidence, req.action, rid
+                );
                 let hash = blake3::hash(payload.as_bytes());
                 evidence_id = Some(hash.to_hex().to_string());
             }
@@ -208,15 +244,29 @@ pub async fn arena_action_handler(
     let mut arena = state.arena.lock().await;
     // If we have LLM text, use it to enrich rationale detail via evidence
     let effective_rationale = if let Some(txt) = llm_text.clone() {
-        format!("{} | LLM: {}", rationale, txt.chars().take(100).collect::<String>())
+        format!(
+            "{} | LLM: {}",
+            rationale,
+            txt.chars().take(100).collect::<String>()
+        )
     } else {
         rationale
     };
-    match arena.apply(&agent_id, req.action, req.target, effective_rationale, evidence_id.clone()) {
+    match arena.apply(
+        &agent_id,
+        req.action,
+        req.target,
+        effective_rationale,
+        evidence_id.clone(),
+    ) {
         Ok(mut ev) => {
             // Enrich detail with LLM if available
             if let Some(txt) = llm_text {
-                ev.detail = format!("{} | LLM: {}", ev.detail, txt.chars().take(80).collect::<String>());
+                ev.detail = format!(
+                    "{} | LLM: {}",
+                    ev.detail,
+                    txt.chars().take(80).collect::<String>()
+                );
             }
             arena.advance_tick();
             let path = arena_path_for(&state.info.repo_root);
@@ -224,7 +274,14 @@ pub async fn arena_action_handler(
             if let Some(_em) = &state.evidence {
                 let _ = evidence_id;
             }
-            (axum::http::StatusCode::OK, Json(serde_json::json!(ActionResponse{ event: ev, world_tick: arena.tick }))).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!(ActionResponse {
+                    event: ev,
+                    world_tick: arena.tick
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             if let Some(rid) = reservation_id {
@@ -233,11 +290,17 @@ pub async fn arena_action_handler(
                 }
             }
             let code = match e {
-                decentraai_arena::ArenaError::Cooldown(_) => axum::http::StatusCode::TOO_MANY_REQUESTS,
-                decentraai_arena::ArenaError::InsufficientResources{..} => axum::http::StatusCode::PAYMENT_REQUIRED,
+                decentraai_arena::ArenaError::Cooldown(_) => {
+                    axum::http::StatusCode::TOO_MANY_REQUESTS
+                }
+                decentraai_arena::ArenaError::InsufficientResources { .. } => {
+                    axum::http::StatusCode::PAYMENT_REQUIRED
+                }
                 decentraai_arena::ArenaError::AlreadyJoined => axum::http::StatusCode::CONFLICT,
                 decentraai_arena::ArenaError::OutOfBounds => axum::http::StatusCode::BAD_REQUEST,
-                decentraai_arena::ArenaError::ActionNotAllowed(_) => axum::http::StatusCode::BAD_REQUEST,
+                decentraai_arena::ArenaError::ActionNotAllowed(_) => {
+                    axum::http::StatusCode::BAD_REQUEST
+                }
                 _ => axum::http::StatusCode::BAD_REQUEST,
             };
             (code, Json(serde_json::json!({"error": e.to_string()}))).into_response()
@@ -247,10 +310,16 @@ pub async fn arena_action_handler(
 
 pub async fn arena_events_handler(
     State(state): State<ApiState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String,String>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let since: u64 = params.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let limit: usize = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let since: u64 = params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let arena = state.arena.lock().await;
     let events = arena.events_since(since, limit.min(200));
     Json(serde_json::json!({"tick": arena.tick, "events": events}))
@@ -264,7 +333,12 @@ pub async fn arena_stream_handler(
     let stream = futures::stream::unfold((arena_clone, 0u64), |(arena, last_seen)| async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let guard = arena.lock().await;
-        let new_events: Vec<ArenaEvent> = guard.events.iter().filter(|e| e.tick >= last_seen).cloned().collect();
+        let new_events: Vec<ArenaEvent> = guard
+            .events
+            .iter()
+            .filter(|e| e.tick >= last_seen)
+            .cloned()
+            .collect();
         if new_events.is_empty() {
             let next = last_seen;
             drop(guard);
@@ -273,10 +347,17 @@ pub async fn arena_stream_handler(
             let max_tick = new_events.iter().map(|e| e.tick).max().unwrap_or(last_seen) + 1;
             let data = serde_json::to_string(&new_events).unwrap_or_else(|_| "[]".to_string());
             drop(guard);
-            Some((Ok(SseEvent::default().data(data).event("arena_events")), (arena, max_tick)))
+            Some((
+                Ok(SseEvent::default().data(data).event("arena_events")),
+                (arena, max_tick),
+            ))
         }
     });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("keepalive"))
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 /// Spectator HTML — premium grid + live SSE + poll fallback, no secrets.

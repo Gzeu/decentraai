@@ -1092,30 +1092,60 @@ pub fn compensation_request(raw: &str) -> bool {
 }
 
 pub fn arena_state_request(raw: &str) -> bool {
-    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
-    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("arena_state")
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("arena_state")
 }
 
 pub fn arena_act_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())?;
-    if name != "arena_act" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "arena_act" {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments")).cloned();
     Some(args.unwrap_or(json!({})))
 }
 
 pub fn hub_state_request(raw: &str) -> bool {
-    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
-    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("hub_state")
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("hub_state")
 }
 
 pub fn hub_events_request(raw: &str) -> Option<(u64, usize)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_events" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_events"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let since = args.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
@@ -1123,11 +1153,29 @@ pub fn hub_events_request(raw: &str) -> Option<(u64, usize)> {
 }
 pub fn hub_publish_task_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_publish_task" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_publish_task"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1137,11 +1185,29 @@ pub fn hub_publish_task_request(raw: &str) -> Option<serde_json::Value> {
 }
 pub fn hub_place_bid_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_place_bid" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_place_bid"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1151,11 +1217,29 @@ pub fn hub_place_bid_request(raw: &str) -> Option<serde_json::Value> {
 }
 pub fn hub_propose_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_propose" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_propose"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1165,11 +1249,29 @@ pub fn hub_propose_request(raw: &str) -> Option<serde_json::Value> {
 }
 pub fn hub_decide_proposal_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_decide_proposal" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_decide_proposal"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1179,11 +1281,29 @@ pub fn hub_decide_proposal_request(raw: &str) -> Option<serde_json::Value> {
 }
 pub fn hub_form_team_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_form_team" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_form_team"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1193,11 +1313,29 @@ pub fn hub_form_team_request(raw: &str) -> Option<serde_json::Value> {
 }
 pub fn hub_execute_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "hub_execute" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "hub_execute"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     // Add account from request if present, for multi-agent support
-    if let Some(acc) = msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("account")).and_then(|v| v.as_str()) {
+    if let Some(acc) = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("account"))
+        .and_then(|v| v.as_str())
+    {
         let mut a = args.as_object().cloned().unwrap_or_default();
         a.insert("account".to_string(), json!(acc));
         Some(json!(a))
@@ -1207,14 +1345,30 @@ pub fn hub_execute_request(raw: &str) -> Option<serde_json::Value> {
 }
 
 pub fn society_state_request(raw: &str) -> bool {
-    let Ok(msg) = serde_json::from_str::<Value>(raw) else { return false; };
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
-    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("society_state")
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("society_state")
 }
 pub fn society_trust_request(raw: &str) -> Option<(String, String)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_trust" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_trust"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let observer = args.get("observer").and_then(|v| v.as_str())?.to_string();
     let subject = args.get("subject").and_then(|v| v.as_str())?.to_string();
@@ -1222,32 +1376,78 @@ pub fn society_trust_request(raw: &str) -> Option<(String, String)> {
 }
 pub fn society_reputation_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_reputation" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_reputation"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
-    let capability = args.get("capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let capability = args
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Some((agent_id, capability))
 }
 pub fn society_relationships_request(raw: &str) -> Option<(String, bool)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_relationships" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_relationships"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
-    let as_observer = args.get("as_observer").and_then(|v| v.as_bool()).unwrap_or(true);
+    let as_observer = args
+        .get("as_observer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     Some((agent_id, as_observer))
 }
 pub fn society_contributions_request(raw: &str) -> Option<String> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_contributions" { return None; }
-    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("task_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_contributions"
+    {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("task_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 pub fn society_outcomes_request(raw: &str) -> Option<(String, usize)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_outcomes" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_outcomes"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -1255,8 +1455,17 @@ pub fn society_outcomes_request(raw: &str) -> Option<(String, usize)> {
 }
 pub fn society_decision_hints_request(raw: &str) -> Option<(String, Value, Value)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_decision_hints" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_decision_hints"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let hub_state = args.get("hub_state").cloned().unwrap_or(json!({}));
@@ -1266,61 +1475,145 @@ pub fn society_decision_hints_request(raw: &str) -> Option<(String, Value, Value
 
 pub fn society_record_relationship_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_relationship" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_record_relationship"
+    {
+        return None;
+    }
     msg.get("params").and_then(|p| p.get("arguments")).cloned()
 }
 pub fn society_record_contribution_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_contribution" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_record_contribution"
+    {
+        return None;
+    }
     msg.get("params").and_then(|p| p.get("arguments")).cloned()
 }
 pub fn society_record_outcome_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_outcome" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_record_outcome"
+    {
+        return None;
+    }
     msg.get("params").and_then(|p| p.get("arguments")).cloned()
 }
 pub fn society_record_reputation_event_request(raw: &str) -> Option<serde_json::Value> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_record_reputation_event" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_record_reputation_event"
+    {
+        return None;
+    }
     msg.get("params").and_then(|p| p.get("arguments")).cloned()
 }
 
 pub fn agent_memory_write_request(raw: &str) -> Option<(String, String, Value)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_write" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "agent_memory_write"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let category = args.get("category").and_then(|v| v.as_str())?.to_string();
     let entry = args.get("entry").cloned().unwrap_or(json!({}));
     Some((agent_id, category, entry))
 }
 
-
 /// Extract request parameters for agent_memory_read
 pub fn agent_memory_read_request(raw: &str) -> Option<(String, Option<Vec<String>>)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_read" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "agent_memory_read"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
-    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+            .collect()
+    });
     Some((agent_id, categories))
 }
 
 /// Extract request parameters for agent_memory_search
-pub fn agent_memory_search_request(raw: &str) -> Option<(String, String, Option<Vec<String>>, usize)> {
+pub fn agent_memory_search_request(
+    raw: &str,
+) -> Option<(String, String, Option<Vec<String>>, usize)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_search" { return None; }
-    let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "agent_memory_search"
+    {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let query = args.get("query").and_then(|v| v.as_str())?.to_string();
-    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect());
+    let categories = args.get("categories").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+            .collect()
+    });
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     Some((agent_id, query, categories, limit))
 }
@@ -1328,17 +1621,43 @@ pub fn agent_memory_search_request(raw: &str) -> Option<(String, String, Option<
 /// Extract request parameters for agent_memory_snapshot
 pub fn agent_memory_snapshot_request(raw: &str) -> Option<String> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_snapshot" { return None; }
-    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "agent_memory_snapshot"
+    {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("agent_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract request parameters for agent_memory_export
 pub fn agent_memory_export_request(raw: &str) -> Option<String> {
     let msg: Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "agent_memory_export" { return None; }
-    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("agent_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "agent_memory_export"
+    {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("agent_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
@@ -1365,12 +1684,19 @@ pub fn embeddings_request(raw: &str) -> Option<(String, Option<String>)> {
     Some((input, model))
 }
 
-
 /// Extract request parameters for discover_capabilities
 pub fn discover_capabilities_request(raw: &str) -> bool {
-    let msg: Value = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => return false };
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
-    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("discover_capabilities")
+    let msg: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("discover_capabilities")
 }
 
 /// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).

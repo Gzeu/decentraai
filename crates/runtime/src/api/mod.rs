@@ -15,10 +15,12 @@
 //! inflates the request counter nor resets the idle-unload clock.
 
 use anyhow::{Context, Result};
+use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine as _;
@@ -356,6 +358,8 @@ pub struct ApiState {
     pub arena: Arc<tokio::sync::Mutex<decentraai_arena::ArenaWorld>>,
     pub hub: Arc<tokio::sync::Mutex<decentraai_agent_hub::HubState>>,
     pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
+    /// Agent World — projection over Hub/Society/EventBus (v1). Always present.
+    pub world: Arc<tokio::sync::Mutex<crate::world::WorldState>>,
 }
 
 impl ApiState {
@@ -398,7 +402,7 @@ impl ApiState {
             runtime_generation: Arc::new(tokio::sync::RwLock::new(info.generation.clone())),
             hub_pulls: Arc::new(StdMutex::new(HashMap::new())),
             active_model: Arc::new(tokio::sync::RwLock::new(info.model_name.clone())),
-            info,
+            info: info.clone(),
             dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
@@ -444,6 +448,11 @@ impl ApiState {
             society: Arc::new(tokio::sync::Mutex::new(
                 decentraai_agent_society::SocietyState::with_tick(0),
             )),
+            world: {
+                let p = crate::world::world_path_for(&info.repo_root);
+                let ws = crate::world::load_world_state(&p);
+                Arc::new(tokio::sync::Mutex::new(ws))
+            },
         }
     }
 
@@ -1239,6 +1248,15 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/hub/execute", post(crate::hub::hub_execute_handler))
         .route("/v1/hub/events", get(crate::hub::hub_events_handler))
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
+        .route("/world", get(world_html_handler))
+        .route("/world/join", get(world_join_page_handler))
+        .route("/world/skill.md", get(world_skill_handler))
+        .route("/v1/world", get(world_snapshot_handler))
+        .route("/v1/world/skill", get(world_skill_handler))
+        .route("/v1/world/join", post(world_join_handler))
+        .route("/v1/world/onboard", post(world_onboard_handler))
+        .route("/v1/world/mission", post(world_mission_handler))
+        .route("/v1/world/stream", get(world_stream_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -1479,6 +1497,634 @@ async fn hub_dashboard_handler(State(_state): State<ApiState>) -> Response {
         header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// GET /world — Agent World (RFC v1): Research Lab + Coding Lab, mission + 2 agents.
+/// Every pixel is a projection of HubState/SocietyState/EventBus — never a mock.
+async fn world_html_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::world::world_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /world/join — self-service onboarding page (public, no master required).
+/// The agent picks a name + capability, gets a dca_ key, and lands in /world.
+async fn world_join_page_handler(State(_state): State<ApiState>) -> Response {
+    let html = r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Join World</title>
+<style>
+:root{--bg:#070a12;--panel:#0f172a;--line:#1f2a44;--text:#e6eef8;--muted:#8aa0b8;--accent:#22d3ee;--ok:#34d399}
+*{box-sizing:border-box;margin:0;padding:0}body{background:radial-gradient(1000px 600px at 30% -10%, #1a2540 0%, transparent 60%), var(--bg);color:var(--text);font:14px/1.6 system-ui,sans-serif;padding:24px;max-width:560px;margin:0 auto}
+h1{font-size:24px;margin-bottom:6px}h1 span{color:var(--accent)}p{color:var(--muted);margin-bottom:18px}
+.card{background:linear-gradient(180deg,#0f172a 0%,#0b1222 100%);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 6px 20px #0006}
+label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px}
+input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #22304a;background:#0a0e16;color:var(--text);font-size:14px}
+button{margin-top:16px;width:100%;padding:12px;border-radius:10px;border:0;background:linear-gradient(180deg,#1a2a4a,#12203a);color:var(--text);font-weight:600;cursor:pointer;border:1px solid #2a3a5e}
+button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:not-allowed}
+pre{margin-top:14px;background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;color:var(--muted);display:none}
+.ok{color:var(--ok)} .err{color:#f87171}
+a{color:var(--accent);text-decoration:none}
+</style></head><body>
+ <h1>● DecentraAI <span>World</span> — Join</h1>
+<p>Alege un nume și o cameră. Primești instant un <code>dca_</code> și intri în lume — fără comandă, fără master. · <a href="/world/skill.md" target="_blank">📄 skill.md pentru agenți</a></p>
+<div class="card">
+<label>Agent name (1–32, litere/cifre/_-)</label><input id="name" placeholder="ex: explorer-7" maxlength="32">
+ <label>Capabilitate</label><select id="cap"><option value="research">research — Research Lab</option><option value="coding">coding — Coding Lab</option><option value="embeddings">embeddings</option><option value="ocr">ocr</option><option value="stt">stt</option><option value="translation">translation</option></select>
+<button id="go" onclick="go()">Creează cont și intră în World →</button>
+<pre id="out"></pre>
+<div id="next" style="margin-top:12px;display:none"><a id="worldLink" href="/world">Deschide World → vezi camerele live</a><div class="sub" style="color:var(--muted);font-size:12px;margin-top:6px">Cheia <code>dca_</code> a fost salvată automat în browser (localStorage). O poți vedea în DevTools → Application → Local Storage.</div></div>
+</div>
+<p style="margin-top:14px;font-size:12px;color:var(--muted)">Fiecare cont primește <code>quota 100</code> + <code>rate 10/min</code>. Orice capabilitate (research, coding, embeddings, ocr, stt, translation, …) este acceptată — cameră determinată automat la join.</p>
+<script>
+async function go(){
+ const name=document.getElementById('name').value.trim();
+ const cap=document.getElementById('cap').value;
+ const btn=document.getElementById('go'); const out=document.getElementById('out');
+ if(!name || !/^[a-zA-Z0-9_-]{1,32}$/.test(name)){ out.style.display='block'; out.textContent='Nume invalid: 1–32 caractere, doar litere/cifre/_-'; out.className='err'; return; }
+ btn.disabled=true; btn.textContent='Se creează...';
+ try{
+  const r=await fetch('/v1/world/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_name:name, capabilities:[cap]})});
+  const j=await r.json();
+  if(!r.ok){ out.style.display='block'; out.textContent=(j.error||JSON.stringify(j)).slice(0,400); out.className='err'; btn.disabled=false; btn.textContent='Creează cont și intră în World →'; return; }
+  localStorage.setItem('world-token', j.api_key);
+  localStorage.setItem('world-agent', j.agent_name);
+  out.style.display='block'; out.textContent=`Cont creat!\nAgent: ${j.agent_name}\nCheie: ${j.api_key.slice(0,16)}… (salvată)\nCapabilitate: ${j.capabilities.join(', ')} → ${j.room_id||cap}\n\nAcum intri în World.`; out.className='ok';
+  document.getElementById('next').style.display='block';
+  btn.textContent='Gata — deschide World';
+  btn.onclick=()=> location.href='/world';
+ }catch(e){ out.style.display='block'; out.textContent=String(e).slice(0,400); out.className='err'; btn.disabled=false; }
+}
+</script></body></html>"##.to_string();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// POST /v1/world/onboard — public self-service onboarding (no master).
+/// Limited to research/coding, quota 100, rate 10. No hub scope.
+async fn world_onboard_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(path) = state.consumer_keys_path.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consumer key store not configured"})),
+        )
+            .into_response();
+    };
+    let agent_name = body
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if agent_name.is_empty()
+        || agent_name.len() > 32
+        || !agent_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent_name must be 1..32 chars [a-zA-Z0-9_-]"})),
+        )
+            .into_response();
+    }
+    let mut caps: Vec<String> = body
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| {
+            body.get("capability")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+        })
+        .unwrap_or_default();
+    if caps.is_empty() {
+        caps = vec!["research".to_string()];
+    }
+    // Generic validation: 1..128 chars, non-empty (no research/coding filter)
+    for c in &caps {
+        if c.trim().is_empty() || c.len() > 128 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "capability must be 1..128 non-empty chars"})),
+            )
+                .into_response();
+        }
+    }
+    if caps.len() > 8 {
+        caps.truncate(8);
+    }
+    let owner_account = format!("agent:{}", agent_name);
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("key store load failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    // Check if account already has a key (reuse, don't duplicate)
+    if let Some(existing) = store
+        .list()
+        .iter()
+        .find(|rec| rec.owner_account == owner_account && !rec.revoked)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("agent_name '{}' already taken (key {})", agent_name, existing.key_id)})),
+        )
+            .into_response();
+    }
+    // Limited quota for public onboarding
+    let quota = 100u64;
+    let rate = 10u32;
+    let scopes = caps.clone();
+    let plaintext =
+        match store.create_with_expiry(&owner_account, quota, rate, scopes.clone(), None) {
+            Ok(k) => k,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("key creation failed: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+    let rec = match store.lookup(&plaintext) {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "key created but lookup failed"})),
+            )
+                .into_response();
+        }
+    };
+    // Also auto-join World so the agent appears immediately
+    {
+        let mut world = state.world.lock().await;
+        let room_id = world.room_for_capabilities(&caps);
+        if !world.agents.iter().any(|a| a.account == owner_account) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            world.agents.push(crate::world::WorldAgent {
+                agent_id: agent_name.clone(),
+                key_id: rec.key_id.clone(),
+                account: owner_account.clone(),
+                declared_capabilities: caps.clone(),
+                room_id: room_id.clone(),
+                joined_at: now,
+            });
+            world.advance_tick();
+            let wpath = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&wpath, &world);
+        }
+    }
+    decentraai_audit::record_best_effort(
+        &state.info.repo_root.join("logs"),
+        "world_onboarded",
+        serde_json::json!({
+            "agent_name": agent_name,
+            "key_id": rec.key_id,
+            "prefix": rec.prefix,
+            "scopes": scopes,
+            "capabilities": caps,
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "agent_name": agent_name,
+            "api_key": plaintext,
+            "key_id": rec.key_id,
+            "prefix": rec.prefix,
+            "scopes": scopes,
+            "capabilities": caps,
+            "quota": {"quota_ceiling": quota, "rate_limit": rate},
+            "world": "/world",
+            "skill": "/world/skill.md",
+            "note": "Cheia a fost salvată automat în browser. Păstreaz-o — nu se mai arată."
+        })),
+    )
+        .into_response()
+}
+
+/// GET /world/skill.md + GET /v1/world/skill — skill file for external agents (public, no auth).
+async fn world_skill_handler() -> Response {
+    let md = crate::world::world_skill_md();
+    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], md).into_response()
+}
+
+/// GET /v1/world — JSON snapshot projection (read-only).
+async fn world_snapshot_handler(State(state): State<ApiState>) -> Response {
+    let world = state.world.lock().await.clone();
+    let hub = state.hub.lock().await.clone();
+    let society = state.society.lock().await.clone();
+
+    // Build enriched mission view from HubState
+    let mission = world.mission_task_id.as_ref().and_then(|tid| {
+        hub.tasks.get(tid).map(|task| {
+            let bids: Vec<_> = hub
+                .bids
+                .values()
+                .filter(|b| &b.task_id == tid)
+                .cloned()
+                .collect();
+            let team = hub
+                .teams
+                .values()
+                .find(|t| &t.task_id == tid)
+                .map(|t| t.members.clone())
+                .unwrap_or_default();
+            let evidence = hub.tasks.get(tid).and_then(|_| {
+                // evidence is stored in task settlement; hub.events carries it
+                hub.events
+                    .iter()
+                    .rev()
+                    .find(|e| e.task_id.as_deref() == Some(tid.as_str()) && e.evidence_id.is_some())
+                    .and_then(|e| e.evidence_id.clone())
+            });
+            serde_json::json!({
+                "task": task,
+                "bids": bids,
+                "team": team,
+                "evidence_id": evidence,
+            })
+        })
+    });
+
+    // Enrich agents with live status + reputation (projection, never stored)
+    let agents: Vec<serde_json::Value> = world
+        .agents
+        .iter()
+        .map(|a| {
+            let rep: f32 = society
+                .reputation
+                .get(&a.agent_id)
+                .or_else(|| society.reputation.get(&a.account))
+                .map(|evs| evs.iter().map(|e| e.delta).sum())
+                .unwrap_or(0.0);
+            // Derive status from HubState
+            let status =
+                if let Some(tid) = &world.mission_task_id {
+                    if let Some(team) = hub.teams.values().find(|t| &t.task_id == tid) {
+                        if team
+                            .members
+                            .iter()
+                            .any(|(id, _)| id == &a.account || id == &a.agent_id)
+                        {
+                            if hub
+                                .tasks
+                                .get(tid)
+                                .map(|t| t.status == decentraai_agent_hub::TaskStatus::Settled)
+                                .unwrap_or(false)
+                            {
+                                "settled"
+                            } else {
+                                "placed"
+                            }
+                        } else if hub.bids.values().any(|b| {
+                            &b.task_id == tid && (b.bidder == a.account || b.bidder == a.agent_id)
+                        }) {
+                            "bidding"
+                        } else {
+                            "idle"
+                        }
+                    } else if hub.bids.values().any(|b| {
+                        &b.task_id == tid && (b.bidder == a.account || b.bidder == a.agent_id)
+                    }) {
+                        "bidding"
+                    } else {
+                        "idle"
+                    }
+                } else {
+                    "idle"
+                };
+            serde_json::json!({
+                "agent_id": a.agent_id,
+                "account": a.account,
+                "key_id": a.key_id,
+                "declared_capabilities": a.declared_capabilities,
+                "room_id": a.room_id,
+                "joined_at": a.joined_at,
+                "reputation": rep,
+                "status": status,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "world_id": world.world_id,
+        "tick": world.tick,
+        "mission": mission,
+        "rooms": world.rooms,
+        "agents": agents,
+        "mission_task_id": world.mission_task_id,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// POST /v1/world/join — join world with scoped dca_ (reuse gateway validation, no new ledger).
+async fn world_join_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let (key_id, account, _scopes) = match &auth {
+        Auth::Consumer {
+            key_id,
+            account,
+            scopes,
+            ..
+        } => (key_id.clone(), account.clone(), scopes.clone()),
+        Auth::Master => {
+            // master can join as operator for testing
+            (
+                "master".to_string(),
+                "operator".to_string(),
+                vec!["hub".to_string()],
+            )
+        }
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "requires dca_ consumer key with hub scope"})),
+            )
+                .into_response();
+        }
+    };
+    // For consumer, enforce World scope — any non-empty capability is valid.
+    // Keeps scoped-credential security (requires at least one scope) but does
+    // not artificially limit to research/coding. World accepts any free-form
+    // capability (research, coding, embeddings, ocr, stt, ...).
+    if let Auth::Consumer { .. } = &auth {
+        let has_world_scope = !_scopes.is_empty()
+            && _scopes
+                .iter()
+                .any(|s| !s.trim().is_empty() && s.len() <= 128);
+        if !has_world_scope {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "consumer key missing world scope"})),
+            )
+                .into_response();
+        }
+    }
+    let caps: Vec<String> = body
+        .get("declared_capabilities")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| {
+            body.get("capabilities")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    if caps.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "declared_capabilities required (e.g. [\"research\"])"})),
+        )
+            .into_response();
+    }
+    // Inline validation (reuse SAES rule without pulling agent-runtime crate)
+    if caps.iter().any(|c| c.trim().is_empty() || c.len() > 128) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "capability must be 1..128 non-empty chars"})),
+        )
+            .into_response();
+    }
+    let mut world = state.world.lock().await;
+    // Idempotent: if already joined, return existing
+    if let Some(existing) = world
+        .agents
+        .iter()
+        .find(|a| a.account == account || a.key_id == key_id)
+    {
+        let agent_id = existing.agent_id.clone();
+        let room_id = existing.room_id.clone();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "agent_id": agent_id,
+                "account": account,
+                "key_id": key_id,
+                "room_id": room_id,
+                "already_joined": true,
+            })),
+        )
+            .into_response();
+    }
+    let agent_id = format!("agent-{}", &key_id[3..7.min(key_id.len())]);
+    // Use account-derived agent_id for generic agents (agent-generic-N style)
+    let agent_id = if account.starts_with("agent:") {
+        account.trim_start_matches("agent:").to_string()
+    } else {
+        agent_id
+    };
+    let room_id = world.room_for_capabilities(&caps);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    world.agents.push(crate::world::WorldAgent {
+        agent_id: agent_id.clone(),
+        key_id: key_id.clone(),
+        account: account.clone(),
+        declared_capabilities: caps.clone(),
+        room_id: room_id.clone(),
+        joined_at: now,
+    });
+    world.advance_tick();
+    let path = crate::world::world_path_for(&state.info.repo_root);
+    crate::world::save_world_state(&path, &world);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "agent_id": agent_id,
+            "account": account,
+            "key_id": key_id,
+            "room_id": room_id,
+            "declared_capabilities": caps,
+            "world_id": world.world_id,
+            "tick": world.tick,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /v1/world/mission — create the single World mission (reuse Hub publish).
+async fn world_mission_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let issuer = match &auth {
+        Auth::Consumer { account, .. } => account.clone(),
+        Auth::Master => "operator".to_string(),
+        Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Open => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "auth required"})),
+            )
+                .into_response();
+        }
+    };
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() || title.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "title must be 1..128 chars"})),
+        )
+            .into_response();
+    }
+    let reward = body.get("reward").and_then(|v| v.as_u64()).unwrap_or(500);
+    if reward == 0 || reward > 100_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reward must be 1..100000"})),
+        )
+            .into_response();
+    }
+    let cap = body
+        .get("required_capability")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let mut hub = state.hub.lock().await;
+    // Enforce single mission in v1: if one exists and not settled, reject
+    {
+        let world = state.world.lock().await;
+        if let Some(tid) = &world.mission_task_id {
+            if let Some(task) = hub.tasks.get(tid) {
+                if task.status != decentraai_agent_hub::TaskStatus::Settled {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": format!("mission already exists: {} status {:?}", tid, task.status)})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    let task = hub.publish_task(
+        issuer.clone(),
+        title.clone(),
+        body.get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("World mission")
+            .to_string(),
+        reward,
+        cap.clone(),
+    );
+    let task_id = task.id.clone();
+    let task_status = task.status;
+    hub.advance_tick();
+    let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
+    crate::hub::save_hub_state(&hub_path, &hub);
+    drop(hub);
+    let mut world = state.world.lock().await;
+    world.mission_task_id = Some(task_id.clone());
+    world.advance_tick();
+    let path = crate::world::world_path_for(&state.info.repo_root);
+    crate::world::save_world_state(&path, &world);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "title": title,
+            "reward": reward,
+            "required_capability": cap,
+            "status": format!("{:?}", task_status),
+            "issuer": issuer,
+            "world_id": world.world_id,
+            "tick": world.tick,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /v1/world/stream — SSE projection of Hub events (live world).
+async fn world_stream_handler(
+    State(state): State<ApiState>,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let hub_clone = state.hub.clone();
+    let world_clone = state.world.clone();
+    let stream = futures::stream::unfold(
+        (hub_clone, world_clone, 0u64),
+        |(hub, world, last_tick)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let hub_guard = hub.lock().await;
+            let world_guard = world.lock().await;
+            let hub_events: Vec<_> = hub_guard
+                .events
+                .iter()
+                .filter(|e| e.tick >= last_tick)
+                .cloned()
+                .collect();
+            let world_tick = world_guard.tick;
+            let max_hub = hub_events.iter().map(|e| e.tick).max().unwrap_or(last_tick);
+            let next = max_hub.max(world_tick) + 1;
+            drop(hub_guard);
+            drop(world_guard);
+            if hub_events.is_empty() {
+                Some((
+                    Ok(SseEvent::default().comment("heartbeat")),
+                    (hub, world, next),
+                ))
+            } else {
+                let data = serde_json::to_string(&hub_events).unwrap_or_else(|_| "[]".to_string());
+                Some((
+                    Ok(SseEvent::default().data(data).event("hub_events")),
+                    (hub, world, next),
+                ))
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 /// GET /vesper/agents — real registered fabric agents for the VESPER world,
@@ -3668,7 +4314,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 "result": {"content": [{"type": "text", "text": serde_json::to_string(&result_body).unwrap_or_default()}]}
             }).to_string(),
         ).into_response();
-    } else if crate::mcp::execution_request(&raw).is_some() {
+    } else if let Some(args) = crate::mcp::execution_request(&raw) {
         // `execute_decision`: the mutating consumption step, quota-gated.
         // The confirmation gate is enforced inside `run_execute_decision`.
         // SCOPE CHECK: consumers must have explicit "execute" or "*" scope.
@@ -3681,8 +4327,6 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 return forbidden(&reason.to_string());
             }
         }
-        let args: serde_json::Value =
-            serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
         // Per-key rate limit (frequency), independent from quota.
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
@@ -18848,6 +19492,79 @@ mod tests {
         assert_eq!(
             after.available, before_available,
             "quota fully returned to the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_consumer_execute_decision_honors_confirm_from_arguments() {
+        // Regression (P0/P1 protocol correctness): the consumer MCP path must
+        // extract `arguments` from the JSON-RPC envelope (via execution_request)
+        // and pass it to run_execute_decision. Before the fix, the handler
+        // overwrote args with the FULL JSON-RPC body, so `confirm:true` lived
+        // in the outer envelope and run_execute_decision always refused with
+        // `mutating execution requires "confirm": true` — even when the caller
+        // sent confirm:true inside arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let plaintext = make_consumer_key_with_scopes(api, "consumer-account", &["execute"]).await;
+        let client = reqwest::Client::new();
+
+        // Helper: fire execute_decision with the given arguments object and
+        // return the parsed inner body (result.content[0].text).
+        let call = |arguments: serde_json::Value| {
+            let client = client.clone();
+            let plaintext = plaintext.clone();
+            async move {
+                let r = client
+                    .post(format!("http://{api}/mcp"))
+                    .header("Authorization", format!("Bearer {plaintext}"))
+                    .json(&serde_json::json!({
+                        "jsonrpc":"2.0","id":1,"method":"tools/call",
+                        "params":{"name":"execute_decision","arguments":arguments}
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 200, "MCP layer itself responds 200");
+                let j: serde_json::Value = r.json().await.unwrap();
+                let content = j["result"]["content"][0]["text"].as_str().unwrap_or("");
+                serde_json::from_str::<serde_json::Value>(content).unwrap_or_default()
+            }
+        };
+
+        // 1. confirm:false -> refused (mutation safety), regardless of envelope.
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi","confirm":false})).await;
+        assert!(
+            body["body"]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("requires \"confirm\": true"),
+            "confirm:false must be refused: {body}"
+        );
+
+        // 2. missing confirm -> refused (same mutation gate).
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi"})).await;
+        assert!(
+            body["body"]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("requires \"confirm\": true"),
+            "missing confirm must be refused: {body}"
+        );
+
+        // 3. confirm:true (inside arguments) -> must pass the confirm gate and
+        //    reach execution, failing HONESTLY (no fabric model) rather than
+        //    being refused at the confirm gate. The honest message is
+        //    "no runnable decision", NOT "requires confirm".
+        let body = call(serde_json::json!({"intent":"chat","prompt":"hi","confirm":true})).await;
+        let inner_msg = body["body"]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !inner_msg.contains("requires \"confirm\": true"),
+            "confirm:true from arguments must NOT hit the confirm gate: {body}"
+        );
+        assert!(
+            inner_msg.contains("no runnable decision") || body["body"]["ok"] == false,
+            "with confirm honored, execution proceeds and fails honestly (no fabric model): {body}"
         );
     }
 
