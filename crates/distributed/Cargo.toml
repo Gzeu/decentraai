@@ -41,6 +41,6 @@ decentraai-registry = { path = "../registry" }
 
 [dev-dependencies]
 tempfile.workspace = true
-httpmock = "0.7"
+httpmock = "0.8"
 blake3.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
