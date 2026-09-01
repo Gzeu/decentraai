@@ -3080,6 +3080,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             decentraai_providers::ProviderManager::new(&data_dir),
         ));
         state.attach_providers(provider_manager);
+        // M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust
+        // anchors for wallet-backed agent-to-agent service agreements.
+        {
+            let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));
+            state.attach_m18(m18);
+            tracing::info!("M18 economic layer loaded");
+        }
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
             Err(e) => warn!(error = %e, "dashboard failed to bind"),
@@ -4044,6 +4051,11 @@ async fn serve_common(
         None,
     );
     state.set_dashboard(config.node.dashboard);
+    // M18 — MultiversX Trust & Economic Layer (lightweight mode)
+    {
+        let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));
+        state.attach_m18(m18);
+    }
     let api_addr = serve_api(state, &bind_address, api_port).await?;
 
     decentraai_audit::record_best_effort(

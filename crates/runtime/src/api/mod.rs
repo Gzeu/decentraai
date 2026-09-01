@@ -383,6 +383,8 @@ pub struct ApiState {
     /// Wallet identity / session store (MultiversX-backed login).
     wallet_auth: Arc<StdMutex<WalletAuthStore>>,
     wallet_auth_path: PathBuf,
+    /// M18 Economic Layer: contracts, escrow, trust anchors.
+    pub m18: Option<Arc<crate::m18::M18State>>,
 }
 
 impl ApiState {
@@ -481,6 +483,7 @@ impl ApiState {
             wallet_auth: Arc::new(StdMutex::new(
                 WalletAuthStore::load(&wallet_auth_path_for(&info.repo_root)).unwrap_or_default(),
             )),
+            m18: None, // Wired in main.rs after data_dir is resolved
         }
     }
 
@@ -764,6 +767,11 @@ impl ApiState {
     ) {
         self.consumer_keys_path = consumer_keys_path;
         self.quota_ledger = quota_ledger;
+    }
+
+    /// M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust anchors.
+    pub fn attach_m18(&mut self, m18: Arc<crate::m18::M18State>) {
+        self.m18 = Some(m18);
     }
 
     fn wallet_session_for_token(
@@ -1558,6 +1566,56 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/api/admin/providers/{id}/credential",
             put(providers_update_credential_handler),
+        )
+        // M18 — MultiversX Trust & Economic Layer
+        .route(
+            "/v1/m18/contract",
+            post(crate::m18::contract_propose_handler),
+        )
+        .route("/v1/m18/contracts", get(crate::m18::contract_list_handler))
+        .route(
+            "/v1/m18/contract/{id}",
+            get(crate::m18::contract_get_handler),
+        )
+        .route(
+            "/v1/m18/contract/{id}/accept",
+            post(crate::m18::contract_accept_handler),
+        )
+        .route(
+            "/v1/m18/contract/{id}/start",
+            post(crate::m18::contract_start_handler),
+        )
+        .route(
+            "/v1/m18/contract/{id}/complete",
+            post(crate::m18::contract_complete_handler),
+        )
+        .route(
+            "/v1/m18/contract/{id}/cancel",
+            post(crate::m18::contract_cancel_handler),
+        )
+        .route("/v1/m18/escrow", get(crate::m18::escrow_list_handler))
+        .route("/v1/m18/escrow/{id}", get(crate::m18::escrow_get_handler))
+        .route(
+            "/v1/m18/escrow/{contract_id}/create",
+            post(crate::m18::escrow_create_handler),
+        )
+        .route(
+            "/v1/m18/escrow/{id}/settle",
+            post(crate::m18::escrow_settle_handler),
+        )
+        .route("/v1/m18/trust", get(crate::m18::trust_list_handler))
+        .route("/v1/m18/trust/{id}", get(crate::m18::trust_get_handler))
+        .route(
+            "/v1/m18/trust/record",
+            post(crate::m18::trust_record_handler),
+        )
+        .route(
+            "/v1/m18/trust/{id}/verify",
+            post(crate::m18::trust_verify_handler),
+        )
+        .route(
+            "/v1/m18/trust/wallet/{wallet}",
+            get(crate::m18::trust_score_handler),
         )
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)

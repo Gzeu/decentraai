@@ -21,6 +21,7 @@ pub mod governor_execution;
 pub mod hub;
 pub mod intel_assist;
 pub mod job;
+pub mod m18;
 pub mod mcp;
 pub mod providers_api;
 pub mod queue;

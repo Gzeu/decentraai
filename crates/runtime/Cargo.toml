@@ -33,6 +33,7 @@ decentraai-arena = { path = "../arena" }
 decentraai-agent-hub = { path = "../agent-hub" }
 decentraai-agent-society = { path = "../agent-society" }
 decentraai-agent-personal-memory = { path = "../agent-personal-memory" }
+decentraai-economy = { path = "../economy" }
 blake3.workspace = true
 futures.workspace = true
 base64.workspace = true
