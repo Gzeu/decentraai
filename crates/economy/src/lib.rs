@@ -8,7 +8,10 @@
 //!   → VERIFIED CONTRIBUTION   (facts, only with an evidence reference)
 //!   → DETERMINISTIC ECONOMIC VALUE  (Contribution Units, integer math)
 //!   → CRYPTOGRAPHIC PROOF     (bridges the existing Ed25519 receipts)
-//!   → FUTURE SETTLEMENT       (adapter trait only — no chain, no token)
+//!   → TRUST ANCHOR            (wallet-backed, verifiable, chained)
+//!   → AGENT CONTRACT          (provider ↔ consumer, terms, settlement)
+//!   → ESCROW                  (hold → release → settle)
+//!   → SETTLEMENT              (MultiversX testnet anchoring)
 //! ```
 //!
 //! # Hard rules (enforced by construction, tested per rule)
@@ -22,8 +25,10 @@
 //! - This crate never holds private keys, never talks to a network, never
 //!   launches a token. Settlement is an adapter trait with local test impls.
 
+pub mod contract;
 pub mod contribution;
 pub mod engine;
+pub mod escrow;
 pub mod evidence;
 #[cfg(test)]
 pub mod governance_invariants;
@@ -32,6 +37,7 @@ pub mod multiversx_identity;
 pub mod multiversx_tx;
 pub mod settlement;
 pub mod tokenomics;
+pub mod trust_anchor;
 
 use thiserror::Error;
 
