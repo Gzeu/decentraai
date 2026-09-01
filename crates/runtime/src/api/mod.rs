@@ -3163,6 +3163,10 @@ fn mcp_wallet_mutation_request(raw: &str) -> bool {
         || crate::mcp::agent_memory_write_request(raw).is_some()
         || crate::mcp::compute_request(raw).is_some()
         || crate::mcp::embeddings_request(raw).is_some()
+        // M18 Economic Layer mutations
+        || crate::mcp::m18_tool_request(raw)
+            .map(|(name, _)| crate::mcp::M18_MUTATION_TOOLS.contains(&name.as_str()))
+            .unwrap_or(false)
 }
 
 async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -4512,6 +4516,298 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let markdown = memory.to_full_markdown();
         ctx.personal_memory_action =
             decentraai_agent_personal_memory::mcp::build_memory_export_response(markdown);
+    }
+    // M18 — Economic Layer mutations (contract/escrow/trust)
+    if let Some((tool_name, args)) = crate::mcp::m18_tool_request(&raw) {
+        if let Some(ref m18) = state.m18 {
+            use decentraai_economy::contract as econ_contract;
+            use decentraai_economy::trust_anchor as econ_trust;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let result = match tool_name.as_str() {
+                "m18_propose_contract" => {
+                    let consumer = args
+                        .get("consumer_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let provider = args
+                        .get("provider_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let capability = args
+                        .get("capability")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let description = args
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let price = args
+                        .get("price_micro_cu")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let duration = args
+                        .get("max_duration_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3600);
+                    let quality = args
+                        .get("min_quality_percent")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u8;
+                    let escrow_req = args
+                        .get("escrow_required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let service = econ_contract::ServiceDescriptor {
+                        capability: capability.to_string(),
+                        description: description.to_string(),
+                        model_requirement: None,
+                        estimated_input_size: None,
+                    };
+                    let terms = econ_contract::ContractTerms {
+                        price_micro_cu: price,
+                        max_duration_secs: duration,
+                        min_quality_percent: quality,
+                        escrow_required: escrow_req,
+                    };
+                    match econ_contract::propose_contract(provider, consumer, service, terms, now) {
+                        Ok(c) => {
+                            m18.contracts
+                                .lock()
+                                .unwrap()
+                                .insert(c.contract_id.clone(), c.clone());
+                            let _ = m18.save_contracts();
+                            serde_json::to_value(&c).unwrap_or(serde_json::json!({}))
+                        }
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                }
+                "m18_accept_contract" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let wallet = args
+                        .get("caller_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut contracts = m18.contracts.lock().unwrap();
+                    match contracts.get_mut(id) {
+                        Some(c) => match econ_contract::accept_contract(c, wallet, now) {
+                            Ok(()) => {
+                                drop(contracts);
+                                let _ = m18.save_contracts();
+                                let c2 = m18.contracts.lock().unwrap();
+                                serde_json::to_value(c2.get(id).unwrap()).unwrap()
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        },
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_start_execution" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let wallet = args
+                        .get("caller_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut contracts = m18.contracts.lock().unwrap();
+                    match contracts.get_mut(id) {
+                        Some(c) => match econ_contract::start_execution(c, wallet, now) {
+                            Ok(()) => {
+                                drop(contracts);
+                                let _ = m18.save_contracts();
+                                let c2 = m18.contracts.lock().unwrap();
+                                serde_json::to_value(c2.get(id).unwrap()).unwrap()
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        },
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_complete_contract" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let wallet = args
+                        .get("caller_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut contracts = m18.contracts.lock().unwrap();
+                    match contracts.get_mut(id) {
+                        Some(c) => match econ_contract::complete_contract(c, wallet, now) {
+                            Ok(()) => {
+                                drop(contracts);
+                                let _ = m18.save_contracts();
+                                let c2 = m18.contracts.lock().unwrap();
+                                serde_json::to_value(c2.get(id).unwrap()).unwrap()
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        },
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_cancel_contract" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let wallet = args
+                        .get("caller_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut contracts = m18.contracts.lock().unwrap();
+                    match contracts.get_mut(id) {
+                        Some(c) => match econ_contract::cancel_contract(c, wallet, now) {
+                            Ok(()) => {
+                                drop(contracts);
+                                let _ = m18.save_contracts();
+                                let c2 = m18.contracts.lock().unwrap();
+                                serde_json::to_value(c2.get(id).unwrap()).unwrap()
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        },
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_get_contract" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let contracts = m18.contracts.lock().unwrap();
+                    match contracts.get(id) {
+                        Some(c) => serde_json::to_value(c).unwrap(),
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_create_escrow" => {
+                    let id = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let contract_opt = {
+                        let c = m18.contracts.lock().unwrap();
+                        c.get(id).cloned()
+                    };
+                    match contract_opt {
+                        Some(contract) => {
+                            let mut escrow = m18.escrow.lock().unwrap();
+                            match escrow.create_escrow(&contract, now) {
+                                Ok(e) => {
+                                    let r = e.clone();
+                                    drop(escrow);
+                                    let _ = m18.save_escrow();
+                                    serde_json::to_value(&r).unwrap()
+                                }
+                                Err(e) => serde_json::json!({"error": e.to_string()}),
+                            }
+                        }
+                        None => serde_json::json!({"error": "contract not found"}),
+                    }
+                }
+                "m18_settle_escrow" => {
+                    let id = args.get("escrow_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let ev = args
+                        .get("evidence_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let amt = args
+                        .get("amount_micro_cu")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let tx = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut escrow = m18.escrow.lock().unwrap();
+                    if let Err(e) = escrow.release_escrow(id, ev, now) {
+                        serde_json::json!({"error": e.to_string()})
+                    } else {
+                        match escrow.settle_escrow(id, tx, amt, now) {
+                            Ok(()) => {
+                                let r = escrow.get_escrow(id).unwrap().clone();
+                                drop(escrow);
+                                let _ = m18.save_escrow();
+                                serde_json::to_value(&r).unwrap()
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        }
+                    }
+                }
+                "m18_record_trust" => {
+                    let wallet = args
+                        .get("agent_wallet")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ev = args
+                        .get("evidence_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let cap = args
+                        .get("capability")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let q = args
+                        .get("quality_score")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u8;
+                    let v = args
+                        .get("verified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let cu = args.get("micro_cu").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cid = args
+                        .get("contract_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let params = econ_trust::AnchorParams {
+                        agent_wallet: wallet.to_string(),
+                        evidence_hash: ev.to_string(),
+                        capability: cap.to_string(),
+                        quality_score: q,
+                        verified: v,
+                        micro_cu: cu,
+                        contract_id: cid,
+                    };
+                    let mut trust = m18.trust.lock().unwrap();
+                    match trust.record_anchor(&params, now) {
+                        Ok(a) => {
+                            let r = a.clone();
+                            drop(trust);
+                            let _ = m18.save_trust();
+                            serde_json::to_value(&r).unwrap()
+                        }
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                }
+                "m18_verify_trust" => {
+                    let id = args.get("anchor_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let trust = m18.trust.lock().unwrap();
+                    match trust.anchors.get(id) {
+                        Some(a) => match trust.verify_anchor(a) {
+                            Ok(()) => serde_json::json!({"valid": true, "anchor_id": id}),
+                            Err(e) => serde_json::json!({"valid": false, "error": e.to_string()}),
+                        },
+                        None => serde_json::json!({"error": "trust anchor not found"}),
+                    }
+                }
+                "m18_trust_score" => {
+                    let wallet = args.get("wallet").and_then(|v| v.as_str()).unwrap_or("");
+                    let trust = m18.trust.lock().unwrap();
+                    let score = trust.trust_score(wallet);
+                    let anchors = trust.anchors_for_wallet(wallet);
+                    serde_json::json!({"wallet": wallet, "score": score, "anchor_count": anchors.len(), "verified_count": anchors.iter().filter(|a| a.verified).count()})
+                }
+                _ => serde_json::json!({"error": format!("unknown M18 tool: {tool_name}")}),
+            };
+            ctx.m18_action = result;
+        } else {
+            ctx.m18_action = serde_json::json!({"error": "M18 economic layer not attached"});
+        }
     }
     let response = crate::mcp::handle_message(&ctx, &raw);
     let json = response.unwrap_or_else(|| serde_json::json!({}));
@@ -5916,6 +6212,38 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         hub_action: serde_json::json!({}),
         society_action: serde_json::json!({}),
         personal_memory_action: serde_json::json!({}),
+        // M18 Economic Layer snapshots
+        m18_contracts: {
+            if let Some(ref m18) = state.m18 {
+                let contracts = m18.contracts.lock().unwrap();
+                let list: Vec<&decentraai_economy::contract::AgentContract> =
+                    contracts.values().collect();
+                serde_json::to_value(&list).unwrap_or(serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            }
+        },
+        m18_escrow: {
+            if let Some(ref m18) = state.m18 {
+                let escrow = m18.escrow.lock().unwrap();
+                let list: Vec<&decentraai_economy::escrow::EscrowRecord> =
+                    escrow.records.values().collect();
+                serde_json::to_value(&list).unwrap_or(serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            }
+        },
+        m18_trust: {
+            if let Some(ref m18) = state.m18 {
+                let trust = m18.trust.lock().unwrap();
+                let list: Vec<&decentraai_economy::trust_anchor::TrustAnchor> =
+                    trust.anchors.values().collect();
+                serde_json::to_value(&list).unwrap_or(serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            }
+        },
+        m18_action: serde_json::json!({}),
     }
 }
 

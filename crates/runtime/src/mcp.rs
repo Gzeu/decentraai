@@ -104,6 +104,14 @@ pub struct McpContext {
     pub society_action: Value,
     /// Result of last personal memory operation via MCP.
     pub personal_memory_action: Value,
+    /// M18 Economic Layer: active contracts snapshot.
+    pub m18_contracts: Value,
+    /// M18 Economic Layer: escrow records snapshot.
+    pub m18_escrow: Value,
+    /// M18 Economic Layer: trust anchors snapshot.
+    pub m18_trust: Value,
+    /// M18 Economic Layer: result of last contract/escrow/trust mutation via MCP.
+    pub m18_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -814,6 +822,133 @@ pub fn all_tools() -> Vec<ToolDef> {
             description: "Discover all available capabilities/tools on this node and their required scopes. Essential for external agent onboarding — call this first to learn what you can do and what scopes to request.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         annotations: ToolAnnotations::read_only(),
+        },
+        // M18 — MultiversX Trust & Economic Layer
+        ToolDef {
+            name: "m18_list_contracts",
+            description: "List all active agent-to-agent service contracts. Shows provider/consumer wallets, service, terms, status, and settlement references.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "m18_get_contract",
+            description: "Get a specific contract by its ID. Returns full contract details including lifecycle status and settlement.",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID" }
+            }, "required": ["contract_id"], "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "m18_propose_contract",
+            description: "Propose a new agent-to-agent service contract. The consumer wallet proposes to the provider wallet for a specific capability. Both wallets must be erd1... bech32 addresses.",
+            input_schema: json!({ "type": "object", "properties": {
+                "consumer_wallet": { "type": "string", "description": "Consumer wallet address (erd1...)" },
+                "provider_wallet": { "type": "string", "description": "Provider wallet address (erd1...)" },
+                "capability": { "type": "string", "description": "Capability kind (e.g. 'chat', 'ocr', 'embedding')" },
+                "description": { "type": "string", "description": "Task description" },
+                "price_micro_cu": { "type": "integer", "description": "Price in micro-CU" },
+                "max_duration_secs": { "type": "integer", "description": "Max execution time in seconds" },
+                "min_quality_percent": { "type": "integer", "description": "Minimum quality SLA (0 = none)" },
+                "escrow_required": { "type": "boolean", "description": "Whether provider must stake escrow" }
+            }, "required": ["consumer_wallet", "provider_wallet", "capability", "description", "price_micro_cu"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_accept_contract",
+            description: "Provider accepts a proposed contract. Only the provider wallet can accept.",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID to accept" },
+                "caller_wallet": { "type": "string", "description": "Provider wallet address (must match contract provider)" }
+            }, "required": ["contract_id", "caller_wallet"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_start_execution",
+            description: "Either party marks contract execution as started (off-chain work begins).",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID" },
+                "caller_wallet": { "type": "string", "description": "Caller wallet (must be a party to the contract)" }
+            }, "required": ["contract_id", "caller_wallet"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_complete_contract",
+            description: "Provider marks contract execution as completed. Settlement pending.",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID" },
+                "caller_wallet": { "type": "string", "description": "Provider wallet" }
+            }, "required": ["contract_id", "caller_wallet"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_cancel_contract",
+            description: "Either party cancels a contract (before acceptance, or by mutual agreement).",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID" },
+                "caller_wallet": { "type": "string", "description": "Caller wallet (must be a party)" }
+            }, "required": ["contract_id", "caller_wallet"], "additionalProperties": false }),
+            annotations: ToolAnnotations::destructive(),
+        },
+        ToolDef {
+            name: "m18_list_escrow",
+            description: "List all escrow records. Shows hold/release/settle status and evidence references.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "m18_create_escrow",
+            description: "Create an escrow hold for an accepted/executing contract. The escrow amount equals the contract price.",
+            input_schema: json!({ "type": "object", "properties": {
+                "contract_id": { "type": "string", "description": "Contract ID to create escrow for" }
+            }, "required": ["contract_id"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_settle_escrow",
+            description: "Release and settle escrow for a completed contract. Requires evidence hash and MultiversX tx hash.",
+            input_schema: json!({ "type": "object", "properties": {
+                "escrow_id": { "type": "string", "description": "Escrow record ID (same as contract ID)" },
+                "evidence_hash": { "type": "string", "description": "BLAKE3 evidence hash from execution" },
+                "amount_micro_cu": { "type": "integer", "description": "Settlement amount in micro-CU" },
+                "tx_hash": { "type": "string", "description": "MultiversX transaction hash" }
+            }, "required": ["escrow_id", "evidence_hash", "amount_micro_cu", "tx_hash"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_list_trust",
+            description: "List all trust anchors. Shows agent wallet, evidence, capability, quality, verification status.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "m18_record_trust",
+            description: "Record a trust anchor for a completed verified execution. Links agent identity to verified work output.",
+            input_schema: json!({ "type": "object", "properties": {
+                "agent_wallet": { "type": "string", "description": "Agent wallet (erd1...)" },
+                "evidence_hash": { "type": "string", "description": "BLAKE3 evidence hash" },
+                "capability": { "type": "string", "description": "Capability executed" },
+                "quality_score": { "type": "integer", "description": "Quality score (0-100)" },
+                "verified": { "type": "boolean", "description": "Whether execution was verified" },
+                "micro_cu": { "type": "integer", "description": "CU earned" },
+                "contract_id": { "type": "string", "description": "Optional linked contract ID" }
+            }, "required": ["agent_wallet", "evidence_hash", "capability", "quality_score", "verified", "micro_cu"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "m18_verify_trust",
+            description: "Verify a trust anchor's cryptographic integrity (BLAKE3 hash chain).",
+            input_schema: json!({ "type": "object", "properties": {
+                "anchor_id": { "type": "string", "description": "Trust anchor ID" }
+            }, "required": ["anchor_id"], "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "m18_trust_score",
+            description: "Get the trust score for a wallet address. Ratio of verified anchors to total anchors.",
+            input_schema: json!({ "type": "object", "properties": {
+                "wallet": { "type": "string", "description": "Wallet address (erd1...)" }
+            }, "required": ["wallet"], "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
         },
     ]
 }
@@ -1901,6 +2036,49 @@ pub fn resolve_intent(ctx: &McpContext, intent: &str, evidence: &str) -> Value {
     })
 }
 
+// M18 — MultiversX Trust & Economic Layer: generic request detection.
+// All M18 mutations share the same pattern: extract tool name + arguments.
+pub const M18_MUTATION_TOOLS: &[&str] = &[
+    "m18_propose_contract",
+    "m18_accept_contract",
+    "m18_start_execution",
+    "m18_complete_contract",
+    "m18_cancel_contract",
+    "m18_create_escrow",
+    "m18_settle_escrow",
+    "m18_record_trust",
+];
+
+pub const M18_READ_TOOLS: &[&str] = &[
+    "m18_list_contracts",
+    "m18_get_contract",
+    "m18_list_escrow",
+    "m18_list_trust",
+    "m18_verify_trust",
+    "m18_trust_score",
+];
+
+/// Returns the tool name and arguments if `raw` is an M18 tool call.
+pub fn m18_tool_request(raw: &str) -> Option<(String, Value)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if !name.starts_with("m18_") {
+        return None;
+    }
+    let args = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(json!({}));
+    Some((name.to_string(), args))
+}
+
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
 /// Returns `None` for notifications (no `id`), which MCP clients do not await.
 pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
@@ -2026,6 +2204,21 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "agent_memory_snapshot" => &ctx.personal_memory_action,
         "agent_memory_export" => &ctx.personal_memory_action,
         "discover_capabilities" => &ctx.personal_memory_action,
+        // M18 — Economic Layer
+        "m18_list_contracts" => &ctx.m18_contracts,
+        "m18_get_contract" => &ctx.m18_action,
+        "m18_propose_contract" => &ctx.m18_action,
+        "m18_accept_contract" => &ctx.m18_action,
+        "m18_start_execution" => &ctx.m18_action,
+        "m18_complete_contract" => &ctx.m18_action,
+        "m18_cancel_contract" => &ctx.m18_action,
+        "m18_list_escrow" => &ctx.m18_escrow,
+        "m18_create_escrow" => &ctx.m18_action,
+        "m18_settle_escrow" => &ctx.m18_action,
+        "m18_list_trust" => &ctx.m18_trust,
+        "m18_record_trust" => &ctx.m18_action,
+        "m18_verify_trust" => &ctx.m18_action,
+        "m18_trust_score" => &ctx.m18_action,
         _ => return None,
     };
     Some(json!({
@@ -2074,6 +2267,10 @@ mod tests {
             hub_action: json!({}),
             society_action: json!({}),
             personal_memory_action: json!({}),
+            m18_contracts: json!([]),
+            m18_escrow: json!([]),
+            m18_trust: json!([]),
+            m18_action: json!({}),
         }
     }
 
