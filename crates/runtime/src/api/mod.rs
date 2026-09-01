@@ -3935,6 +3935,43 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             let apath = crate::arena::arena_path_for(&state.info.repo_root);
             crate::arena::save_arena_world(&apath, &arena);
         }
+        // M18: Auto-record trust anchors for each team member after Hub execution.
+        // Each verified execution becomes a wallet-backed trust anchor in the
+        // economic layer, linking agent identity to verified work output.
+        if let Some(ref m18) = state.m18 {
+            use decentraai_economy::trust_anchor as econ_trust;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let capability = task
+                .required_capability
+                .clone()
+                .unwrap_or_else(|| "general".to_string());
+            let per_member_cu = if !team_members.is_empty() {
+                task.reward / team_members.len() as u64
+            } else {
+                task.reward
+            };
+            let mut trust = m18.trust.lock().unwrap();
+            for (agent_id, _share) in &team_members {
+                let anchor_id = format!("{}:{}", evidence_id, agent_id);
+                if trust.anchors.contains_key(&anchor_id) {
+                    continue; // dedup
+                }
+                let params = econ_trust::AnchorParams {
+                    agent_wallet: agent_id.clone(),
+                    evidence_hash: evidence_id.clone(),
+                    capability: capability.clone(),
+                    quality_score: 100, // Hub-verified = full quality
+                    verified: true,
+                    micro_cu: per_member_cu,
+                    contract_id: None,
+                };
+                let _ = trust.record_anchor(&params, now);
+            }
+            let _ = m18.save_trust();
+        }
         let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
         ctx.hub_action = res;
     }
@@ -5623,6 +5660,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             "discover_capabilities" => true, // always available for onboarding
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
+                            // M18 Economic Layer: available with "economy" scope or "*"
+                            name if name.starts_with("m18_") => {
+                                scopes.iter().any(|s| s == "economy" || s == "*")
+                            }
                             _ => true,
                         }
                     });
