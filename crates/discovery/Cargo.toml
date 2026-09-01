@@ -12,7 +12,7 @@ anyhow.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek.workspace = true
 libp2p.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
