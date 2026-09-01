@@ -847,7 +847,8 @@ pub(crate) fn worker_engine_compat(
         decentraai_fabric::EngineKind::LlamaServer
         | decentraai_fabric::EngineKind::Vllm
         | decentraai_fabric::EngineKind::Sglang
-        | decentraai_fabric::EngineKind::Ollama => {
+        | decentraai_fabric::EngineKind::Ollama
+        | decentraai_fabric::EngineKind::Transformers => {
             if model_on_disk {
                 "compatible" // known GGUF-serving engine can be swapped to this model
             } else {

@@ -49,6 +49,10 @@ use crate::providers_api::{
     providers_update_credential_handler, resolve_provider_model,
 };
 use crate::queue::InferenceQueue;
+use crate::wallet_auth::{
+    WalletAuthStore, WalletChallengeRequest, WalletChallengeResponse, WalletLoginResponse,
+    WalletVerifyRequest, update_identity_memory_frontmatter, wallet_auth_path_for,
+};
 
 pub(crate) mod admin;
 pub(crate) use admin::*;
@@ -210,6 +214,11 @@ pub(crate) enum Auth {
         rate_limit_per_minute: u32,
         scopes: Vec<String>,
     },
+    Wallet {
+        wallet_address: String,
+        agent_id: String,
+        session_id: String,
+    },
 }
 
 impl Auth {
@@ -219,6 +228,7 @@ impl Auth {
             Self::Master => "master".to_string(),
             Self::Subscriber { name, .. } => name.clone(),
             Self::Consumer { key_id, .. } => key_id.clone(),
+            Self::Wallet { wallet_address, .. } => wallet_address.clone(),
         }
     }
 
@@ -244,6 +254,14 @@ impl Auth {
                 key_id: key_id.clone(),
                 account: account.clone(),
                 scopes: scopes.clone(),
+            },
+            Self::Wallet {
+                wallet_address,
+                agent_id,
+                ..
+            } => crate::authz::Actor::Wallet {
+                wallet_address: wallet_address.clone(),
+                agent_id: agent_id.clone(),
             },
         }
     }
@@ -347,6 +365,8 @@ pub struct ApiState {
     ocr: Arc<crate::tools::OcrManager>,
     stt: Arc<crate::tools::SttManager>,
     skills_tool: Arc<crate::tools::HfSkillsManager>,
+    /// Transformers inference backend subprocess. `None` = disabled.
+    transformers_tool: Option<Arc<crate::tools::TransformersManager>>,
     knowledge: Option<Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>>,
     /// Evidence RAG (experimental memory): when attached, `/v1/evidence`
     /// exposes the fabric's derived lessons over real executions, receipts,
@@ -360,6 +380,9 @@ pub struct ApiState {
     pub society: Arc<tokio::sync::Mutex<decentraai_agent_society::SocietyState>>,
     /// Agent World — projection over Hub/Society/EventBus (v1). Always present.
     pub world: Arc<tokio::sync::Mutex<crate::world::WorldState>>,
+    /// Wallet identity / session store (MultiversX-backed login).
+    wallet_auth: Arc<StdMutex<WalletAuthStore>>,
+    wallet_auth_path: PathBuf,
 }
 
 impl ApiState {
@@ -439,6 +462,7 @@ impl ApiState {
             ocr: Arc::new(crate::tools::OcrManager::disabled()),
             stt: Arc::new(crate::tools::SttManager::disabled()),
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
+            transformers_tool: None,
             knowledge: None,
             evidence: None,
             identity_signing_key: None,
@@ -453,6 +477,10 @@ impl ApiState {
                 let ws = crate::world::load_world_state(&p);
                 Arc::new(tokio::sync::Mutex::new(ws))
             },
+            wallet_auth_path: wallet_auth_path_for(&info.repo_root),
+            wallet_auth: Arc::new(StdMutex::new(
+                WalletAuthStore::load(&wallet_auth_path_for(&info.repo_root)).unwrap_or_default(),
+            )),
         }
     }
 
@@ -499,6 +527,12 @@ impl ApiState {
     /// Attaches the HF-skills tool runtime (subprocess). Disabled by default.
     pub fn attach_skills_tool(&mut self, skills: Arc<crate::tools::HfSkillsManager>) {
         self.skills_tool = skills;
+    }
+
+    /// Attaches the Transformers inference backend (Python subprocess).
+    /// `None` = disabled.
+    pub fn attach_transformers(&mut self, tx: Arc<crate::tools::TransformersManager>) {
+        self.transformers_tool = Some(tx);
     }
 
     /// Attaches the collective-intelligence agent manager (P1) so the
@@ -732,6 +766,72 @@ impl ApiState {
         self.quota_ledger = quota_ledger;
     }
 
+    fn wallet_session_for_token(
+        &self,
+        token: &str,
+    ) -> Option<crate::wallet_auth::WalletSessionRecord> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut store = self.wallet_auth.lock().unwrap();
+        store.session_for_token(token, now)
+    }
+
+    fn wallet_login(
+        &self,
+        req: WalletVerifyRequest,
+    ) -> Result<WalletLoginResponse, crate::wallet_auth::WalletAuthError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut store = self.wallet_auth.lock().unwrap();
+        let login = store.verify_and_login(req, now)?;
+        let _ = store.save(&self.wallet_auth_path);
+        drop(store);
+        if let Some(pm) = &self.personal_memory {
+            let agent_id = login.agent_id.clone();
+            let wallet_address = login.wallet_address.clone();
+            let display_name = login.display_name.clone();
+            let verified_at = now;
+            let pm = pm.clone();
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                let _ = handle.block_on(async move {
+                    let _ = pm
+                        .write_entry(&agent_id, |memory| {
+                            update_identity_memory_frontmatter(
+                                &mut memory.identity,
+                                &wallet_address,
+                                &agent_id,
+                                display_name.as_deref(),
+                                verified_at,
+                            );
+                            Ok(())
+                        })
+                        .await;
+                    Ok::<(), ()>(())
+                });
+            });
+        }
+        Ok(login)
+    }
+
+    fn wallet_challenge(
+        &self,
+        req: WalletChallengeRequest,
+    ) -> Result<WalletChallengeResponse, crate::wallet_auth::WalletAuthError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut store = self.wallet_auth.lock().unwrap();
+        let challenge = store.issue_challenge(req, now)?;
+        let _ = store.save(&self.wallet_auth_path);
+        Ok(challenge)
+    }
+
     fn presented_token(headers: &HeaderMap) -> Option<&str> {
         headers
             .get(header::AUTHORIZATION)
@@ -745,11 +845,34 @@ impl ApiState {
     pub(crate) fn classify(&self, headers: &HeaderMap) -> Result<Auth, GateError> {
         let presented = Self::presented_token(headers);
         match &self.auth_token {
-            None => Ok(Auth::Open),
+            None => {
+                if let Some(presented) = presented {
+                    if presented.starts_with("wx_") {
+                        if let Some(session) = self.wallet_session_for_token(presented) {
+                            return Ok(Auth::Wallet {
+                                wallet_address: session.wallet_address,
+                                agent_id: session.agent_id,
+                                session_id: session.session_token,
+                            });
+                        }
+                    }
+                }
+                Ok(Auth::Open)
+            }
             Some(master) => {
                 let presented = presented.ok_or(GateError::Unauthorized)?;
                 if presented == master.as_ref() {
                     return Ok(Auth::Master);
+                }
+                if presented.starts_with("wx_") {
+                    if let Some(session) = self.wallet_session_for_token(presented) {
+                        return Ok(Auth::Wallet {
+                            wallet_address: session.wallet_address,
+                            agent_id: session.agent_id,
+                            session_id: session.session_token,
+                        });
+                    }
+                    return Err(GateError::Unauthorized);
                 }
                 // Consumer API keys (dca_…): resolved through the consumer key
                 // store. Never admin; carries ceiling + rate limit.
@@ -821,6 +944,9 @@ impl ApiState {
             Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
                 "'{key_id}' is a consumer API key; admin asks for the master token"
             ))),
+            Ok(Auth::Wallet { wallet_address, .. }) => Err(GateError::Forbidden(format!(
+                "'{wallet_address}' is a wallet session; admin asks for the master token"
+            ))),
             Err(_) => Err(GateError::Unauthorized),
         }
     }
@@ -843,6 +969,9 @@ impl ApiState {
             }
             Ok(Auth::Consumer { key_id, .. }) => Err(GateError::Forbidden(format!(
                 "'{key_id}' is a consumer API key; operational views need an operator or admin token"
+            ))),
+            Ok(Auth::Wallet { wallet_address, .. }) => Err(GateError::Forbidden(format!(
+                "'{wallet_address}' is a wallet session; operational views need an operator or admin token"
             ))),
             Err(_) => Err(GateError::Unauthorized),
         }
@@ -1251,6 +1380,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/world", get(world_html_handler))
         .route("/world/join", get(world_join_page_handler))
         .route("/world/skill.md", get(world_skill_handler))
+        .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
+        .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
+        .route("/v1/auth/wallet/session", get(wallet_session_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
@@ -1732,6 +1864,107 @@ async fn world_skill_handler() -> Response {
     ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], md).into_response()
 }
 
+/// POST /v1/auth/wallet/challenge — issue a signed-login challenge for a
+/// MultiversX wallet address.
+async fn wallet_challenge_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let req = match serde_json::from_value::<WalletChallengeRequest>(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid request: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    match state.wallet_challenge(req) {
+        Ok(challenge) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&challenge).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/auth/wallet/verify — verify ownership by signature and issue a
+/// temporary session token.
+async fn wallet_verify_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let req = match serde_json::from_value::<WalletVerifyRequest>(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid request: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    match state.wallet_login(req) {
+        Ok(login) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&login).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/auth/wallet/session — introspect the current wallet session.
+async fn wallet_session_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let Auth::Wallet { wallet_address, agent_id, session_id } = auth else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "wallet session required"})),
+        )
+            .into_response();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let session = state.wallet_auth.lock().unwrap().session_for_token(&session_id, now);
+    match session {
+        Some(session) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "wallet_address": wallet_address,
+                "agent_id": agent_id,
+                "session_token": session.session_token,
+                "session_expires_at": session.expires_at,
+                "challenge_id": session.challenge_id,
+                "purpose": session.purpose,
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "session expired"})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /v1/world — JSON snapshot projection (read-only).
 async fn world_snapshot_handler(State(state): State<ApiState>) -> Response {
     let world = state.world.lock().await.clone();
@@ -1866,10 +2099,21 @@ async fn world_join_handler(
                 vec!["hub".to_string()],
             )
         }
+        Auth::Wallet {
+            wallet_address,
+            agent_id,
+            session_id,
+        } => {
+            (
+                session_id.clone(),
+                wallet_address.clone(),
+                vec!["wallet".to_string(), "world".to_string(), agent_id.clone()],
+            )
+        }
         _ => {
             return (
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "requires dca_ consumer key with hub scope"})),
+                Json(serde_json::json!({"error": "requires dca_, master, or wallet session"})),
             )
                 .into_response();
         }
@@ -1945,13 +2189,31 @@ async fn world_join_handler(
         )
             .into_response();
     }
-    let agent_id = format!("agent-{}", &key_id[3..7.min(key_id.len())]);
-    // Use account-derived agent_id for generic agents (agent-generic-N style)
-    let agent_id = if account.starts_with("agent:") {
+    // For wallet sessions, use the agent_id from the verified binding
+    // (already established during challenge→verify).  The key_id-derivation
+    // below only applies to dca_/master/subscriber paths.
+    let agent_id = if let Auth::Wallet { ref agent_id, .. } = auth {
+        agent_id.clone()
+    } else if account.starts_with("agent:") {
         account.trim_start_matches("agent:").to_string()
     } else {
-        agent_id
+        format!("agent-{}", &key_id[3..7.min(key_id.len())])
     };
+    // Persist wallet binding last_seen_at when a wallet agent joins World
+    if let Auth::Wallet { wallet_address, .. } = &auth {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut store = state.wallet_auth.lock().unwrap();
+        if store.binding_for_wallet(wallet_address).is_some() {
+            // Idempotent: update last_seen_at only
+            if let Some(b) = store.bindings.get_mut(wallet_address) {
+                b.last_seen_at = now;
+            }
+            let _ = store.save(&state.wallet_auth_path);
+        }
+    }
     let room_id = world.room_for_capabilities(&caps);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1968,19 +2230,19 @@ async fn world_join_handler(
     world.advance_tick();
     let path = crate::world::world_path_for(&state.info.repo_root);
     crate::world::save_world_state(&path, &world);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "agent_id": agent_id,
-            "account": account,
-            "key_id": key_id,
-            "room_id": room_id,
-            "declared_capabilities": caps,
-            "world_id": world.world_id,
-            "tick": world.tick,
-        })),
-    )
-        .into_response()
+    let mut resp = serde_json::json!({
+        "agent_id": agent_id,
+        "account": account,
+        "key_id": key_id,
+        "room_id": room_id,
+        "declared_capabilities": caps,
+        "world_id": world.world_id,
+        "tick": world.tick,
+    });
+    if let Auth::Wallet { wallet_address, .. } = &auth {
+        resp["wallet_address"] = serde_json::json!(wallet_address);
+    }
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 /// POST /v1/world/mission — create the single World mission (reuse Hub publish).
@@ -1997,6 +2259,7 @@ async fn world_mission_handler(
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
         Auth::Open => {
             return (
                 StatusCode::FORBIDDEN,
@@ -2810,36 +3073,69 @@ fn prometheus_escape(s: &str) -> String {
 /// Consumer `dca_` keys (Q2) may call the inference-consumption tools
 /// (`decide`, `execute_decision`) with quota authorization; they are denied
 /// the operational/read views (which stay operator/admin).
+/// Detects MCP mutation tools that wallet sessions must NOT call.
+///
+/// Wallet sessions may use `decide` (read-only plan projection) and all
+/// read-only view tools (capability search, hub_state, society_state, etc.)
+/// but never execution, model management, hub/society mutations, arena
+/// actions, memory writes, compute requests, or embeddings — those
+/// require `dca_` or master tokens.
+fn mcp_wallet_mutation_request(raw: &str) -> bool {
+    crate::mcp::execution_request(raw).is_some()
+        || crate::mcp::serve_model_request(raw).is_some()
+        || crate::mcp::pull_model_request(raw).is_some()
+        || crate::mcp::arena_act_request(raw).is_some()
+        || crate::mcp::hub_publish_task_request(raw).is_some()
+        || crate::mcp::hub_place_bid_request(raw).is_some()
+        || crate::mcp::hub_propose_request(raw).is_some()
+        || crate::mcp::hub_decide_proposal_request(raw).is_some()
+        || crate::mcp::hub_form_team_request(raw).is_some()
+        || crate::mcp::hub_execute_request(raw).is_some()
+        || crate::mcp::society_record_relationship_request(raw).is_some()
+        || crate::mcp::society_record_contribution_request(raw).is_some()
+        || crate::mcp::society_record_outcome_request(raw).is_some()
+        || crate::mcp::society_record_reputation_event_request(raw).is_some()
+        || crate::mcp::agent_memory_write_request(raw).is_some()
+        || crate::mcp::compute_request(raw).is_some()
+        || crate::mcp::embeddings_request(raw).is_some()
+}
+
 async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = match state.classify(&headers) {
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
+    let raw = String::from_utf8_lossy(&body);
+    if matches!(auth, Auth::Wallet { .. }) && mcp_wallet_mutation_request(&raw) {
+        return forbidden("wallet sessions are read-only in MCP; use dca_ for execution or mutations");
+    }
     // A consumer `dca_` key: allowed only the consumption path (decide +
     // execute_decision), never the operational/read views (workers, network,
     // executions, sessions, quota, consumer keys). No master/operator grant.
     if matches!(auth, Auth::Consumer { .. }) {
         return mcp_consumer_handler(&state, &auth, &body).await;
     }
-    // Operational control-plane data: operator/admin role required, matching
-    // /v1/compute, /v1/network and /v1/execution which MCP wraps.
-    if let Err(e) = state.require_operator_or_admin(&headers) {
-        return e.into_response();
+    // Wallet sessions may use read-only tools; they are not operator/admin.
+    if !matches!(auth, Auth::Wallet { .. }) {
+        // Operational control-plane data: operator/admin role required,
+        // matching /v1/compute, /v1/network and /v1/execution which MCP wraps.
+        if let Err(e) = state.require_operator_or_admin(&headers) {
+            return e.into_response();
+        }
     }
     // Phase M policy: `execute_decision` is a MUTATION (runs real inference and
     // reserves a worker). It must require the MASTER token, not just an
     // operator role — an operator may decide, but only admin may execute.
     // The write tools `serve_model` and `pull_model` are also master-only.
-    let raw0 = String::from_utf8_lossy(&body);
-    if crate::mcp::execution_request(&raw0).is_some()
-        || crate::mcp::serve_model_request(&raw0).is_some()
-        || crate::mcp::pull_model_request(&raw0).is_some()
+    let raw0 = &raw;
+    if crate::mcp::execution_request(raw0).is_some()
+        || crate::mcp::serve_model_request(raw0).is_some()
+        || crate::mcp::pull_model_request(raw0).is_some()
     {
         if let Err(e) = state.require_master(&headers) {
             return e.into_response();
         }
     }
-    let raw = String::from_utf8_lossy(&body);
     let mut ctx = mcp_context(&state).await;
     // A `search_models_by_capability` call needs a live Hub lookup: precompute
     // its result here (the MCP layer is I/O-free). Unknown/invalid capability
@@ -20223,5 +20519,193 @@ mod tests {
             "master-only hidden from consumer"
         );
         assert!(!tools.contains(&"pull_model".to_string()));
+    }
+
+    #[tokio::test]
+    async fn external_agent_onboarding_contract_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = "master-token".to_string();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master.clone()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.path().join("db/consumer_keys.json")),
+            Some(ledger.clone()),
+        );
+        let pm_store = Arc::new(decentraai_agent_personal_memory::PersonalMemoryStore::new(
+            dir.path().join("memory"),
+        ));
+        state.attach_personal_memory(pm_store.clone());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        async fn post_json(
+            client: &reqwest::Client,
+            url: String,
+            token: Option<&str>,
+            body: serde_json::Value,
+        ) -> (reqwest::StatusCode, serde_json::Value) {
+            let mut req = client.post(url).json(&body);
+            if let Some(token) = token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let resp = req.send().await.unwrap();
+            let status = resp.status();
+            let json = resp.json::<serde_json::Value>().await.unwrap();
+            (status, json)
+        }
+
+        async fn onboard_profile(
+            client: &reqwest::Client,
+            api: SocketAddr,
+            label: &str,
+            capability: &str,
+        ) -> String {
+            let caps = serde_json::json!([capability, "hub", "memory", "society", "arena"]);
+            let (status, body) = post_json(
+                client,
+                format!("http://{api}/v1/world/onboard"),
+                None,
+                serde_json::json!({"agent_name": label, "capabilities": caps}),
+            )
+            .await;
+            assert!(status.is_success(), "onboard {label} failed: {body}");
+            let token = body["api_key"].as_str().unwrap().to_string();
+            assert!(token.starts_with("dca_"));
+
+            let (status, join_body) = post_json(
+                client,
+                format!("http://{api}/v1/world/join"),
+                Some(&token),
+                serde_json::json!({"declared_capabilities": [capability]}),
+            )
+            .await;
+            assert!(status.is_success(), "join {label} failed: {join_body}");
+            assert_eq!(join_body["account"], format!("agent:{label}"));
+            assert!(join_body["room_id"].is_string());
+
+            let init = post_json(
+                client,
+                format!("http://{api}/mcp"),
+                Some(&token),
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"initialize",
+                    "params":{
+                        "protocolVersion":"2025-06-18",
+                        "capabilities":{},
+                        "clientInfo":{"name":label,"version":"1"}
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(init.0, reqwest::StatusCode::OK);
+            assert_eq!(init.1["result"]["protocolVersion"], "2025-06-18");
+            assert!(init.1["result"]["capabilities"]["tools"].is_object());
+
+            let list = post_json(
+                client,
+                format!("http://{api}/mcp"),
+                Some(&token),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            )
+            .await;
+            assert_eq!(list.0, reqwest::StatusCode::OK);
+            let tools = list.1["result"]["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|t| t["name"] == "discover_capabilities"));
+            assert!(tools.iter().any(|t| t["name"] == "hub_publish_task"));
+            assert!(tools.iter().any(|t| t["name"] == "agent_memory_write"));
+            assert!(tools
+                .iter()
+                .all(|t| t["annotations"]["readOnlyHint"].is_boolean()));
+
+            let discover = post_json(
+                client,
+                format!("http://{api}/mcp"),
+                Some(&token),
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":3,
+                    "method":"tools/call",
+                    "params":{"name":"discover_capabilities","arguments":{}}
+                }),
+            )
+            .await;
+            let discover_text = discover.1["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(discover_text.contains("your_account"));
+            assert!(discover_text.contains("step_1"));
+            assert!(discover_text.contains("hub_publish_task"));
+
+            token
+        }
+
+        let skill = client
+            .get(format!("http://{api}/world/skill.md"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(skill.contains("External Agent Onboarding Contract v1"));
+        assert!(skill.contains("MCP initialize"));
+        assert!(skill.contains("discover tools"));
+        assert!(skill.contains("onboard"));
+        assert!(skill.contains("join"));
+        assert!(skill.contains("mission"));
+
+        let token_openclaw = onboard_profile(&client, api, "openclaw-agent", "research").await;
+        let token_claude = onboard_profile(&client, api, "claude-agent", "coding").await;
+        let token_chatgpt = onboard_profile(&client, api, "chatgpt-agent", "embeddings").await;
+
+        let (status, mission) = post_json(
+            &client,
+            format!("http://{api}/v1/world/mission"),
+            Some(&token_openclaw),
+            serde_json::json!({
+                "title": "External onboarding mission",
+                "reward": 500,
+                "required_capability": "research"
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "mission create failed: {mission}");
+        assert!(mission["task_id"].is_string());
+        assert_eq!(mission["required_capability"], "research");
+
+        let world = client
+            .get(format!("http://{api}/v1/world"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert!(world["mission"]["task"].is_object());
+        assert_eq!(world["mission"]["task"]["title"], "External onboarding mission");
+
+        let agents = world["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|a| a["account"] == "agent:openclaw-agent"));
+        assert!(agents.iter().any(|a| a["account"] == "agent:claude-agent"));
+        assert!(agents.iter().any(|a| a["account"] == "agent:chatgpt-agent"));
+
+        // Keep tokens live so the compiler doesn't optimize away the flow.
+        assert!(token_openclaw.starts_with("dca_"));
+        assert!(token_claude.starts_with("dca_"));
+        assert!(token_chatgpt.starts_with("dca_"));
     }
 }

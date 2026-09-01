@@ -29,6 +29,9 @@ pub enum EngineKind {
     Sglang,
     /// Ollama (`ollama serve`).
     Ollama,
+    /// HuggingFace Transformers running through the embedded Python inference
+    /// server. Exposes an OpenAI-compatible `/v1/*` surface.
+    Transformers,
     /// Any other OpenAI-compatible HTTP server.
     RemoteOpenAI,
 }
@@ -43,6 +46,7 @@ impl EngineKind {
             "vllm" => Self::Vllm,
             "sglang" | "sglang_server" => Self::Sglang,
             "ollama" => Self::Ollama,
+            "transformers" | "hf" | "huggingface" => Self::Transformers,
             _ => Self::RemoteOpenAI,
         }
     }
@@ -55,6 +59,7 @@ impl EngineKind {
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
+            Self::Transformers => "transformers",
             Self::RemoteOpenAI => "openai-compatible",
         }
     }
@@ -450,8 +455,12 @@ mod tests {
         assert_eq!(EngineKind::parse("llama-server"), EngineKind::LlamaServer);
         assert_eq!(EngineKind::parse("ollama"), EngineKind::Ollama);
         assert_eq!(EngineKind::parse("sglang"), EngineKind::Sglang);
+        assert_eq!(EngineKind::parse("transformers"), EngineKind::Transformers);
+        assert_eq!(EngineKind::parse("hf"), EngineKind::Transformers);
+        assert_eq!(EngineKind::parse("huggingface"), EngineKind::Transformers);
         assert_eq!(EngineKind::parse("future-engine"), EngineKind::RemoteOpenAI);
         assert_eq!(EngineKind::LlamaServer.as_str(), "llama-server");
+        assert_eq!(EngineKind::Transformers.as_str(), "transformers");
     }
 
     #[test]

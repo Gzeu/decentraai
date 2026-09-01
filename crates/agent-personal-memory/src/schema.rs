@@ -29,6 +29,12 @@ pub struct IdentityMemory {
     pub persona: String,     // e.g. "analytical negotiator", "cautious builder"
     pub values: Vec<String>, // e.g. ["reliability", "fairness", "learning"]
     pub communication_style: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_verified_at: Option<u64>,
 }
 
 impl IdentityMemory {
@@ -48,11 +54,35 @@ impl IdentityMemory {
             persona: String::new(),
             values: Vec::new(),
             communication_style: String::new(),
+            wallet_address: None,
+            wallet_network: None,
+            wallet_verified_at: None,
         }
     }
 
     pub fn to_markdown(&self) -> String {
-        let fm = serde_yaml::to_string(&self.frontmatter).unwrap_or_default();
+        let mut fm = serde_json::to_value(&self.frontmatter).unwrap_or_default();
+        if let serde_json::Value::Object(map) = &mut fm {
+            map.insert("agent_id".to_string(), serde_json::json!(self.agent_id));
+            map.insert("name".to_string(), serde_json::json!(self.name));
+            map.insert("description".to_string(), serde_json::json!(self.description));
+            map.insert("persona".to_string(), serde_json::json!(self.persona));
+            map.insert("values".to_string(), serde_json::json!(self.values));
+            map.insert(
+                "communication_style".to_string(),
+                serde_json::json!(self.communication_style),
+            );
+            if let Some(addr) = &self.wallet_address {
+                map.insert("wallet_address".to_string(), serde_json::json!(addr));
+            }
+            if let Some(net) = &self.wallet_network {
+                map.insert("wallet_network".to_string(), serde_json::json!(net));
+            }
+            if let Some(ts) = self.wallet_verified_at {
+                map.insert("wallet_verified_at".to_string(), serde_json::json!(ts));
+            }
+        }
+        let fm = serde_yaml::to_string(&fm).unwrap_or_default();
         format!(
             "---\n{}---\n\n#[derive(Debug, Clone, Serialize, Deserialize)]Identity\n\n**Agent ID**: {}\n\n**Name**: {}\n\n**Description**: {}\n\n**Persona**: {}\n\n**Values**:\n{}\n\n**Communication Style**: {}\n",
             fm,

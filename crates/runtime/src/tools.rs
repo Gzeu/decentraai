@@ -307,6 +307,7 @@ impl SttManager {
 // ---------------------------------------------------------------------------
 
 const HF_SKILL_SERVER_PY: &str = include_str!("hf_skill_server.py");
+const TRANSFORMERS_SERVER_PY: &str = include_str!("transformers_server.py");
 
 /// The running HF-skills subprocess. One server hosts all enabled skills
 /// (pipelines load lazily on first call). `None` = disabled.
@@ -377,6 +378,96 @@ impl HfSkillsManager {
             .as_ref()
             .map(|s| s.skills().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Health probe for the dashboard /status endpoint.
+    pub fn healthy(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|_| {
+                super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port())
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    }
+}
+
+// ─── Transformers Inference Backend ────────────────────────────────────────
+
+/// The running Transformers inference subprocess. Exposes an OpenAI-compatible
+/// `/v1/*` surface that the existing `InferenceBackend` adapter drives.
+pub struct TransformersServer {
+    server: ToolServer,
+    model: String,
+}
+
+impl TransformersServer {
+    /// Spawns the Python inference server and waits for `/health`.
+    /// The model loads lazily on first request, so startup stays fast.
+    pub async fn spawn(
+        data_dir: &Path,
+        model: &str,
+        device: &str,
+    ) -> Result<Self> {
+        let dir = data_dir.join("tools").join("transformers");
+        let venv_python = dir.join("venv").join("bin").join("python");
+        let args = vec![
+            "--model".to_string(),
+            model.to_string(),
+            "--device".to_string(),
+            device.to_string(),
+        ];
+        let server = ToolServer::start(
+            &dir,
+            &venv_python,
+            TRANSFORMERS_SERVER_PY,
+            &args,
+            "scripts/setup-transformers.sh",
+        )?;
+        let port = server.port();
+        if let Err(e) = wait_until_ready("127.0.0.1", port, Duration::from_secs(120)).await {
+            let _ = server.stop().await;
+            return Err(e.context("Transformers server did not become ready"));
+        }
+        Ok(Self {
+            server,
+            model: model.to_string(),
+        })
+    }
+
+    pub fn base_url(&self) -> String {
+        self.server.base_url()
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Manages the Transformers inference subprocess. `None` = disabled.
+pub struct TransformersManager {
+    server: Option<TransformersServer>,
+}
+
+impl TransformersManager {
+    pub fn new(server: Option<TransformersServer>) -> Self {
+        Self { server }
+    }
+
+    pub fn disabled() -> Self {
+        Self { server: None }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.base_url())
+    }
+
+    pub fn model(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.model().to_string())
     }
 
     /// Health probe for the dashboard /status endpoint.

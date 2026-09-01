@@ -61,6 +61,13 @@ pub struct NodeConfig {
     /// `<data_dir>/tools/skills/venv`.
     #[serde(default)]
     pub skills: Option<SkillsSection>,
+    /// Transformers inference backend. When enabled, the node spawns a Python
+    /// inference server (`transformers_server.py`) that exposes an
+    /// OpenAI-compatible `/v1/*` surface. Use with `inference.engine:
+    /// "transformers"` to route inference through the Transformers backend
+    /// instead of llama-server. Requires `<data_dir>/tools/transformers/venv`.
+    #[serde(default)]
+    pub transformers: Option<TransformersSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -921,6 +928,28 @@ impl Default for SkillsSection {
     }
 }
 
+/// Transformers inference backend configuration. When enabled alongside
+/// `inference.engine: "transformers"`, the node spawns a Python inference
+/// server that wraps HuggingFace Transformers behind an OpenAI-compatible
+/// API. The server runs as a subprocess (never FFI) on loopback with an
+/// ephemeral port, matching the proven ToolServer pattern.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformersSection {
+    /// Enable the Transformers inference subprocess at node start.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HuggingFace model ID (e.g. "Qwen/Qwen2-0.5B") or local path.
+    pub model: String,
+    /// Device to run on: "cpu" (default), "cuda", or "auto" (GPU if available).
+    #[serde(default = "default_transformers_device")]
+    pub device: String,
+}
+
+fn default_transformers_device() -> String {
+    "cpu".to_string()
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -1039,6 +1068,20 @@ impl NodeConfig {
                 }
             }
         }
+        // Transformers backend: model id is required when enabled.
+        if let Some(tx) = &self.transformers {
+            if tx.enabled && tx.model.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "transformers.model must not be empty when transformers is enabled".into(),
+                ));
+            }
+            if tx.device != "cpu" && tx.device != "cuda" && tx.device != "auto" {
+                return Err(ConfigError::Validation(format!(
+                    "transformers.device must be 'cpu', 'cuda', or 'auto' (got '{}')",
+                    tx.device
+                )));
+            }
+        }
         if self.inference.allow_remote_inference && !self.network.private_swarm {
             return Err(ConfigError::Validation(
                 "remote inference requires private_swarm in the initial release".into(),
@@ -1113,6 +1156,9 @@ pub fn is_known_engine(s: &str) -> bool {
             | "sglang_server"
             | "ollama"
             | "openai-compatible"
+            | "transformers"
+            | "hf"
+            | "huggingface"
     )
 }
 
@@ -1741,10 +1787,74 @@ security:
             "sglang",
             "ollama",
             "openai-compatible",
+            "transformers",
         ] {
             assert!(is_known_engine(known), "{known} should be known");
         }
         assert!(!is_known_engine("baz-engine"));
+    }
+
+    #[test]
+    fn transformers_config_validation_empty_model_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let patched = raw.replace(
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]",
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]\n\ntransformers:\n  enabled: true\n  model: \"\"\n  device: cpu",
+        );
+        std::fs::write(file.path(), patched).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("transformers.model"),
+            "expected empty model error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transformers_config_validation_bad_device_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let patched = raw.replace(
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]",
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]\n\ntransformers:\n  enabled: true\n  model: Qwen/Qwen2-0.5B\n  device: tpu",
+        );
+        std::fs::write(file.path(), patched).unwrap();
+        let err = NodeConfig::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("transformers.device"),
+            "expected bad device error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn transformers_config_valid_accepted() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let patched = raw.replace(
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]",
+            "#   list: [\"sentiment\", \"ner\", \"summarize\", \"translate_ro_en\", \"translate_en_ro\"]\n\ntransformers:\n  enabled: true\n  model: Qwen/Qwen2-0.5B\n  device: auto",
+        );
+        std::fs::write(file.path(), patched).unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        let tx = config.transformers.unwrap();
+        assert!(tx.enabled);
+        assert_eq!(tx.model, "Qwen/Qwen2-0.5B");
+        assert_eq!(tx.device, "auto");
+    }
+
+    #[test]
+    fn transformers_config_absent_means_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(config.transformers.is_none());
     }
 }
 

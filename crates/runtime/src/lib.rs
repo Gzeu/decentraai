@@ -26,6 +26,7 @@ pub mod providers_api;
 pub mod queue;
 pub mod tools;
 pub mod vesper;
+pub mod wallet_auth;
 pub mod world;
 
 use anyhow::{Context, Result, bail};

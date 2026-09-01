@@ -122,6 +122,7 @@ pub async fn hub_publish_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     if req.title.trim().is_empty() || req.reward == 0 {
         return (
@@ -162,6 +163,7 @@ pub async fn hub_bid_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let mut hub = state.hub.lock().await;
     match hub.place_bid(
@@ -217,6 +219,7 @@ pub async fn hub_proposal_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let mut hub = state.hub.lock().await;
     match hub.propose(
@@ -259,6 +262,7 @@ pub async fn hub_decide_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let mut hub = state.hub.lock().await;
     match hub.decide_proposal(&id, &actor, req.accept) {
@@ -294,6 +298,7 @@ pub async fn hub_team_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let mut hub = state.hub.lock().await;
     match hub.form_team(req.task_id, req.members) {
@@ -329,6 +334,7 @@ pub async fn hub_execute_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let mut hub = state.hub.lock().await;
     let task = match hub.tasks.get(&req.task_id) {

@@ -11,7 +11,8 @@
 //! unit-testable without a network or a running node.
 //!
 //! Protocol: Model Context Protocol (2025-06-18), JSON-RPC 2.0 over HTTP POST.
-//! Only read-only tools are exposed in this first cut.
+//! Exposes both read-only queries and mutating actions, each annotated with
+//! MCP tool annotations (readOnlyHint, destructiveHint, etc.) for clients.
 
 use serde_json::{Value, json};
 
@@ -110,6 +111,44 @@ pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    pub annotations: ToolAnnotations,
+}
+
+/// MCP tool annotations (MCP spec 2025-03-26+).  Hints for clients;
+/// clients MUST treat them as untrusted unless from a trusted server.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolAnnotations {
+    /// `true` = tool does not modify its environment (default: `false`).
+    pub read_only_hint: bool,
+    /// `true` = modifications may be destructive (default: `true`).
+    pub destructive_hint: bool,
+    /// `true` = repeated calls with same args have no extra effect (default: `false`).
+    pub idempotent_hint: bool,
+    /// `true` = tool may interact with external entities (default: `true`).
+    pub open_world_hint: bool,
+}
+
+impl ToolAnnotations {
+    pub const fn read_only() -> Self {
+        Self { read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false }
+    }
+    pub const fn additive() -> Self {
+        Self { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false }
+    }
+    pub const fn destructive() -> Self {
+        Self { read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false }
+    }
+    pub const fn open_world() -> Self {
+        Self { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: true }
+    }
+    pub fn to_json(&self) -> Value {
+        json!({
+            "readOnlyHint": self.read_only_hint,
+            "destructiveHint": self.destructive_hint,
+            "idempotentHint": self.idempotent_hint,
+            "openWorldHint": self.open_world_hint,
+        })
+    }
 }
 
 pub fn all_tools() -> Vec<ToolDef> {
@@ -118,36 +157,43 @@ pub fn all_tools() -> Vec<ToolDef> {
             name: "get_status",
             description: "Node status: model loaded, inference queue, requests served/failed, tokens generated, uptime, worker count.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "list_workers",
             description: "Every worker on the fabric with its advertised resources (CPU/RAM/VRAM), health, load, model(s) served, and trust status.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "list_models",
             description: "Models available on the fabric, split into served (currently loadable) and on-disk, with the node(s) that hold them.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "list_executions",
             description: "Recent autonomous execution decisions: which worker ran what, the planner's reasoning (network/KV/capability), and the outcome.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "get_quota",
             description: "Contribution-backed quota accounting: per-account earned/available/reserved/consumed quota (keyed by worker peer), totals, and the active contribution-to-quota policy version. Read-only; every figure is real measured work converted under the versioned policy. UNKNOWN measurements are never fabricated.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "get_compensation",
             description: "Reputation-based compensation (M9-9): lifetime contribution credits per worker (earned only from verified work, reputation-scaled), the most recent audited credit events, and the active reward policy. Read-only; synthetic bookkeeping — never money, never the token registry.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "list_peers",
             description: "Connected P2P peers and measured network links (RTT, bandwidth, locality).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "search_models_by_capability",
@@ -171,6 +217,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["capability"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "find_local_models_by_capability",
@@ -191,6 +238,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["capability"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "get_worker_capability",
@@ -215,6 +263,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["model", "capability"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "resolve_intent",
@@ -235,6 +284,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["intent"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "resolve_intent_with_fit",
@@ -255,11 +305,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["intent"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "get_fabric_graph",
             description: "Project the current fabric graph (Digital Twin): real nodes (peer_id/node_id/node_name kept separate), models with their INFERRED quantization and persisted capability claims, the capabilities known across the fabric, recent executions with their recovery timeline, measured network links, and KV session count. Read-only projection of real fabric state — no fake nodes, no hardcoded names; empty arrays are honest. Future nodes appear automatically.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "decide",
@@ -274,6 +326,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["intent"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "execute_decision",
@@ -295,11 +348,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["prompt", "confirm"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "list_sessions",
             description: "Coordinator-tracked KV/session residency (KV locality): which worker currently holds each session's KV prefix, the model, accounted tokens used, capacity, and KV headroom. Read-only; real accounted state (empty when no sessions/compute). Useful to know why a continuation would be steered to a specific worker.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "serve_model",
@@ -312,6 +367,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["model"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "pull_model",
@@ -324,11 +380,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["reference"],
                 "additionalProperties": false,
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "arena_state",
             description: "Agent Arena live world: tick, grid size, agents (position/resources/reputation), recent events with evidence_id. Read-only projection of the deterministic ArenaWorld (Issue #63).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "arena_act",
@@ -343,11 +401,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["action"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_state",
             description: "Agent Hub live state: tasks, bids, proposals, teams, events, tick. Read-only projection of the task market (Issue #63 Hub).",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "hub_events",
@@ -360,6 +420,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 },
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "hub_publish_task",
@@ -375,6 +436,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["title", "reward"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_place_bid",
@@ -389,6 +451,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["task_id", "price"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_propose",
@@ -404,6 +467,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["to", "task_id", "offer_price"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_decide_proposal",
@@ -417,6 +481,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["proposal_id", "accept"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_form_team",
@@ -430,6 +495,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["task_id", "members"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "hub_execute",
@@ -442,11 +508,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["task_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "society_state",
             description: "Agent Society live state: relationships, trust scores, reputation, contributions, outcomes. Read-only projection.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_trust",
@@ -460,6 +528,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["observer", "subject"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_reputation",
@@ -473,6 +542,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_relationships",
@@ -486,6 +556,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_contributions",
@@ -498,6 +569,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["task_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_outcomes",
@@ -511,6 +583,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_decision_hints",
@@ -525,6 +598,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id", "hub_state", "resources"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "society_record_relationship",
@@ -544,6 +618,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         "additionalProperties": false
     }
     "#).unwrap(),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "society_record_contribution",
@@ -564,6 +639,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         "additionalProperties": false
     }
     "#).unwrap(),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "society_record_outcome",
@@ -585,6 +661,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         "additionalProperties": false
     }
     "#).unwrap(),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "society_record_reputation_event",
@@ -604,11 +681,13 @@ pub fn all_tools() -> Vec<ToolDef> {
         "additionalProperties": false
     }
     "#).unwrap(),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "list_consumer_keys",
             description: "Consumer API key metadata (Compute Contribution & Quota): per-key id, display prefix, owner account, quota ceiling, rate limit, scopes, status, and live usage + the owner account's quota balance. Read-only; NEVER exposes the plaintext secret.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "decentraai_embeddings",
@@ -622,6 +701,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["input"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::open_world(),
         },
         ToolDef {
             name: "decentraai_compute_request",
@@ -636,6 +716,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["capability", "payload"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::open_world(),
         },
         ToolDef {
             name: "agent_memory_read",
@@ -649,6 +730,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "agent_memory_write",
@@ -663,6 +745,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id", "category", "entry"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::additive(),
         },
         ToolDef {
             name: "agent_memory_search",
@@ -678,6 +761,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id", "query"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "agent_memory_snapshot",
@@ -690,6 +774,7 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "agent_memory_export",
@@ -702,11 +787,13 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "required": ["agent_id"],
                 "additionalProperties": false
             }),
+        annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "discover_capabilities",
             description: "Discover all available capabilities/tools on this node and their required scopes. Essential for external agent onboarding — call this first to learn what you can do and what scopes to request.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
         },
     ]
 }
@@ -1821,7 +1908,7 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
             "serverInfo": server_info(),
-            "instructions": "DecentraAI exposes its local model fabric to AI agents. All tools are read-only. Authentication: the same dsk_ Bearer token as the rest of the API."
+            "instructions": "DecentraAI exposes its local model fabric to AI agents. Tools are a mix of read-only queries (status, workers, models, peers, capabilities, sessions, quota, compensation) and mutating actions (execute inference, serve/pull models, arena actions, hub marketplace, society operations, memory writes). Mutating tools require explicit confirmation or master authentication. Each tool carries annotations (readOnlyHint, destructiveHint, etc.) for client UX decisions. Authentication: dsk_ Bearer token for operator tools, dca_ consumer key for consumption tools."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
@@ -1831,6 +1918,7 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
                     "name": t.name,
                     "description": t.description,
                     "inputSchema": t.input_schema,
+                    "annotations": t.annotations.to_json(),
                 }))
                 .collect::<Vec<_>>()
         })),
@@ -2609,6 +2697,220 @@ mod tests {
         assert!(
             !content.contains("dca_"),
             "metadata must not leak the secret prefix value"
+        );
+    }
+
+    // ── ChatGPT MCP connector compatibility regression tests ─────────────
+
+    #[test]
+    fn chatgpt_initialize_instructions_no_longer_claim_readonly() {
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        );
+        let instructions = r["result"]["instructions"].as_str().unwrap();
+        // The old lie: "All tools are read-only." must NOT be present.
+        assert!(
+            !instructions.contains("All tools are read-only"),
+            "instructions must not falsely claim all tools are read-only"
+        );
+        // Must mention mutating tools exist.
+        assert!(
+            instructions.contains("mutating") || instructions.contains("actions"),
+            "instructions should describe that some tools are mutating"
+        );
+        // Must mention annotations.
+        assert!(
+            instructions.contains("annotations") || instructions.contains("readOnlyHint"),
+            "instructions should mention tool annotations for client UX"
+        );
+    }
+
+    #[test]
+    fn chatgpt_tools_list_includes_annotations_on_every_tool() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            assert!(
+                tool["annotations"].is_object(),
+                "tool '{name}' must have an annotations object (ChatGPT requires readOnlyHint/openWorldHint/destructiveHint)"
+            );
+            let ann = &tool["annotations"];
+            assert!(
+                ann["readOnlyHint"].is_boolean(),
+                "tool '{name}' must have readOnlyHint boolean"
+            );
+            assert!(
+                ann["destructiveHint"].is_boolean(),
+                "tool '{name}' must have destructiveHint boolean"
+            );
+            assert!(
+                ann["openWorldHint"].is_boolean(),
+                "tool '{name}' must have openWorldHint boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_read_only_tools_have_readonlyhint_true() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let read_only_names = [
+            "get_status", "list_workers", "list_models", "list_executions",
+            "get_quota", "get_compensation", "list_peers",
+            "search_models_by_capability", "find_local_models_by_capability",
+            "get_worker_capability", "resolve_intent", "resolve_intent_with_fit",
+            "get_fabric_graph", "decide", "list_sessions", "list_consumer_keys",
+            "arena_state", "hub_state", "hub_events",
+            "society_state", "society_trust", "society_reputation",
+            "society_relationships", "society_contributions", "society_outcomes",
+            "society_decision_hints",
+            "agent_memory_read", "agent_memory_search", "agent_memory_snapshot",
+            "agent_memory_export", "discover_capabilities",
+        ];
+        for name in &read_only_names {
+            let tool = tools.iter().find(|t| t["name"].as_str() == Some(name));
+            assert!(tool.is_some(), "tool '{name}' must exist in tools/list");
+            let tool = tool.unwrap();
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"].as_bool(),
+                Some(true),
+                "read-only tool '{name}' must have readOnlyHint: true"
+            );
+            assert_eq!(
+                tool["annotations"]["destructiveHint"].as_bool(),
+                Some(false),
+                "read-only tool '{name}' must have destructiveHint: false"
+            );
+            assert_eq!(
+                tool["annotations"]["openWorldHint"].as_bool(),
+                Some(false),
+                "read-only tool '{name}' must have openWorldHint: false"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_mutating_tools_have_readonlyhint_false() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let mutating_names = [
+            "execute_decision", "serve_model", "pull_model",
+            "arena_act", "hub_publish_task", "hub_place_bid",
+            "hub_propose", "hub_decide_proposal", "hub_form_team",
+            "hub_execute",
+            "society_record_relationship", "society_record_contribution",
+            "society_record_outcome", "society_record_reputation_event",
+            "agent_memory_write",
+        ];
+        for name in &mutating_names {
+            let tool = tools.iter().find(|t| t["name"].as_str() == Some(name));
+            assert!(tool.is_some(), "tool '{name}' must exist in tools/list");
+            let tool = tool.unwrap();
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"].as_bool(),
+                Some(false),
+                "mutating tool '{name}' must have readOnlyHint: false"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_open_world_tools_have_openworldhint_true() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let open_world_names = ["decentraai_embeddings", "decentraai_compute_request"];
+        for name in &open_world_names {
+            let tool = tools.iter().find(|t| t["name"].as_str() == Some(name));
+            assert!(tool.is_some(), "tool '{name}' must exist in tools/list");
+            let tool = tool.unwrap();
+            assert_eq!(
+                tool["annotations"]["openWorldHint"].as_bool(),
+                Some(true),
+                "open-world tool '{name}' must have openWorldHint: true"
+            );
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"].as_bool(),
+                Some(false),
+                "open-world tool '{name}' must have readOnlyHint: false"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_additive_mutating_tools_have_destructivehint_false() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let additive_names = [
+            "execute_decision", "arena_act", "hub_publish_task",
+            "hub_place_bid", "hub_propose", "hub_decide_proposal",
+            "hub_form_team", "hub_execute",
+            "society_record_relationship", "society_record_contribution",
+            "society_record_outcome", "society_record_reputation_event",
+            "agent_memory_write",
+        ];
+        for name in &additive_names {
+            let tool = tools.iter().find(|t| t["name"].as_str() == Some(name));
+            let tool = tool.unwrap_or_else(|| panic!("tool '{name}' must exist"));
+            assert_eq!(
+                tool["annotations"]["destructiveHint"].as_bool(),
+                Some(false),
+                "additive tool '{name}' must have destructiveHint: false (non-destructive mutation)"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_every_tool_has_input_schema() {
+        // ChatGPT validates tools have a valid JSON Schema input.
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            assert!(
+                tool["inputSchema"].is_object(),
+                "tool '{name}' must have an inputSchema object"
+            );
+            assert_eq!(
+                tool["inputSchema"]["type"].as_str(),
+                Some("object"),
+                "tool '{name}' inputSchema must have type: object"
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_tools_list_jsonrpc_response_format() {
+        // Verify the JSON-RPC 2.0 response structure that ChatGPT expects.
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        assert_eq!(r["jsonrpc"], "2.0");
+        assert_eq!(r["id"], 3);
+        assert!(r["result"].is_object());
+        assert!(r["result"]["tools"].is_array());
+        // No error field on success.
+        assert!(r.get("error").is_none());
+    }
+
+    #[test]
+    fn chatgpt_initialize_server_info_required() {
+        // ChatGPT connector discovery requires serverInfo with name and version.
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        );
+        assert!(r["result"]["serverInfo"]["name"].is_string());
+        assert!(r["result"]["serverInfo"]["version"].is_string());
+        assert_eq!(r["result"]["serverInfo"]["name"], "decentraai-mcp");
+    }
+
+    #[test]
+    fn chatgpt_initialize_capabilities_declares_tools() {
+        // ChatGPT requires capabilities.tools to be present.
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        );
+        assert!(
+            r["result"]["capabilities"]["tools"].is_object(),
+            "capabilities.tools must be present for ChatGPT connector"
         );
     }
 }

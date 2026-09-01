@@ -40,6 +40,12 @@ pub enum EngineKind {
     Sglang,
     /// Ollama (`ollama serve`). OpenAI-compatible layer over llama.cpp.
     Ollama,
+    /// HuggingFace Transformers running through the node's embedded Python
+    /// inference server (`transformers_server.py`). The server exposes an
+    /// OpenAI-compatible `/v1/*` surface so the same backend adapter can
+    /// drive it. Useful for small-to-medium models where Python ecosystem
+    /// access (tokenizers, adapters, PEFT) is needed.
+    Transformers,
     /// Any other OpenAI-compatible HTTP server (generic hub-and-spoke).
     RemoteOpenAI,
 }
@@ -54,6 +60,7 @@ impl EngineKind {
             "vllm" => Self::Vllm,
             "sglang" => Self::Sglang,
             "ollama" => Self::Ollama,
+            "transformers" | "hf" | "huggingface" => Self::Transformers,
             _ => Self::RemoteOpenAI,
         }
     }
@@ -65,6 +72,7 @@ impl EngineKind {
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
             Self::Ollama => "ollama",
+            Self::Transformers => "transformers",
             Self::RemoteOpenAI => "openai-compatible",
         }
     }
@@ -111,6 +119,18 @@ impl EngineKind {
                 pipeline_parallel: true,
             },
             Self::Ollama => EngineCapabilities {
+                streaming: true,
+                kv_report: false,
+                prefill_decode_separation: false,
+                expert_routing: false,
+                tensor_parallel: false,
+                ..EngineCapabilities::zero_extra()
+            },
+            // Transformers: streaming via token-by-token generation; no KV
+            // cache reporting or tensor parallelism (single-device by
+            // default). Continuous batching depends on the model size and
+            // device; conservative false until probed.
+            Self::Transformers => EngineCapabilities {
                 streaming: true,
                 kv_report: false,
                 prefill_decode_separation: false,
@@ -279,6 +299,7 @@ mod tests {
         let kinds = [
             EngineKind::LlamaServer,
             EngineKind::Ollama,
+            EngineKind::Transformers,
             EngineKind::RemoteOpenAI,
         ];
         for kind in kinds {
@@ -312,6 +333,7 @@ mod tests {
             EngineKind::Vllm,
             EngineKind::Sglang,
             EngineKind::Ollama,
+            EngineKind::Transformers,
             EngineKind::RemoteOpenAI,
         ];
         for kind in kinds {
@@ -325,6 +347,26 @@ mod tests {
         assert!(
             !conservative.expert_routing,
             "the unprobed conservative baseline must not advertise expert routing"
+        );
+    }
+
+    #[test]
+    fn transformers_engine_kind_parse_roundtrip() {
+        assert_eq!(EngineKind::parse("transformers"), EngineKind::Transformers);
+        assert_eq!(EngineKind::parse("hf"), EngineKind::Transformers);
+        assert_eq!(EngineKind::parse("huggingface"), EngineKind::Transformers);
+        assert_eq!(EngineKind::Transformers.as_str(), "transformers");
+        assert!(
+            EngineKind::Transformers
+                .advertised_capabilities()
+                .streaming,
+            "Transformers backend supports streaming"
+        );
+        assert!(
+            !EngineKind::Transformers
+                .advertised_capabilities()
+                .expert_routing,
+            "Transformers backend must not advertise expert routing"
         );
     }
 }

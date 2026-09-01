@@ -5,6 +5,7 @@ use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
 use decentraai_runtime::tools::{
     HfSkillsManager, HfSkillsServer, OcrManager, OcrServer, SttManager, SttServer,
+    TransformersManager, TransformersServer,
 };
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
@@ -1300,6 +1301,7 @@ async fn spawn_tool_runtimes(
     Option<OcrManager>,
     Option<SttManager>,
     Option<HfSkillsManager>,
+    Option<TransformersManager>,
 ) {
     let mut ocr = None;
     if let Some(cfg) = config.ocr.clone() {
@@ -1337,7 +1339,10 @@ async fn spawn_tool_runtimes(
             }
         }
     }
-    (ocr, stt, skills)
+    // Transformers is spawned earlier (before is_worker is determined) because
+    // it can make the node a worker without a local GGUF model. Return None
+    // here; the early path sets transformers_manager directly.
+    (ocr, stt, skills, None)
 }
 
 async fn node_start(args: NodeArgs) -> Result<()> {
@@ -1461,6 +1466,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let mut maybe_server: Option<LlamaServer> = None;
     let mut provision_factory: Option<decentraai_distributed::ProvisioningFactory> = None;
     let mut worker_backend: Option<OpenAiCompatibleBackend> = None;
+    let mut transformers_manager: Option<TransformersManager> = None;
     // Single authoritative source of truth for the live engine base URL. The
     // engine supervisor (M24) writes the current port here after every start /
     // respawn; the worker backend resolves its base URL synchronously from this
@@ -1617,6 +1623,75 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     hash = %model_hash,
                     "registered remote OpenAI-compatible engine as a distributed worker"
                 );
+            }
+        }
+    }
+
+    // Transformers backend: when `inference.engine` is "transformers" (or
+    // aliases "hf"/"huggingface"), spawn the Python inference server and
+    // register it as the distributed worker backend. This is the same
+    // pattern as the multi-engine remote backend, but the backend URL
+    // comes from a locally-spawned Python subprocess.
+    if worker_backend.is_none() {
+        let engine = config
+            .inference
+            .engine
+            .as_deref()
+            .map(EngineKind::parse)
+            .unwrap_or(EngineKind::LlamaServer);
+        if engine == EngineKind::Transformers {
+            if let Some(tx_cfg) = &config.transformers {
+                if tx_cfg.enabled {
+                    match TransformersServer::spawn(&data_dir, &tx_cfg.model, &tx_cfg.device).await {
+                        Ok(server) => {
+                            let base = server.base_url();
+                            let tx_model = tx_cfg.model.clone();
+                            info!(
+                                model = %tx_model,
+                                device = %tx_cfg.device,
+                                base_url = %base,
+                                "Transformers inference backend online (Python subprocess)"
+                            );
+                            transformers_manager = Some(TransformersManager::new(Some(server)));
+                            if let Ok(backend) = OpenAiCompatibleBackend::new(BackendConfig {
+                                base_url: base.clone(),
+                                model: tx_model.clone(),
+                                api_key: None,
+                                connect_timeout: Duration::from_secs(3),
+                                request_timeout: Duration::from_secs(300),
+                                max_prompt_bytes: 200_000,
+                                max_output_tokens: 8192,
+                                engine: EngineKind::Transformers,
+                                backend_url_resolver: None,
+                            }) {
+                                if model_hash.is_empty() {
+                                    model_hash = blake3::hash(
+                                        format!("transformers:{tx_model}").as_bytes(),
+                                    )
+                                    .to_hex()
+                                    .to_string();
+                                }
+                                if model_size_bytes == 0 {
+                                    model_size_bytes = 1024;
+                                }
+                                backend_url = base.clone();
+                                *live_engine_url.lock().unwrap() = Some(base.clone());
+                                worker_backend = Some(backend);
+                                info!(
+                                    engine = "transformers",
+                                    base_url = %base,
+                                    model = %tx_model,
+                                    hash = %model_hash,
+                                    "registered local Transformers backend as a distributed worker"
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            "Transformers backend unavailable (run scripts/setup-transformers.sh)"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1867,7 +1942,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // executors so the real tool bindings (name + description + loopback
         // URL) can be attached to the executor. Missing setups fail graceful —
         // the node runs without the tool and logs a warning.
-        (ocr_manager, stt_manager, skills_manager) = spawn_tool_runtimes(&config, &data_dir).await;
+        (ocr_manager, stt_manager, skills_manager, transformers_manager) = spawn_tool_runtimes(&config, &data_dir).await;
         // Real tool bindings for the agent executor — only for tools that are
         // actually online (spawn succeeded). The model is told about them and
         // may emit a [TOOL_CALL] block; the executor runs the tool and re-asks.
@@ -2795,6 +2870,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // HF skills: attach the manager spawned earlier (`/v1/skills/<id>`).
         if let Some(manager) = skills_manager {
             state.attach_skills_tool(Arc::new(manager));
+        }
+        // Transformers: attach the manager spawned earlier (Python subprocess
+        // for OpenAI-compatible inference backend).
+        if let Some(manager) = transformers_manager {
+            state.attach_transformers(Arc::new(manager));
         }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());

@@ -44,6 +44,11 @@ pub enum Actor {
         account: String,
         scopes: Vec<String>,
     },
+    /// A wallet-backed session (challenge verified, temporary bearer token).
+    Wallet {
+        wallet_address: String,
+        agent_id: String,
+    },
 }
 
 /// Subscription role (mirrors [`decentraai_tokens::Role`]).
@@ -315,6 +320,23 @@ pub fn authorize(actor: &Actor, resource: Resource, operation: Operation) -> Aut
                 None => AuthzResult::Allowed,
             }
         }
+
+        // Wallet: verified public identity, but no administrative authority.
+        Actor::Wallet { .. } => match operation {
+            Operation::Read => match resource {
+                Resource::Credentials | Resource::Admin => AuthzResult::Denied(
+                    DenyReason::WrongActorType {
+                        actor: "wallet".into(),
+                        resource,
+                    },
+                ),
+                _ => AuthzResult::Allowed,
+            },
+            _ => AuthzResult::Denied(DenyReason::WrongActorType {
+                actor: "wallet".into(),
+                resource,
+            }),
+        },
     }
 }
 

@@ -113,6 +113,7 @@ pub async fn arena_join_handler(
         Auth::Master => ("operator".to_string(), "operator".to_string()),
         Auth::Open => ("open".to_string(), "open".to_string()),
         Auth::Subscriber { name, .. } => (name.clone(), name.clone()),
+        Auth::Wallet { wallet_address, agent_id, .. } => (wallet_address.clone(), agent_id.clone()),
     };
     let agent_id = format!("arena:{}:{}", account_id, agent_suffix);
     let name = req.name.unwrap_or_else(|| account_id.clone());
@@ -159,6 +160,7 @@ pub async fn arena_action_handler(
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
+        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
     };
     let agent_id = format!("arena:{}:{}", account_id, account_id);
     // Ensure agent exists (short lock)

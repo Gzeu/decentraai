@@ -36,6 +36,7 @@ decentraai-agent-personal-memory = { path = "../agent-personal-memory" }
 blake3.workspace = true
 futures.workspace = true
 base64.workspace = true
+bech32.workspace = true
 hex.workspace = true
 sha2.workspace = true
 rand_core.workspace = true
@@ -43,7 +44,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
