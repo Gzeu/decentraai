@@ -1339,10 +1339,37 @@ async fn spawn_tool_runtimes(
             }
         }
     }
-    // Transformers is spawned earlier (before is_worker is determined) because
-    // it can make the node a worker without a local GGUF model. Return None
-    // here; the early path sets transformers_manager directly.
-    (ocr, stt, skills, None)
+    // Transformers for embeddings: when `transformers.enabled = true` and the
+    // main engine is NOT Transformers (that case is handled earlier), spawn
+    // the Python server for embeddings only. The backend URL is returned so
+    // the caller can wire `embeddings_backend_url` if it wasn't set.
+    let mut tx = None;
+    let engine_is_transformers = config
+        .inference
+        .engine
+        .as_deref()
+        .map(decentraai_inference_adapter::EngineKind::parse)
+        .map(|e| e == decentraai_inference_adapter::EngineKind::Transformers)
+        .unwrap_or(false);
+    if !engine_is_transformers {
+        if let Some(tx_cfg) = config.transformers.as_ref() {
+            if tx_cfg.enabled {
+                match TransformersServer::spawn(data_dir, &tx_cfg.model, &tx_cfg.device).await {
+                    Ok(server) => {
+                        info!(
+                            model = %tx_cfg.model,
+                            device = %tx_cfg.device,
+                            base_url = %server.base_url(),
+                            "Transformers embeddings backend online (Python subprocess)"
+                        );
+                        tx = Some(TransformersManager::new(Some(server)));
+                    }
+                    Err(e) => warn!(error = %e, "Transformers embeddings unavailable (run scripts/setup-transformers.sh)"),
+                }
+            }
+        }
+    }
+    (ocr, stt, skills, tx)
 }
 
 async fn node_start(args: NodeArgs) -> Result<()> {
@@ -1904,7 +1931,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // collective memory. Both are best-effort and never disturb the flow.
     // RAG embeddings/retrieval are created once and shared by the inference
     // executor (retrieval tool at runtime) and the API (/v1/embeddings, /v1/rag).
-    let (embedding_client, retrieval_manager): (
+    let (mut embedding_client, mut retrieval_manager): (
         Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
         Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
     ) = match config.inference.embeddings_backend_url.as_deref() {
@@ -1942,7 +1969,33 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // executors so the real tool bindings (name + description + loopback
         // URL) can be attached to the executor. Missing setups fail graceful —
         // the node runs without the tool and logs a warning.
-        (ocr_manager, stt_manager, skills_manager, transformers_manager) = spawn_tool_runtimes(&config, &data_dir).await;
+        let (ocr_new, stt_new, skills_new, tx_new) = spawn_tool_runtimes(&config, &data_dir).await;
+        ocr_manager = ocr_new;
+        stt_manager = stt_new;
+        skills_manager = skills_new;
+        // Don't overwrite transformers_manager if the early path (engine=transformers) already set it.
+        if tx_new.is_some() && transformers_manager.is_none() {
+            transformers_manager = tx_new;
+        }
+        // If Transformers spawned for embeddings but no embeddings_backend_url was
+        // configured, wire the auto-started server as the embeddings backend.
+        if embedding_client.is_none() {
+            if let Some(tx) = &transformers_manager {
+                if let Some(url) = tx.base_url() {
+                    let client = Arc::new(
+                        decentraai_distributed::embedding::EmbeddingClient::new(url.clone()),
+                    );
+                    let rm = Arc::new(
+                        decentraai_distributed::retrieval_manager::RetrievalManager::new(
+                            client.clone(),
+                        ),
+                    );
+                    embedding_client = Some(client);
+                    retrieval_manager = Some(rm);
+                    info!(url = %url, "embeddings wired to auto-started Transformers server");
+                }
+            }
+        }
         // Real tool bindings for the agent executor — only for tools that are
         // actually online (spawn succeeded). The model is told about them and
         // may emit a [TOOL_CALL] block; the executor runs the tool and re-asks.
