@@ -2,12 +2,11 @@
 //!
 //! Exposes social state, reputation, and decision hints via MCP tools.
 
+use crate::{
+    AgentId, DecisionContext, SocietyRules, SocietyState, TaskId, reputation::ReputationStore,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use crate::{
-    AgentId, TaskId, SocietyState, SocietyRules, DecisionContext,
-    reputation::ReputationStore,
-};
 
 /// MCP tool definitions for society
 pub fn society_tools() -> Vec<ToolDef> {
@@ -108,16 +107,32 @@ pub struct ToolDef {
 
 /// Extract society_state request
 pub fn society_state_request(raw: &str) -> bool {
-    let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) else { return false; };
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return false; }
-    msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some("society_state")
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("society_state")
 }
 
 /// Extract society_trust request
 pub fn society_trust_request(raw: &str) -> Option<(String, String)> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_trust" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_trust"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let observer = args.get("observer").and_then(|v| v.as_str())?.to_string();
     let subject = args.get("subject").and_then(|v| v.as_str())?.to_string();
@@ -127,38 +142,84 @@ pub fn society_trust_request(raw: &str) -> Option<(String, String)> {
 /// Extract society_reputation request
 pub fn society_reputation_request(raw: &str) -> Option<(String, Option<String>)> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_reputation" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_reputation"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
-    let capability = args.get("capability").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let capability = args
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Some((agent_id, capability))
 }
 
 /// Extract society_relationships request
 pub fn society_relationships_request(raw: &str) -> Option<(String, bool)> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_relationships" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_relationships"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
-    let as_observer = args.get("as_observer").and_then(|v| v.as_bool()).unwrap_or(true);
+    let as_observer = args
+        .get("as_observer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     Some((agent_id, as_observer))
 }
 
 /// Extract society_contributions request
 pub fn society_contributions_request(raw: &str) -> Option<String> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_contributions" { return None; }
-    msg.get("params").and_then(|p| p.get("arguments")).and_then(|a| a.get("task_id")).and_then(|v| v.as_str()).map(|s| s.to_string())
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_contributions"
+    {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("task_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract society_outcomes request
 pub fn society_outcomes_request(raw: &str) -> Option<(String, usize)> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_outcomes" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_outcomes"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -166,10 +227,21 @@ pub fn society_outcomes_request(raw: &str) -> Option<(String, usize)> {
 }
 
 /// Extract society_decision_hints request
-pub fn society_decision_hints_request(raw: &str) -> Option<(String, serde_json::Value, serde_json::Value)> {
+pub fn society_decision_hints_request(
+    raw: &str,
+) -> Option<(String, serde_json::Value, serde_json::Value)> {
     let msg: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") { return None; }
-    if msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str())? != "society_decision_hints" { return None; }
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "society_decision_hints"
+    {
+        return None;
+    }
     let args = msg.get("params").and_then(|p| p.get("arguments"))?;
     let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
     let hub_state = args.get("hub_state").cloned().unwrap_or(json!({}));
@@ -187,7 +259,7 @@ pub fn build_society_state_response(state: &SocietyState, agent_id: &AgentId) ->
             trust_scores.insert(subject.clone(), score);
         }
     }
-    
+
     // Also get trust from others toward this agent
     for (observer, subjects) in &state.relationships {
         if subjects.contains_key(agent_id) {
@@ -195,7 +267,7 @@ pub fn build_society_state_response(state: &SocietyState, agent_id: &AgentId) ->
             trust_scores.insert(format!("{}_toward_me", observer), score);
         }
     }
-    
+
     json!({
         "tick": state.tick,
         "trust_scores": trust_scores,
@@ -208,7 +280,11 @@ pub fn build_society_state_response(state: &SocietyState, agent_id: &AgentId) ->
 }
 
 /// Build trust score response
-pub fn build_trust_response(state: &SocietyState, observer: &AgentId, subject: &AgentId) -> serde_json::Value {
+pub fn build_trust_response(
+    state: &SocietyState,
+    observer: &AgentId,
+    subject: &AgentId,
+) -> serde_json::Value {
     let score = state.trust_score(observer, subject);
     let rels = state.get_relationships(observer, subject);
     json!({
@@ -227,7 +303,11 @@ pub fn build_trust_response(state: &SocietyState, observer: &AgentId, subject: &
 }
 
 /// Build reputation response
-pub fn build_reputation_response(store: &ReputationStore, agent_id: &AgentId, capability: Option<&str>) -> serde_json::Value {
+pub fn build_reputation_response(
+    store: &ReputationStore,
+    agent_id: &AgentId,
+    capability: Option<&str>,
+) -> serde_json::Value {
     if let Some(rep) = store.get(agent_id, capability) {
         json!({
             "agent_id": agent_id,
@@ -248,13 +328,17 @@ pub fn build_reputation_response(store: &ReputationStore, agent_id: &AgentId, ca
 }
 
 /// Build relationships response
-pub fn build_relationships_response(state: &SocietyState, agent_id: &AgentId, as_observer: bool) -> serde_json::Value {
+pub fn build_relationships_response(
+    state: &SocietyState,
+    agent_id: &AgentId,
+    as_observer: bool,
+) -> serde_json::Value {
     let rels = if as_observer {
         state.get_all_for_agent(agent_id)
     } else {
         state.get_about_agent(agent_id)
     };
-    
+
     json!({
         "agent_id": agent_id,
         "as_observer": as_observer,
@@ -272,7 +356,11 @@ pub fn build_relationships_response(state: &SocietyState, agent_id: &AgentId, as
 
 /// Build contributions response
 pub fn build_contributions_response(state: &SocietyState, task_id: &TaskId) -> serde_json::Value {
-    let contribs = state.contributions.get(task_id).cloned().unwrap_or_default();
+    let contribs = state
+        .contributions
+        .get(task_id)
+        .cloned()
+        .unwrap_or_default();
     json!({
         "task_id": task_id,
         "contributions": contribs.iter().map(|c| json!({
@@ -290,7 +378,11 @@ pub fn build_contributions_response(state: &SocietyState, task_id: &TaskId) -> s
 }
 
 /// Build outcomes response
-pub fn build_outcomes_response(state: &SocietyState, agent_id: &AgentId, limit: usize) -> serde_json::Value {
+pub fn build_outcomes_response(
+    state: &SocietyState,
+    agent_id: &AgentId,
+    limit: usize,
+) -> serde_json::Value {
     let outcomes = state.recent_outcomes(agent_id, limit);
     json!({
         "agent_id": agent_id,
@@ -308,7 +400,10 @@ pub fn build_outcomes_response(state: &SocietyState, agent_id: &AgentId, limit: 
 }
 
 /// Build decision hints response
-pub fn build_decision_hints_response(rules: &SocietyRules, ctx: &DecisionContext) -> serde_json::Value {
+pub fn build_decision_hints_response(
+    rules: &SocietyRules,
+    ctx: &DecisionContext,
+) -> serde_json::Value {
     let hints = rules.evaluate(ctx);
     json!({
         "agent_id": ctx.agent_id,

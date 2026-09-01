@@ -144,17 +144,39 @@ pub struct AgentMetadata {
 
 #[async_trait]
 pub trait IntrospectionProvider: Send + Sync {
-    async fn get_agent_full_state(&self, agent_id: &str) -> Result<AgentFullState, IntrospectionError>;
+    async fn get_agent_full_state(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentFullState, IntrospectionError>;
     async fn get_agent_summary(&self, agent_id: &str) -> Result<AgentSummary, IntrospectionError>;
-    async fn list_agents(&self, query: AgentSearchQuery) -> Result<Vec<AgentSummary>, IntrospectionError>;
+    async fn list_agents(
+        &self,
+        query: AgentSearchQuery,
+    ) -> Result<Vec<AgentSummary>, IntrospectionError>;
     async fn get_network_topology(&self) -> Result<NetworkTopology, IntrospectionError>;
-    async fn get_agent_activity(&self, agent_id: &str, since: u64, limit: usize) -> Result<Vec<AgentActivity>, IntrospectionError>;
-    async fn get_agent_relationships(&self, agent_id: &str) -> Result<Vec<AgentConnection>, IntrospectionError>;
+    async fn get_agent_activity(
+        &self,
+        agent_id: &str,
+        since: u64,
+        limit: usize,
+    ) -> Result<Vec<AgentActivity>, IntrospectionError>;
+    async fn get_agent_relationships(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<AgentConnection>, IntrospectionError>;
     async fn get_trust_network(&self) -> Result<Vec<AgentConnection>, IntrospectionError>;
     async fn get_collective_memory(&self) -> Result<serde_json::Value, IntrospectionError>;
-    async fn search_memory(&self, agent_id: &str, query: &str, limit: usize) -> Result<serde_json::Value, IntrospectionError>;
+    async fn search_memory(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, IntrospectionError>;
     async fn get_agent_dreams(&self, agent_id: &str) -> Result<Vec<String>, IntrospectionError>;
-    async fn get_agent_beliefs(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError>;
+    async fn get_agent_beliefs(
+        &self,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, IntrospectionError>;
     async fn get_agent_lessons(&self, agent_id: &str) -> Result<Vec<String>, IntrospectionError>;
 }
 
@@ -187,20 +209,35 @@ impl IntrospectionService {
     }
 
     async fn get_agent_state(&self, agent_id: &str) -> Result<AgentState, IntrospectionError> {
-        self.agent_runtime.get_state(&agent_id.to_string())
+        self.agent_runtime
+            .get_state(&agent_id.to_string())
             .await
             .map_err(|_| IntrospectionError::NotFound(agent_id.to_string()))
     }
 
-    async fn get_personal_memory(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
-        let snapshot = self.personal_memory.snapshot(&agent_id.to_string()).await
-            .map_err(|e| IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}")))?;
+    async fn get_personal_memory(
+        &self,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, IntrospectionError> {
+        let snapshot = self
+            .personal_memory
+            .snapshot(&agent_id.to_string())
+            .await
+            .map_err(|e| {
+                IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}"))
+            })?;
         Ok(serde_json::to_value(snapshot).unwrap_or(serde_json::json!({})))
     }
 
-    async fn get_society_snapshot(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
+    async fn get_society_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, IntrospectionError> {
         let society = self.society.read().await;
-        let snapshot = decentraai_agent_society::mcp::build_society_state_response(&society, &agent_id.to_string());
+        let snapshot = decentraai_agent_society::mcp::build_society_state_response(
+            &society,
+            &agent_id.to_string(),
+        );
         Ok(snapshot)
     }
 
@@ -215,7 +252,10 @@ impl IntrospectionService {
         }))
     }
 
-    async fn get_quota_snapshot(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
+    async fn get_quota_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, IntrospectionError> {
         let ledger = self.quota_ledger.lock().unwrap();
         if let Some(account) = ledger.account(&agent_id.to_string()) {
             Ok(serde_json::json!({
@@ -237,7 +277,10 @@ impl IntrospectionService {
 
 #[async_trait]
 impl IntrospectionProvider for IntrospectionService {
-    async fn get_agent_full_state(&self, agent_id: &str) -> Result<AgentFullState, IntrospectionError> {
+    async fn get_agent_full_state(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentFullState, IntrospectionError> {
         let state = self.get_agent_state(agent_id).await?;
         let memory = self.get_personal_memory(agent_id).await?;
         let society = self.get_society_snapshot(agent_id).await?;
@@ -271,8 +314,11 @@ impl IntrospectionProvider for IntrospectionService {
             tasks_completed: state.metrics.tasks_completed,
             tasks_failed: state.metrics.tasks_failed,
             success_rate: if state.metrics.tasks_completed + state.metrics.tasks_failed > 0 {
-                state.metrics.tasks_completed as f32 / (state.metrics.tasks_completed + state.metrics.tasks_failed) as f32
-            } else { 0.0 },
+                state.metrics.tasks_completed as f32
+                    / (state.metrics.tasks_completed + state.metrics.tasks_failed) as f32
+            } else {
+                0.0
+            },
             total_reward: state.metrics.total_reward_earned,
             reputation: state.metrics.reputation_score,
             trust_given: state.metrics.trust_scores_given,
@@ -294,8 +340,14 @@ impl IntrospectionProvider for IntrospectionService {
         })
     }
 
-    async fn list_agents(&self, query: AgentSearchQuery) -> Result<Vec<AgentSummary>, IntrospectionError> {
-        let agents = self.agent_runtime.list_agents().await
+    async fn list_agents(
+        &self,
+        query: AgentSearchQuery,
+    ) -> Result<Vec<AgentSummary>, IntrospectionError> {
+        let agents = self
+            .agent_runtime
+            .list_agents()
+            .await
             .map_err(|e| IntrospectionError::Internal(format!("Failed to list agents: {e}")))?;
 
         let mut results = Vec::new();
@@ -332,7 +384,10 @@ impl IntrospectionProvider for IntrospectionService {
     }
 
     async fn get_network_topology(&self) -> Result<NetworkTopology, IntrospectionError> {
-        let agents = self.agent_runtime.list_agents().await
+        let agents = self
+            .agent_runtime
+            .list_agents()
+            .await
             .map_err(|e| IntrospectionError::Internal(format!("Failed to list agents: {e}")))?;
 
         let mut nodes = Vec::new();
@@ -375,12 +430,20 @@ impl IntrospectionProvider for IntrospectionService {
         })
     }
 
-    async fn get_agent_activity(&self, _agent_id: &str, _since: u64, _limit: usize) -> Result<Vec<AgentActivity>, IntrospectionError> {
+    async fn get_agent_activity(
+        &self,
+        _agent_id: &str,
+        _since: u64,
+        _limit: usize,
+    ) -> Result<Vec<AgentActivity>, IntrospectionError> {
         // Event store not wired yet
         Ok(vec![])
     }
 
-    async fn get_agent_relationships(&self, agent_id: &str) -> Result<Vec<AgentConnection>, IntrospectionError> {
+    async fn get_agent_relationships(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<AgentConnection>, IntrospectionError> {
         let society = self.society.read().await;
         let mut connections = Vec::new();
 
@@ -447,10 +510,19 @@ impl IntrospectionProvider for IntrospectionService {
         Ok(serde_json::json!({}))
     }
 
-    async fn search_memory(&self, agent_id: &str, query: &str, limit: usize) -> Result<serde_json::Value, IntrospectionError> {
-        let cached = self.personal_memory.get_or_create(&agent_id.to_string()).await;
+    async fn search_memory(
+        &self,
+        agent_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, IntrospectionError> {
+        let cached = self
+            .personal_memory
+            .get_or_create(&agent_id.to_string())
+            .await;
         let mem = cached.read().await;
-        let results = decentraai_agent_personal_memory::mcp::search_memory(&mem.memory, query, None, limit);
+        let results =
+            decentraai_agent_personal_memory::mcp::search_memory(&mem.memory, query, None, limit);
         Ok(serde_json::json!({
             "results": results,
             "count": results.len()
@@ -461,15 +533,27 @@ impl IntrospectionProvider for IntrospectionService {
         Ok(vec![])
     }
 
-    async fn get_agent_beliefs(&self, agent_id: &str) -> Result<serde_json::Value, IntrospectionError> {
+    async fn get_agent_beliefs(
+        &self,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, IntrospectionError> {
         let state = self.get_agent_state(agent_id).await?;
         Ok(serde_json::to_value(&state.current_beliefs).unwrap_or_default())
     }
 
     async fn get_agent_lessons(&self, agent_id: &str) -> Result<Vec<String>, IntrospectionError> {
-        let snapshot = self.personal_memory.snapshot(&agent_id.to_string()).await
-            .map_err(|e| IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}")))?;
-        Ok(snapshot.recent_lessons.iter().map(|l| l.title.clone()).collect())
+        let snapshot = self
+            .personal_memory
+            .snapshot(&agent_id.to_string())
+            .await
+            .map_err(|e| {
+                IntrospectionError::Internal(format!("Failed to get memory snapshot: {e}"))
+            })?;
+        Ok(snapshot
+            .recent_lessons
+            .iter()
+            .map(|l| l.title.clone())
+            .collect())
     }
 }
 

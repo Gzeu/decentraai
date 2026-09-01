@@ -1,29 +1,50 @@
 //! Agent Hub — runtime wiring for task market, bids, proposals, teams, settlement.
 //! Reuses dca_ auth, QuotaLedger, Evidence, Reputation; no new scheduler.
 
-use std::sync::Arc;
-use axum::{extract::State, http::HeaderMap, response::{IntoResponse, sse::{Event as SseEvent, Sse}}, Json};
+use crate::api::{ApiState, Auth};
+use axum::{
+    Json,
+    extract::State,
+    http::HeaderMap,
+    response::{
+        IntoResponse,
+        sse::{Event as SseEvent, Sse},
+    },
+};
+use decentraai_agent_hub::{HubState, TaskStatus};
 use futures::stream::Stream;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use decentraai_agent_hub::{HubState, TaskStatus};
-use crate::api::{ApiState, Auth};
 
 pub type SharedHub = Arc<Mutex<HubState>>;
 
-pub fn new_shared_hub() -> SharedHub { Arc::new(Mutex::new(HubState::new())) }
+pub fn new_shared_hub() -> SharedHub {
+    Arc::new(Mutex::new(HubState::new()))
+}
 
-pub fn hub_path_for(repo_root: &Path) -> PathBuf { repo_root.join("db/hub.json") }
+pub fn hub_path_for(repo_root: &Path) -> PathBuf {
+    repo_root.join("db/hub.json")
+}
 
 pub fn load_hub_state(path: &Path) -> HubState {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 pub fn save_hub_state(path: &Path, state: &HubState) {
-    if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
     let tmp = path.with_extension("tmp");
-    if let Ok(s) = serde_json::to_string(state) { if std::fs::write(&tmp, s).is_ok() { let _ = std::fs::rename(&tmp, path); } }
+    if let Ok(s) = serde_json::to_string(state) {
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
 }
 
 // ---------- Shapes ----------
@@ -87,25 +108,55 @@ pub async fn hub_tasks_handler(State(state): State<ApiState>) -> impl IntoRespon
     Json(serde_json::json!({"tasks": hub.tasks.values().collect::<Vec<_>>()}))
 }
 
-pub async fn hub_publish_handler(State(state): State<ApiState>, headers: HeaderMap, Json(req): Json<PublishTaskRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_publish_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<PublishTaskRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let issuer = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
         Auth::Open => "open".to_string(),
         Auth::Subscriber { name, .. } => name.clone(),
     };
-    if req.title.trim().is_empty() || req.reward == 0 { return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"title and reward required"}))).into_response(); }
+    if req.title.trim().is_empty() || req.reward == 0 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"title and reward required"})),
+        )
+            .into_response();
+    }
     let mut hub = state.hub.lock().await;
-    let task = hub.publish_task(issuer, req.title, req.description.unwrap_or_default(), req.reward, req.required_capability);
+    let task = hub.publish_task(
+        issuer,
+        req.title,
+        req.description.unwrap_or_default(),
+        req.reward,
+        req.required_capability,
+    );
     hub.advance_tick();
     let path = hub_path_for(&state.info.repo_root);
     save_hub_state(&path, &hub);
-    (axum::http::StatusCode::OK, Json(serde_json::to_value(&task).unwrap())).into_response()
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::to_value(&task).unwrap()),
+    )
+        .into_response()
 }
 
-pub async fn hub_bid_handler(State(state): State<ApiState>, headers: HeaderMap, Json(req): Json<BidRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_bid_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<BidRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let bidder = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
@@ -113,26 +164,54 @@ pub async fn hub_bid_handler(State(state): State<ApiState>, headers: HeaderMap, 
         Auth::Subscriber { name, .. } => name.clone(),
     };
     let mut hub = state.hub.lock().await;
-    match hub.place_bid(bidder, req.task_id, req.price, req.rationale.unwrap_or_default()) {
+    match hub.place_bid(
+        bidder,
+        req.task_id,
+        req.price,
+        req.rationale.unwrap_or_default(),
+    ) {
         Ok(bid) => {
             hub.advance_tick();
             let path = hub_path_for(&state.info.repo_root);
             save_hub_state(&path, &hub);
-            (axum::http::StatusCode::OK, Json(serde_json::to_value(&bid).unwrap())).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::to_value(&bid).unwrap()),
+            )
+                .into_response()
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-pub async fn hub_bids_handler(State(state): State<ApiState>, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String,String>>) -> impl IntoResponse {
+pub async fn hub_bids_handler(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let task_id = params.get("task_id").cloned();
     let hub = state.hub.lock().await;
-    let bids: Vec<_> = hub.bids.values().filter(|b| task_id.as_ref().is_none_or(|id| &b.task_id == id)).cloned().collect();
+    let bids: Vec<_> = hub
+        .bids
+        .values()
+        .filter(|b| task_id.as_ref().is_none_or(|id| &b.task_id == id))
+        .cloned()
+        .collect();
     Json(serde_json::json!({"bids": bids}))
 }
 
-pub async fn hub_proposal_handler(State(state): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposalRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_proposal_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ProposalRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let from = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
@@ -140,19 +219,41 @@ pub async fn hub_proposal_handler(State(state): State<ApiState>, headers: Header
         Auth::Subscriber { name, .. } => name.clone(),
     };
     let mut hub = state.hub.lock().await;
-    match hub.propose(from, req.to, req.task_id, req.offer_price, req.workshare.unwrap_or(100)) {
+    match hub.propose(
+        from,
+        req.to,
+        req.task_id,
+        req.offer_price,
+        req.workshare.unwrap_or(100),
+    ) {
         Ok(prop) => {
             hub.advance_tick();
             let path = hub_path_for(&state.info.repo_root);
             save_hub_state(&path, &hub);
-            (axum::http::StatusCode::OK, Json(serde_json::to_value(&prop).unwrap())).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::to_value(&prop).unwrap()),
+            )
+                .into_response()
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-pub async fn hub_decide_handler(State(state): State<ApiState>, headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<String>, Json(req): Json<DecideProposalRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_decide_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<DecideProposalRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let actor = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
@@ -165,14 +266,29 @@ pub async fn hub_decide_handler(State(state): State<ApiState>, headers: HeaderMa
             hub.advance_tick();
             let path = hub_path_for(&state.info.repo_root);
             save_hub_state(&path, &hub);
-            (axum::http::StatusCode::OK, Json(serde_json::to_value(&prop).unwrap())).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::to_value(&prop).unwrap()),
+            )
+                .into_response()
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-pub async fn hub_team_handler(State(state): State<ApiState>, headers: HeaderMap, Json(req): Json<TeamRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_team_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<TeamRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let _actor = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
@@ -185,14 +301,29 @@ pub async fn hub_team_handler(State(state): State<ApiState>, headers: HeaderMap,
             hub.advance_tick();
             let path = hub_path_for(&state.info.repo_root);
             save_hub_state(&path, &hub);
-            (axum::http::StatusCode::OK, Json(serde_json::to_value(&team).unwrap())).into_response()
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::to_value(&team).unwrap()),
+            )
+                .into_response()
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderMap, Json(req): Json<ExecuteRequest>) -> impl IntoResponse {
-    let auth = match state.classify(&headers) { Ok(a) => a, Err(e) => return e.into_response() };
+pub async fn hub_execute_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ExecuteRequest>,
+) -> impl IntoResponse {
+    let auth = match state.classify(&headers) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let actor = match &auth {
         Auth::Consumer { account, .. } => account.clone(),
         Auth::Master => "operator".to_string(),
@@ -200,21 +331,41 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
         Auth::Subscriber { name, .. } => name.clone(),
     };
     let mut hub = state.hub.lock().await;
-    let task = match hub.tasks.get(&req.task_id) { Some(t) => t.clone(), None => return (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"task not found"}))).into_response() };
-    if task.status != TaskStatus::Assigned && task.status != TaskStatus::Open && task.status != TaskStatus::Bidding {
+    let task = match hub.tasks.get(&req.task_id) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"task not found"})),
+            )
+                .into_response();
+        }
+    };
+    if task.status != TaskStatus::Assigned
+        && task.status != TaskStatus::Open
+        && task.status != TaskStatus::Bidding
+    {
         return (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("task status {:?} not executable", task.status)}))).into_response();
     }
     hub.mark_executing(&req.task_id);
     // Settlement: distribute reward via QuotaLedger to team members or issuer/best bidder
-    let team_members: Vec<(String, u8)> = hub.teams.values().find(|t| t.task_id == req.task_id).map(|t| t.members.clone()).unwrap_or_else(|| {
-        if let Some(best) = hub.best_bid(&req.task_id) {
-            vec![(best.bidder.clone(), 100)]
-        } else {
-            vec![(task.issuer.clone(), 100)]
-        }
-    });
+    let team_members: Vec<(String, u8)> = hub
+        .teams
+        .values()
+        .find(|t| t.task_id == req.task_id)
+        .map(|t| t.members.clone())
+        .unwrap_or_else(|| {
+            if let Some(best) = hub.best_bid(&req.task_id) {
+                vec![(best.bidder.clone(), 100)]
+            } else {
+                vec![(task.issuer.clone(), 100)]
+            }
+        });
     // Generate evidence
-    let evidence_id = blake3::hash(format!("hub:{}:{}:{}", req.task_id, actor, hub.tick).as_bytes()).to_hex().to_string();
+    let evidence_id =
+        blake3::hash(format!("hub:{}:{}:{}", req.task_id, actor, hub.tick).as_bytes())
+            .to_hex()
+            .to_string();
     // Credit each member
     if let Some(ledger) = &state.quota_ledger {
         let mut lg = ledger.lock().unwrap();
@@ -248,18 +399,32 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
                     agent_id.clone(),
                     *share,
                     tick,
-                ).verify(*share as f32 / 100.0, _ev_for_society.clone(), 0.85, true, tick);
+                )
+                .verify(
+                    *share as f32 / 100.0,
+                    _ev_for_society.clone(),
+                    0.85,
+                    true,
+                    tick,
+                );
                 contrib_records.push(cr.clone());
                 society.record_contribution(cr);
             }
-            let dists = _team_for_society.iter().map(|(aid, share)| {
-                let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
-                decentraai_agent_society::state::RewardDistribution { agent_id: aid.clone(), amount, share_basis: decentraai_agent_society::state::ShareBasis::Verified }
-            }).collect::<Vec<_>>();
+            let dists = _team_for_society
+                .iter()
+                .map(|(aid, share)| {
+                    let amount = (_reward_for_society as u128 * *share as u128 / 100) as u64;
+                    decentraai_agent_society::state::RewardDistribution {
+                        agent_id: aid.clone(),
+                        amount,
+                        share_basis: decentraai_agent_society::state::ShareBasis::Verified,
+                    }
+                })
+                .collect::<Vec<_>>();
             let outcome = decentraai_agent_society::state::TaskOutcome {
                 task_id: _task_for_society.clone(),
                 issuer: _issuer_for_society.clone(),
-                team_members: _team_for_society.iter().map(|(a,_)| a.clone()).collect(),
+                team_members: _team_for_society.iter().map(|(a, _)| a.clone()).collect(),
                 status: decentraai_agent_society::state::TaskOutcomeStatus::Settled,
                 evidence_id: Some(_ev_for_society.clone()),
                 settled_tick: tick,
@@ -276,12 +441,16 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
                     delta: 0.15,
                     tick,
                     evidence_id: Some(_ev_for_society.clone()),
-                    detail: format!("hub execute {} as team {:?}", _task_for_society, _team_for_society),
+                    detail: format!(
+                        "hub execute {} as team {:?}",
+                        _task_for_society, _team_for_society
+                    ),
                 };
                 society.record_reputation_event(ev);
                 let ev2 = decentraai_agent_society::state::ReputationEvent {
                     agent_id: agent_id.clone(),
-                    event_type: decentraai_agent_society::state::ReputationEventType::ContributionVerified,
+                    event_type:
+                        decentraai_agent_society::state::ReputationEventType::ContributionVerified,
                     task_id: Some(_task_for_society.clone()),
                     delta: 0.1,
                     tick,
@@ -296,17 +465,42 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
         }
     }
     if let Some(pm) = &state.personal_memory {
-        let mut all_agents = _team_for_society.iter().map(|(a,_)| a.clone()).collect::<Vec<_>>();
-        if !all_agents.contains(&_issuer_for_society) && !_issuer_for_society.is_empty() && _issuer_for_society != "open" && _issuer_for_society != "operator" {
+        let mut all_agents = _team_for_society
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect::<Vec<_>>();
+        if !all_agents.contains(&_issuer_for_society)
+            && !_issuer_for_society.is_empty()
+            && _issuer_for_society != "open"
+            && _issuer_for_society != "operator"
+        {
             all_agents.push(_issuer_for_society.clone());
         }
         for agent_id in all_agents {
             let exp_id = format!("hub-{}-{}", _task_for_society, agent_id);
             let cached = pm.get_or_create(&agent_id).await;
-            let exists = { cached.read().await.memory.experiences.experiences.iter().any(|e| e.id == exp_id) };
+            let exists = {
+                cached
+                    .read()
+                    .await
+                    .memory
+                    .experiences
+                    .experiences
+                    .iter()
+                    .any(|e| e.id == exp_id)
+            };
             if !exists {
-                let summary = format!("Executed task {} (reward {}) as team {:?} — evidence {}", _task_for_society, _reward_for_society, _team_for_society, &_ev_for_society[..8.min(_ev_for_society.len())]);
-                let detail = format!("Task {} settled with evidence {}. Team: {:?}. Issuer: {}.", _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society);
+                let summary = format!(
+                    "Executed task {} (reward {}) as team {:?} — evidence {}",
+                    _task_for_society,
+                    _reward_for_society,
+                    _team_for_society,
+                    &_ev_for_society[..8.min(_ev_for_society.len())]
+                );
+                let detail = format!(
+                    "Task {} settled with evidence {}. Team: {:?}. Issuer: {}.",
+                    _task_for_society, _ev_for_society, _team_for_society, _issuer_for_society
+                );
                 let entry = serde_json::json!({
                     "id": exp_id,
                     "type_": "success",
@@ -320,17 +514,35 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
                     "emotional_impact": 0.7,
                     "tags": ["hub", "settlement", "team"]
                 });
-                let _ = pm.write_entry(&agent_id, |mem| {
-                    decentraai_agent_personal_memory::mcp::apply_write(mem, "experiences", entry.clone())
-                }).await;
+                let _ = pm
+                    .write_entry(&agent_id, |mem| {
+                        decentraai_agent_personal_memory::mcp::apply_write(
+                            mem,
+                            "experiences",
+                            entry.clone(),
+                        )
+                    })
+                    .await;
             }
         }
     }
     {
         let mut arena = state.arena.lock().await;
-        let ev = decentraai_arena::ArenaEvent { tick: arena.tick, agent_id: format!("hub:{}", actor), action: decentraai_arena::ActionKind::RequestCompute, from: (0,0), to: None, rationale: format!("hub execute {}", req.task_id), evidence_id: Some(evidence_id.clone()), success: true, detail: format!("hub team {} executed", req.task_id) };
+        let ev = decentraai_arena::ArenaEvent {
+            tick: arena.tick,
+            agent_id: format!("hub:{}", actor),
+            action: decentraai_arena::ActionKind::RequestCompute,
+            from: (0, 0),
+            to: None,
+            rationale: format!("hub execute {}", req.task_id),
+            evidence_id: Some(evidence_id.clone()),
+            success: true,
+            detail: format!("hub team {} executed", req.task_id),
+        };
         arena.events.push_back(ev);
-        while arena.events.len() > arena.max_events { arena.events.pop_front(); }
+        while arena.events.len() > arena.max_events {
+            arena.events.pop_front();
+        }
         arena.advance_tick();
         let apath = crate::arena::arena_path_for(&state.info.repo_root);
         crate::arena::save_arena_world(&apath, &arena);
@@ -338,20 +550,36 @@ pub async fn hub_execute_handler(State(state): State<ApiState>, headers: HeaderM
     (axum::http::StatusCode::OK, Json(serde_json::json!({"task_id": req.task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward}))).into_response()
 }
 
-pub async fn hub_events_handler(State(state): State<ApiState>, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String,String>>) -> impl IntoResponse {
-    let since: u64 = params.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let limit: usize = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+pub async fn hub_events_handler(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let since: u64 = params
+        .get("since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let hub = state.hub.lock().await;
     let events = hub.events_since(since, limit.min(200));
     Json(serde_json::json!({"tick": hub.tick, "events": events}))
 }
 
-pub async fn hub_stream_handler(State(state): State<ApiState>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+pub async fn hub_stream_handler(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let hub_clone = state.hub.clone();
     let stream = futures::stream::unfold((hub_clone, 0u64), |(hub, last_seen)| async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let guard = hub.lock().await;
-        let new_events: Vec<_> = guard.events.iter().filter(|e| e.tick >= last_seen).cloned().collect();
+        let new_events: Vec<_> = guard
+            .events
+            .iter()
+            .filter(|e| e.tick >= last_seen)
+            .cloned()
+            .collect();
         if new_events.is_empty() {
             let next = last_seen;
             drop(guard);
@@ -360,10 +588,17 @@ pub async fn hub_stream_handler(State(state): State<ApiState>) -> Sse<impl Strea
             let max_tick = new_events.iter().map(|e| e.tick).max().unwrap_or(last_seen) + 1;
             let data = serde_json::to_string(&new_events).unwrap_or_else(|_| "[]".to_string());
             drop(guard);
-            Some((Ok(SseEvent::default().data(data).event("hub_events")), (hub, max_tick)))
+            Some((
+                Ok(SseEvent::default().data(data).event("hub_events")),
+                (hub, max_tick),
+            ))
         }
     });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("keepalive"))
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 pub fn hub_html() -> String {

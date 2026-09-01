@@ -211,7 +211,10 @@ impl ArenaWorld {
         }
         let cost = action.cost_quota();
         if agent_resources < cost {
-            return Err(ArenaError::InsufficientResources { need: cost, have: agent_resources });
+            return Err(ArenaError::InsufficientResources {
+                need: cost,
+                have: agent_resources,
+            });
         }
         let from = (from_x, from_y);
         let mut to = None;
@@ -222,7 +225,9 @@ impl ArenaWorld {
             let mut best = 999;
             let mut nearest = None;
             for (oid, other) in self.agents.iter() {
-                if oid == agent_id { continue; }
+                if oid == agent_id {
+                    continue;
+                }
                 let d = (other.x - from_x).abs() + (other.y - from_y).abs();
                 if d < best && d <= 3 {
                     best = d;
@@ -230,23 +235,31 @@ impl ArenaWorld {
                 }
             }
             nearest
-        } else { None };
-        let nearest_ally: Option<String> = if matches!(action, ActionKind::Negotiate | ActionKind::Cooperate) {
-            let mut best = 999;
-            let mut nearest = None;
-            for (oid, other) in self.agents.iter() {
-                if oid == agent_id { continue; }
-                let d = (other.x - from_x).abs() + (other.y - from_y).abs();
-                if d < best && d <= 5 {
-                    best = d;
-                    nearest = Some(oid.clone());
+        } else {
+            None
+        };
+        let nearest_ally: Option<String> =
+            if matches!(action, ActionKind::Negotiate | ActionKind::Cooperate) {
+                let mut best = 999;
+                let mut nearest = None;
+                for (oid, other) in self.agents.iter() {
+                    if oid == agent_id {
+                        continue;
+                    }
+                    let d = (other.x - from_x).abs() + (other.y - from_y).abs();
+                    if d < best && d <= 5 {
+                        best = d;
+                        nearest = Some(oid.clone());
+                    }
                 }
-            }
-            nearest
-        } else { None };
+                nearest
+            } else {
+                None
+            };
         match action {
             ActionKind::Move => {
-                let (tx, ty) = target.ok_or_else(|| ArenaError::ActionNotAllowed("move requires target".into()))?;
+                let (tx, ty) = target
+                    .ok_or_else(|| ArenaError::ActionNotAllowed("move requires target".into()))?;
                 if tx < 0 || tx >= self.width || ty < 0 || ty >= self.height {
                     return Err(ArenaError::OutOfBounds);
                 }
@@ -262,7 +275,11 @@ impl ArenaWorld {
                 to = Some((tx, ty));
                 detail = format!("moved to {},{}", tx, ty);
             }
-            ActionKind::Observe | ActionKind::Scout | ActionKind::Rest | ActionKind::Compete | ActionKind::Defend => {
+            ActionKind::Observe
+            | ActionKind::Scout
+            | ActionKind::Rest
+            | ActionKind::Compete
+            | ActionKind::Defend => {
                 detail = format!("{:?} at {},{}", action, from_x, from_y);
             }
             ActionKind::RequestCompute => {
@@ -292,7 +309,14 @@ impl ArenaWorld {
                     agent.resources = agent.resources.saturating_sub(cost);
                     agent.reputation += 1;
                 }
-                self.buildings.insert(key.clone(), Building { owner: agent_id.to_string(), built_tick: self.tick, kind: "outpost".to_string() });
+                self.buildings.insert(
+                    key.clone(),
+                    Building {
+                        owner: agent_id.to_string(),
+                        built_tick: self.tick,
+                        kind: "outpost".to_string(),
+                    },
+                );
                 detail = format!("built outpost at {} (total {})", key, self.buildings.len());
             }
             ActionKind::Trade => {
@@ -322,9 +346,16 @@ impl ArenaWorld {
             ActionKind::Negotiate | ActionKind::Cooperate => {
                 if let Some(partner) = nearest_ally.clone() {
                     let mut pair = (agent_id.to_string(), partner.clone());
-                    if pair.0 > pair.1 { pair = (pair.1, pair.0); }
+                    if pair.0 > pair.1 {
+                        pair = (pair.1, pair.0);
+                    }
                     self.alliances.insert(pair.clone());
-                    detail = format!("{:?} with {} (alliances {})", action, partner, self.alliances.len());
+                    detail = format!(
+                        "{:?} with {} (alliances {})",
+                        action,
+                        partner,
+                        self.alliances.len()
+                    );
                 } else {
                     detail = format!("{:?} alone at {},{}", action, from_x, from_y);
                 }
@@ -376,20 +407,44 @@ mod tests {
 
     fn world_with_two() -> ArenaWorld {
         let mut w = ArenaWorld::new(10, 10);
-        w.join(ArenaAgent::new("a1".into(), "acc1".into(), "Alpha".into(), 5, 5)).unwrap();
-        w.join(ArenaAgent::new("a2".into(), "acc2".into(), "Beta".into(), 2, 2)).unwrap();
+        w.join(ArenaAgent::new(
+            "a1".into(),
+            "acc1".into(),
+            "Alpha".into(),
+            5,
+            5,
+        ))
+        .unwrap();
+        w.join(ArenaAgent::new(
+            "a2".into(),
+            "acc2".into(),
+            "Beta".into(),
+            2,
+            2,
+        ))
+        .unwrap();
         w
     }
 
     #[test]
     fn join_and_move_deterministic() {
         let mut w = world_with_two();
-        let ev = w.apply("a1", ActionKind::Move, Some((6, 5)), "explore east".into(), None).unwrap();
+        let ev = w
+            .apply(
+                "a1",
+                ActionKind::Move,
+                Some((6, 5)),
+                "explore east".into(),
+                None,
+            )
+            .unwrap();
         assert_eq!(ev.from, (5, 5));
         assert_eq!(ev.to, Some((6, 5)));
         assert_eq!(w.agent("a1").unwrap().x, 6);
         w.advance_tick();
-        let ev2 = w.apply("a1", ActionKind::Move, Some((6, 6)), "north".into(), None).unwrap();
+        let ev2 = w
+            .apply("a1", ActionKind::Move, Some((6, 6)), "north".into(), None)
+            .unwrap();
         assert_eq!(ev2.tick, 1);
     }
 
@@ -397,7 +452,14 @@ mod tests {
     fn request_compute_rewards_on_evidence() {
         let mut w = world_with_two();
         let r_before = w.agent("a1").unwrap().resources;
-        w.apply("a1", ActionKind::RequestCompute, None, "need inference".into(), Some("ev123".into())).unwrap();
+        w.apply(
+            "a1",
+            ActionKind::RequestCompute,
+            None,
+            "need inference".into(),
+            Some("ev123".into()),
+        )
+        .unwrap();
         assert!(w.agent("a1").unwrap().resources > r_before.saturating_sub(5));
         assert_eq!(w.agent("a1").unwrap().reputation, 1);
     }
@@ -405,25 +467,37 @@ mod tests {
     #[test]
     fn cooldown_enforced() {
         let mut w = world_with_two();
-        w.apply("a1", ActionKind::Move, Some((6, 5)), "m".into(), None).unwrap();
-        let err = w.apply("a1", ActionKind::Move, Some((6, 6)), "m".into(), None).unwrap_err();
+        w.apply("a1", ActionKind::Move, Some((6, 5)), "m".into(), None)
+            .unwrap();
+        let err = w
+            .apply("a1", ActionKind::Move, Some((6, 6)), "m".into(), None)
+            .unwrap_err();
         assert_eq!(err, ArenaError::Cooldown(1));
         w.advance_tick();
-        w.apply("a1", ActionKind::Move, Some((6, 6)), "m".into(), None).unwrap();
+        w.apply("a1", ActionKind::Move, Some((6, 6)), "m".into(), None)
+            .unwrap();
     }
 
     #[test]
     fn insufficient_resources() {
         let mut w = ArenaWorld::new(5, 5);
-        w.join(ArenaAgent { resources: 0, ..ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 0, 0) }).unwrap();
-        let err = w.apply("a1", ActionKind::Build, None, "build".into(), None).unwrap_err();
+        w.join(ArenaAgent {
+            resources: 0,
+            ..ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 0, 0)
+        })
+        .unwrap();
+        let err = w
+            .apply("a1", ActionKind::Build, None, "build".into(), None)
+            .unwrap_err();
         assert!(matches!(err, ArenaError::InsufficientResources { .. }));
     }
 
     #[test]
     fn out_of_bounds_rejected() {
         let mut w = world_with_two();
-        let err = w.apply("a1", ActionKind::Move, Some((99, 99)), "oob".into(), None).unwrap_err();
+        let err = w
+            .apply("a1", ActionKind::Move, Some((99, 99)), "oob".into(), None)
+            .unwrap_err();
         assert_eq!(err, ArenaError::OutOfBounds);
     }
 
@@ -431,9 +505,11 @@ mod tests {
     fn events_capped_and_replay() {
         let mut w = ArenaWorld::new(10, 10);
         w.max_events = 3;
-        w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5)).unwrap();
+        w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5))
+            .unwrap();
         for _ in 0..5 {
-            w.apply("a1", ActionKind::Observe, None, "see".into(), None).unwrap();
+            w.apply("a1", ActionKind::Observe, None, "see".into(), None)
+                .unwrap();
             w.advance_tick();
         }
         assert_eq!(w.events.len(), 3);

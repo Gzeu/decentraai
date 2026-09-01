@@ -1,10 +1,10 @@
 //! Social state: relationships, contributions, task outcomes
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
+use super::{AgentId, TaskId, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::{AgentId, TaskId, Tick};
 
 /// Kind of social relationship between two agents
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ impl RelationshipKind {
             RelationshipKind::WorkedWith => 0.2,
         }
     }
-    
+
     /// Whether this is a positive signal
     pub fn is_positive(&self) -> bool {
         self.weight() > 0.0
@@ -80,17 +80,17 @@ impl SocialRelationship {
             strength: kind.weight().abs().min(1.0),
         }
     }
-    
+
     pub fn with_task(mut self, task_id: TaskId) -> Self {
         self.task_id = Some(task_id);
         self
     }
-    
+
     pub fn with_detail(mut self, detail: String) -> Self {
         self.detail = Some(detail);
         self
     }
-    
+
     pub fn with_strength(mut self, strength: f32) -> Self {
         self.strength = strength.clamp(-1.0, 1.0);
         self
@@ -134,8 +134,15 @@ impl ContributionRecord {
             met_sla: None,
         }
     }
-    
-    pub fn verify(mut self, contribution: f32, evidence_id: String, quality: f32, met_sla: bool, tick: Tick) -> Self {
+
+    pub fn verify(
+        mut self,
+        contribution: f32,
+        evidence_id: String,
+        quality: f32,
+        met_sla: bool,
+        tick: Tick,
+    ) -> Self {
         self.verified_contribution = Some(contribution.clamp(0.0, 1.0));
         self.evidence_id = Some(evidence_id);
         self.quality = Some(quality.clamp(0.0, 1.0));
@@ -143,10 +150,11 @@ impl ContributionRecord {
         self.verified_tick = Some(tick);
         self
     }
-    
+
     /// Effective share for reward distribution
     pub fn effective_share(&self) -> f32 {
-        self.verified_contribution.unwrap_or(self.planned_share as f32 / 100.0)
+        self.verified_contribution
+            .unwrap_or(self.planned_share as f32 / 100.0)
     }
 }
 
@@ -209,16 +217,20 @@ impl SocietyState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     pub fn with_tick(tick: Tick) -> Self {
-        Self { tick, ..Default::default() }
+        Self {
+            tick,
+            ..Default::default()
+        }
     }
-    
+
     /// Record a social relationship
     pub fn record_relationship(&mut self, rel: SocialRelationship) {
         let observer = rel.observer.clone();
         let subject = rel.subject.clone();
-        let entry = self.relationships
+        let entry = self
+            .relationships
             .entry(observer)
             .or_default()
             .entry(subject)
@@ -230,16 +242,20 @@ impl SocietyState {
             entry.drain(0..excess);
         }
     }
-    
+
     /// Get relationships from observer to subject
-    pub fn get_relationships(&self, observer: &AgentId, subject: &AgentId) -> Vec<&SocialRelationship> {
+    pub fn get_relationships(
+        &self,
+        observer: &AgentId,
+        subject: &AgentId,
+    ) -> Vec<&SocialRelationship> {
         self.relationships
             .get(observer)
             .and_then(|m| m.get(subject))
             .map(|v| v.iter().collect())
             .unwrap_or_default()
     }
-    
+
     /// Get all relationships where observer is involved
     pub fn get_all_for_agent(&self, agent: &AgentId) -> Vec<&SocialRelationship> {
         self.relationships
@@ -247,7 +263,7 @@ impl SocietyState {
             .map(|m| m.values().flatten().collect())
             .unwrap_or_default()
     }
-    
+
     /// Get relationships where agent is subject
     pub fn get_about_agent(&self, agent: &AgentId) -> Vec<&SocialRelationship> {
         self.relationships
@@ -256,22 +272,20 @@ impl SocietyState {
             .flatten()
             .collect()
     }
-    
+
     /// Compute trust score from observer to subject based on relationship history
     pub fn trust_score(&self, observer: &AgentId, subject: &AgentId) -> f32 {
         let rels = self.get_relationships(observer, subject);
         if rels.is_empty() {
             return 0.0; // Unknown = neutral
         }
-        
-        let total: f32 = rels.iter()
-            .map(|r| r.kind.weight() * r.strength)
-            .sum();
+
+        let total: f32 = rels.iter().map(|r| r.kind.weight() * r.strength).sum();
         let count = rels.len() as f32;
-        
+
         (total / count).clamp(-1.0, 1.0)
     }
-    
+
     /// Record a contribution
     pub fn record_contribution(&mut self, contrib: ContributionRecord) {
         self.contributions
@@ -279,12 +293,12 @@ impl SocietyState {
             .or_default()
             .push(contrib);
     }
-    
+
     /// Record task outcome
     pub fn record_outcome(&mut self, outcome: TaskOutcome) {
         self.outcomes.insert(outcome.task_id.clone(), outcome);
     }
-    
+
     /// Record reputation event
     pub fn record_reputation_event(&mut self, event: ReputationEvent) {
         self.reputation
@@ -292,32 +306,36 @@ impl SocietyState {
             .or_default()
             .push(event);
     }
-    
+
     /// Get recent outcomes for an agent
     pub fn recent_outcomes(&self, agent: &AgentId, limit: usize) -> Vec<&TaskOutcome> {
-        let mut outcomes: Vec<_> = self.outcomes
+        let mut outcomes: Vec<_> = self
+            .outcomes
             .values()
             .filter(|o| o.team_members.contains(agent) || o.issuer == *agent)
             .collect();
-        
+
         // Sort by tick descending
         outcomes.sort_by_key(|b| std::cmp::Reverse(b.settled_tick));
         outcomes.into_iter().take(limit).collect()
     }
-    
+
     /// Get contribution for agent on task
-    pub fn get_contribution(&self, task_id: &TaskId, agent: &AgentId) -> Option<&ContributionRecord> {
+    pub fn get_contribution(
+        &self,
+        task_id: &TaskId,
+        agent: &AgentId,
+    ) -> Option<&ContributionRecord> {
         self.contributions
             .get(task_id)
             .and_then(|v| v.iter().find(|c| c.agent_id == *agent))
     }
-    
+
     /// Advance tick
     pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
 }
-
 
 /// Get the path for the society state file
 pub fn society_path_for(repo_root: &Path) -> PathBuf {
