@@ -148,8 +148,8 @@ pub fn wallet_auth_path_for(repo_root: &Path) -> PathBuf {
 }
 
 pub fn validate_wallet_address(address: &str) -> Result<[u8; 32], WalletAuthError> {
-    let (hrp, data, variant) = decode(address)
-        .map_err(|_| WalletAuthError::InvalidAddress(address.to_string()))?;
+    let (hrp, data, variant) =
+        decode(address).map_err(|_| WalletAuthError::InvalidAddress(address.to_string()))?;
     if hrp.as_str() != "erd" || variant != Variant::Bech32 {
         return Err(WalletAuthError::InvalidAddress(address.to_string()));
     }
@@ -238,7 +238,8 @@ impl WalletAuthStore {
     }
 
     fn cleanup(&mut self, now: u64) {
-        self.challenges.retain(|_, c| c.expires_at > now && c.used_at.is_none());
+        self.challenges
+            .retain(|_, c| c.expires_at > now && c.used_at.is_none());
         self.sessions.retain(|_, s| s.expires_at > now);
     }
 
@@ -338,8 +339,10 @@ impl WalletAuthStore {
                 .get(&canonical_address)
                 .and_then(|b| b.display_name.clone())
         });
-        let binding = self.bindings.entry(canonical_address.clone()).or_insert_with(|| {
-            WalletIdentityBinding {
+        let binding = self
+            .bindings
+            .entry(canonical_address.clone())
+            .or_insert_with(|| WalletIdentityBinding {
                 wallet_address: canonical_address.clone(),
                 agent_id: agent_id.clone(),
                 display_name: display_name.clone(),
@@ -347,8 +350,7 @@ impl WalletAuthStore {
                 bound_at: now,
                 verified_at: now,
                 last_seen_at: now,
-            }
-        });
+            });
         binding.agent_id = agent_id.clone();
         binding.display_name = display_name.clone();
         binding.verified_at = now;
@@ -382,7 +384,10 @@ impl WalletAuthStore {
 
     pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {
         self.cleanup(now);
-        self.sessions.get(token).cloned().filter(|s| s.expires_at > now)
+        self.sessions
+            .get(token)
+            .cloned()
+            .filter(|s| s.expires_at > now)
     }
 
     pub fn binding_for_wallet(&self, wallet_address: &str) -> Option<&WalletIdentityBinding> {
@@ -410,23 +415,27 @@ pub fn update_identity_memory_frontmatter(
         memory.persona = "wallet-backed operator".to_string();
     }
     if memory.values.is_empty() {
-        memory.values = vec!["security".to_string(), "reliability".to_string(), "continuity".to_string()];
+        memory.values = vec![
+            "security".to_string(),
+            "reliability".to_string(),
+            "continuity".to_string(),
+        ];
     }
     if memory.communication_style.trim().is_empty() {
         memory.communication_style = "direct, technical, concise".to_string();
     }
-    memory
-        .frontmatter
-        .extra
-        .insert("wallet_address".to_string(), serde_json::json!(wallet_address));
-    memory
-        .frontmatter
-        .extra
-        .insert("wallet_network".to_string(), serde_json::json!(network_name()));
-    memory
-        .frontmatter
-        .extra
-        .insert("wallet_verified_at".to_string(), serde_json::json!(verified_at));
+    memory.frontmatter.extra.insert(
+        "wallet_address".to_string(),
+        serde_json::json!(wallet_address),
+    );
+    memory.frontmatter.extra.insert(
+        "wallet_network".to_string(),
+        serde_json::json!(network_name()),
+    );
+    memory.frontmatter.extra.insert(
+        "wallet_verified_at".to_string(),
+        serde_json::json!(verified_at),
+    );
 }
 
 #[cfg(test)]
@@ -479,17 +488,20 @@ mod tests {
             .unwrap();
         assert_eq!(login.wallet_address, address);
         assert_eq!(login.agent_id, "agent-wallet");
-        assert!(store.verify_and_login(
-            WalletVerifyRequest {
-                wallet_address: login.wallet_address.clone(),
-                challenge_id: challenge.challenge_id.clone(),
-                signature: hex::encode(sig.to_bytes()),
-                agent_id: Some("agent-wallet".into()),
-                display_name: Some("Wallet Agent".into()),
-            },
-            106,
-        )
-        .is_err());
+        assert!(
+            store
+                .verify_and_login(
+                    WalletVerifyRequest {
+                        wallet_address: login.wallet_address.clone(),
+                        challenge_id: challenge.challenge_id.clone(),
+                        signature: hex::encode(sig.to_bytes()),
+                        agent_id: Some("agent-wallet".into()),
+                        display_name: Some("Wallet Agent".into()),
+                    },
+                    106,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -525,8 +537,15 @@ mod tests {
             .unwrap();
         store.save(&path).unwrap();
         let mut loaded = WalletAuthStore::load(&path).unwrap();
-        assert!(loaded.session_for_token(&login.session_token, 210).is_some());
-        assert_eq!(loaded.binding_for_wallet(&address).unwrap().agent_id, address);
+        assert!(
+            loaded
+                .session_for_token(&login.session_token, 210)
+                .is_some()
+        );
+        assert_eq!(
+            loaded.binding_for_wallet(&address).unwrap().agent_id,
+            address
+        );
     }
 
     #[test]
@@ -638,9 +657,11 @@ mod tests {
         assert!(login_a.session_expires_at > 1005);
 
         // Session is live
-        assert!(store
-            .session_for_token(&login_a.session_token, 1010)
-            .is_some());
+        assert!(
+            store
+                .session_for_token(&login_a.session_token, 1010)
+                .is_some()
+        );
 
         // Binding persisted in store
         let binding = store.binding_for_wallet(&address_a).unwrap();
@@ -694,8 +715,16 @@ mod tests {
         assert!(login_a2.session_token.starts_with("wx_"));
         assert_ne!(login_a2.session_token, login_a.session_token);
         // Both sessions are valid concurrently
-        assert!(reloaded.session_for_token(&login_a.session_token, 2010).is_some());
-        assert!(reloaded.session_for_token(&login_a2.session_token, 2010).is_some());
+        assert!(
+            reloaded
+                .session_for_token(&login_a.session_token, 2010)
+                .is_some()
+        );
+        assert!(
+            reloaded
+                .session_for_token(&login_a2.session_token, 2010)
+                .is_some()
+        );
 
         // --- Step 4: different identity tries to claim same wallet → conflict ---
         let identity_b = Identity::generate();
@@ -713,18 +742,20 @@ mod tests {
         // Sign with identity_b but claim wallet address_a
         let sig_a3_wrong = identity_b.sign(challenge_a3.message.as_bytes());
         // This should fail: signature doesn't match wallet's public key
-        assert!(reloaded
-            .verify_and_login(
-                WalletVerifyRequest {
-                    wallet_address: address_a.clone(),
-                    challenge_id: challenge_a3.challenge_id.clone(),
-                    signature: hex::encode(sig_a3_wrong.to_bytes()),
-                    agent_id: Some("agent-beta".into()),
-                    display_name: None,
-                },
-                3005,
-            )
-            .is_err());
+        assert!(
+            reloaded
+                .verify_and_login(
+                    WalletVerifyRequest {
+                        wallet_address: address_a.clone(),
+                        challenge_id: challenge_a3.challenge_id.clone(),
+                        signature: hex::encode(sig_a3_wrong.to_bytes()),
+                        agent_id: Some("agent-beta".into()),
+                        display_name: None,
+                    },
+                    3005,
+                )
+                .is_err()
+        );
 
         // --- Step 5: same wallet + wrong agent_id → BindingConflict ---
         // Re-challenge with correct wallet address but wrong agent_id
@@ -783,9 +814,11 @@ mod tests {
 
         // Both bindings coexist
         assert!(reloaded.binding_for_wallet(&address_a).is_some());
-        assert!(reloaded
-            .binding_for_wallet(&address_from_identity(&identity_b))
-            .is_some());
+        assert!(
+            reloaded
+                .binding_for_wallet(&address_from_identity(&identity_b))
+                .is_some()
+        );
 
         // --- Step 7: session expires ---
         let expired = reloaded.session_for_token(&login_a.session_token, 99999);

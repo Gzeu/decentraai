@@ -324,12 +324,12 @@ pub fn authorize(actor: &Actor, resource: Resource, operation: Operation) -> Aut
         // Wallet: verified public identity, but no administrative authority.
         Actor::Wallet { .. } => match operation {
             Operation::Read => match resource {
-                Resource::Credentials | Resource::Admin => AuthzResult::Denied(
-                    DenyReason::WrongActorType {
+                Resource::Credentials | Resource::Admin => {
+                    AuthzResult::Denied(DenyReason::WrongActorType {
                         actor: "wallet".into(),
                         resource,
-                    },
-                ),
+                    })
+                }
                 _ => AuthzResult::Allowed,
             },
             _ => AuthzResult::Denied(DenyReason::WrongActorType {

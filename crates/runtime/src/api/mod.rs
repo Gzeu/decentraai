@@ -1932,7 +1932,12 @@ async fn wallet_session_handler(State(state): State<ApiState>, headers: HeaderMa
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
-    let Auth::Wallet { wallet_address, agent_id, session_id } = auth else {
+    let Auth::Wallet {
+        wallet_address,
+        agent_id,
+        session_id,
+    } = auth
+    else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "wallet session required"})),
@@ -1943,7 +1948,11 @@ async fn wallet_session_handler(State(state): State<ApiState>, headers: HeaderMa
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let session = state.wallet_auth.lock().unwrap().session_for_token(&session_id, now);
+    let session = state
+        .wallet_auth
+        .lock()
+        .unwrap()
+        .session_for_token(&session_id, now);
     match session {
         Some(session) => (
             StatusCode::OK,
@@ -2103,13 +2112,11 @@ async fn world_join_handler(
             wallet_address,
             agent_id,
             session_id,
-        } => {
-            (
-                session_id.clone(),
-                wallet_address.clone(),
-                vec!["wallet".to_string(), "world".to_string(), agent_id.clone()],
-            )
-        }
+        } => (
+            session_id.clone(),
+            wallet_address.clone(),
+            vec!["wallet".to_string(), "world".to_string(), agent_id.clone()],
+        ),
         _ => {
             return (
                 StatusCode::FORBIDDEN,
@@ -3107,7 +3114,9 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
     };
     let raw = String::from_utf8_lossy(&body);
     if matches!(auth, Auth::Wallet { .. }) && mcp_wallet_mutation_request(&raw) {
-        return forbidden("wallet sessions are read-only in MCP; use dca_ for execution or mutations");
+        return forbidden(
+            "wallet sessions are read-only in MCP; use dca_ for execution or mutations",
+        );
     }
     // A consumer `dca_` key: allowed only the consumption path (decide +
     // execute_decision), never the operational/read views (workers, network,
@@ -20629,9 +20638,11 @@ mod tests {
             assert!(tools.iter().any(|t| t["name"] == "discover_capabilities"));
             assert!(tools.iter().any(|t| t["name"] == "hub_publish_task"));
             assert!(tools.iter().any(|t| t["name"] == "agent_memory_write"));
-            assert!(tools
-                .iter()
-                .all(|t| t["annotations"]["readOnlyHint"].is_boolean()));
+            assert!(
+                tools
+                    .iter()
+                    .all(|t| t["annotations"]["readOnlyHint"].is_boolean())
+            );
 
             let discover = post_json(
                 client,
@@ -20696,10 +20707,17 @@ mod tests {
             .await
             .unwrap();
         assert!(world["mission"]["task"].is_object());
-        assert_eq!(world["mission"]["task"]["title"], "External onboarding mission");
+        assert_eq!(
+            world["mission"]["task"]["title"],
+            "External onboarding mission"
+        );
 
         let agents = world["agents"].as_array().unwrap();
-        assert!(agents.iter().any(|a| a["account"] == "agent:openclaw-agent"));
+        assert!(
+            agents
+                .iter()
+                .any(|a| a["account"] == "agent:openclaw-agent")
+        );
         assert!(agents.iter().any(|a| a["account"] == "agent:claude-agent"));
         assert!(agents.iter().any(|a| a["account"] == "agent:chatgpt-agent"));
 

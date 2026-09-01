@@ -356,8 +356,10 @@ impl GoalStore for SqliteGoalStore {
         conn.query_row(
             "SELECT COUNT(*) FROM agent_goals WHERE agent_id = ?1 AND state = ?2",
             params![agent_id, state_str],
-            |row| row.get::<_, usize>(0),
+            |row| row.get::<_, i64>(0),
         )
+        .unwrap_or(0)
+        .try_into()
         .unwrap_or(0)
     }
 }

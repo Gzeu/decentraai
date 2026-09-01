@@ -1364,7 +1364,9 @@ async fn spawn_tool_runtimes(
                         );
                         tx = Some(TransformersManager::new(Some(server)));
                     }
-                    Err(e) => warn!(error = %e, "Transformers embeddings unavailable (run scripts/setup-transformers.sh)"),
+                    Err(e) => {
+                        warn!(error = %e, "Transformers embeddings unavailable (run scripts/setup-transformers.sh)")
+                    }
                 }
             }
         }
@@ -1669,7 +1671,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if engine == EngineKind::Transformers {
             if let Some(tx_cfg) = &config.transformers {
                 if tx_cfg.enabled {
-                    match TransformersServer::spawn(&data_dir, &tx_cfg.model, &tx_cfg.device).await {
+                    match TransformersServer::spawn(&data_dir, &tx_cfg.model, &tx_cfg.device).await
+                    {
                         Ok(server) => {
                             let base = server.base_url();
                             let tx_model = tx_cfg.model.clone();
@@ -1692,11 +1695,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                                 backend_url_resolver: None,
                             }) {
                                 if model_hash.is_empty() {
-                                    model_hash = blake3::hash(
-                                        format!("transformers:{tx_model}").as_bytes(),
-                                    )
-                                    .to_hex()
-                                    .to_string();
+                                    model_hash =
+                                        blake3::hash(format!("transformers:{tx_model}").as_bytes())
+                                            .to_hex()
+                                            .to_string();
                                 }
                                 if model_size_bytes == 0 {
                                     model_size_bytes = 1024;
@@ -1982,9 +1984,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         if embedding_client.is_none() {
             if let Some(tx) = &transformers_manager {
                 if let Some(url) = tx.base_url() {
-                    let client = Arc::new(
-                        decentraai_distributed::embedding::EmbeddingClient::new(url.clone()),
-                    );
+                    let client = Arc::new(decentraai_distributed::embedding::EmbeddingClient::new(
+                        url.clone(),
+                    ));
                     let rm = Arc::new(
                         decentraai_distributed::retrieval_manager::RetrievalManager::new(
                             client.clone(),

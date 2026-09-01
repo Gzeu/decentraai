@@ -39,7 +39,7 @@ async fn executor_runs_a_real_tool_call_round_trip() {
         .mock_async(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
-                .body_contains("How do people feel about this");
+                .body_includes("How do people feel about this");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(
@@ -51,7 +51,7 @@ async fn executor_runs_a_real_tool_call_round_trip() {
         .mock_async(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/chat/completions")
-                .body_contains("[TOOL_RESULT");
+                .body_includes("[TOOL_RESULT");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(
@@ -104,9 +104,9 @@ async fn executor_runs_a_real_tool_call_round_trip() {
     assert_eq!(calls.len(), 1, "one tool call must have been executed");
     assert_eq!(calls[0]["tool"], "sentiment");
     assert_eq!(calls[0]["arguments"]["text"], "wow");
-    assert_eq!(tool_handle.hits(), 1, "tool server hit exactly once");
+    assert_eq!(tool_handle.calls(), 1, "tool server hit exactly once");
     assert_eq!(
-        first_round.hits() + final_round.hits(),
+        first_round.calls() + final_round.calls(),
         2,
         "backend hit twice: tool-call round + final round"
     );

@@ -404,11 +404,7 @@ pub struct TransformersServer {
 impl TransformersServer {
     /// Spawns the Python inference server and waits for `/health`.
     /// The model loads lazily on first request, so startup stays fast.
-    pub async fn spawn(
-        data_dir: &Path,
-        model: &str,
-        device: &str,
-    ) -> Result<Self> {
+    pub async fn spawn(data_dir: &Path, model: &str, device: &str) -> Result<Self> {
         let dir = data_dir.join("tools").join("transformers");
         let venv_python = dir.join("venv").join("bin").join("python");
         let args = vec![

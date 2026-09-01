@@ -65,7 +65,10 @@ impl IdentityMemory {
         if let serde_json::Value::Object(map) = &mut fm {
             map.insert("agent_id".to_string(), serde_json::json!(self.agent_id));
             map.insert("name".to_string(), serde_json::json!(self.name));
-            map.insert("description".to_string(), serde_json::json!(self.description));
+            map.insert(
+                "description".to_string(),
+                serde_json::json!(self.description),
+            );
             map.insert("persona".to_string(), serde_json::json!(self.persona));
             map.insert("values".to_string(), serde_json::json!(self.values));
             map.insert(

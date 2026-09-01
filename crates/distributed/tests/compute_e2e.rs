@@ -855,7 +855,7 @@ async fn worker_rejects_request_exceeding_advertised_capacity() {
         other => panic!("expected InferFailed, got {other:?}"),
     }
     assert_eq!(
-        big_mock.hits(),
+        big_mock.calls(),
         0,
         "the rejected request must never reach the backend"
     );

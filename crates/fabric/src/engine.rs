@@ -357,9 +357,7 @@ mod tests {
         assert_eq!(EngineKind::parse("huggingface"), EngineKind::Transformers);
         assert_eq!(EngineKind::Transformers.as_str(), "transformers");
         assert!(
-            EngineKind::Transformers
-                .advertised_capabilities()
-                .streaming,
+            EngineKind::Transformers.advertised_capabilities().streaming,
             "Transformers backend supports streaming"
         );
         assert!(

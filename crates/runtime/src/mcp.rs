@@ -130,16 +130,36 @@ pub struct ToolAnnotations {
 
 impl ToolAnnotations {
     pub const fn read_only() -> Self {
-        Self { read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false }
+        Self {
+            read_only_hint: true,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+        }
     }
     pub const fn additive() -> Self {
-        Self { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false }
+        Self {
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
+            open_world_hint: false,
+        }
     }
     pub const fn destructive() -> Self {
-        Self { read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false }
+        Self {
+            read_only_hint: false,
+            destructive_hint: true,
+            idempotent_hint: false,
+            open_world_hint: false,
+        }
     }
     pub const fn open_world() -> Self {
-        Self { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: true }
+        Self {
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
+            open_world_hint: true,
+        }
     }
     pub fn to_json(&self) -> Value {
         json!({
@@ -2756,17 +2776,37 @@ mod tests {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let read_only_names = [
-            "get_status", "list_workers", "list_models", "list_executions",
-            "get_quota", "get_compensation", "list_peers",
-            "search_models_by_capability", "find_local_models_by_capability",
-            "get_worker_capability", "resolve_intent", "resolve_intent_with_fit",
-            "get_fabric_graph", "decide", "list_sessions", "list_consumer_keys",
-            "arena_state", "hub_state", "hub_events",
-            "society_state", "society_trust", "society_reputation",
-            "society_relationships", "society_contributions", "society_outcomes",
+            "get_status",
+            "list_workers",
+            "list_models",
+            "list_executions",
+            "get_quota",
+            "get_compensation",
+            "list_peers",
+            "search_models_by_capability",
+            "find_local_models_by_capability",
+            "get_worker_capability",
+            "resolve_intent",
+            "resolve_intent_with_fit",
+            "get_fabric_graph",
+            "decide",
+            "list_sessions",
+            "list_consumer_keys",
+            "arena_state",
+            "hub_state",
+            "hub_events",
+            "society_state",
+            "society_trust",
+            "society_reputation",
+            "society_relationships",
+            "society_contributions",
+            "society_outcomes",
             "society_decision_hints",
-            "agent_memory_read", "agent_memory_search", "agent_memory_snapshot",
-            "agent_memory_export", "discover_capabilities",
+            "agent_memory_read",
+            "agent_memory_search",
+            "agent_memory_snapshot",
+            "agent_memory_export",
+            "discover_capabilities",
         ];
         for name in &read_only_names {
             let tool = tools.iter().find(|t| t["name"].as_str() == Some(name));
@@ -2795,12 +2835,20 @@ mod tests {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let mutating_names = [
-            "execute_decision", "serve_model", "pull_model",
-            "arena_act", "hub_publish_task", "hub_place_bid",
-            "hub_propose", "hub_decide_proposal", "hub_form_team",
+            "execute_decision",
+            "serve_model",
+            "pull_model",
+            "arena_act",
+            "hub_publish_task",
+            "hub_place_bid",
+            "hub_propose",
+            "hub_decide_proposal",
+            "hub_form_team",
             "hub_execute",
-            "society_record_relationship", "society_record_contribution",
-            "society_record_outcome", "society_record_reputation_event",
+            "society_record_relationship",
+            "society_record_contribution",
+            "society_record_outcome",
+            "society_record_reputation_event",
             "agent_memory_write",
         ];
         for name in &mutating_names {
@@ -2842,11 +2890,18 @@ mod tests {
         let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = r["result"]["tools"].as_array().unwrap();
         let additive_names = [
-            "execute_decision", "arena_act", "hub_publish_task",
-            "hub_place_bid", "hub_propose", "hub_decide_proposal",
-            "hub_form_team", "hub_execute",
-            "society_record_relationship", "society_record_contribution",
-            "society_record_outcome", "society_record_reputation_event",
+            "execute_decision",
+            "arena_act",
+            "hub_publish_task",
+            "hub_place_bid",
+            "hub_propose",
+            "hub_decide_proposal",
+            "hub_form_team",
+            "hub_execute",
+            "society_record_relationship",
+            "society_record_contribution",
+            "society_record_outcome",
+            "society_record_reputation_event",
             "agent_memory_write",
         ];
         for name in &additive_names {
