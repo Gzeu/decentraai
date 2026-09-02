@@ -1401,6 +1401,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/list", post(world_list_handler))
         .route("/v1/world/buy", post(world_buy_handler))
         .route("/v1/world/entity", get(world_entity_handler))
+        .route("/v1/world/tick", post(world_tick_handler))
+        .route("/v1/world/service", post(world_service_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -2060,7 +2062,12 @@ async fn wallet_session_handler(State(state): State<ApiState>, headers: HeaderMa
 
 /// GET /v1/world — JSON snapshot projection (read-only).
 async fn world_snapshot_handler(State(state): State<ApiState>) -> Response {
-    let world = state.world.lock().await.clone();
+    let mut world = state.world.lock().await.clone();
+    // Ensure NPCs exist (spawn if missing, but don't persist from read-only handler)
+    let had_npcs = world.entities.iter().any(|e| e.entity_type == "npc");
+    if !had_npcs {
+        world.spawn_npcs();
+    }
     let hub = state.hub.lock().await.clone();
     let society = state.society.lock().await.clone();
 
@@ -2659,6 +2666,86 @@ async fn world_entity_handler(
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "entity not found"})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/tick — run a world tick (NPCs act, agents auto-behave).
+async fn world_tick_handler(State(state): State<ApiState>) -> Response {
+    let mut world = state.world.lock().await;
+    // Spawn NPCs if not present
+    world.spawn_npcs();
+    // Run world tick
+    world.world_tick();
+    let path = crate::world::world_path_for(&state.info.repo_root);
+    crate::world::save_world_state(&path, &world);
+    let tick = world.tick;
+    let entities = world.entities.len();
+    let listings = world.listings.iter().filter(|l| l.active).count();
+    let events = world.events.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "tick": tick,
+            "entities": entities,
+            "active_listings": listings,
+            "events": events,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /v1/world/service — buy a service at a location.
+async fn world_service_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let buyer_id = body
+        .get("buyer_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let location_id = body
+        .get("location_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let service_name = body
+        .get("service")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if buyer_id.is_empty() || location_id.is_empty() || service_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "buyer_id, location_id, and service required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.buy_service(&buyer_id, &location_id, &service_name) {
+        Ok((service, provider, price)) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "service": service,
+                    "provider": provider,
+                    "price": price,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }

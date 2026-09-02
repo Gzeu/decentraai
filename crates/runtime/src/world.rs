@@ -688,6 +688,226 @@ impl WorldState {
             self.events.drain(0..50);
         }
     }
+
+    /// Spawn NPCs at locations that offer services.
+    /// Idempotent: only spawns if no NPC exists at that location yet.
+    pub fn spawn_npcs(&mut self) {
+        let npcs: Vec<(&str, &str, &str, Vec<&str>, u64)> = vec![
+            // Central Hub
+            ("npc-questkeeper", "Questkeeper", "hub-quest-board", vec!["quest-giver"], 0),
+            ("npc-inkeeper", "Innkeeper", "hub-inn", vec!["rest"], 0),
+            // Research District
+            ("npc-librarian", "Librarian", "research-archive", vec!["research"], 0),
+            ("npc-researcher", "Researcher", "research-lab-main", vec!["inference", "embeddings"], 0),
+            // Marketplace
+            ("npc-broker", "Broker", "market-bazaar", vec!["trade"], 0),
+            ("npc-auctioneer", "Auctioneer", "market-auction", vec!["auction"], 0),
+            // The Forge
+            ("npc-smith", "Smith", "forge-workshop", vec!["coding"], 0),
+            ("npc-tester", "Tester", "forge-testing", vec!["ocr", "stt"], 0),
+            // Deep Forest
+            ("npc-hermit", "Hermit", "forest-clearing", vec!["mystery"], 0),
+        ];
+
+        for (id, name, loc_id, caps, credits) in npcs {
+            if !self.entities.iter().any(|e| e.id == id) {
+                let zone_id = self
+                    .locations
+                    .iter()
+                    .find(|l| l.id == loc_id)
+                    .map(|l| l.zone_id.clone())
+                    .unwrap_or_default();
+                self.entities.push(WorldEntity {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    entity_type: "npc".to_string(),
+                    zone_id,
+                    location_id: loc_id.to_string(),
+                    state: EntityState::Idle,
+                    capabilities: caps.iter().map(|s| s.to_string()).collect(),
+                    needs: vec![],
+                    wallet: format!("npc:{}", id),
+                    reputation: 1.0,
+                    credits,
+                    activity: "tending shop".to_string(),
+                    last_move_tick: self.tick,
+                    inventory: vec![],
+                });
+            }
+        }
+    }
+
+    /// Execute a world tick: NPCs act, agents auto-behave, world evolves.
+    pub fn world_tick(&mut self) {
+        self.advance_tick();
+
+        // 1. NPC behavior: NPCs at service locations offer services
+        for entity in &mut self.entities {
+            if entity.entity_type == "npc" {
+                // NPCs maintain their reputation
+                entity.reputation = (entity.reputation + 0.01).min(5.0);
+                // NPCs at service locations restock
+                if let Some(loc) = self.locations.iter().find(|l| l.id == entity.location_id) {
+                    if !loc.services.is_empty() {
+                        entity.activity = format!(
+                            "offering {}",
+                            loc.services.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Agent autonomous behavior: agents with needs seek services
+        let entity_ids: Vec<String> = self.entities.iter().map(|e| e.id.clone()).collect();
+        for entity_id in entity_ids {
+            let is_agent = self
+                .entities
+                .iter()
+                .find(|e| e.id == entity_id)
+                .map(|e| e.entity_type == "agent")
+                .unwrap_or(false);
+            if !is_agent {
+                continue;
+            }
+
+            // Get agent needs and current location
+            let (needs, current_loc, credits) = {
+                let e = self.entities.iter().find(|e| e.id == entity_id).unwrap();
+                (e.needs.clone(), e.location_id.clone(), e.credits)
+            };
+
+            if needs.is_empty() {
+                continue;
+            }
+
+            // Find a location that offers a needed service
+            for needed in &needs {
+                if let Some(target_loc) = self.locations.iter().find(|l| {
+                    l.services.contains_key(needed)
+                        && l.id != current_loc
+                        && credits >= *l.services.get(needed).unwrap_or(&u64::MAX)
+                }) {
+                    let target_label = target_loc.label.clone();
+                    let target_id = target_loc.id.clone();
+                    // Move agent to the service location
+                    let _ = self.move_entity(&entity_id, &target_id);
+                    // Set activity
+                    if let Some(e) = self.entities.iter_mut().find(|e| e.id == entity_id) {
+                        e.activity = format!("seeking {} at {}", needed, target_label);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 3. Record tick event periodically
+        if self.tick % 10 == 0 {
+            let agent_count = self.entities.iter().filter(|e| e.entity_type == "agent").count();
+            let npc_count = self.entities.iter().filter(|e| e.entity_type == "npc").count();
+            self.record_event(WorldEvent {
+                tick: self.tick,
+                kind: "world_tick".to_string(),
+                detail: format!(
+                    "tick {} — {} agents, {} NPCs, {} listings",
+                    self.tick,
+                    agent_count,
+                    npc_count,
+                    self.listings.iter().filter(|l| l.active).count()
+                ),
+                entity_id: None,
+                location_id: None,
+                evidence_id: None,
+            });
+        }
+    }
+
+    /// Buy a service at a location (triggers actual execution).
+    /// Returns (service_name, provider_npc_id, price) on success.
+    pub fn buy_service(
+        &mut self,
+        buyer_id: &str,
+        location_id: &str,
+        service_name: &str,
+    ) -> Result<(String, String, u64), String> {
+        let location = self
+            .locations
+            .iter()
+            .find(|l| l.id == location_id)
+            .ok_or_else(|| format!("location '{}' not found", location_id))?;
+
+        let price = location
+            .services
+            .get(service_name)
+            .ok_or_else(|| format!("service '{}' not available at {}", service_name, location_id))?;
+
+        let price = *price;
+
+        // Verify buyer is at this location
+        let buyer = self
+            .entities
+            .iter()
+            .find(|e| e.id == buyer_id)
+            .ok_or_else(|| format!("buyer '{}' not found", buyer_id))?;
+
+        if buyer.location_id != location_id {
+            return Err("buyer is not at this location".to_string());
+        }
+
+        if buyer.credits < price {
+            return Err(format!(
+                "insufficient credits: {} < {}",
+                buyer.credits, price
+            ));
+        }
+
+        // Find NPC provider at this location
+        let provider = self
+            .entities
+            .iter()
+            .find(|e| {
+                e.entity_type == "npc"
+                    && e.location_id == location_id
+                    && e.capabilities.iter().any(|c| c == service_name)
+            })
+            .map(|e| e.id.clone())
+            .unwrap_or_else(|| format!("auto-{}", location_id));
+
+        // Deduct credits from buyer
+        if let Some(b) = self.entities.iter_mut().find(|e| e.id == buyer_id) {
+            b.credits = b.credits.saturating_sub(price);
+            b.activity = format!("used {} service", service_name);
+            // Add service result to inventory
+            b.inventory.push(WorldItem {
+                id: format!("svc-{}-{}", service_name, self.tick),
+                name: format!("{} Result", service_name),
+                item_type: "service-result".to_string(),
+                price: 0,
+                description: format!("Result of {} service at {}", service_name, location_id),
+            });
+        }
+
+        // Credit the provider NPC
+        if let Some(p) = self.entities.iter_mut().find(|e| e.id == provider) {
+            p.credits += price;
+            p.reputation += 0.1;
+        }
+
+        let event = WorldEvent {
+            tick: self.tick,
+            kind: "service_purchased".to_string(),
+            detail: format!(
+                "{} purchased {} service at {} for {}Cr",
+                buyer_id, service_name, location_id, price
+            ),
+            entity_id: Some(buyer_id.to_string()),
+            location_id: Some(location_id.to_string()),
+            evidence_id: None,
+        };
+        self.record_event(event);
+
+        Ok((service_name.to_string(), provider, price))
+    }
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────
