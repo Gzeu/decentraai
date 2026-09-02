@@ -2227,6 +2227,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "m18_record_trust" => &ctx.m18_action,
         "m18_verify_trust" => &ctx.m18_action,
         "m18_trust_score" => &ctx.m18_action,
+        "m18_update_needs" => &ctx.m18_action,
         _ => return None,
     };
     Some(json!({

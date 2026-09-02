@@ -311,11 +311,15 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
             let providers = discover_providers(ctx, needed);
             if let Some(provider) = providers.first() {
                 // Propose an M18 contract directly to the best provider.
-                // Price: 5% of balance (market-driven, affordable).
-                let price = ctx.balance / 20;
-                if price < 10 {
-                    continue; // Too poor to buy.
-                }
+                // Price: 5% of balance, with a minimum floor for bootstrapping.
+                // New agents with trust score > 0 can propose at minimum price.
+                let price = if ctx.balance > 0 {
+                    (ctx.balance / 20).max(10)
+                } else if ctx.trust_score > 0.0 {
+                    10 // Minimum bootstrap price for trusted agents
+                } else {
+                    10 // Allow first contract even with no trust (get started)
+                };
                 return EconomicAction::ProposeContract {
                     provider_wallet: provider.wallet.clone(),
                     capability: needed.clone(),

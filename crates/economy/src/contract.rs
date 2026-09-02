@@ -203,9 +203,11 @@ pub fn propose_contract(
     if provider_wallet == consumer_wallet {
         return Err(ContractError::SameParty);
     }
-    if !provider_wallet.starts_with("erd1") || !consumer_wallet.starts_with("erd1") {
+    // Accept erd1... bech32 (production) or agent: prefixed (local network).
+    let valid_wallet = |w: &str| w.starts_with("erd1") || w.starts_with("agent:");
+    if !valid_wallet(provider_wallet) || !valid_wallet(consumer_wallet) {
         return Err(ContractError::InvalidWallet(
-            "both addresses must be erd1... bech32".into(),
+            "wallets must be erd1... bech32 or agent: prefixed".into(),
         ));
     }
     let contract_id = generate_contract_id(provider_wallet, consumer_wallet, now);
