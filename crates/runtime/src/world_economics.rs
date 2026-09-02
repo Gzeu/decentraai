@@ -286,6 +286,80 @@ async fn apply_action(
             Ok(true)
         }
 
+        EconomicAction::SettleContract { contract_id } => {
+            // 1. Mark contract as Settled (idempotent: already settled → no-op).
+            let (consumer, provider, capability, price) = {
+                let mut contracts = m18.contracts.lock().map_err(|e| format!("lock: {}", e))?;
+                let c = contracts.get_mut(contract_id).ok_or("contract not found")?;
+                if matches!(c.status, ContractStatus::Settled) {
+                    return Ok(false); // Already settled — idempotent no-op.
+                }
+                if !matches!(c.status, ContractStatus::Completed) {
+                    return Err(format!("cannot settle: status is {:?}", c.status));
+                }
+                let consumer = c.consumer_wallet.clone();
+                let provider = c.provider_wallet.clone();
+                let capability = c.service.capability.clone();
+                let price = c.terms.price_micro_cu;
+                c.status = ContractStatus::Settled;
+                drop(contracts);
+                (consumer, provider, capability, price)
+            };
+
+            // 2. Release escrow (if any exists for this contract).
+            {
+                let mut escrow = m18.escrow.lock().map_err(|e| format!("lock: {}", e))?;
+                if let Some(record) = escrow.records.values_mut().find(|r| r.contract_id == *contract_id) {
+                    record.status = decentraai_economy::escrow::EscrowStatus::Released;
+                    record.updated_at = m18.current_tick();
+                }
+            }
+
+            // 3. Record trust anchors for both parties.
+            let evidence = format!("contract:{}:settled", contract_id);
+            {
+                let ev_hash = blake3::hash(evidence.as_bytes()).to_hex().to_string();
+                let mut trust = m18.trust.lock().map_err(|e| format!("lock: {}", e))?;
+                // Provider trust: they did the work.
+                let provider_params = AnchorParams {
+                    agent_wallet: provider.clone(),
+                    evidence_hash: format!("provider:{}", ev_hash),
+                    capability: capability.clone(),
+                    quality_score: 90,
+                    verified: true,
+                    micro_cu: price,
+                    contract_id: Some(contract_id.clone()),
+                };
+                if let Err(e) = trust.record_anchor(&provider_params, m18.current_tick()) {
+                    return Err(format!("provider trust anchor failed: {}", e));
+                }
+                // Consumer trust: they paid.
+                let consumer_params = AnchorParams {
+                    agent_wallet: consumer.clone(),
+                    evidence_hash: format!("consumer:{}", ev_hash),
+                    capability: format!("{}:payment", capability),
+                    quality_score: 100,
+                    verified: true,
+                    micro_cu: price,
+                    contract_id: Some(contract_id.clone()),
+                };
+                if let Err(e) = trust.record_anchor(&consumer_params, m18.current_tick()) {
+                    return Err(format!("consumer trust anchor failed: {}", e));
+                }
+            }
+
+            record_action(
+                m18,
+                M18Action::SettleContract {
+                    contract_id: contract_id.clone(),
+                },
+            );
+            m18.save_contracts()?;
+            m18.save_escrow()?;
+            m18.save_trust()?;
+            Ok(true)
+        }
+
         EconomicAction::CancelContract { contract_id } => {
             let mut contracts = m18.contracts.lock().map_err(|e| format!("lock: {}", e))?;
             match contracts.get_mut(contract_id) {
@@ -564,5 +638,145 @@ mod tests {
         let trust = m18.trust.lock().unwrap();
         assert_eq!(trust.anchors.len(), 1);
         assert_eq!(trust.trust_score(&wallet(1)), 1.0);
+    }
+
+    /// Full end-to-end BUY/SELL cycle:
+    /// need → discovery → propose → accept → execute → complete → settle → trust.
+    #[tokio::test]
+    async fn full_economic_cycle_e2e() {
+        use decentraai_compute::quota::{ContributionPolicy, QuotaLedger};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let shared = new_shared_hub();
+        let m18 = M18State::test_default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create quota ledger with balance for buyer.
+        let mut ledger = QuotaLedger::new(ContributionPolicy::default());
+        ledger.credit(&wallet(1), "init-buyer", Some(10_000), None);
+        ledger.credit(&wallet(2), "init-seller", Some(10_000), None);
+        let ledger = Arc::new(StdMutex::new(ledger));
+
+        // Setup: Buyer (wallet 1) needs "ocr", Seller (wallet 2) has "ocr".
+        let mut buyer = test_agent(
+            "buyer",
+            &wallet(1),
+            vec!["general".to_string()],
+        );
+        buyer.needs = vec!["ocr".to_string()];
+        let seller = test_agent(
+            "seller",
+            &wallet(2),
+            vec!["ocr".to_string()],
+        );
+        let agents = vec![buyer, seller];
+
+        // --- Tick 1: Buyer assesses needs → ProposeContract to seller ---
+        let r1 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        assert_eq!(r1.agents_evaluated, 2);
+        // Buyer should propose a contract (has need "ocr", seller has it).
+        let buyer_result = r1.agent_results.iter().find(|r| r.agent_id == "buyer").unwrap();
+        assert!(
+            matches!(&buyer_result.action, EconomicAction::ProposeContract { .. }),
+            "buyer should propose contract, got: {:?}",
+            buyer_result.action
+        );
+
+        // Verify contract was created.
+        {
+            let contracts = m18.contracts.lock().unwrap();
+            assert_eq!(contracts.len(), 1);
+            let c = contracts.values().next().unwrap();
+            assert_eq!(c.consumer_wallet, wallet(1));
+            assert_eq!(c.provider_wallet, wallet(2));
+            assert!(matches!(c.status, ContractStatus::Proposed));
+        }
+
+        // --- Tick 2: Seller assesses → AcceptContract ---
+        let r2 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let seller_result = r2.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        assert!(
+            matches!(&seller_result.action, EconomicAction::AcceptContract { .. }),
+            "seller should accept contract, got: {:?}",
+            seller_result.action
+        );
+
+        {
+            let contracts = m18.contracts.lock().unwrap();
+            let c = contracts.values().next().unwrap();
+            assert!(matches!(c.status, ContractStatus::Accepted));
+        }
+
+        // --- Tick 3: Seller → StartExecution ---
+        let r3 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let seller_result = r3.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        assert!(
+            matches!(&seller_result.action, EconomicAction::StartExecution { .. }),
+            "seller should start execution, got: {:?}",
+            seller_result.action
+        );
+
+        {
+            let contracts = m18.contracts.lock().unwrap();
+            let c = contracts.values().next().unwrap();
+            assert!(matches!(c.status, ContractStatus::Executing));
+        }
+
+        // --- Tick 4: Seller → CompleteContract ---
+        let r4 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let seller_result = r4.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        assert!(
+            matches!(&seller_result.action, EconomicAction::CompleteContract { .. }),
+            "seller should complete contract, got: {:?}",
+            seller_result.action
+        );
+
+        {
+            let contracts = m18.contracts.lock().unwrap();
+            let c = contracts.values().next().unwrap();
+            assert!(matches!(c.status, ContractStatus::Completed));
+        }
+
+        // --- Tick 5: Either party → SettleContract (escrow + trust) ---
+        let r5 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let settler = r5.agent_results.iter().find(|r| {
+            matches!(&r.action, EconomicAction::SettleContract { .. })
+        });
+        assert!(
+            settler.is_some(),
+            "someone should settle the contract, actions: {:?}",
+            r5.agent_results.iter().map(|r| (&r.agent_id, std::mem::discriminant(&r.action))).collect::<Vec<_>>()
+        );
+
+        {
+            let contracts = m18.contracts.lock().unwrap();
+            let c = contracts.values().next().unwrap();
+            assert!(matches!(c.status, ContractStatus::Settled));
+        }
+
+        // Trust anchors should exist for both provider and consumer.
+        {
+            let trust = m18.trust.lock().unwrap();
+            eprintln!("trust anchors: {}", trust.anchors.len());
+            for a in trust.anchors.values() {
+                eprintln!("  anchor: wallet={} evidence={} cap={}", a.agent_wallet, &a.evidence_hash[..16], a.capability);
+            }
+            let provider_score = trust.trust_score(&wallet(2));
+            let consumer_score = trust.trust_score(&wallet(1));
+            eprintln!("provider_score={} consumer_score={}", provider_score, consumer_score);
+            assert!(provider_score > 0.0, "provider should have trust score");
+            assert!(consumer_score > 0.0, "consumer should have trust score");
+        }
+
+        // --- Tick 6: Nothing more to do (cycle complete) ---
+        let r6 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        for result in &r6.agent_results {
+            assert!(
+                matches!(&result.action, EconomicAction::Nothing),
+                "agent {} should have Nothing after settlement, got: {:?}",
+                result.agent_id,
+                result.action
+            );
+        }
     }
 }

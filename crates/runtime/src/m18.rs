@@ -35,6 +35,9 @@ pub enum M18Action {
     CompleteContract {
         contract_id: String,
     },
+    SettleContract {
+        contract_id: String,
+    },
     CancelContract {
         contract_id: String,
     },

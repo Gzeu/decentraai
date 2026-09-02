@@ -87,6 +87,9 @@ pub enum EconomicAction {
     StartExecution { contract_id: String },
     /// Complete a contract (work done).
     CompleteContract { contract_id: String },
+    /// Settle a completed contract: release escrow + record trust anchor.
+    /// This is the final step in the economic cycle.
+    SettleContract { contract_id: String },
     /// Cancel a contract.
     CancelContract { contract_id: String },
     /// Record a trust anchor (after verified work).
@@ -168,15 +171,16 @@ pub fn assess_needs(ctx: &EconomicContext) -> NeedsAssessment {
         .collect();
 
     // Find contracts awaiting this agent's response.
+    // As consumer: contracts proposed TO us that we need to evaluate.
+    // As provider: contracts proposed BY a consumer that we should accept.
     let pending_contracts: Vec<String> = ctx
         .contracts
         .iter()
         .filter(|(_, c)| {
-            c.consumer_wallet == ctx.agent_wallet
-                && matches!(
-                    c.status,
-                    decentraai_economy::contract::ContractStatus::Proposed
-                )
+            matches!(
+                c.status,
+                decentraai_economy::contract::ContractStatus::Proposed
+            ) && (c.consumer_wallet == ctx.agent_wallet || c.provider_wallet == ctx.agent_wallet)
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -209,6 +213,21 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
         }
     }
 
+    // 1b. Settle any completed contract (release escrow + record trust).
+    for contract_id in &needs.active_contracts {
+        if let Some(c) = ctx.contracts.get(contract_id) {
+            if matches!(
+                c.status,
+                decentraai_economy::contract::ContractStatus::Completed
+            ) && (c.consumer_wallet == ctx.agent_wallet || c.provider_wallet == ctx.agent_wallet)
+            {
+                return EconomicAction::SettleContract {
+                    contract_id: contract_id.clone(),
+                };
+            }
+        }
+    }
+
     // 2. Start execution on accepted contracts.
     for contract_id in &needs.active_contracts {
         if let Some(c) = ctx.contracts.get(contract_id) {
@@ -223,9 +242,13 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
         }
     }
 
-    // 3. Accept pending contract proposals (if the agent can provide the service).
+    // 3. Accept pending contract proposals (if the agent is the provider and can provide the service).
     for contract_id in &needs.pending_contracts {
         if let Some(c) = ctx.contracts.get(contract_id) {
+            // Only accept if we are the provider (the one being asked to do work).
+            if c.provider_wallet != ctx.agent_wallet {
+                continue;
+            }
             if ctx.capabilities.iter().any(|cap| {
                 cap.to_lowercase() == c.service.capability.to_lowercase()
                     || c.service
@@ -233,8 +256,11 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
                         .to_lowercase()
                         .contains(&cap.to_lowercase())
             }) {
-                // Only accept if trust score is decent and we have capacity.
-                if ctx.trust_score >= 0.3 || ctx.balance < 1000 {
+                // Accept if we have the capability. Trust/balance are soft gates:
+                // - New agents (trust=0) always accept to build reputation.
+                // - Established agents accept if trust >= 0.3 or balance is healthy.
+                let can_afford = !c.terms.escrow_required || ctx.balance >= c.terms.price_micro_cu;
+                if ctx.trust_score < 0.01 || ctx.trust_score >= 0.3 || can_afford {
                     return EconomicAction::AcceptContract {
                         contract_id: contract_id.clone(),
                     };
@@ -269,37 +295,43 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
         }
     }
 
-    // 5. Buy-side: publish Hub tasks for needed capabilities.
-    // If the agent needs a capability it doesn't have, and no provider
-    // is already offering it via an active contract, publish a Hub task.
+    // 5. Buy-side: propose M18 contracts OR publish Hub tasks for needed capabilities.
     if !needs.missing_capabilities.is_empty() {
         for needed in &needs.missing_capabilities {
-            // Check if we already have an active contract for this capability.
-            let already_covered = needs.active_contracts.iter().any(|id| {
-                ctx.contracts
-                    .get(id)
-                    .map(|c| {
-                        c.service.capability.to_lowercase() == needed.to_lowercase()
-                            && c.consumer_wallet == ctx.agent_wallet
-                    })
-                    .unwrap_or(false)
+            // Check if we already have ANY contract (active or settled) for this capability.
+            let already_covered = ctx.contracts.iter().any(|(_, c)| {
+                c.service.capability.to_lowercase() == needed.to_lowercase()
+                    && (c.consumer_wallet == ctx.agent_wallet || c.provider_wallet == ctx.agent_wallet)
             });
             if already_covered {
                 continue;
             }
 
-            // Check if any provider exists in the World.
-            let provider_exists = ctx.world_agents.iter().any(|a| {
-                a.wallet != ctx.agent_wallet
-                    && a.capabilities.iter().any(|cap| {
-                        cap.to_lowercase() == needed.to_lowercase()
-                            || needed.to_lowercase().contains(&cap.to_lowercase())
-                    })
-            });
-            if !provider_exists {
-                continue; // No provider exists yet; don't publish a task nobody can fill.
+            // Find a provider in the World.
+            let providers = discover_providers(ctx, needed);
+            if let Some(provider) = providers.first() {
+                // Propose an M18 contract directly to the best provider.
+                // Price: 5% of balance (market-driven, affordable).
+                let price = ctx.balance / 20;
+                if price < 10 {
+                    continue; // Too poor to buy.
+                }
+                return EconomicAction::ProposeContract {
+                    provider_wallet: provider.wallet.clone(),
+                    capability: needed.clone(),
+                    description: format!(
+                        "Agent {} needs {} capability. Trust: {:.0}%.",
+                        ctx.agent_id,
+                        needed,
+                        ctx.trust_score * 100.0,
+                    ),
+                    price_micro_cu: price,
+                    max_duration_secs: 3600,
+                    escrow_required: true,
+                };
             }
 
+            // No provider found — publish a Hub task as a marketplace signal.
             // Check if there's already an open Hub task for this capability.
             let already_listed = ctx.hub.tasks.values().any(|t| {
                 matches!(t.status, TaskStatus::Open | TaskStatus::Bidding)
@@ -314,7 +346,6 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
             }
 
             // Publish a Hub task for this capability.
-            // Price: 10% of balance (affordable, market-driven).
             let reward = ctx.balance / 10;
             if reward < 10 {
                 continue; // Too poor to buy.
