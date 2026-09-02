@@ -506,6 +506,7 @@ pub async fn economic_tick_handler(State(state): State<ApiState>, headers: Heade
         &state.hub,
         &m18,
         &state.info.repo_root,
+        &state.quota_ledger,
     )
     .await;
 

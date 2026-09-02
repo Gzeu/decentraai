@@ -1891,6 +1891,23 @@ async fn world_onboard_handler(
             crate::world::save_world_state(&wpath, &world);
         }
     }
+    // Seed the agent's quota ledger account so it has spendable credits
+    // from the start (same pattern as VESPER dispatch).
+    if let Some(ledger) = &state.quota_ledger {
+        let mut l = ledger.lock().unwrap();
+        let has = l.account(&owner_account).map_or(0, |a| a.spendable()) > 0;
+        if !has {
+            let ref_id = format!(
+                "onboard-seed-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            l.credit(&owner_account, &ref_id, Some(quota as u32), None);
+        }
+        drop(l);
+    }
     decentraai_audit::record_best_effort(
         &state.info.repo_root.join("logs"),
         "world_onboarded",

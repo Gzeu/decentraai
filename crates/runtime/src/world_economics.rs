@@ -10,6 +10,7 @@
 use crate::economic_agent::{self, EconomicAction, EconomicContext};
 use crate::hub::{SharedHub, hub_path_for, save_hub_state};
 use crate::m18::{M18Action, M18State};
+use decentraai_compute::QuotaLedger;
 use decentraai_economy::contract::{
     self, AgentContract, ContractStatus, ContractTerms, ServiceDescriptor,
 };
@@ -18,6 +19,7 @@ use decentraai_economy::trust_anchor::{AnchorParams, TrustStore};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Result of a single agent's economic tick.
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +50,7 @@ pub async fn run_world_economic_tick(
     hub: &SharedHub,
     m18: &M18State,
     repo_root: &Path,
+    quota_ledger: &Option<Arc<StdMutex<QuotaLedger>>>,
 ) -> EconomicTickResult {
     let tick = m18.current_tick();
     let mut results = Vec::new();
@@ -58,6 +61,14 @@ pub async fn run_world_economic_tick(
 
     for agent in agents {
         let trust_score = trust_snap.trust_score(&agent.account);
+
+        // Look up real balance from the quota ledger.
+        let balance = quota_ledger
+            .as_ref()
+            .and_then(|l| l.lock().ok())
+            .and_then(|l| l.account(&agent.account))
+            .map(|a| a.spendable())
+            .unwrap_or(0);
 
         // Decide under a short hub lock; drop before applying to avoid deadlock.
         let action = {
@@ -71,7 +82,7 @@ pub async fn run_world_economic_tick(
                 contracts: &contracts_snap,
                 escrow: &escrow_snap,
                 trust: &trust_snap,
-                balance: 0, // TODO: wire from quota ledger per-account
+                balance,
                 trust_score,
             };
             let a = economic_agent::decide_action(&ctx);
@@ -358,7 +369,7 @@ mod tests {
         let m18 = M18State::test_default();
         let tmp = tempfile::tempdir().unwrap();
         let agents = vec![test_agent("a1", &wallet(1), vec!["research".to_string()])];
-        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path()).await;
+        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &None).await;
 
         assert_eq!(result.agents_evaluated, 1);
         assert_eq!(result.actions_taken, 1);
@@ -377,7 +388,7 @@ mod tests {
         let m18 = M18State::test_default();
         let tmp = tempfile::tempdir().unwrap();
         let agents = vec![test_agent("a1", &wallet(1), vec!["research".to_string()])];
-        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path()).await;
+        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &None).await;
 
         assert_eq!(result.actions_taken, 0);
         assert!(matches!(
@@ -404,7 +415,7 @@ mod tests {
         let m18 = M18State::test_default();
         let tmp = tempfile::tempdir().unwrap();
         let agents = vec![test_agent("a1", &wallet(1), vec!["research".to_string()])];
-        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path()).await;
+        let result = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &None).await;
 
         assert_eq!(result.actions_taken, 0);
     }
