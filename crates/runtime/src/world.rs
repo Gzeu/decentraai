@@ -169,6 +169,61 @@ pub struct WorldEvent {
     pub evidence_id: Option<String>,
 }
 
+// ─── On-Chain Settlement ─────────────────────────────────────────────
+
+/// Status of an on-chain settlement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementStatus {
+    /// Proof generated, awaiting operator signing.
+    Pending,
+    /// Transaction submitted to MultiversX testnet.
+    Submitted,
+    /// Transaction confirmed on-chain.
+    Confirmed,
+    /// Settlement failed.
+    Failed,
+}
+
+/// An on-chain proof anchoring an economic action to MultiversX testnet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnChainProof {
+    /// Unique proof id.
+    pub id: String,
+    /// What was settled (quest completion, service purchase, trade, etc.).
+    pub action_type: String,
+    /// Description of the settled action.
+    pub description: String,
+    /// Entity that triggered the settlement.
+    pub entity_id: String,
+    /// Amount settled in credits/micro-CU.
+    pub amount: u64,
+    /// BLAKE3 evidence hash (raw bytes, hex-encoded).
+    pub evidence_hash: String,
+    /// MultiversX testnet tx data (unsigned intent).
+    pub tx_data: String,
+    /// Tx hash after submission (empty until submitted).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tx_hash: String,
+    /// Current settlement status.
+    pub status: SettlementStatus,
+    /// When the proof was generated (tick).
+    pub created_tick: u64,
+    /// When the tx was submitted (0 = not yet).
+    #[serde(default)]
+    pub submitted_tick: u64,
+    /// When the tx was confirmed (0 = not yet).
+    #[serde(default)]
+    pub confirmed_tick: u64,
+    /// MultiversX testnet network.
+    #[serde(default = "default_network")]
+    pub network: String,
+}
+
+fn default_network() -> String {
+    "multiversx-testnet".to_string()
+}
+
 // ─── Quests ──────────────────────────────────────────────────────────
 
 /// Type of quest objective.
@@ -313,6 +368,9 @@ pub struct WorldState {
     /// Active and available quests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quests: Vec<Quest>,
+    /// On-chain settlement proofs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proofs: Vec<OnChainProof>,
 }
 
 impl Default for WorldState {
@@ -340,6 +398,7 @@ impl Default for WorldState {
             listings: vec![],
             events: vec![],
             quests: vec![],
+            proofs: vec![],
         }
     }
 }
@@ -1405,6 +1464,9 @@ impl WorldState {
             evidence_id: None,
         });
 
+        // Auto-settle on MultiversX testnet
+        self.auto_settle_quest(quest_id);
+
         Ok(reward)
     }
 
@@ -1424,6 +1486,166 @@ impl WorldState {
                 }
             }
         }
+    }
+
+    // ─── On-Chain Settlement ─────────────────────────────────────────
+
+    /// Generate an on-chain proof for an economic action.
+    /// Creates a BLAKE3 evidence hash and an unsigned MultiversX tx intent.
+    pub fn settle_on_chain(
+        &mut self,
+        action_type: &str,
+        description: &str,
+        entity_id: &str,
+        amount: u64,
+    ) -> Result<OnChainProof, String> {
+        // Verify entity exists
+        self.entities
+            .iter()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| format!("entity '{}' not found", entity_id))?;
+
+        // Generate evidence hash from action data
+        let evidence_data = format!(
+            "{}:{}:{}:{}:{}",
+            action_type, entity_id, amount, self.tick, description
+        );
+        let evidence_hash = blake3::hash(evidence_data.as_bytes()).to_hex().to_string();
+
+        // Build MultiversX testnet tx intent
+        let job_id = format!("quest-{}-{}", entity_id, self.tick);
+        let tx_data = format!(
+            "submit_proof@{}@{}",
+            hex::encode(job_id.as_bytes()),
+            evidence_hash
+        );
+
+        let proof = OnChainProof {
+            id: format!("proof-{}-{}", self.tick, &evidence_hash[..12]),
+            action_type: action_type.to_string(),
+            description: description.to_string(),
+            entity_id: entity_id.to_string(),
+            amount,
+            evidence_hash: evidence_hash.clone(),
+            tx_data,
+            tx_hash: String::new(),
+            status: SettlementStatus::Pending,
+            created_tick: self.tick,
+            submitted_tick: 0,
+            confirmed_tick: 0,
+            network: "multiversx-testnet".to_string(),
+        };
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "settlement_initiated".to_string(),
+            detail: format!(
+                "On-chain proof generated: {} for {} ({}Cr) — evidence: {}",
+                action_type, entity_id, amount, &evidence_hash[..16]
+            ),
+            entity_id: Some(entity_id.to_string()),
+            location_id: None,
+            evidence_id: Some(evidence_hash),
+        });
+
+        self.proofs.push(proof.clone());
+        Ok(proof)
+    }
+
+    /// Mark a proof as submitted (tx hash recorded).
+    pub fn submit_settlement(&mut self, proof_id: &str, tx_hash: &str) -> Result<(), String> {
+        let (entity_id, evidence_hash) = {
+            let proof = self
+                .proofs
+                .iter_mut()
+                .find(|p| p.id == proof_id)
+                .ok_or_else(|| format!("proof '{}' not found", proof_id))?;
+
+            proof.status = SettlementStatus::Submitted;
+            proof.tx_hash = tx_hash.to_string();
+            proof.submitted_tick = self.tick;
+
+            (proof.entity_id.clone(), proof.evidence_hash.clone())
+        };
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "settlement_submitted".to_string(),
+            detail: format!(
+                "Proof {} submitted to MultiversX testnet — tx: {}",
+                proof_id,
+                &tx_hash[..tx_hash.len().min(16)]
+            ),
+            entity_id: Some(entity_id),
+            location_id: None,
+            evidence_id: Some(evidence_hash),
+        });
+
+        Ok(())
+    }
+
+    /// Confirm a settlement (tx confirmed on-chain).
+    pub fn confirm_settlement(&mut self, proof_id: &str) -> Result<(), String> {
+        let (entity_id, evidence_hash, tx_hash) = {
+            let proof = self
+                .proofs
+                .iter_mut()
+                .find(|p| p.id == proof_id)
+                .ok_or_else(|| format!("proof '{}' not found", proof_id))?;
+
+            if proof.status != SettlementStatus::Submitted {
+                return Err("proof is not in submitted state".to_string());
+            }
+
+            proof.status = SettlementStatus::Confirmed;
+            proof.confirmed_tick = self.tick;
+
+            // Grant reputation bonus for confirmed on-chain settlement
+            let eid = proof.entity_id.clone();
+            (eid.clone(), proof.evidence_hash.clone(), proof.tx_hash.clone())
+        };
+
+        if let Some(entity) = self.entities.iter_mut().find(|e| e.id == entity_id) {
+            entity.reputation += 0.2;
+        }
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "settlement_confirmed".to_string(),
+            detail: format!(
+                "Proof {} confirmed on MultiversX testnet — tx: {} (reputation +0.2)",
+                proof_id, tx_hash
+            ),
+            entity_id: Some(entity_id),
+            location_id: None,
+            evidence_id: Some(evidence_hash),
+        });
+
+        Ok(())
+    }
+
+    /// Auto-settle quest completions on-chain.
+    /// Called after quest completion to anchor the reward on MultiversX.
+    pub fn auto_settle_quest(&mut self, quest_id: &str) -> Option<OnChainProof> {
+        let (action, desc, agent_id, amount) = {
+            let quest = self.quests.iter().find(|q| q.id == quest_id)?;
+            if quest.status != QuestStatus::Completed {
+                return None;
+            }
+            let agent_id = quest.accepted_by.clone()?;
+            let reward = quest.reward.clone();
+            if reward.credits == 0 && reward.reputation == 0.0 {
+                return None; // No economic value to settle
+            }
+            (
+                "quest_completion".to_string(),
+                format!("Quest '{}' completed", quest.title),
+                agent_id,
+                reward.credits,
+            )
+        };
+
+        self.settle_on_chain(&action, &desc, &agent_id, amount).ok()
     }
 }
 
@@ -1910,5 +2132,152 @@ mod tests {
             });
         }
         assert!(w.events.len() <= 200);
+    }
+
+    #[test]
+    fn settle_on_chain_generates_proof() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.5,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        let proof = w.settle_on_chain(
+            "quest_completion",
+            "Quest 'Deliver OCR' completed",
+            "agent-1",
+            20,
+        );
+        assert!(proof.is_ok());
+        let proof = proof.unwrap();
+        assert!(proof.id.starts_with("proof-"));
+        assert_eq!(proof.action_type, "quest_completion");
+        assert_eq!(proof.entity_id, "agent-1");
+        assert_eq!(proof.amount, 20);
+        assert!(!proof.evidence_hash.is_empty());
+        assert!(proof.tx_data.starts_with("submit_proof@"));
+        assert_eq!(proof.status, SettlementStatus::Pending);
+        assert_eq!(proof.network, "multiversx-testnet");
+        assert_eq!(w.proofs.len(), 1);
+    }
+
+    #[test]
+    fn settle_on_chain_fails_for_unknown_entity() {
+        let mut w = WorldState::default();
+        let proof = w.settle_on_chain("test", "test", "nonexistent", 10);
+        assert!(proof.is_err());
+    }
+
+    #[test]
+    fn submit_and_confirm_settlement() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        let proof = w
+            .settle_on_chain("quest_completion", "completed", "agent-1", 20)
+            .unwrap();
+        let proof_id = proof.id.clone();
+
+        // Submit
+        assert!(w
+            .submit_settlement(&proof_id, "abc123def456")
+            .is_ok());
+        assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
+        assert_eq!(w.proofs[0].tx_hash, "abc123def456");
+
+        // Confirm
+        assert!(w.confirm_settlement(&proof_id).is_ok());
+        assert_eq!(w.proofs[0].status, SettlementStatus::Confirmed);
+        // Reputation bonus
+        assert!((w.entities[0].reputation - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn auto_settle_quest_creates_proof() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        // Create a quest via WorldState
+        w.quests.push(Quest {
+            id: "q1".to_string(),
+            title: "Deliver OCR".to_string(),
+            description: "test".to_string(),
+            giver_id: "questkeeper-1".to_string(),
+            objectives: vec![QuestObjective::MoveTo {
+                location_id: "hub-plaza".to_string(),
+            }],
+            reward: QuestReward {
+                credits: 20,
+                reputation: 0.5,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status: QuestStatus::Available,
+            accepted_by: None,
+            accepted_tick: 0,
+            created_tick: 0,
+            deadline_tick: 0,
+            required_reputation: 0.0,
+            required_capabilities: vec![],
+            progress: vec![false],
+        });
+
+        // Accept quest via WorldState
+        assert!(w.accept_quest("q1", "agent-1").is_ok());
+        assert_eq!(w.quests[0].status, QuestStatus::Active);
+        assert_eq!(w.quests[0].accepted_by.as_deref(), Some("agent-1"));
+
+        // Mark quest completed directly for testing
+        w.quests[0].status = QuestStatus::Completed;
+
+        // Auto-settle
+        let proof = w.auto_settle_quest("q1");
+        assert!(proof.is_some());
+        let proof = proof.unwrap();
+        assert_eq!(proof.action_type, "quest_completion");
+        assert_eq!(proof.amount, 20);
+        assert_eq!(proof.entity_id, "agent-1");
     }
 }

@@ -1407,6 +1407,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/quest/accept", post(world_quest_accept_handler))
         .route("/v1/world/quest/complete", post(world_quest_complete_handler))
         .route("/v1/world/quest/generate", post(world_quest_generate_handler))
+        .route("/v1/world/settle", post(world_settle_handler))
+        .route("/v1/world/settle/submit", post(world_settle_submit_handler))
+        .route("/v1/world/settle/confirm", post(world_settle_confirm_handler))
+        .route("/v1/world/proofs", get(world_proofs_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -2889,6 +2893,163 @@ async fn world_quest_generate_handler(State(state): State<ApiState>) -> Response
         )
             .into_response(),
     }
+}
+
+/// POST /v1/world/settle — settle an economic action on-chain.
+/// Generates an OnChainProof with BLAKE3 evidence + MultiversX tx intent.
+async fn world_settle_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let action_type = body
+        .get("action_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let entity_id = match body.get("entity_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "entity_id required"})),
+            )
+                .into_response()
+        }
+    };
+    let amount = body
+        .get("amount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut world = state.world.lock().await;
+    match world.settle_on_chain(action_type, description, &entity_id, amount) {
+        Ok(proof) => {
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "proof_id": proof.id,
+                "evidence_hash": proof.evidence_hash,
+                "tx_data": proof.tx_data,
+                "network": proof.network,
+                "status": "pending",
+            })))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/submit — record tx hash after operator submits to MultiversX.
+async fn world_settle_submit_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proof_id = match body.get("proof_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
+            )
+                .into_response()
+        }
+    };
+    let tx_hash = match body.get("tx_hash").and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "tx_hash required"})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut world = state.world.lock().await;
+    match world.submit_settlement(&proof_id, &tx_hash) {
+        Ok(()) => {
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "submitted"})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/confirm — confirm a settlement on-chain.
+async fn world_settle_confirm_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proof_id = match body.get("proof_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut world = state.world.lock().await;
+    match world.confirm_settlement(&proof_id) {
+        Ok(()) => {
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed"})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/world/proofs — list all on-chain settlement proofs.
+async fn world_proofs_handler(State(state): State<ApiState>) -> Response {
+    let world = state.world.lock().await;
+    let proofs: Vec<serde_json::Value> = world
+        .proofs
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "action_type": p.action_type,
+                "description": p.description,
+                "entity_id": p.entity_id,
+                "amount": p.amount,
+                "evidence_hash": p.evidence_hash,
+                "tx_hash": p.tx_hash,
+                "status": p.status,
+                "network": p.network,
+                "created_tick": p.created_tick,
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "proofs": proofs}))).into_response()
 }
 
 /// GET /vesper/agents — real registered fabric agents for the VESPER world,
