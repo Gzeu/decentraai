@@ -7,7 +7,7 @@
 //! Lock discipline: M18 state uses `std::sync::Mutex` — we snapshot before
 //! decision-making and apply mutations in short non-async critical sections.
 
-use crate::economic_agent::{self, EconomicAction, EconomicContext};
+use crate::economic_agent::{self, EconomicAction, EconomicContext, WorldAgentSnapshot};
 use crate::hub::{SharedHub, hub_path_for, save_hub_state};
 use crate::m18::{M18Action, M18State};
 use decentraai_compute::QuotaLedger;
@@ -59,6 +59,16 @@ pub async fn run_world_economic_tick(
     // Snapshot M18 state (short locks, synchronous).
     let (contracts_snap, escrow_snap, trust_snap) = snapshot_m18(m18);
 
+    // Build lightweight agent snapshots for provider discovery.
+    let world_agent_snapshots: Vec<WorldAgentSnapshot> = agents
+        .iter()
+        .map(|a| WorldAgentSnapshot {
+            agent_id: a.agent_id.clone(),
+            wallet: a.account.clone(),
+            capabilities: a.declared_capabilities.clone(),
+        })
+        .collect();
+
     for agent in agents {
         let trust_score = trust_snap.trust_score(&agent.account);
 
@@ -71,12 +81,16 @@ pub async fn run_world_economic_tick(
             .unwrap_or(0);
 
         // Decide under a short hub lock; drop before applying to avoid deadlock.
+        // needs: empty for now — wired from goals/personal-memory in future.
+        let needs: Vec<String> = Vec::new();
         let action = {
             let mut hub_guard = hub.lock().await;
             let ctx = EconomicContext {
                 agent_id: &agent.agent_id,
                 agent_wallet: &agent.account,
                 capabilities: &agent.declared_capabilities,
+                needs: &needs,
+                world_agents: &world_agent_snapshots,
                 tick,
                 hub: &hub_guard,
                 contracts: &contracts_snap,
@@ -315,6 +329,26 @@ async fn apply_action(
                 .map_err(|e| e.to_string())?;
             drop(trust);
             m18.save_trust()?;
+            Ok(true)
+        }
+
+        EconomicAction::PublishHubTask {
+            title,
+            description,
+            reward,
+            required_capability,
+        } => {
+            let mut h = hub.lock().await;
+            h.publish_task(
+                caller_wallet.to_string(),
+                title.clone(),
+                description.clone(),
+                *reward,
+                Some(required_capability.clone()),
+            );
+            h.advance_tick();
+            let path = hub_path_for(repo_root);
+            save_hub_state(&path, &h);
             Ok(true)
         }
 

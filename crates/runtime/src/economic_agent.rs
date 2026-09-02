@@ -31,8 +31,12 @@ pub struct EconomicContext<'a> {
     pub agent_id: &'a str,
     /// The agent's wallet address (erd1...).
     pub agent_wallet: &'a str,
-    /// The agent's declared capabilities.
+    /// The agent's declared capabilities (what it CAN do).
     pub capabilities: &'a [String],
+    /// Capabilities the agent NEEDS (from goals/planning).
+    pub needs: &'a [String],
+    /// All World agents (for provider discovery).
+    pub world_agents: &'a [WorldAgentSnapshot],
     /// Current tick.
     pub tick: u64,
     /// Hub state: available tasks, bids, proposals, teams.
@@ -47,6 +51,14 @@ pub struct EconomicContext<'a> {
     pub balance: u64,
     /// Agent's trust score (0.0 - 1.0).
     pub trust_score: f64,
+}
+
+/// Lightweight snapshot of a World agent (for provider discovery).
+#[derive(Debug, Clone)]
+pub struct WorldAgentSnapshot {
+    pub agent_id: String,
+    pub wallet: String,
+    pub capabilities: Vec<String>,
 }
 
 /// An economic action an agent decides to take.
@@ -85,6 +97,13 @@ pub enum EconomicAction {
         micro_cu: u64,
         contract_id: Option<String>,
     },
+    /// Publish a Hub task for a needed service (buy-side via marketplace).
+    PublishHubTask {
+        title: String,
+        description: String,
+        reward: u64,
+        required_capability: String,
+    },
     /// No action needed this tick.
     Nothing,
 }
@@ -108,7 +127,19 @@ pub struct NeedsAssessment {
 
 /// Assess what an agent needs and what it can offer.
 pub fn assess_needs(ctx: &EconomicContext) -> NeedsAssessment {
-    let missing = Vec::new();
+    // Missing capabilities: things the agent needs but doesn't have.
+    let missing: Vec<String> = ctx
+        .needs
+        .iter()
+        .filter(|needed| {
+            !ctx.capabilities.iter().any(|cap| {
+                cap.to_lowercase() == needed.to_lowercase()
+                    || needed.to_lowercase().contains(&cap.to_lowercase())
+            })
+        })
+        .cloned()
+        .collect();
+
     let mut sellable = Vec::new();
 
     // Find Hub tasks the agent's capabilities match (sell opportunities).
@@ -149,10 +180,6 @@ pub fn assess_needs(ctx: &EconomicContext) -> NeedsAssessment {
         })
         .map(|(id, _)| id.clone())
         .collect();
-
-    // For now, missing_capabilities is empty — agents discover needs
-    // dynamically when they encounter tasks requiring capabilities they lack.
-    // This is a simplification; real needs assessment would consult goals/plans.
 
     NeedsAssessment {
         missing_capabilities: missing,
@@ -242,10 +269,69 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
         }
     }
 
-    // 5. If no active economic activity, look for needs to fill via contracts.
-    // This is where agents would propose contracts for services they need.
-    // For now, agents only react to existing opportunities (sell-side active).
-    // Buy-side activation would come from goal/planning integration.
+    // 5. Buy-side: publish Hub tasks for needed capabilities.
+    // If the agent needs a capability it doesn't have, and no provider
+    // is already offering it via an active contract, publish a Hub task.
+    if !needs.missing_capabilities.is_empty() {
+        for needed in &needs.missing_capabilities {
+            // Check if we already have an active contract for this capability.
+            let already_covered = needs.active_contracts.iter().any(|id| {
+                ctx.contracts
+                    .get(id)
+                    .map(|c| {
+                        c.service.capability.to_lowercase() == needed.to_lowercase()
+                            && c.consumer_wallet == ctx.agent_wallet
+                    })
+                    .unwrap_or(false)
+            });
+            if already_covered {
+                continue;
+            }
+
+            // Check if any provider exists in the World.
+            let provider_exists = ctx.world_agents.iter().any(|a| {
+                a.wallet != ctx.agent_wallet
+                    && a.capabilities.iter().any(|cap| {
+                        cap.to_lowercase() == needed.to_lowercase()
+                            || needed.to_lowercase().contains(&cap.to_lowercase())
+                    })
+            });
+            if !provider_exists {
+                continue; // No provider exists yet; don't publish a task nobody can fill.
+            }
+
+            // Check if there's already an open Hub task for this capability.
+            let already_listed = ctx.hub.tasks.values().any(|t| {
+                matches!(t.status, TaskStatus::Open | TaskStatus::Bidding)
+                    && t.required_capability
+                        .as_ref()
+                        .map(|c| c.to_lowercase() == needed.to_lowercase())
+                        .unwrap_or(false)
+                    && t.issuer == ctx.agent_wallet
+            });
+            if already_listed {
+                continue;
+            }
+
+            // Publish a Hub task for this capability.
+            // Price: 10% of balance (affordable, market-driven).
+            let reward = ctx.balance / 10;
+            if reward < 10 {
+                continue; // Too poor to buy.
+            }
+            return EconomicAction::PublishHubTask {
+                title: format!("Need: {}", needed),
+                description: format!(
+                    "Agent {} needs {} capability. Trust: {:.0}%.",
+                    ctx.agent_id,
+                    needed,
+                    ctx.trust_score * 100.0,
+                ),
+                reward,
+                required_capability: needed.clone(),
+            };
+        }
+    }
 
     EconomicAction::Nothing
 }
@@ -318,6 +404,32 @@ pub fn has_capability(capabilities: &[String], required: &str) -> bool {
     })
 }
 
+/// Discover World agents that can provide a specific capability.
+/// Returns providers sorted by trust score (descending), excluding the caller.
+pub fn discover_providers<'a>(
+    ctx: &'a EconomicContext,
+    capability: &str,
+) -> Vec<&'a WorldAgentSnapshot> {
+    let mut providers: Vec<&WorldAgentSnapshot> = ctx
+        .world_agents
+        .iter()
+        .filter(|a| {
+            a.wallet != ctx.agent_wallet
+                && a.capabilities.iter().any(|cap| {
+                    cap.to_lowercase() == capability.to_lowercase()
+                        || capability.to_lowercase().contains(&cap.to_lowercase())
+                })
+        })
+        .collect();
+    // Sort by trust score descending (highest trust first).
+    providers.sort_by(|a, b| {
+        let sa = ctx.trust.anchors_for_wallet(&a.wallet).len();
+        let sb = ctx.trust.anchors_for_wallet(&b.wallet).len();
+        sb.cmp(&sa)
+    });
+    providers
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -332,6 +444,8 @@ mod tests {
         agent_id: &'a str,
         wallet: &'a String,
         caps: &'a [String],
+        needs: &'a [String],
+        world_agents: &'a [WorldAgentSnapshot],
         hub: &'a HubState,
         contracts: &'a BTreeMap<String, AgentContract>,
         escrow: &'a EscrowLedger,
@@ -343,6 +457,8 @@ mod tests {
             agent_id,
             agent_wallet: wallet,
             capabilities: caps,
+            needs,
+            world_agents,
             tick: 1,
             hub,
             contracts,
@@ -395,6 +511,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -434,6 +552,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -482,6 +602,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -525,6 +647,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -539,6 +663,8 @@ mod tests {
             "agent1",
             &w1,
             &caps2,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -559,6 +685,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
@@ -594,6 +722,8 @@ mod tests {
             "agent1",
             &w1,
             &caps,
+            &[],
+            &[],
             &hub,
             &state.contracts,
             &state.escrow,
