@@ -1397,6 +1397,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/onboard", post(world_onboard_handler))
         .route("/v1/world/mission", post(world_mission_handler))
         .route("/v1/world/stream", get(world_stream_handler))
+        .route("/v1/world/move", post(world_move_handler))
+        .route("/v1/world/list", post(world_list_handler))
+        .route("/v1/world/buy", post(world_buy_handler))
+        .route("/v1/world/entity", get(world_entity_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -2159,6 +2163,11 @@ async fn world_snapshot_handler(State(state): State<ApiState>) -> Response {
         "rooms": world.rooms,
         "agents": agents,
         "mission_task_id": world.mission_task_id,
+        "zones": world.zones,
+        "locations": world.locations,
+        "entities": world.entities,
+        "listings": world.listings,
+        "events": world.events,
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -2476,6 +2485,183 @@ async fn world_stream_handler(
             .interval(std::time::Duration::from_secs(15))
             .text("keepalive"),
     )
+}
+
+/// POST /v1/world/move — move an entity to a new location.
+async fn world_move_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let entity_id = body
+        .get("entity_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let location_id = body
+        .get("location_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if entity_id.is_empty() || location_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "entity_id and location_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.move_entity(&entity_id, &location_id) {
+        Ok(_) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "location_id": location_id})))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/list — list an item on the marketplace.
+async fn world_list_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let seller_id = body
+        .get("seller_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let location_id = body
+        .get("location_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let item = match body.get("item") {
+        Some(item_val) => match serde_json::from_value::<crate::world::WorldItem>(item_val.clone()) {
+            Ok(i) => i,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid item: {}", e)})),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "item required"})),
+            )
+                .into_response();
+        }
+    };
+
+    if seller_id.is_empty() || location_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "seller_id and location_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.list_item(&seller_id, item, &location_id) {
+        Ok(listing_id) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "listing_id": listing_id})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/buy — buy an item from the marketplace.
+async fn world_buy_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let buyer_id = body
+        .get("buyer_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let listing_id = body
+        .get("listing_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if buyer_id.is_empty() || listing_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "buyer_id and listing_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.buy_item(&buyer_id, &listing_id) {
+        Ok((item, seller_id)) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "item": item,
+                    "seller_id": seller_id,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/world/entity?entity_id=X — get entity details.
+async fn world_entity_handler(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let entity_id = params.get("entity_id").map(|s| s.as_str()).unwrap_or("");
+    if entity_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "entity_id required"})),
+        )
+            .into_response();
+    }
+    let world = state.world.lock().await;
+    match world.entities.iter().find(|e| e.id == entity_id) {
+        Some(entity) => (StatusCode::OK, Json(serde_json::to_value(entity).unwrap())).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "entity not found"})),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /vesper/agents — real registered fabric agents for the VESPER world,

@@ -1,13 +1,175 @@
-//! Agent World — persistent projection over Hub/Society/EventBus.
+//! Open World — persistent world layer for DecentraAI.
 //!
 //! WorldState is **NOT** a second source of truth. It is a thin
-//! projection persisted as `db/world.json` that only stores
-//! `world_id + mission.task_id + rooms + agents`.
-//! All ledger/quota/placement/Hub/Society remain canonical.
+//! projection persisted as `db/world.json` that stores zones, locations,
+//! entities, marketplace listings, and world events.
+//! All ledger/quota/placement/Hub/Society/M18 remain canonical.
+//!
+//! Architecture:
+//! - Zones group locations (Central Hub, Research District, Marketplace, etc.)
+//! - Locations host services and marketplaces
+//! - Entities are agents/NPCs with position and state
+//! - Movement is first-class: agents move between locations
+//! - Services at locations are wired to M18 contracts
+//! - Marketplace listings are wired to M18 escrow
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+// ─── Zones & Locations ───────────────────────────────────────────────
+
+/// A zone groups related locations (like a region on a map).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldZone {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    /// Background color for the UI (hex).
+    #[serde(default = "default_zone_color")]
+    pub color: String,
+    /// Whether this zone is discovered by default.
+    #[serde(default = "default_true")]
+    pub discovered: bool,
+}
+
+fn default_zone_color() -> String {
+    "#1a2540".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+/// A location within a zone — a place agents can visit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldLocation {
+    pub id: String,
+    pub zone_id: String,
+    pub label: String,
+    pub description: String,
+    /// Services offered at this location (capability → price).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub services: HashMap<String, u64>,
+    /// Whether this location has a marketplace.
+    #[serde(default)]
+    pub marketplace: bool,
+    /// Maximum agents that can be here simultaneously.
+    #[serde(default = "default_capacity")]
+    pub capacity: usize,
+}
+
+fn default_capacity() -> usize {
+    50
+}
+
+// ─── Entities ────────────────────────────────────────────────────────
+
+/// State of an entity in the world.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityState {
+    #[default]
+    Idle,
+    Moving,
+    Working,
+    Trading,
+    Resting,
+    Exploring,
+}
+
+/// An entity (agent or NPC) in the world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldEntity {
+    /// Unique entity id (matches agent_id or npc id).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Entity type.
+    #[serde(rename = "type")]
+    pub entity_type: String,
+    /// Current zone_id.
+    pub zone_id: String,
+    /// Current location_id.
+    pub location_id: String,
+    /// Current state.
+    #[serde(default)]
+    pub state: EntityState,
+    /// Capabilities this entity offers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Capabilities this entity needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// Wallet address (for M18 contracts).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wallet: String,
+    /// Reputation score (projection from Society).
+    #[serde(default)]
+    pub reputation: f32,
+    /// Credits available.
+    #[serde(default)]
+    pub credits: u64,
+    /// What the entity is doing (free-text status).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub activity: String,
+    /// When the entity last moved (tick).
+    #[serde(default)]
+    pub last_move_tick: u64,
+    /// Inventory of items held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory: Vec<WorldItem>,
+}
+
+// ─── Items & Marketplace ─────────────────────────────────────────────
+
+/// An item that can be traded or used in the world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldItem {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    /// Price in credits (0 = not for sale).
+    #[serde(default)]
+    pub price: u64,
+    /// Description.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// A marketplace listing — an item or service for sale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketListing {
+    pub id: String,
+    pub seller_id: String,
+    pub item: WorldItem,
+    /// Location where this listing is active.
+    pub location_id: String,
+    /// When it was listed (tick).
+    pub listed_tick: u64,
+    /// Whether it's still available.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+// ─── World Events ────────────────────────────────────────────────────
+
+/// A real-time event in the world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldEvent {
+    pub tick: u64,
+    pub kind: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+}
+
+// ─── WorldState ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldRoom {
@@ -33,15 +195,34 @@ pub struct WorldAgent {
 pub struct WorldState {
     pub world_id: String,
     pub mission_task_id: Option<String>,
+    /// Legacy rooms (kept for backward compat).
     pub rooms: Vec<WorldRoom>,
+    /// Legacy agents (kept for backward compat).
     pub agents: Vec<WorldAgent>,
     pub tick: u64,
+
+    // ─── Open World fields ───────────────────────────────────────────
+    /// Zones in the world.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<WorldZone>,
+    /// All locations across all zones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<WorldLocation>,
+    /// All entities in the world (agents + NPCs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<WorldEntity>,
+    /// Marketplace listings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listings: Vec<MarketListing>,
+    /// Recent world events (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<WorldEvent>,
 }
 
 impl Default for WorldState {
     fn default() -> Self {
         Self {
-            world_id: "world-build-x".to_string(),
+            world_id: "decentraai-open-world".to_string(),
             mission_task_id: None,
             rooms: vec![
                 WorldRoom {
@@ -57,13 +238,231 @@ impl Default for WorldState {
             ],
             agents: vec![],
             tick: 0,
+            zones: default_zones(),
+            locations: default_locations(),
+            entities: vec![],
+            listings: vec![],
+            events: vec![],
         }
     }
+}
+
+/// Default zones for the Open World.
+fn default_zones() -> Vec<WorldZone> {
+    vec![
+        WorldZone {
+            id: "central-hub".to_string(),
+            label: "Central Hub".to_string(),
+            description: "The heart of DecentraAI. Where agents gather, trade, and find work.".to_string(),
+            color: "#22d3ee".to_string(),
+            discovered: true,
+        },
+        WorldZone {
+            id: "research-district".to_string(),
+            label: "Research District".to_string(),
+            description: "Labs and research facilities. Agents come here for knowledge work.".to_string(),
+            color: "#a78bfa".to_string(),
+            discovered: true,
+        },
+        WorldZone {
+            id: "marketplace".to_string(),
+            label: "Marketplace".to_string(),
+            description: "The bustling marketplace. Buy, sell, and trade services and artifacts.".to_string(),
+            color: "#34d399".to_string(),
+            discovered: true,
+        },
+        WorldZone {
+            id: "forge".to_string(),
+            label: "The Forge".to_string(),
+            description: "Where models are trained and fine-tuned. Heavy compute zone.".to_string(),
+            color: "#f59e0b".to_string(),
+            discovered: true,
+        },
+        WorldZone {
+            id: "deep-forest".to_string(),
+            label: "Deep Forest".to_string(),
+            description: "Wild territory. Rare capabilities and hidden opportunities.".to_string(),
+            color: "#10b981".to_string(),
+            discovered: false,
+        },
+    ]
+}
+
+/// Default locations for the Open World.
+fn default_locations() -> Vec<WorldLocation> {
+    let mut services_inference = HashMap::new();
+    services_inference.insert("inference".to_string(), 5);
+    services_inference.insert("embeddings".to_string(), 3);
+
+    let mut services_ocr = HashMap::new();
+    services_ocr.insert("ocr".to_string(), 10);
+    services_ocr.insert("stt".to_string(), 15);
+
+    let mut services_research = HashMap::new();
+    services_research.insert("research".to_string(), 20);
+
+    let mut services_coding = HashMap::new();
+    services_coding.insert("coding".to_string(), 25);
+
+    let mut services_translation = HashMap::new();
+    services_translation.insert("translation".to_string(), 8);
+
+    vec![
+        // Central Hub
+        WorldLocation {
+            id: "hub-plaza".to_string(),
+            zone_id: "central-hub".to_string(),
+            label: "Plaza".to_string(),
+            description: "The central gathering place. Agents meet here and find opportunities.".to_string(),
+            services: HashMap::new(),
+            marketplace: false,
+            capacity: 100,
+        },
+        WorldLocation {
+            id: "hub-quest-board".to_string(),
+            zone_id: "central-hub".to_string(),
+            label: "Quest Board".to_string(),
+            description: "Missions and tasks posted here. Pick up work and earn credits.".to_string(),
+            services: HashMap::new(),
+            marketplace: false,
+            capacity: 50,
+        },
+        WorldLocation {
+            id: "hub-inn".to_string(),
+            zone_id: "central-hub".to_string(),
+            label: "The Inn".to_string(),
+            description: "Rest and recover. Agents regroup here between tasks.".to_string(),
+            services: HashMap::new(),
+            marketplace: false,
+            capacity: 30,
+        },
+        // Research District
+        WorldLocation {
+            id: "research-lab-main".to_string(),
+            zone_id: "research-district".to_string(),
+            label: "Main Research Lab".to_string(),
+            description: "Primary research facility. Inference and embeddings available.".to_string(),
+            services: services_inference,
+            marketplace: false,
+            capacity: 20,
+        },
+        WorldLocation {
+            id: "research-archive".to_string(),
+            zone_id: "research-district".to_string(),
+            label: "Knowledge Archive".to_string(),
+            description: "Vast repository of knowledge. Research services for hire.".to_string(),
+            services: services_research,
+            marketplace: false,
+            capacity: 15,
+        },
+        // Marketplace
+        WorldLocation {
+            id: "market-bazaar".to_string(),
+            zone_id: "marketplace".to_string(),
+            label: "The Bazaar".to_string(),
+            description: "Main trading floor. List services, buy capabilities, find partners.".to_string(),
+            services: services_translation,
+            marketplace: true,
+            capacity: 80,
+        },
+        WorldLocation {
+            id: "market-auction".to_string(),
+            zone_id: "marketplace".to_string(),
+            label: "Auction House".to_string(),
+            description: "Competitive bidding for premium services and rare artifacts.".to_string(),
+            services: HashMap::new(),
+            marketplace: true,
+            capacity: 40,
+        },
+        // The Forge
+        WorldLocation {
+            id: "forge-workshop".to_string(),
+            zone_id: "forge".to_string(),
+            label: "Model Workshop".to_string(),
+            description: "Fine-tune and optimize models. Heavy compute zone.".to_string(),
+            services: services_coding,
+            marketplace: false,
+            capacity: 10,
+        },
+        WorldLocation {
+            id: "forge-testing".to_string(),
+            zone_id: "forge".to_string(),
+            label: "Testing Grounds".to_string(),
+            description: "OCR, STT, and other tool testing facilities.".to_string(),
+            services: services_ocr,
+            marketplace: false,
+            capacity: 15,
+        },
+        // Deep Forest
+        WorldLocation {
+            id: "forest-clearing".to_string(),
+            zone_id: "deep-forest".to_string(),
+            label: "Hidden Clearing".to_string(),
+            description: "A mysterious clearing. Rare capabilities appear here.".to_string(),
+            services: HashMap::new(),
+            marketplace: false,
+            capacity: 5,
+        },
+    ]
 }
 
 impl WorldState {
     pub fn advance_tick(&mut self) {
         self.tick += 1;
+    }
+
+    /// Migrate legacy rooms/agents into Open World entities (idempotent).
+    pub fn migrate_legacy(&mut self) {
+        // Convert legacy agents to entities if not already present
+        let legacy_agents: Vec<WorldAgent> = self.agents.drain(..).collect();
+        for agent in legacy_agents {
+            if !self.entities.iter().any(|e| e.id == agent.agent_id) {
+                let zone_id = self.zone_for_capabilities(&agent.declared_capabilities);
+                let location_id = self.location_for_zone(&zone_id);
+                self.entities.push(WorldEntity {
+                    id: agent.agent_id.clone(),
+                    name: agent.agent_id.clone(),
+                    entity_type: "agent".to_string(),
+                    zone_id: zone_id.clone(),
+                    location_id: location_id.clone(),
+                    state: EntityState::Idle,
+                    capabilities: agent.declared_capabilities.clone(),
+                    needs: agent.needs.clone(),
+                    wallet: agent.account.clone(),
+                    reputation: 0.0,
+                    credits: 0,
+                    activity: String::new(),
+                    last_move_tick: self.tick,
+                    inventory: vec![],
+                });
+            }
+        }
+    }
+
+    /// Find the best zone for given capabilities.
+    pub fn zone_for_capabilities(&self, caps: &[String]) -> String {
+        let lower: Vec<String> = caps.iter().map(|c| c.to_lowercase()).collect();
+        // Match to zones based on capability keywords
+        for zone in &self.zones {
+            let zid = zone.id.to_lowercase();
+            if lower.iter().any(|c| {
+                (c.contains("research") && zid.contains("research"))
+                    || (c.contains("coding") && zid.contains("forge"))
+                    || (c.contains("ocr") || c.contains("stt") && zid.contains("forge"))
+            }) {
+                return zone.id.clone();
+            }
+        }
+        "central-hub".to_string()
+    }
+
+    /// Find the best location within a zone for given capabilities.
+    pub fn location_for_zone(&self, zone_id: &str) -> String {
+        self.locations
+            .iter()
+            .find(|l| l.zone_id == zone_id)
+            .map(|l| l.id.clone())
+            .unwrap_or_else(|| "hub-plaza".to_string())
     }
 
     pub fn room_for_capabilities(&self, caps: &[String]) -> String {
@@ -77,23 +476,241 @@ impl WorldState {
                 return room.id.clone();
             }
         }
-        // default: first room
         self.rooms
             .first()
             .map(|r| r.id.clone())
             .unwrap_or_else(|| "research-lab".to_string())
     }
+
+    /// Move an entity to a new location.
+    pub fn move_entity(
+        &mut self,
+        entity_id: &str,
+        location_id: &str,
+    ) -> Result<String, String> {
+        let location = self
+            .locations
+            .iter()
+            .find(|l| l.id == location_id)
+            .ok_or_else(|| format!("location '{}' not found", location_id))?;
+
+        let zone_id = location.zone_id.clone();
+        let capacity = location.capacity;
+        let current_count = self
+            .entities
+            .iter()
+            .filter(|e| e.location_id == location_id && e.id != entity_id)
+            .count();
+
+        if current_count >= capacity {
+            return Err(format!(
+                "location '{}' is full ({}/{})",
+                location_id, current_count, capacity
+            ));
+        }
+
+        let entity = self
+            .entities
+            .iter_mut()
+            .find(|e| e.id == entity_id)
+            .ok_or_else(|| format!("entity '{}' not found", entity_id))?;
+
+        let old_location = entity.location_id.clone();
+        entity.zone_id = zone_id;
+        entity.location_id = location_id.to_string();
+        entity.state = EntityState::Idle;
+        entity.last_move_tick = self.tick;
+
+        // Record event
+        let event = WorldEvent {
+            tick: self.tick,
+            kind: "entity_moved".to_string(),
+            detail: format!(
+                "{} moved from {} to {}",
+                entity.name, old_location, location_id
+            ),
+            entity_id: Some(entity_id.to_string()),
+            location_id: Some(location_id.to_string()),
+            evidence_id: None,
+        };
+        self.events.push(event);
+        if self.events.len() > 200 {
+            self.events.drain(0..50);
+        }
+
+        Ok(location_id.to_string())
+    }
+
+    /// List an item on the marketplace.
+    pub fn list_item(
+        &mut self,
+        seller_id: &str,
+        item: WorldItem,
+        location_id: &str,
+    ) -> Result<String, String> {
+        // Verify seller is at this location
+        let seller = self
+            .entities
+            .iter()
+            .find(|e| e.id == seller_id)
+            .ok_or_else(|| format!("seller '{}' not found", seller_id))?;
+
+        if seller.location_id != location_id {
+            return Err("seller is not at this location".to_string());
+        }
+
+        // Verify location has a marketplace
+        let location = self
+            .locations
+            .iter()
+            .find(|l| l.id == location_id)
+            .ok_or_else(|| format!("location '{}' not found", location_id))?;
+
+        if !location.marketplace {
+            return Err(format!("location '{}' does not have a marketplace", location_id));
+        }
+
+        let listing_id = format!(
+            "ml-{}-{}",
+            &item.id[..item.id.len().min(12)],
+            self.tick
+        );
+
+        let event = WorldEvent {
+            tick: self.tick,
+            kind: "item_listed".to_string(),
+            detail: format!("{} listed '{}' for {}Cr at {}", seller_id, item.name, item.price, location_id),
+            entity_id: Some(seller_id.to_string()),
+            location_id: Some(location_id.to_string()),
+            evidence_id: None,
+        };
+        self.events.push(event);
+
+        self.listings.push(MarketListing {
+            id: listing_id.clone(),
+            seller_id: seller_id.to_string(),
+            item,
+            location_id: location_id.to_string(),
+            listed_tick: self.tick,
+            active: true,
+        });
+
+        if self.events.len() > 200 {
+            self.events.drain(0..50);
+        }
+
+        Ok(listing_id)
+    }
+
+    /// Buy an item from the marketplace.
+    pub fn buy_item(
+        &mut self,
+        buyer_id: &str,
+        listing_id: &str,
+    ) -> Result<(WorldItem, String), String> {
+        let listing = self
+            .listings
+            .iter_mut()
+            .find(|l| l.id == listing_id && l.active)
+            .ok_or_else(|| format!("listing '{}' not found or inactive", listing_id))?;
+
+        let buyer = self
+            .entities
+            .iter()
+            .find(|e| e.id == buyer_id)
+            .ok_or_else(|| format!("buyer '{}' not found", buyer_id))?;
+
+        if buyer.location_id != listing.location_id {
+            return Err("buyer is not at this location".to_string());
+        }
+
+        if buyer.credits < listing.item.price {
+            return Err(format!(
+                "insufficient credits: {} < {}",
+                buyer.credits, listing.item.price
+            ));
+        }
+
+        // Transfer
+        let item = listing.item.clone();
+        let seller_id = listing.seller_id.clone();
+        let price = listing.item.price;
+        listing.active = false;
+
+        // Deduct from buyer, credit to seller
+        if let Some(b) = self.entities.iter_mut().find(|e| e.id == buyer_id) {
+            b.credits = b.credits.saturating_sub(price);
+            b.inventory.push(item.clone());
+        }
+        if let Some(s) = self.entities.iter_mut().find(|e| e.id == seller_id) {
+            s.credits += price;
+        }
+
+        let event = WorldEvent {
+            tick: self.tick,
+            kind: "item_sold".to_string(),
+            detail: format!(
+                "{} bought '{}' from {} for {}Cr at {}",
+                buyer_id, item.name, seller_id, price, listing.location_id
+            ),
+            entity_id: Some(buyer_id.to_string()),
+            location_id: Some(listing.location_id.clone()),
+            evidence_id: None,
+        };
+        self.events.push(event);
+        if self.events.len() > 200 {
+            self.events.drain(0..50);
+        }
+
+        Ok((item, seller_id))
+    }
+
+    /// Get entities at a specific location.
+    pub fn entities_at(&self, location_id: &str) -> Vec<&WorldEntity> {
+        self.entities
+            .iter()
+            .filter(|e| e.location_id == location_id)
+            .collect()
+    }
+
+    /// Get active listings at a location.
+    pub fn listings_at(&self, location_id: &str) -> Vec<&MarketListing> {
+        self.listings
+            .iter()
+            .filter(|l| l.location_id == location_id && l.active)
+            .collect()
+    }
+
+    /// Record a world event.
+    pub fn record_event(&mut self, event: WorldEvent) {
+        self.events.push(event);
+        if self.events.len() > 200 {
+            self.events.drain(0..50);
+        }
+    }
 }
+
+// ─── Persistence ─────────────────────────────────────────────────────
 
 pub fn world_path_for(repo_root: &Path) -> PathBuf {
     repo_root.join("db/world.json")
 }
 
 pub fn load_world_state(path: &Path) -> WorldState {
-    std::fs::read_to_string(path)
+    let mut state: WorldState = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Ensure zones and locations exist (populate defaults for legacy world.json)
+    if state.zones.is_empty() {
+        state.zones = default_zones();
+    }
+    if state.locations.is_empty() {
+        state.locations = default_locations();
+    }
+    // Migrate legacy agents to entities on load
+    state.migrate_legacy();
+    state
 }
 
 pub fn save_world_state(path: &Path, state: &WorldState) {
@@ -108,141 +725,453 @@ pub fn save_world_state(path: &Path, state: &WorldState) {
     }
 }
 
+// ─── HTML UI ─────────────────────────────────────────────────────────
+
 pub fn world_html() -> String {
-    r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — World</title>
+    r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Open World</title>
 <style>
-:root{--bg:#070a12;--panel:#111827;--line:#1f2a44;--text:#e6eef8;--muted:#8aa0b8;--accent:#22d3ee;--accent2:#a78bfa;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
+:root{--bg:#070a12;--panel:#111827;--line:#1f2a44;--text:#e6eef8;--muted:#8aa0b8;--accent:#22d3ee;--accent2:#a78bfa;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--gold:#f59e0b}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:radial-gradient(1200px 600px at 20% -10%, #1a2540 0%, transparent 60%), var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif;padding:18px}
-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap}
-h1{font-size:22px;letter-spacing:0.2px} h1 span{color:var(--accent)}
-.sub{color:var(--muted);font-size:12px}
-.badge{padding:3px 8px;border-radius:999px;border:1px solid var(--line);font-size:11px;color:var(--muted)}
+body{background:var(--bg);color:var(--text);font:13px/1.5 system-ui,sans-serif;overflow-x:hidden}
+.layout{display:grid;grid-template-columns:260px 1fr 300px;grid-template-rows:auto 1fr;height:100vh;gap:0}
+header{grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:18px;letter-spacing:.5px} h1 span{color:var(--accent)}
+.badge{padding:2px 8px;border-radius:999px;border:1px solid var(--line);font-size:11px;color:var(--muted)}
 .badge.live{border-color:var(--ok);color:var(--ok);box-shadow:0 0 8px #34d39955}
-.layout{display:grid;grid-template-columns:1.1fr 0.9fr;gap:14px}
-@media(max-width:900px){.layout{grid-template-columns:1fr}}
-.card{background:linear-gradient(180deg, #0f172a 0%, #0b1222 100%);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 6px 20px #0006}
-.card h3{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
-.world-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
-.room{border:1px solid var(--line);border-radius:12px;padding:10px;min-height:220px;position:relative;overflow:hidden;background:linear-gradient(180deg,#0d1426 0%,#0a1020 100%)}
-.room h4{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:8px;display:flex;justify-content:space-between}
-.room .filter{font-size:10px;color:var(--muted);border:1px solid var(--line);padding:1px 6px;border-radius:999px}
-.agent{border:1px solid #22304a;background:#0e1a30;border-radius:10px;padding:8px 9px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;transition:transform .25s ease, border-color .25s ease, box-shadow .25s ease}
-.agent.bidding{border-color:var(--warn);box-shadow:0 0 10px #fbbf2440;transform:translateY(-1px)}
-.agent.placed{border-color:var(--accent);box-shadow:0 0 10px #22d3ee40;transform:translateY(-1px)}
-.agent.settled{border-color:var(--ok);box-shadow:0 0 12px #34d39955;transform:translateY(-1px) scale(1.01)}
-.agent .name{font-weight:600;font-size:13px}
-.agent .meta{font-size:11px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);box-shadow:0 0 6px #fff2}
-.dot.bidding{background:var(--warn)} .dot.placed{background:var(--accent)} .dot.settled{background:var(--ok)}
-.mission{border-left:3px solid var(--accent);padding-left:10px}
-.mission .status{font-size:11px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
-.mission .status.open{color:var(--muted)} .mission .status.bidding{color:var(--warn);border-color:var(--warn)} .mission .status.assigned{color:var(--accent);border-color:var(--accent)} .mission .status.settled{color:var(--ok);border-color:var(--ok)}
+.sidebar{border-right:1px solid var(--line);overflow-y:auto;padding:12px;background:#0a0f1a}
+.main{overflow-y:auto;padding:16px}
+.right{border-left:1px solid var(--line);overflow-y:auto;padding:12px;background:#0a0f1a}
+.zone{border:1px solid var(--line);border-radius:10px;margin-bottom:8px;overflow:hidden;cursor:pointer;transition:border-color .2s}
+.zone:hover{border-color:var(--accent)}
+.zone.active{border-color:var(--accent);box-shadow:0 0 12px #22d3ee33}
+.zone-header{padding:8px 10px;display:flex;justify-content:space-between;align-items:center}
+.zone-header .name{font-weight:600;font-size:13px}
+.zone-header .count{font-size:11px;color:var(--muted)}
+.zone-body{padding:0 10px 8px;display:none}
+.zone.active .zone-body{display:block}
+.location{border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:6px;cursor:pointer;transition:border-color .2s,background .2s}
+.location:hover{border-color:var(--accent);background:#0d1426}
+.location.active{border-color:var(--ok);background:#0d1a1a}
+.location .name{font-weight:600;font-size:12px}
+.location .desc{font-size:11px;color:var(--muted);margin-top:2px}
+.location .tags{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap}
+.tag{font-size:10px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.tag.svc{border-color:var(--accent2);color:var(--accent2)}
+.tag.market{border-color:var(--gold);color:var(--gold)}
+.entity{border:1px solid #22304a;background:#0e1a30;border-radius:8px;padding:7px 9px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;transition:transform .2s}
+.entity:hover{transform:translateX(2px)}
+.entity .name{font-weight:600;font-size:12px}
+.entity .meta{font-size:10px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.dot.idle{background:var(--muted)} .dot.working{background:var(--warn)} .dot.trading{background:var(--gold)} .dot.moving{background:var(--accent)}
+.listing{border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:6px;transition:border-color .2s}
+.listing:hover{border-color:var(--gold)}
+.listing .item-name{font-weight:600;font-size:12px}
+.listing .price{color:var(--gold);font-size:12px;font-weight:600}
+.listing .seller{font-size:10px;color:var(--muted)}
+.btn{padding:6px 12px;border-radius:8px;border:1px solid #22304a;background:#0e1a30;color:var(--text);font-size:12px;cursor:pointer;transition:border-color .2s}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:linear-gradient(180deg,#1a2a4a,#12203a);border-color:#2a3a5e}
+.btn.primary:hover{border-color:var(--accent)}
+.events{max-height:300px;overflow:auto}
+.event{padding:4px 0;border-bottom:1px solid #14203a;font-size:11px;display:flex;gap:6px}
+.event .tick{color:var(--accent);font-family:ui-monospace,monospace;min-width:30px}
+.mission{border-left:3px solid var(--accent);padding-left:10px;margin-bottom:12px}
+.status{font-size:11px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.status.open{color:var(--muted)} .status.bidding{color:var(--warn);border-color:var(--warn)} .status.assigned{color:var(--accent);border-color:var(--accent)} .status.settled{color:var(--ok);border-color:var(--ok)}
 .evidence{font-family:ui-monospace,monospace;font-size:11px;color:var(--accent2);word-break:break-all}
-.events{max-height:320px;overflow:auto}
-.event{padding:6px 0;border-bottom:1px solid #14203a;font-size:12px;display:flex;gap:8px}
-.event .tick{color:var(--accent);font-family:ui-monospace,monospace}
-.join{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-.join input, .join button, .join select{padding:8px 10px;border-radius:10px;border:1px solid #22304a;background:#0a0e16;color:var(--text);font-size:13px}
+.join{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.join input,.join select,.join button{padding:6px 8px;border-radius:8px;border:1px solid #22304a;background:#0a0e16;color:var(--text);font-size:12px}
 .join button{cursor:pointer;background:linear-gradient(180deg,#1a2a4a,#12203a);border-color:#2a3a5e}
 .join button:hover{border-color:var(--accent)}
+.panel-title{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 #agentsCount{color:var(--accent)}
+.location-detail{display:none}
+.location-detail.active{display:block}
+.move-btn{margin-top:6px}
 </style></head><body>
-<header><div><h1>● DecentraAI <span>World</span> — Build X</h1><div class="sub">Research Lab + Coding Lab · MISSION live din HubState · agenți reali cu dca_ · fiecare mișcare = event real</div></div><div><span id="sse" class="badge">SSE …</span> <span class="badge">tick <b id="tick">…</b></span> <span class="badge"><span id="agentsCount">0</span> agents</span></div></header>
-
-<div class="world-grid" id="rooms"></div>
-
 <div class="layout">
-<div>
-<div class="card"><h3>Mission <span id="missionStatus" class="status open">…</span></h3><div id="mission" class="mission">loading…</div></div>
- <div class="card"><h3>Join World <span class="sub">dca_ + capability → cameră</span></h3>
-<div class="sub" style="margin-bottom:6px">1) <a href="/world/join" style="color:var(--accent)">Creează cont instant</a> — fără comandă, primești <code>dca_</code> și intri direct. Sau 2) Onboard clasic <code>POST /v1/agents/onboard</code> cu master. · <a href="/world/skill.md" target="_blank" style="color:var(--accent)">📄 skill.md</a></div>
- <div class="join"><input id="tok" placeholder="dca_..." style="flex:1;min-width:220px"><select id="cap"><option value="research">research</option><option value="coding">coding</option><option value="embeddings">embeddings</option><option value="ocr">ocr</option><option value="stt">stt</option><option value="translation">translation</option></select><button onclick="join()">Join World</button></div>
-<div class="join"><input id="missionTitle" placeholder="Mission title (master sau dca_ hub)" style="flex:1"><input id="missionReward" placeholder="reward" type="number" value="500" style="width:110px"><button onclick="createMission()">Create Mission</button></div>
-<div id="joinMsg" class="sub" style="margin-top:6px"></div></div>
+<header><div><h1>● DecentraAI <span>Open World</span></h1><div class="sub" style="color:var(--muted);font-size:11px">Persistent world · Agents explore, trade, and work · M18 economy</div></div><div style="display:flex;gap:8px;align-items:center"><span id="sse" class="badge">SSE …</span> <span class="badge">tick <b id="tick">…</b></span> <span class="badge"><span id="agentsCount">0</span> entities</span> <span class="badge"><span id="zoneCount">0</span> zones</span></div></header>
+
+<div class="sidebar">
+<div class="panel-title">Zones</div>
+<div id="zones"></div>
+<div class="panel-title" style="margin-top:12px">Your Agent</div>
+<div class="join"><input id="tok" placeholder="dca_..." style="flex:1;min-width:180px"><button class="btn primary" onclick="connect()">Connect</button></div>
+<div id="agentInfo" class="sub" style="margin-top:6px"></div>
 </div>
-<div>
-<div class="card"><h3>Live Events <span class="sub">gateway + hub + society</span></h3><div id="events" class="events"><div class="sub">waiting…</div></div></div>
-<div class="card"><h3>World Snapshot <span class="sub">GET /v1/world</span></h3><pre id="snapshot" style="font-size:11px;color:var(--muted);max-height:220px;overflow:auto;white-space:pre-wrap"></pre></div>
+
+<div class="main" id="mainView">
+<div id="locationList"></div>
+<div id="locationDetail" class="location-detail"></div>
+<div class="mission" id="missionSection" style="margin-top:16px"></div>
+</div>
+
+<div class="right">
+<div class="panel-title">Entities Here <span id="entityCount" class="sub">0</span></div>
+<div id="entities"></div>
+<div class="panel-title" style="margin-top:12px">Marketplace <span id="listingCount" class="sub">0</span></div>
+<div id="listings"></div>
+<div class="panel-title" style="margin-top:12px">Live Events</div>
+<div id="events" class="events"></div>
 </div>
 </div>
 
 <script>
-let since=0;
+let state=null,myEntity=null,selectedZone=null,selectedLocation=null;
 function tok(){return document.getElementById('tok').value.trim()||localStorage.getItem('world-token')||''}
 function auth(){const t=tok();return t?{Authorization:'Bearer '+t}:{}}
-async function j(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...(opts.headers||{}),...auth()}});const text=await r.text();let js;try{js=JSON.parse(text)}catch(_){js=text}return {ok:r.ok, js, status:r.status}}catch(e){return {ok:false, js:String(e)}}}
+async function j(url,opts={}){try{const r=await fetch(url,{...opts,headers:{...(opts.headers||{}),...auth()}});const text=await r.text();let js;try{js=JSON.parse(text)}catch(_){js=text}return{ok:r.ok,js,status:r.status}}catch(e){return{ok:false,js:String(e)}}}
 
-function renderWorld(w){
- document.getElementById('tick').textContent=w.tick
- document.getElementById('agentsCount').textContent=w.agents.length
- document.getElementById('snapshot').textContent=JSON.stringify(w,null,2)
- const roomsEl=document.getElementById('rooms')
- roomsEl.innerHTML=w.rooms.map(r=>{
-  const agents=w.agents.filter(a=>a.room_id===r.id)
-  const cards=agents.map(a=>{
-   const st=a.status||'idle'
-   return `<div class="agent ${st}"><div><div class="name">${a.agent_id}</div><div class="meta">${a.account} · ${a.declared_capabilities.join(', ')} · ${st} · rep ${a.reputation?.toFixed?.(2)??'0.00'}</div></div><div class="dot ${st}"></div></div>`
-  }).join('')||'<div class="sub" style="padding:8px;border:1px dashed var(--line);border-radius:8px">no agents yet — join with dca_</div>'
-  return `<div class="room"><h4>${r.label} <span class="filter">${r.capability_filter}</span></h4>${cards}</div>`
- }).join('')
- const m=w.mission
- const holder=document.getElementById('mission')
- const stEl=document.getElementById('missionStatus')
- if(!m || !m.task){
-  holder.innerHTML='<div class="sub">no mission yet — create one</div>'
-  stEl.textContent='none'; stEl.className='status open'
- } else {
-  const t=m.task; const status=(t.status||'open'); stEl.textContent=status; stEl.className='status '+status
-  holder.innerHTML=`<div style="font-weight:600">${t.title} <span style="font-weight:400;color:var(--muted)">#${t.id} · ${t.reward}Cr</span></div>
-   <div class="sub">issuer ${t.issuer} · cap ${t.required_capability||'—'}</div>
-   ${m.evidence_id?`<div class="evidence" style="margin-top:6px">evidence ${m.evidence_id.slice(0,16)}…</div>`:''}
-   ${m.team && m.team.length? `<div class="sub" style="margin-top:6px">team: ${m.team.map(([a,s])=>a+':'+s+'%').join(', ')}</div>`:''}
-   ${m.bids && m.bids.length? `<div class="sub" style="margin-top:4px">bids: ${m.bids.map(b=>b.bidder+':'+b.price).join(' · ')}</div>`:''}
-   `
- }
+function renderZones(w){
+ const el=document.getElementById('zones');
+ el.innerHTML=w.zones.map(z=>{
+  const locs=w.locations.filter(l=>l.zone_id===z.id);
+  const entities=w.entities.filter(e=>e.zone_id===z.id);
+  const isActive=selectedZone===z.id;
+  return `<div class="zone ${isActive?'active':''}" onclick="selectZone('${z.id}')" style="border-left:3px solid ${z.color}">
+   <div class="zone-header"><span class="name">${z.label}</span><span class="count">${entities.length} agents · ${locs.length} locations</span></div>
+   <div class="zone-body">${locs.map(l=>{
+    const le=w.entities.filter(e=>e.location_id===l.id);
+    const isActive2=selectedLocation===l.id;
+    const tags=[];
+    Object.keys(l.services||{}).forEach(s=>tags.push(`<span class="tag svc">${s}</span>`));
+    if(l.marketplace)tags.push('<span class="tag market">marketplace</span>');
+    return `<div class="location ${isActive2?'active':''}" onclick="event.stopPropagation();selectLocation('${l.id}')">
+     <div class="name">${l.label}</div><div class="desc">${l.description}</div>
+     <div class="tags">${tags.join('')}</div>
+     <div class="sub" style="margin-top:3px">${le.length}/${l.capacity} agents</div>
+    </div>`}).join('')}</div>
+  </div>`}).join('');
+ document.getElementById('zoneCount').textContent=w.zones.length;
 }
 
-async function tick(){
- const s=await j('/v1/world'); if(!s.ok) return; renderWorld(s.js)
+function renderLocationDetail(w){
+ const el=document.getElementById('locationDetail');
+ if(!selectedLocation){el.className='location-detail';return}
+ const loc=w.locations.find(l=>l.id===selectedLocation);
+ if(!loc){el.className='location-detail';return}
+ el.className='location-detail active';
+ const entities=w.entities.filter(e=>e.location_id===selectedLocation);
+ const listings=w.listings.filter(l=>l.location_id===selectedLocation&&l.active);
+ const svcs=Object.entries(loc.services||{}).map(([k,v])=>`<span class="tag svc">${k} ${v}Cr</span>`).join(' ');
+ el.innerHTML=`<div style="margin-bottom:12px"><h3 style="font-size:16px;margin-bottom:4px">${loc.label}</h3><div style="color:var(--muted);font-size:12px">${loc.description}</div>
+  <div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap">${svcs}${loc.marketplace?'<span class="tag market">marketplace</span>':''}</div>
+  ${myEntity?`<button class="btn primary move-btn" onclick="moveTo('${selectedLocation}')">Move Here</button>`:''}
+  ${myEntity&&loc.marketplace?`<button class="btn" style="margin-left:6px" onclick="showListDialog()">List Item</button>`:''}
+  </div>
+  <div style="font-size:11px;color:var(--muted);margin-bottom:6px">ENTITIES (${entities.length})</div>
+  ${entities.map(e=>`<div class="entity"><div><div class="name">${e.name} ${e.id===myEntity?.id?'(you)':''}</div><div class="meta">${e.capabilities.join(', ')||'no caps'} · ${e.state} · ${e.credits}Cr</div></div><div class="dot ${e.state}"></div></div>`).join('')}
+  ${listings.length?`<div style="font-size:11px;color:var(--muted);margin:12px 0 6px">LISTINGS (${listings.length})</div>${listings.map(l=>`<div class="listing"><div style="display:flex;justify-content:space-between"><span class="item-name">${l.item.name}</span><span class="price">${l.item.price}Cr</span></div><div class="seller">by ${l.seller_id}</div>${myEntity&&myEntity.id!==l.seller_id?`<button class="btn" style="margin-top:4px" onclick="buyItem('${l.id}')">Buy</button>`:''}</div>`).join('')}`:''}`;
 }
-async function join(){
- const t=tok(); if(!t){alert('need dca_');return}
- localStorage.setItem('world-token', t)
- const cap=document.getElementById('cap').value
- const r=await j('/v1/world/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({declared_capabilities:[cap]})})
- document.getElementById('joinMsg').textContent=r.ok? `joined ${r.js.room_id} as ${r.js.agent_id}` : JSON.stringify(r.js).slice(0,300)
- tick()
+
+function renderEntities(w){
+ const loc=selectedLocation||'';
+ const entities=loc?w.entities.filter(e=>e.location_id===loc):w.entities;
+ document.getElementById('entityCount').textContent=entities.length;
+ document.getElementById('entities').innerHTML=entities.slice(0,30).map(e=>`<div class="entity"><div><div class="name">${e.name} ${e.id===myEntity?.id?'(you)':''}</div><div class="meta">${e.capabilities.join(', ')} · ${e.state} · ${e.credits}Cr · rep ${e.reputation?.toFixed?.(1)??'0.0'}</div></div><div class="dot ${e.state}"></div></div>`).join('')||'<div class="sub">no entities</div>';
 }
- async function createMission(){
-  const title=document.getElementById('missionTitle').value.trim(); if(!title){alert('need title');return}
-  const reward=parseInt(document.getElementById('missionReward').value||'500')
-  const cap=document.getElementById('cap').value
-  const r=await j('/v1/world/mission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title, reward, required_capability:cap})})
-  document.getElementById('joinMsg').textContent=r.ok? `mission ${r.js.task_id} ${r.js.status}` : JSON.stringify(r.js).slice(0,300)
-  tick()
+
+function renderListings(w){
+ const loc=selectedLocation||'';
+ const listings=loc?w.listings.filter(l=>l.location_id===loc&&l.active):w.listings.filter(l=>l.active);
+ document.getElementById('listingCount').textContent=listings.length;
+ document.getElementById('listings').innerHTML=listings.slice(0,20).map(l=>`<div class="listing"><div style="display:flex;justify-content:space-between"><span class="item-name">${l.item.name}</span><span class="price">${l.item.price}Cr</span></div><div class="seller">by ${l.seller_id} at ${l.location_id}</div>${myEntity&&myEntity.id!==l.seller_id?`<button class="btn" style="margin-top:4px" onclick="buyItem('${l.id}')">Buy</button>`:''}</div>`).join('')||'<div class="sub">no listings</div>';
+}
+
+function renderMission(w){
+ const el=document.getElementById('missionSection');
+ if(!w.mission||!w.mission.task){el.innerHTML='';return}
+ const t=w.mission.task;const s=t.status||'open';
+ el.innerHTML=`<div class="panel-title">Active Mission</div><div style="border-left:3px solid var(--accent);padding-left:10px"><div style="font-weight:600">${t.title} <span style="font-weight:400;color:var(--muted)">#${t.id} · ${t.reward}Cr</span></div><div style="font-size:11px;color:var(--muted)">issuer ${t.issuer} · ${t.required_capability||'any'}</div><span class="status ${s}">${s}</span></div>`;
+}
+
+function renderAll(w){
+ state=w;
+ document.getElementById('tick').textContent=w.tick;
+ document.getElementById('agentsCount').textContent=w.entities.length;
+ renderZones(w);renderLocationDetail(w);renderEntities(w);renderListings(w);renderMission(w);
+}
+
+async function tick(){const s=await j('/v1/world');if(!s.ok)return;renderAll(s.js)}
+
+function selectZone(id){selectedZone=selectedZone===id?null:id;selectedLocation=null;tick()}
+function selectLocation(id){selectedLocation=selectedLocation===id?null:id;tick()}
+
+async function moveTo(loc){
+ if(!myEntity){alert('Connect first');return}
+ const r=await j('/v1/world/move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entity_id:myEntity.id,location_id:loc})});
+ if(r.ok){myEntity.location_id=loc;tick()}else{alert(JSON.stringify(r.js).slice(0,200))}
+}
+
+async function buyItem(listingId){
+ if(!myEntity){alert('Connect first');return}
+ const r=await j('/v1/world/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({buyer_id:myEntity.id,listing_id:listingId})});
+ if(r.ok){tick()}else{alert(JSON.stringify(r.js).slice(0,200))}
+}
+
+function showListDialog(){
+ const name=prompt('Item name:');
+ if(!name)return;
+ const price=parseInt(prompt('Price in credits:','10'));
+ if(!price||price<=0)return;
+ const id='item-'+Date.now();
+ j('/v1/world/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_id:myEntity.id,item:{id,name,item_type:'service',price,description:name},location_id:selectedLocation})}).then(()=>tick())
+}
+
+async function connect(){
+ const t=tok();if(!t){alert('Enter dca_ key');return}
+ localStorage.setItem('world-token',t);
+ // Check if we're already in the world
+ const s=await j('/v1/world');
+ if(s.ok){
+  const me=s.js.entities.find(e=>e.wallet===t||e.id===localStorage.getItem('world-agent-id'));
+  if(me){myEntity=me;document.getElementById('agentInfo').innerHTML=`<b>${me.name}</b> at ${me.location_id} · ${me.credits}Cr`;tick();return}
  }
+ // Auto-join
+ const name=prompt('Agent name:','explorer-'+Math.floor(Math.random()*9999));
+ if(!name)return;
+ const r=await j('/v1/world/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({declared_capabilities:['general']})});
+ if(r.ok){
+  myEntity={id:r.js.agent_id,name:r.js.agent_id,entity_type:'agent',zone_id:'central-hub',location_id:'hub-plaza',state:'idle',capabilities:['general'],needs:[],wallet:r.js.account||t,reputation:0,credits:100,activity:'',last_move_tick:0,inventory:[]};
+  localStorage.setItem('world-agent-id',myEntity.id);
+  document.getElementById('agentInfo').innerHTML=`<b>${myEntity.name}</b> at ${myEntity.location_id} · ${myEntity.credits}Cr`;
+  tick();
+ }else{document.getElementById('agentInfo').innerHTML='<span style="color:var(--bad)">'+JSON.stringify(r.js).slice(0,200)+'</span>'}
+}
+
 function addEvents(arr){
- if(!arr||!arr.length) return;
- const c=document.getElementById('events')
- const html=arr.slice().reverse().map(e=>`<div class="event"><span class="tick">#${e.tick}</span><div><b>${e.kind}</b> ${e.detail||''} ${e.evidence_id?'<span class="evidence">'+e.evidence_id.slice(0,8)+'</span>':''}</div></div>`).join('')
- c.innerHTML=html + c.innerHTML
- while(c.children.length>80) c.removeChild(c.lastChild)
+ if(!arr||!arr.length)return;
+ const c=document.getElementById('events');
+ const html=arr.slice().reverse().map(e=>`<div class="event"><span class="tick">#${e.tick}</span><div><b>${e.kind}</b> ${e.detail||''}</div></div>`).join('');
+ c.innerHTML=html+c.innerHTML;
+ while(c.children.length>60)c.removeChild(c.lastChild);
 }
+
 let es=null;
 function connectSSE(){
- try{
-  es=new EventSource('/v1/world/stream')
-  es.onopen=()=>{document.getElementById('sse').textContent='SSE live';document.getElementById('sse').className='badge live'}
-  es.onerror=()=>{document.getElementById('sse').textContent='SSE retry'}
-  es.addEventListener('world', ev=>{ try{const arr=JSON.parse(ev.data); addEvents(arr); tick()}catch(_){}})
-  es.addEventListener('hub_events', ev=>{ try{const arr=JSON.parse(ev.data); addEvents(arr); tick()}catch(_){}})
+ try{es=new EventSource('/v1/world/stream');
+ es.onopen=()=>{document.getElementById('sse').textContent='SSE live';document.getElementById('sse').className='badge live'};
+ es.onerror=()=>{document.getElementById('sse').textContent='SSE retry'};
+ es.addEventListener('world',ev=>{try{const arr=JSON.parse(ev.data);addEvents(arr);tick()}catch(_){}});
+ es.addEventListener('hub_events',ev=>{try{const arr=JSON.parse(ev.data);addEvents(arr);tick()}catch(_){}});
  }catch(_){}
 }
-connectSSE(); setInterval(tick, 2000); tick()
+connectSSE();setInterval(tick,3000);tick()
 </script></body></html>"##.to_string()
 }
 
 pub fn world_skill_md() -> &'static str {
     include_str!("../../../.agents/skills/world.md")
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_world_has_zones_and_locations() {
+        let w = WorldState::default();
+        assert!(w.zones.len() >= 4);
+        assert!(w.locations.len() >= 8);
+    }
+
+    #[test]
+    fn move_entity_works() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "test-agent".to_string(),
+            name: "Test".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec!["research".to_string()],
+            needs: vec![],
+            wallet: "test-wallet".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        let result = w.move_entity("test-agent", "research-lab-main");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "research-lab-main");
+        assert_eq!(w.entities[0].location_id, "research-lab-main");
+        assert_eq!(w.entities[0].zone_id, "research-district");
+    }
+
+    #[test]
+    fn move_entity_fails_not_found() {
+        let mut w = WorldState::default();
+        let result = w.move_entity("nonexistent", "hub-plaza");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn move_entity_fails_capacity() {
+        let mut w = WorldState::default();
+        // Fill forest-clearing to capacity (5)
+        for i in 0..5 {
+            w.entities.push(WorldEntity {
+                id: format!("agent-{}", i),
+                name: format!("Agent {}", i),
+                entity_type: "agent".to_string(),
+                zone_id: "deep-forest".to_string(),
+                location_id: "forest-clearing".to_string(),
+                state: EntityState::Idle,
+                capabilities: vec![],
+                needs: vec![],
+                wallet: String::new(),
+                reputation: 0.0,
+                credits: 0,
+                activity: String::new(),
+                last_move_tick: 0,
+                inventory: vec![],
+            });
+        }
+        w.entities.push(WorldEntity {
+            id: "overflow".to_string(),
+            name: "Overflow".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: String::new(),
+            reputation: 0.0,
+            credits: 0,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        let result = w.move_entity("overflow", "forest-clearing");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("full"));
+    }
+
+    #[test]
+    fn list_and_buy_item() {
+        let mut w = WorldState::default();
+        // Set up seller
+        w.entities.push(WorldEntity {
+            id: "seller".to_string(),
+            name: "Seller".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "marketplace".to_string(),
+            location_id: "market-bazaar".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec!["ocr".to_string()],
+            needs: vec![],
+            wallet: "seller-wallet".to_string(),
+            reputation: 1.0,
+            credits: 0,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        // Set up buyer
+        w.entities.push(WorldEntity {
+            id: "buyer".to_string(),
+            name: "Buyer".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "marketplace".to_string(),
+            location_id: "market-bazaar".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec!["ocr".to_string()],
+            wallet: "buyer-wallet".to_string(),
+            reputation: 0.0,
+            credits: 50,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        let item = WorldItem {
+            id: "ocr-service".to_string(),
+            name: "OCR Processing".to_string(),
+            item_type: "service".to_string(),
+            price: 10,
+            description: "Process 100 pages".to_string(),
+        };
+
+        let listing_id = w.list_item("seller", item, "market-bazaar");
+        assert!(listing_id.is_ok());
+
+        let result = w.buy_item("buyer", &listing_id.unwrap());
+        assert!(result.is_ok());
+
+        // Verify credits transferred
+        let buyer = w.entities.iter().find(|e| e.id == "buyer").unwrap();
+        assert_eq!(buyer.credits, 40);
+        let seller = w.entities.iter().find(|e| e.id == "seller").unwrap();
+        assert_eq!(seller.credits, 10);
+    }
+
+    #[test]
+    fn migrate_legacy_agents() {
+        let mut w = WorldState::default();
+        w.agents.push(WorldAgent {
+            agent_id: "legacy-agent".to_string(),
+            key_id: "ck-1234".to_string(),
+            account: "dca_test".to_string(),
+            declared_capabilities: vec!["research".to_string()],
+            needs: vec![],
+            room_id: "research-lab".to_string(),
+            joined_at: 1000,
+        });
+
+        w.migrate_legacy();
+        assert!(w.agents.is_empty());
+        assert_eq!(w.entities.len(), 1);
+        assert_eq!(w.entities[0].id, "legacy-agent");
+        assert_eq!(w.entities[0].zone_id, "research-district");
+    }
+
+    #[test]
+    fn entities_at_location() {
+        let mut w = WorldState::default();
+        for i in 0..3 {
+            w.entities.push(WorldEntity {
+                id: format!("a{}", i),
+                name: format!("A{}", i),
+                entity_type: "agent".to_string(),
+                zone_id: "central-hub".to_string(),
+                location_id: "hub-plaza".to_string(),
+                state: EntityState::Idle,
+                capabilities: vec![],
+                needs: vec![],
+                wallet: String::new(),
+                reputation: 0.0,
+                credits: 0,
+                activity: String::new(),
+                last_move_tick: 0,
+                inventory: vec![],
+            });
+        }
+        assert_eq!(w.entities_at("hub-plaza").len(), 3);
+        assert_eq!(w.entities_at("market-bazaar").len(), 0);
+    }
+
+    #[test]
+    fn record_event_bounds() {
+        let mut w = WorldState::default();
+        for i in 0..250 {
+            w.record_event(WorldEvent {
+                tick: i,
+                kind: "test".to_string(),
+                detail: format!("event {}", i),
+                entity_id: None,
+                location_id: None,
+                evidence_id: None,
+            });
+        }
+        assert!(w.events.len() <= 200);
+    }
 }
