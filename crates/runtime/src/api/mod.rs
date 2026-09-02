@@ -1403,6 +1403,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/entity", get(world_entity_handler))
         .route("/v1/world/tick", post(world_tick_handler))
         .route("/v1/world/service", post(world_service_handler))
+        .route("/v1/world/quest/list", get(world_quest_list_handler))
+        .route("/v1/world/quest/accept", post(world_quest_accept_handler))
+        .route("/v1/world/quest/complete", post(world_quest_complete_handler))
+        .route("/v1/world/quest/generate", post(world_quest_generate_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -2746,6 +2750,142 @@ async fn world_service_handler(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/world/quest/list — list all quests.
+async fn world_quest_list_handler(State(state): State<ApiState>) -> Response {
+    let mut world = state.world.lock().await;
+    // Ensure quests exist
+    world.questkeeper_tick();
+    let quests: Vec<serde_json::Value> = world
+        .quests
+        .iter()
+        .map(|q| {
+            serde_json::json!({
+                "id": q.id,
+                "title": q.title,
+                "description": q.description,
+                "giver_id": q.giver_id,
+                "objectives": q.objectives,
+                "progress": q.progress,
+                "reward": q.reward,
+                "status": q.status,
+                "accepted_by": q.accepted_by,
+                "created_tick": q.created_tick,
+                "deadline_tick": q.deadline_tick,
+                "required_reputation": q.required_reputation,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({"quests": quests}))).into_response()
+}
+
+/// POST /v1/world/quest/accept — accept a quest.
+async fn world_quest_accept_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let quest_id = body
+        .get("quest_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let agent_id = body
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if quest_id.is_empty() || agent_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "quest_id and agent_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.accept_quest(&quest_id, &agent_id) {
+        Ok(()) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "quest_id": quest_id})))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/quest/complete — complete a quest and get rewards.
+async fn world_quest_complete_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let quest_id = body
+        .get("quest_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if quest_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "quest_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.complete_quest(&quest_id) {
+        Ok(reward) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "quest_id": quest_id,
+                    "reward": reward,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/quest/generate — manually generate a new quest.
+async fn world_quest_generate_handler(State(state): State<ApiState>) -> Response {
+    let mut world = state.world.lock().await;
+    match world.generate_quest() {
+        Some(quest) => {
+            let quest_id = quest.id.clone();
+            world.quests.push(quest);
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "quest_id": quest_id})),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": false, "error": "no quests can be generated"})),
         )
             .into_response(),
     }

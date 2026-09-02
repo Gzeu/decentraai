@@ -169,6 +169,99 @@ pub struct WorldEvent {
     pub evidence_id: Option<String>,
 }
 
+// ─── Quests ──────────────────────────────────────────────────────────
+
+/// Type of quest objective.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestObjective {
+    /// Move to a specific location.
+    MoveTo { location_id: String },
+    /// Purchase a service at a location.
+    BuyService { location_id: String, service: String },
+    /// List an item on the marketplace.
+    ListItem { location_id: String },
+    /// Buy an item from the marketplace.
+    BuyItem { location_id: String },
+    /// Trade with another entity (buy or sell).
+    Trade { location_id: String },
+    /// Visit any location in a zone.
+    VisitZone { zone_id: String },
+    /// Accumulate a certain amount of credits.
+    EarnCredits { amount: u64 },
+    /// Have a certain reputation score.
+    ReachReputation { score: f32 },
+}
+
+/// Status of a quest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestStatus {
+    /// Available for acceptance.
+    Available,
+    /// Accepted by an agent, in progress.
+    Active,
+    /// All objectives completed, ready to turn in.
+    Ready,
+    /// Completed and rewarded.
+    Completed,
+    /// Failed or expired.
+    Failed,
+}
+
+/// Reward for completing a quest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestReward {
+    /// Credits awarded.
+    #[serde(default)]
+    pub credits: u64,
+    /// Reputation bonus.
+    #[serde(default)]
+    pub reputation: f32,
+    /// Items awarded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<WorldItem>,
+    /// Access to a zone unlock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_unlock: Option<String>,
+}
+
+/// A quest in the world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Quest {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    /// Who gave the quest (NPC id).
+    pub giver_id: String,
+    /// Objectives to complete (all must be done).
+    pub objectives: Vec<QuestObjective>,
+    /// Current progress per objective (same length as objectives).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<bool>,
+    /// Reward for completing.
+    pub reward: QuestReward,
+    /// Current status.
+    pub status: QuestStatus,
+    /// Who accepted this quest (agent id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_by: Option<String>,
+    /// When the quest was generated (tick).
+    pub created_tick: u64,
+    /// When the quest was accepted (tick).
+    #[serde(default)]
+    pub accepted_tick: u64,
+    /// Tick deadline (0 = no deadline).
+    #[serde(default)]
+    pub deadline_tick: u64,
+    /// Required reputation to accept.
+    #[serde(default)]
+    pub required_reputation: f32,
+    /// Required capabilities to accept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+}
+
 // ─── WorldState ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +310,9 @@ pub struct WorldState {
     /// Recent world events (bounded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<WorldEvent>,
+    /// Active and available quests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quests: Vec<Quest>,
 }
 
 impl Default for WorldState {
@@ -243,6 +339,7 @@ impl Default for WorldState {
             entities: vec![],
             listings: vec![],
             events: vec![],
+            quests: vec![],
         }
     }
 }
@@ -741,7 +838,13 @@ impl WorldState {
     pub fn world_tick(&mut self) {
         self.advance_tick();
 
-        // 1. NPC behavior: NPCs at service locations offer services
+        // 1. Questkeeper generates quests
+        self.questkeeper_tick();
+
+        // 2. Check quest progress
+        self.check_quest_progress();
+
+        // 3. NPC behavior: NPCs at service locations offer services
         for entity in &mut self.entities {
             if entity.entity_type == "npc" {
                 // NPCs maintain their reputation
@@ -907,6 +1010,420 @@ impl WorldState {
         self.record_event(event);
 
         Ok((service_name.to_string(), provider, price))
+    }
+
+    // ─── Quest System ─────────────────────────────────────────────────
+
+    /// Generate a quest based on world state. Called by Questkeeper NPC.
+    pub fn generate_quest(&mut self) -> Option<Quest> {
+        // Find locations with services
+        let service_locations: Vec<_> = self
+            .locations
+            .iter()
+            .filter(|l| !l.services.is_empty())
+            .collect();
+
+        if service_locations.is_empty() {
+            return None;
+        }
+
+        // Find agents with needs
+        let agents_with_needs: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "agent" && !e.needs.is_empty())
+            .collect();
+
+        // Generate different quest types based on world state
+        let quest = if let Some(agent) = agents_with_needs.first() {
+            // Quest: fulfill an agent's need
+            let needed = &agent.needs[0];
+            if let Some(loc) = service_locations.iter().find(|l| l.services.contains_key(needed))
+            {
+                let price = *loc.services.get(needed).unwrap_or(&10);
+                Quest {
+                    id: format!("q-{}-{}", self.tick, &needed[..needed.len().min(8)]),
+                    title: format!("Deliver {} Service", needed),
+                    description: format!(
+                        "The Questkeeper needs someone to purchase {} service at {} for an agent in need.",
+                        needed, loc.label
+                    ),
+                    giver_id: "npc-questkeeper".to_string(),
+                    objectives: vec![
+                        QuestObjective::MoveTo {
+                            location_id: loc.id.clone(),
+                        },
+                        QuestObjective::BuyService {
+                            location_id: loc.id.clone(),
+                            service: needed.clone(),
+                        },
+                    ],
+                    progress: vec![false, false],
+                    reward: QuestReward {
+                        credits: price * 2,
+                        reputation: 0.5,
+                        items: vec![],
+                        zone_unlock: None,
+                    },
+                    status: QuestStatus::Available,
+                    accepted_by: None,
+                    created_tick: self.tick,
+                    accepted_tick: 0,
+                    deadline_tick: self.tick + 100,
+                    required_reputation: 0.0,
+                    required_capabilities: vec![],
+                }
+            } else {
+                // No matching location, create exploration quest
+                let target = service_locations[0];
+                Quest {
+                    id: format!("q-{}-explore", self.tick),
+                    title: format!("Explore {}", target.label),
+                    description: format!(
+                        "The Questkeeper wants you to visit {} in the {} zone.",
+                        target.label,
+                        target.zone_id
+                    ),
+                    giver_id: "npc-questkeeper".to_string(),
+                    objectives: vec![QuestObjective::MoveTo {
+                        location_id: target.id.clone(),
+                    }],
+                    progress: vec![false],
+                    reward: QuestReward {
+                        credits: 20,
+                        reputation: 0.2,
+                        items: vec![],
+                        zone_unlock: None,
+                    },
+                    status: QuestStatus::Available,
+                    accepted_by: None,
+                    created_tick: self.tick,
+                    accepted_tick: 0,
+                    deadline_tick: self.tick + 50,
+                    required_reputation: 0.0,
+                    required_capabilities: vec![],
+                }
+            }
+        } else {
+            // No agents with needs — create marketplace quest
+            let market = self
+                .locations
+                .iter()
+                .find(|l| l.marketplace)
+                .unwrap_or(service_locations[0]);
+            Quest {
+                id: format!("q-{}-trade", self.tick),
+                title: "Market Trader".to_string(),
+                description: format!(
+                    "The Questkeeper wants you to list an item for sale at {}.",
+                    market.label
+                ),
+                giver_id: "npc-questkeeper".to_string(),
+                objectives: vec![
+                    QuestObjective::MoveTo {
+                        location_id: market.id.clone(),
+                    },
+                    QuestObjective::ListItem {
+                        location_id: market.id.clone(),
+                    },
+                ],
+                progress: vec![false, false],
+                reward: QuestReward {
+                    credits: 30,
+                    reputation: 0.3,
+                    items: vec![],
+                    zone_unlock: None,
+                },
+                status: QuestStatus::Available,
+                accepted_by: None,
+                created_tick: self.tick,
+                accepted_tick: 0,
+                deadline_tick: self.tick + 50,
+                required_reputation: 0.0,
+                required_capabilities: vec![],
+            }
+        };
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "quest_generated".to_string(),
+            detail: format!("New quest: {} (by {})", quest.title, quest.giver_id),
+            entity_id: Some(quest.giver_id.clone()),
+            location_id: None,
+            evidence_id: None,
+        });
+
+        Some(quest)
+    }
+
+    /// Accept a quest.
+    pub fn accept_quest(&mut self, quest_id: &str, agent_id: &str) -> Result<(), String> {
+        // Check agent exists and meets requirements
+        {
+            let agent = self
+                .entities
+                .iter()
+                .find(|e| e.id == agent_id)
+                .ok_or_else(|| format!("agent '{}' not found", agent_id))?;
+
+            let quest = self
+                .quests
+                .iter()
+                .find(|q| q.id == quest_id)
+                .ok_or_else(|| format!("quest '{}' not found", quest_id))?;
+
+            if quest.status != QuestStatus::Available {
+                return Err("quest is not available".to_string());
+            }
+
+            if agent.reputation < quest.required_reputation {
+                return Err(format!(
+                    "insufficient reputation: {} < {}",
+                    agent.reputation, quest.required_reputation
+                ));
+            }
+
+            for req_cap in &quest.required_capabilities {
+                if !agent.capabilities.iter().any(|c| c == req_cap) {
+                    return Err(format!("missing required capability: {}", req_cap));
+                }
+            }
+        }
+
+        // Accept the quest
+        let quest_title;
+        {
+            let quest = self
+                .quests
+                .iter_mut()
+                .find(|q| q.id == quest_id)
+                .ok_or_else(|| format!("quest '{}' not found", quest_id))?;
+            quest.status = QuestStatus::Active;
+            quest.accepted_by = Some(agent_id.to_string());
+            quest.accepted_tick = self.tick;
+            quest.progress = vec![false; quest.objectives.len()];
+            quest_title = quest.title.clone();
+        }
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "quest_accepted".to_string(),
+            detail: format!("{} accepted quest: {}", agent_id, quest_title),
+            entity_id: Some(agent_id.to_string()),
+            location_id: None,
+            evidence_id: None,
+        });
+
+        Ok(())
+    }
+
+    /// Check and update quest progress based on world state.
+    /// Returns list of newly completed quest ids.
+    pub fn check_quest_progress(&mut self) -> Vec<String> {
+        let mut completed = Vec::new();
+
+        // Gather all active quest info first (avoid borrow issues)
+        let active_quests: Vec<(String, Vec<QuestObjective>, String)> = self
+            .quests
+            .iter()
+            .filter(|q| q.status == QuestStatus::Active)
+            .map(|q| {
+                (
+                    q.id.clone(),
+                    q.objectives.clone(),
+                    q.accepted_by.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        // Collect updates to apply
+        let mut updates: Vec<(String, Vec<bool>, bool)> = Vec::new();
+
+        for (quest_id, objectives, agent_id) in active_quests {
+            let mut all_done = true;
+            let mut new_progress = Vec::new();
+
+            for obj in &objectives {
+                let done = self.check_objective(&agent_id, obj);
+                new_progress.push(done);
+                if !done {
+                    all_done = false;
+                }
+            }
+
+            updates.push((quest_id, new_progress, all_done));
+        }
+
+        // Apply updates
+        for (quest_id, new_progress, all_done) in updates {
+            if let Some(quest) = self.quests.iter_mut().find(|q| q.id == quest_id) {
+                let changed = quest.progress != new_progress;
+                let title = quest.title.clone();
+                let agent_id = quest.accepted_by.clone().unwrap_or_default();
+                let obj_count = quest.objectives.len();
+                quest.progress = new_progress;
+
+                if all_done {
+                    quest.status = QuestStatus::Ready;
+                    self.record_event(WorldEvent {
+                        tick: self.tick,
+                        kind: "quest_ready".to_string(),
+                        detail: format!(
+                            "{} completed all objectives for: {}",
+                            agent_id, title
+                        ),
+                        entity_id: Some(agent_id),
+                        location_id: None,
+                        evidence_id: None,
+                    });
+                    completed.push(quest_id);
+                } else if changed {
+                    let done_count = quest.progress.iter().filter(|&&p| p).count();
+                    self.record_event(WorldEvent {
+                        tick: self.tick,
+                        kind: "quest_progress".to_string(),
+                        detail: format!(
+                            "{} progress on {}: {}/{} objectives",
+                            agent_id, title, done_count, obj_count
+                        ),
+                        entity_id: Some(agent_id),
+                        location_id: None,
+                        evidence_id: None,
+                    });
+                }
+            }
+        }
+
+        completed
+    }
+
+    /// Check if a single objective is completed by an agent.
+    fn check_objective(&self, agent_id: &str, objective: &QuestObjective) -> bool {
+        let agent = match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        match objective {
+            QuestObjective::MoveTo { location_id } => agent.location_id == *location_id,
+            QuestObjective::BuyService {
+                location_id,
+                service,
+            } => {
+                // Check if agent has a service result item from this location
+                agent.location_id == *location_id
+                    && agent.inventory.iter().any(|item| {
+                        item.item_type == "service-result"
+                            && item.description.contains(service)
+                    })
+            }
+            QuestObjective::ListItem { location_id } => {
+                // Check if agent has an active listing at this location
+                self.listings.iter().any(|l| {
+                    l.seller_id == agent_id && l.location_id == *location_id && l.active
+                })
+            }
+            QuestObjective::BuyItem { location_id } => {
+                // Check if agent bought something at this location
+                agent.location_id == *location_id
+                    && self.events.iter().any(|e| {
+                        e.kind == "item_sold"
+                            && e.entity_id.as_deref() == Some(agent_id)
+                            && e.location_id.as_deref() == Some(location_id.as_str())
+                    })
+            }
+            QuestObjective::Trade { location_id } => {
+                // Either bought or sold at this location
+                agent.location_id == *location_id
+                    && self.events.iter().any(|e| {
+                        (e.kind == "item_sold" || e.kind == "service_purchased")
+                            && e.entity_id.as_deref() == Some(agent_id)
+                            && e.location_id.as_deref() == Some(location_id.as_str())
+                    })
+            }
+            QuestObjective::VisitZone { zone_id } => agent.zone_id == *zone_id,
+            QuestObjective::EarnCredits { amount } => agent.credits >= *amount,
+            QuestObjective::ReachReputation { score } => agent.reputation >= *score,
+        }
+    }
+
+    /// Complete a quest and distribute rewards.
+    pub fn complete_quest(&mut self, quest_id: &str) -> Result<QuestReward, String> {
+        let quest = self
+            .quests
+            .iter()
+            .find(|q| q.id == quest_id)
+            .ok_or_else(|| format!("quest '{}' not found", quest_id))?;
+
+        if quest.status != QuestStatus::Ready {
+            return Err("quest is not ready to complete".to_string());
+        }
+
+        let agent_id = quest
+            .accepted_by
+            .clone()
+            .ok_or("quest has no acceptor")?;
+        let reward = quest.reward.clone();
+
+        // Find quest and update status
+        if let Some(q) = self.quests.iter_mut().find(|q| q.id == quest_id) {
+            q.status = QuestStatus::Completed;
+        }
+
+        // Distribute rewards
+        if let Some(agent) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+            agent.credits += reward.credits;
+            agent.reputation += reward.reputation;
+            for item in &reward.items {
+                agent.inventory.push(item.clone());
+            }
+        }
+
+        // Zone unlock
+        if let Some(zone_id) = &reward.zone_unlock {
+            if let Some(zone) = self.zones.iter_mut().find(|z| &z.id == zone_id) {
+                zone.discovered = true;
+            }
+        }
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "quest_completed".to_string(),
+            detail: format!(
+                "{} completed quest: {} ({}Cr, +{} rep)",
+                agent_id,
+                self.quests
+                    .iter()
+                    .find(|q| q.id == quest_id)
+                    .map(|q| q.title.as_str())
+                    .unwrap_or(""),
+                reward.credits,
+                reward.reputation
+            ),
+            entity_id: Some(agent_id),
+            location_id: None,
+            evidence_id: None,
+        });
+
+        Ok(reward)
+    }
+
+    /// Generate quests from Questkeeper if none available.
+    pub fn questkeeper_tick(&mut self) {
+        let available_count = self
+            .quests
+            .iter()
+            .filter(|q| q.status == QuestStatus::Available)
+            .count();
+
+        // Keep 2-3 quests available at a time
+        if available_count < 2 {
+            for _ in 0..2 {
+                if let Some(quest) = self.generate_quest() {
+                    self.quests.push(quest);
+                }
+            }
+        }
     }
 }
 
