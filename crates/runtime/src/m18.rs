@@ -17,11 +17,36 @@ use decentraai_economy::contract::{self, AgentContract, ContractTerms, ServiceDe
 use decentraai_economy::escrow::EscrowRecord;
 use decentraai_economy::trust_anchor::{AnchorParams, TrustAnchor, TrustStore};
 
+/// An economic action recorded during a tick (for audit trail).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M18Action {
+    ProposeContract {
+        contract_id: String,
+        consumer: String,
+    },
+    AcceptContract {
+        contract_id: String,
+        provider: String,
+    },
+    StartExecution {
+        contract_id: String,
+    },
+    CompleteContract {
+        contract_id: String,
+    },
+    CancelContract {
+        contract_id: String,
+    },
+}
+
 /// Shared M18 economic state, attached to ApiState.
 pub struct M18State {
     pub contracts: StdMutex<BTreeMap<String, AgentContract>>,
     pub escrow: StdMutex<decentraai_economy::escrow::EscrowLedger>,
     pub trust: StdMutex<TrustStore>,
+    pub actions: StdMutex<Vec<M18Action>>,
+    pub tick: StdMutex<u64>,
     pub contracts_path: PathBuf,
     pub escrow_path: PathBuf,
     pub trust_path: PathBuf,
@@ -39,11 +64,46 @@ impl M18State {
             contracts: StdMutex::new(contracts),
             escrow: StdMutex::new(escrow),
             trust: StdMutex::new(trust),
+            actions: StdMutex::new(Vec::new()),
+            tick: StdMutex::new(0),
             contracts_path,
             escrow_path,
             trust_path,
         }
     }
+
+    /// Test-only default (empty state, unique temp file paths per call).
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("m18-test-{}-{:05}", std::process::id(), n));
+        let _ = std::fs::create_dir_all(&base);
+        Self {
+            contracts: StdMutex::new(BTreeMap::new()),
+            escrow: StdMutex::new(decentraai_economy::escrow::EscrowLedger::default()),
+            trust: StdMutex::new(TrustStore::default()),
+            actions: StdMutex::new(Vec::new()),
+            tick: StdMutex::new(1),
+            contracts_path: base.join("contracts.json"),
+            escrow_path: base.join("escrow.json"),
+            trust_path: base.join("trust.json"),
+        }
+    }
+
+    /// Current tick (read from atomic).
+    pub fn current_tick(&self) -> u64 {
+        *self.tick.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Advance tick by 1.
+    pub fn advance_tick(&self) {
+        if let Ok(mut t) = self.tick.lock() {
+            *t += 1;
+        }
+    }
+
     pub fn save_contracts(&self) -> Result<(), String> {
         let contracts = self.contracts.lock().map_err(|e| e.to_string())?;
         save_json(&self.contracts_path, &*contracts)
@@ -408,15 +468,54 @@ pub async fn trust_score_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Economic tick handler — runs autonomous agent economic behavior
 // ---------------------------------------------------------------------------
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Runs one economic tick: every World agent evaluates its needs and
+/// applies its chosen action (bid, propose, accept, execute, complete).
+/// Operator/master only; wallet/consumer are rejected before any mutation.
+pub async fn economic_tick_handler(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    use crate::api::Auth;
+
+    let m18 = match require_m18(&state) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    // Operator/master only — deterministic economic decisions affect state.
+    let operator_ok = match state.classify(&headers) {
+        Ok(Auth::Master) => true,
+        Ok(Auth::Subscriber { role, .. }) => {
+            matches!(role, decentraai_tokens::Role::Operator)
+        }
+        Ok(_) => false,
+        Err(e) => return e.into_response(),
+    };
+    if !operator_ok {
+        return error_response("economic tick requires operator/master");
+    }
+
+    // Snapshot World agents.
+    let agents = {
+        let world = state.world.lock().await;
+        world.agents.clone()
+    };
+
+    let result = crate::world_economics::run_world_economic_tick(
+        &agents,
+        &state.hub,
+        &m18,
+        &state.info.repo_root,
+    )
+    .await;
+
+    m18.advance_tick();
+    json_response(&result)
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn json_response<T: Serialize>(data: &T) -> Response {
     (
@@ -424,6 +523,13 @@ fn json_response<T: Serialize>(data: &T) -> Response {
         serde_json::to_string(data).unwrap_or_default(),
     )
         .into_response()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn error_response(msg: impl Into<String>) -> Response {

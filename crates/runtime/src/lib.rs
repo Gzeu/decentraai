@@ -14,6 +14,7 @@ pub mod arena;
 pub mod authz;
 pub mod dashboard;
 pub mod dashboard_v2;
+pub mod economic_agent;
 pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;
@@ -29,6 +30,7 @@ pub mod tools;
 pub mod vesper;
 pub mod wallet_auth;
 pub mod world;
+pub mod world_economics;
 
 use anyhow::{Context, Result, bail};
 use decentraai_config::{InferenceMode, NodeConfig, ResourceSection};

@@ -1617,6 +1617,10 @@ pub fn build_router(state: ApiState) -> Router {
             "/v1/m18/trust/wallet/{wallet}",
             get(crate::m18::trust_score_handler),
         )
+        .route(
+            "/v1/m18/economic-tick",
+            post(crate::m18::economic_tick_handler),
+        )
         .route("/admin", get(admin_handler))
         .fallback(dashboard_handler)
         .with_state(state)
