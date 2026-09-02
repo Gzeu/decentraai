@@ -81,15 +81,13 @@ pub async fn run_world_economic_tick(
             .unwrap_or(0);
 
         // Decide under a short hub lock; drop before applying to avoid deadlock.
-        // needs: empty for now — wired from goals/personal-memory in future.
-        let needs: Vec<String> = Vec::new();
         let action = {
             let mut hub_guard = hub.lock().await;
             let ctx = EconomicContext {
                 agent_id: &agent.agent_id,
                 agent_wallet: &agent.account,
                 capabilities: &agent.declared_capabilities,
-                needs: &needs,
+                needs: &agent.needs,
                 world_agents: &world_agent_snapshots,
                 tick,
                 hub: &hub_guard,
@@ -379,6 +377,7 @@ mod tests {
             key_id: format!("dca_{}", id),
             account: w.to_string(),
             declared_capabilities: caps,
+            needs: Vec::new(),
             room_id: "research-lab".to_string(),
             joined_at: 1,
         }

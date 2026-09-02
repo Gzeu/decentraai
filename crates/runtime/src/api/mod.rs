@@ -1883,6 +1883,7 @@ async fn world_onboard_handler(
                 key_id: rec.key_id.clone(),
                 account: owner_account.clone(),
                 declared_capabilities: caps.clone(),
+                needs: Vec::new(),
                 room_id: room_id.clone(),
                 joined_at: now,
             });
@@ -2310,6 +2311,7 @@ async fn world_join_handler(
         key_id: key_id.clone(),
         account: account.clone(),
         declared_capabilities: caps.clone(),
+        needs: Vec::new(),
         room_id: room_id.clone(),
         joined_at: now,
     });
@@ -3795,6 +3797,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let _task_for_society = task_id.clone();
         let _reward_for_society = task.reward;
         let _issuer_for_society = task.issuer.clone();
+        let _cap_for_society = task.required_capability.clone().unwrap_or_else(|| "general".to_string());
         drop(hub);
         {
             let mut society = state.society.lock().await;
@@ -3841,6 +3844,24 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     contributor_records: contrib_records,
                 };
                 society.record_outcome(outcome);
+                // --- M18 Trust Bridge: create trust anchors from verified outcomes ---
+                if let Some(m18) = &state.m18 {
+                    for (agent_id, share) in &_team_for_society {
+                        let params = decentraai_economy::trust_anchor::AnchorParams {
+                            agent_wallet: agent_id.clone(),
+                            evidence_hash: _ev_for_society.clone(),
+                            capability: _cap_for_society.clone(),
+                            quality_score: 85u8,
+                            verified: true,
+                            micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
+                            contract_id: None,
+                        };
+                        let mut trust = m18.trust.lock().unwrap();
+                        let _ = trust.record_anchor(&params, tick);
+                        drop(trust);
+                    }
+                    let _ = m18.save_trust();
+                }
                 for (agent_id, _) in &_team_for_society {
                     let ev = decentraai_agent_society::state::ReputationEvent {
                         agent_id: agent_id.clone(),
@@ -4402,6 +4423,24 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         };
         let mut society = state.society.lock().await;
         society.record_outcome(outcome.clone());
+        // --- M18 Trust Bridge: create trust anchors from MCP-recorded outcomes ---
+        if let Some(m18) = &state.m18 {
+            for agent_id in &outcome.team_members {
+                let params = decentraai_economy::trust_anchor::AnchorParams {
+                    agent_wallet: agent_id.clone(),
+                    evidence_hash: evidence.clone().unwrap_or_default(),
+                    capability: "general".to_string(),
+                    quality_score: 80u8,
+                    verified: true,
+                    micro_cu: total_reward / outcome.team_members.len().max(1) as u64,
+                    contract_id: None,
+                };
+                let mut trust = m18.trust.lock().unwrap();
+                let _ = trust.record_anchor(&params, tick);
+                drop(trust);
+            }
+            let _ = m18.save_trust();
+        }
         society.advance_tick();
         let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
         decentraai_agent_society::state::save_society_state(&path, &society);
@@ -4859,6 +4898,32 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     let score = trust.trust_score(wallet);
                     let anchors = trust.anchors_for_wallet(wallet);
                     serde_json::json!({"wallet": wallet, "score": score, "anchor_count": anchors.len(), "verified_count": anchors.iter().filter(|a| a.verified).count()})
+                }
+                "m18_update_needs" => {
+                    let needs: Vec<String> = args
+                        .get("needs")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    // Resolve caller wallet: Wallet auth → auto; others → args.
+                    let caller_wallet = match &auth {
+                        Auth::Wallet { wallet_address, .. } => wallet_address.clone(),
+                        _ => args
+                            .get("caller_wallet")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    };
+                    let mut world = state.world.lock().await;
+                    if let Some(agent) = world.agents.iter_mut().find(|a| a.account == caller_wallet) {
+                        agent.needs = needs.clone();
+                        world.advance_tick();
+                        let wpath = crate::world::world_path_for(&state.info.repo_root);
+                        crate::world::save_world_state(&wpath, &world);
+                        serde_json::json!({"success": true, "needs": needs})
+                    } else {
+                        serde_json::json!({"error": "agent not found in World"})
+                    }
                 }
                 _ => serde_json::json!({"error": format!("unknown M18 tool: {tool_name}")}),
             };
@@ -5467,6 +5532,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         let _task_for_society = task_id.clone();
         let _reward_for_society = task.reward;
         let _issuer_for_society = task.issuer.clone();
+        let _cap_for_society = task.required_capability.clone().unwrap_or_else(|| "general".to_string());
         drop(hub);
         {
             let mut society = state.society.lock().await;
@@ -5513,6 +5579,24 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     contributor_records: contrib_records,
                 };
                 society.record_outcome(outcome);
+                // --- M18 Trust Bridge: create trust anchors from verified outcomes ---
+                if let Some(m18) = &state.m18 {
+                    for (agent_id, share) in &_team_for_society {
+                        let params = decentraai_economy::trust_anchor::AnchorParams {
+                            agent_wallet: agent_id.clone(),
+                            evidence_hash: _ev_for_society.clone(),
+                            capability: _cap_for_society.clone(),
+                            quality_score: 85u8,
+                            verified: true,
+                            micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
+                            contract_id: None,
+                        };
+                        let mut trust = m18.trust.lock().unwrap();
+                        let _ = trust.record_anchor(&params, tick);
+                        drop(trust);
+                    }
+                    let _ = m18.save_trust();
+                }
                 for (agent_id, _) in &_team_for_society {
                     let ev = decentraai_agent_society::state::ReputationEvent {
                         agent_id: agent_id.clone(),

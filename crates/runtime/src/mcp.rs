@@ -950,6 +950,14 @@ pub fn all_tools() -> Vec<ToolDef> {
             }, "required": ["wallet"], "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
         },
+        ToolDef {
+            name: "m18_update_needs",
+            description: "Declare what capabilities an agent needs from others (buy-side signal). These needs drive autonomous economic decisions — the agent will publish Hub tasks for missing capabilities when a provider exists.",
+            input_schema: json!({ "type": "object", "properties": {
+                "needs": { "type": "array", "items": { "type": "string" }, "description": "Capability names this agent needs (e.g. [\"ocr\", \"embedding\"])" }
+            }, "required": ["needs"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
     ]
 }
 

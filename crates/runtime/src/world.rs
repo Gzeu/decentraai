@@ -22,6 +22,9 @@ pub struct WorldAgent {
     pub key_id: String,
     pub account: String,
     pub declared_capabilities: Vec<String>,
+    /// Capabilities this agent needs from others (buy-side signals for economic tick).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
     pub room_id: String,
     pub joined_at: u64,
 }
