@@ -669,6 +669,23 @@ impl WorldState {
         }
     }
 
+    /// Deduplicate quest entries: when old completed/expired quests persist
+    /// alongside newly generated ones with the same ID, keep only the LAST
+    /// copy (newest state always wins). This prevents `.find()` from grabbing
+    /// stale Completed copies and rejecting Available ones ("quest is not
+    /// available").
+    pub fn dedup_quests(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for quest in self.quests.drain(..).rev() {
+            if seen.insert(quest.id.clone()) {
+                deduped.push(quest);
+            }
+        }
+        deduped.reverse();
+        self.quests = deduped;
+    }
+
     /// Find the best zone for given capabilities.
     pub fn zone_for_capabilities(&self, caps: &[String]) -> String {
         let lower: Vec<String> = caps.iter().map(|c| c.to_lowercase()).collect();
@@ -2913,6 +2930,11 @@ pub fn load_world_state(path: &Path) -> WorldState {
     }
     // Migrate legacy agents to entities on load
     state.migrate_legacy();
+    // Deduplicate quest entries: when old completed quests persist alongside
+    // newly generated ones with the same ID, keep only the LAST copy (newest
+    // state always wins). This prevents .find() from grabbing stale Completed
+    // copies and rejecting Available ones ("quest is not available").
+    state.dedup_quests();
     state
 }
 
@@ -4105,5 +4127,74 @@ mod tests {
         assert_eq!(w.proofs[0].nonce, Some(9));
         assert_eq!(w.proofs[0].sender, sender);
         assert!(w.submit_intent(&proof.id, sender).is_err());
+    }
+
+    /// Regression: VPS world.json accumulated duplicate quest entries with the
+    /// same ID (old Completed copies alongside fresh Available ones), making
+    /// `.find()` hit the stale copy and reject every acceptance with
+    /// "quest is not available" — the live economy froze at tick ~100.
+    /// `dedup_quests` (called by `load_world_state`) keeps only the newest
+    /// entry per ID and restores acceptance.
+    #[test]
+    fn dedup_quests_keeps_newest_and_unblocks_acceptance() {
+        let quest = |id: &str, status: QuestStatus| Quest {
+            id: id.to_string(),
+            title: "t".to_string(),
+            description: String::new(),
+            giver_id: "npc-questkeeper".to_string(),
+            objectives: vec![QuestObjective::MoveTo {
+                location_id: "hub-plaza".to_string(),
+            }],
+            progress: vec![false],
+            reward: QuestReward {
+                credits: 20,
+                reputation: 0.5,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status,
+            accepted_by: None,
+            created_tick: 1,
+            accepted_tick: 0,
+            deadline_tick: 0,
+            required_reputation: 0.0,
+            required_capabilities: vec![],
+            stake: 0,
+        };
+        let mut w = WorldState::default();
+        // Old Completed copy FIRST, fresh Available copy LAST — VPS layout.
+        w.quests.push(quest("q-dup", QuestStatus::Completed));
+        w.quests.push(quest("q-dup", QuestStatus::Available));
+        w.entities.push(WorldEntity {
+            id: "a1".to_string(),
+            name: "a1".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1a".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        // Before dedup: find() hits the Completed copy and rejects.
+        assert!(matches!(
+            w.quests.iter().find(|q| q.id == "q-dup").map(|q| &q.status),
+            Some(QuestStatus::Completed)
+        ));
+
+        w.dedup_quests();
+
+        // After dedup: single entry, the Available one, accept succeeds.
+        assert_eq!(w.quests.len(), 1);
+        assert!(matches!(w.quests[0].status, QuestStatus::Available));
+        assert!(w.accept_quest("q-dup", "a1").is_ok());
+        assert!(matches!(w.quests[0].status, QuestStatus::Active));
+        assert_eq!(w.quests[0].accepted_by.as_deref(), Some("a1"));
     }
 }
