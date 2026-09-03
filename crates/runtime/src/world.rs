@@ -1497,6 +1497,15 @@ impl WorldState {
 
     // ─── On-Chain Settlement ─────────────────────────────────────────
 
+    /// Minimum trade value (credits) worth an on-chain settlement.
+    /// Dust trades stay off-chain; services (5–10Cr) and real sales settle.
+    pub const SETTLEMENT_MIN_CREDITS: u64 = 5;
+
+    /// Whether a value merits the full M18 + MultiversX settlement path.
+    pub fn merits_settlement(amount: u64) -> bool {
+        amount >= Self::SETTLEMENT_MIN_CREDITS
+    }
+
     /// Generate an on-chain proof for an economic action.
     /// Creates a BLAKE3 evidence hash and a MultiversX tx intent built with
     /// the real [`Mx8004TxBuilder::submit_proof_raw`] (same encoding the
@@ -1504,6 +1513,20 @@ impl WorldState {
     /// as-is, never re-hashed).
     pub fn settle_on_chain(
         &mut self,
+        action_type: &str,
+        description: &str,
+        entity_id: &str,
+        amount: u64,
+    ) -> Result<OnChainProof, String> {
+        self.settle_on_chain_with_job("quest", action_type, description, entity_id, amount)
+    }
+
+    /// Same as [`Self::settle_on_chain`] but with an explicit job namespace
+    /// (`quest` for quest rewards, `trade` for marketplace/service sales) so
+    /// the anchored `job_id` tells WHAT settled, not just that something did.
+    pub fn settle_on_chain_with_job(
+        &mut self,
+        job_ns: &str,
         action_type: &str,
         description: &str,
         entity_id: &str,
@@ -1525,7 +1548,7 @@ impl WorldState {
 
         // Build MultiversX testnet tx intent with the REAL builder —
         // no hand-rolled `submit_proof@…` strings anymore.
-        let job_id = format!("quest-{}-{}", entity_id, self.tick);
+        let job_id = format!("{job_ns}-{entity_id}-{}", self.tick);
         let intent = Mx8004TxBuilder::submit_proof_raw(&job_id, digest.as_bytes())
             .map_err(|e| format!("tx intent build failed: {e}"))?;
         let tx_data = intent.data_field();
@@ -1663,13 +1686,45 @@ impl WorldState {
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&raw);
-        let job_id = format!("quest-{}-{}", proof.entity_id, proof.created_tick);
-        let mut intent = Mx8004TxBuilder::submit_proof_raw(&job_id, &digest)
-            .map_err(|e| format!("tx intent build failed: {e}"))?;
+        // Rebuild the SAME intent `settle_on_chain*` produced: try each job
+        // namespace and keep the one whose data matches the proof. No
+        // re-rolling, no guessing — byte equality decides.
+        let mut matched: Option<UnsignedTxIntent> = None;
+        for ns in ["trade", "quest"] {
+            let job_id = format!("{ns}-{}-{}", proof.entity_id, proof.created_tick);
+            if let Ok(intent) = Mx8004TxBuilder::submit_proof_raw(&job_id, &digest)
+                && intent.data_field() == proof.tx_data
+            {
+                matched = Some(intent);
+                break;
+            }
+        }
+        let mut intent =
+            matched.ok_or_else(|| format!("proof '{proof_id}' intent no longer rebuilds"))?;
         intent.sender = Some(sender.to_string());
         intent.chain_id = Some("T".to_string());
         let payload_hex = hex::encode(canonical_sign_payload(&intent));
         Ok((intent, payload_hex))
+    }
+
+    /// Build the settlement proof for a completed World trade.
+    ///
+    /// `earner` is who delivered value (seller / provider NPC) — they are
+    /// the reputation beneficiary on confirmation. Returns `None` for dust
+    /// (below [`SETTLEMENT_MIN_CREDITS`]) or unknown earner: those trades
+    /// stay purely off-chain by design.
+    pub fn trade_settlement_proof(
+        &mut self,
+        action_type: &str,
+        description: &str,
+        earner_id: &str,
+        amount: u64,
+    ) -> Option<OnChainProof> {
+        if !Self::merits_settlement(amount) {
+            return None;
+        }
+        self.settle_on_chain_with_job("trade", action_type, description, earner_id, amount)
+            .ok()
     }
 
     /// Confirm a settlement (tx confirmed on-chain).
@@ -2368,6 +2423,49 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn trade_proof_uses_trade_namespace_and_merit_gate() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "npc-smith".to_string(),
+            name: "Smith".to_string(),
+            entity_type: "npc".to_string(),
+            zone_id: "forge".to_string(),
+            location_id: "forge-workshop".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec!["coding".to_string()],
+            needs: vec![],
+            wallet: "npc:npc-smith".to_string(),
+            reputation: 1.0,
+            credits: 0,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        // Dust stays off-chain.
+        assert!(!WorldState::merits_settlement(4));
+        assert!(w
+            .trade_settlement_proof("service_sale", "dust", "npc-smith", 4)
+            .is_none());
+        // Real sale settles under the trade namespace.
+        assert!(WorldState::merits_settlement(10));
+        let proof = w
+            .trade_settlement_proof("service_sale", "coding sale", "npc-smith", 10)
+            .unwrap();
+        assert_eq!(proof.entity_id, "npc-smith");
+        let job_hex = hex::encode("trade-npc-smith-0".as_bytes());
+        assert!(
+            proof.tx_data.starts_with(&format!("submit_proof@{job_hex}@")),
+            "unexpected tx_data: {}",
+            proof.tx_data
+        );
+        // Unknown earner → None, never a panic.
+        assert!(w
+            .trade_settlement_proof("service_sale", "x", "ghost", 10)
+            .is_none());
     }
 
     #[test]

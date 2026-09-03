@@ -1414,6 +1414,7 @@ pub fn build_router(state: ApiState) -> Router {
             post(world_settle_auto_submit_handler),
         )
         .route("/v1/world/settle/check", post(world_settle_check_handler))
+        .route("/v1/world/settle/sweep", post(world_settle_sweep_handler))
         .route("/v1/world/settle/submit", post(world_settle_submit_handler))
         .route("/v1/world/settle/confirm", post(world_settle_confirm_handler))
         .route("/v1/world/proofs", get(world_proofs_handler))
@@ -2641,14 +2642,41 @@ async fn world_buy_handler(
     match world.buy_item(&buyer_id, &listing_id) {
         Ok((item, seller_id)) => {
             world.advance_tick();
+            let price = item.price;
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
+            drop(world);
+            // Full economy path: M18 contract/escrow → proof → auto-submit.
+            // Best-effort: the trade already executed; dust stays off-chain.
+            let settlement = settle_world_trade(
+                &state,
+                "item_sale",
+                &format!("{} bought '{}' from {}", buyer_id, item.name, seller_id),
+                &seller_id,
+                &buyer_id,
+                "trade",
+                price,
+            )
+            .await;
+            let (proof_id, tx_hash, contract_id, escrow_id) = match settlement {
+                Some(s) => (
+                    Some(s.proof_id),
+                    s.tx_hash,
+                    s.contract_id,
+                    s.escrow_id,
+                ),
+                None => (None, None, None, None),
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
                     "item": item,
                     "seller_id": seller_id,
+                    "proof_id": proof_id,
+                    "tx_hash": tx_hash,
+                    "contract_id": contract_id,
+                    "escrow_id": escrow_id,
                 })),
             )
                 .into_response()
@@ -2746,6 +2774,28 @@ async fn world_service_handler(
             world.advance_tick();
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
+            drop(world);
+            // Full economy path: the provider NPC earns credits + reputation
+            // here, and the sale anchors on-chain when it merits settlement.
+            let settlement = settle_world_trade(
+                &state,
+                "service_sale",
+                &format!("{buyer_id} purchased {service_name} from {provider} for {price}Cr"),
+                &provider,
+                &buyer_id,
+                &service_name,
+                price,
+            )
+            .await;
+            let (proof_id, tx_hash, contract_id, escrow_id) = match settlement {
+                Some(s) => (
+                    Some(s.proof_id),
+                    s.tx_hash,
+                    s.contract_id,
+                    s.escrow_id,
+                ),
+                None => (None, None, None, None),
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2753,6 +2803,10 @@ async fn world_service_handler(
                     "service": service,
                     "provider": provider,
                     "price": price,
+                    "proof_id": proof_id,
+                    "tx_hash": tx_hash,
+                    "contract_id": contract_id,
+                    "escrow_id": escrow_id,
                 })),
             )
                 .into_response()
@@ -3076,71 +3130,171 @@ async fn world_settle_auto_submit_handler(
         }
     };
 
-    let sender = match crate::settlement_tx::operator_address() {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"ok": false, "error": e})),
-            )
-                .into_response()
-        }
-    };
+    match settle_proof_best_effort(&state, &proof_id).await {
+        Some((tx_hash, sender)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "proof_id": proof_id,
+                "status": "submitted",
+                "tx_hash": tx_hash,
+                "sender": sender,
+                "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{tx_hash}"),
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": "automated submission unavailable (signer not injected, proof not pending, or testnet unreachable) — proof stays pending for /v1/world/settle/sweep"})),
+        )
+            .into_response(),
+    }
+}
 
-    // Build the deterministic intent under a short lock; network I/O happens
-    // outside the lock so ticks are never blocked by the testnet API.
+/// Best-effort automated submission for a pending proof: operator address →
+/// deterministic intent → testnet nonce → sign → broadcast → record +
+/// persist. Returns `(tx_hash, sender)`.
+///
+/// ANY failure (no signer injected, proof not pending, network down,
+/// insufficient funds) → `None`, proof stays `Pending` for the sweep path.
+async fn settle_proof_best_effort(
+    state: &ApiState,
+    proof_id: &str,
+) -> Option<(String, String)> {
+    let sender = crate::settlement_tx::operator_address().ok()?;
+
+    // Deterministic intent under a short lock; network I/O outside the lock
+    // so ticks are never blocked by the testnet API.
     let tx_data = {
         let world = state.world.lock().await;
-        match world.submit_intent(&proof_id, &sender) {
+        match world.submit_intent(proof_id, &sender) {
             Ok((intent, _)) => intent.data_field(),
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"ok": false, "error": e})),
-                )
-                    .into_response()
-            }
+            Err(_) => return None,
         }
     };
 
-    match crate::settlement_tx::auto_submit_proof(
+    let (tx_hash, _) = crate::settlement_tx::auto_submit_proof(
         &tx_data,
         &sender,
         crate::settlement_tx::TESTNET_API_BASE,
     )
     .await
-    {
-        Ok((tx_hash, _)) => {
-            let mut world = state.world.lock().await;
-            match world.submit_settlement(&proof_id, &tx_hash, &sender) {
-                Ok(()) => {
-                    let path = crate::world::world_path_for(&state.info.repo_root);
-                    crate::world::save_world_state(&path, &world);
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "ok": true,
-                            "proof_id": proof_id,
-                            "status": "submitted",
-                            "tx_hash": tx_hash,
-                            "sender": sender,
-                            "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{tx_hash}"),
-                        })),
-                    )
-                        .into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"ok": false, "error": e, "tx_hash": tx_hash})),
-                )
-                    .into_response(),
+    .ok()?;
+
+    let mut world = state.world.lock().await;
+    match world.submit_settlement(proof_id, &tx_hash, &sender) {
+        Ok(()) => {
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            Some((tx_hash, sender))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Outcome of the full World-trade settlement path (proof always,
+/// chain Submission best-effort). All ids are public chain/world data.
+pub struct TradeSettlement {
+    pub proof_id: String,
+    pub evidence_hash: String,
+    pub tx_hash: Option<String>,
+    pub sender: String,
+    pub contract_id: Option<String>,
+    pub escrow_id: Option<String>,
+}
+
+/// Full M18 + MultiversX path for a COMPLETED World trade:
+///
+/// 1. `OnChainProof` (earner = seller/provider, the reputation
+///    beneficiary) — dust below merit stays off-chain (`None`).
+/// 2. M18 contract → escrow → release, best-effort.
+/// 3. best-effort auto-submit → record + escrow settle on broadcast.
+///
+/// Never fails the trade: the trade already executed and persisted before
+/// this runs. Every stage degrades to a retryable pending state.
+#[allow(clippy::too_many_arguments)]
+async fn settle_world_trade(
+    state: &ApiState,
+    action_type: &str,
+    description: &str,
+    earner_id: &str,
+    buyer_id: &str,
+    capability: &str,
+    price: u64,
+) -> Option<TradeSettlement> {
+    // 1. Proof (under a short world lock) + persist.
+    let (proof_id, evidence_hash, earner_wallet, buyer_wallet) = {
+        let mut world = state.world.lock().await;
+        let proof = world.trade_settlement_proof(action_type, description, earner_id, price)?;
+        let ew = world
+            .entities
+            .iter()
+            .find(|e| e.id == earner_id)
+            .map(|e| e.wallet.clone())
+            .unwrap_or_default();
+        let bw = world
+            .entities
+            .iter()
+            .find(|e| e.id == buyer_id)
+            .map(|e| e.wallet.clone())
+            .unwrap_or_default();
+        let out = (
+            proof.id.clone(),
+            proof.evidence_hash.clone(),
+            ew,
+            bw,
+        );
+        let path = crate::world::world_path_for(&state.info.repo_root);
+        crate::world::save_world_state(&path, &world);
+        out
+    };
+
+    // 2. M18 record (best-effort; node works without M18 attached).
+    let m18 = state.m18.clone();
+    let (contract_id, escrow_id) = match &m18 {
+        Some(m) => {
+            let now = crate::m18::now_secs_public();
+            match crate::m18::record_world_sale(
+                m,
+                (earner_id, &earner_wallet),
+                (buyer_id, &buyer_wallet),
+                capability,
+                description,
+                price,
+                &evidence_hash,
+                now,
+            ) {
+                Ok((c, e)) => (Some(c), Some(e)),
+                Err(_) => (None, None),
             }
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"ok": false, "error": e})),
-        )
-            .into_response(),
+        None => (None, None),
+    };
+
+    // 3. Best-effort chain submission → record + escrow settle.
+    match settle_proof_best_effort(state, &proof_id).await {
+        Some((tx_hash, sender)) => {
+            if let (Some(m), Some(eid)) = (m18.as_ref(), escrow_id.clone()) {
+                let now = crate::m18::now_secs_public();
+                let _ = crate::m18::settle_world_sale(m, &eid, &tx_hash, price, now);
+            }
+            Some(TradeSettlement {
+                proof_id,
+                evidence_hash,
+                tx_hash: Some(tx_hash),
+                sender,
+                contract_id,
+                escrow_id,
+            })
+        }
+        None => Some(TradeSettlement {
+            proof_id,
+            evidence_hash,
+            tx_hash: None,
+            sender: String::new(),
+            contract_id,
+            escrow_id,
+        }),
     }
 }
 
@@ -3200,6 +3354,8 @@ async fn world_settle_check_handler(
                     Ok(()) => {
                         let path = crate::world::world_path_for(&state.info.repo_root);
                         crate::world::save_world_state(&path, &world);
+                        drop(world);
+                        settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash})),
@@ -3234,6 +3390,113 @@ async fn world_settle_check_handler(
             Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/sweep — batch recovery for the economy.
+///
+/// Submits every `Pending` proof that merits settlement (quest rewards,
+/// trades left pending by offline signers) and re-checks every
+/// `Submitted` one. Returns per-proof outcomes. This is the path that
+/// closes the loop after restarts and for tick-completed quests.
+async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
+    // Snapshot ids under one short lock; all network I/O outside it.
+    let (pending, submitted): (Vec<String>, Vec<(String, String)>) = {
+        let world = state.world.lock().await;
+        let mut p = vec![];
+        let mut s = vec![];
+        for proof in &world.proofs {
+            match proof.status {
+                crate::world::SettlementStatus::Pending => {
+                    if crate::world::WorldState::merits_settlement(proof.amount) {
+                        p.push(proof.id.clone());
+                    }
+                }
+                crate::world::SettlementStatus::Submitted if !proof.tx_hash.is_empty() => {
+                    s.push((proof.id.clone(), proof.tx_hash.clone()));
+                }
+                crate::world::SettlementStatus::Submitted => {}
+                _ => {}
+            }
+        }
+        (p, s)
+    };
+
+    let mut submitted_now = vec![];
+    let mut submit_failed = vec![];
+    for proof_id in pending {
+        match settle_proof_best_effort(&state, &proof_id).await {
+            Some((tx_hash, _)) => {
+                settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
+                submitted_now.push(serde_json::json!({"proof_id": proof_id, "tx_hash": tx_hash}));
+            }
+            None => submit_failed.push(proof_id),
+        }
+    }
+
+    let mut confirmed = vec![];
+    let mut still_pending = vec![];
+    let mut failed = vec![];
+    for (proof_id, tx_hash) in submitted {
+        match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash)
+            .await
+        {
+            Ok(status) if status == "success" => {
+                let mut world = state.world.lock().await;
+                match world.confirm_settlement(&proof_id) {
+                    Ok(()) => {
+                        let path = crate::world::world_path_for(&state.info.repo_root);
+                        crate::world::save_world_state(&path, &world);
+                        drop(world);
+                        settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
+                        confirmed.push(proof_id);
+                    }
+                    Err(_) => still_pending.push(proof_id),
+                }
+            }
+            Ok(status) if status == "fail" || status == "invalid" => {
+                let mut world = state.world.lock().await;
+                let _ = world.fail_settlement(&proof_id, &format!("chain status: {status}"));
+                let path = crate::world::world_path_for(&state.info.repo_root);
+                crate::world::save_world_state(&path, &world);
+                failed.push(proof_id);
+            }
+            _ => still_pending.push(proof_id),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "submitted": submitted_now,
+            "submit_failed": submit_failed,
+            "confirmed": confirmed,
+            "failed": failed,
+            "still_pending": still_pending,
+        })),
+    )
+        .into_response()
+}
+
+/// Settle the M18 escrow linked to a proof (via its evidence hash) after a
+/// chain broadcast. Best-effort: proofs without escrows (quest rewards)
+/// simply have nothing to settle.
+async fn settle_escrow_for_proof(state: &ApiState, proof_id: &str, tx_hash: &str) {
+    let m18 = match state.m18.clone() {
+        Some(m) => m,
+        None => return,
+    };
+    let (evidence_hash, amount) = {
+        let world = state.world.lock().await;
+        match world.proofs.iter().find(|p| p.id == proof_id) {
+            Some(p) => (p.evidence_hash.clone(), p.amount),
+            None => return,
+        }
+    };
+    if let Some(escrow_id) = crate::m18::escrow_for_evidence(&m18, &evidence_hash) {
+        let now = crate::m18::now_secs_public();
+        let _ = crate::m18::settle_world_sale(&m18, &escrow_id, tx_hash, amount, now);
     }
 }
 

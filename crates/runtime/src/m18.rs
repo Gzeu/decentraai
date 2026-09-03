@@ -137,12 +137,129 @@ fn save_json<T: Serialize>(path: &Path, data: &T) -> Result<(), String> {
     Ok(())
 }
 
+/// Current unix time, seconds. Public for the World settlement path
+/// (trade timestamps share the same clock as the M18 handlers).
+pub fn now_secs_public() -> u64 {
+    now_secs()
+}
+
 fn m18_opt(state: &ApiState) -> Option<Arc<M18State>> {
     state.m18.clone()
 }
 #[allow(clippy::result_large_err)]
 fn require_m18(state: &ApiState) -> Result<Arc<M18State>, Response> {
     m18_opt(state).ok_or_else(|| error_response("M18 economic layer not attached"))
+}
+
+// ---------------------------------------------------------------------------
+// World trade anchoring: contract → escrow → release → settle
+// ---------------------------------------------------------------------------
+
+/// Map a World entity wallet to an M18-valid wallet: `erd1…` passes
+/// through, local identities (`npc:…`, plain ids) become `agent:{id}` —
+/// the documented local-network form. Pure, no I/O.
+pub fn world_m18_wallet(entity_wallet: &str, entity_id: &str) -> String {
+    if entity_wallet.starts_with("erd1") {
+        entity_wallet.to_string()
+    } else {
+        format!("agent:{entity_id}")
+    }
+}
+
+/// Record a COMPLETED World sale through the full M18 path:
+///
+/// propose → accept → persist → escrow create → persist →
+/// release(evidence) → persist. Returns `(contract_id, escrow_id)`.
+///
+/// Amount unit: World credits pass 1:1 as micro-CU for the anchor record.
+/// The World ledger stays authoritative for balances; the M18 reward
+/// formula is NOT invoked here — this anchors an agreed trade, it does
+/// not mint contribution value.
+#[allow(clippy::too_many_arguments)]
+pub fn record_world_sale(
+    m18: &M18State,
+    provider: (&str, &str),
+    consumer: (&str, &str),
+    capability: &str,
+    description: &str,
+    price_credits: u64,
+    evidence_hash: &str,
+    now: u64,
+) -> Result<(String, String), String> {
+    let (provider_id, provider_wallet_raw) = provider;
+    let (consumer_id, consumer_wallet_raw) = consumer;
+    let provider_wallet = world_m18_wallet(provider_wallet_raw, provider_id);
+    let consumer_wallet = world_m18_wallet(consumer_wallet_raw, consumer_id);
+
+    let mut c = contract::propose_contract(
+        &provider_wallet,
+        &consumer_wallet,
+        ServiceDescriptor {
+            capability: capability.to_string(),
+            description: description.chars().take(280).collect(),
+            model_requirement: None,
+            estimated_input_size: None,
+        },
+        ContractTerms {
+            price_micro_cu: price_credits,
+            max_duration_secs: 3_600,
+            min_quality_percent: 0,
+            escrow_required: true,
+        },
+        now,
+    )
+    .map_err(|e| format!("m18 propose failed: {e}"))?;
+    contract::accept_contract(&mut c, &provider_wallet, now)
+        .map_err(|e| format!("m18 accept failed: {e}"))?;
+    let contract_id = c.contract_id.clone();
+    {
+        let mut contracts = m18.contracts.lock().map_err(|e| e.to_string())?;
+        contracts.insert(contract_id.clone(), c.clone());
+    }
+    let _ = m18.save_contracts();
+    {
+        let mut escrow = m18.escrow.lock().map_err(|e| e.to_string())?;
+        escrow
+            .create_escrow(&c, now)
+            .map_err(|e| format!("m18 escrow create failed: {e}"))?;
+        escrow
+            .release_escrow(&contract_id, evidence_hash, now)
+            .map_err(|e| format!("m18 escrow release failed: {e}"))?;
+    }
+    let _ = m18.save_escrow();
+    Ok((contract_id.clone(), contract_id))
+}
+
+/// Settle a released World-sale escrow with the chain tx hash.
+/// Best-effort after broadcast: failure here never un-records the proof.
+pub fn settle_world_sale(
+    m18: &M18State,
+    escrow_id: &str,
+    tx_hash: &str,
+    amount_credits: u64,
+    now: u64,
+) -> Result<(), String> {
+    {
+        let mut escrow = m18.escrow.lock().map_err(|e| e.to_string())?;
+        escrow
+            .settle_escrow(escrow_id, tx_hash, amount_credits, now)
+            .map_err(|e| format!("m18 escrow settle failed: {e}"))?;
+    }
+    let _ = m18.save_escrow();
+    Ok(())
+}
+
+/// Find the escrow holding a given evidence hash — the proof ↔ escrow link.
+/// Used by the sweep/check paths to settle escrows created before a restart.
+pub fn escrow_for_evidence(m18: &M18State, evidence_hash: &str) -> Option<String> {
+    let escrow = m18.escrow.lock().ok()?;
+    escrow.records.values().find_map(|r| {
+        if r.evidence_hash.as_deref() == Some(evidence_hash) {
+            Some(r.escrow_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -544,4 +661,65 @@ fn error_response(msg: impl Into<String>) -> Response {
         serde_json::to_string(&body).unwrap_or_default(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_m18() -> M18State {
+        M18State::test_default()
+    }
+
+    #[test]
+    fn wallet_mapping_keeps_erd1_and_namespaces_locals() {
+        assert_eq!(
+            world_m18_wallet("erd1abc", "x"),
+            "erd1abc".to_string()
+        );
+        assert_eq!(
+            world_m18_wallet("npc:npc-smith", "npc-smith"),
+            "agent:npc-smith".to_string()
+        );
+    }
+
+    #[test]
+    fn world_sale_full_path_propose_to_settle() {
+        let m18 = test_m18();
+        let now = 1_700_000_000;
+        let (cid, eid) = record_world_sale(
+            &m18,
+            ("npc-smith", "npc:npc-smith"),
+            ("agent-1", "erd1buyerbuyerbuyerbuyerbuyerbuyerbuyerbuyerbuye"),
+            "coding",
+            "agent-1 purchased coding from npc-smith for 10Cr",
+            10,
+            "aa".repeat(32).as_str(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(cid, eid);
+        // Released with evidence attached.
+        {
+            let escrow = m18.escrow.lock().unwrap();
+            let r = escrow.records.get(&eid).unwrap();
+            assert_eq!(
+                r.status,
+                decentraai_economy::escrow::EscrowStatus::Released
+            );
+            assert_eq!(r.evidence_hash.as_deref(), Some("aa".repeat(32).as_str()));
+            assert_eq!(r.provider_wallet, "agent:npc-smith".to_string());
+        }
+        // Proof ↔ escrow link resolves.
+        assert_eq!(
+            escrow_for_evidence(&m18, &"aa".repeat(32)),
+            Some(eid.clone())
+        );
+        // Chain settle finalizes.
+        settle_world_sale(&m18, &eid, "deadbeef01", 10, now + 1).unwrap();
+        let escrow = m18.escrow.lock().unwrap();
+        let r = escrow.records.get(&eid).unwrap();
+        assert_eq!(r.status, decentraai_economy::escrow::EscrowStatus::Settled);
+        assert_eq!(r.tx_hash.as_deref(), Some("deadbeef01"));
+    }
 }
