@@ -2081,21 +2081,30 @@ impl WorldState {
         }
 
         // One special quest per tick at most: the keeper reacts to the
-        // economy instead of repeating the same board.
-        if self.elite_quest_available() {
+        // economy instead of repeating the same board. Kind-capped across
+        // open quests (Available + Active): a taken-but-unfinished special
+        // blocks reposts, so the board never floods.
+        if self.open_kind_count("-elite-") >= 1 {
             return;
         }
         if self.maybe_elite_quest() {
             return;
         }
+        if self.open_kind_count("-marketbuy") >= 2 {
+            return;
+        }
         self.maybe_market_quest();
     }
 
-    /// True when an elite quest is already waiting on the board.
-    fn elite_quest_available(&self) -> bool {
-        self.quests.iter().any(|q| {
-            q.status == QuestStatus::Available && q.id.contains("-elite-")
-        })
+    /// Open (Available or Active) quests of a kind, by id infix.
+    fn open_kind_count(&self, infix: &str) -> usize {
+        self.quests
+            .iter()
+            .filter(|q| {
+                (q.status == QuestStatus::Available || q.status == QuestStatus::Active)
+                    && q.id.contains(infix)
+            })
+            .count()
     }
 
     /// Elite work for proven agents: when someone holds reputation >= 2.0,
@@ -2152,14 +2161,10 @@ impl WorldState {
 
     /// Market work from live stock: when a market holds active listings and
     /// some funded agent exists, the keeper posts a BuyItem run there.
-    /// Reward covers the cheapest listing + margin. Marketplace ↔ quests,
-    /// feeding each other instead of idling side by side.
+    /// Reward covers the cheapest listing + margin. Capped by the caller:
+    /// at most 2 open market runs at once. Marketplace ↔ quests, feeding
+    /// each other instead of idling side by side.
     fn maybe_market_quest(&mut self) -> bool {
-        if self.quests.iter().any(|q| {
-            q.status == QuestStatus::Available && q.id.contains("-marketbuy-")
-        }) {
-            return false;
-        }
         let (market_id, market_label, floor_price) = match self
             .locations
             .iter()
