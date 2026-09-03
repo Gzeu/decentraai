@@ -39,6 +39,49 @@ pub const SETTLEMENT_GAS_PER_BYTE: u64 = 1_500;
 /// Transaction version we broadcast.
 pub const SETTLEMENT_TX_VERSION: u64 = 1;
 
+/// Local nonce tracker: the next nonce this node will use.
+/// `None` until the first reservation after boot.
+///
+/// WHY: the chain account nonce only advances on INCLUSION. Two rapid
+/// submits both read the same confirmed nonce and broadcast different txs
+/// with it — one hash silently dies (observed live: proof-29 vs proof-30
+/// collided on nonce 5). Reservations serialize through this tracker:
+/// `max(chain_nonce, last_reserved + 1, observed pendings + 1)`.
+static NEXT_NONCE: std::sync::OnceLock<tokio::sync::Mutex<Option<u64>>> =
+    std::sync::OnceLock::new();
+
+fn nonce_tracker() -> &'static tokio::sync::Mutex<Option<u64>> {
+    NEXT_NONCE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Pure reservation rule (unit-tested): never go backwards, never reuse.
+pub fn next_nonce(chain_nonce: u64, last: Option<u64>) -> u64 {
+    match last {
+        Some(l) => chain_nonce.max(l.saturating_add(1)),
+        None => chain_nonce,
+    }
+}
+
+/// Feed an externally known used nonce (e.g. a `Submitted` proof's nonce
+/// reloaded after a restart) so the tracker never reissues it.
+pub async fn observe_nonce(used: u64) {
+    let mut guard = nonce_tracker().lock().await;
+    *guard = Some(guard.unwrap_or(0).max(used));
+}
+
+/// Reserve the next sendable nonce for `sender`. Serialized: concurrent
+/// submits queue here instead of colliding on a stale chain read.
+pub async fn reserve_nonce(api_base: &str, sender: &str) -> Result<u64, String> {
+    // Held across the fetch on purpose: reservation + record is one atomic
+    // step, so no two callers can take the same nonce. (tokio Mutex —
+    // no executor blocking, just queuing.)
+    let mut guard = nonce_tracker().lock().await;
+    let chain = fetch_nonce(api_base, sender).await?;
+    let n = next_nonce(chain, *guard);
+    *guard = Some(n);
+    Ok(n)
+}
+
 /// Gas for an anchoring tx carrying `data_len_bytes` of payload.
 pub fn gas_limit_for_data(data_len_bytes: usize) -> u64 {
     SETTLEMENT_BASE_GAS + SETTLEMENT_GAS_PER_BYTE * data_len_bytes as u64
@@ -196,21 +239,22 @@ pub async fn tx_status(api_base: &str, tx_hash: &str) -> Result<String, String> 
         .ok_or_else(|| "status response missing status".to_string())
 }
 
-/// Full automation for one proof: intent → nonce → sign → broadcast.
+/// Full automation for one proof: reserve nonce → sign → broadcast.
 /// `sender` MUST be [`operator_address()`] output — the caller enforces the
 /// operator identity, this function enforces the chain mechanics.
-/// Returns `(tx_hash, sender)`. Recording + persistence stay with the caller.
+/// Returns `(tx_hash, sender, nonce)`. Recording + persistence stay with
+/// the caller (the nonce travels with the record for restart recovery).
 pub async fn auto_submit_proof(
     intent_data: &str,
     sender: &str,
     api_base: &str,
-) -> Result<(String, String), String> {
-    let nonce = fetch_nonce(api_base, sender).await?;
+) -> Result<(String, String, u64), String> {
+    let nonce = reserve_nonce(api_base, sender).await?;
     let prepared = prepare_anchoring_tx(sender, nonce, intent_data);
     let sig = sign_prepared(&prepared)?;
     let signed = attach_signature(&prepared, &sig);
     let tx_hash = broadcast_tx(api_base, &signed).await?;
-    Ok((tx_hash, sender.to_string()))
+    Ok((tx_hash, sender.to_string(), nonce))
 }
 
 /// Network tag this module submits to (mirrors the intent network).
@@ -278,8 +322,27 @@ mod tests {
     }
 
     #[test]
-    fn operator_address_fails_closed_without_injection() {
-        // No DECENTRAAI_MX_SIGNER_* in test env → deterministic failure.
+    fn nonce_reservation_never_reuses_or_regresses() {
+        // Fresh boot: chain decides.
+        assert_eq!(next_nonce(5, None), 5);
+        assert_eq!(next_nonce(0, None), 0);
+        // Rapid submits: chain is stale, tracker advances.
+        assert_eq!(next_nonce(5, Some(5)), 6);
+        assert_eq!(next_nonce(5, Some(8)), 9);
+        // Chain moved past us (restart, external tx): follow the chain.
+        assert_eq!(next_nonce(12, Some(8)), 12);
+    }
+
+    #[tokio::test]
+    async fn observe_nonce_feeds_the_tracker() {
+        observe_nonce(41).await;
+        let guard = nonce_tracker().lock().await;
+        assert!(guard.unwrap_or(0) >= 41);
+        // Leave the tracker ahead — other tests use explicit values only.
+    }
+
+    #[test]
+    fn operator_address_fails_closed_without_injection() {        // No DECENTRAAI_MX_SIGNER_* in test env → deterministic failure.
         // (If the operator env leaks into tests, skip instead of failing.)
         if std::env::var("DECENTRAAI_MX_SIGNER_HEX").is_err()
             && std::env::var("DECENTRAAI_MX_SIGNER_HEX_FILE").is_err()

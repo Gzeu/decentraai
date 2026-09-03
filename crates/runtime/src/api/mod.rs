@@ -3091,7 +3091,7 @@ async fn world_settle_submit_handler(
         .to_string();
 
     let mut world = state.world.lock().await;
-    match world.submit_settlement(&proof_id, &tx_hash, &sender) {
+    match world.submit_settlement(&proof_id, &tx_hash, &sender, None) {
         Ok(()) => {
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
@@ -3163,17 +3163,26 @@ async fn settle_proof_best_effort(
 ) -> Option<(String, String)> {
     let sender = crate::settlement_tx::operator_address().ok()?;
 
-    // Deterministic intent under a short lock; network I/O outside the lock
-    // so ticks are never blocked by the testnet API.
+    // Feed every known in-flight nonce into the tracker first: after a
+    // restart, pending proofs still occupy their nonces on-chain.
+    // Then build the deterministic intent under a short lock; network I/O
+    // stays outside the lock so ticks never block on the testnet API.
     let tx_data = {
         let world = state.world.lock().await;
+        for p in &world.proofs {
+            if p.status == crate::world::SettlementStatus::Submitted
+                && let Some(n) = p.nonce
+            {
+                crate::settlement_tx::observe_nonce(n).await;
+            }
+        }
         match world.submit_intent(proof_id, &sender) {
             Ok((intent, _)) => intent.data_field(),
             Err(_) => return None,
         }
     };
 
-    let (tx_hash, _) = crate::settlement_tx::auto_submit_proof(
+    let (tx_hash, _, nonce) = crate::settlement_tx::auto_submit_proof(
         &tx_data,
         &sender,
         crate::settlement_tx::TESTNET_API_BASE,
@@ -3182,7 +3191,7 @@ async fn settle_proof_best_effort(
     .ok()?;
 
     let mut world = state.world.lock().await;
-    match world.submit_settlement(proof_id, &tx_hash, &sender) {
+    match world.submit_settlement(proof_id, &tx_hash, &sender, Some(nonce)) {
         Ok(()) => {
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
@@ -3437,6 +3446,7 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
     let mut confirmed = vec![];
     let mut still_pending = vec![];
     let mut failed = vec![];
+    let mut resubmitted = vec![];
     for (proof_id, tx_hash) in submitted {
         match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash)
             .await
@@ -3461,6 +3471,35 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                 crate::world::save_world_state(&path, &world);
                 failed.push(proof_id);
             }
+            Err(e) if e.contains("404") => {
+                // Broadcast accepted but the tx never landed (e.g. a nonce
+                // collision dropped it from the mempool): requeue with a
+                // FRESH nonce and resubmit in this same sweep.
+                let requeued = {
+                    let mut world = state.world.lock().await;
+                    match world.requeue_settlement(&proof_id) {
+                        Ok(()) => {
+                            let path = crate::world::world_path_for(&state.info.repo_root);
+                            crate::world::save_world_state(&path, &world);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                };
+                if requeued {
+                    match settle_proof_best_effort(&state, &proof_id).await {
+                        Some((new_hash, _)) => {
+                            settle_escrow_for_proof(&state, &proof_id, &new_hash).await;
+                            resubmitted.push(
+                                serde_json::json!({"proof_id": proof_id, "tx_hash": new_hash}),
+                            );
+                        }
+                        None => still_pending.push(proof_id),
+                    }
+                } else {
+                    still_pending.push(proof_id);
+                }
+            }
             _ => still_pending.push(proof_id),
         }
     }
@@ -3473,6 +3512,7 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
             "submit_failed": submit_failed,
             "confirmed": confirmed,
             "failed": failed,
+            "resubmitted": resubmitted,
             "still_pending": still_pending,
         })),
     )

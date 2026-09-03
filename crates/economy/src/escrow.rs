@@ -211,6 +211,33 @@ impl EscrowLedger {
         Ok(())
     }
 
+    /// Re-anchors an already-Settled escrow to a replacement tx hash.
+    ///
+    /// Used when the first broadcast died off-chain (dropped from the
+    /// mempool: accepted hash, never included) and a resubmission landed
+    /// instead. Same evidence, same amount — only the chain reference is
+    /// corrected. Rejects anything that is not already Settled.
+    pub fn reanchor_escrow(
+        &mut self,
+        escrow_id: &str,
+        tx_hash: &str,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        let record = self
+            .records
+            .get_mut(escrow_id)
+            .ok_or_else(|| EscrowError::NotFound(escrow_id.to_string()))?;
+        if record.status != EscrowStatus::Settled {
+            return Err(EscrowError::InvalidTransition(
+                record.status,
+                EscrowStatus::Settled,
+            ));
+        }
+        record.tx_hash = Some(tx_hash.to_string());
+        record.updated_at = now;
+        Ok(())
+    }
+
     /// Executes a full settlement flow: release → local test settle.
     pub fn execute_settlement(
         &mut self,
@@ -293,6 +320,27 @@ mod tests {
         let escrow = ledger.create_escrow(&c, 300).unwrap();
         assert_eq!(escrow.status, EscrowStatus::Held);
         assert_eq!(escrow.amount_micro_cu, 5_000_000);
+    }
+
+    #[test]
+    fn reanchor_corrects_dead_tx_on_settled_only() {
+        let mut ledger = EscrowLedger::default();
+        let c = make_contract();
+        ledger.create_escrow(&c, 300).unwrap();
+        // Non-settled escrows refuse reanchor.
+        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400).is_err());
+        ledger.release_escrow(&c.contract_id, "ev96", 400).unwrap();
+        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400).is_err());
+        ledger
+            .settle_escrow(&c.contract_id, "deadh00", 5_000_000, 500)
+            .unwrap();
+        // Same evidence, replacement hash: allowed.
+        ledger
+            .reanchor_escrow(&c.contract_id, "liveh11", 600)
+            .unwrap();
+        let r = ledger.records.get(&c.contract_id).unwrap();
+        assert_eq!(r.status, EscrowStatus::Settled);
+        assert_eq!(r.tx_hash.as_deref(), Some("liveh11"));
     }
 
     #[test]

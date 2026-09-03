@@ -212,6 +212,10 @@ pub struct OnChainProof {
     /// Persisted so restart/recovery can verify sender consistency.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sender: String,
+    /// Chain nonce the tx was broadcast with (for restart recovery: pending
+    /// txs occupy their nonces, the tracker must not reissue them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
     /// Current settlement status.
     pub status: SettlementStatus,
     /// When the proof was generated (tick).
@@ -1630,6 +1634,7 @@ impl WorldState {
             tx_data,
             tx_hash: String::new(),
             sender: String::new(),
+            nonce: None,
             status: SettlementStatus::Pending,
             created_tick: self.tick,
             submitted_tick: 0,
@@ -1653,12 +1658,14 @@ impl WorldState {
         Ok(proof)
     }
 
-    /// Mark a proof as submitted (tx hash + operator sender recorded).
+    /// Mark a proof as submitted (tx hash + operator sender + nonce recorded).
+    /// The nonce is persisted so restart recovery never reissues it.
     pub fn submit_settlement(
         &mut self,
         proof_id: &str,
         tx_hash: &str,
         sender: &str,
+        nonce: Option<u64>,
     ) -> Result<(), String> {
         let (entity_id, evidence_hash) = {
             let proof = self
@@ -1670,6 +1677,7 @@ impl WorldState {
             proof.status = SettlementStatus::Submitted;
             proof.tx_hash = tx_hash.to_string();
             proof.sender = sender.to_string();
+            proof.nonce = nonce;
             proof.submitted_tick = self.tick;
 
             (proof.entity_id.clone(), proof.evidence_hash.clone())
@@ -1683,6 +1691,39 @@ impl WorldState {
                 &tx_hash[..tx_hash.len().min(16)],
                 if sender.is_empty() { "?" } else { sender }
             ),
+            entity_id: Some(entity_id),
+            location_id: None,
+            evidence_id: Some(evidence_hash),
+        });
+
+        Ok(())
+    }
+
+    /// Requeue a `Submitted` proof whose tx never landed on-chain back to
+    /// `Pending` (clears tx hash + nonce, keeps sender + evidence). The
+    /// sweep path calls this when the chain 404s a submitted hash; the
+    /// proof then resubmits with a FRESH nonce instead of rotting.
+    pub fn requeue_settlement(&mut self, proof_id: &str) -> Result<(), String> {
+        let (entity_id, evidence_hash) = {
+            let proof = self
+                .proofs
+                .iter_mut()
+                .find(|p| p.id == proof_id)
+                .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
+            if proof.status != SettlementStatus::Submitted {
+                return Err("proof is not in submitted state".to_string());
+            }
+            proof.status = SettlementStatus::Pending;
+            proof.tx_hash.clear();
+            proof.nonce = None;
+            proof.submitted_tick = 0;
+            (proof.entity_id.clone(), proof.evidence_hash.clone())
+        };
+
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "settlement_requeued".to_string(),
+            detail: format!("Proof {proof_id} requeued: tx never landed, will resubmit"),
             entity_id: Some(entity_id),
             location_id: None,
             evidence_id: Some(evidence_hash),
@@ -2417,7 +2458,7 @@ mod tests {
 
         // Submit
         assert!(w
-            .submit_settlement(&proof_id, "abc123def456", "erd1operator")
+            .submit_settlement(&proof_id, "abc123def456", "erd1operator", Some(7))
             .is_ok());
         assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
         assert_eq!(w.proofs[0].tx_hash, "abc123def456");
@@ -2490,6 +2531,48 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn requeue_returns_dead_submission_to_pending() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "z".to_string(),
+            location_id: "l".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        let proof = w
+            .settle_on_chain("quest_completion", "c", "agent-1", 20)
+            .unwrap();
+        let pid = proof.id.clone();
+        w.submit_settlement(&pid, "deadhash", "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Some(5)).unwrap();
+        assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
+        // Non-submitted proofs refuse requeue.
+        assert!(w.requeue_settlement("missing").is_err());
+        w.requeue_settlement(&pid).unwrap();
+        assert_eq!(w.proofs[0].status, SettlementStatus::Pending);
+        assert!(w.proofs[0].tx_hash.is_empty());
+        assert_eq!(w.proofs[0].nonce, None);
+        // ...but the intent still rebuilds byte-identical for resubmission.
+        let (intent, _) = w
+            .submit_intent(&pid, "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+            .unwrap();
+        assert_eq!(intent.data_field(), proof.tx_data);
+        // Confirmed proofs refuse requeue.
+        w.submit_settlement(&pid, "livehash", "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Some(6)).unwrap();
+        w.confirm_settlement(&pid).unwrap();
+        assert!(w.requeue_settlement(&pid).is_err());
     }
 
     #[test]
@@ -2624,7 +2707,8 @@ mod tests {
         assert!(w.submit_intent(&proof.id, "").is_err());
         assert!(w.submit_intent(&proof.id, "not-an-address").is_err());
         assert!(w.submit_intent("proof-missing", sender).is_err());
-        w.submit_settlement(&proof.id, "deadbeef", sender).unwrap();
+        w.submit_settlement(&proof.id, "deadbeef", sender, Some(9)).unwrap();
+        assert_eq!(w.proofs[0].nonce, Some(9));
         assert_eq!(w.proofs[0].sender, sender);
         assert!(w.submit_intent(&proof.id, sender).is_err());
     }

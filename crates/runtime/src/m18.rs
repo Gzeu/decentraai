@@ -232,6 +232,8 @@ pub fn record_world_sale(
 
 /// Settle a released World-sale escrow with the chain tx hash.
 /// Best-effort after broadcast: failure here never un-records the proof.
+/// When the escrow already settled on a tx that later proved dead
+/// (dropped from the mempool), the anchor is CORRECTED to the live hash.
 pub fn settle_world_sale(
     m18: &M18State,
     escrow_id: &str,
@@ -241,9 +243,18 @@ pub fn settle_world_sale(
 ) -> Result<(), String> {
     {
         let mut escrow = m18.escrow.lock().map_err(|e| e.to_string())?;
-        escrow
-            .settle_escrow(escrow_id, tx_hash, amount_credits, now)
-            .map_err(|e| format!("m18 escrow settle failed: {e}"))?;
+        match escrow.settle_escrow(escrow_id, tx_hash, amount_credits, now) {
+            Ok(()) => {}
+            Err(decentraai_economy::escrow::EscrowError::InvalidTransition(
+                decentraai_economy::escrow::EscrowStatus::Settled,
+                _,
+            )) => {
+                escrow
+                    .reanchor_escrow(escrow_id, tx_hash, now)
+                    .map_err(|e| format!("m18 escrow reanchor failed: {e}"))?;
+            }
+            Err(e) => return Err(format!("m18 escrow settle failed: {e}")),
+        }
     }
     let _ = m18.save_escrow();
     Ok(())
