@@ -936,26 +936,6 @@ impl WorldState {
         // 1. Questkeeper generates quests
         self.questkeeper_tick();
 
-        // 2. Check quest progress
-        self.check_quest_progress();
-
-        // 3. NPC behavior: NPCs at service locations offer services
-        for entity in &mut self.entities {
-            if entity.entity_type == "npc" {
-                // NPCs maintain their reputation
-                entity.reputation = (entity.reputation + 0.01).min(5.0);
-                // NPCs at service locations restock
-                if let Some(loc) = self.locations.iter().find(|l| l.id == entity.location_id) {
-                    if !loc.services.is_empty() {
-                        entity.activity = format!(
-                            "offering {}",
-                            loc.services.keys().cloned().collect::<Vec<_>>().join(", ")
-                        );
-                    }
-                }
-            }
-        }
-
         // 2. Agent autonomous behavior: agents with needs seek services
         let entity_ids: Vec<String> = self.entities.iter().map(|e| e.id.clone()).collect();
         for entity_id in entity_ids {
@@ -1003,6 +983,44 @@ impl WorldState {
             }
         }
 
+        // 2b. Agent autonomy: fulfill needs, take and work quests, earn.
+        // This is what makes the world ALIVE without API calls: agents buy
+        // services where they stand, accept quests they qualify for, pursue
+        // objectives (move / buy / list / trade), and collect rewards.
+        // On-chain submission stays OUT of the tick (no network here):
+        // every worthy sale leaves a Pending proof for the sweep path.
+        self.agent_autonomy_tick();
+
+        // 2c. Quest progress follows action, then Ready quests complete:
+        // rewards pay out and auto-settle (Pending) in the same tick.
+        self.check_quest_progress();
+        let ready: Vec<String> = self
+            .quests
+            .iter()
+            .filter(|q| q.status == QuestStatus::Ready)
+            .map(|q| q.id.clone())
+            .collect();
+        for quest_id in ready {
+            let _ = self.complete_quest(&quest_id);
+        }
+
+        // 3. NPC behavior: NPCs at service locations offer services
+        for entity in &mut self.entities {
+            if entity.entity_type == "npc" {
+                // NPCs maintain their reputation
+                entity.reputation = (entity.reputation + 0.01).min(5.0);
+                // NPCs at service locations restock
+                if let Some(loc) = self.locations.iter().find(|l| l.id == entity.location_id) {
+                    if !loc.services.is_empty() {
+                        entity.activity = format!(
+                            "offering {}",
+                            loc.services.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                }
+            }
+        }
+
         // 3. Record tick event periodically
         if self.tick % 10 == 0 {
             let agent_count = self.entities.iter().filter(|e| e.entity_type == "agent").count();
@@ -1021,6 +1039,270 @@ impl WorldState {
                 location_id: None,
                 evidence_id: None,
             });
+        }
+    }
+
+    /// Agent autonomy: needs, quests, earning — one action per agent.
+    ///
+    /// This is what makes the world ALIVE without API calls. Each tick every
+    /// agent, in order: (1) may develop a new need, (2) buys ONE needed
+    /// service where it stands, (3) takes or works ONE quest objective.
+    /// Sales leave Pending proofs (no network in tick) for the sweep path;
+    /// quest completion pays rewards + auto-settles right here.
+    fn agent_autonomy_tick(&mut self) {
+        let ids: Vec<String> = self
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "agent")
+            .map(|e| e.id.clone())
+            .collect();
+        for id in ids {
+            self.agent_regenerate_need(&id);
+            self.agent_fulfill_need(&id);
+            self.agent_quest_tick(&id);
+        }
+    }
+
+    /// Services agents can develop needs for (all real priced offers).
+    const NEED_ROTATION: &'static [&'static str] = &[
+        "ocr",
+        "inference",
+        "translation",
+        "research",
+        "embeddings",
+        "coding",
+        "stt",
+    ];
+
+    /// Idle agents develop new needs over time, so the world never runs dry:
+    /// no needs + no active quest + rhythm tick → next need in rotation
+    /// (only for services actually offered somewhere).
+    fn agent_regenerate_need(&mut self, agent_id: &str) {
+        if self.tick % 7 != 0 {
+            return;
+        }
+        let (needs_empty, has_active, slot) = match self
+            .entities
+            .iter()
+            .find(|e| e.id == agent_id)
+        {
+            Some(e) => (
+                e.needs.is_empty(),
+                self.quests.iter().any(|q| {
+                    q.status == QuestStatus::Active && q.accepted_by.as_deref() == Some(agent_id)
+                }),
+                e.id.len(),
+            ),
+            None => return,
+        };
+        if !needs_empty || has_active {
+            return;
+        }
+        let pick = Self::NEED_ROTATION[(self.tick as usize / 7 + slot) % Self::NEED_ROTATION.len()];
+        let offered = self
+            .locations
+            .iter()
+            .any(|l| l.services.contains_key(pick));
+        if !offered {
+            return;
+        }
+        if let Some(e) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+            e.needs.push(pick.to_string());
+            e.activity = format!("needs {}", pick);
+        }
+    }
+
+    /// Buy ONE needed service where the agent stands (dynamic price).
+    /// Fulfilled needs clear; worthy sales leave a Pending proof.
+    fn agent_fulfill_need(&mut self, agent_id: &str) {
+        let (loc, needs) = match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(e) => (e.location_id.clone(), e.needs.clone()),
+            None => return,
+        };
+        let Some(needed) = needs.into_iter().next() else {
+            return;
+        };
+        let affordable = self
+            .entities
+            .iter()
+            .find(|e| e.id == agent_id)
+            .map(|e| {
+                self.service_price(&loc, &needed)
+                    .map(|p| e.credits >= p)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !affordable {
+            return;
+        }
+        if let Ok((_, provider, price)) = self.buy_service(agent_id, &loc, &needed) {
+            if let Some(e) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+                e.needs.retain(|n| n != &needed);
+            }
+            let desc = format!("{agent_id} used {needed} (need fulfilled)");
+            self.trade_settlement_proof("service_sale", &desc, &provider, price);
+        }
+    }
+
+    /// Quest life: take an available quest, or work the first open objective
+    /// of the active one. One action per tick: move, buy, list, or trade.
+    fn agent_quest_tick(&mut self, agent_id: &str) {
+        let active_id: Option<String> = self
+            .quests
+            .iter()
+            .find(|q| {
+                q.status == QuestStatus::Active && q.accepted_by.as_deref() == Some(agent_id)
+            })
+            .map(|q| q.id.clone());
+        let quest_id = match active_id {
+            Some(id) => id,
+            None => {
+                // Oldest available quest the agent qualifies for.
+                let mut avail: Vec<String> = self
+                    .quests
+                    .iter()
+                    .filter(|q| q.status == QuestStatus::Available)
+                    .map(|q| q.id.clone())
+                    .collect();
+                avail.sort();
+                let mut took = None;
+                for qid in avail {
+                    if self.accept_quest(&qid, agent_id).is_ok() {
+                        took = Some(qid);
+                        break;
+                    }
+                }
+                match took {
+                    Some(id) => id,
+                    None => return,
+                }
+            }
+        };
+
+        let (objectives, progress) = match self.quests.iter().find(|q| q.id == quest_id) {
+            Some(q) => (q.objectives.clone(), q.progress.clone()),
+            None => return,
+        };
+        let open = objectives
+            .iter()
+            .zip(progress.iter())
+            .find(|(_, done)| !**done)
+            .map(|(obj, _)| obj.clone());
+        let Some(obj) = open else { return };
+        match obj {
+            QuestObjective::MoveTo { location_id } => {
+                self.agent_goto(agent_id, &location_id);
+            }
+            QuestObjective::BuyService {
+                location_id,
+                service,
+            } => {
+                if self.agent_at(agent_id, &location_id) {
+                    if let Ok((_, provider, price)) =
+                        self.buy_service(agent_id, &location_id, &service)
+                    {
+                        let desc = format!("{agent_id} completed quest service {service}");
+                        self.trade_settlement_proof("service_sale", &desc, &provider, price);
+                    }
+                } else {
+                    self.agent_goto(agent_id, &location_id);
+                }
+            }
+            QuestObjective::ListItem { location_id } => {
+                if self.agent_at(agent_id, &location_id) {
+                    let item = WorldItem {
+                        id: format!("craft-{agent_id}-{}", self.tick),
+                        name: format!("{agent_id} Crafts"),
+                        item_type: "artifact".to_string(),
+                        price: 8,
+                        description: format!("Handmade goods by {agent_id}"),
+                    };
+                    let _ = self.list_item(agent_id, item, &location_id);
+                } else {
+                    self.agent_goto(agent_id, &location_id);
+                }
+            }
+            QuestObjective::BuyItem { location_id } => {
+                if self.agent_at(agent_id, &location_id) {
+                    self.agent_buy_cheapest(agent_id, &location_id);
+                } else {
+                    self.agent_goto(agent_id, &location_id);
+                }
+            }
+            QuestObjective::Trade { location_id } => {
+                if self.agent_at(agent_id, &location_id) {
+                    self.agent_buy_cheapest(agent_id, &location_id);
+                } else {
+                    self.agent_goto(agent_id, &location_id);
+                }
+            }
+            QuestObjective::VisitZone { zone_id } => {
+                let here: bool = self
+                    .entities
+                    .iter()
+                    .find(|e| e.id == agent_id)
+                    .map(|e| e.zone_id == zone_id)
+                    .unwrap_or(true);
+                if !here {
+                    let target: Option<String> = self
+                        .locations
+                        .iter()
+                        .filter(|l| l.zone_id == zone_id)
+                        .map(|l| l.id.clone())
+                        .next();
+                    if let Some(t) = target {
+                        self.agent_goto(agent_id, &t);
+                    }
+                }
+            }
+            QuestObjective::EarnCredits { .. } | QuestObjective::ReachReputation { .. } => {}
+        }
+    }
+
+    /// True when the agent stands at the location.
+    fn agent_at(&self, agent_id: &str, location_id: &str) -> bool {
+        self.entities
+            .iter()
+            .find(|e| e.id == agent_id)
+            .map(|e| e.location_id == location_id)
+            .unwrap_or(false)
+    }
+
+    /// Move toward a location (capacity failures are silent by design).
+    fn agent_goto(&mut self, agent_id: &str, location_id: &str) {
+        if self.agent_at(agent_id, location_id) {
+            return;
+        }
+        if self.move_entity(agent_id, location_id).is_ok()
+            && let Some(e) = self.entities.iter_mut().find(|e| e.id == agent_id)
+        {
+            e.activity = format!("traveling to {location_id}");
+        }
+    }
+
+    /// Buy the cheapest affordable listing that is not the agent's own.
+    /// Worthy sales leave a Pending proof for the seller.
+    fn agent_buy_cheapest(&mut self, agent_id: &str, location_id: &str) {
+        let credits: u64 = self
+            .entities
+            .iter()
+            .find(|e| e.id == agent_id)
+            .map(|e| e.credits)
+            .unwrap_or(0);
+        let pick: Option<(String, u64)> = self
+            .listings
+            .iter()
+            .filter(|l| {
+                l.active && l.location_id == location_id && l.seller_id != agent_id
+            })
+            .min_by_key(|l| l.item.price)
+            .filter(|l| credits >= l.item.price)
+            .map(|l| (l.id.clone(), l.item.price));
+        if let Some((listing_id, _)) = pick {
+            if let Ok((item, seller_id)) = self.buy_item(agent_id, &listing_id) {
+                let desc = format!("{agent_id} bought market goods from {seller_id}");
+                self.trade_settlement_proof("item_sale", &desc, &seller_id, item.price);
+            }
         }
     }
 
@@ -2597,6 +2879,104 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn agents_live_alone_needs_and_quests() {
+        let mut w = WorldState::default();
+        w.locations.push(WorldLocation {
+            id: "loc-life".to_string(),
+            zone_id: "z".to_string(),
+            label: "Life".to_string(),
+            description: String::new(),
+            services: [("ocr".to_string(), 10u64)].into_iter().collect(),
+            marketplace: false,
+            capacity: 10,
+        });
+        w.locations.push(WorldLocation {
+            id: "loc-far".to_string(),
+            zone_id: "z".to_string(),
+            label: "Far".to_string(),
+            description: String::new(),
+            services: HashMap::new(),
+            marketplace: false,
+            capacity: 10,
+        });
+        for (id, etype, caps) in [
+            ("agent-a", "agent", vec![]),
+            ("npc-o", "npc", vec!["ocr".to_string()]),
+        ] {
+            w.entities.push(WorldEntity {
+                id: id.to_string(),
+                name: id.to_string(),
+                entity_type: etype.to_string(),
+                zone_id: "z".to_string(),
+                location_id: "loc-life".to_string(),
+                state: EntityState::Idle,
+                capabilities: caps,
+                needs: if etype == "agent" {
+                    vec!["ocr".to_string()]
+                } else {
+                    vec![]
+                },
+                wallet: format!("erd1{id}"),
+                reputation: 0.0,
+                credits: 100,
+                activity: String::new(),
+                last_move_tick: 0,
+                inventory: vec![],
+            });
+        }
+        // The world is eager: in ONE tick the agent moves to the ocr lab,
+        // fulfills its need, takes the generated quest (already positioned),
+        // and completes it for +20Cr. Need gone, reward paid, proof pends.
+        w.world_tick();
+        let a = w.entities.iter().find(|e| e.id == "agent-a").unwrap();
+        assert!(a.needs.is_empty(), "need should be fulfilled");
+        assert_eq!(a.credits, 110); // 100 - 10 service + 20 quest reward
+        assert!(a.inventory.iter().any(|i| i.item_type == "service-result"));
+        assert_eq!(w.proofs.len(), 1); // quest proof (sale had no NPC earner)
+        assert_eq!(w.proofs[0].entity_id, "agent-a");
+
+        // Quest autonomy: available MoveTo quest gets taken, walked, done.
+        w.entities
+            .iter_mut()
+            .find(|e| e.id == "agent-a")
+            .unwrap()
+            .location_id = "loc-far".to_string();
+        w.quests.push(Quest {
+            id: "q-life".to_string(),
+            title: "Go far".to_string(),
+            description: String::new(),
+            giver_id: "npc-o".to_string(),
+            objectives: vec![QuestObjective::MoveTo {
+                location_id: "loc-far".to_string(),
+            }],
+            reward: QuestReward {
+                credits: 20,
+                reputation: 0.5,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status: QuestStatus::Available,
+            accepted_by: None,
+            accepted_tick: 0,
+            created_tick: 0,
+            deadline_tick: 999,
+            required_reputation: 0.0,
+            required_capabilities: vec![],
+            progress: vec![false],
+        });
+        // Tick 1: accept (already there → progress true → Ready).
+        w.world_tick();
+        // Tick 2: Ready → Completed + reward + auto-settle proof.
+        w.world_tick();
+        let q = w.quests.iter().find(|q| q.id == "q-life").unwrap();
+        assert_eq!(q.status, QuestStatus::Completed);
+        let a = w.entities.iter().find(|e| e.id == "agent-a").unwrap();
+        assert_eq!(a.credits, 130); // 110 + 20 reward
+        assert!(a.reputation >= 0.5);
+        assert_eq!(w.proofs.len(), 2); // both quest proofs
     }
 
     #[test]
