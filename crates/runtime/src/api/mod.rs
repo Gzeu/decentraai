@@ -3277,7 +3277,7 @@ async fn settle_world_trade(
     // 1. Proof (under a short world lock) + persist.
     let (proof_id, evidence_hash, earner_wallet, buyer_wallet) = {
         let mut world = state.world.lock().await;
-        let proof = world.trade_settlement_proof(action_type, description, earner_id, price)?;
+        let proof = world.trade_settlement_proof(action_type, description, earner_id, price, capability)?;
         let ew = world
             .entities
             .iter()
@@ -3408,6 +3408,7 @@ async fn world_settle_check_handler(
                         crate::world::save_world_state(&path, &world);
                         drop(world);
                         settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
+                        anchor_provider_trust(&state, &proof_id).await;
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash})),
@@ -3502,6 +3503,7 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                         crate::world::save_world_state(&path, &world);
                         drop(world);
                         settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
+                        anchor_provider_trust(&state, &proof_id).await;
                         confirmed.push(proof_id);
                     }
                     Err(_) => still_pending.push(proof_id),
@@ -3560,6 +3562,64 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Anchor provider trust on chain-confirm: the earner's wallet gets an M18
+/// trust anchor (capability, quality 100, verified, contract-linked).
+/// Best-effort: proofs without earners/M18 simply skip. Duplicates are
+/// rejected by the store itself (same evidence hash).
+/// This closes the system loop: World sale → chain confirm → provider
+/// trust → future provider selection and quest eligibility.
+async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
+    let m18 = match state.m18.clone() {
+        Some(m) => m,
+        None => return,
+    };
+    let (wallet, evidence, capability, amount) = {
+        let world = state.world.lock().await;
+        match world.proofs.iter().find(|p| p.id == proof_id) {
+            Some(p) => {
+                let ew = world
+                    .entities
+                    .iter()
+                    .find(|e| e.id == p.entity_id)
+                    .map(|e| crate::m18::world_m18_wallet(&e.wallet, &e.id))
+                    .unwrap_or_default();
+                if ew.is_empty() {
+                    return;
+                }
+                let cap = if p.capability.is_empty() {
+                    p.action_type.clone()
+                } else {
+                    p.capability.clone()
+                };
+                (
+                    ew,
+                    p.evidence_hash.clone(),
+                    cap,
+                    p.amount,
+                )
+            }
+            None => return,
+        }
+    };
+    let escrow_id = crate::m18::escrow_for_evidence(&m18, &evidence);
+    let params = decentraai_economy::trust_anchor::AnchorParams {
+        agent_wallet: wallet,
+        evidence_hash: evidence,
+        capability,
+        quality_score: 100,
+        verified: true,
+        micro_cu: amount,
+        contract_id: escrow_id,
+    };
+    let now = crate::m18::now_secs_public();
+    if let Ok(mut trust) = m18.trust.lock() {
+        if trust.record_anchor(&params, now).is_ok() {
+            drop(trust);
+            let _ = m18.save_trust();
+        }
+    }
 }
 
 /// Settle the M18 escrow linked to a proof (via its evidence hash) after a

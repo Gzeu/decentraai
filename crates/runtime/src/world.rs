@@ -231,6 +231,11 @@ pub struct OnChainProof {
     /// Tx hash after submission (empty until submitted).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tx_hash: String,
+    /// Capability that earned this settlement ("ocr", "trade", "quest"...).
+    /// Feeds the M18 trust anchor on confirmation: the loop
+    /// World sale → chain confirm → provider trust → future opportunities.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub capability: String,
     /// Operator wallet that signed+broadcast the tx (empty until submitted).
     /// Persisted so restart/recovery can verify sender consistency.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -349,6 +354,12 @@ pub struct Quest {
     /// Required capabilities to accept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<String>,
+    /// Stake locked at accept (Cr), refunded on completion, slashed
+    /// (burned) on expiry. The off-chain form of the future DCAI quest
+    /// stake: same lock → refund/slash mechanics, game-denominated.
+    /// 0 = no stake.
+    #[serde(default)]
+    pub stake: u64,
 }
 
 // ─── WorldState ──────────────────────────────────────────────────────
@@ -424,6 +435,10 @@ pub struct WorldState {
     /// Per-agent economic history, keyed by entity id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ledger: HashMap<String, AgentEconomy>,
+    /// Locked quest stakes: quest_id → (agent_id, amount). Refunded on
+    /// completion, burned on expiry. Persisted like everything else.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub quest_stakes: HashMap<String, (String, u64)>,
 }
 
 impl Default for WorldState {
@@ -457,6 +472,7 @@ impl Default for WorldState {
             treasury_minted: 0,
             treasury_burned: 0,
             ledger: HashMap::new(),
+            quest_stakes: HashMap::new(),
         }
     }
 }
@@ -1121,6 +1137,8 @@ impl WorldState {
 
         // 2c. Quest progress follows action, then Ready quests complete:
         // rewards pay out and auto-settle (Pending) in the same tick.
+        // Deadlines bite before progress: expired quests fail + slash first.
+        self.enforce_deadlines();
         self.check_quest_progress();
         let ready: Vec<String> = self
             .quests
@@ -1282,7 +1300,7 @@ impl WorldState {
                 e.needs.retain(|n| n != &needed);
             }
             let desc = format!("{agent_id} used {needed} (need fulfilled)");
-            self.trade_settlement_proof("service_sale", &desc, &provider, price);
+            self.trade_settlement_proof("service_sale", &desc, &provider, price, &needed);
         }
     }
 
@@ -1370,7 +1388,7 @@ impl WorldState {
                         self.buy_service(agent_id, &location_id, &service)
                     {
                         let desc = format!("{agent_id} completed quest service {service}");
-                        self.trade_settlement_proof("service_sale", &desc, &provider, price);
+                        self.trade_settlement_proof("service_sale", &desc, &provider, price, &service);
                     }
                 } else {
                     self.agent_goto(agent_id, &location_id);
@@ -1444,21 +1462,33 @@ impl WorldState {
     }
 
     /// True when the agent can pursue a quest's BuyService costs right now
-    /// (dynamic price + spend reserve). Unaffordable quests wait for later.
+    /// (dynamic price + spend reserve) AND lock its stake. Unaffordable or
+    /// unstakeable quests wait for later.
     fn quest_pursuable(&self, agent_id: &str, quest_id: &str) -> bool {
         match self.quests.iter().find(|q| q.id == quest_id) {
-            Some(quest) => quest.objectives.iter().all(|obj| {
-                if let QuestObjective::BuyService {
-                    location_id,
-                    service,
-                } = obj
-                {
-                    let price = self.service_price(location_id, service).unwrap_or(u64::MAX);
-                    self.agent_can_spend(agent_id, price)
-                } else {
-                    true
+            Some(quest) => {
+                let credits: u64 = self
+                    .entities
+                    .iter()
+                    .find(|e| e.id == agent_id)
+                    .map(|e| e.credits)
+                    .unwrap_or(0);
+                if credits < quest.stake.saturating_add(Self::AGENT_SPEND_RESERVE) {
+                    return false;
                 }
-            }),
+                quest.objectives.iter().all(|obj| {
+                    if let QuestObjective::BuyService {
+                        location_id,
+                        service,
+                    } = obj
+                    {
+                        let price = self.service_price(location_id, service).unwrap_or(u64::MAX);
+                        self.agent_can_spend(agent_id, price)
+                    } else {
+                        true
+                    }
+                })
+            }
             None => false,
         }
     }
@@ -1560,7 +1590,7 @@ impl WorldState {
         if let Some((listing_id, _)) = pick {
             if let Ok((item, seller_id)) = self.buy_item(agent_id, &listing_id) {
                 let desc = format!("{agent_id} bought market goods from {seller_id}");
-                self.trade_settlement_proof("item_sale", &desc, &seller_id, item.price);
+                self.trade_settlement_proof("item_sale", &desc, &seller_id, item.price, "trade");
             }
         }
     }
@@ -1907,6 +1937,7 @@ impl WorldState {
                     deadline_tick: self.tick + 100,
                     required_reputation: 0.0,
                     required_capabilities: vec![],
+            stake: 0,
                 }
             } else {
                 // No matching location, create exploration quest
@@ -1937,6 +1968,7 @@ impl WorldState {
                     deadline_tick: self.tick + 50,
                     required_reputation: 0.0,
                     required_capabilities: vec![],
+            stake: 0,
                 }
             }
         } else {
@@ -1976,6 +2008,7 @@ impl WorldState {
                 deadline_tick: self.tick + 50,
                 required_reputation: 0.0,
                 required_capabilities: vec![],
+            stake: 0,
             }
         };
 
@@ -1989,6 +2022,47 @@ impl WorldState {
         });
 
         Some(quest)
+    }
+
+    /// Enforce quest deadlines: Active quests past `deadline_tick` expire —
+    /// status Failed, locked stake SLASHED (burned). Risk is real: taking a
+    /// staked quest and abandoning it costs money. Called from `world_tick`.
+    pub fn enforce_deadlines(&mut self) {
+        let expired: Vec<(String, String)> = self
+            .quests
+            .iter()
+            .filter(|q| {
+                q.status == QuestStatus::Active
+                    && q.deadline_tick > 0
+                    && self.tick > q.deadline_tick
+            })
+            .map(|q| (q.id.clone(), q.accepted_by.clone().unwrap_or_default()))
+            .collect();
+        for (quest_id, agent_id) in expired {
+            if let Some(q) = self.quests.iter_mut().find(|q| q.id == quest_id) {
+                q.status = QuestStatus::Failed;
+            }
+            let slashed = self.quest_stakes.remove(&quest_id).map(|(_, a)| a).unwrap_or(0);
+            if slashed > 0 {
+                self.burn(slashed);
+            }
+            self.record_event(WorldEvent {
+                tick: self.tick,
+                kind: "quest_expired".to_string(),
+                detail: if slashed > 0 {
+                    format!("{agent_id} abandoned quest {quest_id}: {slashed}Cr stake slashed")
+                } else {
+                    format!("{agent_id} abandoned quest {quest_id}")
+                },
+                entity_id: if agent_id.is_empty() {
+                    None
+                } else {
+                    Some(agent_id)
+                },
+                location_id: None,
+                evidence_id: None,
+            });
+        }
     }
 
     /// Accept a quest.
@@ -2023,6 +2097,31 @@ impl WorldState {
                     return Err(format!("missing required capability: {}", req_cap));
                 }
             }
+
+            if quest.stake > 0 && agent.credits < quest.stake {
+                return Err(format!(
+                    "stake {}Cr not affordable (balance {})",
+                    quest.stake, agent.credits
+                ));
+            }
+        }
+
+        // Lock the stake (held by the world, refunded or slashed later).
+        let stake = {
+            let quest = self
+                .quests
+                .iter()
+                .find(|q| q.id == quest_id)
+                .ok_or_else(|| format!("quest '{}' not found", quest_id))?;
+            quest.stake
+        };
+        if stake > 0 {
+            if let Some(a) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+                a.credits -= stake;
+            }
+            self.record_spend(agent_id, stake);
+            self.quest_stakes
+                .insert(quest_id.to_string(), (agent_id.to_string(), stake));
         }
 
         // Accept the quest
@@ -2217,6 +2316,15 @@ impl WorldState {
         self.mint(reward.credits);
         self.record_earn(&agent_id, reward.credits);
 
+        // Refund the locked stake (no mint: it never left supply).
+        if let Some((staker, amount)) = self.quest_stakes.remove(quest_id) {
+            if staker == agent_id
+                && let Some(agent) = self.entities.iter_mut().find(|e| e.id == agent_id)
+            {
+                agent.credits += amount;
+            }
+        }
+
         // Deliverables are consumed: each BuyService objective eats the
         // matching service-result out of the agent's inventory. One purchase
         // completes one quest — results can't be double-spent across quests.
@@ -2357,6 +2465,7 @@ impl WorldState {
             deadline_tick: self.tick + 100,
             required_reputation: 1.0,
             required_capabilities: vec![],
+            stake: 10,
         };
         self.record_event(WorldEvent {
             tick: self.tick,
@@ -2430,6 +2539,7 @@ impl WorldState {
             deadline_tick: self.tick + 100,
             required_reputation: 0.0,
             required_capabilities: vec![],
+            stake: 0,
         };
         self.record_event(WorldEvent {
             tick: self.tick,
@@ -2466,12 +2576,14 @@ impl WorldState {
         entity_id: &str,
         amount: u64,
     ) -> Result<OnChainProof, String> {
-        self.settle_on_chain_with_job("quest", action_type, description, entity_id, amount)
+        self.settle_on_chain_with_job("quest", action_type, description, entity_id, amount, "")
     }
 
     /// Same as [`Self::settle_on_chain`] but with an explicit job namespace
     /// (`quest` for quest rewards, `trade` for marketplace/service sales) so
     /// the anchored `job_id` tells WHAT settled, not just that something did.
+    /// `capability` travels on the proof into the M18 trust anchor at
+    /// confirmation time ("" when unknown — trust falls back to the action).
     pub fn settle_on_chain_with_job(
         &mut self,
         job_ns: &str,
@@ -2479,6 +2591,7 @@ impl WorldState {
         description: &str,
         entity_id: &str,
         amount: u64,
+        capability: &str,
     ) -> Result<OnChainProof, String> {
         // Verify entity exists
         self.entities
@@ -2510,6 +2623,7 @@ impl WorldState {
             evidence_hash: evidence_hash.clone(),
             tx_data,
             tx_hash: String::new(),
+            capability: capability.to_string(),
             sender: String::new(),
             nonce: None,
             status: SettlementStatus::Pending,
@@ -2695,20 +2809,22 @@ impl WorldState {
     /// Build the settlement proof for a completed World trade.
     ///
     /// `earner` is who delivered value (seller / provider NPC) — they are
-    /// the reputation beneficiary on confirmation. Returns `None` for dust
-    /// (below [`SETTLEMENT_MIN_CREDITS`]) or unknown earner: those trades
-    /// stay purely off-chain by design.
+    /// the reputation beneficiary on confirmation. `capability` is the
+    /// skill that earned it (service name / "trade") for trust anchoring.
+    /// Returns `None` for dust (below [`SETTLEMENT_MIN_CREDITS`]) or
+    /// unknown earner: those trades stay purely off-chain by design.
     pub fn trade_settlement_proof(
         &mut self,
         action_type: &str,
         description: &str,
         earner_id: &str,
         amount: u64,
+        capability: &str,
     ) -> Option<OnChainProof> {
         if !Self::merits_settlement(amount) {
             return None;
         }
-        self.settle_on_chain_with_job("trade", action_type, description, earner_id, amount)
+        self.settle_on_chain_with_job("trade", action_type, description, earner_id, amount, capability)
             .ok()
     }
 
@@ -2773,7 +2889,7 @@ impl WorldState {
             )
         };
 
-        self.settle_on_chain(&action, &desc, &agent_id, amount).ok()
+        self.settle_on_chain_with_job("quest", &action, &desc, &agent_id, amount, "quest").ok()
     }
 }
 
@@ -3473,6 +3589,7 @@ mod tests {
             deadline_tick: 0,
             required_reputation: 0.0,
             required_capabilities: vec![],
+            stake: 0,
             progress: vec![false],
         });
 
@@ -3541,6 +3658,97 @@ mod tests {
         assert_eq!(b.credits, 40);
     }
 
+
+
+
+
+    #[test]
+    fn quest_stake_locks_refunds_and_slashes() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "staker".to_string(),
+            name: "Staker".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "z".to_string(),
+            location_id: "loc-far".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1staker".to_string(),
+            reputation: 0.0,
+            credits: 50,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        let mk = |id: &str, deadline: u64| Quest {
+            id: id.to_string(),
+            title: "Staked".to_string(),
+            description: String::new(),
+            giver_id: "npc-o".to_string(),
+            objectives: vec![QuestObjective::MoveTo {
+                location_id: "loc-far".to_string(),
+            }],
+            reward: QuestReward {
+                credits: 20,
+                reputation: 0.5,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status: QuestStatus::Available,
+            accepted_by: None,
+            accepted_tick: 0,
+            created_tick: 0,
+            deadline_tick: deadline,
+            required_reputation: 0.0,
+            required_capabilities: vec![],
+            progress: vec![false],
+            stake: 10,
+        };
+        // Unaffordable stake refuses.
+        w.entities.iter_mut().find(|e| e.id == "staker").unwrap().credits = 5;
+        w.quests.push(mk("q-poor", 999));
+        assert!(w.accept_quest("q-poor", "staker").is_err());
+        // Lock on accept.
+        w.entities.iter_mut().find(|e| e.id == "staker").unwrap().credits = 50;
+        w.quests.push(mk("q-risk", 999));
+        w.accept_quest("q-risk", "staker").unwrap();
+        assert_eq!(
+            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            40
+        );
+        assert_eq!(
+            w.quest_stakes.get("q-risk"),
+            Some(&("staker".to_string(), 10))
+        );
+        // Complete: reward + FULL refund (no mint on the stake).
+        w.world_tick(); // MoveTo already there → Ready → Completed
+        let q = w.quests.iter().find(|q| q.id == "q-risk").unwrap();
+        assert_eq!(q.status, QuestStatus::Completed);
+        assert_eq!(
+            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            70
+        ); // 40 + 20 reward + 10 refund
+        assert!(!w.quest_stakes.contains_key("q-risk"));
+        assert_eq!(w.treasury_minted, 20); // only the reward minted
+        // Expiry slashes: no refund, burned.
+        w.quests.push(mk("q-doom", 1));
+        w.accept_quest("q-doom", "staker").unwrap();
+        assert_eq!(
+            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            60
+        );
+        w.tick = 2;
+        w.enforce_deadlines();
+        let q = w.quests.iter().find(|q| q.id == "q-doom").unwrap();
+        assert_eq!(q.status, QuestStatus::Failed);
+        assert_eq!(
+            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            60
+        ); // no refund
+        assert_eq!(w.treasury_burned, 10); // slashed out of supply
+    }
+
     #[test]
     fn elite_quest_for_proven_agents() {
         let mut w = WorldState::default();
@@ -3568,14 +3776,21 @@ mod tests {
             .filter(|q| q.id.contains("-elite-"))
             .collect();
         assert_eq!(elite.len(), 1);
-        // Ticks 2-3: BuyService coding + completion (+60 reward).
-        w.world_tick();
+        // Tick 2: BuyService coding + completion (+60 reward, stake back).
         w.world_tick();
         let q = w.quests.iter().find(|q| q.id.contains("-elite-")).unwrap();
         assert_eq!(q.status, QuestStatus::Completed);
         let v = w.entities.iter().find(|e| e.id == "vet").unwrap();
-        assert_eq!(v.credits, 135); // 100 - 25 coding + 60 elite reward
+        assert_eq!(v.credits, 135); // 100 - 10 stake - 25 coding + 60 + 10 refund
         assert!(v.reputation >= 3.5);
+        // The loop continues on its own: tick 3 posts the next elite and
+        // the veteran stakes again (10Cr locked, quest Active).
+        w.world_tick();
+        let v = w.entities.iter().find(|e| e.id == "vet").unwrap();
+        assert_eq!(v.credits, 125);
+        assert!(w.quests.iter().any(|q| q.id.contains("-elite-")
+            && q.status == QuestStatus::Active
+            && q.accepted_by.as_deref() == Some("vet")));
     }
 
     #[test]
@@ -3669,6 +3884,7 @@ mod tests {
             deadline_tick: 999,
             required_reputation: 0.0,
             required_capabilities: vec![],
+            stake: 0,
             progress: vec![false],
         });
         // One tick: accept (already there → progress true → Ready → done).
@@ -3826,12 +4042,12 @@ mod tests {
         // Dust stays off-chain.
         assert!(!WorldState::merits_settlement(4));
         assert!(w
-            .trade_settlement_proof("service_sale", "dust", "npc-smith", 4)
+            .trade_settlement_proof("service_sale", "dust", "npc-smith", 4, "coding")
             .is_none());
         // Real sale settles under the trade namespace.
         assert!(WorldState::merits_settlement(10));
         let proof = w
-            .trade_settlement_proof("service_sale", "coding sale", "npc-smith", 10)
+            .trade_settlement_proof("service_sale", "coding sale", "npc-smith", 10, "coding")
             .unwrap();
         assert_eq!(proof.entity_id, "npc-smith");
         let job_hex = hex::encode("trade-npc-smith-0".as_bytes());
@@ -3842,7 +4058,7 @@ mod tests {
         );
         // Unknown earner → None, never a panic.
         assert!(w
-            .trade_settlement_proof("service_sale", "x", "ghost", 10)
+            .trade_settlement_proof("service_sale", "x", "ghost", 10, "coding")
             .is_none());
     }
 

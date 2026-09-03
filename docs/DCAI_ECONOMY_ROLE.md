@@ -68,12 +68,26 @@ evidence hash — via `submit_proof@jobHex@digestHex` payloads.
 
 - [ ] Cr sinks ≈ sources over long runs (`treasury` counters observable
       per tick; persistent inflation or deflation understood, not guessed)
-- [ ] Stake/slash flows PROVEN with Cr-equivalent value first (lock →
-      refund/slash inside M18 escrow states, off-chain)
+- [x] Stake/slash flows PROVEN with Cr-equivalent value first — LIVE since
+      Economy v2 integration: `Quest.stake` locks at accept
+      (`WorldState.quest_stakes`), refunds in full on `complete_quest`,
+      burns on `enforce_deadlines` expiry. Elite quests (stake 10Cr) prove
+      the loop end-to-end on every veteran cycle. The DCAI form is a pure
+      denomination swap of this exact state machine.
 - [ ] VERIFIED MX-8004 registry addresses (contract calls replace
       self-transfer anchoring; DCAI needs contracts to live in)
 - [ ] Compute-side contribution settlement design (DCAI's first real
       demand: paying for verified work, not gameplay)
+
+Field map for the future swap (no new ledger when it happens):
+
+```text
+Quest.stake (u64 Cr)              → quest stake in DCAI (same lock/refund/slash)
+M18 EscrowRecord.{evidence,tx}    → + stake field beside them (lock at
+                                    create, refund/slash at settle)
+WorldState.quest_stakes           → reads as today (denomination-agnostic map)
+EconomicEvidence / trust anchors  → unchanged (evidence carries no currency)
+```
 
 Until then: no supply, no decimals, no sale, no promises. The economy
 below must stay fun and solvent with Cr alone — that is the test DCAI
