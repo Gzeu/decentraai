@@ -1400,6 +1400,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/move", post(world_move_handler))
         .route("/v1/world/list", post(world_list_handler))
         .route("/v1/world/buy", post(world_buy_handler))
+        .route("/v1/world/refine", post(world_refine_handler))
         .route("/v1/world/entity", get(world_entity_handler))
         .route("/v1/world/tick", post(world_tick_handler))
         .route("/v1/world/service", post(world_service_handler))
@@ -2726,6 +2727,7 @@ async fn world_tick_handler(State(state): State<ApiState>) -> Response {
     let entities = world.entities.len();
     let listings = world.listings.iter().filter(|l| l.active).count();
     let events = world.events.len();
+    let (supply, minted, burned) = world.treasury_report();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2734,9 +2736,50 @@ async fn world_tick_handler(State(state): State<ApiState>) -> Response {
             "entities": entities,
             "active_listings": listings,
             "events": events,
+            "treasury": {"supply": supply, "minted": minted, "burned": burned},
         })),
     )
         .into_response()
+}
+
+/// POST /v1/world/refine — refine 2 service-result materials + 2Cr fee
+/// into a tradable Refined Data Bundle (15Cr). Production is off-chain
+/// work; value anchors later when the bundle sells.
+async fn world_refine_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let agent_id = body
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if agent_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent_id required"})),
+        )
+            .into_response();
+    }
+
+    let mut world = state.world.lock().await;
+    match world.refine_materials(&agent_id) {
+        Ok(bundle) => {
+            world.advance_tick();
+            let path = crate::world::world_path_for(&state.info.repo_root);
+            crate::world::save_world_state(&path, &world);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "bundle": bundle})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /v1/world/service — buy a service at a location.

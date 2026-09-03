@@ -165,6 +165,20 @@ struct VendorOffer {
     odd: (&'static str, &'static str, u64),
 }
 
+/// Per-agent economic record: lifetime flows. Derived state (balance =
+/// credits on the entity, assets = credits + inventory) stays on
+/// `WorldEntity`; this tracks HISTORY for decisions and treasury math.
+/// Keyed by entity id, created on first flow — never blocks gameplay.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentEconomy {
+    /// Lifetime credits earned (sales, rewards, quests).
+    #[serde(default)]
+    pub earned: u64,
+    /// Lifetime credits spent (purchases, fees, production).
+    #[serde(default)]
+    pub spent: u64,
+}
+
 // ─── World Events ────────────────────────────────────────────────────
 
 /// A real-time event in the world.
@@ -399,6 +413,17 @@ pub struct WorldState {
     /// Drives the dynamic price — hot services cost more, quiet ones cool.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub service_demand: HashMap<String, u64>,
+    /// Treasury: lifetime credits MINTED by quest rewards. The only source.
+    /// Genesis balances (entities created with credits) predate the counter
+    /// and are excluded by design — see `treasury_report`.
+    #[serde(default)]
+    pub treasury_minted: u64,
+    /// Treasury: lifetime credits BURNED by fees and taxes. The sinks.
+    #[serde(default)]
+    pub treasury_burned: u64,
+    /// Per-agent economic history, keyed by entity id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ledger: HashMap<String, AgentEconomy>,
 }
 
 impl Default for WorldState {
@@ -429,6 +454,9 @@ impl Default for WorldState {
             proofs: vec![],
             service_base_prices: HashMap::new(),
             service_demand: HashMap::new(),
+            treasury_minted: 0,
+            treasury_burned: 0,
+            ledger: HashMap::new(),
         }
     }
 }
@@ -728,6 +756,10 @@ impl WorldState {
     }
 
     /// List an item on the marketplace.
+    ///
+    /// Costs a 1Cr listing fee, burned on the spot (the anti-spam sink) —
+    /// waived for sellers holding ≤ 1Cr so broke artisans can still reach
+    /// the market. Prices are bounded by `LISTING_MAX_PRICE`.
     pub fn list_item(
         &mut self,
         seller_id: &str,
@@ -735,14 +767,31 @@ impl WorldState {
         location_id: &str,
     ) -> Result<String, String> {
         // Verify seller is at this location
-        let seller = self
+        let seller_credits = self
             .entities
             .iter()
             .find(|e| e.id == seller_id)
             .ok_or_else(|| format!("seller '{}' not found", seller_id))?;
 
-        if seller.location_id != location_id {
+        if seller_credits.location_id != location_id {
             return Err("seller is not at this location".to_string());
+        }
+
+        if item.price > Self::LISTING_MAX_PRICE {
+            return Err(format!(
+                "price {} exceeds maximum listing price {}",
+                item.price,
+                Self::LISTING_MAX_PRICE
+            ));
+        }
+
+        // Listing fee (burned), waived for the broke.
+        if seller_credits.credits > Self::LISTING_FEE {
+            if let Some(s) = self.entities.iter_mut().find(|e| e.id == seller_id) {
+                s.credits -= Self::LISTING_FEE;
+            }
+            self.burn(Self::LISTING_FEE);
+            self.record_spend(seller_id, Self::LISTING_FEE);
         }
 
         // Verify location has a marketplace
@@ -794,53 +843,63 @@ impl WorldState {
         buyer_id: &str,
         listing_id: &str,
     ) -> Result<(WorldItem, String), String> {
-        let listing = self
-            .listings
-            .iter_mut()
-            .find(|l| l.id == listing_id && l.active)
-            .ok_or_else(|| format!("listing '{}' not found or inactive", listing_id))?;
+        // Validate + snapshot under one short borrow; everything after owns
+        // its data so treasury bookkeeping never fights the borrow checker.
+        let (item, seller_id, price, location_id) = {
+            let listing = self
+                .listings
+                .iter_mut()
+                .find(|l| l.id == listing_id && l.active)
+                .ok_or_else(|| format!("listing '{listing_id}' not found or inactive"))?;
 
-        let buyer = self
-            .entities
-            .iter()
-            .find(|e| e.id == buyer_id)
-            .ok_or_else(|| format!("buyer '{}' not found", buyer_id))?;
+            let buyer = self
+                .entities
+                .iter()
+                .find(|e| e.id == buyer_id)
+                .ok_or_else(|| format!("buyer '{buyer_id}' not found"))?;
 
-        if buyer.location_id != listing.location_id {
-            return Err("buyer is not at this location".to_string());
-        }
+            if buyer.location_id != listing.location_id {
+                return Err("buyer is not at this location".to_string());
+            }
 
-        if buyer.credits < listing.item.price {
-            return Err(format!(
-                "insufficient credits: {} < {}",
-                buyer.credits, listing.item.price
-            ));
-        }
+            if buyer.credits < listing.item.price {
+                return Err(format!(
+                    "insufficient credits: {} < {}",
+                    buyer.credits, listing.item.price
+                ));
+            }
 
-        // Transfer
-        let item = listing.item.clone();
-        let seller_id = listing.seller_id.clone();
-        let price = listing.item.price;
-        listing.active = false;
+            listing.active = false;
+            (
+                listing.item.clone(),
+                listing.seller_id.clone(),
+                listing.item.price,
+                listing.location_id.clone(),
+            )
+        };
 
-        // Deduct from buyer, credit to seller
+        // Deduct from buyer, credit to seller (net of protocol tithe).
         if let Some(b) = self.entities.iter_mut().find(|e| e.id == buyer_id) {
             b.credits = b.credits.saturating_sub(price);
             b.inventory.push(item.clone());
         }
+        self.record_spend(buyer_id, price);
+        let (net, tithe) = Self::sale_tithe(price);
+        self.burn(tithe);
         if let Some(s) = self.entities.iter_mut().find(|e| e.id == seller_id) {
-            s.credits += price;
+            s.credits += net;
         }
+        self.record_earn(&seller_id, net);
 
         let event = WorldEvent {
             tick: self.tick,
             kind: "item_sold".to_string(),
             detail: format!(
-                "{} bought '{}' from {} for {}Cr at {}",
-                buyer_id, item.name, seller_id, price, listing.location_id
+                "{buyer_id} bought '{}' from {seller_id} for {price}Cr at {location_id}",
+                item.name,
             ),
             entity_id: Some(buyer_id.to_string()),
-            location_id: Some(listing.location_id.clone()),
+            location_id: Some(location_id),
             evidence_id: None,
         };
         self.events.push(event);
@@ -865,6 +924,74 @@ impl WorldState {
             .iter()
             .filter(|l| l.location_id == location_id && l.active)
             .collect()
+    }
+
+    /// Production: refine raw service-results into tradable goods.
+    ///
+    /// `Input → Production → Output`: consumes 2 service-result materials
+    /// plus a 2Cr refining fee (burned) and produces a Refined Data Bundle
+    /// (artifact, base value 15Cr) the agent can use or sell. This is the
+    /// reason to trade: raw work is worth less than finished goods, and
+    /// the spread (15 vs 2 + fee) rewards producers. Production itself is
+    /// off-chain work; the VALUE surfaces on-chain when the bundle sells.
+    pub const REFINE_FEE: u64 = 2;
+    pub const REFINE_INPUTS: usize = 2;
+    pub const REFINE_OUTPUT_VALUE: u64 = 15;
+
+    pub fn refine_materials(&mut self, agent_id: &str) -> Result<WorldItem, String> {
+        let (mats, credits) = match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(e) => (
+                e.inventory
+                    .iter()
+                    .filter(|i| i.item_type == "service-result")
+                    .take(Self::REFINE_INPUTS)
+                    .map(|i| i.id.clone())
+                    .collect::<Vec<_>>(),
+                e.credits,
+            ),
+            None => return Err(format!("agent '{agent_id}' not found")),
+        };
+        if mats.len() < Self::REFINE_INPUTS {
+            return Err(format!(
+                "need {} service-result materials, have {}",
+                Self::REFINE_INPUTS,
+                mats.len()
+            ));
+        }
+        if credits < Self::REFINE_FEE {
+            return Err(format!(
+                "refining fee {}Cr not affordable",
+                Self::REFINE_FEE
+            ));
+        }
+        if !self.entities.iter().any(|e| e.id == agent_id) {
+            return Err(format!("agent '{agent_id}' not found"));
+        }
+        let bundle = WorldItem {
+            id: format!("refined-{agent_id}-{}", self.tick),
+            name: "Refined Data Bundle".to_string(),
+            item_type: "artifact".to_string(),
+            price: Self::REFINE_OUTPUT_VALUE,
+            description: format!("Refined from {} materials by {}", mats.len(), agent_id),
+        };
+        if let Some(e) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+            e.inventory
+                .retain(|i| !(i.item_type == "service-result" && mats.contains(&i.id)));
+            e.credits -= Self::REFINE_FEE;
+            e.activity = "refining materials".to_string();
+            e.inventory.push(bundle.clone());
+        }
+        self.burn(Self::REFINE_FEE);
+        self.record_spend(agent_id, Self::REFINE_FEE);
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "materials_refined".to_string(),
+            detail: format!("{agent_id} refined {} materials into a Data Bundle", mats.len()),
+            entity_id: Some(agent_id.to_string()),
+            location_id: None,
+            evidence_id: None,
+        });
+        Ok(bundle)
     }
 
     /// Record a world event.
@@ -1558,12 +1685,16 @@ impl WorldState {
                 description: format!("Result of {} service at {}", service_name, location_id),
             });
         }
+        self.record_spend(buyer_id, price);
 
-        // Credit the provider NPC
+        // Credit the provider NPC (net of the 10% protocol tithe, burned).
+        let (net, tithe) = Self::sale_tithe(price);
+        self.burn(tithe);
         if let Some(p) = self.entities.iter_mut().find(|e| e.id == provider) {
-            p.credits += price;
+            p.credits += net;
             p.reputation += 0.1;
         }
+        self.record_earn(&provider, net);
 
         let event = WorldEvent {
             tick: self.tick,
@@ -1602,8 +1733,17 @@ impl WorldState {
             .and_then(|l| l.services.get(service_name).copied())
     }
 
-    /// Effective (dynamic) price: `base + base * min(demand, 20) / 20` —
-    /// up to 2x at sustained demand. `None` when the service is not offered.
+    /// Effective (dynamic) price — the coherent price formation system:
+    ///
+    /// ```text
+    /// price = base × demand × reputation, each bounded, all deterministic
+    ///   demand     = 100 + 5 × min(demand, 20)      → 100..200
+    ///   reputation = 100 + 2 × min(provider_rep, 5) → 100..110
+    /// ```
+    ///
+    /// Trusted providers charge a premium (their work settles on-chain and
+    /// earns reputation, compounding honestly). Hot services cost more.
+    /// `None` when the service is not offered here.
     pub fn service_price(&self, location_id: &str, service_name: &str) -> Option<u64> {
         let base = self.service_base_price(location_id, service_name)?;
         let demand = self
@@ -1612,7 +1752,17 @@ impl WorldState {
             .copied()
             .unwrap_or(0)
             .min(20);
-        Some(base + base * demand / 20)
+        let rep: u64 = self
+            .entities
+            .iter()
+            .find(|e| {
+                e.entity_type == "npc"
+                    && e.location_id == location_id
+                    && e.capabilities.iter().any(|c| c == service_name)
+            })
+            .map(|e| (e.reputation.max(0.0).floor() as u64).min(5))
+            .unwrap_or(0);
+        Some(base * (100 + 5 * demand) / 100 * (100 + 2 * rep) / 100)
     }
 
     /// Record a sale: backfill the base price on first sale, bump demand.
@@ -1638,6 +1788,64 @@ impl WorldState {
             *d > 0
         });
     }
+
+    // ─── Treasury & ledger ──────────────────────────────────────────
+
+    /// Mutable economic record for an entity (created on first flow).
+    fn econ_mut(&mut self, entity_id: &str) -> &mut AgentEconomy {
+        self.ledger.entry(entity_id.to_string()).or_default()
+    }
+
+    /// Mint credits into existence (quest rewards — the only source).
+    fn mint(&mut self, amount: u64) {
+        self.treasury_minted = self.treasury_minted.saturating_add(amount);
+    }
+
+    /// Burn credits out of existence (fees, taxes — the sinks).
+    fn burn(&mut self, amount: u64) {
+        self.treasury_burned = self.treasury_burned.saturating_add(amount);
+    }
+
+    /// Record earnings for an entity (no-op for unknown ids like auto-*
+    /// fallback providers — the credits still move, history just skips).
+    fn record_earn(&mut self, entity_id: &str, amount: u64) {
+        if self.entities.iter().any(|e| e.id == entity_id) {
+            self.econ_mut(entity_id).earned =
+                self.econ_mut(entity_id).earned.saturating_add(amount);
+        }
+    }
+
+    /// Record spending for an entity.
+    fn record_spend(&mut self, entity_id: &str, amount: u64) {
+        if self.entities.iter().any(|e| e.id == entity_id) {
+            self.econ_mut(entity_id).spent =
+                self.econ_mut(entity_id).spent.saturating_add(amount);
+        }
+    }
+
+    /// Treasury report: circulating supply (sum of balances) plus lifetime
+    /// mint/burn. Genesis balances predate the counters, so
+    /// `minted - burned` equals supply MINUS genesis — the gap is expected
+    /// and shrinks in relative terms as the economy turns over.
+    pub fn treasury_report(&self) -> (u64, u64, u64) {
+        let supply = self.entities.iter().map(|e| e.credits).sum();
+        (supply, self.treasury_minted, self.treasury_burned)
+    }
+
+    /// 10% protocol tithe on every sale, burned. Integer math, deterministic:
+    /// seller keeps `price - price/10`, the tithe vanishes from supply.
+    /// Applies uniformly to services and items, NPCs and agents alike.
+    fn sale_tithe(price: u64) -> (u64, u64) {
+        let tithe = price / 10;
+        (price - tithe, tithe)
+    }
+
+    /// Marketplace listing fee, burned. Waived for sellers holding ≤ 1Cr —
+    /// broke artisans must be able to reach the market to earn.
+    pub const LISTING_FEE: u64 = 1;
+
+    /// Maximum listing price (deterministic bound against absurd anchors).
+    pub const LISTING_MAX_PRICE: u64 = 10_000;
 
     // ─── Quest System ─────────────────────────────────────────────────
 
@@ -1997,7 +2205,8 @@ impl WorldState {
             q.status = QuestStatus::Completed;
         }
 
-        // Distribute rewards
+        // Distribute rewards — quest payouts MINT new credits: the one and
+        // only source. Balanced over time by the tithe + fee sinks.
         if let Some(agent) = self.entities.iter_mut().find(|e| e.id == agent_id) {
             agent.credits += reward.credits;
             agent.reputation += reward.reputation;
@@ -2005,6 +2214,8 @@ impl WorldState {
                 agent.inventory.push(item.clone());
             }
         }
+        self.mint(reward.credits);
+        self.record_earn(&agent_id, reward.credits);
 
         // Deliverables are consumed: each BuyService objective eats the
         // matching service-result out of the agent's inventory. One purchase
@@ -2983,11 +3194,94 @@ mod tests {
         let result = w.buy_item("buyer", &listing_id.unwrap());
         assert!(result.is_ok());
 
-        // Verify credits transferred
+        // Verify credits transferred (net of the 10% protocol tithe, burned)
         let buyer = w.entities.iter().find(|e| e.id == "buyer").unwrap();
         assert_eq!(buyer.credits, 40);
         let seller = w.entities.iter().find(|e| e.id == "seller").unwrap();
-        assert_eq!(seller.credits, 10);
+        assert_eq!(seller.credits, 9);
+        assert_eq!(w.treasury_burned, 1);
+        assert_eq!(w.treasury_minted, 0);
+        assert_eq!(w.ledger.get("seller").map(|r| r.earned), Some(9));
+        assert_eq!(w.ledger.get("buyer").map(|r| r.spent), Some(10));
+    }
+
+    #[test]
+    fn production_refine_and_treasury_close_the_loop() {
+        let mut w = WorldState::default();
+        w.locations.push(WorldLocation {
+            id: "loc-ref".to_string(),
+            zone_id: "z".to_string(),
+            label: "Ref".to_string(),
+            description: String::new(),
+            services: HashMap::new(),
+            marketplace: true,
+            capacity: 10,
+        });
+        for (id, credits) in [("maker", 20u64), ("taker", 100u64)] {
+            w.entities.push(WorldEntity {
+                id: id.to_string(),
+                name: id.to_string(),
+                entity_type: "agent".to_string(),
+                zone_id: "z".to_string(),
+                location_id: "loc-ref".to_string(),
+                state: EntityState::Idle,
+                capabilities: vec![],
+                needs: vec![],
+                wallet: format!("erd1{id}"),
+                reputation: 0.0,
+                credits,
+                activity: String::new(),
+                last_move_tick: 0,
+                inventory: if id == "maker" {
+                    vec![
+                        WorldItem {
+                            id: "m1".to_string(),
+                            name: "ocr Result".to_string(),
+                            item_type: "service-result".to_string(),
+                            price: 0,
+                            description: "Result of ocr service at loc-ref".to_string(),
+                        },
+                        WorldItem {
+                            id: "m2".to_string(),
+                            name: "ocr Result".to_string(),
+                            item_type: "service-result".to_string(),
+                            price: 0,
+                            description: "Result of ocr service at loc-ref".to_string(),
+                        },
+                    ]
+                } else {
+                    vec![]
+                },
+            });
+        }
+        // Produce: 2 materials + 2Cr fee (burned) → 15Cr bundle.
+        let bundle = w.refine_materials("maker").unwrap();
+        assert_eq!(bundle.price, 15);
+        let maker = w.entities.iter().find(|e| e.id == "maker").unwrap();
+        assert_eq!(maker.credits, 18);
+        assert_eq!(maker.inventory.len(), 1);
+        assert_eq!(w.treasury_burned, 2);
+        // Too few materials / unknown agent fail cleanly.
+        assert!(w.refine_materials("maker").is_err());
+        assert!(w.refine_materials("ghost").is_err());
+        // Sell the bundle: 1Cr listing fee + 1Cr tithe burned, seller nets 14.
+        let lid = w.list_item("maker", bundle, "loc-ref").unwrap();
+        assert_eq!(
+            w.entities.iter().find(|e| e.id == "maker").unwrap().credits,
+            17
+        );
+        w.buy_item("taker", &lid).unwrap();
+        let maker = w.entities.iter().find(|e| e.id == "maker").unwrap();
+        let taker = w.entities.iter().find(|e| e.id == "taker").unwrap();
+        assert_eq!(maker.credits, 31); // 17 + 14
+        assert_eq!(taker.credits, 85); // 100 - 15
+        assert_eq!(w.treasury_burned, 4); // 2 refine + 1 list + 1 tithe
+        assert_eq!(w.treasury_minted, 0); // production moves value, mints none
+        assert_eq!(w.ledger.get("maker").map(|r| r.earned), Some(14));
+        // Full circulation audit: supply 31 + 85 = 116; genesis was 120,
+        // flows burned 4 → 120 - 4 = 116. Money is conserved.
+        let (supply, minted, burned) = w.treasury_report();
+        assert_eq!((supply, minted, burned), (116, 0, 4));
     }
 
     #[test]
