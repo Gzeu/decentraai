@@ -156,6 +156,15 @@ pub struct MarketListing {
     pub active: bool,
 }
 
+/// A vendor's two-item catalog: (item_id, name, price) per tick parity.
+/// Module scope (not inside `impl`) so the vendor tick can name it.
+struct VendorOffer {
+    npc_id: &'static str,
+    location_id: &'static str,
+    even: (&'static str, &'static str, u64),
+    odd: (&'static str, &'static str, u64),
+}
+
 // ─── World Events ────────────────────────────────────────────────────
 
 /// A real-time event in the world.
@@ -921,6 +930,9 @@ impl WorldState {
         // 0. Hot markets cool: demand decays every tick.
         self.decay_service_demand();
 
+        // 0b. Vendor NPCs restock the marketplace on their own rhythm.
+        self.npc_vendor_tick();
+
         // 1. Questkeeper generates quests
         self.questkeeper_tick();
 
@@ -1009,6 +1021,60 @@ impl WorldState {
                 location_id: None,
                 evidence_id: None,
             });
+        }
+    }
+
+    /// Vendor restock: trade NPCs list fresh goods on their own rhythm.
+    ///
+    /// Every 5 ticks each vendor lists ONE item (alternating its two-item
+    /// catalog by tick parity) while it has fewer than 2 active listings —
+    /// bounded, deterministic, persisted. Only market locations qualify
+    /// (`list_item` enforces presence + marketplace). This is what makes
+    /// the bazaar alive without human sellers: buyers always find stock,
+    /// sales heat nothing here (items have fixed artisan prices), and every
+    /// sale still flows through M18 + on-chain settlement at buy time.
+    fn npc_vendor_tick(&mut self) {
+        if self.tick % 5 != 0 {
+            return;
+        }
+        const VENDORS: &[VendorOffer] = &[
+            VendorOffer {
+                npc_id: "npc-broker",
+                location_id: "market-bazaar",
+                even: ("bazaar-token", "Bazaar Token", 8),
+                odd: ("trade-compass", "Trade Compass", 12),
+            },
+            VendorOffer {
+                npc_id: "npc-auctioneer",
+                location_id: "market-auction",
+                even: ("bid-ledger", "Bid Ledger", 7),
+                odd: ("auction-gavel", "Auction Gavel", 10),
+            },
+        ];
+        let tick = self.tick;
+        for v in VENDORS {
+            let active = self
+                .listings
+                .iter()
+                .filter(|l| l.active && l.seller_id == v.npc_id)
+                .count();
+            if active >= 2 {
+                continue;
+            }
+            let (item_id, name, price) = if tick % 10 < 5 { v.even } else { v.odd };
+            let _ = self.list_item(
+                v.npc_id,
+                WorldItem {
+                    id: format!("{item_id}-{tick}"),
+                    name: name.to_string(),
+                    item_type: "artifact".to_string(),
+                    price,
+                    description: format!("Vendor goods from {}", v.npc_id),
+                },
+                v.location_id,
+            );
+            // list_item fails silently when the NPC is away or the location
+            // is no market — vendors never crash the tick.
         }
     }
 
@@ -2531,6 +2597,36 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn vendors_restock_bounded_and_deterministic() {
+        let mut w = WorldState::default();
+        w.spawn_npcs();
+        assert!(w.listings.iter().all(|l| !l.active));
+        for _ in 0..5 {
+            w.world_tick();
+        }
+        let active: Vec<_> = w.listings.iter().filter(|l| l.active).collect();
+        // Both vendors listed once (tick 5 fires).
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|l| l.seller_id == "npc-broker"));
+        assert!(active.iter().any(|l| l.seller_id == "npc-auctioneer"));
+        // Catalog alternates by tick parity: tick 5 → odd items (5 % 10 >= 5).
+        assert!(active.iter().any(|l| l.item.id.starts_with("trade-compass-5")));
+        // Cap holds over many ticks: never more than 2 per vendor.
+        for _ in 0..60 {
+            w.world_tick();
+        }
+        for seller in ["npc-broker", "npc-auctioneer"] {
+            let n = w
+                .listings
+                .iter()
+                .filter(|l| l.active && l.seller_id == seller)
+                .count();
+            assert!(n <= 2, "{seller} over listed: {n}");
+        }
+        assert!(!w.listings.is_empty());
     }
 
     #[test]
