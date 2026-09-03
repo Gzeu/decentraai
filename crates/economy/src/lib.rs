@@ -36,6 +36,7 @@ pub mod multiversx_devnet;
 pub mod multiversx_identity;
 pub mod multiversx_tx;
 pub mod settlement;
+pub mod signer;
 pub mod tokenomics;
 pub mod trust_anchor;
 

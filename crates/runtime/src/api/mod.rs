@@ -1408,6 +1408,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/quest/complete", post(world_quest_complete_handler))
         .route("/v1/world/quest/generate", post(world_quest_generate_handler))
         .route("/v1/world/settle", post(world_settle_handler))
+        .route("/v1/world/settle/intent", post(world_settle_intent_handler))
         .route("/v1/world/settle/submit", post(world_settle_submit_handler))
         .route("/v1/world/settle/confirm", post(world_settle_confirm_handler))
         .route("/v1/world/proofs", get(world_proofs_handler))
@@ -2939,6 +2940,58 @@ async fn world_settle_handler(
             })))
                 .into_response()
         }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/intent — deterministic signing intent for a proof.
+/// Returns the UnsignedTxIntent (sender + chain_id filled) and the
+/// hex-encoded canonical payload the operator signs with gzeu-wallet.
+/// No keys touched; operator submits via wallet tooling, then POSTs the
+/// tx hash to /v1/world/settle/submit.
+async fn world_settle_intent_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proof_id = match body.get("proof_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
+            )
+                .into_response()
+        }
+    };
+    let sender = match body.get("sender").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "sender required"})),
+            )
+                .into_response()
+        }
+    };
+
+    let world = state.world.lock().await;
+    match world.submit_intent(&proof_id, &sender) {
+        Ok((intent, sign_payload_hex)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "proof_id": proof_id,
+                "intent": intent,
+                "data": intent.data_field(),
+                "sign_payload_hex": sign_payload_hex,
+                "note": "sign sign_payload_hex with gzeu-wallet, submit via wallet tooling, then POST tx_hash to /v1/world/settle/submit",
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"ok": false, "error": e})),

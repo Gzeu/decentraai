@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use decentraai_economy::multiversx_tx::{Mx8004TxBuilder, UnsignedTxIntent};
+use decentraai_economy::signer::canonical_sign_payload;
+
 // ─── Zones & Locations ───────────────────────────────────────────────
 
 /// A zone groups related locations (like a region on a map).
@@ -1491,7 +1494,10 @@ impl WorldState {
     // ─── On-Chain Settlement ─────────────────────────────────────────
 
     /// Generate an on-chain proof for an economic action.
-    /// Creates a BLAKE3 evidence hash and an unsigned MultiversX tx intent.
+    /// Creates a BLAKE3 evidence hash and a MultiversX tx intent built with
+    /// the real [`Mx8004TxBuilder::submit_proof_raw`] (same encoding the
+    /// contract expects: `submit_proof@jobIdHex@digestHex`, digest carried
+    /// as-is, never re-hashed).
     pub fn settle_on_chain(
         &mut self,
         action_type: &str,
@@ -1510,15 +1516,15 @@ impl WorldState {
             "{}:{}:{}:{}:{}",
             action_type, entity_id, amount, self.tick, description
         );
-        let evidence_hash = blake3::hash(evidence_data.as_bytes()).to_hex().to_string();
+        let digest = blake3::hash(evidence_data.as_bytes());
+        let evidence_hash = digest.to_hex().to_string();
 
-        // Build MultiversX testnet tx intent
+        // Build MultiversX testnet tx intent with the REAL builder —
+        // no hand-rolled `submit_proof@…` strings anymore.
         let job_id = format!("quest-{}-{}", entity_id, self.tick);
-        let tx_data = format!(
-            "submit_proof@{}@{}",
-            hex::encode(job_id.as_bytes()),
-            evidence_hash
-        );
+        let intent = Mx8004TxBuilder::submit_proof_raw(&job_id, digest.as_bytes())
+            .map_err(|e| format!("tx intent build failed: {e}"))?;
+        let tx_data = intent.data_field();
 
         let proof = OnChainProof {
             id: format!("proof-{}-{}", self.tick, &evidence_hash[..12]),
@@ -1533,7 +1539,7 @@ impl WorldState {
             created_tick: self.tick,
             submitted_tick: 0,
             confirmed_tick: 0,
-            network: "multiversx-testnet".to_string(),
+            network: intent.network.clone(),
         };
 
         self.record_event(WorldEvent {
@@ -1582,6 +1588,55 @@ impl WorldState {
         });
 
         Ok(())
+    }
+
+    /// Build the deterministic signing intent for a pending proof.
+    ///
+    /// Rebuilds the SAME [`UnsignedTxIntent`] `settle_on_chain` produced
+    /// (job-id formula + digest carried as-is) and fills the operator
+    /// `sender` + testnet `chain_id`. `nonce`/`gas_limit`/`receiver` stay
+    /// unset — they belong to the operator's wallet tooling, against
+    /// VERIFIED contract addresses.
+    ///
+    /// Returns the intent plus the hex-encoded
+    /// [`canonical_sign_payload`] the operator signs with `gzeu-wallet`.
+    /// No key material is touched here — signing happens outside, via
+    /// [`decentraai_economy::signer::TransactionSigner`].
+    pub fn submit_intent(
+        &self,
+        proof_id: &str,
+        sender: &str,
+    ) -> Result<(UnsignedTxIntent, String), String> {
+        let sender = sender.trim();
+        if sender.is_empty() {
+            return Err("sender wallet address required".to_string());
+        }
+        if !(sender.starts_with("erd1") && sender.len() >= 10) {
+            return Err("sender must be a bech32 erd1… address".to_string());
+        }
+        let proof = self
+            .proofs
+            .iter()
+            .find(|p| p.id == proof_id)
+            .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
+        if proof.status != SettlementStatus::Pending {
+            return Err("proof is not in pending state".to_string());
+        }
+        let raw = hex::decode(proof.evidence_hash.trim()).map_err(|_| {
+            format!("proof '{proof_id}' carries a corrupt evidence hash")
+        })?;
+        if raw.len() != 32 {
+            return Err(format!("proof '{proof_id}' carries a corrupt evidence hash"));
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&raw);
+        let job_id = format!("quest-{}-{}", proof.entity_id, proof.created_tick);
+        let mut intent = Mx8004TxBuilder::submit_proof_raw(&job_id, &digest)
+            .map_err(|e| format!("tx intent build failed: {e}"))?;
+        intent.sender = Some(sender.to_string());
+        intent.chain_id = Some("T".to_string());
+        let payload_hex = hex::encode(canonical_sign_payload(&intent));
+        Ok((intent, payload_hex))
     }
 
     /// Confirm a settlement (tx confirmed on-chain).
@@ -2279,5 +2334,48 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn submit_intent_rebuilds_builder_intent_deterministically() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        let proof = w
+            .settle_on_chain("quest_completion", "completed", "agent-1", 20)
+            .unwrap();
+        let sender = "erd17y5h7t00yd7r7qlfjmndnvhu2yu2arpe9sexj73v42qzgysthpjsk2q033";
+        let (intent, payload_hex) = w.submit_intent(&proof.id, sender).unwrap();
+        // Same data the proof carries — rebuilt, not re-rolled.
+        assert_eq!(intent.data_field(), proof.tx_data);
+        assert_eq!(intent.sender.as_deref(), Some(sender));
+        assert_eq!(intent.chain_id.as_deref(), Some("T"));
+        assert_eq!(intent.network, "multiversx-testnet");
+        assert!(!payload_hex.is_empty());
+        // Deterministic: second call → identical bytes.
+        let (again, payload_again) = w.submit_intent(&proof.id, sender).unwrap();
+        assert_eq!(intent, again);
+        assert_eq!(payload_hex, payload_again);
+        // Guards: bad sender, unknown proof, non-pending proof.
+        assert!(w.submit_intent(&proof.id, "").is_err());
+        assert!(w.submit_intent(&proof.id, "not-an-address").is_err());
+        assert!(w.submit_intent("proof-missing", sender).is_err());
+        w.submit_settlement(&proof.id, "deadbeef").unwrap();
+        assert!(w.submit_intent(&proof.id, sender).is_err());
     }
 }

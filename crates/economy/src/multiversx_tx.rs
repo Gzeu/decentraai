@@ -196,12 +196,23 @@ impl Mx8004TxBuilder {
         job_id: &str,
         evidence: &EconomicEvidence,
     ) -> Result<UnsignedTxIntent, TxBuildError> {
+        Self::submit_proof_raw(job_id, &evidence.evidence_hash())
+    }
+
+    /// `submit_proof@jobId@proof` from a raw 32-byte digest (same encoding as
+    /// [`Self::submit_proof`], for callers that already hold the digest —
+    /// e.g. the Open World settlement layer, whose BLAKE3 evidence hash is
+    /// the proof). The digest is STILL never re-hashed.
+    pub fn submit_proof_raw(
+        job_id: &str,
+        evidence_hash: &[u8; 32],
+    ) -> Result<UnsignedTxIntent, TxBuildError> {
         if job_id.is_empty() || job_id.chars().count() > MAX_JOB_ID {
             return Err(TxBuildError::EmptyField("job_id"));
         }
         let fields = vec![
             str_field("job_id", job_id)?,
-            hash_field(&evidence.evidence_hash()),
+            hash_field(evidence_hash),
         ];
         Ok(base_intent(SUBMIT_PROOF_ENDPOINT, fields))
     }
