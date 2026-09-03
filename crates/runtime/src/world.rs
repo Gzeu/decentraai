@@ -950,7 +950,7 @@ impl WorldState {
             }
 
             // Get agent needs and current location
-            let (needs, current_loc, credits) = {
+            let (needs, current_loc, _credits) = {
                 let e = self.entities.iter().find(|e| e.id == entity_id).unwrap();
                 (e.needs.clone(), e.location_id.clone(), e.credits)
             };
@@ -960,15 +960,16 @@ impl WorldState {
             }
 
             // Find a location that offers a needed service (at its CURRENT
-            // dynamic price — agents feel hot markets like anyone else).
+            // dynamic price, reserve respected — agents don't travel to
+            // counters they won't buy from).
             for needed in &needs {
                 if let Some(target_loc) = self.locations.iter().find(|l| {
                     l.services.contains_key(needed)
                         && l.id != current_loc
-                        && credits
-                            >= self
-                                .service_price(&l.id, needed)
-                                .unwrap_or(u64::MAX)
+                        && self
+                            .service_price(&l.id, needed)
+                            .map(|p| self.agent_can_spend(&entity_id, p))
+                            .unwrap_or(false)
                 }) {
                     let target_label = target_loc.label.clone();
                     let target_id = target_loc.id.clone();
@@ -1046,7 +1047,10 @@ impl WorldState {
     ///
     /// This is what makes the world ALIVE without API calls. Each tick every
     /// agent, in order: (1) may develop a new need, (2) buys ONE needed
-    /// service where it stands, (3) takes or works ONE quest objective.
+    /// service where it stands, (3) takes or works ONE quest objective,
+    /// (4) does commerce when broke, or drifts to the bazaar when idle.
+    /// Deliberation is situational: every spend keeps a reserve, every
+    /// choice weighs credits, needs, quests, prices, and place.
     /// Sales leave Pending proofs (no network in tick) for the sweep path;
     /// quest completion pays rewards + auto-settles right here.
     fn agent_autonomy_tick(&mut self) {
@@ -1060,7 +1064,22 @@ impl WorldState {
             self.agent_regenerate_need(&id);
             self.agent_fulfill_need(&id);
             self.agent_quest_tick(&id);
+            self.agent_commerce_tick(&id);
         }
+    }
+
+    /// Spend reserve: agents never spend their last credits in a tick.
+    /// Keeps agents solvent and forces broke agents into the earn loop
+    /// (craft + sell) instead of starving at a service counter.
+    pub const AGENT_SPEND_RESERVE: u64 = 10;
+
+    /// True when the agent can pay `price` and still keep its reserve.
+    fn agent_can_spend(&self, agent_id: &str, price: u64) -> bool {
+        self.entities
+            .iter()
+            .find(|e| e.id == agent_id)
+            .map(|e| e.credits >= price.saturating_add(Self::AGENT_SPEND_RESERVE))
+            .unwrap_or(false)
     }
 
     /// Services agents can develop needs for (all real priced offers).
@@ -1113,6 +1132,8 @@ impl WorldState {
     }
 
     /// Buy ONE needed service where the agent stands (dynamic price).
+    /// Respects the spend reserve — an agent that cannot afford the price
+    /// AND its reserve holds the need and earns first instead.
     /// Fulfilled needs clear; worthy sales leave a Pending proof.
     fn agent_fulfill_need(&mut self, agent_id: &str) {
         let (loc, needs) = match self.entities.iter().find(|e| e.id == agent_id) {
@@ -1122,17 +1143,11 @@ impl WorldState {
         let Some(needed) = needs.into_iter().next() else {
             return;
         };
-        let affordable = self
-            .entities
-            .iter()
-            .find(|e| e.id == agent_id)
-            .map(|e| {
-                self.service_price(&loc, &needed)
-                    .map(|p| e.credits >= p)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if !affordable {
+        let price = match self.service_price(&loc, &needed) {
+            Some(p) => p,
+            None => return,
+        };
+        if !self.agent_can_spend(agent_id, price) {
             return;
         }
         if let Ok((_, provider, price)) = self.buy_service(agent_id, &loc, &needed) {
@@ -1157,23 +1172,45 @@ impl WorldState {
         let quest_id = match active_id {
             Some(id) => id,
             None => {
-                // Oldest available quest the agent qualifies for.
-                let mut avail: Vec<String> = self
+                // Value choice, not oldest-first: score each available quest
+                // by reward (credits + reputation weight) and take the best
+                // one the agent qualifies for AND can pursue. BuyService
+                // quests beyond current reach are skipped for later — the
+                // agent earns first instead of stranding itself. Exactly one
+                // accept call: evaluation never mutates quest state.
+                let mut best: Option<(String, u64)> = None;
+                let avail: Vec<(String, u64)> = self
                     .quests
                     .iter()
-                    .filter(|q| q.status == QuestStatus::Available)
-                    .map(|q| q.id.clone())
+                    .filter(|q| {
+                        q.status == QuestStatus::Available
+                            && self.quest_qualifies(agent_id, q)
+                    })
+                    .map(|q| {
+                        let score = q.reward.credits + (q.reward.reputation * 10.0) as u64;
+                        (q.id.clone(), score)
+                    })
                     .collect();
-                avail.sort();
-                let mut took = None;
-                for qid in avail {
-                    if self.accept_quest(&qid, agent_id).is_ok() {
-                        took = Some(qid);
-                        break;
+                for (qid, score) in avail {
+                    if !self.quest_pursuable(agent_id, &qid) {
+                        continue;
+                    }
+                    // Strictly greater wins: ties keep the oldest id.
+                    let take = match &best {
+                        Some((bid, s)) => score > *s || (score == *s && qid < *bid),
+                        None => true,
+                    };
+                    if take {
+                        best = Some((qid, score));
                     }
                 }
-                match took {
-                    Some(id) => id,
+                match best {
+                    Some((id, _)) => {
+                        if self.accept_quest(&id, agent_id).is_err() {
+                            return;
+                        }
+                        id
+                    }
                     None => return,
                 }
             }
@@ -1198,6 +1235,10 @@ impl WorldState {
                 service,
             } => {
                 if self.agent_at(agent_id, &location_id) {
+                    let price = self.service_price(&location_id, &service).unwrap_or(u64::MAX);
+                    if !self.agent_can_spend(agent_id, price) {
+                        return;
+                    }
                     if let Ok((_, provider, price)) =
                         self.buy_service(agent_id, &location_id, &service)
                     {
@@ -1259,6 +1300,96 @@ impl WorldState {
         }
     }
 
+    /// True when the agent meets a quest's reputation + capability gates.
+    /// Pure read: the same rules `accept_quest` enforces, usable for
+    /// scoring WITHOUT mutating quest state.
+    fn quest_qualifies(&self, agent_id: &str, quest: &Quest) -> bool {
+        match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(agent) => {
+                agent.reputation >= quest.required_reputation
+                    && quest
+                        .required_capabilities
+                        .iter()
+                        .all(|c| agent.capabilities.iter().any(|a| a == c))
+            }
+            None => false,
+        }
+    }
+
+    /// True when the agent can pursue a quest's BuyService costs right now
+    /// (dynamic price + spend reserve). Unaffordable quests wait for later.
+    fn quest_pursuable(&self, agent_id: &str, quest_id: &str) -> bool {
+        match self.quests.iter().find(|q| q.id == quest_id) {
+            Some(quest) => quest.objectives.iter().all(|obj| {
+                if let QuestObjective::BuyService {
+                    location_id,
+                    service,
+                } = obj
+                {
+                    let price = self.service_price(location_id, service).unwrap_or(u64::MAX);
+                    self.agent_can_spend(agent_id, price)
+                } else {
+                    true
+                }
+            }),
+            None => false,
+        }
+    }
+
+    /// Commerce + drift: the earn loop and the social hub.
+    ///
+    /// Broke agents (< 20Cr) head for the bazaar and craft goods to sell
+    /// (capped like vendors: max 2 own active listings) — poverty becomes
+    /// enterprise instead of deadlock. Idle, solvent agents with no quest
+    /// drift to the bazaar too: that is where listings, vendors, and other
+    /// agents are, so encounters and trades concentrate there.
+    fn agent_commerce_tick(&mut self, agent_id: &str) {
+        let (credits, has_active, loc) = match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(e) => (
+                e.credits,
+                self.quests.iter().any(|q| {
+                    q.status == QuestStatus::Active && q.accepted_by.as_deref() == Some(agent_id)
+                }),
+                e.location_id.clone(),
+            ),
+            None => return,
+        };
+        if has_active {
+            return;
+        }
+        const BAZAAR: &str = "market-bazaar";
+        if credits < 20 {
+            if loc == BAZAAR {
+                let own_active = self
+                    .listings
+                    .iter()
+                    .filter(|l| l.active && l.seller_id == agent_id)
+                    .count();
+                if own_active < 2 {
+                    let item = WorldItem {
+                        id: format!("craft-{agent_id}-{}", self.tick),
+                        name: format!("{agent_id} Crafts"),
+                        item_type: "artifact".to_string(),
+                        price: 8,
+                        description: format!("Handmade goods by {agent_id}"),
+                    };
+                    let _ = self.list_item(agent_id, item, BAZAAR);
+                }
+            } else {
+                self.agent_goto(agent_id, BAZAAR);
+            }
+            return;
+        }
+        // Solvent + idle: drift to the hub of opportunities.
+        let (needs_empty, at_hub) = match self.entities.iter().find(|e| e.id == agent_id) {
+            Some(e) => (e.needs.is_empty(), e.location_id == BAZAAR),
+            None => return,
+        };
+        if needs_empty && !at_hub {
+            self.agent_goto(agent_id, BAZAAR);
+        }
+    }
+
     /// True when the agent stands at the location.
     fn agent_at(&self, agent_id: &str, location_id: &str) -> bool {
         self.entities
@@ -1281,13 +1412,14 @@ impl WorldState {
     }
 
     /// Buy the cheapest affordable listing that is not the agent's own.
+    /// Reserve-aware: tick shopping never touches the last credits.
     /// Worthy sales leave a Pending proof for the seller.
     fn agent_buy_cheapest(&mut self, agent_id: &str, location_id: &str) {
-        let credits: u64 = self
+        let budget: u64 = self
             .entities
             .iter()
             .find(|e| e.id == agent_id)
-            .map(|e| e.credits)
+            .map(|e| e.credits.saturating_sub(Self::AGENT_SPEND_RESERVE))
             .unwrap_or(0);
         let pick: Option<(String, u64)> = self
             .listings
@@ -1296,7 +1428,7 @@ impl WorldState {
                 l.active && l.location_id == location_id && l.seller_id != agent_id
             })
             .min_by_key(|l| l.item.price)
-            .filter(|l| credits >= l.item.price)
+            .filter(|l| budget >= l.item.price)
             .map(|l| (l.id.clone(), l.item.price));
         if let Some((listing_id, _)) = pick {
             if let Ok((item, seller_id)) = self.buy_item(agent_id, &listing_id) {
@@ -1335,15 +1467,25 @@ impl WorldState {
         ];
         let tick = self.tick;
         for v in VENDORS {
-            let active = self
+            let active_here = self
+                .listings
+                .iter()
+                .filter(|l| l.active && l.location_id == v.location_id)
+                .count();
+            let own_active = self
                 .listings
                 .iter()
                 .filter(|l| l.active && l.seller_id == v.npc_id)
                 .count();
-            if active >= 2 {
+            if own_active >= 2 {
                 continue;
             }
-            let (item_id, name, price) = if tick % 10 < 5 { v.even } else { v.odd };
+            let (item_id, name, base) = if tick % 10 < 5 { v.even } else { v.odd };
+            // Clearance reaction: overstocked shelves discount the new
+            // goods 5% per active listing here, floor 50% of base.
+            // Symmetric with services, which heat UP with demand.
+            let factor = 100u64.saturating_sub(5 * active_here.min(10) as u64).max(50);
+            let price = (base * factor / 100).max(1);
             let _ = self.list_item(
                 v.npc_id,
                 WorldItem {
@@ -1864,6 +2006,31 @@ impl WorldState {
             }
         }
 
+        // Deliverables are consumed: each BuyService objective eats the
+        // matching service-result out of the agent's inventory. One purchase
+        // completes one quest — results can't be double-spent across quests.
+        // (Makes quest proof ids unique per completion too.)
+        if let Some(agent) = self.entities.iter_mut().find(|e| e.id == agent_id) {
+            if let Some(q) = self.quests.iter().find(|q| q.id == quest_id) {
+                let objectives = q.objectives.clone();
+                for obj in &objectives {
+                    if let QuestObjective::BuyService {
+                        location_id,
+                        service,
+                    } = obj
+                    {
+                        if let Some(pos) = agent.inventory.iter().position(|item| {
+                            item.item_type == "service-result"
+                                && item.description.contains(service.as_str())
+                                && item.description.contains(location_id.as_str())
+                        }) {
+                            agent.inventory.remove(pos);
+                        }
+                    }
+                }
+            }
+        }
+
         // Zone unlock
         if let Some(zone_id) = &reward.zone_unlock {
             if let Some(zone) = self.zones.iter_mut().find(|z| &z.id == zone_id) {
@@ -1912,6 +2079,152 @@ impl WorldState {
                 }
             }
         }
+
+        // One special quest per tick at most: the keeper reacts to the
+        // economy instead of repeating the same board.
+        if self.elite_quest_available() {
+            return;
+        }
+        if self.maybe_elite_quest() {
+            return;
+        }
+        self.maybe_market_quest();
+    }
+
+    /// True when an elite quest is already waiting on the board.
+    fn elite_quest_available(&self) -> bool {
+        self.quests.iter().any(|q| {
+            q.status == QuestStatus::Available && q.id.contains("-elite-")
+        })
+    }
+
+    /// Elite work for proven agents: when someone holds reputation >= 2.0,
+    /// the keeper posts a high-stakes forge run (25Cr coding service,
+    /// 60Cr + 1.0 rep, reputation-gated). Progression, not repetition.
+    fn maybe_elite_quest(&mut self) -> bool {
+        let proven = self
+            .entities
+            .iter()
+            .any(|e| e.entity_type == "agent" && e.reputation >= 2.0);
+        if !proven {
+            return false;
+        }
+        let quest = Quest {
+            id: format!("q-{}-elite-forge", self.tick),
+            title: "Elite: Forge Commission".to_string(),
+            description: "A master smith needs the coding service at the forge workshop. Veterans only.".to_string(),
+            giver_id: "npc-questkeeper".to_string(),
+            objectives: vec![
+                QuestObjective::MoveTo {
+                    location_id: "forge-workshop".to_string(),
+                },
+                QuestObjective::BuyService {
+                    location_id: "forge-workshop".to_string(),
+                    service: "coding".to_string(),
+                },
+            ],
+            progress: vec![false, false],
+            reward: QuestReward {
+                credits: 60,
+                reputation: 1.0,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status: QuestStatus::Available,
+            accepted_by: None,
+            created_tick: self.tick,
+            accepted_tick: 0,
+            deadline_tick: self.tick + 100,
+            required_reputation: 1.0,
+            required_capabilities: vec![],
+        };
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "quest_generated".to_string(),
+            detail: format!("New elite quest: {} (by {})", quest.title, quest.giver_id),
+            entity_id: Some(quest.giver_id.clone()),
+            location_id: None,
+            evidence_id: None,
+        });
+        self.quests.push(quest);
+        true
+    }
+
+    /// Market work from live stock: when a market holds active listings and
+    /// some funded agent exists, the keeper posts a BuyItem run there.
+    /// Reward covers the cheapest listing + margin. Marketplace ↔ quests,
+    /// feeding each other instead of idling side by side.
+    fn maybe_market_quest(&mut self) -> bool {
+        if self.quests.iter().any(|q| {
+            q.status == QuestStatus::Available && q.id.contains("-marketbuy-")
+        }) {
+            return false;
+        }
+        let (market_id, market_label, floor_price) = match self
+            .locations
+            .iter()
+            .filter(|l| l.marketplace)
+            .filter_map(|l| {
+                let floor = self
+                    .listings
+                    .iter()
+                    .filter(|li| li.active && li.location_id == l.id)
+                    .map(|li| li.item.price)
+                    .min()?;
+                Some((l.id.clone(), l.label.clone(), floor))
+            })
+            .min_by_key(|(_, _, p)| *p)
+        {
+            Some(t) => t,
+            None => return false,
+        };
+        let funded = self.entities.iter().any(|e| {
+            e.entity_type == "agent"
+                && e.credits >= floor_price.saturating_add(Self::AGENT_SPEND_RESERVE)
+        });
+        if !funded {
+            return false;
+        }
+        let quest = Quest {
+            id: format!("q-{}-marketbuy", self.tick),
+            title: format!("Market Run: {market_label}"),
+            description: format!(
+                "The Questkeeper wants goods from {market_label} (from {floor_price}Cr)."
+            ),
+            giver_id: "npc-questkeeper".to_string(),
+            objectives: vec![
+                QuestObjective::MoveTo {
+                    location_id: market_id.clone(),
+                },
+                QuestObjective::BuyItem {
+                    location_id: market_id,
+                },
+            ],
+            progress: vec![false, false],
+            reward: QuestReward {
+                credits: (floor_price + 10).min(60),
+                reputation: 0.3,
+                items: vec![],
+                zone_unlock: None,
+            },
+            status: QuestStatus::Available,
+            accepted_by: None,
+            created_tick: self.tick,
+            accepted_tick: 0,
+            deadline_tick: self.tick + 100,
+            required_reputation: 0.0,
+            required_capabilities: vec![],
+        };
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "quest_generated".to_string(),
+            detail: format!("New market quest: {} (by {})", quest.title, quest.giver_id),
+            entity_id: Some(quest.giver_id.clone()),
+            location_id: None,
+            evidence_id: None,
+        });
+        self.quests.push(quest);
+        true
     }
 
     // ─── On-Chain Settlement ─────────────────────────────────────────
@@ -2882,6 +3195,91 @@ mod tests {
     }
 
     #[test]
+    fn reserve_blocks_tick_spending_but_not_earning() {
+        let mut w = WorldState::default();
+        w.locations.push(WorldLocation {
+            id: "loc-rsv".to_string(),
+            zone_id: "z".to_string(),
+            label: "Rsv".to_string(),
+            description: String::new(),
+            services: [("ocr".to_string(), 10u64)].into_iter().collect(),
+            marketplace: false,
+            capacity: 10,
+        });
+        w.entities.push(WorldEntity {
+            id: "broke".to_string(),
+            name: "Broke".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "z".to_string(),
+            location_id: "loc-rsv".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec!["ocr".to_string()],
+            wallet: "erd1broke".to_string(),
+            reputation: 0.0,
+            credits: 12,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        // 12Cr can't cover 10Cr + 10 reserve: need held, nothing spent.
+        w.world_tick();
+        let b = w.entities.iter().find(|e| e.id == "broke").unwrap();
+        assert_eq!(b.needs, vec!["ocr".to_string()]);
+        assert_eq!(b.credits, 12);
+        assert!(w.proofs.is_empty());
+        // Funded past the reserve: the need fulfills. The eager world also
+        // completes the generated ocr quest in the same tick (positioned
+        // agent + fresh service result), so 30 - 10 service + 20 reward.
+        w.entities
+            .iter_mut()
+            .find(|e| e.id == "broke")
+            .unwrap()
+            .credits = 30;
+        w.world_tick();
+        let b = w.entities.iter().find(|e| e.id == "broke").unwrap();
+        assert!(b.needs.is_empty());
+        assert_eq!(b.credits, 40);
+    }
+
+    #[test]
+    fn elite_quest_for_proven_agents() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "vet".to_string(),
+            name: "Vet".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "forge".to_string(),
+            location_id: "forge-workshop".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1vet".to_string(),
+            reputation: 2.5,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        // Tick 1: elite posted (rep >= 2), taken (best value), positioned.
+        w.world_tick();
+        let elite: Vec<_> = w
+            .quests
+            .iter()
+            .filter(|q| q.id.contains("-elite-"))
+            .collect();
+        assert_eq!(elite.len(), 1);
+        // Ticks 2-3: BuyService coding + completion (+60 reward).
+        w.world_tick();
+        w.world_tick();
+        let q = w.quests.iter().find(|q| q.id.contains("-elite-")).unwrap();
+        assert_eq!(q.status, QuestStatus::Completed);
+        let v = w.entities.iter().find(|e| e.id == "vet").unwrap();
+        assert_eq!(v.credits, 135); // 100 - 25 coding + 60 elite reward
+        assert!(v.reputation >= 3.5);
+    }
+
+    #[test]
     fn agents_live_alone_needs_and_quests() {
         let mut w = WorldState::default();
         w.locations.push(WorldLocation {
@@ -2934,11 +3332,18 @@ mod tests {
         let a = w.entities.iter().find(|e| e.id == "agent-a").unwrap();
         assert!(a.needs.is_empty(), "need should be fulfilled");
         assert_eq!(a.credits, 110); // 100 - 10 service + 20 quest reward
-        assert!(a.inventory.iter().any(|i| i.item_type == "service-result"));
+        // The service result was delivered into the quest (consumed on
+        // completion), and the quest proof pends for the sweep path.
         assert_eq!(w.proofs.len(), 1); // quest proof (sale had no NPC earner)
         assert_eq!(w.proofs[0].entity_id, "agent-a");
+        assert!(w
+            .quests
+            .iter()
+            .any(|q| q.status == QuestStatus::Completed && q.accepted_by.as_deref() == Some("agent-a")));
 
-        // Quest autonomy: available MoveTo quest gets taken, walked, done.
+        // Quest autonomy with an unambiguous winner: q-life pays 40+0.5
+        // (score 45), beating any generated board quest. The positioned
+        // agent takes it and finishes it in ONE tick.
         w.entities
             .iter_mut()
             .find(|e| e.id == "agent-a")
@@ -2953,7 +3358,7 @@ mod tests {
                 location_id: "loc-far".to_string(),
             }],
             reward: QuestReward {
-                credits: 20,
+                credits: 40,
                 reputation: 0.5,
                 items: vec![],
                 zone_unlock: None,
@@ -2967,15 +3372,13 @@ mod tests {
             required_capabilities: vec![],
             progress: vec![false],
         });
-        // Tick 1: accept (already there → progress true → Ready).
-        w.world_tick();
-        // Tick 2: Ready → Completed + reward + auto-settle proof.
+        // One tick: accept (already there → progress true → Ready → done).
         w.world_tick();
         let q = w.quests.iter().find(|q| q.id == "q-life").unwrap();
         assert_eq!(q.status, QuestStatus::Completed);
         let a = w.entities.iter().find(|e| e.id == "agent-a").unwrap();
-        assert_eq!(a.credits, 130); // 110 + 20 reward
-        assert!(a.reputation >= 0.5);
+        assert_eq!(a.credits, 150); // 110 + 40 reward
+        assert!(a.reputation >= 1.0);
         assert_eq!(w.proofs.len(), 2); // both quest proofs
     }
 
