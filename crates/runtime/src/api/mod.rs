@@ -1409,6 +1409,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/quest/generate", post(world_quest_generate_handler))
         .route("/v1/world/settle", post(world_settle_handler))
         .route("/v1/world/settle/intent", post(world_settle_intent_handler))
+        .route(
+            "/v1/world/settle/auto-submit",
+            post(world_settle_auto_submit_handler),
+        )
+        .route("/v1/world/settle/check", post(world_settle_check_handler))
         .route("/v1/world/settle/submit", post(world_settle_submit_handler))
         .route("/v1/world/settle/confirm", post(world_settle_confirm_handler))
         .route("/v1/world/proofs", get(world_proofs_handler))
@@ -3025,9 +3030,14 @@ async fn world_settle_submit_handler(
                 .into_response()
         }
     };
+    let sender = body
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let mut world = state.world.lock().await;
-    match world.submit_settlement(&proof_id, &tx_hash) {
+    match world.submit_settlement(&proof_id, &tx_hash, &sender) {
         Ok(()) => {
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
@@ -3039,6 +3049,188 @@ async fn world_settle_submit_handler(
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/auto-submit — full automation for one proof.
+///
+/// Uses the injected Settlement Operator signer (env secret on the node):
+/// intent → testnet nonce → sign → broadcast → record tx_hash + sender.
+/// Returns the REAL chain tx_hash. No key material touches this handler —
+/// signing happens inside `settlement_tx` from process-env injection.
+async fn world_settle_auto_submit_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proof_id = match body.get("proof_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
+            )
+                .into_response()
+        }
+    };
+
+    let sender = match crate::settlement_tx::operator_address() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"ok": false, "error": e})),
+            )
+                .into_response()
+        }
+    };
+
+    // Build the deterministic intent under a short lock; network I/O happens
+    // outside the lock so ticks are never blocked by the testnet API.
+    let tx_data = {
+        let world = state.world.lock().await;
+        match world.submit_intent(&proof_id, &sender) {
+            Ok((intent, _)) => intent.data_field(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"ok": false, "error": e})),
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    match crate::settlement_tx::auto_submit_proof(
+        &tx_data,
+        &sender,
+        crate::settlement_tx::TESTNET_API_BASE,
+    )
+    .await
+    {
+        Ok((tx_hash, _)) => {
+            let mut world = state.world.lock().await;
+            match world.submit_settlement(&proof_id, &tx_hash, &sender) {
+                Ok(()) => {
+                    let path = crate::world::world_path_for(&state.info.repo_root);
+                    crate::world::save_world_state(&path, &world);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            "proof_id": proof_id,
+                            "status": "submitted",
+                            "tx_hash": tx_hash,
+                            "sender": sender,
+                            "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{tx_hash}"),
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"ok": false, "error": e, "tx_hash": tx_hash})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/world/settle/check — poll testnet for a submitted proof.
+///
+/// `success` → confirm (reputation +0.2, persisted). Chain `fail`/`invalid`
+/// → proof marked Failed with the reason. Anything else → still pending.
+async fn world_settle_check_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proof_id = match body.get("proof_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
+            )
+                .into_response()
+        }
+    };
+
+    let (tx_hash, already_confirmed) = {
+        let world = state.world.lock().await;
+        match world.proofs.iter().find(|p| p.id == proof_id) {
+            Some(p) => (p.tx_hash.clone(), p.status == crate::world::SettlementStatus::Confirmed),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"ok": false, "error": "proof not found"})),
+                )
+                    .into_response()
+            }
+        }
+    };
+    if already_confirmed {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed"})),
+        )
+            .into_response();
+    }
+    if tx_hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "proof not submitted yet"})),
+        )
+            .into_response();
+    }
+
+    match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash).await
+    {
+        Ok(status) => {
+            let mut world = state.world.lock().await;
+            if status == "success" {
+                match world.confirm_settlement(&proof_id) {
+                    Ok(()) => {
+                        let path = crate::world::world_path_for(&state.info.repo_root);
+                        crate::world::save_world_state(&path, &world);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash})),
+                        )
+                            .into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"ok": false, "error": e})),
+                    )
+                        .into_response(),
+                }
+            } else if status == "fail" || status == "invalid" {
+                let _ = world.fail_settlement(&proof_id, &format!("chain status: {status}"));
+                let path = crate::world::world_path_for(&state.info.repo_root);
+                crate::world::save_world_state(&path, &world);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "failed", "chain_status": status})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "pending", "chain_status": status})),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
@@ -3095,6 +3287,7 @@ async fn world_proofs_handler(State(state): State<ApiState>) -> Response {
                 "amount": p.amount,
                 "evidence_hash": p.evidence_hash,
                 "tx_hash": p.tx_hash,
+                "sender": p.sender,
                 "status": p.status,
                 "network": p.network,
                 "created_tick": p.created_tick,

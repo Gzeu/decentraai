@@ -25,6 +25,7 @@
 //! [`UnsignedTxIntent`]: crate::multiversx_tx::UnsignedTxIntent
 
 use crate::multiversx_tx::UnsignedTxIntent;
+use bech32::{ToBase32 as _, Variant, encode};
 use ed25519_dalek::{Signer as _, Verifier as _};
 use std::fmt;
 
@@ -152,6 +153,13 @@ impl TransactionSigner for Ed25519Signer {
     }
 }
 
+/// Derive the MultiversX bech32 (`erd1…`) address for a verifying key.
+/// Pure function of public bytes — safe to log, store, and compare.
+pub fn bech32_address(verifying_key: &[u8; 32]) -> String {
+    encode("erd", verifying_key.to_base32(), Variant::Bech32)
+        .expect("bech32 encoding of 32 bytes never fails")
+}
+
 /// Load the operator wallet signer from secret injection.
 ///
 /// Precedence: `DECENTRAAI_MX_SIGNER_HEX_FILE` (0600 file with hex seed)
@@ -259,8 +267,19 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_leaks_seed() {
-        let signer = Ed25519Signer::from_seed_hex(TEST_SEED_HEX).unwrap();
+    fn bech32_address_is_stable_erd1_and_key_bound() {
+        let a = Ed25519Signer::from_seed_hex(TEST_SEED_HEX).unwrap();
+        let addr1 = bech32_address(&a.verifying_key_bytes());
+        let addr2 = bech32_address(&a.verifying_key_bytes());
+        assert_eq!(addr1, addr2);
+        assert!(addr1.starts_with("erd1"), "unexpected: {addr1}");
+        assert_eq!(addr1.len(), 62);
+        let other = Ed25519Signer::from_seed_hex(&"ab".repeat(32)).unwrap();
+        assert_ne!(addr1, bech32_address(&other.verifying_key_bytes()));
+    }
+
+    #[test]
+    fn debug_never_leaks_seed() {        let signer = Ed25519Signer::from_seed_hex(TEST_SEED_HEX).unwrap();
         let dbg = format!("{signer:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains(TEST_SEED_HEX));

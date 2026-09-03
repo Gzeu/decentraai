@@ -26,6 +26,7 @@ pub mod m18;
 pub mod mcp;
 pub mod providers_api;
 pub mod queue;
+pub mod settlement_tx;
 pub mod tools;
 pub mod vesper;
 pub mod wallet_auth;

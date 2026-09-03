@@ -208,6 +208,10 @@ pub struct OnChainProof {
     /// Tx hash after submission (empty until submitted).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tx_hash: String,
+    /// Operator wallet that signed+broadcast the tx (empty until submitted).
+    /// Persisted so restart/recovery can verify sender consistency.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender: String,
     /// Current settlement status.
     pub status: SettlementStatus,
     /// When the proof was generated (tick).
@@ -1535,6 +1539,7 @@ impl WorldState {
             evidence_hash: evidence_hash.clone(),
             tx_data,
             tx_hash: String::new(),
+            sender: String::new(),
             status: SettlementStatus::Pending,
             created_tick: self.tick,
             submitted_tick: 0,
@@ -1558,17 +1563,23 @@ impl WorldState {
         Ok(proof)
     }
 
-    /// Mark a proof as submitted (tx hash recorded).
-    pub fn submit_settlement(&mut self, proof_id: &str, tx_hash: &str) -> Result<(), String> {
+    /// Mark a proof as submitted (tx hash + operator sender recorded).
+    pub fn submit_settlement(
+        &mut self,
+        proof_id: &str,
+        tx_hash: &str,
+        sender: &str,
+    ) -> Result<(), String> {
         let (entity_id, evidence_hash) = {
             let proof = self
                 .proofs
                 .iter_mut()
                 .find(|p| p.id == proof_id)
-                .ok_or_else(|| format!("proof '{}' not found", proof_id))?;
+                .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
 
             proof.status = SettlementStatus::Submitted;
             proof.tx_hash = tx_hash.to_string();
+            proof.sender = sender.to_string();
             proof.submitted_tick = self.tick;
 
             (proof.entity_id.clone(), proof.evidence_hash.clone())
@@ -1578,15 +1589,37 @@ impl WorldState {
             tick: self.tick,
             kind: "settlement_submitted".to_string(),
             detail: format!(
-                "Proof {} submitted to MultiversX testnet — tx: {}",
-                proof_id,
-                &tx_hash[..tx_hash.len().min(16)]
+                "Proof {proof_id} submitted to MultiversX testnet — tx: {} (sender: {})",
+                &tx_hash[..tx_hash.len().min(16)],
+                if sender.is_empty() { "?" } else { sender }
             ),
             entity_id: Some(entity_id),
             location_id: None,
             evidence_id: Some(evidence_hash),
         });
 
+        Ok(())
+    }
+
+    /// Mark a proof as failed (tx rejected/failed on-chain, with reason).
+    pub fn fail_settlement(&mut self, proof_id: &str, reason: &str) -> Result<(), String> {
+        let (entity_id, evidence_hash) = {
+            let proof = self
+                .proofs
+                .iter_mut()
+                .find(|p| p.id == proof_id)
+                .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
+            proof.status = SettlementStatus::Failed;
+            (proof.entity_id.clone(), proof.evidence_hash.clone())
+        };
+        self.record_event(WorldEvent {
+            tick: self.tick,
+            kind: "settlement_failed".to_string(),
+            detail: format!("Proof {proof_id} failed: {reason}"),
+            entity_id: Some(entity_id),
+            location_id: None,
+            evidence_id: Some(evidence_hash),
+        });
         Ok(())
     }
 
@@ -2262,10 +2295,11 @@ mod tests {
 
         // Submit
         assert!(w
-            .submit_settlement(&proof_id, "abc123def456")
+            .submit_settlement(&proof_id, "abc123def456", "erd1operator")
             .is_ok());
         assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
         assert_eq!(w.proofs[0].tx_hash, "abc123def456");
+        assert_eq!(w.proofs[0].sender, "erd1operator");
 
         // Confirm
         assert!(w.confirm_settlement(&proof_id).is_ok());
@@ -2375,7 +2409,8 @@ mod tests {
         assert!(w.submit_intent(&proof.id, "").is_err());
         assert!(w.submit_intent(&proof.id, "not-an-address").is_err());
         assert!(w.submit_intent("proof-missing", sender).is_err());
-        w.submit_settlement(&proof.id, "deadbeef").unwrap();
+        w.submit_settlement(&proof.id, "deadbeef", sender).unwrap();
+        assert_eq!(w.proofs[0].sender, sender);
         assert!(w.submit_intent(&proof.id, sender).is_err());
     }
 }

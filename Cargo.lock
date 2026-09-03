@@ -1173,12 +1173,14 @@ dependencies = [
 name = "decentraai-economy"
 version = "1.0.0"
 dependencies = [
+ "bech32",
  "blake3",
  "decentraai-agents",
  "decentraai-compute",
  "decentraai-identity",
  "ed25519-dalek 3.0.0",
  "hex",
+ "rand_core 0.6.4",
  "reqwest",
  "serde",
  "serde_json",
