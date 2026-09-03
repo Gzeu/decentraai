@@ -378,6 +378,14 @@ pub struct WorldState {
     /// On-chain settlement proofs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proofs: Vec<OnChainProof>,
+    /// Base service prices by "location_id/service" (first-seen price sticks;
+    /// the live `locations[].services` map is the base source of truth).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub service_base_prices: HashMap<String, u64>,
+    /// Demand counters by "location_id/service": +1 per sale, -1 per tick.
+    /// Drives the dynamic price — hot services cost more, quiet ones cool.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub service_demand: HashMap<String, u64>,
 }
 
 impl Default for WorldState {
@@ -406,6 +414,8 @@ impl Default for WorldState {
             events: vec![],
             quests: vec![],
             proofs: vec![],
+            service_base_prices: HashMap::new(),
+            service_demand: HashMap::new(),
         }
     }
 }
@@ -904,6 +914,9 @@ impl WorldState {
     pub fn world_tick(&mut self) {
         self.advance_tick();
 
+        // 0. Hot markets cool: demand decays every tick.
+        self.decay_service_demand();
+
         // 1. Questkeeper generates quests
         self.questkeeper_tick();
 
@@ -950,12 +963,16 @@ impl WorldState {
                 continue;
             }
 
-            // Find a location that offers a needed service
+            // Find a location that offers a needed service (at its CURRENT
+            // dynamic price — agents feel hot markets like anyone else).
             for needed in &needs {
                 if let Some(target_loc) = self.locations.iter().find(|l| {
                     l.services.contains_key(needed)
                         && l.id != current_loc
-                        && credits >= *l.services.get(needed).unwrap_or(&u64::MAX)
+                        && credits
+                            >= self
+                                .service_price(&l.id, needed)
+                                .unwrap_or(u64::MAX)
                 }) {
                     let target_label = target_loc.label.clone();
                     let target_id = target_loc.id.clone();
@@ -992,32 +1009,24 @@ impl WorldState {
     }
 
     /// Buy a service at a location (triggers actual execution).
-    /// Returns (service_name, provider_npc_id, price) on success.
+    /// Price is the DYNAMIC effective price (base + demand premium), so the
+    /// same service costs more when hot. Returns (service, provider, price).
     pub fn buy_service(
         &mut self,
         buyer_id: &str,
         location_id: &str,
         service_name: &str,
     ) -> Result<(String, String, u64), String> {
-        let location = self
-            .locations
-            .iter()
-            .find(|l| l.id == location_id)
-            .ok_or_else(|| format!("location '{}' not found", location_id))?;
-
-        let price = location
-            .services
-            .get(service_name)
-            .ok_or_else(|| format!("service '{}' not available at {}", service_name, location_id))?;
-
-        let price = *price;
+        let price = self.service_price(location_id, service_name).ok_or_else(|| {
+            format!("service '{service_name}' not available at {location_id}")
+        })?;
 
         // Verify buyer is at this location
         let buyer = self
             .entities
             .iter()
             .find(|e| e.id == buyer_id)
-            .ok_or_else(|| format!("buyer '{}' not found", buyer_id))?;
+            .ok_or_else(|| format!("buyer '{buyer_id}' not found"))?;
 
         if buyer.location_id != location_id {
             return Err("buyer is not at this location".to_string());
@@ -1075,7 +1084,65 @@ impl WorldState {
         };
         self.record_event(event);
 
+        // Demand follows the sale: the next buyer pays a little more.
+        self.note_service_sale(location_id, service_name);
+
         Ok((service_name.to_string(), provider, price))
+    }
+
+    /// Demand key for a service offer.
+    pub fn service_key(location_id: &str, service_name: &str) -> String {
+        format!("{location_id}/{service_name}")
+    }
+
+    /// Base price: the remembered first-seen price, else the live map value.
+    /// The `locations[].services` map stays the base source of truth.
+    pub fn service_base_price(&self, location_id: &str, service_name: &str) -> Option<u64> {
+        let key = Self::service_key(location_id, service_name);
+        if let Some(base) = self.service_base_prices.get(&key) {
+            return Some(*base);
+        }
+        self.locations
+            .iter()
+            .find(|l| l.id == location_id)
+            .and_then(|l| l.services.get(service_name).copied())
+    }
+
+    /// Effective (dynamic) price: `base + base * min(demand, 20) / 20` —
+    /// up to 2x at sustained demand. `None` when the service is not offered.
+    pub fn service_price(&self, location_id: &str, service_name: &str) -> Option<u64> {
+        let base = self.service_base_price(location_id, service_name)?;
+        let demand = self
+            .service_demand
+            .get(&Self::service_key(location_id, service_name))
+            .copied()
+            .unwrap_or(0)
+            .min(20);
+        Some(base + base * demand / 20)
+    }
+
+    /// Record a sale: backfill the base price on first sale, bump demand.
+    fn note_service_sale(&mut self, location_id: &str, service_name: &str) {
+        let key = Self::service_key(location_id, service_name);
+        if !self.service_base_prices.contains_key(&key)
+            && let Some(base) = self
+                .locations
+                .iter()
+                .find(|l| l.id == location_id)
+                .and_then(|l| l.services.get(service_name).copied())
+        {
+            self.service_base_prices.insert(key.clone(), base);
+        }
+        *self.service_demand.entry(key).or_insert(0) += 1;
+    }
+
+    /// Cool every demand counter by one (quiet markets return to base).
+    /// Called from [`Self::world_tick`].
+    fn decay_service_demand(&mut self) {
+        self.service_demand.retain(|_, d| {
+            *d = d.saturating_sub(1);
+            *d > 0
+        });
     }
 
     // ─── Quest System ─────────────────────────────────────────────────
@@ -2423,6 +2490,56 @@ mod tests {
         assert_eq!(proof.action_type, "quest_completion");
         assert_eq!(proof.amount, 20);
         assert_eq!(proof.entity_id, "agent-1");
+    }
+
+    #[test]
+    fn dynamic_pricing_heats_and_cools() {
+        let mut w = WorldState::default();
+        // Seed a service offer + buyer at that location.
+        w.locations.push(WorldLocation {
+            id: "loc-dyn".to_string(),
+            zone_id: "z".to_string(),
+            label: "Dyn".to_string(),
+            description: String::new(),
+            services: [("svc".to_string(), 20u64)].into_iter().collect(),
+            marketplace: false,
+            capacity: 10,
+        });
+        w.entities.push(WorldEntity {
+            id: "buyer".to_string(),
+            name: "B".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "z".to_string(),
+            location_id: "loc-dyn".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1buyer".to_string(),
+            reputation: 0.0,
+            credits: 10_000,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+
+        assert_eq!(w.service_price("loc-dyn", "svc"), Some(20));
+        let (_, _, p1) = w.buy_service("buyer", "loc-dyn", "svc").unwrap();
+        assert_eq!(p1, 20);
+        // Demand 1 → 20 + 20*1/20 = 21.
+        assert_eq!(w.service_price("loc-dyn", "svc"), Some(21));
+        // Heat to the 2x cap.
+        for _ in 0..30 {
+            let (_, _, p) = w.buy_service("buyer", "loc-dyn", "svc").unwrap();
+            let _ = p;
+        }
+        assert_eq!(w.service_price("loc-dyn", "svc"), Some(40));
+        // Ticks cool it back to base.
+        for _ in 0..40 {
+            w.world_tick();
+        }
+        assert_eq!(w.service_price("loc-dyn", "svc"), Some(20));
+        // Unknown service → None, never a panic.
+        assert_eq!(w.service_price("loc-dyn", "nope"), None);
     }
 
     #[test]
