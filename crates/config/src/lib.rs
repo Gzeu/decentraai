@@ -61,6 +61,13 @@ pub struct NodeConfig {
     /// `<data_dir>/tools/skills/venv`.
     #[serde(default)]
     pub skills: Option<SkillsSection>,
+    /// DCAI ecosystem asset (NOT issued). Absent = Cr-only economy: every
+    /// DCAI-denominated flow stays in its Cr-equivalent shadow mode and the
+    /// node behaves exactly as without this section. Set ONLY after the
+    /// token is created on MultiversX (see docs/DCAI_MECHANICS.md); the
+    /// identifier is then pure configuration — no economic logic changes.
+    #[serde(default)]
+    pub dcai: Option<DcaiSection>,
     /// Transformers inference backend. When enabled, the node spawns a Python
     /// inference server (`transformers_server.py`) that exposes an
     /// OpenAI-compatible `/v1/*` surface. Use with `inference.engine:
@@ -950,6 +957,70 @@ fn default_transformers_device() -> String {
     "cpu".to_string()
 }
 
+/// DCAI ecosystem asset configuration. The token is NOT issued: this
+/// section is an identifier slot. Absent (or empty identifier) = the node
+/// runs the Cr-only economy and every DCAI-denominated flow stays in its
+/// Cr-equivalent shadow mode. Set `token_identifier` ONLY after creating
+/// the token on MultiversX — same code paths, denomination comes from
+/// here. See docs/DCAI_MECHANICS.md for the per-mechanism contract.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DcaiSection {
+    /// MultiversX ESDT token identifier (e.g. `DCAI-abcdef`). Empty =
+    /// unconfigured (explicitly allowed: shadow mode, no behavior change).
+    #[serde(default)]
+    pub token_identifier: String,
+    /// Chain the token lives on. Default `T` (testnet).
+    #[serde(default = "default_dcai_chain_id")]
+    pub chain_id: String,
+}
+
+fn default_dcai_chain_id() -> String {
+    "T".to_string()
+}
+
+impl DcaiSection {
+    /// The configured identifier, or `None` in shadow mode (absent/empty).
+    pub fn identifier(&self) -> Option<&str> {
+        let id = self.token_identifier.trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// Fail-closed validation: either shadow mode, or a well-formed ESDT
+    /// identifier (`TICKER-hexnonce`, ticker 3–10 uppercase alphanumerics)
+    /// on a non-empty chain id. A typo must never silently pass.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.identifier() {
+            None => Ok(()),
+            Some(id) => {
+                let (ticker, nonce) = id
+                    .split_once('-')
+                    .ok_or_else(|| format!("dcai.token_identifier '{id}' must look like TICKER-hexnonce"))?;
+                if !(3..=10).contains(&ticker.len())
+                    || !ticker.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                {
+                    return Err(format!(
+                        "dcai.token_identifier ticker '{ticker}' must be 3-10 uppercase alphanumerics"
+                    ));
+                }
+                if nonce.len() != 6 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "dcai.token_identifier nonce '{nonce}' must be 6 hex chars"
+                    ));
+                }
+                if self.chain_id.trim().is_empty() {
+                    return Err("dcai.chain_id must not be empty".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -993,6 +1064,10 @@ impl NodeConfig {
         }
         if let Some(gw) = &self.agent_gateway {
             gw.validate().map_err(ConfigError::Validation)?;
+        }
+        if let Some(dcai) = &self.dcai {
+            dcai.validate()
+                .map_err(|e| ConfigError::Validation(format!("dcai: {e}")))?;
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(
@@ -1855,6 +1930,65 @@ security:
             .unwrap();
         let config = NodeConfig::load(file.path()).unwrap();
         assert!(config.transformers.is_none());
+    }
+
+    #[test]
+    fn dcai_absent_means_shadow_mode() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(include_bytes!("../../../configs/node.example.yaml"))
+            .unwrap();
+        let config = NodeConfig::load(file.path()).unwrap();
+        assert!(config.dcai.is_none());
+    }
+
+    /// Unit validation of the identifier slot (no file needed).
+    #[test]
+    fn dcai_identifier_rules() {
+        // Shadow mode: empty identifier validates.
+        let shadow = DcaiSection {
+            token_identifier: String::new(),
+            chain_id: "T".to_string(),
+        };
+        assert!(shadow.validate().is_ok());
+        assert_eq!(shadow.identifier(), None);
+        // Well-formed ESDT identifier validates.
+        let live = DcaiSection {
+            token_identifier: "DCAI-a1b2c3".to_string(),
+            chain_id: "T".to_string(),
+        };
+        assert!(live.validate().is_ok());
+        assert_eq!(live.identifier(), Some("DCAI-a1b2c3"));
+        // Malformed identifiers fail closed (never silently accepted).
+        for bad in [
+            "dcai-a1b2c3",   // lowercase ticker
+            "DC-a1b2c3",     // ticker too short
+            "DCAI-a1b2c",    // nonce too short
+            "DCAI-a1b2c33",  // nonce too long
+            "DCAI-zzzzzz",   // nonce not hex
+            "DCAIa1b2c3",    // no dash
+            "DCAI-a1b2c3-x", // extra dash
+        ] {
+            let s = DcaiSection {
+                token_identifier: bad.to_string(),
+                chain_id: "T".to_string(),
+            };
+            assert!(s.validate().is_err(), "must reject '{bad}'");
+            assert_eq!(s.identifier(), Some(bad));
+        }
+        // Empty chain with a set identifier fails.
+        let no_chain = DcaiSection {
+            token_identifier: "DCAI-a1b2c3".to_string(),
+            chain_id: "  ".to_string(),
+        };
+        assert!(no_chain.validate().is_err());
+    }
+
+    /// Unknown fields inside `dcai:` are a config typo, never a silent no-op.
+    #[test]
+    fn dcai_unknown_field_is_rejected() {
+        let yaml = "token_identifier: DCAI-a1b2c3\nchain_id: T\ntotken: 1\n";
+        let result: Result<DcaiSection, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
     }
 }
 

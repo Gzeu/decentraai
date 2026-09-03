@@ -3087,6 +3087,18 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             state.attach_m18(m18);
             tracing::info!("M18 economic layer loaded");
         }
+        // DCAI ecosystem asset identifier slot: None = shadow mode (Cr-only).
+        // See docs/DCAI_MECHANICS.md — set token_identifier only after on-chain
+        // token creation; the same code paths denominate from here.
+        {
+            let dcai = config.dcai.clone();
+            state.attach_dcai(dcai);
+            if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
+                tracing::info!("DCAI configured: {}", state.dcai_status()["token_identifier"]);
+            } else {
+                tracing::info!("DCAI shadow mode (Cr-only economy)");
+            }
+        }
         match serve_api(state, &bind_address, api_port).await {
             Ok(addr) => info!(address = %addr, "dashboard serving"),
             Err(e) => warn!(error = %e, "dashboard failed to bind"),

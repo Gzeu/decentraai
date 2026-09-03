@@ -385,6 +385,11 @@ pub struct ApiState {
     wallet_auth_path: PathBuf,
     /// M18 Economic Layer: contracts, escrow, trust anchors.
     pub m18: Option<Arc<crate::m18::M18State>>,
+    /// DCAI ecosystem asset identifier slot. `None` = shadow mode: the
+    /// Cr-only economy runs and every DCAI flow stays in its Cr-equivalent
+    /// form. Set (via config, after token creation) = the same code paths
+    /// denominate in DCAI — pure configuration, no logic switch.
+    pub dcai: Option<decentraai_config::DcaiSection>,
 }
 
 impl ApiState {
@@ -484,6 +489,7 @@ impl ApiState {
                 WalletAuthStore::load(&wallet_auth_path_for(&info.repo_root)).unwrap_or_default(),
             )),
             m18: None, // Wired in main.rs after data_dir is resolved
+            dcai: None, // Wired in main.rs from the node config (shadow mode default)
         }
     }
 
@@ -772,6 +778,28 @@ impl ApiState {
     /// M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust anchors.
     pub fn attach_m18(&mut self, m18: Arc<crate::m18::M18State>) {
         self.m18 = Some(m18);
+    }
+
+    /// DCAI identifier slot: attach the validated config section (or
+    /// nothing for shadow mode). No economic logic reads anything else.
+    pub fn attach_dcai(&mut self, dcai: Option<decentraai_config::DcaiSection>) {
+        self.dcai = dcai;
+    }
+
+    /// DCAI status for observability: configured identifier or shadow mode.
+    /// Read-only projection — never a secret, the identifier is public.
+    pub fn dcai_status(&self) -> serde_json::Value {
+        match self.dcai.as_ref().and_then(|d| {
+            d.identifier()
+                .map(|id| (id.to_string(), d.chain_id.clone()))
+        }) {
+            Some((id, chain)) => serde_json::json!({
+                "configured": true, "token_identifier": id, "chain_id": chain,
+            }),
+            None => serde_json::json!({
+                "configured": false, "token_identifier": null, "chain_id": null,
+            }),
+        }
     }
 
     fn wallet_session_for_token(
@@ -4174,6 +4202,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
             "healthy": state.stt.healthy(),
             "model": state.stt.model,
         },
+        "dcai": state.dcai_status(),
         "skills": {
             "enabled": state.skills_tool.enabled(),
             "healthy": state.skills_tool.healthy(),
