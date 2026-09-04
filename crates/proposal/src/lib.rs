@@ -45,6 +45,7 @@
 
 pub mod action;
 pub mod budget;
+pub mod curiosity;
 pub mod economic;
 pub mod error;
 pub mod evidence;
@@ -53,6 +54,7 @@ pub mod policy;
 pub mod protocol;
 pub mod risk;
 pub mod sandbox;
+pub mod selection;
 pub mod store;
 pub mod testnet;
 
@@ -61,6 +63,7 @@ pub use budget::{
     DCAI_TESTNET_ID, ExperimentBudget, MAX_BUDGET_ACTIONS, MAX_BUDGET_RETRIES, MAX_BUDGET_WEI,
     MAX_GAS_LIMIT, TestnetAsset,
 };
+pub use curiosity::{CuriosityState, HypothesisBelief};
 pub use economic::{
     DenyAllEconomicAuthorization, EconomicAuthError, EconomicAuthorization, TestnetApproval,
     TestnetAuthConfig, TestnetAuthRequest, TestnetEconomicAuthorization,
@@ -77,6 +80,11 @@ pub use protocol::{
 };
 pub use risk::{ExperimentRiskClass, ResourceCommitment};
 pub use sandbox::{ExecutionReport, StepResult, execute};
+pub use selection::{
+    CandidateExperiment, CandidateRejection, CycleState, MIN_EXECUTABLE_SCORE, ScoreBreakdown,
+    ScoredCandidate, ScoredSummary, SelectionRecord, TESTNET_RISK_PENALTY, action_signature,
+    generate_candidates, novelty_bp, score_candidate, select_experiment,
+};
 pub use store::{AttemptInfo, ExperimentRecord, ExperimentStatus, ExperimentStore};
 pub use testnet::{
     AuthorizedTransfer, TestnetExecutor, TestnetReport, execute_testnet_experiment, transfer_totals,

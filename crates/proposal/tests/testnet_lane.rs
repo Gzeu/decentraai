@@ -142,6 +142,7 @@ fn authorized_testnet_action_allowed_and_evidenced() {
         &report,
         ExperimentOutcome::Success,
         b.max_amount_wei,
+        None,
         NOW * 1_000,
         None,
     );

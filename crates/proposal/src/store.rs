@@ -111,6 +111,12 @@ impl ExperimentStore {
         self.records.get(experiment_id)
     }
 
+    /// All records, oldest-key first (deterministic iteration for
+    /// duplicate detection and post-mortem scans).
+    pub fn records(&self) -> impl Iterator<Item = &ExperimentRecord> {
+        self.records.values()
+    }
+
     /// How many experiments are tracked.
     #[must_use]
     pub fn len(&self) -> usize {

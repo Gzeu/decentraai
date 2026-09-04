@@ -14,6 +14,7 @@ use crate::budget::TestnetAsset;
 use crate::error::ProposalError;
 use crate::policy::ExecutionMode;
 use crate::sandbox::ExecutionReport;
+use crate::selection::SelectionRecord;
 
 /// Schema version for sealed evidence.
 pub const EVIDENCE_VERSION: u32 = 1;
@@ -58,6 +59,10 @@ pub struct ExperimentEvidence {
     /// closed on any mutation as before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testnet: Option<TestnetEvidence>,
+    /// Post-mortem selection record (v0.3): candidates, scores, winner,
+    /// reason. `None` for operator-chosen runs. Sealed like everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionRecord>,
     /// Seal: BLAKE3 over canonical JSON with `hash` zeroed.
     pub hash: [u8; 32],
 }
@@ -108,6 +113,7 @@ impl ExperimentEvidence {
             sealed_at_ms,
             prev_hash,
             testnet: None,
+            selection: None,
             hash: [0u8; 32],
         };
         ev.hash = *blake3::hash(&serde_json::to_vec(&ev).unwrap_or_default()).as_bytes();
@@ -116,12 +122,14 @@ impl ExperimentEvidence {
 
     /// Build + seal evidence for a BOUNDED TESTNET execution report.
     /// Commits to the tx hash, the authorized budget and the actual amount,
-    /// so under-reporting the spend breaks the seal.
+    /// so under-reporting the spend breaks the seal. Carries the optional
+    /// post-mortem [`SelectionRecord`][crate::selection::SelectionRecord].
     #[must_use]
     pub fn seal_testnet(
         report: &crate::testnet::TestnetReport,
         outcome: ExperimentOutcome,
         authorized_wei: u64,
+        selection: Option<SelectionRecord>,
         sealed_at_ms: u64,
         prev_hash: Option<[u8; 32]>,
     ) -> Self {
@@ -146,6 +154,7 @@ impl ExperimentEvidence {
                 tx_hash: report.tx_hash.clone(),
                 policy_mode: ExecutionMode::Testnet,
             }),
+            selection,
             hash: [0u8; 32],
         };
         ev.hash = *blake3::hash(&serde_json::to_vec(&ev).unwrap_or_default()).as_bytes();

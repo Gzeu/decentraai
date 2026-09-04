@@ -189,6 +189,12 @@ enum ExperimentCommand {
     /// `--enable-live-testnet` is passed explicitly; without it the run
     /// is denied before touching anything.
     TestnetRun(TestnetRunArgs),
+    /// Run ONE autonomous decision cycle: observation → generated
+    /// candidates → deterministic selection (agent's choice) → policy →
+    /// authorization → bounded execution → evidence (with post-mortem
+    /// selection record) → learning → curiosity update → next-decision
+    /// preview. At most one experiment executes per invocation.
+    AutonomousCycle(AutonomousCycleArgs),
 }
 #[derive(Debug, Args)]
 struct TestnetRunArgs {
@@ -205,6 +211,38 @@ struct TestnetRunArgs {
     /// Default: ~/.decentraai/experiments/testnet-store.json
     #[arg(long)]
     store: Option<PathBuf>,
+    /// Override the settlement-signer file path instead of env.
+    #[arg(long)]
+    secret_file: Option<PathBuf>,
+}
+#[derive(Debug, Args)]
+struct AutonomousCycleArgs {
+    /// Path to the observation JSON: `{ id, text, source }` (real world
+    /// observation — the operator provides facts, the agent decides).
+    #[arg(long)]
+    observation: PathBuf,
+    /// Operator destination allow-listed for micro-transfers (self).
+    #[arg(long)]
+    operator: String,
+    /// Cycle id (idempotency + post-mortem grouping).
+    #[arg(long, default_value = "cycle:autonomous-001")]
+    cycle_id: String,
+    /// Max total wei for the whole cycle (all experiments in it).
+    #[arg(long, default_value_t = 2_000)]
+    cycle_budget_wei: u64,
+    /// Operator-declared hypothesis verdict AFTER observing the outcome
+    /// ("supported"|"refuted"|"inconclusive"). Never inferred here.
+    #[arg(long, default_value = "inconclusive")]
+    hypothesis_verdict: String,
+    /// Arm the testnet kill switch for this cycle (absent = deny all live).
+    #[arg(long, default_value_t = false)]
+    enable_live_testnet: bool,
+    /// Durable experiment store (restart-safe idempotency).
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Durable curiosity file (belief persistence across cycles).
+    #[arg(long)]
+    curiosity: Option<PathBuf>,
     /// Override the settlement-signer file path instead of env.
     #[arg(long)]
     secret_file: Option<PathBuf>,
@@ -5734,6 +5772,426 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
     }
 }
 
+/// Shared testnet execution helpers (used by both `testnet-run` and
+/// `autonomous-cycle`): key-holding broadcast + bounded confirmation.
+/// Sign + broadcast one plain xEGLD value transfer with the operator key.
+/// Returns (tx_hash, nonce). Pure chain mechanics — all permission checks
+/// (policy, budget, authorization, idempotency) happen BEFORE this call.
+async fn broadcast_xegld(
+    api_base: &str,
+    signer: &decentraai_economy::signer::Ed25519Signer,
+    sender: &str,
+    destination: &str,
+    amount_wei: u64,
+) -> Result<(String, u64)> {
+    use decentraai_economy::signer::TransactionSigner as _;
+    let nonce = settlement_tx::reserve_nonce(api_base, sender)
+        .await
+        .map_err(|e| anyhow::anyhow!("nonce failed: {e}"))?;
+    let unsigned = settlement_tx::signable_json(
+        nonce,
+        &amount_wei.to_string(),
+        destination,
+        sender,
+        settlement_tx::SETTLEMENT_GAS_PRICE,
+        50_000,
+        None,
+        settlement_tx::TESTNET_CHAIN_ID,
+        settlement_tx::SETTLEMENT_TX_VERSION,
+    );
+    let sig = signer
+        .sign_hex(unsigned.as_bytes())
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+    let mut signed = unsigned.clone();
+    signed.pop();
+    signed.push_str(&format!(",\"signature\":\"{sig}\"}}"));
+    let hash = settlement_tx::broadcast_tx(api_base, &signed)
+        .await
+        .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
+    Ok((hash, nonce))
+}
+
+/// Bounded confirmation poll (30 × 2s). Bails unless the tx confirms with
+/// `success` — anything else seals no evidence.
+async fn poll_confirm(api_base: &str, tx_hash: &str) -> Result<()> {
+    let mut status = String::from("pending");
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        match settlement_tx::tx_status(api_base, tx_hash).await {
+            Ok(s) => {
+                status = s;
+                if status == "success" || status == "fail" || status == "invalid" {
+                    break;
+                }
+            }
+            Err(e) => println!("status poll: {e} (retrying)"),
+        }
+    }
+    println!("status:     {status}");
+    if status != "success" {
+        anyhow::bail!("tx did not confirm (status {status}); evidence NOT sealed");
+    }
+    Ok(())
+}
+
+/// Primordial Mind v0.3 autonomous cycle: the operator supplies ONE real
+/// observation and arms the kill switch; the AGENT (deterministic scoring
+/// in decentraai-proposal) generates candidates, scores them, selects the
+/// winner, and only the winner flows through policy → authorization →
+/// bounded execution. At most one experiment executes per invocation.
+async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
+    use decentraai_economy::signer::TransactionSigner as _;
+    use decentraai_proposal::*;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // 1. Observation in (facts from the operator; the choice is the agent's).
+    let obs_raw = std::fs::read_to_string(&args.observation)
+        .with_context(|| format!("reading observation {}", args.observation.display()))?;
+    let obs_v: serde_json::Value =
+        serde_json::from_str(&obs_raw).context("observation is not valid JSON")?;
+    let observation = Observation {
+        id: obs_v
+            .get("id")
+            .and_then(|v| v.as_str())
+            .context("observation.id required")?
+            .to_string(),
+        text: obs_v
+            .get("text")
+            .and_then(|v| v.as_str())
+            .context("observation.text required")?
+            .to_string(),
+        source: obs_v
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("world")
+            .to_string(),
+        observed_at_ms: obs_v
+            .get("observed_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(now_unix * 1_000),
+    };
+    println!("observation: {} — {}", observation.id, observation.text);
+
+    // 2. Durable state in (store + curiosity; created when absent).
+    let store_path = args
+        .store
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/testnet-store.json"));
+    let mut store = if store_path.exists() {
+        ExperimentStore::from_json(&std::fs::read_to_string(&store_path)?)
+            .map_err(|e| anyhow::anyhow!("store reload failed: {e}"))?
+    } else {
+        ExperimentStore::new()
+    };
+    let curiosity_path = args
+        .curiosity
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/curiosity.json"));
+    let mut curiosity = if curiosity_path.exists() {
+        CuriosityState::from_json(&std::fs::read_to_string(&curiosity_path)?)
+            .map_err(|e| anyhow::anyhow!("curiosity reload failed: {e}"))?
+    } else {
+        CuriosityState::new()
+    };
+    let mut cycle = CycleState::new(&args.cycle_id, args.cycle_budget_wei);
+
+    // 3. Agent's choice: generate → score → select (deterministic).
+    let candidates = generate_candidates(&args.cycle_id, &observation.id, &args.operator, now_unix);
+    println!("candidates:");
+    for c in &candidates {
+        let b = score_candidate(c, &store, &curiosity, &cycle);
+        println!(
+            "  {} risk={:?} amount={} gain={} novelty={} unc={} cost={} riskpen={} TOTAL={}",
+            c.id,
+            c.risk,
+            c.amount_wei,
+            b.gain_bp,
+            b.novelty_bp,
+            b.uncertainty_bp,
+            b.cost_penalty_bp,
+            b.risk_penalty_bp,
+            b.total
+        );
+    }
+    let winner = match select_experiment(&candidates, &store, &curiosity, &cycle) {
+        Ok(w) => w,
+        Err(reason) => {
+            println!("agent decision: NO VALID CANDIDATE ({reason:?}) — nothing executes");
+            return Ok(());
+        }
+    };
+    println!(
+        "selected:     {} (score {}) — {}",
+        winner.candidate.id, winner.breakdown.total, winner.candidate.reason
+    );
+
+    // 4. Winner becomes a proposal through the untrusted boundary (parse).
+    let proposal_value = serde_json::json!({
+        "version": 1,
+        "id": format!("prop:{}", winner.candidate.id),
+        "idea_id": format!("idea:{}", winner.candidate.id),
+        "risk": winner.candidate.risk,
+        "commitment": winner.candidate.commitment,
+        "budget": winner.candidate.budget,
+        "created_by": "agent:primordial-selector",
+        "steps": [
+            {"id": "s1", "rationale": winner.candidate.reason,
+             "action": winner.candidate.action}
+        ]
+    });
+    let proposal = parse_proposal(&proposal_value.to_string())
+        .map_err(|e| anyhow::anyhow!("winner failed validation: {e}"))?;
+    let decision = decide(&proposal, &DenyAllEconomicAuthorization, now_unix);
+    let PolicyDecision::Allow { mode } = &decision else {
+        anyhow::bail!("policy DENIED the agent's choice: {decision:?}");
+    };
+    println!("policy:       Allow({mode:?})");
+    let experiment_id = format!("exp:{}", winner.candidate.id);
+
+    if *mode == ExecutionMode::ReadOnly {
+        // Zero-cost lane: pure local execution, sealed sandbox evidence.
+        let report = execute(&proposal, &decision, now_unix * 1_000)
+            .map_err(|e| anyhow::anyhow!("sandbox execution failed: {e}"))?;
+        let selection = SelectionRecord::build(
+            &args.cycle_id,
+            &candidates,
+            &store,
+            &curiosity,
+            &cycle,
+            &winner,
+        );
+        let mut evidence = ExperimentEvidence::seal(
+            &report,
+            ExperimentOutcome::Inconclusive,
+            now_unix * 1_000,
+            None,
+        );
+        evidence.selection = Some(selection);
+        evidence.hash = [0u8; 32];
+        let seal = *blake3::hash(&serde_json::to_vec(&evidence).unwrap_or_default()).as_bytes();
+        evidence.hash = seal;
+        curiosity.update(
+            &winner.candidate.hypothesis_id,
+            ExperimentOutcome::Inconclusive,
+        );
+        persist_curiosity(&curiosity_path, &curiosity)?;
+        println!("evidence:     {} (read-only, no tx)", evidence.id);
+        print_next_preview(&candidates, &store, &curiosity, &cycle);
+        return Ok(());
+    }
+
+    // 5. Testnet lane: authorization (kill switch armed ONLY by flag).
+    let budget = proposal
+        .budget
+        .clone()
+        .context("testnet lane requires an explicit budget")?;
+    let (asset, destination, total_wei) =
+        transfer_totals(&proposal).map_err(|e| anyhow::anyhow!("intent error: {e}"))?;
+    let attempts_used = store.get(&experiment_id).map_or(0, |r| r.attempts_used);
+    let auth = TestnetEconomicAuthorization::new(TestnetAuthConfig {
+        enabled: args.enable_live_testnet,
+        chain_id: "T".to_string(),
+    })
+    .map_err(|e| anyhow::anyhow!("auth misconfigured: {e}"))?;
+    let approval = auth
+        .authorize_testnet(&TestnetAuthRequest {
+            proposal_id: proposal.id.clone(),
+            chain_id: "T".to_string(),
+            asset: asset.clone(),
+            destination: destination.clone(),
+            amount_wei: total_wei,
+            gas: 50_000,
+            actions: proposal.steps.len(),
+            attempts_used,
+            now_unix,
+            policy_allowed: true,
+            budget: budget.clone(),
+        })
+        .map_err(|e| anyhow::anyhow!("authorization DENIED: {e}"))?;
+    println!(
+        "approval:     {} {} wei → {} (budget {})",
+        approval.asset.name(),
+        approval.amount_wei,
+        approval.destination,
+        approval.budget_id
+    );
+
+    // 6. Bounded execution with replay-first idempotency + cumulative cap.
+    if asset != TestnetAsset::Xegld {
+        anyhow::bail!(
+            "asset {} on-chain transfer not wired in v0.3 (xEGLD only)",
+            asset.name()
+        );
+    }
+    if let Some(secret) = &args.secret_file {
+        let content = std::fs::read_to_string(secret)
+            .with_context(|| format!("reading secret file {}", secret.display()))?;
+        decentraai_economy::signer::Ed25519Signer::from_seed_hex(&content)
+            .map_err(|e| anyhow::anyhow!("secret file invalid: {e}"))?;
+    }
+    let spent = store.get(&experiment_id).map_or(0, |r| r.total_spent_wei);
+    if spent.saturating_add(total_wei) > budget.max_amount_wei {
+        anyhow::bail!("cumulative spend exceeds budget: DENIED");
+    }
+    let api_base = settlement_tx::TESTNET_API_BASE;
+    let signer = decentraai_economy::signer::load_signer_from_env()
+        .map_err(|e| anyhow::anyhow!("signer unavailable: {e}"))?;
+    let sender = decentraai_economy::signer::bech32_address(&signer.verifying_key_bytes());
+    let (tx_hash, replayed) = match store.get(&experiment_id).and_then(|r| r.tx_hash.clone()) {
+        Some(h) => {
+            println!("replay:      cached {h} (no new broadcast)");
+            (h, true)
+        }
+        None => {
+            let (hash, nonce) =
+                broadcast_xegld(api_base, &signer, &sender, &destination, total_wei).await?;
+            println!("broadcast:  {total_wei} wei → {destination} (nonce {nonce})");
+            println!("tx:         https://testnet-explorer.multiversx.com/transactions/{hash}");
+            (hash, false)
+        }
+    };
+    poll_confirm(api_base, &tx_hash).await?;
+    cycle.spent_wei = cycle
+        .spent_wei
+        .saturating_add(if replayed { 0 } else { total_wei });
+    cycle.executed = Some(experiment_id.clone());
+
+    // 7. Evidence (with post-mortem selection) + learning + curiosity.
+    let verdict = match args.hypothesis_verdict.as_str() {
+        "supported" => HypothesisVerdict::Supported,
+        "refuted" => HypothesisVerdict::Refuted,
+        _ => HypothesisVerdict::Inconclusive,
+    };
+    let outcome = match verdict {
+        HypothesisVerdict::Supported => ExperimentOutcome::Success,
+        HypothesisVerdict::Refuted => ExperimentOutcome::Failed,
+        HypothesisVerdict::Inconclusive => ExperimentOutcome::Inconclusive,
+    };
+    store.record_attempt(
+        &experiment_id,
+        AttemptInfo {
+            proposal: &proposal,
+            budget_id: &budget.id,
+            asset: &asset,
+            destination: &destination,
+            amount_wei: total_wei,
+            attempts_used: attempts_used.saturating_add(1),
+            now_ms: now_unix * 1_000,
+        },
+    );
+    store.mark_submitted(&experiment_id, &tx_hash, total_wei, now_unix * 1_000);
+    store.mark_confirmed(&experiment_id, &tx_hash, now_unix * 1_000);
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&store_path, store.to_json().unwrap())?;
+    let report = TestnetReport {
+        experiment_id: experiment_id.clone(),
+        proposal_id: proposal.id.clone(),
+        tx_hash: tx_hash.clone(),
+        asset: asset.clone(),
+        amount_wei: total_wei,
+        destination: destination.clone(),
+        chain_id: "T".to_string(),
+        attempts_used: attempts_used.saturating_add(1),
+        completed_at_ms: now_unix * 1_000,
+        replayed,
+    };
+    let selection = SelectionRecord::build(
+        &args.cycle_id,
+        &candidates,
+        &store,
+        &curiosity,
+        &cycle,
+        &winner,
+    );
+    let evidence = ExperimentEvidence::seal_testnet(
+        &report,
+        outcome,
+        budget.max_amount_wei,
+        Some(selection),
+        now_unix * 1_000,
+        None,
+    );
+    let learning = assess(
+        &experiment_id,
+        &proposal.id,
+        &evidence.id,
+        true,
+        true,
+        verdict,
+        Some(tx_hash.clone()),
+    );
+    // Learning feeds the NEXT decision: curiosity moves now.
+    curiosity.update(&winner.candidate.hypothesis_id, outcome);
+    persist_curiosity(&curiosity_path, &curiosity)?;
+    println!(
+        "evidence:     {} seal {:02x?}…",
+        evidence.id,
+        &evidence.hash[..4]
+    );
+    println!("learning:     execution=success experiment=success hypothesis={verdict:?}");
+    print_next_preview(&candidates, &store, &curiosity, &cycle);
+    println!(
+        "\n{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "cycle_id": args.cycle_id,
+            "selected": winner.candidate.id,
+            "score": winner.breakdown.total,
+            "budget_wei": budget.max_amount_wei,
+            "amount_wei": total_wei,
+            "tx_hash": tx_hash,
+            "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{tx_hash}"),
+            "evidence_id": evidence.id,
+            "outcome": format!("{outcome:?}"),
+            "learning": learning,
+            "replayed": replayed,
+        }))
+        .unwrap()
+    );
+    Ok(())
+}
+
+fn persist_curiosity(
+    path: &std::path::Path,
+    curiosity: &decentraai_proposal::CuriosityState,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = curiosity
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("curiosity serialize failed: {e}"))?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+/// Show how learning changed the next decision: re-run selection with the
+/// updated curiosity and report the hypothetical winner (no execution).
+fn print_next_preview(
+    candidates: &[decentraai_proposal::CandidateExperiment],
+    store: &decentraai_proposal::ExperimentStore,
+    curiosity: &decentraai_proposal::CuriosityState,
+    cycle: &decentraai_proposal::CycleState,
+) {
+    let next_cycle = decentraai_proposal::CycleState {
+        cycle_id: format!("{}:next", cycle.cycle_id),
+        max_total_wei: cycle.max_total_wei,
+        spent_wei: cycle.spent_wei,
+        executed: None,
+    };
+    match decentraai_proposal::select_experiment(candidates, store, curiosity, &next_cycle) {
+        Ok(w) => println!(
+            "next-preview: learning now favors {} (score {})",
+            w.candidate.id, w.breakdown.total
+        ),
+        Err(r) => println!("next-preview: no valid candidate next ({r:?})"),
+    }
+}
+
 /// Primordial Mind v0.2 operator-side executor: runs ONE authorized bounded
 /// testnet experiment end-to-end.
 ///
@@ -5892,55 +6350,17 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
                     (h, true)
                 }
                 None => {
-                    let nonce = settlement_tx::reserve_nonce(api_base, &sender)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("nonce failed: {e}"))?;
-                    let unsigned = settlement_tx::signable_json(
-                        nonce,
-                        &total_wei.to_string(),
-                        &destination,
-                        &sender,
-                        settlement_tx::SETTLEMENT_GAS_PRICE,
-                        50_000,
-                        None,
-                        settlement_tx::TESTNET_CHAIN_ID,
-                        settlement_tx::SETTLEMENT_TX_VERSION,
-                    );
-                    let sig = signer
-                        .sign_hex(unsigned.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-                    let mut signed = unsigned.clone();
-                    signed.pop();
-                    signed.push_str(&format!(",\"signature\":\"{sig}\"}}"));
+                    let (hash, nonce) =
+                        broadcast_xegld(api_base, &signer, &sender, &destination, total_wei)
+                            .await?;
                     println!("broadcast:  {total_wei} wei → {destination} (nonce {nonce})");
-                    let hash = settlement_tx::broadcast_tx(api_base, &signed)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
                     println!(
                         "tx:         https://testnet-explorer.multiversx.com/transactions/{hash}"
                     );
                     (hash, false)
                 }
             };
-
-            // Bounded confirmation poll (30 × 2s); anything else stays pending.
-            let mut status = String::from("pending");
-            for _ in 0..30 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                match settlement_tx::tx_status(api_base, &tx_hash).await {
-                    Ok(s) => {
-                        status = s;
-                        if status == "success" || status == "fail" || status == "invalid" {
-                            break;
-                        }
-                    }
-                    Err(e) => println!("status poll: {e} (retrying)"),
-                }
-            }
-            println!("status:     {status}");
-            if status != "success" {
-                anyhow::bail!("tx did not confirm (status {status}); evidence NOT sealed");
-            }
+            poll_confirm(api_base, &tx_hash).await?;
 
             // Record + seal + learn. The hypothesis verdict is the OPERATOR's
             // declaration from the bundle (observed facts), never inferred.
@@ -5983,6 +6403,7 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
                 &report,
                 outcome,
                 budget.max_amount_wei,
+                None,
                 now_unix * 1_000,
                 None,
             );
@@ -6020,6 +6441,7 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
             );
             Ok(())
         }
+        ExperimentCommand::AutonomousCycle(run) => autonomous_cycle_command(run).await,
     }
 }
 
