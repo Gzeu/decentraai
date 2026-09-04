@@ -4109,6 +4109,13 @@ async fn serve_common(
         let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));
         state.attach_m18(m18);
     }
+    // DCAI ecosystem asset projection (None = shadow mode, Cr-only economy)
+    state.attach_dcai(config.dcai.clone());
+    if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
+        tracing::info!("DCAI configured: {}", state.dcai_status()["token_identifier"]);
+    } else {
+        tracing::info!("DCAI shadow mode (Cr-only economy)");
+    }
     let api_addr = serve_api(state, &bind_address, api_port).await?;
 
     decentraai_audit::record_best_effort(
@@ -5488,6 +5495,7 @@ async fn contribution_command(command: ContributionCommand) -> Result<()> {
 /// Signs and broadcasts the issuance through the node's settlement signer,
 /// then updates ~/.decentraai/node.yaml with the token identifier returned by the chain.
 async fn dcai_command(args: DcaiArgs) -> Result<()> {
+    use base64::Engine as _;
     use decentraai_economy::dcai_esdt::*;
     use decentraai_economy::signer::TransactionSigner as _;
 
@@ -5519,9 +5527,9 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
             let gas_limit = ISSUE_GAS_LIMIT;
             let version = settlement_tx::SETTLEMENT_TX_VERSION;
 
-            // Build data field.
+            // Build data field — base64 for the signed envelope.
             let data = params.build_data_field();
-            let data_hex = hex::encode(data.as_bytes());
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
 
             // Fetch nonce from the network.
             let api_base = "https://testnet-api.multiversx.com";
@@ -5534,7 +5542,7 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
             let unsigned_json = format!(
                 r#"{{"nonce":{},"value":"{}","receiver":"{}","sender":"{}","gasPrice":{},"gasLimit":{},"data":"{}","chainID":"{}","version":{}}}"#,
                 nonce, ISSUE_COST_WEI, ESDT_SYSTEM_SC, sender_hex,
-                gas_price, gas_limit, data_hex, chain_id, version
+                gas_price, gas_limit, data_b64, chain_id, version
             );
 
             // Sign.
