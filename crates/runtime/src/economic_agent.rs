@@ -301,7 +301,8 @@ pub fn decide_action(ctx: &EconomicContext) -> EconomicAction {
             // Check if we already have ANY contract (active or settled) for this capability.
             let already_covered = ctx.contracts.iter().any(|(_, c)| {
                 c.service.capability.to_lowercase() == needed.to_lowercase()
-                    && (c.consumer_wallet == ctx.agent_wallet || c.provider_wallet == ctx.agent_wallet)
+                    && (c.consumer_wallet == ctx.agent_wallet
+                        || c.provider_wallet == ctx.agent_wallet)
             });
             if already_covered {
                 continue;

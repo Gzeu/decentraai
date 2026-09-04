@@ -983,11 +983,7 @@ impl DcaiSection {
     /// The configured identifier, or `None` in shadow mode (absent/empty).
     pub fn identifier(&self) -> Option<&str> {
         let id = self.token_identifier.trim();
-        if id.is_empty() {
-            None
-        } else {
-            Some(id)
-        }
+        if id.is_empty() { None } else { Some(id) }
     }
 
     /// Fail-closed validation: either shadow mode, or a well-formed ESDT
@@ -997,11 +993,13 @@ impl DcaiSection {
         match self.identifier() {
             None => Ok(()),
             Some(id) => {
-                let (ticker, nonce) = id
-                    .split_once('-')
-                    .ok_or_else(|| format!("dcai.token_identifier '{id}' must look like TICKER-hexnonce"))?;
+                let (ticker, nonce) = id.split_once('-').ok_or_else(|| {
+                    format!("dcai.token_identifier '{id}' must look like TICKER-hexnonce")
+                })?;
                 if !(3..=10).contains(&ticker.len())
-                    || !ticker.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                    || !ticker
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
                 {
                     return Err(format!(
                         "dcai.token_identifier ticker '{ticker}' must be 3-10 uppercase alphanumerics"

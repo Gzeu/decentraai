@@ -19,12 +19,13 @@ use decentraai_economy::signer::{Ed25519Signer, TransactionSigner as _, bech32_a
 use std::os::unix::fs::PermissionsExt as _;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: gen_operator_wallet <out-hex-path>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: gen_operator_wallet <out-hex-path>");
     let mut rng = rand_core::OsRng;
     let mut seed = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut rng, &mut seed);
-    let signer =
-        Ed25519Signer::from_seed_bytes(&seed);
+    let signer = Ed25519Signer::from_seed_bytes(&seed);
     let address = bech32_address(&signer.verifying_key_bytes());
     let hex_seed = hex::encode(seed);
     seed.fill(0);

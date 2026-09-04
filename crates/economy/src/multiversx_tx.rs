@@ -210,10 +210,7 @@ impl Mx8004TxBuilder {
         if job_id.is_empty() || job_id.chars().count() > MAX_JOB_ID {
             return Err(TxBuildError::EmptyField("job_id"));
         }
-        let fields = vec![
-            str_field("job_id", job_id)?,
-            hash_field(evidence_hash),
-        ];
+        let fields = vec![str_field("job_id", job_id)?, hash_field(evidence_hash)];
         Ok(base_intent(SUBMIT_PROOF_ENDPOINT, fields))
     }
 

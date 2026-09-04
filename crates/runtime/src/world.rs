@@ -272,7 +272,10 @@ pub enum QuestObjective {
     /// Move to a specific location.
     MoveTo { location_id: String },
     /// Purchase a service at a location.
-    BuyService { location_id: String, service: String },
+    BuyService {
+        location_id: String,
+        service: String,
+    },
     /// List an item on the marketplace.
     ListItem { location_id: String },
     /// Buy an item from the marketplace.
@@ -483,21 +486,24 @@ fn default_zones() -> Vec<WorldZone> {
         WorldZone {
             id: "central-hub".to_string(),
             label: "Central Hub".to_string(),
-            description: "The heart of DecentraAI. Where agents gather, trade, and find work.".to_string(),
+            description: "The heart of DecentraAI. Where agents gather, trade, and find work."
+                .to_string(),
             color: "#22d3ee".to_string(),
             discovered: true,
         },
         WorldZone {
             id: "research-district".to_string(),
             label: "Research District".to_string(),
-            description: "Labs and research facilities. Agents come here for knowledge work.".to_string(),
+            description: "Labs and research facilities. Agents come here for knowledge work."
+                .to_string(),
             color: "#a78bfa".to_string(),
             discovered: true,
         },
         WorldZone {
             id: "marketplace".to_string(),
             label: "Marketplace".to_string(),
-            description: "The bustling marketplace. Buy, sell, and trade services and artifacts.".to_string(),
+            description: "The bustling marketplace. Buy, sell, and trade services and artifacts."
+                .to_string(),
             color: "#34d399".to_string(),
             discovered: true,
         },
@@ -543,7 +549,8 @@ fn default_locations() -> Vec<WorldLocation> {
             id: "hub-plaza".to_string(),
             zone_id: "central-hub".to_string(),
             label: "Plaza".to_string(),
-            description: "The central gathering place. Agents meet here and find opportunities.".to_string(),
+            description: "The central gathering place. Agents meet here and find opportunities."
+                .to_string(),
             services: HashMap::new(),
             marketplace: false,
             capacity: 100,
@@ -552,7 +559,8 @@ fn default_locations() -> Vec<WorldLocation> {
             id: "hub-quest-board".to_string(),
             zone_id: "central-hub".to_string(),
             label: "Quest Board".to_string(),
-            description: "Missions and tasks posted here. Pick up work and earn credits.".to_string(),
+            description: "Missions and tasks posted here. Pick up work and earn credits."
+                .to_string(),
             services: HashMap::new(),
             marketplace: false,
             capacity: 50,
@@ -571,7 +579,8 @@ fn default_locations() -> Vec<WorldLocation> {
             id: "research-lab-main".to_string(),
             zone_id: "research-district".to_string(),
             label: "Main Research Lab".to_string(),
-            description: "Primary research facility. Inference and embeddings available.".to_string(),
+            description: "Primary research facility. Inference and embeddings available."
+                .to_string(),
             services: services_inference,
             marketplace: false,
             capacity: 20,
@@ -590,7 +599,8 @@ fn default_locations() -> Vec<WorldLocation> {
             id: "market-bazaar".to_string(),
             zone_id: "marketplace".to_string(),
             label: "The Bazaar".to_string(),
-            description: "Main trading floor. List services, buy capabilities, find partners.".to_string(),
+            description: "Main trading floor. List services, buy capabilities, find partners."
+                .to_string(),
             services: services_translation,
             marketplace: true,
             capacity: 80,
@@ -730,11 +740,7 @@ impl WorldState {
     }
 
     /// Move an entity to a new location.
-    pub fn move_entity(
-        &mut self,
-        entity_id: &str,
-        location_id: &str,
-    ) -> Result<String, String> {
+    pub fn move_entity(&mut self, entity_id: &str, location_id: &str) -> Result<String, String> {
         let location = self
             .locations
             .iter()
@@ -835,19 +841,21 @@ impl WorldState {
             .ok_or_else(|| format!("location '{}' not found", location_id))?;
 
         if !location.marketplace {
-            return Err(format!("location '{}' does not have a marketplace", location_id));
+            return Err(format!(
+                "location '{}' does not have a marketplace",
+                location_id
+            ));
         }
 
-        let listing_id = format!(
-            "ml-{}-{}",
-            &item.id[..item.id.len().min(12)],
-            self.tick
-        );
+        let listing_id = format!("ml-{}-{}", &item.id[..item.id.len().min(12)], self.tick);
 
         let event = WorldEvent {
             tick: self.tick,
             kind: "item_listed".to_string(),
-            detail: format!("{} listed '{}' for {}Cr at {}", seller_id, item.name, item.price, location_id),
+            detail: format!(
+                "{} listed '{}' for {}Cr at {}",
+                seller_id, item.name, item.price, location_id
+            ),
             entity_id: Some(seller_id.to_string()),
             location_id: Some(location_id.to_string()),
             evidence_id: None,
@@ -1019,7 +1027,10 @@ impl WorldState {
         self.record_event(WorldEvent {
             tick: self.tick,
             kind: "materials_refined".to_string(),
-            detail: format!("{agent_id} refined {} materials into a Data Bundle", mats.len()),
+            detail: format!(
+                "{agent_id} refined {} materials into a Data Bundle",
+                mats.len()
+            ),
             entity_id: Some(agent_id.to_string()),
             location_id: None,
             evidence_id: None,
@@ -1040,19 +1051,55 @@ impl WorldState {
     pub fn spawn_npcs(&mut self) {
         let npcs: Vec<(&str, &str, &str, Vec<&str>, u64)> = vec![
             // Central Hub
-            ("npc-questkeeper", "Questkeeper", "hub-quest-board", vec!["quest-giver"], 0),
+            (
+                "npc-questkeeper",
+                "Questkeeper",
+                "hub-quest-board",
+                vec!["quest-giver"],
+                0,
+            ),
             ("npc-inkeeper", "Innkeeper", "hub-inn", vec!["rest"], 0),
             // Research District
-            ("npc-librarian", "Librarian", "research-archive", vec!["research"], 0),
-            ("npc-researcher", "Researcher", "research-lab-main", vec!["inference", "embeddings"], 0),
+            (
+                "npc-librarian",
+                "Librarian",
+                "research-archive",
+                vec!["research"],
+                0,
+            ),
+            (
+                "npc-researcher",
+                "Researcher",
+                "research-lab-main",
+                vec!["inference", "embeddings"],
+                0,
+            ),
             // Marketplace
             ("npc-broker", "Broker", "market-bazaar", vec!["trade"], 0),
-            ("npc-auctioneer", "Auctioneer", "market-auction", vec!["auction"], 0),
+            (
+                "npc-auctioneer",
+                "Auctioneer",
+                "market-auction",
+                vec!["auction"],
+                0,
+            ),
             // The Forge
             ("npc-smith", "Smith", "forge-workshop", vec!["coding"], 0),
-            ("npc-tester", "Tester", "forge-testing", vec!["ocr", "stt"], 0),
+            (
+                "npc-tester",
+                "Tester",
+                "forge-testing",
+                vec!["ocr", "stt"],
+                0,
+            ),
             // Deep Forest
-            ("npc-hermit", "Hermit", "forest-clearing", vec!["mystery"], 0),
+            (
+                "npc-hermit",
+                "Hermit",
+                "forest-clearing",
+                vec!["mystery"],
+                0,
+            ),
         ];
 
         for (id, name, loc_id, caps, credits) in npcs {
@@ -1186,8 +1233,16 @@ impl WorldState {
 
         // 3. Record tick event periodically
         if self.tick % 10 == 0 {
-            let agent_count = self.entities.iter().filter(|e| e.entity_type == "agent").count();
-            let npc_count = self.entities.iter().filter(|e| e.entity_type == "npc").count();
+            let agent_count = self
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == "agent")
+                .count();
+            let npc_count = self
+                .entities
+                .iter()
+                .filter(|e| e.entity_type == "npc")
+                .count();
             self.record_event(WorldEvent {
                 tick: self.tick,
                 kind: "world_tick".to_string(),
@@ -1262,10 +1317,7 @@ impl WorldState {
         if self.tick % 7 != 0 {
             return;
         }
-        let (needs_empty, has_active, slot) = match self
-            .entities
-            .iter()
-            .find(|e| e.id == agent_id)
+        let (needs_empty, has_active, slot) = match self.entities.iter().find(|e| e.id == agent_id)
         {
             Some(e) => (
                 e.needs.is_empty(),
@@ -1280,10 +1332,7 @@ impl WorldState {
             return;
         }
         let pick = Self::NEED_ROTATION[(self.tick as usize / 7 + slot) % Self::NEED_ROTATION.len()];
-        let offered = self
-            .locations
-            .iter()
-            .any(|l| l.services.contains_key(pick));
+        let offered = self.locations.iter().any(|l| l.services.contains_key(pick));
         if !offered {
             return;
         }
@@ -1327,9 +1376,7 @@ impl WorldState {
         let active_id: Option<String> = self
             .quests
             .iter()
-            .find(|q| {
-                q.status == QuestStatus::Active && q.accepted_by.as_deref() == Some(agent_id)
-            })
+            .find(|q| q.status == QuestStatus::Active && q.accepted_by.as_deref() == Some(agent_id))
             .map(|q| q.id.clone());
         let quest_id = match active_id {
             Some(id) => id,
@@ -1345,8 +1392,7 @@ impl WorldState {
                     .quests
                     .iter()
                     .filter(|q| {
-                        q.status == QuestStatus::Available
-                            && self.quest_qualifies(agent_id, q)
+                        q.status == QuestStatus::Available && self.quest_qualifies(agent_id, q)
                     })
                     .map(|q| {
                         let score = q.reward.credits + (q.reward.reputation * 10.0) as u64;
@@ -1397,7 +1443,9 @@ impl WorldState {
                 service,
             } => {
                 if self.agent_at(agent_id, &location_id) {
-                    let price = self.service_price(&location_id, &service).unwrap_or(u64::MAX);
+                    let price = self
+                        .service_price(&location_id, &service)
+                        .unwrap_or(u64::MAX);
                     if !self.agent_can_spend(agent_id, price) {
                         return;
                     }
@@ -1405,7 +1453,13 @@ impl WorldState {
                         self.buy_service(agent_id, &location_id, &service)
                     {
                         let desc = format!("{agent_id} completed quest service {service}");
-                        self.trade_settlement_proof("service_sale", &desc, &provider, price, &service);
+                        self.trade_settlement_proof(
+                            "service_sale",
+                            &desc,
+                            &provider,
+                            price,
+                            &service,
+                        );
                     }
                 } else {
                     self.agent_goto(agent_id, &location_id);
@@ -1598,9 +1652,7 @@ impl WorldState {
         let pick: Option<(String, u64)> = self
             .listings
             .iter()
-            .filter(|l| {
-                l.active && l.location_id == location_id && l.seller_id != agent_id
-            })
+            .filter(|l| l.active && l.location_id == location_id && l.seller_id != agent_id)
             .min_by_key(|l| l.item.price)
             .filter(|l| budget >= l.item.price)
             .map(|l| (l.id.clone(), l.item.price));
@@ -1658,7 +1710,9 @@ impl WorldState {
             // Clearance reaction: overstocked shelves discount the new
             // goods 5% per active listing here, floor 50% of base.
             // Symmetric with services, which heat UP with demand.
-            let factor = 100u64.saturating_sub(5 * active_here.min(10) as u64).max(50);
+            let factor = 100u64
+                .saturating_sub(5 * active_here.min(10) as u64)
+                .max(50);
             let price = (base * factor / 100).max(1);
             let _ = self.list_item(
                 v.npc_id,
@@ -1685,9 +1739,9 @@ impl WorldState {
         location_id: &str,
         service_name: &str,
     ) -> Result<(String, String, u64), String> {
-        let price = self.service_price(location_id, service_name).ok_or_else(|| {
-            format!("service '{service_name}' not available at {location_id}")
-        })?;
+        let price = self
+            .service_price(location_id, service_name)
+            .ok_or_else(|| format!("service '{service_name}' not available at {location_id}"))?;
 
         // Verify buyer is at this location
         let buyer = self
@@ -1865,8 +1919,7 @@ impl WorldState {
     /// Record spending for an entity.
     fn record_spend(&mut self, entity_id: &str, amount: u64) {
         if self.entities.iter().any(|e| e.id == entity_id) {
-            self.econ_mut(entity_id).spent =
-                self.econ_mut(entity_id).spent.saturating_add(amount);
+            self.econ_mut(entity_id).spent = self.econ_mut(entity_id).spent.saturating_add(amount);
         }
     }
 
@@ -1920,7 +1973,9 @@ impl WorldState {
         let quest = if let Some(agent) = agents_with_needs.first() {
             // Quest: fulfill an agent's need
             let needed = &agent.needs[0];
-            if let Some(loc) = service_locations.iter().find(|l| l.services.contains_key(needed))
+            if let Some(loc) = service_locations
+                .iter()
+                .find(|l| l.services.contains_key(needed))
             {
                 let price = *loc.services.get(needed).unwrap_or(&10);
                 Quest {
@@ -1954,7 +2009,7 @@ impl WorldState {
                     deadline_tick: self.tick + 100,
                     required_reputation: 0.0,
                     required_capabilities: vec![],
-            stake: 0,
+                    stake: 0,
                 }
             } else {
                 // No matching location, create exploration quest
@@ -1964,8 +2019,7 @@ impl WorldState {
                     title: format!("Explore {}", target.label),
                     description: format!(
                         "The Questkeeper wants you to visit {} in the {} zone.",
-                        target.label,
-                        target.zone_id
+                        target.label, target.zone_id
                     ),
                     giver_id: "npc-questkeeper".to_string(),
                     objectives: vec![QuestObjective::MoveTo {
@@ -1985,7 +2039,7 @@ impl WorldState {
                     deadline_tick: self.tick + 50,
                     required_reputation: 0.0,
                     required_capabilities: vec![],
-            stake: 0,
+                    stake: 0,
                 }
             }
         } else {
@@ -2025,7 +2079,7 @@ impl WorldState {
                 deadline_tick: self.tick + 50,
                 required_reputation: 0.0,
                 required_capabilities: vec![],
-            stake: 0,
+                stake: 0,
             }
         };
 
@@ -2059,7 +2113,11 @@ impl WorldState {
             if let Some(q) = self.quests.iter_mut().find(|q| q.id == quest_id) {
                 q.status = QuestStatus::Failed;
             }
-            let slashed = self.quest_stakes.remove(&quest_id).map(|(_, a)| a).unwrap_or(0);
+            let slashed = self
+                .quest_stakes
+                .remove(&quest_id)
+                .map(|(_, a)| a)
+                .unwrap_or(0);
             if slashed > 0 {
                 self.burn(slashed);
             }
@@ -2219,10 +2277,7 @@ impl WorldState {
                     self.record_event(WorldEvent {
                         tick: self.tick,
                         kind: "quest_ready".to_string(),
-                        detail: format!(
-                            "{} completed all objectives for: {}",
-                            agent_id, title
-                        ),
+                        detail: format!("{} completed all objectives for: {}", agent_id, title),
                         entity_id: Some(agent_id),
                         location_id: None,
                         evidence_id: None,
@@ -2264,15 +2319,14 @@ impl WorldState {
                 // Check if agent has a service result item from this location
                 agent.location_id == *location_id
                     && agent.inventory.iter().any(|item| {
-                        item.item_type == "service-result"
-                            && item.description.contains(service)
+                        item.item_type == "service-result" && item.description.contains(service)
                     })
             }
             QuestObjective::ListItem { location_id } => {
                 // Check if agent has an active listing at this location
-                self.listings.iter().any(|l| {
-                    l.seller_id == agent_id && l.location_id == *location_id && l.active
-                })
+                self.listings
+                    .iter()
+                    .any(|l| l.seller_id == agent_id && l.location_id == *location_id && l.active)
             }
             QuestObjective::BuyItem { location_id } => {
                 // Check if agent bought something at this location
@@ -2310,10 +2364,7 @@ impl WorldState {
             return Err("quest is not ready to complete".to_string());
         }
 
-        let agent_id = quest
-            .accepted_by
-            .clone()
-            .ok_or("quest has no acceptor")?;
+        let agent_id = quest.accepted_by.clone().ok_or("quest has no acceptor")?;
         let reward = quest.reward.clone();
 
         // Find quest and update status
@@ -2457,7 +2508,9 @@ impl WorldState {
         let quest = Quest {
             id: format!("q-{}-elite-forge", self.tick),
             title: "Elite: Forge Commission".to_string(),
-            description: "A master smith needs the coding service at the forge workshop. Veterans only.".to_string(),
+            description:
+                "A master smith needs the coding service at the forge workshop. Veterans only."
+                    .to_string(),
             giver_id: "npc-questkeeper".to_string(),
             objectives: vec![
                 QuestObjective::MoveTo {
@@ -2655,7 +2708,10 @@ impl WorldState {
             kind: "settlement_initiated".to_string(),
             detail: format!(
                 "On-chain proof generated: {} for {} ({}Cr) — evidence: {}",
-                action_type, entity_id, amount, &evidence_hash[..16]
+                action_type,
+                entity_id,
+                amount,
+                &evidence_hash[..16]
             ),
             entity_id: Some(entity_id.to_string()),
             location_id: None,
@@ -2794,11 +2850,12 @@ impl WorldState {
         if proof.status != SettlementStatus::Pending {
             return Err("proof is not in pending state".to_string());
         }
-        let raw = hex::decode(proof.evidence_hash.trim()).map_err(|_| {
-            format!("proof '{proof_id}' carries a corrupt evidence hash")
-        })?;
+        let raw = hex::decode(proof.evidence_hash.trim())
+            .map_err(|_| format!("proof '{proof_id}' carries a corrupt evidence hash"))?;
         if raw.len() != 32 {
-            return Err(format!("proof '{proof_id}' carries a corrupt evidence hash"));
+            return Err(format!(
+                "proof '{proof_id}' carries a corrupt evidence hash"
+            ));
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&raw);
@@ -2841,8 +2898,15 @@ impl WorldState {
         if !Self::merits_settlement(amount) {
             return None;
         }
-        self.settle_on_chain_with_job("trade", action_type, description, earner_id, amount, capability)
-            .ok()
+        self.settle_on_chain_with_job(
+            "trade",
+            action_type,
+            description,
+            earner_id,
+            amount,
+            capability,
+        )
+        .ok()
     }
 
     /// Confirm a settlement (tx confirmed on-chain).
@@ -2863,7 +2927,11 @@ impl WorldState {
 
             // Grant reputation bonus for confirmed on-chain settlement
             let eid = proof.entity_id.clone();
-            (eid.clone(), proof.evidence_hash.clone(), proof.tx_hash.clone())
+            (
+                eid.clone(),
+                proof.evidence_hash.clone(),
+                proof.tx_hash.clone(),
+            )
         };
 
         if let Some(entity) = self.entities.iter_mut().find(|e| e.id == entity_id) {
@@ -2906,7 +2974,8 @@ impl WorldState {
             )
         };
 
-        self.settle_on_chain_with_job("quest", &action, &desc, &agent_id, amount, "quest").ok()
+        self.settle_on_chain_with_job("quest", &action, &desc, &agent_id, amount, "quest")
+            .ok()
     }
 }
 
@@ -3555,9 +3624,10 @@ mod tests {
         let proof_id = proof.id.clone();
 
         // Submit
-        assert!(w
-            .submit_settlement(&proof_id, "abc123def456", "erd1operator", Some(7))
-            .is_ok());
+        assert!(
+            w.submit_settlement(&proof_id, "abc123def456", "erd1operator", Some(7))
+                .is_ok()
+        );
         assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
         assert_eq!(w.proofs[0].tx_hash, "abc123def456");
         assert_eq!(w.proofs[0].sender, "erd1operator");
@@ -3680,10 +3750,6 @@ mod tests {
         assert_eq!(b.credits, 40);
     }
 
-
-
-
-
     #[test]
     fn quest_stake_locks_refunds_and_slashes() {
         let mut w = WorldState::default();
@@ -3728,15 +3794,27 @@ mod tests {
             stake: 10,
         };
         // Unaffordable stake refuses.
-        w.entities.iter_mut().find(|e| e.id == "staker").unwrap().credits = 5;
+        w.entities
+            .iter_mut()
+            .find(|e| e.id == "staker")
+            .unwrap()
+            .credits = 5;
         w.quests.push(mk("q-poor", 999));
         assert!(w.accept_quest("q-poor", "staker").is_err());
         // Lock on accept.
-        w.entities.iter_mut().find(|e| e.id == "staker").unwrap().credits = 50;
+        w.entities
+            .iter_mut()
+            .find(|e| e.id == "staker")
+            .unwrap()
+            .credits = 50;
         w.quests.push(mk("q-risk", 999));
         w.accept_quest("q-risk", "staker").unwrap();
         assert_eq!(
-            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            w.entities
+                .iter()
+                .find(|e| e.id == "staker")
+                .unwrap()
+                .credits,
             40
         );
         assert_eq!(
@@ -3748,7 +3826,11 @@ mod tests {
         let q = w.quests.iter().find(|q| q.id == "q-risk").unwrap();
         assert_eq!(q.status, QuestStatus::Completed);
         assert_eq!(
-            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            w.entities
+                .iter()
+                .find(|e| e.id == "staker")
+                .unwrap()
+                .credits,
             70
         ); // 40 + 20 reward + 10 refund
         assert!(!w.quest_stakes.contains_key("q-risk"));
@@ -3757,7 +3839,11 @@ mod tests {
         w.quests.push(mk("q-doom", 1));
         w.accept_quest("q-doom", "staker").unwrap();
         assert_eq!(
-            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            w.entities
+                .iter()
+                .find(|e| e.id == "staker")
+                .unwrap()
+                .credits,
             60
         );
         w.tick = 2;
@@ -3765,7 +3851,11 @@ mod tests {
         let q = w.quests.iter().find(|q| q.id == "q-doom").unwrap();
         assert_eq!(q.status, QuestStatus::Failed);
         assert_eq!(
-            w.entities.iter().find(|e| e.id == "staker").unwrap().credits,
+            w.entities
+                .iter()
+                .find(|e| e.id == "staker")
+                .unwrap()
+                .credits,
             60
         ); // no refund
         assert_eq!(w.treasury_burned, 10); // slashed out of supply
@@ -3872,10 +3962,10 @@ mod tests {
         // completion), and the quest proof pends for the sweep path.
         assert_eq!(w.proofs.len(), 1); // quest proof (sale had no NPC earner)
         assert_eq!(w.proofs[0].entity_id, "agent-a");
-        assert!(w
-            .quests
-            .iter()
-            .any(|q| q.status == QuestStatus::Completed && q.accepted_by.as_deref() == Some("agent-a")));
+        assert!(
+            w.quests.iter().any(|q| q.status == QuestStatus::Completed
+                && q.accepted_by.as_deref() == Some("agent-a"))
+        );
 
         // Quest autonomy with an unambiguous winner: q-life pays 40+0.5
         // (score 45), beating any generated board quest. The positioned
@@ -3933,7 +4023,11 @@ mod tests {
         assert!(active.iter().any(|l| l.seller_id == "npc-broker"));
         assert!(active.iter().any(|l| l.seller_id == "npc-auctioneer"));
         // Catalog alternates by tick parity: tick 5 → odd items (5 % 10 >= 5).
-        assert!(active.iter().any(|l| l.item.id.starts_with("trade-compass-5")));
+        assert!(
+            active
+                .iter()
+                .any(|l| l.item.id.starts_with("trade-compass-5"))
+        );
         // Cap holds over many ticks: never more than 2 per vendor.
         for _ in 0..60 {
             w.world_tick();
@@ -3972,7 +4066,13 @@ mod tests {
             .settle_on_chain("quest_completion", "c", "agent-1", 20)
             .unwrap();
         let pid = proof.id.clone();
-        w.submit_settlement(&pid, "deadhash", "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Some(5)).unwrap();
+        w.submit_settlement(
+            &pid,
+            "deadhash",
+            "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            Some(5),
+        )
+        .unwrap();
         assert_eq!(w.proofs[0].status, SettlementStatus::Submitted);
         // Non-submitted proofs refuse requeue.
         assert!(w.requeue_settlement("missing").is_err());
@@ -3986,7 +4086,13 @@ mod tests {
             .unwrap();
         assert_eq!(intent.data_field(), proof.tx_data);
         // Confirmed proofs refuse requeue.
-        w.submit_settlement(&pid, "livehash", "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Some(6)).unwrap();
+        w.submit_settlement(
+            &pid,
+            "livehash",
+            "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            Some(6),
+        )
+        .unwrap();
         w.confirm_settlement(&pid).unwrap();
         assert!(w.requeue_settlement(&pid).is_err());
     }
@@ -4063,9 +4169,10 @@ mod tests {
 
         // Dust stays off-chain.
         assert!(!WorldState::merits_settlement(4));
-        assert!(w
-            .trade_settlement_proof("service_sale", "dust", "npc-smith", 4, "coding")
-            .is_none());
+        assert!(
+            w.trade_settlement_proof("service_sale", "dust", "npc-smith", 4, "coding")
+                .is_none()
+        );
         // Real sale settles under the trade namespace.
         assert!(WorldState::merits_settlement(10));
         let proof = w
@@ -4074,14 +4181,17 @@ mod tests {
         assert_eq!(proof.entity_id, "npc-smith");
         let job_hex = hex::encode("trade-npc-smith-0".as_bytes());
         assert!(
-            proof.tx_data.starts_with(&format!("submit_proof@{job_hex}@")),
+            proof
+                .tx_data
+                .starts_with(&format!("submit_proof@{job_hex}@")),
             "unexpected tx_data: {}",
             proof.tx_data
         );
         // Unknown earner → None, never a panic.
-        assert!(w
-            .trade_settlement_proof("service_sale", "x", "ghost", 10, "coding")
-            .is_none());
+        assert!(
+            w.trade_settlement_proof("service_sale", "x", "ghost", 10, "coding")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4123,7 +4233,8 @@ mod tests {
         assert!(w.submit_intent(&proof.id, "").is_err());
         assert!(w.submit_intent(&proof.id, "not-an-address").is_err());
         assert!(w.submit_intent("proof-missing", sender).is_err());
-        w.submit_settlement(&proof.id, "deadbeef", sender, Some(9)).unwrap();
+        w.submit_settlement(&proof.id, "deadbeef", sender, Some(9))
+            .unwrap();
         assert_eq!(w.proofs[0].nonce, Some(9));
         assert_eq!(w.proofs[0].sender, sender);
         assert!(w.submit_intent(&proof.id, sender).is_err());

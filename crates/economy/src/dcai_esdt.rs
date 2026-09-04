@@ -11,7 +11,7 @@
 //!
 //! Docs: <https://docs.multiversx.com/tokens/fungible-tokens>
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -143,10 +143,7 @@ impl IssueParams {
 /// 2. base64-decode their `data` field
 /// 3. look for the `ESDTTransfer` marker
 /// 4. return the first topic that matches the requested ticker prefix.
-pub fn extract_token_identifier(
-    tx: &serde_json::Value,
-    ticker_prefix: &str,
-) -> Option<String> {
+pub fn extract_token_identifier(tx: &serde_json::Value, ticker_prefix: &str) -> Option<String> {
     let results = tx.get("smartContractResults")?.as_array()?;
     for res in results {
         let data = res.get("data")?.as_str()?;
@@ -182,30 +179,36 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_names() {
-        assert!(IssueParams {
-            name: "AB".to_string(),
-            ticker: "AB".to_string(),
-            initial_supply: 0,
-            decimals: 18,
-        }
-        .validate()
-        .is_err());
-        assert!(IssueParams {
-            name: "DecentraAI".to_string(),
-            ticker: "dcai".to_string(), // lowercase
-            initial_supply: 0,
-            decimals: 18,
-        }
-        .validate()
-        .is_err());
-        assert!(IssueParams {
-            name: "DecentraAI".to_string(),
-            ticker: "DCAI".to_string(),
-            initial_supply: 0,
-            decimals: 19,
-        }
-        .validate()
-        .is_err());
+        assert!(
+            IssueParams {
+                name: "AB".to_string(),
+                ticker: "AB".to_string(),
+                initial_supply: 0,
+                decimals: 18,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            IssueParams {
+                name: "DecentraAI".to_string(),
+                ticker: "dcai".to_string(), // lowercase
+                initial_supply: 0,
+                decimals: 18,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            IssueParams {
+                name: "DecentraAI".to_string(),
+                ticker: "DCAI".to_string(),
+                initial_supply: 0,
+                decimals: 19,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
