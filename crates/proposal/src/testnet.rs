@@ -155,6 +155,16 @@ pub fn execute_testnet_experiment(
         }
         .into());
     }
+    // 5b. Cumulative spend: lifetime spend + this intent must fit the
+    // budget TOTAL. Retries and replays can never push past the cap.
+    let spent = store.get(experiment_id).map_or(0, |r| r.total_spent_wei);
+    if spent.saturating_add(total_wei) > budget.max_amount_wei {
+        return Err(EconomicAuthError::BudgetExceeded {
+            amount_wei: spent.saturating_add(total_wei),
+            max_wei: budget.max_amount_wei,
+        }
+        .into());
+    }
     // 6. Record the attempt BEFORE executing (crash-safe accounting).
     store.record_attempt(
         experiment_id,
@@ -179,7 +189,7 @@ pub fn execute_testnet_experiment(
     };
     match executor.execute_transfer(&intent) {
         Ok(tx_hash) => {
-            store.mark_submitted(experiment_id, &tx_hash, now_ms);
+            store.mark_submitted(experiment_id, &tx_hash, total_wei, now_ms);
             Ok(TestnetReport {
                 experiment_id: experiment_id.to_string(),
                 proposal_id: proposal.id.clone(),

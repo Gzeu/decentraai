@@ -52,8 +52,14 @@ pub struct ExperimentRecord {
     pub asset: TestnetAsset,
     /// Destination (for exact replay reports).
     pub destination: String,
-    /// Amount authorized (wei).
+    /// Amount authorized (wei) for one execution.
     pub amount_wei: u64,
+    /// Cumulative wei already spent by this experiment (all broadcasts).
+    /// Enforces the budget as a TOTAL, not per attempt: retried experiments
+    /// can never push lifetime spend past the cap.
+    /// `#[serde(default)]` keeps older stores readable (→ 0).
+    #[serde(default)]
+    pub total_spent_wei: u64,
     /// Current lifecycle state.
     pub status: ExperimentStatus,
     /// Attempts used (retry accounting survives restarts).
@@ -146,18 +152,27 @@ impl ExperimentStore {
                 status: ExperimentStatus::Authorized,
                 attempts_used,
                 tx_hash: None,
+                total_spent_wei: 0,
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             });
     }
 
-    /// Mark broadcast. Sets the replayable tx hash.
-    pub fn mark_submitted(&mut self, experiment_id: &str, tx_hash: &str, now_ms: u64) {
+    /// Mark broadcast. Sets the replayable tx hash AND accumulates spend,
+    /// so lifetime spend can never silently exceed the budget.
+    pub fn mark_submitted(
+        &mut self,
+        experiment_id: &str,
+        tx_hash: &str,
+        amount_wei: u64,
+        now_ms: u64,
+    ) {
         if let Some(r) = self.records.get_mut(experiment_id) {
             r.status = ExperimentStatus::Submitted {
                 tx_hash: tx_hash.to_string(),
             };
             r.tx_hash = Some(tx_hash.to_string());
+            r.total_spent_wei = r.total_spent_wei.saturating_add(amount_wei);
             r.updated_at_ms = now_ms;
         }
     }
@@ -224,7 +239,7 @@ mod tests {
                 now_ms: 100,
             },
         );
-        s.mark_submitted("exp:1", "hash:abc", 101);
+        s.mark_submitted("exp:1", "hash:abc", 1_000, 101);
         let json = s.to_json().unwrap();
         let back = ExperimentStore::from_json(&json).unwrap();
         assert_eq!(s, back);

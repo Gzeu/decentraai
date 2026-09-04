@@ -328,6 +328,81 @@ fn missing_policy_approval_denied() {
     ));
 }
 
+// Cumulative spend: a crash-recovery store (600 wei spent, tx lost) plus a
+// new 500-wei intent exceeds the 1000-wei budget TOTAL → DENIED.
+#[test]
+fn cumulative_spend_across_attempts_denied() {
+    let b = budget();
+    let p = parse_proposal(&proposal_json(&b)).expect("valid testnet proposal");
+    let d = decide(&p, &DenyAllEconomicAuthorization, NOW);
+    let approval = enabled_auth()
+        .authorize_testnet(&auth_request(&b, NOW))
+        .expect("bounded request approves");
+    // Hand-built recovery state: prior spend recorded, tx hash lost.
+    let store_json = serde_json::json!({
+        "records": {
+            "exp:crash": {
+                "experiment_id": "exp:crash",
+                "proposal_id": "prop:first-testnet",
+                "budget_id": "budget:first",
+                "asset": "xegld",
+                "destination": DEST,
+                "amount_wei": 1000,
+                "total_spent_wei": 600,
+                "status": {"failed": {"reason": "crash before record"}},
+                "attempts_used": 1,
+                "tx_hash": null,
+                "created_at_ms": 1,
+                "updated_at_ms": 2
+            }
+        }
+    })
+    .to_string();
+    let mut store = ExperimentStore::from_json(&store_json).expect("recovery loads");
+    // Same experiment, smaller intent that still breaks the TOTAL cap.
+    let mut smaller = serde_json::from_str::<serde_json::Value>(&proposal_json(&b)).unwrap();
+    smaller["id"] = serde_json::json!("prop:first-testnet");
+    smaller["steps"][0]["action"]["amount_wei"] = serde_json::json!(500);
+    smaller["steps"][0]["id"] = serde_json::json!("s1");
+    let _ = (d, approval);
+    // Rebuild approval for 500 wei against the same budget.
+    let req = TestnetAuthRequest {
+        proposal_id: "prop:first-testnet".to_string(),
+        chain_id: "T".to_string(),
+        asset: TestnetAsset::Xegld,
+        destination: DEST.to_string(),
+        amount_wei: 500,
+        gas: 50_000,
+        actions: 1,
+        attempts_used: 1,
+        now_unix: NOW,
+        policy_allowed: true,
+        budget: b.clone(),
+    };
+    let approval500 = enabled_auth()
+        .authorize_testnet(&req)
+        .expect("500 fits the single-intent cap");
+    let p500 = parse_proposal(&smaller.to_string()).expect("parses");
+    let d500 = decide(&p500, &DenyAllEconomicAuthorization, NOW);
+    let ex = mock();
+    let err = execute_testnet_experiment(
+        "exp:crash",
+        &p500,
+        &d500,
+        &approval500,
+        &b,
+        NOW * 1_000,
+        &mut store,
+        &ex,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds budget"),
+        "cumulative 600+500 > 1000 must deny, got {err}"
+    );
+    assert_eq!(ex.calls.get(), 0, "executor never touched");
+}
+
 // Testnet lane without budget → policy DENIED (no limit = no experiment).
 #[test]
 fn testnet_without_budget_denied_by_policy() {

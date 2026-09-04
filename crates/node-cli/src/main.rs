@@ -5856,6 +5856,21 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
                 approval.budget_id
             );
 
+            // Idempotency FIRST: a recorded tx hash replays — the executor
+            // (sign + broadcast below) is never reached twice for one id.
+            // Cumulative spend is enforced as a TOTAL across all broadcasts.
+            let spent = store.get(experiment_id).map_or(0, |r| r.total_spent_wei);
+            if spent.saturating_add(total_wei) > budget.max_amount_wei {
+                anyhow::bail!(
+                    "cumulative spend {} + {} wei exceeds budget {} wei: DENIED",
+                    spent,
+                    total_wei,
+                    budget.max_amount_wei
+                );
+            }
+            let replayed_hash: Option<String> =
+                store.get(experiment_id).and_then(|r| r.tx_hash.clone());
+
             // Operator-side execution: keys + network live here, never in
             // the cognitive crate. v0.2 wires plain xEGLD transfers only.
             if asset != TestnetAsset::Xegld {
@@ -5871,31 +5886,42 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
             if destination != sender {
                 println!("warning: destination is not the operator (self-transfer expected)");
             }
-            let nonce = settlement_tx::reserve_nonce(api_base, &sender)
-                .await
-                .map_err(|e| anyhow::anyhow!("nonce failed: {e}"))?;
-            let unsigned = settlement_tx::signable_json(
-                nonce,
-                &total_wei.to_string(),
-                &destination,
-                &sender,
-                settlement_tx::SETTLEMENT_GAS_PRICE,
-                50_000,
-                None,
-                settlement_tx::TESTNET_CHAIN_ID,
-                settlement_tx::SETTLEMENT_TX_VERSION,
-            );
-            let sig = signer
-                .sign_hex(unsigned.as_bytes())
-                .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-            let mut signed = unsigned.clone();
-            signed.pop();
-            signed.push_str(&format!(",\"signature\":\"{sig}\"}}"));
-            println!("broadcast:  {total_wei} wei → {destination} (nonce {nonce})");
-            let tx_hash = settlement_tx::broadcast_tx(api_base, &signed)
-                .await
-                .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
-            println!("tx:         https://testnet-explorer.multiversx.com/transactions/{tx_hash}");
+            let (tx_hash, replayed) = match replayed_hash {
+                Some(h) => {
+                    println!("replay:    cached {h} (no new broadcast)");
+                    (h, true)
+                }
+                None => {
+                    let nonce = settlement_tx::reserve_nonce(api_base, &sender)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("nonce failed: {e}"))?;
+                    let unsigned = settlement_tx::signable_json(
+                        nonce,
+                        &total_wei.to_string(),
+                        &destination,
+                        &sender,
+                        settlement_tx::SETTLEMENT_GAS_PRICE,
+                        50_000,
+                        None,
+                        settlement_tx::TESTNET_CHAIN_ID,
+                        settlement_tx::SETTLEMENT_TX_VERSION,
+                    );
+                    let sig = signer
+                        .sign_hex(unsigned.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+                    let mut signed = unsigned.clone();
+                    signed.pop();
+                    signed.push_str(&format!(",\"signature\":\"{sig}\"}}"));
+                    println!("broadcast:  {total_wei} wei → {destination} (nonce {nonce})");
+                    let hash = settlement_tx::broadcast_tx(api_base, &signed)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
+                    println!(
+                        "tx:         https://testnet-explorer.multiversx.com/transactions/{hash}"
+                    );
+                    (hash, false)
+                }
+            };
 
             // Bounded confirmation poll (30 × 2s); anything else stays pending.
             let mut status = String::from("pending");
@@ -5930,7 +5956,7 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
                     now_ms: now_unix * 1_000,
                 },
             );
-            store.mark_submitted(experiment_id, &tx_hash, now_unix * 1_000);
+            store.mark_submitted(experiment_id, &tx_hash, total_wei, now_unix * 1_000);
             store.mark_confirmed(experiment_id, &tx_hash, now_unix * 1_000);
             if let Some(parent) = store_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -5946,7 +5972,7 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
                 chain_id: "T".to_string(),
                 attempts_used: attempts_used.saturating_add(1),
                 completed_at_ms: now_unix * 1_000,
-                replayed: false,
+                replayed,
             };
             let outcome = match verdict {
                 HypothesisVerdict::Supported => ExperimentOutcome::Success,
