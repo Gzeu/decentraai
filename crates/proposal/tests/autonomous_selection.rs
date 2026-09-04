@@ -8,7 +8,8 @@
 use decentraai_proposal::{
     AttemptInfo, CandidateExperiment, CandidateRejection, CuriosityState, CycleState,
     ExperimentOutcome, ExperimentProposal, ExperimentRiskClass, ExperimentStore, ProposedAction,
-    ResourceCommitment, TestnetAsset, generate_candidates, score_candidate, select_experiment,
+    ResourceCommitment, TestnetAsset, detect_uncertainty, generate_candidates, generate_hypothesis,
+    generate_question, score_candidate, select_experiment,
 };
 
 const NOW: u64 = 1_780_000_000;
@@ -101,7 +102,8 @@ fn best_candidate_selection() {
         &cycle(),
     )
     .expect("selects");
-    assert_eq!(w.candidate.id, "high");
+    assert_eq!(w.proposal_id, "prop:high");
+    assert_eq!(w.expected_information_gain, 9_000);
 }
 
 // Ties break toward the cheaper experiment.
@@ -119,7 +121,8 @@ fn minimum_cost_selection() {
         score_candidate(&b, &store, &curiosity, &cy).total
     );
     let w = select_experiment(&[a, b], &store, &curiosity, &cy).expect("selects");
-    assert_eq!(w.candidate.id, "cheap");
+    assert_eq!(w.proposal_id, "prop:cheap");
+    assert_eq!(w.estimated_cost, 1_000);
 }
 
 // Duplicate action (same sig as a confirmed experiment) is rejected.
@@ -192,11 +195,11 @@ fn learning_changes_next_decision() {
     let mut curiosity = CuriosityState::new();
     let cy = cycle();
     let w1 = select_experiment(&[a.clone(), b.clone()], &store, &curiosity, &cy).expect("first");
-    assert_eq!(w1.candidate.id, "first");
+    assert_eq!(w1.proposal_id, "prop:first");
     // A succeeds → supported → repetitive → next round picks B.
     curiosity.update(&a.hypothesis_id, ExperimentOutcome::Success);
     let w2 = select_experiment(&[a, b], &store, &curiosity, &cy).expect("second");
-    assert_eq!(w2.candidate.id, "second");
+    assert_eq!(w2.proposal_id, "prop:second");
 }
 
 // Inconclusive keeps curiosity high: uncertainty still rewards retests.
@@ -215,7 +218,15 @@ fn uncertainty_update() {
 // Generator emits the three v0.3 rules with minimal budgets.
 #[test]
 fn generator_rules_and_minimal_budgets() {
-    let cs = generate_candidates("cycle:g", "obs:1", DEST, NOW);
+    let cs = generate_candidates(
+        "cycle:g",
+        "obs:1",
+        "does_transfer_work",
+        "hyp:transfer",
+        "Transfer works",
+        DEST,
+        NOW,
+    );
     assert_eq!(cs.len(), 3);
     for c in &cs {
         assert!(c.budget.max_amount_wei >= c.amount_wei);
@@ -227,4 +238,26 @@ fn generator_rules_and_minimal_budgets() {
         micro.budget.max_amount_wei, 500,
         "minimal viable, not inflated"
     );
+}
+
+#[test]
+fn question_and_hypothesis_generation_deterministic() {
+    let mut curiosity = CuriosityState::new();
+    curiosity.update("hyp:known", ExperimentOutcome::Success);
+    let unc = curiosity.detect_uncertainty();
+    assert_eq!(unc, "hyp:known"); // only entry
+
+    let empty_curiosity = CuriosityState::new();
+    let unc_default = detect_uncertainty(&empty_curiosity);
+    assert_eq!(unc_default, "hyp:uninitialized");
+
+    let q1 = generate_question("treasury burned 187", &unc_default);
+    let q2 = generate_question("treasury burned 187", &unc_default);
+    assert_eq!(q1, q2);
+
+    let (h_id1, h_text1) = generate_hypothesis(&q1);
+    let (h_id2, h_text2) = generate_hypothesis(&q2);
+    assert_eq!(h_id1, h_id2);
+    assert_eq!(h_text1, h_text2);
+    assert!(h_id1.starts_with("hyp:"));
 }

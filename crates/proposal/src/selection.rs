@@ -259,12 +259,62 @@ pub fn score_candidate(
 /// The agent's decision: the best VALID candidate, or the reason nothing
 /// may run. Validity (anti-loop) before ranking; ranking before thrift:
 /// highest score wins, ties break toward the cheaper experiment, then id.
+///
+/// Carries the full `ExperimentDecision` payload required by the spec:
+/// `proposal_id`, `expected_information_gain`, `estimated_cost`, `risk`,
+/// `confidence`, `novelty`, `reason`, `selected_action`.
+pub struct ExperimentDecision {
+    /// Proposal id (`prop:<candidate_id>`).
+    pub proposal_id: String,
+    /// Agent-claimed information value (bp).
+    pub expected_information_gain: u32,
+    /// Estimated cost in wei.
+    pub estimated_cost: u64,
+    /// Risk class of the chosen action.
+    pub risk: ExperimentRiskClass,
+    /// Confidence in the hypothesis (bp) at decision time.
+    pub confidence: u32,
+    /// Novelty score (bp).
+    pub novelty: u32,
+    /// Why this candidate was selected (post-mortem record).
+    pub reason: String,
+    /// The action the executor must run.
+    pub selected_action: ProposedAction,
+}
+
+impl ExperimentDecision {
+    /// Build an `ExperimentDecision` from a scored winner and its
+    /// context. The `proposal_id` is derived from the candidate id;
+    /// `confidence` is read from the curiosity state for this hypothesis.
+    #[must_use]
+    pub fn build(
+        candidate: &CandidateExperiment,
+        breakdown: &ScoreBreakdown,
+        curiosity: &CuriosityState,
+        _cycle_id: &str,
+    ) -> Self {
+        Self {
+            proposal_id: format!("prop:{}", candidate.id),
+            expected_information_gain: candidate.expected_gain_bp,
+            estimated_cost: candidate.amount_wei,
+            risk: candidate.risk,
+            confidence: curiosity.confidence_bp(&candidate.hypothesis_id),
+            novelty: breakdown.novelty_bp as u32,
+            reason: candidate.reason.clone(),
+            selected_action: candidate.action.clone(),
+        }
+    }
+}
+
+/// The agent's decision: the best VALID candidate, or the reason nothing
+/// may run. Validity (anti-loop) before ranking; ranking before thrift:
+/// highest score wins, ties break toward the cheaper experiment, then id.
 pub fn select_experiment(
     candidates: &[CandidateExperiment],
     store: &ExperimentStore,
     curiosity: &CuriosityState,
     cycle: &CycleState,
-) -> Result<ScoredCandidate, CandidateRejection> {
+) -> Result<ExperimentDecision, CandidateRejection> {
     if let Some(done) = &cycle.executed {
         let _ = done;
         return Err(CandidateRejection::CycleSpent {
@@ -313,12 +363,13 @@ pub fn select_experiment(
             Some(b) => b,
         });
     }
-    best.ok_or_else(|| {
-        first_rejection.unwrap_or(CandidateRejection::LowInformation {
-            id: String::new(),
-            score: 0,
+    best.map(|s| ExperimentDecision::build(&s.candidate, &s.breakdown, curiosity, &cycle.cycle_id))
+        .ok_or_else(|| {
+            first_rejection.unwrap_or(CandidateRejection::LowInformation {
+                id: String::new(),
+                score: 0,
+            })
         })
-    })
 }
 
 /// True when the exact action already submitted/confirmed (replay guard).
@@ -338,7 +389,8 @@ fn is_duplicate_action(candidate: &CandidateExperiment, store: &ExperimentStore)
     })
 }
 
-/// Generate the v0.3 candidate set from one real observation.
+/// Generate the v0.3 candidate set from one real observation and an
+/// already-formulated hypothesis.
 ///
 /// Three deterministic rules (mechanical enumeration — the CHOICE is the
 /// agent's score, computed in [`select_experiment`]):
@@ -346,9 +398,16 @@ fn is_duplicate_action(candidate: &CandidateExperiment, store: &ExperimentStore)
 /// R2 replication: the previously-seen amount (usually rejected live as
 ///     duplicate — the anti-loop proving itself);
 /// R3 read-only: zero-cost observation check (low gain, always valid).
+///
+/// `question` and `hypothesis` are produced by [`generate_question`]
+/// and [`generate_hypothesis`] before this call — the agent's reasoning
+/// chain, not operator hand-off.
 pub fn generate_candidates(
     cycle_id: &str,
     observation_id: &str,
+    question: &str,
+    hypothesis_id: &str,
+    hypothesis_text: &str,
     operator_destination: &str,
     now_unix: u64,
 ) -> Vec<CandidateExperiment> {
@@ -369,9 +428,8 @@ pub fn generate_candidates(
     vec![
         CandidateExperiment {
             id: format!("{cycle_id}:micro-probe"),
-            hypothesis_id: "hyp:micro-transfer-confirms".to_string(),
-            hypothesis_text: "A bounded 500-wei xEGLD self-transfer confirms on testnet."
-                .to_string(),
+            hypothesis_id: hypothesis_id.to_string(),
+            hypothesis_text: hypothesis_text.to_string(),
             action: ProposedAction::TestnetTransfer {
                 asset: TestnetAsset::Xegld,
                 destination: operator_destination.to_string(),
@@ -383,13 +441,13 @@ pub fn generate_candidates(
             budget: micro_budget,
             expected_gain_bp: 6_000,
             reason: format!(
-                "R1 micro-probe: cheapest viable confirmation test for {observation_id}"
+                "R1 micro-probe: cheapest viable confirmation test for {observation_id} (q: {question})"
             ),
         },
         CandidateExperiment {
             id: format!("{cycle_id}:replicate-1000"),
-            hypothesis_id: "hyp:transfer-replicates".to_string(),
-            hypothesis_text: "A 1000-wei transfer replicates the v0.2 confirmation.".to_string(),
+            hypothesis_id: hypothesis_id.to_string(),
+            hypothesis_text: hypothesis_text.to_string(),
             action: ProposedAction::TestnetTransfer {
                 asset: TestnetAsset::Xegld,
                 destination: operator_destination.to_string(),
@@ -400,25 +458,96 @@ pub fn generate_candidates(
             commitment: ResourceCommitment::Cr,
             budget: replicate_budget,
             expected_gain_bp: 3_000,
-            reason: "R2 replication: same shape as v0.2, expected duplicate in live store"
-                .to_string(),
+            reason: format!("R2 replication: same hypothesis, double check (q: {question})"),
         },
         CandidateExperiment {
             id: format!("{cycle_id}:observe-supply"),
-            hypothesis_id: "hyp:supply-observable".to_string(),
-            hypothesis_text: "Treasury supply is readable without side effects.".to_string(),
+            hypothesis_id: hypothesis_id.to_string(),
+            hypothesis_text: hypothesis_text.to_string(),
             action: ProposedAction::Observe {
                 source: "world".to_string(),
-                query: "treasury supply".to_string(),
+                query: question.to_string(),
             },
             amount_wei: 0,
             risk: ExperimentRiskClass::ReadOnly,
             commitment: ResourceCommitment::None,
             budget: minimal_readonly_budget(now_unix),
             expected_gain_bp: 1_000,
-            reason: format!("R3 read-only: zero-cost baseline for {observation_id}"),
+            reason: format!(
+                "R3 read-only: zero-cost baseline for {observation_id} (q: {question})"
+            ),
         },
     ]
+}
+
+/// Detect the highest-uncertainty domain from the agent's curiosity state.
+/// Returns the hypothesis id with maximal `uncertainty_bp`.
+/// Deterministic: max by (uncertainty desc, hypothesis_id asc).
+pub fn detect_uncertainty(curiosity: &CuriosityState) -> String {
+    curiosity
+        .to_json()
+        .ok()
+        .and_then(|j| {
+            serde_json::from_str::<serde_json::Value>(&j)
+                .ok()
+                .and_then(|v| v.get("beliefs").and_then(|b| b.as_object()).cloned())
+        })
+        .and_then(|beliefs| {
+            beliefs
+                .into_iter()
+                .map(|(hid, b)| {
+                    let unc = b
+                        .get("uncertainty_bp")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10_000);
+                    (hid, unc)
+                })
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(hid, _)| hid)
+        })
+        .unwrap_or_else(|| "hyp:uninitialized".to_string())
+}
+
+/// Generate a deterministic question from an observation and the
+/// highest-uncertainty domain detected by [`detect_uncertainty`].
+///
+/// The question is a bounded string (≤256 chars) that identifies
+/// WHAT the agent should investigate next. Deterministic given the
+/// same (observation_text, highest_uncertainty_domain) pair.
+pub fn generate_question(observation_text: &str, highest_uncertainty_domain: &str) -> String {
+    let question = format!(
+        "does_{observation_text}_{highest_uncertainty_domain}_hold",
+        observation_text = observation_text.chars().take(40).collect::<String>(),
+        highest_uncertainty_domain = highest_uncertainty_domain
+    );
+    if question.len() > 256 {
+        question[..256].to_string()
+    } else {
+        question
+    }
+}
+
+/// Generate a deterministic hypothesis from a question.
+///
+/// Returns `(hypothesis_id, hypothesis_text)`. Deterministic: the
+/// `hypothesis_id` is a stable derivation (`hyp:hash-of-question`),
+/// and `hypothesis_text` is a bounded human-readable description.
+pub fn generate_hypothesis(question: &str) -> (String, String) {
+    let hypothesis_id = format!("hyp:{}", deterministic_hash(question));
+    let hypothesis_text = format!(
+        "Investigating whether '{}' holds under current network conditions.",
+        question.chars().take(80).collect::<String>()
+    );
+    (hypothesis_id, hypothesis_text)
+}
+
+/// Deterministic hex hash helper (pure string derivation).
+fn deterministic_hash(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Minimal-viable budget for exactly one transfer: amount == cap, one
@@ -488,13 +617,16 @@ impl SelectionRecord {
         store: &ExperimentStore,
         curiosity: &CuriosityState,
         cycle: &CycleState,
-        winner: &ScoredCandidate,
+        winner: &ExperimentDecision,
     ) -> Self {
         let scored = candidates
             .iter()
             .map(|c| {
-                let line = if c.id == winner.candidate.id {
-                    format!("score={}", winner.breakdown.total)
+                let line = if c.id == winner.proposal_id.trim_start_matches("prop:") {
+                    format!(
+                        "score={}",
+                        (winner.expected_information_gain + winner.novelty) as i64
+                    )
                 } else if is_duplicate_action(c, store) {
                     "rejected=duplicate_action".to_string()
                 } else if curiosity.is_supported(&c.hypothesis_id) {
@@ -518,8 +650,8 @@ impl SelectionRecord {
         Self {
             cycle_id: cycle_id.to_string(),
             scored,
-            selected_id: winner.candidate.id.clone(),
-            reason: winner.candidate.reason.clone(),
+            selected_id: winner.proposal_id.trim_start_matches("prop:").to_string(),
+            reason: winner.reason.clone(),
         }
     }
 }

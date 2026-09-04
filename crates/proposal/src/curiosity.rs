@@ -126,6 +126,22 @@ impl CuriosityState {
     pub fn from_json(json: &str) -> Result<Self, crate::error::ProposalError> {
         serde_json::from_str(json).map_err(|e| crate::error::ProposalError::Parse(e.to_string()))
     }
+
+    /// The hypothesis id with the highest uncertainty (bp).
+    /// Deterministic: max by (uncertainty_bp desc, hypothesis_id asc).
+    /// Falls back to `"hyp:uninitialized"` when empty.
+    #[must_use]
+    pub fn detect_uncertainty(&self) -> String {
+        self.beliefs
+            .iter()
+            .max_by(|a, b| {
+                a.1.uncertainty_bp
+                    .cmp(&b.1.uncertainty_bp)
+                    .then_with(|| b.0.cmp(a.0))
+            })
+            .map(|(hid, _)| hid.clone())
+            .unwrap_or_else(|| "hyp:uninitialized".to_string())
+    }
 }
 
 #[cfg(test)]

@@ -5898,8 +5898,27 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     };
     let mut cycle = CycleState::new(&args.cycle_id, args.cycle_budget_wei);
 
-    // 3. Agent's choice: generate → score → select (deterministic).
-    let candidates = generate_candidates(&args.cycle_id, &observation.id, &args.operator, now_unix);
+    // 3. Agent's reasoning chain: detect uncertainty → question → hypothesis.
+    let uncertainty_domain = curiosity.detect_uncertainty();
+    println!(
+        "uncertainty:  highest domain = {uncertainty_domain} ({} bp)",
+        curiosity.uncertainty_bp(&uncertainty_domain)
+    );
+    let question = generate_question(&observation.text, &uncertainty_domain);
+    println!("question:     {question}");
+    let (hypothesis_id, hypothesis_text) = generate_hypothesis(&question);
+    println!("hypothesis:   {hypothesis_id} — {hypothesis_text}");
+
+    // 4. Agent's choice: generate → score → select (deterministic).
+    let candidates = generate_candidates(
+        &args.cycle_id,
+        &observation.id,
+        &question,
+        &hypothesis_id,
+        &hypothesis_text,
+        &args.operator,
+        now_unix,
+    );
     println!("candidates:");
     for c in &candidates {
         let b = score_candidate(c, &store, &curiosity, &cycle);
@@ -5924,22 +5943,37 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         }
     };
     println!(
-        "selected:     {} (score {}) — {}",
-        winner.candidate.id, winner.breakdown.total, winner.candidate.reason
+        "selected:     {} (score {}) — {} [gain={} cost={} risk={:?} confidence={} novelty={}]",
+        winner.proposal_id,
+        winner.expected_information_gain + winner.novelty,
+        winner.reason,
+        winner.expected_information_gain,
+        winner.estimated_cost,
+        winner.risk,
+        winner.confidence,
+        winner.novelty
     );
 
     // 4. Winner becomes a proposal through the untrusted boundary (parse).
     let proposal_value = serde_json::json!({
         "version": 1,
-        "id": format!("prop:{}", winner.candidate.id),
-        "idea_id": format!("idea:{}", winner.candidate.id),
-        "risk": winner.candidate.risk,
-        "commitment": winner.candidate.commitment,
-        "budget": winner.candidate.budget,
+        "id": winner.proposal_id,
+        "idea_id": format!("idea:{}", winner.proposal_id),
+        "risk": winner.risk,
+        "commitment": winner.selected_action.required_commitment(),
+        "budget": {
+            "max_amount_wei": winner.estimated_cost,
+            "max_gas": 60_000,
+            "max_actions": 1,
+            "max_retries": 1,
+            "expiry_unix": now_unix + 3_600,
+            "allowed_assets": ["xegld"],
+            "allowed_destinations": ["operator"]
+        },
         "created_by": "agent:primordial-selector",
         "steps": [
-            {"id": "s1", "rationale": winner.candidate.reason,
-             "action": winner.candidate.action}
+            {"id": "s1", "rationale": winner.reason,
+             "action": winner.selected_action}
         ]
     });
     let proposal = parse_proposal(&proposal_value.to_string())
@@ -5949,7 +5983,16 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         anyhow::bail!("policy DENIED the agent's choice: {decision:?}");
     };
     println!("policy:       Allow({mode:?})");
-    let experiment_id = format!("exp:{}", winner.candidate.id);
+    println!(
+        "decision:     proposal={} gain={} cost={} risk={:?} confidence={} novelty={}",
+        winner.proposal_id,
+        winner.expected_information_gain,
+        winner.estimated_cost,
+        winner.risk,
+        winner.confidence,
+        winner.novelty
+    );
+    let experiment_id = format!("exp:{}", winner.proposal_id);
 
     if *mode == ExecutionMode::ReadOnly {
         // Zero-cost lane: pure local execution, sealed sandbox evidence.
@@ -5973,10 +6016,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         evidence.hash = [0u8; 32];
         let seal = *blake3::hash(&serde_json::to_vec(&evidence).unwrap_or_default()).as_bytes();
         evidence.hash = seal;
-        curiosity.update(
-            &winner.candidate.hypothesis_id,
-            ExperimentOutcome::Inconclusive,
-        );
+        curiosity.update(&winner.proposal_id, ExperimentOutcome::Inconclusive);
         persist_curiosity(&curiosity_path, &curiosity)?;
         println!("evidence:     {} (read-only, no tx)", evidence.id);
         print_next_preview(&candidates, &store, &curiosity, &cycle);
@@ -6126,7 +6166,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         Some(tx_hash.clone()),
     );
     // Learning feeds the NEXT decision: curiosity moves now.
-    curiosity.update(&winner.candidate.hypothesis_id, outcome);
+    curiosity.update(&hypothesis_id, outcome);
     persist_curiosity(&curiosity_path, &curiosity)?;
     println!(
         "evidence:     {} seal {:02x?}…",
@@ -6139,8 +6179,19 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         "\n{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "cycle_id": args.cycle_id,
-            "selected": winner.candidate.id,
-            "score": winner.breakdown.total,
+            "selected": winner.proposal_id,
+            "question": question,
+            "hypothesis": hypothesis_text,
+            "decision": {
+                "proposal_id": winner.proposal_id,
+                "expected_information_gain": winner.expected_information_gain,
+                "estimated_cost": winner.estimated_cost,
+                "risk": format!("{:?}", winner.risk),
+                "confidence": winner.confidence,
+                "novelty": winner.novelty,
+                "reason": winner.reason
+            },
+            "score": winner.expected_information_gain as i64 + winner.novelty as i64,
             "budget_wei": budget.max_amount_wei,
             "amount_wei": total_wei,
             "tx_hash": tx_hash,
@@ -6186,7 +6237,8 @@ fn print_next_preview(
     match decentraai_proposal::select_experiment(candidates, store, curiosity, &next_cycle) {
         Ok(w) => println!(
             "next-preview: learning now favors {} (score {})",
-            w.candidate.id, w.breakdown.total
+            w.proposal_id,
+            w.expected_information_gain + w.novelty
         ),
         Err(r) => println!("next-preview: no valid candidate next ({r:?})"),
     }

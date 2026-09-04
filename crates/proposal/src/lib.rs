@@ -81,9 +81,10 @@ pub use protocol::{
 pub use risk::{ExperimentRiskClass, ResourceCommitment};
 pub use sandbox::{ExecutionReport, StepResult, execute};
 pub use selection::{
-    CandidateExperiment, CandidateRejection, CycleState, MIN_EXECUTABLE_SCORE, ScoreBreakdown,
-    ScoredCandidate, ScoredSummary, SelectionRecord, TESTNET_RISK_PENALTY, action_signature,
-    generate_candidates, novelty_bp, score_candidate, select_experiment,
+    CandidateExperiment, CandidateRejection, CycleState, ExperimentDecision, MIN_EXECUTABLE_SCORE,
+    ScoreBreakdown, ScoredCandidate, ScoredSummary, SelectionRecord, TESTNET_RISK_PENALTY,
+    action_signature, detect_uncertainty, generate_candidates, generate_hypothesis,
+    generate_question, novelty_bp, score_candidate, select_experiment,
 };
 pub use store::{AttemptInfo, ExperimentRecord, ExperimentStatus, ExperimentStore};
 pub use testnet::{
