@@ -1078,6 +1078,7 @@ dependencies = [
  "decentraai-inference-adapter",
  "decentraai-manifest",
  "decentraai-p2p",
+ "decentraai-proposal",
  "decentraai-protocol",
  "decentraai-providers",
  "decentraai-registry",

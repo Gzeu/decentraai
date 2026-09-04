@@ -44,6 +44,7 @@
 //! (`deny_unknown_fields`) plus hard bounds before anything else runs.
 
 pub mod action;
+pub mod budget;
 pub mod economic;
 pub mod error;
 pub mod evidence;
@@ -52,12 +53,23 @@ pub mod policy;
 pub mod protocol;
 pub mod risk;
 pub mod sandbox;
+pub mod store;
+pub mod testnet;
 
 pub use action::ProposedAction;
-pub use economic::{DenyAllEconomicAuthorization, EconomicAuthError, EconomicAuthorization};
+pub use budget::{
+    DCAI_TESTNET_ID, ExperimentBudget, MAX_BUDGET_ACTIONS, MAX_BUDGET_RETRIES, MAX_BUDGET_WEI,
+    MAX_GAS_LIMIT, TestnetAsset,
+};
+pub use economic::{
+    DenyAllEconomicAuthorization, EconomicAuthError, EconomicAuthorization, TestnetApproval,
+    TestnetAuthConfig, TestnetAuthRequest, TestnetEconomicAuthorization,
+};
 pub use error::ProposalError;
-pub use evidence::{EvidenceLog, ExperimentEvidence, ExperimentOutcome};
-pub use learning::{LearningEntry, derive_learnings};
+pub use evidence::{EvidenceLog, ExperimentEvidence, ExperimentOutcome, TestnetEvidence};
+pub use learning::{
+    ExperimentLearning, HypothesisVerdict, LearningEntry, assess, derive_learnings,
+};
 pub use policy::{DenyReason, ExecutionMode, PolicyDecision, decide};
 pub use protocol::{
     AgentIdea, ExperimentProposal, ExperimentStep, Hypothesis, Observation, PROTOCOL_VERSION,
@@ -65,3 +77,7 @@ pub use protocol::{
 };
 pub use risk::{ExperimentRiskClass, ResourceCommitment};
 pub use sandbox::{ExecutionReport, StepResult, execute};
+pub use store::{AttemptInfo, ExperimentRecord, ExperimentStatus, ExperimentStore};
+pub use testnet::{
+    AuthorizedTransfer, TestnetExecutor, TestnetReport, execute_testnet_experiment, transfer_totals,
+};
