@@ -654,7 +654,7 @@ impl WorldState {
     /// Migrate legacy rooms/agents into Open World entities (idempotent).
     pub fn migrate_legacy(&mut self) {
         // Convert legacy agents to entities if not already present
-        let legacy_agents: Vec<WorldAgent> = self.agents.drain(..).collect();
+        let legacy_agents: Vec<WorldAgent> = std::mem::take(&mut self.agents);
         for agent in legacy_agents {
             if !self.entities.iter().any(|e| e.id == agent.agent_id) {
                 let zone_id = self.zone_for_capabilities(&agent.declared_capabilities);
