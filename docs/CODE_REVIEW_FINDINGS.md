@@ -2,8 +2,9 @@
 
 Deep code review of commits `f43825d` (quest dedup fix), `caba134` (nonce serialization +
 dead-tx recovery), `fee7a02` (Phase 7 signing layer), `a14d8ebe` (automated testnet
-submission + operator wallet), `88aee0a` (economy-v2 closed loop) and `633c304` (quest
-spam cap).
+submission + operator wallet), `88aee0a` (economy-v2 closed loop), `633c304` (quest
+spam cap), `d072bf8` (world trade settlement slice) and `fe32299` (DCAI config seam —
+reviewed clean, no findings).
 
 Overall verdict: the code is in very good shape — regression tests reproduce live bugs,
 invariant tests (money-conservation) exist, event recording covers every settlement state
@@ -259,17 +260,18 @@ path and asserts `supply == genesis − burned` still holds.
 
 ## F13 — Request handlers advance the world tick (MEDIUM)
 
-**Location:** `crates/runtime/src/api/mod.rs` — `world_refine_handler` and friends (from `88aee0a`)
+**Location:** `crates/runtime/src/api/mod.rs` — `world_refine_handler`, `world_buy_handler`,
+`world_service_handler` (from `88aee0a`, `d072bf8`)
 
-**Problem:** `world_refine_handler` calls `world.advance_tick()` on every request. The
-world clock is therefore drivable by external HTTP calls: an unauthenticated caller (see
-F9) can fast-forward time arbitrarily, skewing quest deadlines, deadline-tick stake
-burns, demand cooling, vendor restock cadence and econ-observer sampling.
+**Problem:** Multiple handlers call `world.advance_tick()` on every request. The world
+clock is therefore drivable by external HTTP calls: an unauthenticated caller (see F9)
+can fast-forward time arbitrarily, skewing quest deadlines, deadline-tick stake burns,
+demand cooling, vendor restock cadence and econ-observer sampling.
 
 **Recommendation:** Own the tick in the scheduler only. Handlers should perform their
 action and persist state without advancing the clock (or advance at most a bounded
-"action cost" of zero ticks). If refine is meant to consume time, model it as a cooldown
-on the agent rather than a global tick advance.
+"action cost" of zero ticks). If an action is meant to consume time, model it as a
+cooldown on the agent rather than a global tick advance.
 
 ---
 
@@ -321,6 +323,74 @@ workspace lint set tightens.
 
 ---
 
+## F17 — `submit_intent` rebuilds intents by probing hardcoded namespaces (MEDIUM)
+
+**Location:** `crates/runtime/src/world.rs` — `submit_intent()` (from `d072bf8`)
+
+**Problem:** To rebuild the deterministic signing intent for a proof, the code loops
+over a hardcoded namespace list `for ns in ["trade", "quest"]` and keeps the first whose
+`data_field()` matches the stored `tx_data` byte-for-byte. Two failure modes: (a) any
+new job namespace added later makes its proofs permanently un-rebuildable ("intent no
+longer rebuilds") because the probe list is stale; (b) if two namespaces ever produce
+the same data for a proof, the probe silently picks the first. Semantics are re-derived
+by trial instead of being stored.
+
+**Recommendation:** Persist the job_id (or at least the namespace) on `OnChainProof` at
+creation time (`#[serde(default)]` for legacy proofs, with the probe kept ONLY as a
+fallback for pre-existing records). `submit_intent` then rebuilds directly from the
+stored value.
+
+---
+
+## F18 — Proof↔escrow link resolved by evidence-hash reverse lookup (MEDIUM)
+
+**Location:** `crates/runtime/src/m18.rs` — `escrow_for_evidence` (from `d072bf8`)
+
+**Problem:** `settle_escrow_for_proof` finds the escrow to settle by scanning all escrow
+records for a matching `evidence_hash` and taking the FIRST match. Evidence hashes are
+not guaranteed unique — two trades by the same earner in the same tick with the same
+amount and description produce the identical `action:entity:amount:tick:description`
+input — and the link is not stored anywhere. On a collision the wrong escrow gets
+settled (and later re-anchored) while the real one rots in `Released`.
+
+**Recommendation:** Store `escrow_id` on `OnChainProof` when `record_world_sale` creates
+the escrow (same pattern as F17). The sweep/check paths then settle by direct id, and
+`escrow_for_evidence` remains only as a migration fallback. Add a test with two
+colliding-evidence trades asserting each proof settles its own escrow.
+
+---
+
+## F19 — `record_world_sale` returns the contract id in both tuple slots (LOW)
+
+**Location:** `crates/runtime/src/m18.rs` — `record_world_sale` (from `d072bf8`)
+
+**Problem:** The function returns `Ok((contract_id.clone(), contract_id))` while the
+doc comment promises `(contract_id, escrow_id)`. It works only because escrow records
+happen to be keyed by contract id — but the API lies, and any future refactor that gives
+escrows their own ids silently breaks every caller using the second slot as an escrow id.
+
+**Recommendation:** Either return the real escrow id, or rename/document that escrows
+are keyed by contract id and the two values are equal by construction. Pairs with F18's
+stored-escrow-id fix.
+
+---
+
+## F20 — Settlement job_id is not unique per trade (LOW)
+
+**Location:** `crates/runtime/src/world.rs` — `settle_on_chain_with_job` (from `d072bf8`)
+
+**Problem:** `job_id = format!("{ns}-{entity_id}-{}", self.tick)` collides whenever the
+same earner settles twice within one tick (two sales, a sale + a quest reward). The
+on-chain anchors then share a job id while carrying different digests — legal on-chain,
+but it corrupts the "job_id tells WHAT settled" property the namespace was added for,
+and makes explorer-based auditing ambiguous.
+
+**Recommendation:** Add a monotonic component to the job id (same `next_seq` counter as
+F3/F14 — one shared per-world sequence serves both). Same root cause family as F3, F14
+and F17: identity derived from context instead of stored.
+
+---
+
 ## N1 — Enforce `cargo fmt --check` in CI (NITPICK)
 
 **Evidence:** commits `caba134` and `a14d8ebe` both ship tests where a statement is glued
@@ -332,6 +402,17 @@ to the opening brace on the same line (`operator_address_fails_closed_without_in
 
 ---
 
+## Structural note — the root pattern behind F3, F14, F17, F18, F20
+
+Five of the twenty findings share one root cause: **semantic identity is derived from
+context (id substrings, tick-based formulas, reverse lookups, trial probing) instead of
+being stored on the record at creation time.** Both live defects so far (quest spam,
+economy freeze) came from this family. A single refactor — one monotonic per-world
+sequence feeding quest ids and job ids, plus `QuestKind`, `job_id` and `escrow_id` stored
+on their records — eliminates the whole class.
+
+---
+
 ## Suggested implementation order
 
 1. F9 (verify auth coverage first — it gates whether the API can stay bound publicly;
@@ -340,10 +421,11 @@ to the opening brace on the same line (`operator_address_fails_closed_without_in
 3. F7 (sender validation on the manual submit path)
 4. F12 (explicit sinks: conservation must hold on every sale path)
 5. F13 (tick ownership back to the scheduler)
-6. F3 + F14 together (quest ids + QuestKind enum — same refactor, kills the whole class
-   of id-string bugs)
+6. F3 + F14 + F17 + F18 + F20 as ONE refactor (store identity on the record: unique
+   quest ids, QuestKind enum, job_id + escrow_id persisted on OnChainProof) — kills the
+   entire class of re-derivation bugs
 7. N1 (one line in CI)
 8. F5 + F11 (zeroize + safe seed file creation)
 9. F6 + F10 (bech32 validation, cached signer)
-10. F15 + F16 (price provider selection, dead code)
+10. F15 + F16 + F19 (price provider selection, dead code, tuple semantics)
 11. F4 (observe + metric only for now)
