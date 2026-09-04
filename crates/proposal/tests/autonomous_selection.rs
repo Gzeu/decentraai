@@ -7,9 +7,10 @@
 
 use decentraai_proposal::{
     AttemptInfo, CandidateExperiment, CandidateRejection, CuriosityState, CycleState,
-    ExperimentOutcome, ExperimentProposal, ExperimentRiskClass, ExperimentStore, ProposedAction,
-    ResourceCommitment, TestnetAsset, detect_uncertainty, generate_candidates, generate_hypothesis,
-    generate_question, score_candidate, select_experiment,
+    ExperimentOutcome, ExperimentProposal, ExperimentRiskClass, ExperimentStore, HypothesisVerdict,
+    ProposedAction, ResourceCommitment, SuccessCriterion, TestnetAsset, detect_uncertainty,
+    evaluate_outcome, generate_candidates, generate_hypothesis, generate_question, score_candidate,
+    select_experiment,
 };
 
 const NOW: u64 = 1_780_000_000;
@@ -25,6 +26,7 @@ fn micro_candidate(id: &str, gain: u32, amount: u64) -> CandidateExperiment {
             destination: DEST.to_string(),
             amount_wei: amount,
         },
+        criterion: decentraai_proposal::SuccessCriterion::TxConfirmation,
         amount_wei: amount,
         risk: ExperimentRiskClass::TestnetEconomic,
         commitment: ResourceCommitment::Cr,
@@ -260,4 +262,126 @@ fn question_and_hypothesis_generation_deterministic() {
     assert_eq!(h_id1, h_id2);
     assert_eq!(h_text1, h_text2);
     assert!(h_id1.starts_with("hyp:"));
+}
+
+// GOLDEN AUTONOMOUS CHOICE: A (cheap, low gain), B (medium cost, high
+// gain), C (high cost, high risk). The agent MUST choose B — then, after
+// learning marks B's hypothesis supported, the next decision MUST move
+// to a different candidate. This proves selection is the agent's own.
+#[test]
+fn golden_autonomous_choice() {
+    // A: observe, cost 0, gain 1000, risk ReadOnly (no risk penalty).
+    let a = CandidateExperiment {
+        id: "cand:a-cheap-observe".to_string(),
+        hypothesis_id: "hyp:a-observability".to_string(),
+        hypothesis_text: "observable".to_string(),
+        action: ProposedAction::Observe {
+            source: "world".to_string(),
+            query: "q".to_string(),
+        },
+        criterion: SuccessCriterion::ObservationContains {
+            needle: "x".to_string(),
+        },
+        amount_wei: 0,
+        risk: ExperimentRiskClass::ReadOnly,
+        commitment: ResourceCommitment::None,
+        budget: decentraai_proposal::ExperimentBudget {
+            id: "budget:a".to_string(),
+            max_amount_wei: 0,
+            max_gas: 0,
+            max_actions: 1,
+            max_retries: 0,
+            expiry_unix: NOW + 3_600,
+            allowed_assets: vec![TestnetAsset::Xegld],
+            allowed_destinations: vec![DEST.to_string()],
+        },
+        expected_gain_bp: 1_000,
+        reason: "A: cheap low-gain".to_string(),
+    };
+    // B: transfer 500, gain 6000, Testnet risk.
+    let b = micro_candidate("b-medium-high-gain", 6_000, 500);
+    // C: transfer 2500, gain 5000, Testnet risk (cost pressure).
+    let c = micro_candidate("c-pricey-risky", 5_000, 2_500);
+    let store = ExperimentStore::new();
+    let mut curiosity = CuriosityState::new();
+    let cy = CycleState::new("cycle:golden", 10_000);
+
+    // Scores: A = 1k+10k+10k-0-0 = 21000; B = 6k+10k+10k-500-1500 = 24000;
+    // C = 5k+10k+10k-2500-1500 = 21000. B wins (medium cost, high gain).
+    let w1 = select_experiment(&[a.clone(), b.clone(), c.clone()], &store, &curiosity, &cy)
+        .expect("first pick");
+    assert_eq!(
+        w1.proposal_id, "prop:b-medium-high-gain",
+        "agent must pick B (best information-per-cost), got {}",
+        w1.proposal_id
+    );
+
+    // B's hypothesis confirmed → supported → repetitive → rejected next.
+    curiosity.update(&b.hypothesis_id, ExperimentOutcome::Success);
+    let w2 =
+        select_experiment(&[a, b, c], &store, &curiosity, &cy).expect("learning flips decision");
+    assert_ne!(
+        w2.proposal_id, "prop:b-medium-high-gain",
+        "supported hypothesis must not be re-run"
+    );
+    assert_eq!(
+        w2.proposal_id, "prop:cand:a-cheap-observe",
+        "tie at 21000 → cheaper (free observe) wins over the pricey one"
+    );
+}
+
+// Verdict inference: execution success ≠ hypothesis supported; the
+// criterion decides, never the operator.
+#[test]
+fn verdict_inferred_not_declared() {
+    // Tx confirmed success → Supported.
+    assert_eq!(
+        evaluate_outcome(
+            &SuccessCriterion::TxConfirmation,
+            Some("success"),
+            "anything"
+        ),
+        HypothesisVerdict::Supported
+    );
+    // Tx failed → Refuted (execution DID run, hypothesis disproven).
+    assert_eq!(
+        evaluate_outcome(&SuccessCriterion::TxConfirmation, Some("fail"), "anything"),
+        HypothesisVerdict::Refuted
+    );
+    // No tx (read-only lane) on a tx criterion → Inconclusive.
+    assert_eq!(
+        evaluate_outcome(&SuccessCriterion::TxConfirmation, None, "anything"),
+        HypothesisVerdict::Inconclusive
+    );
+    // Observation needle present → Supported; absent → Inconclusive.
+    let crit = SuccessCriterion::ObservationContains {
+        needle: "minted".to_string(),
+    };
+    assert_eq!(
+        evaluate_outcome(&crit, None, "treasury minted 4530"),
+        HypothesisVerdict::Supported
+    );
+    assert_eq!(
+        evaluate_outcome(&crit, None, "treasury empty"),
+        HypothesisVerdict::Inconclusive
+    );
+}
+
+// Candidates carry THREE DISTINCT hypotheses (not one, three actions).
+#[test]
+fn generator_emits_three_distinct_hypotheses() {
+    let cs = generate_candidates(
+        "cycle:g",
+        "obs:1",
+        "does_x_hold",
+        "hyp:root",
+        "root hyp",
+        DEST,
+        NOW,
+    );
+    assert_eq!(cs.len(), 3);
+    let mut ids: Vec<&str> = cs.iter().map(|c| c.hypothesis_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "each candidate must test its own hypothesis");
 }

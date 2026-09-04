@@ -82,9 +82,10 @@ pub use risk::{ExperimentRiskClass, ResourceCommitment};
 pub use sandbox::{ExecutionReport, StepResult, execute};
 pub use selection::{
     CandidateExperiment, CandidateRejection, CycleState, ExperimentDecision, MIN_EXECUTABLE_SCORE,
-    ScoreBreakdown, ScoredCandidate, ScoredSummary, SelectionRecord, TESTNET_RISK_PENALTY,
-    action_signature, detect_uncertainty, generate_candidates, generate_hypothesis,
-    generate_question, novelty_bp, score_candidate, select_experiment,
+    ScoreBreakdown, ScoredCandidate, ScoredSummary, SelectionRecord, SuccessCriterion,
+    TESTNET_RISK_PENALTY, action_signature, detect_uncertainty, evaluate_outcome,
+    generate_candidates, generate_hypothesis, generate_question, novelty_bp, score_candidate,
+    select_experiment,
 };
 pub use store::{AttemptInfo, ExperimentRecord, ExperimentStatus, ExperimentStore};
 pub use testnet::{

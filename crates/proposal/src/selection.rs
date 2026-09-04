@@ -52,6 +52,9 @@ pub struct CandidateExperiment {
     pub hypothesis_text: String,
     /// What the experiment would do.
     pub action: ProposedAction,
+    /// Objective success signal evaluated AFTER execution — the verdict
+    /// is inferred from this, never declared by the operator.
+    pub criterion: SuccessCriterion,
     /// Minimal amount that still exercises the path (0 for read-only).
     pub amount_wei: u64,
     /// Claimed lane.
@@ -65,6 +68,49 @@ pub struct CandidateExperiment {
     pub expected_gain_bp: u32,
     /// Why this candidate exists (post-mortem record).
     pub reason: String,
+}
+
+/// The objective success signal of a candidate. Deterministic evaluation
+/// AFTER execution keeps the three truths separate per spec:
+/// execution success ≠ experiment success ≠ hypothesis supported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "criterion", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SuccessCriterion {
+    /// Hypothesis supported iff the testnet tx confirms with success.
+    TxConfirmation,
+    /// Hypothesis supported iff the observed text contains `needle`.
+    ObservationContains {
+        /// Substring to look for in the observed text.
+        needle: String,
+    },
+}
+
+/// Evaluate a hypothesis verdict deterministically. `tx_status` is the
+/// confirmed chain status (Some only after broadcast), `observed_text`
+/// the operator-sovereign observation. ExecutionSucceeded + signal
+/// present → Supported; execution failed → Refuted; otherwise
+/// Inconclusive. The operator NEVER declares the verdict by hand.
+#[must_use]
+pub fn evaluate_outcome(
+    criterion: &SuccessCriterion,
+    tx_status: Option<&str>,
+    observed_text: &str,
+) -> crate::learning::HypothesisVerdict {
+    use crate::learning::HypothesisVerdict;
+    match criterion {
+        SuccessCriterion::TxConfirmation => match tx_status {
+            Some("success") => HypothesisVerdict::Supported,
+            Some(_) => HypothesisVerdict::Refuted,
+            None => HypothesisVerdict::Inconclusive,
+        },
+        SuccessCriterion::ObservationContains { needle } => {
+            if observed_text.contains(needle.as_str()) {
+                HypothesisVerdict::Supported
+            } else {
+                HypothesisVerdict::Inconclusive
+            }
+        }
+    }
 }
 
 /// Score breakdown: every term is inspectable post-mortem.
@@ -280,6 +326,10 @@ pub struct ExperimentDecision {
     pub reason: String,
     /// The action the executor must run.
     pub selected_action: ProposedAction,
+    /// Objective success signal carried to the evaluator.
+    pub criterion: SuccessCriterion,
+    /// Hypothesis under test (curiosity key — learning writes here).
+    pub hypothesis_id: String,
     /// Minimal-viable budget carried with the decision (so the executor
     /// never inflates it).
     pub budget: ExperimentBudget,
@@ -305,6 +355,8 @@ impl ExperimentDecision {
             novelty: breakdown.novelty_bp as u32,
             reason: candidate.reason.clone(),
             selected_action: candidate.action.clone(),
+            criterion: candidate.criterion.clone(),
+            hypothesis_id: candidate.hypothesis_id.clone(),
             budget: candidate.budget.clone(),
         }
     }
@@ -393,19 +445,17 @@ fn is_duplicate_action(candidate: &CandidateExperiment, store: &ExperimentStore)
     })
 }
 
-/// Generate the v0.3 candidate set from one real observation and an
-/// already-formulated hypothesis.
+/// Generate the v0.3 candidate set from the agent's question/hypothesis.
+/// The three candidates carry THREE DISTINCT HYPOTHESES, each derived
+/// deterministically from the question — not one hypothesis wearing
+/// three actions:
 ///
-/// Three deterministic rules (mechanical enumeration — the CHOICE is the
-/// agent's score, computed in [`select_experiment`]):
-/// R1 micro-probe: smallest viable transfer testing confirmation;
-/// R2 replication: the previously-seen amount (usually rejected live as
-///     duplicate — the anti-loop proving itself);
-/// R3 read-only: zero-cost observation check (low gain, always valid).
-///
-/// `question` and `hypothesis` are produced by [`generate_question`]
-/// and [`generate_hypothesis`] before this call — the agent's reasoning
-/// chain, not operator hand-off.
+/// H1 (confirmation probe): "a minimal 500-wei transfer confirms" —
+///    TestnetEconomic, criterion [`SuccessCriterion::TxConfirmation`].
+/// H2 (cost-pressure scaling): "a 2× amount confirms equally" —
+///    TestnetEconomic at 1000 wei, tests whether cost pressure matters.
+/// H3 (observability): "the observation domain is independently
+///    readable" — ReadOnly, criterion judged against observed text.
 pub fn generate_candidates(
     cycle_id: &str,
     observation_id: &str,
@@ -429,16 +479,27 @@ pub fn generate_candidates(
         crate::budget::TestnetAsset::Xegld,
         now_unix,
     );
+    // Three distinct hypothesis ids, derived deterministically from the
+    // agent's question — the agent reasons into THREE rival explanations.
+    let h1_id = format!(
+        "{}:confirmation",
+        hypothesis_id.trim_end_matches(":confirmation")
+    );
+    let h2_id = format!("{}:cost-scaling", hypothesis_id);
+    let h3_id = format!("{}:observability", hypothesis_id);
     vec![
         CandidateExperiment {
             id: format!("{cycle_id}:micro-probe"),
-            hypothesis_id: hypothesis_id.to_string(),
-            hypothesis_text: hypothesis_text.to_string(),
+            hypothesis_id: h1_id,
+            hypothesis_text: format!(
+                "H1: a bounded 500-wei xEGLD self-transfer confirms on testnet ({hypothesis_text})"
+            ),
             action: ProposedAction::TestnetTransfer {
                 asset: TestnetAsset::Xegld,
                 destination: operator_destination.to_string(),
                 amount_wei: 500,
             },
+            criterion: SuccessCriterion::TxConfirmation,
             amount_wei: 500,
             risk: ExperimentRiskClass::TestnetEconomic,
             commitment: ResourceCommitment::Cr,
@@ -450,27 +511,38 @@ pub fn generate_candidates(
         },
         CandidateExperiment {
             id: format!("{cycle_id}:replicate-1000"),
-            hypothesis_id: hypothesis_id.to_string(),
-            hypothesis_text: hypothesis_text.to_string(),
+            hypothesis_id: h2_id,
+            hypothesis_text: "H2: a 2× larger transfer confirms equally — cost pressure is neutral"
+                .to_string(),
             action: ProposedAction::TestnetTransfer {
                 asset: TestnetAsset::Xegld,
                 destination: operator_destination.to_string(),
                 amount_wei: 1_000,
             },
+            criterion: SuccessCriterion::TxConfirmation,
             amount_wei: 1_000,
             risk: ExperimentRiskClass::TestnetEconomic,
             commitment: ResourceCommitment::Cr,
             budget: replicate_budget,
             expected_gain_bp: 3_000,
-            reason: format!("R2 replication: same hypothesis, double check (q: {question})"),
+            reason: format!("R2 cost-scaling rival explanation for {observation_id}"),
         },
         CandidateExperiment {
             id: format!("{cycle_id}:observe-supply"),
-            hypothesis_id: hypothesis_id.to_string(),
-            hypothesis_text: hypothesis_text.to_string(),
+            hypothesis_id: h3_id,
+            hypothesis_text: format!(
+                "H3: the observation '{observation_id}' is independently confirmable"
+            ),
             action: ProposedAction::Observe {
                 source: "world".to_string(),
                 query: question.to_string(),
+            },
+            criterion: SuccessCriterion::ObservationContains {
+                needle: observation_id
+                    .split(':')
+                    .nth(1)
+                    .unwrap_or("minted")
+                    .to_string(),
             },
             amount_wei: 0,
             risk: ExperimentRiskClass::ReadOnly,

@@ -230,10 +230,9 @@ struct AutonomousCycleArgs {
     /// Max total wei for the whole cycle (all experiments in it).
     #[arg(long, default_value_t = 2_000)]
     cycle_budget_wei: u64,
-    /// Operator-declared hypothesis verdict AFTER observing the outcome
-    /// ("supported"|"refuted"|"inconclusive"). Never inferred here.
-    #[arg(long, default_value = "inconclusive")]
-    hypothesis_verdict: String,
+    /// NOTE: the hypothesis verdict is INFERRED deterministically from
+    /// the candidate's success criterion (tx status / observed text) —
+    /// the operator never declares it.
     /// Arm the testnet kill switch for this cycle (absent = deny all live).
     #[arg(long, default_value_t = false)]
     enable_live_testnet: bool,
@@ -5812,8 +5811,8 @@ async fn broadcast_xegld(
 }
 
 /// Bounded confirmation poll (30 × 2s). Bails unless the tx confirms with
-/// `success` — anything else seals no evidence.
-async fn poll_confirm(api_base: &str, tx_hash: &str) -> Result<()> {
+/// `success` — anything else seals no evidence. Returns the final status.
+async fn poll_confirm(api_base: &str, tx_hash: &str) -> Result<String> {
     let mut status = String::from("pending");
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -5831,7 +5830,7 @@ async fn poll_confirm(api_base: &str, tx_hash: &str) -> Result<()> {
     if status != "success" {
         anyhow::bail!("tx did not confirm (status {status}); evidence NOT sealed");
     }
-    Ok(())
+    Ok(status)
 }
 
 /// Primordial Mind v0.3 autonomous cycle: the operator supplies ONE real
@@ -5998,19 +5997,27 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             &cycle,
             &winner,
         );
-        let mut evidence = ExperimentEvidence::seal(
-            &report,
-            ExperimentOutcome::Inconclusive,
-            now_unix * 1_000,
-            None,
-        );
+        let verdict = evaluate_outcome(&winner.criterion, None, &observation.text);
+        let outcome = match verdict {
+            HypothesisVerdict::Supported => ExperimentOutcome::Success,
+            HypothesisVerdict::Refuted => ExperimentOutcome::Failed,
+            HypothesisVerdict::Inconclusive => ExperimentOutcome::Inconclusive,
+        };
+        let mut evidence = ExperimentEvidence::seal(&report, outcome, now_unix * 1_000, None);
         evidence.selection = Some(selection);
         evidence.hash = [0u8; 32];
         let seal = *blake3::hash(&serde_json::to_vec(&evidence).unwrap_or_default()).as_bytes();
         evidence.hash = seal;
-        curiosity.update(&winner.proposal_id, ExperimentOutcome::Inconclusive);
+        curiosity.update(&winner.hypothesis_id, outcome);
         persist_curiosity(&curiosity_path, &curiosity)?;
-        println!("evidence:     {} (read-only, no tx)", evidence.id);
+        println!(
+            "evidence:     {} (read-only, no tx) outcome={outcome:?}",
+            evidence.id
+        );
+        println!(
+            "verdict:      {verdict:?} (inferred from criterion {:?})",
+            winner.criterion
+        );
         print_next_preview(&candidates, &store, &curiosity, &cycle);
         return Ok(());
     }
@@ -6085,18 +6092,17 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             (hash, false)
         }
     };
-    poll_confirm(api_base, &tx_hash).await?;
+    let final_status = poll_confirm(api_base, &tx_hash).await?;
     cycle.spent_wei = cycle
         .spent_wei
         .saturating_add(if replayed { 0 } else { total_wei });
     cycle.executed = Some(experiment_id.clone());
 
     // 7. Evidence (with post-mortem selection) + learning + curiosity.
-    let verdict = match args.hypothesis_verdict.as_str() {
-        "supported" => HypothesisVerdict::Supported,
-        "refuted" => HypothesisVerdict::Refuted,
-        _ => HypothesisVerdict::Inconclusive,
-    };
+    // Verdict INFERRED deterministically from the candidate's criterion
+    // (execution success ≠ hypothesis supported): the operator declares
+    // nothing about the hypothesis.
+    let verdict = evaluate_outcome(&winner.criterion, Some(&final_status), &observation.text);
     let outcome = match verdict {
         HypothesisVerdict::Supported => ExperimentOutcome::Success,
         HypothesisVerdict::Refuted => ExperimentOutcome::Failed,
@@ -6158,7 +6164,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         Some(tx_hash.clone()),
     );
     // Learning feeds the NEXT decision: curiosity moves now.
-    curiosity.update(&hypothesis_id, outcome);
+    curiosity.update(&winner.hypothesis_id, outcome);
     persist_curiosity(&curiosity_path, &curiosity)?;
     println!(
         "evidence:     {} seal {:02x?}…",
