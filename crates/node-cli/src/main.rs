@@ -3094,7 +3094,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             let dcai = config.dcai.clone();
             state.attach_dcai(dcai);
             if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
-                tracing::info!("DCAI configured: {}", state.dcai_status()["token_identifier"]);
+                tracing::info!(
+                    "DCAI configured: {}",
+                    state.dcai_status()["token_identifier"]
+                );
             } else {
                 tracing::info!("DCAI shadow mode (Cr-only economy)");
             }

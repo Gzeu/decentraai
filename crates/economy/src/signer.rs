@@ -188,8 +188,7 @@ mod tests {
     use crate::multiversx_tx::Mx8004TxBuilder;
 
     /// TEST-ONLY seed. No funds, no mainnet, never a real wallet.
-    const TEST_SEED_HEX: &str =
-        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const TEST_SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 
     fn test_intent() -> UnsignedTxIntent {
         let facts = ContributionFacts {
@@ -279,7 +278,8 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_leaks_seed() {        let signer = Ed25519Signer::from_seed_hex(TEST_SEED_HEX).unwrap();
+    fn debug_never_leaks_seed() {
+        let signer = Ed25519Signer::from_seed_hex(TEST_SEED_HEX).unwrap();
         let dbg = format!("{signer:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains(TEST_SEED_HEX));

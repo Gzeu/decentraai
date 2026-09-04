@@ -488,7 +488,7 @@ impl ApiState {
             wallet_auth: Arc::new(StdMutex::new(
                 WalletAuthStore::load(&wallet_auth_path_for(&info.repo_root)).unwrap_or_default(),
             )),
-            m18: None, // Wired in main.rs after data_dir is resolved
+            m18: None,  // Wired in main.rs after data_dir is resolved
             dcai: None, // Wired in main.rs from the node config (shadow mode default)
         }
     }
@@ -1434,8 +1434,14 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/service", post(world_service_handler))
         .route("/v1/world/quest/list", get(world_quest_list_handler))
         .route("/v1/world/quest/accept", post(world_quest_accept_handler))
-        .route("/v1/world/quest/complete", post(world_quest_complete_handler))
-        .route("/v1/world/quest/generate", post(world_quest_generate_handler))
+        .route(
+            "/v1/world/quest/complete",
+            post(world_quest_complete_handler),
+        )
+        .route(
+            "/v1/world/quest/generate",
+            post(world_quest_generate_handler),
+        )
         .route("/v1/world/settle", post(world_settle_handler))
         .route("/v1/world/settle/intent", post(world_settle_intent_handler))
         .route(
@@ -1445,7 +1451,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/settle/check", post(world_settle_check_handler))
         .route("/v1/world/settle/sweep", post(world_settle_sweep_handler))
         .route("/v1/world/settle/submit", post(world_settle_submit_handler))
-        .route("/v1/world/settle/confirm", post(world_settle_confirm_handler))
+        .route(
+            "/v1/world/settle/confirm",
+            post(world_settle_confirm_handler),
+        )
         .route("/v1/world/proofs", get(world_proofs_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
@@ -2568,7 +2577,10 @@ async fn world_move_handler(
             world.advance_tick();
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "location_id": location_id})))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "location_id": location_id})),
+            )
                 .into_response()
         }
         Err(e) => (
@@ -2596,7 +2608,8 @@ async fn world_list_handler(
         .to_string();
 
     let item = match body.get("item") {
-        Some(item_val) => match serde_json::from_value::<crate::world::WorldItem>(item_val.clone()) {
+        Some(item_val) => match serde_json::from_value::<crate::world::WorldItem>(item_val.clone())
+        {
             Ok(i) => i,
             Err(e) => {
                 return (
@@ -2688,12 +2701,7 @@ async fn world_buy_handler(
             )
             .await;
             let (proof_id, tx_hash, contract_id, escrow_id) = match settlement {
-                Some(s) => (
-                    Some(s.proof_id),
-                    s.tx_hash,
-                    s.contract_id,
-                    s.escrow_id,
-                ),
+                Some(s) => (Some(s.proof_id), s.tx_hash, s.contract_id, s.escrow_id),
                 None => (None, None, None, None),
             };
             (
@@ -2733,7 +2741,9 @@ async fn world_entity_handler(
     }
     let world = state.world.lock().await;
     match world.entities.iter().find(|e| e.id == entity_id) {
-        Some(entity) => (StatusCode::OK, Json(serde_json::to_value(entity).unwrap())).into_response(),
+        Some(entity) => {
+            (StatusCode::OK, Json(serde_json::to_value(entity).unwrap())).into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "entity not found"})),
@@ -2859,12 +2869,7 @@ async fn world_service_handler(
             )
             .await;
             let (proof_id, tx_hash, contract_id, escrow_id) = match settlement {
-                Some(s) => (
-                    Some(s.proof_id),
-                    s.tx_hash,
-                    s.contract_id,
-                    s.escrow_id,
-                ),
+                Some(s) => (Some(s.proof_id), s.tx_hash, s.contract_id, s.escrow_id),
                 None => (None, None, None, None),
             };
             (
@@ -2948,7 +2953,10 @@ async fn world_quest_accept_handler(
             world.advance_tick();
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "quest_id": quest_id})))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "quest_id": quest_id})),
+            )
                 .into_response()
         }
         Err(e) => (
@@ -3047,27 +3055,27 @@ async fn world_settle_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "entity_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
-    let amount = body
-        .get("amount")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let amount = body.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let mut world = state.world.lock().await;
     match world.settle_on_chain(action_type, description, &entity_id, amount) {
         Ok(proof) => {
             let path = crate::world::world_path_for(&state.info.repo_root);
             crate::world::save_world_state(&path, &world);
-            (StatusCode::OK, Json(serde_json::json!({
-                "ok": true,
-                "proof_id": proof.id,
-                "evidence_hash": proof.evidence_hash,
-                "tx_data": proof.tx_data,
-                "network": proof.network,
-                "status": "pending",
-            })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "proof_id": proof.id,
+                    "evidence_hash": proof.evidence_hash,
+                    "tx_data": proof.tx_data,
+                    "network": proof.network,
+                    "status": "pending",
+                })),
+            )
                 .into_response()
         }
         Err(e) => (
@@ -3094,7 +3102,7 @@ async fn world_settle_intent_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let sender = match body.get("sender").and_then(|v| v.as_str()) {
@@ -3104,7 +3112,7 @@ async fn world_settle_intent_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "sender required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3142,7 +3150,7 @@ async fn world_settle_submit_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let tx_hash = match body.get("tx_hash").and_then(|v| v.as_str()) {
@@ -3152,7 +3160,7 @@ async fn world_settle_submit_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "tx_hash required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let sender = body
@@ -3197,7 +3205,7 @@ async fn world_settle_auto_submit_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3228,10 +3236,7 @@ async fn world_settle_auto_submit_handler(
 ///
 /// ANY failure (no signer injected, proof not pending, network down,
 /// insufficient funds) → `None`, proof stays `Pending` for the sweep path.
-async fn settle_proof_best_effort(
-    state: &ApiState,
-    proof_id: &str,
-) -> Option<(String, String)> {
+async fn settle_proof_best_effort(state: &ApiState, proof_id: &str) -> Option<(String, String)> {
     let sender = crate::settlement_tx::operator_address().ok()?;
 
     // Feed every known in-flight nonce into the tracker first: after a
@@ -3305,7 +3310,8 @@ async fn settle_world_trade(
     // 1. Proof (under a short world lock) + persist.
     let (proof_id, evidence_hash, earner_wallet, buyer_wallet) = {
         let mut world = state.world.lock().await;
-        let proof = world.trade_settlement_proof(action_type, description, earner_id, price, capability)?;
+        let proof =
+            world.trade_settlement_proof(action_type, description, earner_id, price, capability)?;
         let ew = world
             .entities
             .iter()
@@ -3318,12 +3324,7 @@ async fn settle_world_trade(
             .find(|e| e.id == buyer_id)
             .map(|e| e.wallet.clone())
             .unwrap_or_default();
-        let out = (
-            proof.id.clone(),
-            proof.evidence_hash.clone(),
-            ew,
-            bw,
-        );
+        let out = (proof.id.clone(), proof.evidence_hash.clone(), ew, bw);
         let path = crate::world::world_path_for(&state.info.repo_root);
         crate::world::save_world_state(&path, &world);
         out
@@ -3393,20 +3394,23 @@ async fn world_settle_check_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let (tx_hash, already_confirmed) = {
         let world = state.world.lock().await;
         match world.proofs.iter().find(|p| p.id == proof_id) {
-            Some(p) => (p.tx_hash.clone(), p.status == crate::world::SettlementStatus::Confirmed),
+            Some(p) => (
+                p.tx_hash.clone(),
+                p.status == crate::world::SettlementStatus::Confirmed,
+            ),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"ok": false, "error": "proof not found"})),
                 )
-                    .into_response()
+                    .into_response();
             }
         }
     };
@@ -3425,8 +3429,7 @@ async fn world_settle_check_handler(
             .into_response();
     }
 
-    match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash).await
-    {
+    match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash).await {
         Ok(status) => {
             let mut world = state.world.lock().await;
             if status == "success" {
@@ -3621,12 +3624,7 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
                 } else {
                     p.capability.clone()
                 };
-                (
-                    ew,
-                    p.evidence_hash.clone(),
-                    cap,
-                    p.amount,
-                )
+                (ew, p.evidence_hash.clone(), cap, p.amount)
             }
             None => return,
         }
@@ -3683,7 +3681,7 @@ async fn world_settle_confirm_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"ok": false, "error": "proof_id required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3729,7 +3727,11 @@ async fn world_proofs_handler(State(state): State<ApiState>) -> Response {
         })
         .collect();
 
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "proofs": proofs}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "proofs": proofs})),
+    )
+        .into_response()
 }
 
 /// GET /vesper/agents — real registered fabric agents for the VESPER world,
@@ -5052,7 +5054,10 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let _task_for_society = task_id.clone();
         let _reward_for_society = task.reward;
         let _issuer_for_society = task.issuer.clone();
-        let _cap_for_society = task.required_capability.clone().unwrap_or_else(|| "general".to_string());
+        let _cap_for_society = task
+            .required_capability
+            .clone()
+            .unwrap_or_else(|| "general".to_string());
         drop(hub);
         {
             let mut society = state.society.lock().await;
@@ -6158,7 +6163,11 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     let needs: Vec<String> = args
                         .get("needs")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     // Resolve caller wallet: Wallet auth → auto; others → args.
                     let caller_wallet = match &auth {
@@ -6170,7 +6179,9 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                             .to_string(),
                     };
                     let mut world = state.world.lock().await;
-                    if let Some(agent) = world.agents.iter_mut().find(|a| a.account == caller_wallet) {
+                    if let Some(agent) =
+                        world.agents.iter_mut().find(|a| a.account == caller_wallet)
+                    {
                         agent.needs = needs.clone();
                         world.advance_tick();
                         let wpath = crate::world::world_path_for(&state.info.repo_root);
@@ -6787,7 +6798,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         let _task_for_society = task_id.clone();
         let _reward_for_society = task.reward;
         let _issuer_for_society = task.issuer.clone();
-        let _cap_for_society = task.required_capability.clone().unwrap_or_else(|| "general".to_string());
+        let _cap_for_society = task
+            .required_capability
+            .clone()
+            .unwrap_or_else(|| "general".to_string());
         drop(hub);
         {
             let mut society = state.society.lock().await;

@@ -684,10 +684,7 @@ mod tests {
 
     #[test]
     fn wallet_mapping_keeps_erd1_and_namespaces_locals() {
-        assert_eq!(
-            world_m18_wallet("erd1abc", "x"),
-            "erd1abc".to_string()
-        );
+        assert_eq!(world_m18_wallet("erd1abc", "x"), "erd1abc".to_string());
         assert_eq!(
             world_m18_wallet("npc:npc-smith", "npc-smith"),
             "agent:npc-smith".to_string()
@@ -701,7 +698,10 @@ mod tests {
         let (cid, eid) = record_world_sale(
             &m18,
             ("npc-smith", "npc:npc-smith"),
-            ("agent-1", "erd1buyerbuyerbuyerbuyerbuyerbuyerbuyerbuyerbuye"),
+            (
+                "agent-1",
+                "erd1buyerbuyerbuyerbuyerbuyerbuyerbuyerbuyerbuye",
+            ),
             "coding",
             "agent-1 purchased coding from npc-smith for 10Cr",
             10,
@@ -714,10 +714,7 @@ mod tests {
         {
             let escrow = m18.escrow.lock().unwrap();
             let r = escrow.records.get(&eid).unwrap();
-            assert_eq!(
-                r.status,
-                decentraai_economy::escrow::EscrowStatus::Released
-            );
+            assert_eq!(r.status, decentraai_economy::escrow::EscrowStatus::Released);
             assert_eq!(r.evidence_hash.as_deref(), Some("aa".repeat(32).as_str()));
             assert_eq!(r.provider_wallet, "agent:npc-smith".to_string());
         }

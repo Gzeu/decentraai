@@ -309,7 +309,11 @@ async fn apply_action(
             // 2. Release escrow (if any exists for this contract).
             {
                 let mut escrow = m18.escrow.lock().map_err(|e| format!("lock: {}", e))?;
-                if let Some(record) = escrow.records.values_mut().find(|r| r.contract_id == *contract_id) {
+                if let Some(record) = escrow
+                    .records
+                    .values_mut()
+                    .find(|r| r.contract_id == *contract_id)
+                {
                     record.status = decentraai_economy::escrow::EscrowStatus::Released;
                     record.updated_at = m18.current_tick();
                 }
@@ -658,24 +662,21 @@ mod tests {
         let ledger = Arc::new(StdMutex::new(ledger));
 
         // Setup: Buyer (wallet 1) needs "ocr", Seller (wallet 2) has "ocr".
-        let mut buyer = test_agent(
-            "buyer",
-            &wallet(1),
-            vec!["general".to_string()],
-        );
+        let mut buyer = test_agent("buyer", &wallet(1), vec!["general".to_string()]);
         buyer.needs = vec!["ocr".to_string()];
-        let seller = test_agent(
-            "seller",
-            &wallet(2),
-            vec!["ocr".to_string()],
-        );
+        let seller = test_agent("seller", &wallet(2), vec!["ocr".to_string()]);
         let agents = vec![buyer, seller];
 
         // --- Tick 1: Buyer assesses needs → ProposeContract to seller ---
-        let r1 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let r1 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
         assert_eq!(r1.agents_evaluated, 2);
         // Buyer should propose a contract (has need "ocr", seller has it).
-        let buyer_result = r1.agent_results.iter().find(|r| r.agent_id == "buyer").unwrap();
+        let buyer_result = r1
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "buyer")
+            .unwrap();
         assert!(
             matches!(&buyer_result.action, EconomicAction::ProposeContract { .. }),
             "buyer should propose contract, got: {:?}",
@@ -693,8 +694,13 @@ mod tests {
         }
 
         // --- Tick 2: Seller assesses → AcceptContract ---
-        let r2 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
-        let seller_result = r2.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        let r2 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
+        let seller_result = r2
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "seller")
+            .unwrap();
         assert!(
             matches!(&seller_result.action, EconomicAction::AcceptContract { .. }),
             "seller should accept contract, got: {:?}",
@@ -708,8 +714,13 @@ mod tests {
         }
 
         // --- Tick 3: Seller → StartExecution ---
-        let r3 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
-        let seller_result = r3.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        let r3 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
+        let seller_result = r3
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "seller")
+            .unwrap();
         assert!(
             matches!(&seller_result.action, EconomicAction::StartExecution { .. }),
             "seller should start execution, got: {:?}",
@@ -723,10 +734,18 @@ mod tests {
         }
 
         // --- Tick 4: Seller → CompleteContract ---
-        let r4 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
-        let seller_result = r4.agent_results.iter().find(|r| r.agent_id == "seller").unwrap();
+        let r4 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
+        let seller_result = r4
+            .agent_results
+            .iter()
+            .find(|r| r.agent_id == "seller")
+            .unwrap();
         assert!(
-            matches!(&seller_result.action, EconomicAction::CompleteContract { .. }),
+            matches!(
+                &seller_result.action,
+                EconomicAction::CompleteContract { .. }
+            ),
             "seller should complete contract, got: {:?}",
             seller_result.action
         );
@@ -738,14 +757,19 @@ mod tests {
         }
 
         // --- Tick 5: Either party → SettleContract (escrow + trust) ---
-        let r5 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
-        let settler = r5.agent_results.iter().find(|r| {
-            matches!(&r.action, EconomicAction::SettleContract { .. })
-        });
+        let r5 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
+        let settler = r5
+            .agent_results
+            .iter()
+            .find(|r| matches!(&r.action, EconomicAction::SettleContract { .. }));
         assert!(
             settler.is_some(),
             "someone should settle the contract, actions: {:?}",
-            r5.agent_results.iter().map(|r| (&r.agent_id, std::mem::discriminant(&r.action))).collect::<Vec<_>>()
+            r5.agent_results
+                .iter()
+                .map(|r| (&r.agent_id, std::mem::discriminant(&r.action)))
+                .collect::<Vec<_>>()
         );
 
         {
@@ -759,17 +783,26 @@ mod tests {
             let trust = m18.trust.lock().unwrap();
             eprintln!("trust anchors: {}", trust.anchors.len());
             for a in trust.anchors.values() {
-                eprintln!("  anchor: wallet={} evidence={} cap={}", a.agent_wallet, &a.evidence_hash[..16], a.capability);
+                eprintln!(
+                    "  anchor: wallet={} evidence={} cap={}",
+                    a.agent_wallet,
+                    &a.evidence_hash[..16],
+                    a.capability
+                );
             }
             let provider_score = trust.trust_score(&wallet(2));
             let consumer_score = trust.trust_score(&wallet(1));
-            eprintln!("provider_score={} consumer_score={}", provider_score, consumer_score);
+            eprintln!(
+                "provider_score={} consumer_score={}",
+                provider_score, consumer_score
+            );
             assert!(provider_score > 0.0, "provider should have trust score");
             assert!(consumer_score > 0.0, "consumer should have trust score");
         }
 
         // --- Tick 6: Nothing more to do (cycle complete) ---
-        let r6 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone())).await;
+        let r6 = run_world_economic_tick(&agents, &shared, &m18, tmp.path(), &Some(ledger.clone()))
+            .await;
         for result in &r6.agent_results {
             assert!(
                 matches!(&result.action, EconomicAction::Nothing),

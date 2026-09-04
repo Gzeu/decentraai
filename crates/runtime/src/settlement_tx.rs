@@ -288,7 +288,17 @@ mod tests {
 
     #[test]
     fn signable_json_omits_empty_data() {
-        let got = signable_json(8, "0", "erd1r", "erd1s", 1_000_000_000, 50_000, None, "T", 1);
+        let got = signable_json(
+            8,
+            "0",
+            "erd1r",
+            "erd1s",
+            1_000_000_000,
+            50_000,
+            None,
+            "T",
+            1,
+        );
         assert!(!got.contains("data"));
         assert!(got.starts_with("{\"nonce\":8,"));
         assert!(got.ends_with("\"version\":1}"));
@@ -342,7 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn operator_address_fails_closed_without_injection() {        // No DECENTRAAI_MX_SIGNER_* in test env → deterministic failure.
+    fn operator_address_fails_closed_without_injection() {
+        // No DECENTRAAI_MX_SIGNER_* in test env → deterministic failure.
         // (If the operator env leaks into tests, skip instead of failing.)
         if std::env::var("DECENTRAAI_MX_SIGNER_HEX").is_err()
             && std::env::var("DECENTRAAI_MX_SIGNER_HEX_FILE").is_err()
