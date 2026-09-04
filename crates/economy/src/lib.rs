@@ -27,6 +27,7 @@
 
 pub mod contract;
 pub mod contribution;
+pub mod dcai_esdt;
 pub mod engine;
 pub mod escrow;
 pub mod evidence;

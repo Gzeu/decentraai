@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
+use decentraai_economy::signer;
 use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
+use decentraai_runtime::settlement_tx;
 use decentraai_runtime::tools::{
     HfSkillsManager, HfSkillsServer, OcrManager, OcrServer, SttManager, SttServer,
     TransformersManager, TransformersServer,
@@ -146,6 +148,25 @@ enum Command {
         #[command(subcommand)]
         command: ContributionCommand,
     },
+    /// DCAI — ESDT token issuance on MultiversX testnet (zero supply,
+    /// governance-ready). Deploy to the system's owner signer
+    /// and update .decentraai/node.yaml with the token identifier.
+    ///
+    /// Usage:
+    ///   `DECENTRAAI_MX_SIGNER_HEX_FILE=... decentraai dcai issue`
+    Dcai(DcaiArgs),
+}
+#[derive(Debug, Args)]
+struct DcaiArgs {
+    #[command(subcommand)]
+    command: DcaiCommand,
+}
+/// DCAI issuance subcommands.
+#[derive(Debug, Subcommand)]
+enum DcaiCommand {
+    /// Issue DCAI (zero supply) on MultiversX testnet through the node's
+    /// settlement signer, then print the token identifier.
+    Issue(IssueArgs),
 }
 #[derive(Debug, Subcommand)]
 enum UpgradeCommand {
@@ -156,6 +177,25 @@ enum UpgradeCommand {
     Apply,
     /// Loop forever: check every interval; apply when behind.
     Auto(AutoUpgradeArgs),
+}
+#[derive(Debug, Args)]
+struct IssueArgs {
+    /// Token name (3–20 alnum). Default: "DecentraAI".
+    #[arg(long, default_value = "DecentraAI")]
+    name: String,
+    /// Token ticker (3–10 UPPERCASE alnum). Default: "DCAI".
+    #[arg(long, default_value = "DCAI")]
+    ticker: String,
+    /// Number of decimals for the token. Default: 18.
+    #[arg(long, default_value = "18")]
+    decimals: u8,
+    /// Override the settlement-signer file path instead of using the env var.
+    #[arg(long)]
+    secret_file: Option<PathBuf>,
+    /// Path to the node.yaml file that should be updated with the issued
+    /// token identifier. Default: ~/.decentraai/node.yaml
+    #[arg(long)]
+    node_config: Option<PathBuf>,
 }
 #[derive(Debug, Args)]
 struct UpgradeArgs {
@@ -955,6 +995,7 @@ async fn main() -> Result<()> {
         Command::Upgrade(args) => upgrade_command(args).await,
         Command::Bench { command } => bench_command(command).await,
         Command::Contribution { command } => contribution_command(command).await,
+        Command::Dcai(args) => dcai_command(args).await,
     }
 }
 /// One-command fresh-node onboarding (Q4): detect hardware, generate an
@@ -4071,6 +4112,16 @@ async fn serve_common(
         let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));
         state.attach_m18(m18);
     }
+    // DCAI ecosystem asset projection (None = shadow mode, Cr-only economy)
+    state.attach_dcai(config.dcai.clone());
+    if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
+        tracing::info!(
+            "DCAI configured: {}",
+            state.dcai_status()["token_identifier"]
+        );
+    } else {
+        tracing::info!("DCAI shadow mode (Cr-only economy)");
+    }
     let api_addr = serve_api(state, &bind_address, api_port).await?;
 
     decentraai_audit::record_best_effort(
@@ -5295,6 +5346,8 @@ async fn bench_command(command: BenchCommand) -> Result<()> {
 /// P14 — Compute Contribution / Credits CLI: read-only inspection of the
 /// node-local verified contribution state, credit balances/events, and
 /// placement plans.
+/// P14 — Compute Contribution / Credits: inspect node-local verified
+/// contribution state, credit balances/events, and placement plans.
 async fn contribution_command(command: ContributionCommand) -> Result<()> {
     match command {
         ContributionCommand::State { config } => {
@@ -5442,6 +5495,201 @@ async fn contribution_command(command: ContributionCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// DCAI — ESDT token issuance on MultiversX testnet (zero supply, governance-ready).
+/// Signs and broadcasts the issuance through the node's settlement signer,
+/// then updates ~/.decentraai/node.yaml with the token identifier returned by the chain.
+async fn dcai_command(args: DcaiArgs) -> Result<()> {
+    use base64::Engine as _;
+    use decentraai_economy::dcai_esdt::*;
+    use decentraai_economy::signer::TransactionSigner as _;
+
+    match args.command {
+        DcaiCommand::Issue(issue) => {
+            // Guard: ticker must be uppercase
+            if issue.ticker.chars().any(|c| c.is_lowercase()) {
+                anyhow::bail!("ticker must be UPPERCASE (e.g. DCAI)");
+            }
+            let params = IssueParams {
+                name: issue.name.clone(),
+                ticker: issue.ticker.clone(),
+                initial_supply: 0, // DCAI starts unissued — economics, not supply
+                decimals: issue.decimals,
+            };
+            params
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid params: {e}"))?;
+
+            println!(
+                "Issuing {} ({} decimals) — zero initial supply...",
+                params.name, params.decimals
+            );
+            println!("  Issuance cost: {} wei (0.05 xEGLD)", ISSUE_COST_WEI);
+
+            // Load signer from env (DECENTRAAI_MX_SIGNER_HEX / _FILE).
+            let signer = signer::load_signer_from_env()
+                .map_err(|e| anyhow::anyhow!("signer unavailable: {e}"))?;
+            let sender_hex = signer::bech32_address(&signer.verifying_key_bytes());
+            println!("  Manager account: {}", sender_hex);
+
+            let chain_id = settlement_tx::TESTNET_CHAIN_ID;
+            let gas_price = settlement_tx::SETTLEMENT_GAS_PRICE;
+            let gas_limit = ISSUE_GAS_LIMIT;
+            let version = settlement_tx::SETTLEMENT_TX_VERSION;
+
+            // Build data field — base64 for the signed envelope.
+            let data = params.build_data_field();
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+
+            // Fetch nonce from the network.
+            let api_base = "https://testnet-api.multiversx.com";
+            let current_nonce = settlement_tx::fetch_nonce(api_base, &sender_hex)
+                .await
+                .map_err(|e| anyhow::anyhow!("fetch nonce failed: {e}"))?;
+            let nonce = settlement_tx::next_nonce(current_nonce, None);
+            println!("  Nonce: {}", nonce);
+
+            // Build the unsigned JSON envelope.
+            let unsigned_json = format!(
+                r#"{{"nonce":{},"value":"{}","receiver":"{}","sender":"{}","gasPrice":{},"gasLimit":{},"data":"{}","chainID":"{}","version":{}}}"#,
+                nonce,
+                ISSUE_COST_WEI,
+                ESDT_SYSTEM_SC,
+                sender_hex,
+                gas_price,
+                gas_limit,
+                data_b64,
+                chain_id,
+                version
+            );
+
+            // Sign.
+            let sign_bytes = unsigned_json.clone().into_bytes();
+            let sig_hex = signer
+                .sign_hex(&sign_bytes)
+                .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+            let signed_json = format!(
+                "{},\"signature\":\"{}\"}}",
+                unsigned_json.trim_end_matches('}'),
+                sig_hex
+            );
+
+            // Broadcast.
+            println!("  Broadcasting...");
+            let tx_hash = settlement_tx::broadcast_tx(api_base, &signed_json)
+                .await
+                .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
+            println!(
+                "  Broadcast OK: https://testnet-explorer.multiversx.com/transactions/{}",
+                tx_hash
+            );
+
+            // Poll for confirmation.
+            let mut confirmed: Option<serde_json::Value> = None;
+            for attempt in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let status_url = format!("{}/transactions/{}", api_base, tx_hash);
+                if let Ok(resp) = reqwest::get(&status_url).await {
+                    if resp.status().is_success() {
+                        let tx_json: serde_json::Value = resp.json().await.unwrap_or_default();
+                        match tx_json.get("status").and_then(|s| s.as_str()).unwrap_or("") {
+                            "success" => {
+                                confirmed = Some(tx_json);
+                                break;
+                            }
+                            "fail" | "invalid" => {
+                                let reason = tx_json
+                                    .get("smartContractResults")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|v| v.get("data"))
+                                    .and_then(|d| d.as_str())
+                                    .map(|d| {
+                                        {
+                                            use base64::Engine as _;
+                                            base64::engine::general_purpose::STANDARD.decode(d)
+                                        }
+                                        .ok()
+                                        .and_then(|b| String::from_utf8(b).ok())
+                                        .unwrap_or_else(|| d.to_string())
+                                    })
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                anyhow::bail!("issuance tx failed on chain: {}", reason);
+                            }
+                            _ => {} // pending — keep polling
+                        }
+                    }
+                }
+                if attempt % 5 == 4 {
+                    println!("  waiting... ({}s)", (attempt + 1) * 2);
+                }
+            }
+
+            let tx =
+                confirmed.ok_or_else(|| anyhow::anyhow!("issuance tx not confirmed after 80s"))?;
+
+            // Extract token identifier from the SCR (ESDTTransfer event).
+            let token_id =
+                extract_token_identifier(&tx, params.ticker.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("issuance confirmed, but token identifier not found in SCRs")
+                })?;
+
+            println!("\n  Token identifier: {}", token_id);
+            println!("  Initial supply: 0");
+            println!("  Chain: MultiversX Testnet (chainID={})", chain_id);
+            println!("\n  Add the following to your node.yaml:");
+            println!("    dcai:");
+            println!("      token_identifier: {}", token_id);
+            println!("      chain_id: {}", chain_id);
+
+            // Optional: auto-update node.yaml.
+            if let Some(config_path) = &issue.node_config {
+                let path = expand_tilde(&config_path.to_string_lossy());
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("cannot read {}: {}", path.display(), e))?;
+
+                // Remove any existing dcai: section, then append fresh.
+                let mut out_lines: Vec<&str> = Vec::new();
+                let mut skip_dcai = false;
+                for line in raw.lines() {
+                    let indent = line.chars().take_while(|c| *c == ' ').count();
+                    if indent == 0 && line.trim() == "dcai:" {
+                        skip_dcai = true;
+                        continue;
+                    }
+                    if skip_dcai {
+                        // Any line at indent 0 ends the section.
+                        if indent == 0 && !line.trim().is_empty() {
+                            skip_dcai = false;
+                            out_lines.push(line);
+                        }
+                        continue;
+                    }
+                    out_lines.push(line);
+                }
+                let mut new_yaml = out_lines.join("\n");
+                new_yaml.push_str(&format!(
+                    "\ndcai:\n  token_identifier: {}\n  chain_id: \"{}\"\n",
+                    token_id, chain_id
+                ));
+
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, new_yaml)?;
+                std::fs::rename(&tmp, &path)?;
+
+                println!(
+                    "\n  node.yaml updated: dcai.token_identifier = {}",
+                    token_id
+                );
+                println!("  Restart the node for the change to take effect.");
+            } else {
+                println!("\n  (run with --node-config <path> to write automatically)");
+            }
+
+            Ok(())
+        }
+    }
 }
 
 /// Prints the `/v1/bench` payload as a compact comparison table. The
