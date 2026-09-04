@@ -1370,6 +1370,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentraai-proposal"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "decentraai-protocol"
 version = "1.0.0"
 dependencies = [
