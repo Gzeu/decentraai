@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
-use decentraai_economy::signer;
-use decentraai_runtime::settlement_tx;
 use clap::{Args, Parser, Subcommand};
 use decentraai_config::NodeConfig;
+use decentraai_economy::signer;
 use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
+use decentraai_runtime::settlement_tx;
 use decentraai_runtime::tools::{
     HfSkillsManager, HfSkillsServer, OcrManager, OcrServer, SttManager, SttServer,
     TransformersManager, TransformersServer,
@@ -3135,7 +3135,10 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             let dcai = config.dcai.clone();
             state.attach_dcai(dcai);
             if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
-                tracing::info!("DCAI configured: {}", state.dcai_status()["token_identifier"]);
+                tracing::info!(
+                    "DCAI configured: {}",
+                    state.dcai_status()["token_identifier"]
+                );
             } else {
                 tracing::info!("DCAI shadow mode (Cr-only economy)");
             }
@@ -4112,7 +4115,10 @@ async fn serve_common(
     // DCAI ecosystem asset projection (None = shadow mode, Cr-only economy)
     state.attach_dcai(config.dcai.clone());
     if state.dcai_status()["configured"].as_bool().unwrap_or(false) {
-        tracing::info!("DCAI configured: {}", state.dcai_status()["token_identifier"]);
+        tracing::info!(
+            "DCAI configured: {}",
+            state.dcai_status()["token_identifier"]
+        );
     } else {
         tracing::info!("DCAI shadow mode (Cr-only economy)");
     }
@@ -5511,9 +5517,14 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                 initial_supply: 0, // DCAI starts unissued — economics, not supply
                 decimals: issue.decimals,
             };
-            params.validate().map_err(|e| anyhow::anyhow!("invalid params: {e}"))?;
+            params
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid params: {e}"))?;
 
-            println!("Issuing {} ({} decimals) — zero initial supply...", params.name, params.decimals);
+            println!(
+                "Issuing {} ({} decimals) — zero initial supply...",
+                params.name, params.decimals
+            );
             println!("  Issuance cost: {} wei (0.05 xEGLD)", ISSUE_COST_WEI);
 
             // Load signer from env (DECENTRAAI_MX_SIGNER_HEX / _FILE).
@@ -5533,7 +5544,8 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
 
             // Fetch nonce from the network.
             let api_base = "https://testnet-api.multiversx.com";
-            let current_nonce = settlement_tx::fetch_nonce(api_base, &sender_hex).await
+            let current_nonce = settlement_tx::fetch_nonce(api_base, &sender_hex)
+                .await
                 .map_err(|e| anyhow::anyhow!("fetch nonce failed: {e}"))?;
             let nonce = settlement_tx::next_nonce(current_nonce, None);
             println!("  Nonce: {}", nonce);
@@ -5541,21 +5553,37 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
             // Build the unsigned JSON envelope.
             let unsigned_json = format!(
                 r#"{{"nonce":{},"value":"{}","receiver":"{}","sender":"{}","gasPrice":{},"gasLimit":{},"data":"{}","chainID":"{}","version":{}}}"#,
-                nonce, ISSUE_COST_WEI, ESDT_SYSTEM_SC, sender_hex,
-                gas_price, gas_limit, data_b64, chain_id, version
+                nonce,
+                ISSUE_COST_WEI,
+                ESDT_SYSTEM_SC,
+                sender_hex,
+                gas_price,
+                gas_limit,
+                data_b64,
+                chain_id,
+                version
             );
 
             // Sign.
             let sign_bytes = unsigned_json.clone().into_bytes();
-            let sig_hex = signer.sign_hex(&sign_bytes)
+            let sig_hex = signer
+                .sign_hex(&sign_bytes)
                 .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-            let signed_json = format!("{},\"signature\":\"{}\"}}", unsigned_json.trim_end_matches('}'), sig_hex);
+            let signed_json = format!(
+                "{},\"signature\":\"{}\"}}",
+                unsigned_json.trim_end_matches('}'),
+                sig_hex
+            );
 
             // Broadcast.
             println!("  Broadcasting...");
-            let tx_hash = settlement_tx::broadcast_tx(api_base, &signed_json).await
+            let tx_hash = settlement_tx::broadcast_tx(api_base, &signed_json)
+                .await
                 .map_err(|e| anyhow::anyhow!("broadcast failed: {e}"))?;
-            println!("  Broadcast OK: https://testnet-explorer.multiversx.com/transactions/{}", tx_hash);
+            println!(
+                "  Broadcast OK: https://testnet-explorer.multiversx.com/transactions/{}",
+                tx_hash
+            );
 
             // Poll for confirmation.
             let mut confirmed: Option<serde_json::Value> = None;
@@ -5566,9 +5594,13 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                     if resp.status().is_success() {
                         let tx_json: serde_json::Value = resp.json().await.unwrap_or_default();
                         match tx_json.get("status").and_then(|s| s.as_str()).unwrap_or("") {
-                            "success" => { confirmed = Some(tx_json); break; }
+                            "success" => {
+                                confirmed = Some(tx_json);
+                                break;
+                            }
                             "fail" | "invalid" => {
-                                let reason = tx_json.get("smartContractResults")
+                                let reason = tx_json
+                                    .get("smartContractResults")
                                     .and_then(|v| v.as_array())
                                     .and_then(|arr| arr.first())
                                     .and_then(|v| v.get("data"))
@@ -5578,9 +5610,9 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                                             use base64::Engine as _;
                                             base64::engine::general_purpose::STANDARD.decode(d)
                                         }
-                                            .ok()
-                                            .and_then(|b| String::from_utf8(b).ok())
-                                            .unwrap_or_else(|| d.to_string())
+                                        .ok()
+                                        .and_then(|b| String::from_utf8(b).ok())
+                                        .unwrap_or_else(|| d.to_string())
                                     })
                                     .unwrap_or_else(|| "unknown".to_string());
                                 anyhow::bail!("issuance tx failed on chain: {}", reason);
@@ -5589,14 +5621,19 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                         }
                     }
                 }
-                if attempt % 5 == 4 { println!("  waiting... ({}s)", (attempt + 1) * 2); }
+                if attempt % 5 == 4 {
+                    println!("  waiting... ({}s)", (attempt + 1) * 2);
+                }
             }
 
-            let tx = confirmed.ok_or_else(|| anyhow::anyhow!("issuance tx not confirmed after 80s"))?;
+            let tx =
+                confirmed.ok_or_else(|| anyhow::anyhow!("issuance tx not confirmed after 80s"))?;
 
             // Extract token identifier from the SCR (ESDTTransfer event).
-            let token_id = extract_token_identifier(&tx, params.ticker.as_str())
-                .ok_or_else(|| anyhow::anyhow!("issuance confirmed, but token identifier not found in SCRs"))?;
+            let token_id =
+                extract_token_identifier(&tx, params.ticker.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("issuance confirmed, but token identifier not found in SCRs")
+                })?;
 
             println!("\n  Token identifier: {}", token_id);
             println!("  Initial supply: 0");
@@ -5623,8 +5660,7 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                     }
                     if skip_dcai {
                         // Any line at indent 0 ends the section.
-                        let at_section_root = indent == 0 && !line.trim().is_empty();
-                        if at_section_root {
+                        if indent == 0 && !line.trim().is_empty() {
                             skip_dcai = false;
                             out_lines.push(line);
                         }
@@ -5633,13 +5669,19 @@ async fn dcai_command(args: DcaiArgs) -> Result<()> {
                     out_lines.push(line);
                 }
                 let mut new_yaml = out_lines.join("\n");
-                new_yaml.push_str(&format!("\ndcai:\n  token_identifier: {}\n  chain_id: \"{}\"\n  enabled: true\n", token_id, chain_id));
+                new_yaml.push_str(&format!(
+                    "\ndcai:\n  token_identifier: {}\n  chain_id: \"{}\"\n",
+                    token_id, chain_id
+                ));
 
                 let tmp = path.with_extension("tmp");
                 std::fs::write(&tmp, new_yaml)?;
                 std::fs::rename(&tmp, &path)?;
 
-                println!("\n  node.yaml updated: dcai.token_identifier = {}", token_id);
+                println!(
+                    "\n  node.yaml updated: dcai.token_identifier = {}",
+                    token_id
+                );
                 println!("  Restart the node for the change to take effect.");
             } else {
                 println!("\n  (run with --node-config <path> to write automatically)");
