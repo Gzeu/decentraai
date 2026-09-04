@@ -30,6 +30,7 @@ members = [
   "crates/event-bus",
   "crates/capability-registry",
   "crates/policy-engine",
+  "crates/proposal",
   "crates/introspection-api",
 ]
 resolver = "2"
