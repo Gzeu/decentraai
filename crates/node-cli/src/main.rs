@@ -5961,15 +5961,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         "idea_id": format!("idea:{}", winner.proposal_id),
         "risk": winner.risk,
         "commitment": winner.selected_action.required_commitment(),
-        "budget": {
-            "max_amount_wei": winner.estimated_cost,
-            "max_gas": 60_000,
-            "max_actions": 1,
-            "max_retries": 1,
-            "expiry_unix": now_unix + 3_600,
-            "allowed_assets": ["xegld"],
-            "allowed_destinations": ["operator"]
-        },
+        "budget": winner.budget,
         "created_by": "agent:primordial-selector",
         "steps": [
             {"id": "s1", "rationale": winner.reason,

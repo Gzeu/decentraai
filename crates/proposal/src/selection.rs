@@ -280,6 +280,9 @@ pub struct ExperimentDecision {
     pub reason: String,
     /// The action the executor must run.
     pub selected_action: ProposedAction,
+    /// Minimal-viable budget carried with the decision (so the executor
+    /// never inflates it).
+    pub budget: ExperimentBudget,
 }
 
 impl ExperimentDecision {
@@ -302,6 +305,7 @@ impl ExperimentDecision {
             novelty: breakdown.novelty_bp as u32,
             reason: candidate.reason.clone(),
             selected_action: candidate.action.clone(),
+            budget: candidate.budget.clone(),
         }
     }
 }
