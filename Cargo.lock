@@ -1454,6 +1454,7 @@ dependencies = [
  "decentraai-identity",
  "decentraai-inference-adapter",
  "decentraai-p2p",
+ "decentraai-proposal",
  "decentraai-protocol",
  "decentraai-providers",
  "decentraai-registry",

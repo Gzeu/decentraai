@@ -385,6 +385,11 @@ pub struct ApiState {
     wallet_auth_path: PathBuf,
     /// M18 Economic Layer: contracts, escrow, trust anchors.
     pub m18: Option<Arc<crate::m18::M18State>>,
+    /// M15 Research Pressure Trigger: World initiative for the autonomous
+    /// research loop. `None` (default) = the World never triggers research
+    /// on its own; attached only from the validated `research_trigger`
+    /// config section (node-cli serve path).
+    pub research_trigger: Option<Arc<crate::research_trigger::ResearchTriggerRuntime>>,
     /// DCAI ecosystem asset identifier slot. `None` = shadow mode: the
     /// Cr-only economy runs and every DCAI flow stays in its Cr-equivalent
     /// form. Set (via config, after token creation) = the same code paths
@@ -461,6 +466,7 @@ impl ApiState {
             retrieval: None,
             memory: None,
             personal_memory: None,
+            research_trigger: None,
             model_intel: None,
             model_intel_path: None,
             talent_tree: None,
@@ -778,6 +784,16 @@ impl ApiState {
     /// M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust anchors.
     pub fn attach_m18(&mut self, m18: Arc<crate::m18::M18State>) {
         self.m18 = Some(m18);
+    }
+
+    /// M15 Research Pressure Trigger: attach the validated runtime config.
+    /// Absent (default) = the tick handler reports `disabled` and changes
+    /// nothing — zero behavior delta for existing installs.
+    pub fn attach_research_trigger(
+        &mut self,
+        rt: Arc<crate::research_trigger::ResearchTriggerRuntime>,
+    ) {
+        self.research_trigger = Some(rt);
     }
 
     /// DCAI identifier slot: attach the validated config section (or
@@ -2766,6 +2782,23 @@ async fn world_tick_handler(State(state): State<ApiState>) -> Response {
     let listings = world.listings.iter().filter(|l| l.active).count();
     let events = world.events.len();
     let (supply, minted, burned) = world.treasury_report();
+    let snapshot = serde_json::to_value(&*world).unwrap_or(serde_json::Value::Null);
+    drop(world);
+    // M15 Research Pressure Trigger: the World evaluates whether IT wants
+    // research. No-op (`disabled`) when unconfigured — zero behavior delta.
+    // On Fire the EXISTING autonomous loop spawns as a bounded child
+    // (read-only/bounded lane; testnet can never arm from this path).
+    let trigger_note = match state.research_trigger.as_ref() {
+        None => "disabled".to_string(),
+        Some(rt) => {
+            let journal = rt.load_journal();
+            let (report, _) = rt.evaluate(&snapshot, &journal);
+            if report.fired {
+                rt.spawn_child();
+            }
+            report.note
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2775,6 +2808,7 @@ async fn world_tick_handler(State(state): State<ApiState>) -> Response {
             "active_listings": listings,
             "events": events,
             "treasury": {"supply": supply, "minted": minted, "burned": burned},
+            "trigger": trigger_note,
         })),
     )
         .into_response()

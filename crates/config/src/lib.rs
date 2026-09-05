@@ -49,6 +49,10 @@ pub struct NodeConfig {
     /// requests assistance on its own.
     #[serde(default)]
     pub autonomous_assist: Option<AutonomousAssistSection>,
+    /// M15 Research Pressure Trigger (Primordial World initiative).
+    /// Absent = disabled; the World never starts the research loop alone.
+    #[serde(default)]
+    pub research_trigger: Option<ResearchTriggerSection>,
     /// M16 Agent Gateway (BYOA). Absent = gateway disabled; onboarding returns 404.
     #[serde(default)]
     pub agent_gateway: Option<AgentGatewaySection>,
@@ -678,6 +682,154 @@ pub struct AssistProfileSection {
     pub payload_template: serde_json::Value,
 }
 
+/// M15 Research Pressure Trigger. Absent = disabled; the World never
+/// starts the autonomous research loop on its own. When `enabled`, the
+/// node evaluates deterministic pressure at every World tick and, on
+/// Fire, spawns the EXISTING `experiment autonomous-cycle` loop as a
+/// bounded child (read-only/bounded lane — the trigger path can NEVER
+/// pass `--enable-live-testnet`; testnet stays explicitly manual).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchTriggerSection {
+    /// Master switch. Default false: zero behavior change when absent/off.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Allow-listed operator destination for the child's micro-budget
+    /// (the loop constructs minimal-viable budgets against exactly this
+    /// address; arbitrary destinations stay denied inside the loop).
+    #[serde(default)]
+    pub operator_address: String,
+    /// Cycle budget ceiling (wei) handed to the triggered child.
+    /// 0 = observe-only (read-only candidates alone). Bounded small.
+    #[serde(default = "default_trigger_budget_wei")]
+    pub cycle_budget_wei: u64,
+    /// Ticks separating two triggers (no overlap, no busy loop).
+    #[serde(default = "default_trigger_cooldown_ticks")]
+    pub cooldown_ticks: u64,
+    /// Pressure scoring thresholds (mirrors proposal::PressureThresholds;
+    /// mapped field-by-field at the runtime edge, never imported here).
+    #[serde(default)]
+    pub thresholds: ResearchPressureThresholds,
+    /// Override the trigger-state file (default
+    /// `<data_dir>/experiments/world-trigger.json`).
+    #[serde(default)]
+    pub state_path: Option<String>,
+}
+
+fn default_trigger_budget_wei() -> u64 {
+    2_000
+}
+fn default_trigger_cooldown_ticks() -> u64 {
+    20
+}
+
+/// Scoring thresholds for the deterministic pressure detector.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchPressureThresholds {
+    #[serde(default = "default_pressure_tick_drift")]
+    pub min_tick_drift: u64,
+    #[serde(default = "default_pressure_new_events")]
+    pub min_new_events: i64,
+    #[serde(default = "default_pressure_entity_delta")]
+    pub min_entity_delta: i64,
+    #[serde(default = "default_pressure_treasury_delta")]
+    pub min_treasury_delta: i64,
+    #[serde(default = "default_pressure_refuted_burst")]
+    pub refuted_burst: u32,
+    #[serde(default = "default_pressure_revisit_ticks")]
+    pub revisit_ticks: u64,
+    #[serde(default = "default_pressure_fire_threshold")]
+    pub fire_threshold: u32,
+}
+
+impl Default for ResearchPressureThresholds {
+    fn default() -> Self {
+        Self {
+            min_tick_drift: default_pressure_tick_drift(),
+            min_new_events: default_pressure_new_events(),
+            min_entity_delta: default_pressure_entity_delta(),
+            min_treasury_delta: default_pressure_treasury_delta(),
+            refuted_burst: default_pressure_refuted_burst(),
+            revisit_ticks: default_pressure_revisit_ticks(),
+            fire_threshold: default_pressure_fire_threshold(),
+        }
+    }
+}
+
+fn default_pressure_tick_drift() -> u64 {
+    5
+}
+fn default_pressure_new_events() -> i64 {
+    1
+}
+fn default_pressure_entity_delta() -> i64 {
+    2
+}
+fn default_pressure_treasury_delta() -> i64 {
+    1
+}
+fn default_pressure_refuted_burst() -> u32 {
+    2
+}
+fn default_pressure_revisit_ticks() -> u64 {
+    50
+}
+fn default_pressure_fire_threshold() -> u32 {
+    2
+}
+
+impl ResearchTriggerSection {
+    /// Boot-time sanity. Every rule has a test below.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.operator_address.trim().is_empty() {
+            return Err("research_trigger.enabled requires `operator_address`".into());
+        }
+        if !self.operator_address.trim().is_empty()
+            && !self.operator_address.trim_start().starts_with("erd1")
+        {
+            return Err(format!(
+                "research_trigger.operator_address must be a bech32 erd1 address, got {}",
+                self.operator_address
+            ));
+        }
+        if self.cycle_budget_wei > 1_000_000 {
+            return Err(format!(
+                "research_trigger.cycle_budget_wei must be <= 1000000 (trigger stays tiny), got {}",
+                self.cycle_budget_wei
+            ));
+        }
+        if self.cooldown_ticks == 0 {
+            return Err(
+                "research_trigger.cooldown_ticks must be >= 1 (no overlapping triggers)".into(),
+            );
+        }
+        let t = &self.thresholds;
+        if t.min_tick_drift == 0 {
+            return Err("research_trigger.thresholds.min_tick_drift must be >= 1".into());
+        }
+        if t.min_new_events < 1 {
+            return Err("research_trigger.thresholds.min_new_events must be >= 1".into());
+        }
+        if t.min_entity_delta < 1 {
+            return Err("research_trigger.thresholds.min_entity_delta must be >= 1".into());
+        }
+        if t.min_treasury_delta < 1 {
+            return Err("research_trigger.thresholds.min_treasury_delta must be >= 1".into());
+        }
+        if t.refuted_burst == 0 {
+            return Err("research_trigger.thresholds.refuted_burst must be >= 1".into());
+        }
+        if t.revisit_ticks == 0 {
+            return Err("research_trigger.thresholds.revisit_ticks must be >= 1".into());
+        }
+        if t.fire_threshold == 0 {
+            return Err("research_trigger.thresholds.fire_threshold must be >= 1".into());
+        }
+        Ok(())
+    }
+}
+
 /// Fabric Intelligence configuration. Absent section = disabled; the node
 /// behaves exactly as before this feature existed.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1063,6 +1215,11 @@ impl NodeConfig {
         if let Some(gw) = &self.agent_gateway {
             gw.validate().map_err(ConfigError::Validation)?;
         }
+        if let Some(trigger) = &self.research_trigger {
+            trigger
+                .validate()
+                .map_err(|e| ConfigError::Validation(format!("research_trigger: {e}")))?;
+        }
         if let Some(dcai) = &self.dcai {
             dcai.validate()
                 .map_err(|e| ConfigError::Validation(format!("dcai: {e}")))?;
@@ -1295,6 +1452,79 @@ security:
             result.is_err(),
             "omitting require_signed_announcements must be a parse error (fail-closed)"
         );
+    }
+
+    #[test]
+    fn research_trigger_absent_is_disabled_by_default() {
+        let cfg = ResearchTriggerSection {
+            enabled: false,
+            operator_address: String::new(),
+            cycle_budget_wei: 2_000,
+            cooldown_ticks: 20,
+            thresholds: ResearchPressureThresholds::default(),
+            state_path: None,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn research_trigger_enabled_requires_operator_address() {
+        let mut cfg = ResearchTriggerSection {
+            enabled: true,
+            operator_address: String::new(),
+            cycle_budget_wei: 2_000,
+            cooldown_ticks: 20,
+            thresholds: ResearchPressureThresholds::default(),
+            state_path: None,
+        };
+        assert!(cfg.validate().is_err());
+        cfg.operator_address = "not-bech32".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.operator_address = "erd1qyu5wthldzr8wx5c9ucg8nn6ez0rrssy60u9tsq".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn research_trigger_bounds_hold() {
+        let base = ResearchTriggerSection {
+            enabled: true,
+            operator_address: "erd1abc".to_string(),
+            cycle_budget_wei: 2_000,
+            cooldown_ticks: 20,
+            thresholds: ResearchPressureThresholds::default(),
+            state_path: None,
+        };
+        let mut bad = base.clone();
+        bad.cycle_budget_wei = 1_000_001;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.cooldown_ticks = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.min_tick_drift = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.min_new_events = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.min_entity_delta = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.min_treasury_delta = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.refuted_burst = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.revisit_ticks = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = base.clone();
+        bad.thresholds.fire_threshold = 0;
+        assert!(bad.validate().is_err());
+        // Zero budget (observe-only) and tiny budgets are legal.
+        let mut ok = base.clone();
+        ok.cycle_budget_wei = 0;
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

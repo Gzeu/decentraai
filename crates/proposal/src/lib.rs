@@ -53,6 +53,7 @@ pub mod journal;
 pub mod learning;
 pub mod lenses;
 pub mod policy;
+pub mod pressure;
 pub mod protocol;
 pub mod research;
 pub mod risk;
@@ -80,6 +81,10 @@ pub use learning::{
 };
 pub use lenses::{CONSENSUS_GAIN_BONUS_BP, Lens, construct_multi_lens, lenses_agree};
 pub use policy::{DenyReason, ExecutionMode, PolicyDecision, decide};
+pub use pressure::{
+    PressureDecision, PressureSignal, PressureState, PressureThresholds, evaluate_pressure,
+    open_families, refuted_total,
+};
 pub use protocol::{
     AgentIdea, ExperimentProposal, ExperimentStep, Hypothesis, Observation, PROTOCOL_VERSION,
     ResearchQuestion, parse_proposal,

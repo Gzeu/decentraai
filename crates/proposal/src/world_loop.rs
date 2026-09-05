@@ -138,6 +138,10 @@ pub struct WorldView {
     pub entity_ids: Vec<String>,
     /// Cheapest service in `locations[].services` (None when absent).
     pub cheapest_service: Option<WorldService>,
+    /// Locations holding more entities than their capacity (crowding
+    /// pressure for M15; 0 when locations/entities are absent).
+    #[serde(default)]
+    pub crowded_locations: usize,
 }
 
 /// Parse a raw World snapshot into a typed view (pure, deterministic).
@@ -240,6 +244,32 @@ pub fn parse_world_view(
             }
         }
     }
+    // Crowding: locations holding more entities than their capacity.
+    // Counts use the raw `entities[].location_id` values (unknown or
+    // missing locations are ignored, never guessed); capacity defaults
+    // to 50 exactly like the World's own default.
+    let mut per_location: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    if let Some(ents) = world.get("entities").and_then(|v| v.as_array()) {
+        for e in ents {
+            if let Some(lid) = e.get("location_id").and_then(|v| v.as_str()) {
+                *per_location.entry(lid.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut crowded_locations = 0usize;
+    if let Some(locs) = world.get("locations").and_then(|v| v.as_array()) {
+        for loc in locs {
+            let lid = loc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let cap = loc
+                .get("capacity")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(50) as usize;
+            if !lid.is_empty() && per_location.get(lid).copied().unwrap_or(0) > cap {
+                crowded_locations += 1;
+            }
+        }
+    }
     Ok(WorldView {
         tick,
         entity_count,
@@ -249,6 +279,7 @@ pub fn parse_world_view(
         burned,
         entity_ids,
         cheapest_service: best,
+        crowded_locations,
     })
 }
 
