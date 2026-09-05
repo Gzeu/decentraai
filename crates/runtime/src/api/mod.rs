@@ -15264,6 +15264,87 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn world_tick_reports_disabled_trigger_when_unconfigured() {
+        // Zero behavior delta: without the attach, the tick response is the
+        // old shape plus the additive `trigger: "disabled"` field.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, manager) = start_stateful_api(dir.path(), None, None).await;
+        let body: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://{api}/v1/world/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["tick"].as_u64().unwrap() >= 1);
+        assert_eq!(body["trigger"], "disabled");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn world_tick_baselines_then_skips_with_attached_trigger() {
+        // M15 hook through the real HTTP surface: first tick establishes
+        // the trigger baseline (never fires), the next quiet tick skips,
+        // and the trigger-state file survives on disk (restart recovery).
+        use decentraai_proposal::pressure::PressureThresholds;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let mut state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let state_path = dir.path().join("experiments/world-trigger.json");
+        state.attach_research_trigger(std::sync::Arc::new(
+            crate::research_trigger::ResearchTriggerRuntime {
+                operator_address: "erd1trigger".to_string(),
+                cycle_budget_wei: 100,
+                thresholds: PressureThresholds::default(),
+                self_url: "http://127.0.0.1:0".to_string(),
+                master_token: None,
+                state_path: state_path.clone(),
+                journal_path: dir.path().join("experiments/research-journal.json"),
+            },
+        ));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let first: serde_json::Value = client
+            .post(format!("http://{api}/v1/world/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(first["trigger"].as_str().unwrap().contains("baseline"));
+        assert!(state_path.exists(), "trigger state must persist");
+        let second: serde_json::Value = client
+            .post(format!("http://{api}/v1/world/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let note = second["trigger"].as_str().unwrap().to_string();
+        assert!(
+            note.contains("skip"),
+            "quiet second tick must skip, got: {note}"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn open_webui_openai_surface_round_trips_through_proxy() {
         // Open WebUI connects to DecentraAI as an OpenAI-compatible backend:
         // ``/v1/models`` (a list with data[].id) and ``/v1/chat/completions``
