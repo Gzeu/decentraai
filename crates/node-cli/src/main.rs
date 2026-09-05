@@ -5953,7 +5953,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             );
         }
     }
-    let candidates = construct_candidates(&ConstructInput {
+    let candidates = construct_multi_lens(&ConstructInput {
         cycle_id: &args.cycle_id,
         observation_id: &observation.id,
         question: &question,

@@ -51,6 +51,7 @@ pub mod error;
 pub mod evidence;
 pub mod journal;
 pub mod learning;
+pub mod lenses;
 pub mod policy;
 pub mod protocol;
 pub mod research;
@@ -76,6 +77,7 @@ pub use journal::{JournalEntry, ResearchJournal, family_of};
 pub use learning::{
     ExperimentLearning, HypothesisVerdict, LearningEntry, assess, derive_learnings,
 };
+pub use lenses::{CONSENSUS_GAIN_BONUS_BP, Lens, construct_multi_lens, lenses_agree};
 pub use policy::{DenyReason, ExecutionMode, PolicyDecision, decide};
 pub use protocol::{
     AgentIdea, ExperimentProposal, ExperimentStep, Hypothesis, Observation, PROTOCOL_VERSION,
