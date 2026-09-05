@@ -2770,6 +2770,28 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 ));
             }
         }
+        // M15 Research Pressure Trigger (World initiative). Opt-in via the
+        // validated `research_trigger` config section; absent/disabled = the
+        // tick handler reports `disabled` and nothing else changes. This is
+        // the `node` serve path (the systemd service runs through here).
+        if let Some(trigger_cfg) = config.research_trigger.as_ref() {
+            if trigger_cfg.enabled {
+                let rt = decentraai_runtime::research_trigger::ResearchTriggerRuntime::from_config(
+                    trigger_cfg,
+                    config.inference.api_port,
+                    &data_dir,
+                    token.clone(),
+                );
+                tracing::info!(
+                    "research-trigger: enabled (operator {}, budget {} wei, cooldown {} ticks, state {})",
+                    rt.operator_address,
+                    rt.cycle_budget_wei,
+                    trigger_cfg.cooldown_ticks,
+                    rt.state_path.display()
+                );
+                state.attach_research_trigger(std::sync::Arc::new(rt));
+            }
+        }
 
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
@@ -4227,6 +4249,27 @@ async fn serve_common(
         );
     } else {
         tracing::info!("DCAI shadow mode (Cr-only economy)");
+    }
+    // M15 Research Pressure Trigger (World initiative). Opt-in via the
+    // validated `research_trigger` config section; absent/disabled = the
+    // tick handler reports `disabled` and nothing else changes.
+    if let Some(trigger_cfg) = config.research_trigger.as_ref() {
+        if trigger_cfg.enabled {
+            let rt = decentraai_runtime::research_trigger::ResearchTriggerRuntime::from_config(
+                trigger_cfg,
+                api_port,
+                &data_dir,
+                token.clone(),
+            );
+            tracing::info!(
+                "research-trigger: enabled (operator {}, budget {} wei, cooldown {} ticks, state {})",
+                rt.operator_address,
+                rt.cycle_budget_wei,
+                trigger_cfg.cooldown_ticks,
+                rt.state_path.display()
+            );
+            state.attach_research_trigger(std::sync::Arc::new(rt));
+        }
     }
     let api_addr = serve_api(state, &bind_address, api_port).await?;
 
@@ -5878,12 +5921,22 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     // World mode keeps the RAW snapshot too: the loop consumes it
     // incrementally (cursor gate) and projects research back as a mission.
     let mut world_snapshot: Option<serde_json::Value> = None;
+    // Trigger-spawned children carry the token via env (never argv).
+    let token_env: Option<String> = std::env::var(world_bridge::WORLD_TOKEN_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
     let obs_v: serde_json::Value = match (&args.world_url, &args.observation) {
         (Some(url), _) => {
             let token = args
                 .world_token
                 .as_deref()
-                .context("--world-token required with --world-url")?;
+                .or(token_env.as_deref())
+                .with_context(|| {
+                    format!(
+                        "--world-token or {} required with --world-url",
+                        world_bridge::WORLD_TOKEN_ENV
+                    )
+                })?;
             let snap = world_bridge::fetch_world_snapshot(url, token).await?;
             let obs = world_bridge::observation_from_world(&snap)?;
             world_snapshot = Some(snap);
@@ -6162,7 +6215,11 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     // The returned task id (if any) seals the research-graph node below.
     let mut world_mission_task: Option<String> = None;
     if let Some(url) = &args.world_url {
-        let token = args.world_token.as_deref().unwrap_or("");
+        let token = args
+            .world_token
+            .as_deref()
+            .or(token_env.as_deref())
+            .unwrap_or("");
         let body = world_bridge::mission_body(
             &format!("Research: {}", winner.hypothesis_id),
             &format!(

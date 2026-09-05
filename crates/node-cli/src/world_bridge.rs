@@ -13,6 +13,11 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// Env var fallback for the World API token (used by trigger-spawned
+/// children, which never receive secrets via argv). Must stay identical
+/// to `decentraai_runtime::research_trigger::WORLD_TOKEN_ENV`.
+pub const WORLD_TOKEN_ENV: &str = "DECENTRAAI_WORLD_TOKEN";
+
 /// Build a typed observation from the real world snapshot.
 /// Deterministic shaping over whatever the node actually exposes:
 /// `tick`, entity/event counts, mission presence — no invented facts.
