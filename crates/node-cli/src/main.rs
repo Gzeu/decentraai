@@ -5979,10 +5979,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         if lens_map.is_empty() {
             println!("world-lenses: World has no entities — lenses run unattributed (no fakes)");
         } else {
-            let mut parts: Vec<String> = lens_map
-                .iter()
-                .map(|(l, e)| format!("{l}→{e}"))
-                .collect();
+            let mut parts: Vec<String> = lens_map.iter().map(|(l, e)| format!("{l}→{e}")).collect();
             parts.sort();
             println!("world-lenses: {}", parts.join(" "));
         }
@@ -5994,7 +5991,10 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
                     .to_json()
                     .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
             )?;
-            println!("agent decision: SKIP (no information gain) — cursor advanced to tick {}", view.tick);
+            println!(
+                "agent decision: SKIP (no information gain) — cursor advanced to tick {}",
+                view.tick
+            );
             return Ok(());
         }
         world_view = Some(view);
@@ -6121,7 +6121,10 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
                         .to_json()
                         .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
                 )?;
-                println!("world-cursor: advanced to tick {} (no candidate)", view.tick);
+                println!(
+                    "world-cursor: advanced to tick {} (no candidate)",
+                    view.tick
+                );
             }
             return Ok(());
         }
@@ -6191,7 +6194,10 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
                     .to_json()
                     .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
             )?;
-            println!("world-cursor: advanced to tick {} (policy deny consumed)", view.tick);
+            println!(
+                "world-cursor: advanced to tick {} (policy deny consumed)",
+                view.tick
+            );
         }
         anyhow::bail!("policy DENIED the agent's choice: {decision:?}");
     };
@@ -6280,12 +6286,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             let (provider, cost) = view
                 .cheapest_service
                 .as_ref()
-                .map(|s| {
-                    (
-                        format!("{}/{}", s.location_id, s.capability),
-                        s.price,
-                    )
-                })
+                .map(|s| (format!("{}/{}", s.location_id, s.capability), s.price))
                 .unzip();
             world_graph.append(ResearchTrace {
                 trace_id: ResearchTrace::make_trace_id(view.tick, &observation.id),
@@ -6323,9 +6324,15 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             )?;
             println!(
                 "world-trace:  {} activity={} next={}",
-                world_graph.last().map(|t| t.trace_id.as_str()).unwrap_or("-"),
+                world_graph
+                    .last()
+                    .map(|t| t.trace_id.as_str())
+                    .unwrap_or("-"),
                 activity_state.slug(),
-                world_graph.last().map(|t| t.next_question.as_str()).unwrap_or("-")
+                world_graph
+                    .last()
+                    .map(|t| t.next_question.as_str())
+                    .unwrap_or("-")
             );
         }
         return Ok(());
@@ -6365,7 +6372,10 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
                 let advanced = world_cursor.advanced(view);
                 if let Ok(json) = advanced.to_json() {
                     let _ = persist_json_atomic(&cursor_path, &json);
-                    eprintln!("world-cursor: advanced to tick {} (auth deny consumed)", view.tick);
+                    eprintln!(
+                        "world-cursor: advanced to tick {} (auth deny consumed)",
+                        view.tick
+                    );
                 }
             }
             anyhow::anyhow!("authorization DENIED: {e}")
@@ -6567,7 +6577,10 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         )?;
         println!(
             "world-trace:  {} activity={}",
-            world_graph.last().map(|t| t.trace_id.as_str()).unwrap_or("-"),
+            world_graph
+                .last()
+                .map(|t| t.trace_id.as_str())
+                .unwrap_or("-"),
             activity_state.slug()
         );
     }
@@ -6635,7 +6648,10 @@ fn print_next_preview(
     curiosity: &decentraai_proposal::CuriosityState,
     cycle: &decentraai_proposal::CycleState,
 ) {
-    println!("next-preview: {}", next_preview_id(candidates, store, curiosity, cycle));
+    println!(
+        "next-preview: {}",
+        next_preview_id(candidates, store, curiosity, cycle)
+    );
 }
 
 /// Pure preview id for the research-graph `next_question` field.

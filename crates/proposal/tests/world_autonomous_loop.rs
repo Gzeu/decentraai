@@ -8,11 +8,11 @@
 //! seal → cursor advance → next tick re-gates on the NEW World event.
 
 use decentraai_proposal::{
-    ActivityLedger, CuriosityState, CycleState, ExperimentOutcome, HypothesisVerdict,
-    ResearchActivity, ResearchGraph, ResearchJournal, ResearchTrace, WorldCursor, assign_lenses,
-    compute_deltas, construct_multi_lens, diff_world, economy_note, evaluate_outcome,
-    extract_signals, generate_hypothesis, generate_question, parse_world_view, select_experiment,
-    ConstructInput, ExperimentStore, ObservationSnapshot,
+    ActivityLedger, ConstructInput, CuriosityState, CycleState, ExperimentOutcome, ExperimentStore,
+    HypothesisVerdict, ObservationSnapshot, ResearchActivity, ResearchGraph, ResearchJournal,
+    ResearchTrace, WorldCursor, assign_lenses, compute_deltas, construct_multi_lens, diff_world,
+    economy_note, evaluate_outcome, extract_signals, generate_hypothesis, generate_question,
+    parse_world_view, select_experiment,
 };
 use std::collections::BTreeMap;
 
@@ -51,7 +51,14 @@ fn snapshot_b() -> serde_json::Value {
     })
 }
 
-fn obs_text(view_tick: u64, entities: usize, events: usize, mission: u64, minted: u64, burned: u64) -> String {
+fn obs_text(
+    view_tick: u64,
+    entities: usize,
+    events: usize,
+    mission: u64,
+    minted: u64,
+    burned: u64,
+) -> String {
     format!(
         "world tick {view_tick} entities {entities} events {events} mission {mission} minted {minted} burned {burned}"
     )
@@ -64,9 +71,16 @@ fn golden_world_event_to_learning_to_new_world_event() {
     assert!(cursor.is_fresh());
     let view_a = parse_world_view(&snapshot_a()).unwrap();
     assert_eq!(view_a.tick, 100);
-    assert_eq!(view_a.entity_ids, vec!["agent-a".to_string(), "agent-b".to_string()]);
+    assert_eq!(
+        view_a.entity_ids,
+        vec!["agent-a".to_string(), "agent-b".to_string()]
+    );
     let delta_a = diff_world(&cursor, &view_a);
-    assert!(delta_a.should_research, "fresh cursor must research: {}", delta_a.reason);
+    assert!(
+        delta_a.should_research,
+        "fresh cursor must research: {}",
+        delta_a.reason
+    );
 
     // Observation shaped exactly like world_bridge::observation_from_world.
     let obs_id_a = format!("obs:world:{}", view_a.tick);
@@ -153,14 +167,22 @@ fn golden_world_event_to_learning_to_new_world_event() {
     assert_eq!(activity_state, ResearchActivity::Trading);
     let mut ledger = ActivityLedger::new();
     for (lens, eid) in &lens_map {
-        ledger.set(eid, activity_state, &format!("{lens}: golden research"), view_a.tick);
+        ledger.set(
+            eid,
+            activity_state,
+            &format!("{lens}: golden research"),
+            view_a.tick,
+        );
     }
     // Restart survival: serialize → reload → identical.
     let ledger_back = ActivityLedger::from_json(&ledger.to_json().unwrap()).unwrap();
     assert_eq!(ledger, ledger_back);
 
     // Research graph node seals the FULL chain with stable ids.
-    let cheapest = view_a.cheapest_service.clone().expect("locations expose services");
+    let cheapest = view_a
+        .cheapest_service
+        .clone()
+        .expect("locations expose services");
     let mut graph = ResearchGraph::new();
     graph.append(ResearchTrace {
         trace_id: ResearchTrace::make_trace_id(view_a.tick, &obs_id_a),
@@ -183,7 +205,10 @@ fn golden_world_event_to_learning_to_new_world_event() {
     let trace = &graph.traces[0];
     assert_eq!(trace.trace_id, ResearchTrace::make_trace_id(100, &obs_id_a));
     assert_eq!(trace.mission_task_id, Some("task-test-1".to_string()));
-    assert_eq!(trace.provider, Some("research-lab-main/inference".to_string()));
+    assert_eq!(
+        trace.provider,
+        Some("research-lab-main/inference".to_string())
+    );
     assert_eq!(trace.cost, Some(5));
     let graph_back = ResearchGraph::from_json(&graph.to_json().unwrap()).unwrap();
     assert_eq!(graph, graph_back);

@@ -141,7 +141,9 @@ pub struct WorldView {
 }
 
 /// Parse a raw World snapshot into a typed view (pure, deterministic).
-pub fn parse_world_view(world: &serde_json::Value) -> Result<WorldView, crate::error::ProposalError> {
+pub fn parse_world_view(
+    world: &serde_json::Value,
+) -> Result<WorldView, crate::error::ProposalError> {
     let err = |m: &str| crate::error::ProposalError::Parse(m.to_string());
     let tick = world
         .get("tick")
@@ -224,8 +226,11 @@ pub fn parse_world_view(world: &serde_json::Value) -> Result<WorldView, crate::e
                     let better = match &best {
                         None => true,
                         Some(b) => {
-                            (cand.price, cand.capability.clone(), cand.location_id.clone())
-                                < (b.price, b.capability.clone(), b.location_id.clone())
+                            (
+                                cand.price,
+                                cand.capability.clone(),
+                                cand.location_id.clone(),
+                            ) < (b.price, b.capability.clone(), b.location_id.clone())
                         }
                     };
                     if better {
@@ -706,7 +711,12 @@ mod tests {
         let g2 = ResearchGraph::from_json(&g.to_json().unwrap()).unwrap();
         assert_eq!(g, g2);
         let mut l = ActivityLedger::new();
-        l.set("agent-a", ResearchActivity::Working, "probing transfer-health", 100);
+        l.set(
+            "agent-a",
+            ResearchActivity::Working,
+            "probing transfer-health",
+            100,
+        );
         let l2 = ActivityLedger::from_json(&l.to_json().unwrap()).unwrap();
         assert_eq!(l, l2);
     }
