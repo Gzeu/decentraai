@@ -160,15 +160,6 @@ pub fn family_uncertainty(curiosity: &CuriosityState, family: &str) -> u32 {
     curiosity.uncertainty_bp(&probe)
 }
 
-/// Deterministic family hash of a question (fits experiment id space).
-fn fam_hash(question: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    question.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
 /// Bounded parameter grid for economic probes (wei). Small enough to
 /// stay inside any sane testnet cycle budget; large enough that deltas
 /// remain measurable. Never includes amounts above `cycle_max_wei/2`.
@@ -206,6 +197,8 @@ pub struct ConstructInput<'a> {
     pub store: &'a ExperimentStore,
     /// Curiosity state (family closure probes).
     pub curiosity: &'a CuriosityState,
+    /// v0.5: research journal — dead families (refuted ≥2) are skipped.
+    pub journal: Option<&'a crate::journal::ResearchJournal>,
     /// Cycle budget ceiling (economic candidates ⊆ budget/2 each).
     pub cycle_max_wei: u64,
     /// Allow-listed operator destination.
@@ -218,19 +211,23 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
     let ConstructInput {
         cycle_id,
         observation_id,
-        question,
+        question: _question,
         deltas,
         store,
         curiosity,
+        journal,
         cycle_max_wei,
         operator_destination,
         now_unix,
     } = *input;
     let curiosity_json = curiosity.to_json().unwrap_or_default();
     let mut out: Vec<CandidateExperiment> = Vec::new();
-    let famh = fam_hash(question);
-    let health_family = format!("transfer-health:{famh}");
-    let health_closed = family_closed(&curiosity_json, &health_family);
+    // v0.5: families are STABLE across cycles (they name the research
+    // domain, not the question instance) — this is what makes learning
+    // longitudinal instead of per-cycle.
+    let health_family = "transfer-health".to_string();
+    let health_closed = family_closed(&curiosity_json, &health_family)
+        || journal.is_some_and(|j| j.family_is_dead(&health_family));
 
     // (1) Economic probe on the smallest unseen grid amount.
     if !health_closed {
@@ -339,8 +336,10 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
 
     // (3) Delta probe (read-only): the top changed signal must appear
     // in the observation — hypothesis family `signal-delta`.
-    let delta_family = format!("signal-delta:{famh}");
-    if family_closed(&curiosity_json, &delta_family) {
+    let delta_family = "signal-delta".to_string();
+    let delta_closed = family_closed(&curiosity_json, &delta_family)
+        || journal.is_some_and(|j| j.family_is_dead(&delta_family));
+    if delta_closed {
         out.truncate(MAX_CONSTRUCTED);
         return out;
     }

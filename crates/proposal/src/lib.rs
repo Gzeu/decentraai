@@ -49,6 +49,7 @@ pub mod curiosity;
 pub mod economic;
 pub mod error;
 pub mod evidence;
+pub mod journal;
 pub mod learning;
 pub mod policy;
 pub mod protocol;
@@ -71,6 +72,7 @@ pub use economic::{
 };
 pub use error::ProposalError;
 pub use evidence::{EvidenceLog, ExperimentEvidence, ExperimentOutcome, TestnetEvidence};
+pub use journal::{JournalEntry, ResearchJournal, family_of};
 pub use learning::{
     ExperimentLearning, HypothesisVerdict, LearningEntry, assess, derive_learnings,
 };

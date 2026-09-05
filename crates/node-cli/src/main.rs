@@ -5900,6 +5900,15 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         CuriosityState::new()
     };
     let mut cycle = CycleState::new(&args.cycle_id, args.cycle_budget_wei);
+    // v0.5: persistent research journal (durable across restarts).
+    let journal_path = expand_tilde("~/.decentraai/experiments/research-journal.json");
+    let mut journal = if journal_path.exists() {
+        ResearchJournal::from_json(&std::fs::read_to_string(&journal_path)?)
+            .map_err(|e| anyhow::anyhow!("journal reload failed: {e}"))?
+    } else {
+        ResearchJournal::new()
+    };
+    println!("journal:      {}", journal.research_report());
 
     // 3. Agent's reasoning chain: detect uncertainty → question → hypothesis.
     let uncertainty_domain = curiosity.detect_uncertainty();
@@ -5951,6 +5960,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         deltas: &deltas,
         store: &store,
         curiosity: &curiosity,
+        journal: Some(&journal),
         cycle_max_wei: args.cycle_budget_wei,
         operator_destination: &args.operator,
         now_unix,
@@ -6061,6 +6071,23 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             "verdict:      {verdict:?} (inferred from criterion {:?})",
             winner.criterion
         );
+        journal.record(
+            &args.cycle_id,
+            &winner.hypothesis_id,
+            verdict,
+            &evidence.id,
+            now_unix * 1_000,
+        );
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &journal_path,
+            journal
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("journal serialize: {e}"))?,
+        )?;
+        println!("journal:      {}", journal.research_report());
         print_next_preview(&candidates, &store, &curiosity, &cycle);
         return Ok(());
     }
@@ -6215,6 +6242,24 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         &evidence.hash[..4]
     );
     println!("learning:     execution=success experiment=success hypothesis={verdict:?}");
+    // v0.5: append to the persistent research line.
+    journal.record(
+        &args.cycle_id,
+        &winner.hypothesis_id,
+        verdict,
+        &evidence.id,
+        now_unix * 1_000,
+    );
+    if let Some(parent) = journal_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &journal_path,
+        journal
+            .to_json()
+            .map_err(|e| anyhow::anyhow!("journal serialize: {e}"))?,
+    )?;
+    println!("journal:      {}", journal.research_report());
     print_next_preview(&candidates, &store, &curiosity, &cycle);
     println!(
         "\n{}",
