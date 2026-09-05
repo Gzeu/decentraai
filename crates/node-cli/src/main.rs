@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod upgrade;
+mod world_bridge;
 
 #[derive(Debug, Parser)]
 #[command(name = "decentraai", version, about = "DecentraAI node control CLI")]
@@ -219,8 +220,18 @@ struct TestnetRunArgs {
 struct AutonomousCycleArgs {
     /// Path to the observation JSON: `{ id, text, source }` (real world
     /// observation — the operator provides facts, the agent decides).
+    /// Optional when --world-url is given (observation derived from the
+    /// live World snapshot instead of a file).
     #[arg(long)]
-    observation: PathBuf,
+    observation: Option<PathBuf>,
+    /// World API base URL (e.g. http://127.0.0.1:8080). When set, the
+    /// cycle observes the REAL World and posts the selected research as a
+    /// World mission (typed activity) instead of a file-based observation.
+    #[arg(long)]
+    world_url: Option<String>,
+    /// Auth token for the World API (consumer or master key).
+    #[arg(long)]
+    world_token: Option<String>,
     /// Operator destination allow-listed for micro-transfers (self).
     #[arg(long)]
     operator: String,
@@ -5850,11 +5861,25 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // 1. Observation in (facts from the operator; the choice is the agent's).
-    let obs_raw = std::fs::read_to_string(&args.observation)
-        .with_context(|| format!("reading observation {}", args.observation.display()))?;
-    let obs_v: serde_json::Value =
-        serde_json::from_str(&obs_raw).context("observation is not valid JSON")?;
+    // 1. Observation in: either a real World snapshot (--world-url) or a
+    // file of facts from the operator. The choice remains the agent's.
+    let obs_v: serde_json::Value = match (&args.world_url, &args.observation) {
+        (Some(url), _) => {
+            let token = args
+                .world_token
+                .as_deref()
+                .context("--world-token required with --world-url")?;
+            world_bridge::fetch_world_observation(url, token).await?
+        }
+        (None, Some(path)) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading observation {}", path.display()))?;
+            serde_json::from_str(&raw).context("observation is not valid JSON")?
+        }
+        (None, None) => {
+            anyhow::bail!("either --observation <file> or --world-url + --world-token is required")
+        }
+    };
     let observation = Observation {
         id: obs_v
             .get("id")
@@ -6022,6 +6047,28 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     });
     let proposal = parse_proposal(&proposal_value.to_string())
         .map_err(|e| anyhow::anyhow!("winner failed validation: {e}"))?;
+    // World integration: the selected research becomes a REAL World
+    // activity (mission in hub + world record) — never a parallel sim.
+    if let Some(url) = &args.world_url {
+        let token = args.world_token.as_deref().unwrap_or("");
+        let body = world_bridge::mission_body(
+            &format!("Research: {}", winner.hypothesis_id),
+            &format!(
+                "cycle={} proposal={} cost={}wei gain={}bp — {}",
+                args.cycle_id,
+                winner.proposal_id,
+                winner.estimated_cost,
+                winner.expected_information_gain,
+                winner.reason
+            ),
+            10,
+        );
+        match world_bridge::post_research_mission(url, token, &body).await {
+            Ok(Some(task_id)) => println!("world:        mission posted → task {task_id}"),
+            Ok(None) => println!("world:        existing mission kept (agent continues)"),
+            Err(e) => println!("world:        mission post failed (non-fatal): {e}"),
+        }
+    }
     let decision = decide(&proposal, &DenyAllEconomicAuthorization, now_unix);
     let PolicyDecision::Allow { mode } = &decision else {
         anyhow::bail!("policy DENIED the agent's choice: {decision:?}");
