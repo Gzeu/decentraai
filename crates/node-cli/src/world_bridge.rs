@@ -14,30 +14,41 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 /// Build a typed observation from the real world snapshot.
-/// Deterministic shaping: `tick`, `treasury_minted`, `treasury_burned`
-/// plus agent count — the same fields the v0.4/v0.5 live cycles used,
-/// now sourced from the node instead of hand-written JSON.
+/// Deterministic shaping over whatever the node actually exposes:
+/// `tick`, entity/event counts, mission presence — no invented facts.
 pub fn observation_from_world(world: &Value) -> Result<Value> {
     let tick = world
         .get("tick")
         .and_then(Value::as_u64)
         .context("world snapshot lacks tick")?;
+    let entities = world
+        .get("entities")
+        .or_else(|| world.get("agents"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let events = world
+        .get("events")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mission = world.get("mission_task_id").is_some_and(|v| !v.is_null());
+    // Treasury counters live in the raw projection file; when the API
+    // exposes them (nested or flat), include — otherwise omit honestly.
+    let t = world.get("economy").and_then(|e| e.get("treasury"));
     let minted = world
         .get("treasury_minted")
+        .or_else(|| t.and_then(|x| x.get("minted")))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let burned = world
         .get("treasury_burned")
+        .or_else(|| t.and_then(|x| x.get("burned")))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let agents = world
-        .get("agents")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
     Ok(serde_json::json!({
         "id": format!("obs:world:{tick}"),
         "text": format!(
-            "treasury minted {minted} burned {burned} tick {tick} agents {agents}"
+            "world tick {tick} entities {entities} events {events} mission {} minted {minted} burned {burned}",
+            if mission { 1 } else { 0 }
         ),
         "source": "world",
     }))
@@ -109,9 +120,10 @@ mod tests {
     fn world() -> Value {
         serde_json::json!({
             "tick": 344,
-            "treasury_minted": 6090,
-            "treasury_burned": 255,
-            "agents": [{"id": "a"}, {"id": "b"}]
+            "entities": [{"id": "a"}, {"id": "b"}],
+            "events": [{"kind": "x"}],
+            "agents": [{"id": "a"}, {"id": "b"}],
+            "economy": {"treasury": {"minted": 6090, "burned": 255}}
         })
     }
 
@@ -122,8 +134,9 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a["id"], "obs:world:344");
         assert_eq!(a["source"], "world");
+        assert!(a["text"].as_str().unwrap().contains("tick 344"));
+        assert!(a["text"].as_str().unwrap().contains("entities 2"));
         assert!(a["text"].as_str().unwrap().contains("minted 6090"));
-        assert!(a["text"].as_str().unwrap().contains("agents 2"));
     }
 
     #[test]
