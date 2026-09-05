@@ -60,6 +60,7 @@ pub mod sandbox;
 pub mod selection;
 pub mod store;
 pub mod testnet;
+pub mod world_loop;
 
 pub use action::ProposedAction;
 pub use budget::{
@@ -99,4 +100,8 @@ pub use selection::{
 pub use store::{AttemptInfo, ExperimentRecord, ExperimentStatus, ExperimentStore};
 pub use testnet::{
     AuthorizedTransfer, TestnetExecutor, TestnetReport, execute_testnet_experiment, transfer_totals,
+};
+pub use world_loop::{
+    ActivityLedger, ResearchActivity, ResearchGraph, ResearchTrace, TICK_DRIFT_GATE, WorldCursor,
+    WorldDelta, WorldService, WorldView, assign_lenses, diff_world, economy_note, parse_world_view,
 };

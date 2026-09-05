@@ -195,7 +195,7 @@ enum ExperimentCommand {
     /// authorization → bounded execution → evidence (with post-mortem
     /// selection record) → learning → curiosity update → next-decision
     /// preview. At most one experiment executes per invocation.
-    AutonomousCycle(AutonomousCycleArgs),
+    AutonomousCycle(Box<AutonomousCycleArgs>),
 }
 #[derive(Debug, Args)]
 struct TestnetRunArgs {
@@ -257,6 +257,18 @@ struct AutonomousCycleArgs {
     /// Default: ~/.decentraai/experiments/observations.json
     #[arg(long)]
     snapshot: Option<PathBuf>,
+    /// Durable World cursor (incremental consumption across ticks).
+    /// Default: ~/.decentraai/experiments/world-cursor.json
+    #[arg(long)]
+    world_cursor: Option<PathBuf>,
+    /// Durable research graph (WorldEvent→…→Next Question chain).
+    /// Default: ~/.decentraai/experiments/world-graph.json
+    #[arg(long)]
+    world_graph: Option<PathBuf>,
+    /// Durable agent activity ledger (Exploring/Working/Trading/Resting).
+    /// Default: ~/.decentraai/experiments/world-activity.json
+    #[arg(long)]
+    world_activity: Option<PathBuf>,
     /// Override the settlement-signer file path instead of env.
     #[arg(long)]
     secret_file: Option<PathBuf>,
@@ -5863,13 +5875,19 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
 
     // 1. Observation in: either a real World snapshot (--world-url) or a
     // file of facts from the operator. The choice remains the agent's.
+    // World mode keeps the RAW snapshot too: the loop consumes it
+    // incrementally (cursor gate) and projects research back as a mission.
+    let mut world_snapshot: Option<serde_json::Value> = None;
     let obs_v: serde_json::Value = match (&args.world_url, &args.observation) {
         (Some(url), _) => {
             let token = args
                 .world_token
                 .as_deref()
                 .context("--world-token required with --world-url")?;
-            world_bridge::fetch_world_observation(url, token).await?
+            let snap = world_bridge::fetch_world_snapshot(url, token).await?;
+            let obs = world_bridge::observation_from_world(&snap)?;
+            world_snapshot = Some(snap);
+            obs
         }
         (None, Some(path)) => {
             let raw = std::fs::read_to_string(path)
@@ -5902,6 +5920,85 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             .unwrap_or(now_unix * 1_000),
     };
     println!("observation: {} — {}", observation.id, observation.text);
+
+    // 1b. World autonomous loop gate (v0.7): incremental consumption.
+    // The Mind tracks the last processed tick/event/mission/treasury and
+    // generates a new question ONLY when information gain justifies it.
+    // A SKIP still advances the cursor atomically (durable, restart-safe).
+    let mut world_view: Option<WorldView> = None;
+    let cursor_path = args
+        .world_cursor
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/world-cursor.json"));
+    let graph_path = args
+        .world_graph
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/world-graph.json"));
+    let activity_path = args
+        .world_activity
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/world-activity.json"));
+    let mut world_cursor = if cursor_path.exists() {
+        WorldCursor::from_json(&std::fs::read_to_string(&cursor_path)?)
+            .map_err(|e| anyhow::anyhow!("world cursor reload failed: {e}"))?
+    } else {
+        WorldCursor::default()
+    };
+    let mut world_graph = if graph_path.exists() {
+        ResearchGraph::from_json(&std::fs::read_to_string(&graph_path)?)
+            .map_err(|e| anyhow::anyhow!("world graph reload failed: {e}"))?
+    } else {
+        ResearchGraph::new()
+    };
+    let mut activity_ledger = if activity_path.exists() {
+        ActivityLedger::from_json(&std::fs::read_to_string(&activity_path)?)
+            .map_err(|e| anyhow::anyhow!("activity reload failed: {e}"))?
+    } else {
+        ActivityLedger::new()
+    };
+    if let Some(snap) = &world_snapshot {
+        let view = parse_world_view(snap).map_err(|e| anyhow::anyhow!("world view: {e}"))?;
+        let delta = diff_world(&world_cursor, &view);
+        println!(
+            "world:        tick={} entities={} events={} mission={} minted={} burned={}",
+            view.tick,
+            view.entity_count,
+            view.event_count,
+            view.mission_task_id.as_deref().unwrap_or("-"),
+            view.minted,
+            view.burned
+        );
+        println!("world-delta:  {}", delta.reason);
+        if let Some(svc) = &view.cheapest_service {
+            println!(
+                "world-market: cheapest {} @ {} ({} cr) — recorded, selection stays cheapest-first",
+                svc.capability, svc.location_id, svc.price
+            );
+        }
+        let lens_map = assign_lenses(&view.entity_ids);
+        if lens_map.is_empty() {
+            println!("world-lenses: World has no entities — lenses run unattributed (no fakes)");
+        } else {
+            let mut parts: Vec<String> = lens_map
+                .iter()
+                .map(|(l, e)| format!("{l}→{e}"))
+                .collect();
+            parts.sort();
+            println!("world-lenses: {}", parts.join(" "));
+        }
+        if !delta.should_research {
+            world_cursor = world_cursor.advanced(&view);
+            persist_json_atomic(
+                &cursor_path,
+                &world_cursor
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
+            )?;
+            println!("agent decision: SKIP (no information gain) — cursor advanced to tick {}", view.tick);
+            return Ok(());
+        }
+        world_view = Some(view);
+    }
 
     // 2. Durable state in (store + curiosity; created when absent).
     let store_path = args
@@ -5961,12 +6058,9 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     };
     let signals = extract_signals(&observation.text);
     let deltas = compute_deltas(&mut snapshot, &signals);
-    if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
+    persist_json_atomic(
         &snapshot_path,
-        snapshot
+        &snapshot
             .to_json()
             .map_err(|e| anyhow::anyhow!("snapshot serialize: {e}"))?,
     )?;
@@ -6016,6 +6110,19 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         Ok(w) => w,
         Err(reason) => {
             println!("agent decision: NO VALID CANDIDATE ({reason:?}) — nothing executes");
+            // LIVE LESSON (cycle world-003): a consumed observation must
+            // advance the cursor on EVERY exit path — otherwise a denied or
+            // empty cycle re-asks forever instead of waiting for new gain.
+            if let Some(view) = &world_view {
+                world_cursor = world_cursor.advanced(view);
+                persist_json_atomic(
+                    &cursor_path,
+                    &world_cursor
+                        .to_json()
+                        .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
+                )?;
+                println!("world-cursor: advanced to tick {} (no candidate)", view.tick);
+            }
             return Ok(());
         }
     };
@@ -6049,6 +6156,8 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("winner failed validation: {e}"))?;
     // World integration: the selected research becomes a REAL World
     // activity (mission in hub + world record) — never a parallel sim.
+    // The returned task id (if any) seals the research-graph node below.
+    let mut world_mission_task: Option<String> = None;
     if let Some(url) = &args.world_url {
         let token = args.world_token.as_deref().unwrap_or("");
         let body = world_bridge::mission_body(
@@ -6064,13 +6173,26 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             10,
         );
         match world_bridge::post_research_mission(url, token, &body).await {
-            Ok(Some(task_id)) => println!("world:        mission posted → task {task_id}"),
+            Ok(Some(task_id)) => {
+                println!("world:        mission posted → task {task_id}");
+                world_mission_task = Some(task_id);
+            }
             Ok(None) => println!("world:        existing mission kept (agent continues)"),
             Err(e) => println!("world:        mission post failed (non-fatal): {e}"),
         }
     }
     let decision = decide(&proposal, &DenyAllEconomicAuthorization, now_unix);
     let PolicyDecision::Allow { mode } = &decision else {
+        if let Some(view) = &world_view {
+            world_cursor = world_cursor.advanced(view);
+            persist_json_atomic(
+                &cursor_path,
+                &world_cursor
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
+            )?;
+            println!("world-cursor: advanced to tick {} (policy deny consumed)", view.tick);
+        }
         anyhow::bail!("policy DENIED the agent's choice: {decision:?}");
     };
     println!("policy:       Allow({mode:?})");
@@ -6125,17 +6247,87 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             &evidence.id,
             now_unix * 1_000,
         );
-        if let Some(parent) = journal_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
+        persist_json_atomic(
             &journal_path,
-            journal
+            &journal
                 .to_json()
                 .map_err(|e| anyhow::anyhow!("journal serialize: {e}"))?,
         )?;
         println!("journal:      {}", journal.research_report());
+        println!("economy:      {verdict:?} — {}", economy_note(verdict));
         print_next_preview(&candidates, &store, &curiosity, &cycle);
+        // World loop seal (only in --world-url mode): graph node +
+        // activity ledger + cursor advance — all atomic (crash recovery
+        // at the mission/allocation/execution/evidence/learning boundary).
+        if let Some(view) = &world_view {
+            let next_id = next_preview_id(&candidates, &store, &curiosity, &cycle);
+            let lens_map = assign_lenses(&view.entity_ids);
+            let activity_state = ResearchActivity::Working.on_verdict(verdict);
+            for (lens, eid) in &lens_map {
+                activity_ledger.set(
+                    eid,
+                    activity_state,
+                    &format!("{lens}: {} — {}", winner.hypothesis_id, winner.reason),
+                    view.tick,
+                );
+            }
+            persist_json_atomic(
+                &activity_path,
+                &activity_ledger
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("activity serialize: {e}"))?,
+            )?;
+            let (provider, cost) = view
+                .cheapest_service
+                .as_ref()
+                .map(|s| {
+                    (
+                        format!("{}/{}", s.location_id, s.capability),
+                        s.price,
+                    )
+                })
+                .unzip();
+            world_graph.append(ResearchTrace {
+                trace_id: ResearchTrace::make_trace_id(view.tick, &observation.id),
+                world_tick: view.tick,
+                observation_id: observation.id.clone(),
+                question: question.clone(),
+                hypothesis_id: winner.hypothesis_id.clone(),
+                proposal_id: winner.proposal_id.clone(),
+                mission_task_id: world_mission_task.clone(),
+                evidence_id: evidence.id.clone(),
+                verdict,
+                learning_summary: format!(
+                    "{verdict:?}: {} | {}",
+                    journal.research_report(),
+                    economy_note(verdict)
+                ),
+                next_question: next_id,
+                lens_assignments: lens_map,
+                activity: activity_state.slug().to_string(),
+                provider,
+                cost,
+            });
+            persist_json_atomic(
+                &graph_path,
+                &world_graph
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("graph serialize: {e}"))?,
+            )?;
+            world_cursor = world_cursor.advanced(view);
+            persist_json_atomic(
+                &cursor_path,
+                &world_cursor
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
+            )?;
+            println!(
+                "world-trace:  {} activity={} next={}",
+                world_graph.last().map(|t| t.trace_id.as_str()).unwrap_or("-"),
+                activity_state.slug(),
+                world_graph.last().map(|t| t.next_question.as_str()).unwrap_or("-")
+            );
+        }
         return Ok(());
     }
 
@@ -6166,7 +6358,18 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
             policy_allowed: true,
             budget: budget.clone(),
         })
-        .map_err(|e| anyhow::anyhow!("authorization DENIED: {e}"))?;
+        .map_err(|e| {
+            // Same live lesson as above: the gate's refusal still consumes
+            // the observation (best-effort cursor write; the error propagates).
+            if let Some(view) = &world_view {
+                let advanced = world_cursor.advanced(view);
+                if let Ok(json) = advanced.to_json() {
+                    let _ = persist_json_atomic(&cursor_path, &json);
+                    eprintln!("world-cursor: advanced to tick {} (auth deny consumed)", view.tick);
+                }
+            }
+            anyhow::anyhow!("authorization DENIED: {e}")
+        })?;
     println!(
         "approval:     {} {} wei → {} (budget {})",
         approval.asset.name(),
@@ -6239,10 +6442,7 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     );
     store.mark_submitted(&experiment_id, &tx_hash, total_wei, now_unix * 1_000);
     store.mark_confirmed(&experiment_id, &tx_hash, now_unix * 1_000);
-    if let Some(parent) = store_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&store_path, store.to_json().unwrap())?;
+    persist_json_atomic(&store_path, &store.to_json().unwrap())?;
     let report = TestnetReport {
         experiment_id: experiment_id.clone(),
         proposal_id: proposal.id.clone(),
@@ -6297,17 +6497,80 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
         &evidence.id,
         now_unix * 1_000,
     );
-    if let Some(parent) = journal_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
+    persist_json_atomic(
         &journal_path,
-        journal
+        &journal
             .to_json()
             .map_err(|e| anyhow::anyhow!("journal serialize: {e}"))?,
     )?;
     println!("journal:      {}", journal.research_report());
+    println!("economy:      {verdict:?} — {}", economy_note(verdict));
     print_next_preview(&candidates, &store, &curiosity, &cycle);
+    // World loop seal (testnet lane): same graph/activity/cursor boundary.
+    if let Some(view) = &world_view {
+        let next_id = next_preview_id(&candidates, &store, &curiosity, &cycle);
+        let lens_map = assign_lenses(&view.entity_ids);
+        let activity_state = ResearchActivity::Working.on_verdict(verdict);
+        for (lens, eid) in &lens_map {
+            activity_ledger.set(
+                eid,
+                activity_state,
+                &format!("{lens}: {} — {}", winner.hypothesis_id, winner.reason),
+                view.tick,
+            );
+        }
+        persist_json_atomic(
+            &activity_path,
+            &activity_ledger
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("activity serialize: {e}"))?,
+        )?;
+        let (provider, cost) = view
+            .cheapest_service
+            .as_ref()
+            .map(|s| (format!("{}/{}", s.location_id, s.capability), s.price))
+            .unzip();
+        world_graph.append(ResearchTrace {
+            trace_id: ResearchTrace::make_trace_id(view.tick, &observation.id),
+            world_tick: view.tick,
+            observation_id: observation.id.clone(),
+            question: question.clone(),
+            hypothesis_id: winner.hypothesis_id.clone(),
+            proposal_id: winner.proposal_id.clone(),
+            mission_task_id: world_mission_task.clone().or(view.mission_task_id.clone()),
+            evidence_id: evidence.id.clone(),
+            verdict,
+            learning_summary: format!(
+                "{verdict:?}: {} | {} | tx={}",
+                journal.research_report(),
+                economy_note(verdict),
+                tx_hash
+            ),
+            next_question: next_id,
+            lens_assignments: lens_map,
+            activity: activity_state.slug().to_string(),
+            provider,
+            cost,
+        });
+        persist_json_atomic(
+            &graph_path,
+            &world_graph
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("graph serialize: {e}"))?,
+        )?;
+        world_cursor = world_cursor.advanced(view);
+        persist_json_atomic(
+            &cursor_path,
+            &world_cursor
+                .to_json()
+                .map_err(|e| anyhow::anyhow!("cursor serialize: {e}"))?,
+        )?;
+        println!(
+            "world-trace:  {} activity={}",
+            world_graph.last().map(|t| t.trace_id.as_str()).unwrap_or("-"),
+            activity_state.slug()
+        );
+    }
     println!(
         "\n{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -6343,13 +6606,24 @@ fn persist_curiosity(
     path: &std::path::Path,
     curiosity: &decentraai_proposal::CuriosityState,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = curiosity
         .to_json()
         .map_err(|e| anyhow::anyhow!("curiosity serialize failed: {e}"))?;
-    std::fs::write(path, json)?;
+    persist_json_atomic(path, &json)
+}
+
+/// Crash-safe file write for every loop boundary (cursor, graph, activity,
+/// store, journal, snapshot): tmp + rename so a kill at any point leaves
+/// either the old file or the new file — never a torn half-write.
+// Recovery = reload-first on the next tick (plus store replay-first and
+// mission 409-keep on the World side).
+fn persist_json_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -6361,6 +6635,16 @@ fn print_next_preview(
     curiosity: &decentraai_proposal::CuriosityState,
     cycle: &decentraai_proposal::CycleState,
 ) {
+    println!("next-preview: {}", next_preview_id(candidates, store, curiosity, cycle));
+}
+
+/// Pure preview id for the research-graph `next_question` field.
+fn next_preview_id(
+    candidates: &[decentraai_proposal::CandidateExperiment],
+    store: &decentraai_proposal::ExperimentStore,
+    curiosity: &decentraai_proposal::CuriosityState,
+    cycle: &decentraai_proposal::CycleState,
+) -> String {
     let next_cycle = decentraai_proposal::CycleState {
         cycle_id: format!("{}:next", cycle.cycle_id),
         max_total_wei: cycle.max_total_wei,
@@ -6368,12 +6652,12 @@ fn print_next_preview(
         executed: None,
     };
     match decentraai_proposal::select_experiment(candidates, store, curiosity, &next_cycle) {
-        Ok(w) => println!(
-            "next-preview: learning now favors {} (score {})",
+        Ok(w) => format!(
+            "learning now favors {} (score {})",
             w.proposal_id,
             w.expected_information_gain + w.novelty
         ),
-        Err(r) => println!("next-preview: no valid candidate next ({r:?})"),
+        Err(r) => format!("no valid candidate next ({r:?})"),
     }
 }
 
@@ -6626,7 +6910,7 @@ async fn experiment_command(args: ExperimentArgs) -> Result<()> {
             );
             Ok(())
         }
-        ExperimentCommand::AutonomousCycle(run) => autonomous_cycle_command(run).await,
+        ExperimentCommand::AutonomousCycle(run) => autonomous_cycle_command(*run).await,
     }
 }
 

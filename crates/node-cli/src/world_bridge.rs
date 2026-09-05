@@ -66,8 +66,9 @@ pub fn mission_body(title: &str, description: &str, reward: u64) -> Value {
     })
 }
 
-/// GET /v1/world → observation JSON (typed).
-pub async fn fetch_world_observation(base: &str, token: &str) -> Result<Value> {
+/// GET /v1/world → raw snapshot JSON (typed parsing lives in
+/// `decentraai-proposal::world_loop::parse_world_view`, the single shaper).
+pub async fn fetch_world_snapshot(base: &str, token: &str) -> Result<Value> {
     let url = format!("{}/v1/world", base.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
@@ -79,8 +80,7 @@ pub async fn fetch_world_observation(base: &str, token: &str) -> Result<Value> {
     if !resp.status().is_success() {
         anyhow::bail!("GET /v1/world → HTTP {}", resp.status());
     }
-    let world: Value = resp.json().await.context("world snapshot invalid JSON")?;
-    observation_from_world(&world)
+    resp.json().await.context("world snapshot invalid JSON")
 }
 
 /// POST /v1/world/mission — the research cycle becomes a World activity.
