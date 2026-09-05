@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::TestnetAsset;
 use crate::risk::{ExperimentRiskClass, ResourceCommitment};
 
 /// One step's action. Closed schema: unknown `kind` values fail parsing.
@@ -55,6 +56,17 @@ pub enum ProposedAction {
         /// Declared mint (recorded in the denial, never executed).
         detail: String,
     },
+    /// Bounded testnet value transfer (v0.2 lane only). Allowed ONLY inside
+    /// a `TestnetEconomic` proposal with a valid budget and a testnet
+    /// authorization approval — every other lane denies it as economic.
+    TestnetTransfer {
+        /// Asset to move (must be budget-allowlisted).
+        asset: TestnetAsset,
+        /// Destination (must be budget-allowlisted, never arbitrary).
+        destination: String,
+        /// Amount in wei (must fit the authorized budget).
+        amount_wei: u64,
+    },
 }
 
 impl ProposedAction {
@@ -69,11 +81,13 @@ impl ProposedAction {
             Self::FundTransfer { .. } => "fund_transfer",
             Self::SignerChange { .. } => "signer_change",
             Self::DCAIMint { .. } => "dcai_mint",
+            Self::TestnetTransfer { .. } => "testnet_transfer",
         }
     }
 
-    /// True for the four economic kinds. The policy AND the executor
-    /// boundary both check this — two independent gates, same predicate.
+    /// True for the economic kinds (the four always-denied kinds plus the
+    /// testnet lane action). The policy AND every executor boundary check
+    /// this — independent gates, same predicate.
     #[must_use]
     pub fn is_economic(&self) -> bool {
         matches!(
@@ -82,34 +96,41 @@ impl ProposedAction {
                 | Self::FundTransfer { .. }
                 | Self::SignerChange { .. }
                 | Self::DCAIMint { .. }
+                | Self::TestnetTransfer { .. }
         )
     }
 
     /// Minimum risk class that may carry this action.
     #[must_use]
     pub fn required_risk(&self) -> ExperimentRiskClass {
-        if self.is_economic() {
-            ExperimentRiskClass::Economic
-        } else {
-            match self {
-                Self::Observe { .. } => ExperimentRiskClass::ReadOnly,
-                Self::Simulate { .. } | Self::RecordFinding { .. } => ExperimentRiskClass::Sandbox,
-                // Economic arms covered above; unreachable here.
-                _ => ExperimentRiskClass::Economic,
-            }
+        match self {
+            Self::Observe { .. } => ExperimentRiskClass::ReadOnly,
+            Self::Simulate { .. } | Self::RecordFinding { .. } => ExperimentRiskClass::Sandbox,
+            Self::TestnetTransfer { .. } => ExperimentRiskClass::TestnetEconomic,
+            // Always-denied arms; no lane may carry them.
+            _ => ExperimentRiskClass::Economic,
         }
     }
 
     /// Minimum commitment this action needs. Sandbox actions need none;
-    /// economic actions need a real commitment (which v0.1 never grants).
+    /// testnet transfers need the matching declared commitment
+    /// (xEGLD is backed by a Cr commitment, DCAI by a DCAI commitment);
+    /// always-denied actions need a real commitment no lane grants.
     #[must_use]
     pub fn required_commitment(&self) -> ResourceCommitment {
-        if self.is_economic() {
-            // Economic actions cannot run on `None`; the exact commitment
-            // kind is the proposer's declaration, checked by policy.
-            ResourceCommitment::Cr
-        } else {
-            ResourceCommitment::None
+        match self {
+            Self::TestnetTransfer {
+                asset: TestnetAsset::Xegld,
+                ..
+            } => ResourceCommitment::Cr,
+            Self::TestnetTransfer {
+                asset: TestnetAsset::Dcai,
+                ..
+            } => ResourceCommitment::DCAI,
+            Self::Observe { .. } | Self::Simulate { .. } | Self::RecordFinding { .. } => {
+                ResourceCommitment::None
+            }
+            _ => ResourceCommitment::Cr,
         }
     }
 }
@@ -126,8 +147,9 @@ mod tests {
     }
 
     #[test]
-    fn economic_kinds_are_exactly_four() {
-        let economics = [
+    fn economic_kinds_are_exactly_four_plus_testnet_lane() {
+        // The four always-denied kinds: no lane may carry them.
+        let denied = [
             ProposedAction::EconomicStateMutation {
                 detail: "x".to_string(),
             },
@@ -141,10 +163,25 @@ mod tests {
                 detail: "x".to_string(),
             },
         ];
-        for a in &economics {
+        for a in &denied {
             assert!(a.is_economic(), "{}", a.kind_name());
             assert_eq!(a.required_risk(), ExperimentRiskClass::Economic);
         }
+        // The testnet lane action is economic too, but bound to its lane.
+        let t = ProposedAction::TestnetTransfer {
+            asset: TestnetAsset::Xegld,
+            destination: "erd1x".to_string(),
+            amount_wei: 1,
+        };
+        assert!(t.is_economic());
+        assert_eq!(t.required_risk(), ExperimentRiskClass::TestnetEconomic);
+        assert_eq!(t.required_commitment(), ResourceCommitment::Cr);
+        let td = ProposedAction::TestnetTransfer {
+            asset: TestnetAsset::Dcai,
+            destination: "erd1x".to_string(),
+            amount_wei: 1,
+        };
+        assert_eq!(td.required_commitment(), ResourceCommitment::DCAI);
         assert!(!observe().is_economic());
         assert_eq!(observe().required_risk(), ExperimentRiskClass::ReadOnly);
         assert_eq!(

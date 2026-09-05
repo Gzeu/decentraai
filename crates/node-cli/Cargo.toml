@@ -53,6 +53,8 @@ base64.workspace = true
 
 # DCAI / economy crate for token issuance (dcai subcommands).
 decentraai-economy = { path = "../economy" }
+# Primordial Mind: pure proposal/protocol core (experiment subcommands).
+decentraai-proposal = { path = "../proposal" }
 tracing-subscriber.workspace = true
 chrono.workspace = true
 uuid.workspace = true

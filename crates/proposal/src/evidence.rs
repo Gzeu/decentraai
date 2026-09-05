@@ -10,9 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::TestnetAsset;
 use crate::error::ProposalError;
 use crate::policy::ExecutionMode;
 use crate::sandbox::ExecutionReport;
+use crate::selection::SelectionRecord;
 
 /// Schema version for sealed evidence.
 pub const EVIDENCE_VERSION: u32 = 1;
@@ -51,8 +53,42 @@ pub struct ExperimentEvidence {
     pub sealed_at_ms: u64,
     /// Previous entry's seal (None for genesis). Tamper-evident chaining.
     pub prev_hash: Option<[u8; 32]>,
+    /// Testnet execution facts, when the evidence backs a live experiment.
+    /// `None` for sandbox/read-only runs. `#[serde(default)]` keeps older
+    /// sealed JSON readable (missing field → `None`, seal re-checks fail
+    /// closed on any mutation as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testnet: Option<TestnetEvidence>,
+    /// Post-mortem selection record (v0.3): candidates, scores, winner,
+    /// reason. `None` for operator-chosen runs. Sealed like everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionRecord>,
     /// Seal: BLAKE3 over canonical JSON with `hash` zeroed.
     pub hash: [u8; 32],
+}
+
+/// On-chain facts for one testnet experiment. Every field is a recorded
+/// fact: the tx hash is external verifiable evidence (look it up on the
+/// testnet explorer), never a claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestnetEvidence {
+    /// Experiment id.
+    pub experiment_id: String,
+    /// Chain (always [`crate::budget::TESTNET_CHAIN_ID`]).
+    pub chain_id: String,
+    /// Asset moved.
+    pub asset: TestnetAsset,
+    /// Amount moved (wei).
+    pub amount_wei: u64,
+    /// Amount the budget authorized (wei) — `amount_wei <= authorized`.
+    pub authorized_wei: u64,
+    /// Destination (budget-allowlisted).
+    pub destination: String,
+    /// Chain tx hash.
+    pub tx_hash: String,
+    /// Policy lane that allowed it (always `testnet` here).
+    pub policy_mode: ExecutionMode,
 }
 
 impl ExperimentEvidence {
@@ -76,6 +112,49 @@ impl ExperimentEvidence {
             outcome,
             sealed_at_ms,
             prev_hash,
+            testnet: None,
+            selection: None,
+            hash: [0u8; 32],
+        };
+        ev.hash = *blake3::hash(&serde_json::to_vec(&ev).unwrap_or_default()).as_bytes();
+        ev
+    }
+
+    /// Build + seal evidence for a BOUNDED TESTNET execution report.
+    /// Commits to the tx hash, the authorized budget and the actual amount,
+    /// so under-reporting the spend breaks the seal. Carries the optional
+    /// post-mortem [`SelectionRecord`][crate::selection::SelectionRecord].
+    #[must_use]
+    pub fn seal_testnet(
+        report: &crate::testnet::TestnetReport,
+        outcome: ExperimentOutcome,
+        authorized_wei: u64,
+        selection: Option<SelectionRecord>,
+        sealed_at_ms: u64,
+        prev_hash: Option<[u8; 32]>,
+    ) -> Self {
+        let results_digest =
+            *blake3::hash(&serde_json::to_vec(report).unwrap_or_default()).as_bytes();
+        let mut ev = Self {
+            version: EVIDENCE_VERSION,
+            id: format!("ev:{}:{sealed_at_ms}", report.proposal_id),
+            proposal_id: report.proposal_id.clone(),
+            mode: ExecutionMode::Testnet,
+            results_digest,
+            outcome,
+            sealed_at_ms,
+            prev_hash,
+            testnet: Some(TestnetEvidence {
+                experiment_id: report.experiment_id.clone(),
+                chain_id: report.chain_id.clone(),
+                asset: report.asset.clone(),
+                amount_wei: report.amount_wei,
+                authorized_wei,
+                destination: report.destination.clone(),
+                tx_hash: report.tx_hash.clone(),
+                policy_mode: ExecutionMode::Testnet,
+            }),
+            selection,
             hash: [0u8; 32],
         };
         ev.hash = *blake3::hash(&serde_json::to_vec(&ev).unwrap_or_default()).as_bytes();
@@ -147,6 +226,7 @@ impl EvidenceLog {
 
 #[cfg(test)]
 mod tests {
+    const NOW: u64 = 1_780_000_000;
     use super::*;
     use crate::economic::DenyAllEconomicAuthorization;
     use crate::policy::decide;
@@ -155,7 +235,7 @@ mod tests {
 
     fn report() -> ExecutionReport {
         let p = parse_proposal(&crate::protocol::sandbox_proposal_json()).unwrap();
-        let d = decide(&p, &DenyAllEconomicAuthorization);
+        let d = decide(&p, &DenyAllEconomicAuthorization, NOW);
         execute(&p, &d, 1_700_000_000_000).unwrap()
     }
 

@@ -134,13 +134,15 @@ fn run_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: u64 = 1_780_000_000;
     use crate::economic::DenyAllEconomicAuthorization;
     use crate::policy::decide;
     use crate::protocol::parse_proposal;
 
     fn allowed_report() -> ExecutionReport {
         let p = parse_proposal(&crate::protocol::sandbox_proposal_json()).unwrap();
-        let d = decide(&p, &DenyAllEconomicAuthorization);
+        let d = decide(&p, &DenyAllEconomicAuthorization, NOW);
         execute(&p, &d, 1_700_000_000_000).unwrap()
     }
 

@@ -71,7 +71,7 @@ fn golden_sandbox_chain_end_to_end() {
     // Proposal → policy: allowed in the sandbox lane.
     let proposal = parse_proposal(&proposal_json).expect("valid sandbox proposal");
     assert_eq!(proposal.idea_id, idea.id);
-    let decision = decide(&proposal, &DenyAllEconomicAuthorization);
+    let decision = decide(&proposal, &DenyAllEconomicAuthorization, NOW);
     assert_eq!(
         decision,
         PolicyDecision::Allow {
@@ -140,7 +140,7 @@ fn economic_actions_denied() {
         let proposal = parse_proposal(&proposal_json).expect("parses structurally");
         // …but denied by policy with the exact action reason.
         assert_eq!(
-            decide(&proposal, &DenyAllEconomicAuthorization),
+            decide(&proposal, &DenyAllEconomicAuthorization, NOW),
             PolicyDecision::Deny {
                 reason: DenyReason::EconomicAction { index: 0, kind }
             },
@@ -159,7 +159,7 @@ fn commitments_and_live_risk_denied() {
     for commitment in ["cr", "dcai", "escrow"] {
         v["commitment"] = serde_json::json!(commitment);
         let proposal = parse_proposal(&v.to_string()).expect("parses structurally");
-        match decide(&proposal, &DenyAllEconomicAuthorization) {
+        match decide(&proposal, &DenyAllEconomicAuthorization, NOW) {
             PolicyDecision::Deny {
                 reason: DenyReason::EconomicCommitment { .. },
             } => {}
@@ -171,7 +171,7 @@ fn commitments_and_live_risk_denied() {
     v["risk"] = serde_json::json!("economic");
     let proposal = parse_proposal(&v.to_string()).expect("parses structurally");
     assert_eq!(
-        decide(&proposal, &DenyAllEconomicAuthorization),
+        decide(&proposal, &DenyAllEconomicAuthorization, NOW),
         PolicyDecision::Deny {
             reason: DenyReason::EconomicRiskClass
         }

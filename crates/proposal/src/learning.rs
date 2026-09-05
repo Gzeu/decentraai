@@ -6,7 +6,76 @@
 //! rule as the fabric evidence index. Statements are templated from
 //! aggregates (counts, rates); no free-text conclusions are generated.
 
+use serde::{Deserialize, Serialize};
+
 use crate::evidence::{ExperimentEvidence, ExperimentOutcome};
+
+/// What the hypothesis says after the experiment. NEVER inferred from a
+/// confirmed transaction alone: `assess` takes the observed facts
+/// (execution ok? experiment ok? hypothesis held?) as separate inputs, so
+/// "tx confirmed" can never silently become "hypothesis supported".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HypothesisVerdict {
+    /// Observed facts support the hypothesis.
+    Supported,
+    /// Observed facts refute the hypothesis.
+    Refuted,
+    /// Facts do not decide either way.
+    Inconclusive,
+}
+
+/// One experiment's learning with the three successes separated:
+///
+/// - `execution_success`: the mechanics worked (executor ran, tx confirmed).
+/// - `experiment_success`: the experiment did what it set out to do
+///   (measured the intended effect within bounds).
+/// - `hypothesis`: whether the observed facts support the hypothesis.
+///
+/// A confirmed tx with a broken measurement is
+/// execution-success + experiment-failure — never a supported hypothesis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentLearning {
+    /// Experiment id.
+    pub experiment_id: String,
+    /// Proposal id.
+    pub proposal_id: String,
+    /// Evidence id backing this learning.
+    pub evidence_id: String,
+    /// Did the mechanics work?
+    pub execution_success: bool,
+    /// Did the experiment achieve its measurement goal?
+    pub experiment_success: bool,
+    /// What do the observed facts say about the hypothesis?
+    pub hypothesis: HypothesisVerdict,
+    /// Chain tx hash when the experiment ran on testnet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+}
+
+/// Assess one experiment from OBSERVED facts (caller-provided, never
+/// inferred here). Pure constructor: no judgment, just the record.
+#[must_use]
+pub fn assess(
+    experiment_id: &str,
+    proposal_id: &str,
+    evidence_id: &str,
+    execution_success: bool,
+    experiment_success: bool,
+    hypothesis: HypothesisVerdict,
+    tx_hash: Option<String>,
+) -> ExperimentLearning {
+    ExperimentLearning {
+        experiment_id: experiment_id.to_string(),
+        proposal_id: proposal_id.to_string(),
+        evidence_id: evidence_id.to_string(),
+        execution_success,
+        experiment_success,
+        hypothesis,
+        tx_hash,
+    }
+}
 
 /// One derived learning, bound to the evidence it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +158,7 @@ pub fn derive_learnings(evidence: &[ExperimentEvidence]) -> Vec<LearningEntry> {
 
 #[cfg(test)]
 mod tests {
+    const NOW: u64 = 1_780_000_000;
     use super::*;
     use crate::economic::DenyAllEconomicAuthorization;
     use crate::evidence::{EvidenceLog, ExperimentEvidence};
@@ -98,7 +168,7 @@ mod tests {
 
     fn report_at(at: u64) -> crate::sandbox::ExecutionReport {
         let p = parse_proposal(&crate::protocol::sandbox_proposal_json()).unwrap();
-        let d = decide(&p, &DenyAllEconomicAuthorization);
+        let d = decide(&p, &DenyAllEconomicAuthorization, NOW);
         execute(&p, &d, at).unwrap()
     }
 
@@ -126,7 +196,7 @@ mod tests {
     fn log_chain_feeds_learning() {
         let r = {
             let p = parse_proposal(&crate::protocol::sandbox_proposal_json()).unwrap();
-            let d = decide(&p, &DenyAllEconomicAuthorization);
+            let d = decide(&p, &DenyAllEconomicAuthorization, NOW);
             execute(&p, &d, 7).unwrap()
         };
         let mut log = EvidenceLog::new();

@@ -1,15 +1,17 @@
-//! Sandbox policy — the deterministic gate (AI → Proposal → Policy).
+//! Policy — the deterministic gate (AI → Proposal → Policy).
 //!
-//! [`decide`] is pure over the proposal: same input, same decision, every
-//! time (no clock, no I/O, no randomness). v0.1 allow-list:
+//! [`decide`] is pure over (proposal, clock): same inputs, same verdict,
+//! every time (no I/O, no randomness; `now_unix` is a parameter).
 //!
-//! - risk `Sandbox` with `None` commitment and sandbox actions → `Allow(Sandbox)`
-//! - risk `ReadOnly` with `None` commitment and observe-only steps → `Allow(ReadOnly)`
+//! v0.1 lanes (unchanged): `Sandbox` / `ReadOnly` with `None` commitment.
+//! v0.2 adds exactly one live lane: `TestnetEconomic` with a valid
+//! [`ExperimentBudget`][crate::budget::ExperimentBudget], a matching
+//! declared commitment, and testnet-only actions. `Economic` (the
+//! mainnet-class lane) is denied always — there is no code path that
+//! allows it.
 //!
-//! Everything else is a typed `Deny`: live risk class, any real
-//! commitment (via the [`crate::economic`] seam), any economic action
-//! (checked step-by-step even when the header claims sandbox), or an
-//! action that exceeds the claimed risk class.
+//! Order is load-bearing (cheapest, most structural checks first):
+//! structure → risk class → commitment/budget → per-action scan.
 
 use crate::action::ProposedAction;
 use crate::economic::EconomicAuthorization;
@@ -26,6 +28,10 @@ pub enum ExecutionMode {
     Sandbox,
     /// Observation only: observe steps, nothing else.
     ReadOnly,
+    /// Bounded testnet execution. The Allow decision alone does NOT
+    /// authorize value movement: the operator-side executor must also hold
+    /// a [`crate::economic::TestnetApproval`] for the same proposal.
+    Testnet,
 }
 
 /// Why a proposal was denied. Every reason is explicit and testable.
@@ -57,6 +63,16 @@ pub enum DenyReason {
     },
     /// Structural problem (re-checked defensively; parse catches these first).
     InvalidStructure(String),
+    /// Testnet lane without a usable budget (absent or invalid).
+    MissingBudget(String),
+    /// Testnet lane without the matching declared commitment
+    /// (xEGLD actions need `Cr`, DCAI actions need `DCAI`).
+    CommitmentMismatch {
+        /// Declared commitment.
+        commitment: ResourceCommitment,
+        /// Required commitment kind name.
+        required: &'static str,
+    },
 }
 
 /// The policy verdict.
@@ -82,24 +98,34 @@ impl PolicyDecision {
     }
 }
 
-/// Deterministic gate: proposal + economic seam → verdict.
-///
-/// Order is load-bearing (cheapest, most structural checks first):
-/// structure → risk class → commitment (via seam) → per-action scan.
+/// Deterministic gate: proposal + economic seam + clock → verdict.
 pub fn decide(
     proposal: &ExperimentProposal,
     economic: &dyn EconomicAuthorization,
+    now_unix: u64,
 ) -> PolicyDecision {
     if let Err(e) = validate_proposal(proposal) {
         return PolicyDecision::Deny {
             reason: DenyReason::InvalidStructure(e.to_string()),
         };
     }
-    if proposal.risk.is_live() {
-        return PolicyDecision::Deny {
+    match proposal.risk {
+        ExperimentRiskClass::Economic => PolicyDecision::Deny {
             reason: DenyReason::EconomicRiskClass,
-        };
+        },
+        ExperimentRiskClass::TestnetEconomic => decide_testnet(proposal, now_unix),
+        ExperimentRiskClass::Sandbox | ExperimentRiskClass::ReadOnly => {
+            decide_offline(proposal, economic)
+        }
     }
+}
+
+/// v0.1 lanes, unchanged: `None` commitment, no economic actions,
+/// actions covered by the claimed lane.
+fn decide_offline(
+    proposal: &ExperimentProposal,
+    economic: &dyn EconomicAuthorization,
+) -> PolicyDecision {
     if !proposal.commitment.is_none() {
         let detail = match economic.authorize_commitment(proposal.commitment, &proposal.id) {
             Ok(()) => String::new(),
@@ -112,6 +138,68 @@ pub fn decide(
             },
         };
     }
+    scan_actions(proposal)
+}
+
+/// v0.2 testnet lane: valid budget + matching commitment + testnet-only
+/// actions within budget caps. Value authorization itself happens later
+/// in [`crate::economic`] (per-request approval); policy grants the lane.
+fn decide_testnet(proposal: &ExperimentProposal, now_unix: u64) -> PolicyDecision {
+    let Some(budget) = &proposal.budget else {
+        return PolicyDecision::Deny {
+            reason: DenyReason::MissingBudget(
+                "testnet lane requires an explicit budget".to_string(),
+            ),
+        };
+    };
+    if let Err(e) = budget.validate(now_unix) {
+        return PolicyDecision::Deny {
+            reason: DenyReason::MissingBudget(e.to_string()),
+        };
+    }
+    if proposal.steps.len() > budget.max_actions as usize {
+        return PolicyDecision::Deny {
+            reason: DenyReason::ActionExceedsRiskClass {
+                index: budget.max_actions as usize,
+                kind: "budget_action_cap",
+            },
+        };
+    }
+    for (index, step) in proposal.steps.iter().enumerate() {
+        match &step.action {
+            ProposedAction::TestnetTransfer { asset, .. } => {
+                let required = step.action.required_commitment();
+                if proposal.commitment != required {
+                    let need = match asset {
+                        crate::budget::TestnetAsset::Xegld => "Cr",
+                        crate::budget::TestnetAsset::Dcai => "DCAI",
+                    };
+                    return PolicyDecision::Deny {
+                        reason: DenyReason::CommitmentMismatch {
+                            commitment: proposal.commitment,
+                            required: need,
+                        },
+                    };
+                }
+            }
+            a if a.is_economic() => {
+                return PolicyDecision::Deny {
+                    reason: DenyReason::EconomicAction {
+                        index,
+                        kind: a.kind_name(),
+                    },
+                };
+            }
+            _ => {}
+        }
+    }
+    PolicyDecision::Allow {
+        mode: ExecutionMode::Testnet,
+    }
+}
+
+/// Shared per-action scan for the offline lanes.
+fn scan_actions(proposal: &ExperimentProposal) -> PolicyDecision {
     for (index, step) in proposal.steps.iter().enumerate() {
         if step.action.is_economic() {
             return PolicyDecision::Deny {
@@ -134,8 +222,8 @@ pub fn decide(
         mode: match proposal.risk {
             ExperimentRiskClass::Sandbox => ExecutionMode::Sandbox,
             ExperimentRiskClass::ReadOnly => ExecutionMode::ReadOnly,
-            // Live risk returned above; unreachable here.
-            ExperimentRiskClass::Economic => {
+            // Live risks never reach the offline scan.
+            ExperimentRiskClass::Economic | ExperimentRiskClass::TestnetEconomic => {
                 return PolicyDecision::Deny {
                     reason: DenyReason::EconomicRiskClass,
                 };
@@ -145,13 +233,14 @@ pub fn decide(
 }
 
 /// Sandbox lane covers every non-economic action; ReadOnly covers observe.
+/// Live lanes never reach the offline scan (decide routes them first).
 fn risk_covers(risk: ExperimentRiskClass, action: &ProposedAction) -> bool {
     match risk {
         ExperimentRiskClass::Sandbox => true,
         ExperimentRiskClass::ReadOnly => {
             matches!(action, ProposedAction::Observe { .. })
         }
-        ExperimentRiskClass::Economic => false,
+        ExperimentRiskClass::Economic | ExperimentRiskClass::TestnetEconomic => false,
     }
 }
 
@@ -159,6 +248,8 @@ fn risk_covers(risk: ExperimentRiskClass, action: &ProposedAction) -> bool {
 mod tests {
     use super::*;
     use crate::economic::DenyAllEconomicAuthorization;
+
+    const NOW: u64 = 1_780_000_000;
     use crate::protocol::parse_proposal;
 
     fn sandbox() -> ExperimentProposal {
@@ -166,7 +257,7 @@ mod tests {
     }
 
     fn decision(p: &ExperimentProposal) -> PolicyDecision {
-        decide(p, &DenyAllEconomicAuthorization)
+        decide(p, &DenyAllEconomicAuthorization, NOW)
     }
 
     #[test]
