@@ -629,7 +629,7 @@ fn deterministic_hash(input: &str) -> String {
 /// Minimal-viable budget for exactly one transfer: amount == cap, one
 /// action, one retry, 1h expiry, single asset + single destination.
 /// Anything larger is operator inflation, not agent choice.
-fn minimal_budget(
+pub(crate) fn minimal_budget(
     id: &str,
     amount_wei: u64,
     destination: &str,
@@ -648,7 +648,7 @@ fn minimal_budget(
     }
 }
 
-fn minimal_readonly_budget(now_unix: u64) -> ExperimentBudget {
+pub(crate) fn minimal_readonly_budget(now_unix: u64) -> ExperimentBudget {
     ExperimentBudget {
         id: "budget readonly".to_string(),
         max_amount_wei: 1,

@@ -242,6 +242,10 @@ struct AutonomousCycleArgs {
     /// Durable curiosity file (belief persistence across cycles).
     #[arg(long)]
     curiosity: Option<PathBuf>,
+    /// Durable observation snapshot (signal deltas across cycles).
+    /// Default: ~/.decentraai/experiments/observations.json
+    #[arg(long)]
+    snapshot: Option<PathBuf>,
     /// Override the settlement-signer file path instead of env.
     #[arg(long)]
     secret_file: Option<PathBuf>,
@@ -5908,16 +5912,55 @@ async fn autonomous_cycle_command(args: AutonomousCycleArgs) -> Result<()> {
     let (hypothesis_id, hypothesis_text) = generate_hypothesis(&question);
     println!("hypothesis:   {hypothesis_id} — {hypothesis_text}");
 
-    // 4. Agent's choice: generate → score → select (deterministic).
-    let candidates = generate_candidates(
-        &args.cycle_id,
-        &observation.id,
-        &question,
-        &hypothesis_id,
-        &hypothesis_text,
-        &args.operator,
+    // 4. Agent CONSTRUCTS (v0.4): extract signals → deltas vs persisted
+    // snapshot → bounded parameter grid → novel candidates, not fixed
+    // rules. The snapshot file is the observation memory across cycles.
+    let snapshot_path = args
+        .snapshot
+        .clone()
+        .unwrap_or_else(|| expand_tilde("~/.decentraai/experiments/observations.json"));
+    let mut snapshot = if snapshot_path.exists() {
+        ObservationSnapshot::from_json(&std::fs::read_to_string(&snapshot_path)?)
+            .map_err(|e| anyhow::anyhow!("snapshot reload failed: {e}"))?
+    } else {
+        ObservationSnapshot::default()
+    };
+    let signals = extract_signals(&observation.text);
+    let deltas = compute_deltas(&mut snapshot, &signals);
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &snapshot_path,
+        snapshot
+            .to_json()
+            .map_err(|e| anyhow::anyhow!("snapshot serialize: {e}"))?,
+    )?;
+    for d in &deltas {
+        if d.delta != 0 {
+            println!(
+                "signal:       {} {}→{} (Δ{})",
+                d.key, d.prev, d.curr, d.delta
+            );
+        }
+    }
+    let candidates = construct_candidates(&ConstructInput {
+        cycle_id: &args.cycle_id,
+        observation_id: &observation.id,
+        question: &question,
+        deltas: &deltas,
+        store: &store,
+        curiosity: &curiosity,
+        cycle_max_wei: args.cycle_budget_wei,
+        operator_destination: &args.operator,
         now_unix,
-    );
+    });
+    if candidates.is_empty() {
+        println!(
+            "agent decision: no constructible candidate (all families resolved or budget spent)"
+        );
+        return Ok(());
+    }
     println!("candidates:");
     for c in &candidates {
         let b = score_candidate(c, &store, &curiosity, &cycle);

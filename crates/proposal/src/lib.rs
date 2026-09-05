@@ -52,6 +52,7 @@ pub mod evidence;
 pub mod learning;
 pub mod policy;
 pub mod protocol;
+pub mod research;
 pub mod risk;
 pub mod sandbox;
 pub mod selection;
@@ -77,6 +78,10 @@ pub use policy::{DenyReason, ExecutionMode, PolicyDecision, decide};
 pub use protocol::{
     AgentIdea, ExperimentProposal, ExperimentStep, Hypothesis, Observation, PROTOCOL_VERSION,
     ResearchQuestion, parse_proposal,
+};
+pub use research::{
+    ConstructInput, MAX_CONSTRUCTED, ObservationSnapshot, Signal, SignalDelta, compute_deltas,
+    construct_candidates, extract_signals, family_closed, family_uncertainty,
 };
 pub use risk::{ExperimentRiskClass, ResourceCommitment};
 pub use sandbox::{ExecutionReport, StepResult, execute};
