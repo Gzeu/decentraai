@@ -220,21 +220,29 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
         operator_destination,
         now_unix,
     } = *input;
-    let curiosity_json = curiosity.to_json().unwrap_or_default();
     let mut out: Vec<CandidateExperiment> = Vec::new();
     // v0.5: families are STABLE across cycles (they name the research
     // domain, not the question instance) — this is what makes learning
     // longitudinal instead of per-cycle.
     let health_family = "transfer-health".to_string();
-    let health_closed = family_closed(&curiosity_json, &health_family)
-        || journal.is_some_and(|j| j.family_is_dead(&health_family));
+    // v0.5.1 lesson (live): family-level closure must NOT suppress ALL
+    // novel members — one supported probe settles THAT hypothesis, not
+    // the whole research line. Closure is per-hypothesis: a member is
+    // skipped when SUPPORTED (curiosity) or its signature is in the
+    // store (duplicate). The family dies only after ≥2 REFUTATIONS
+    // (journal) — never from a single success.
+    let health_dead = journal.is_some_and(|j| j.family_is_dead(&health_family));
 
-    // (1) Economic probe on the smallest unseen grid amount.
-    if !health_closed {
+    // (1) Economic probe on the smallest unseen, un-proven grid amount.
+    if !health_dead {
         let mut chosen: Option<u64> = None;
         for &amt in PARAM_AMOUNT_GRID {
             if amt == 0 || amt > cycle_max_wei / 2 {
                 continue;
+            }
+            let hid = format!("fam:{health_family}:probe-{amt}");
+            if curiosity.any_supported_suffix(&hid) {
+                continue; // already proven — do not repeat (anti-loop)
             }
             let sig = format!("testnet_transfer:xegld:{amt}:{operator_destination}");
             let dup = store.records().any(|r| {
@@ -289,9 +297,10 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
         .map(|r| r.amount_wei)
         .max()
         .unwrap_or(0);
-    if !health_closed && max_confirmed > 0 {
+    if !health_dead && max_confirmed > 0 {
         let amt = max_confirmed.saturating_mul(2);
-        if amt <= cycle_max_wei / 2 {
+        let hid = format!("fam:{health_family}:scale-{amt}");
+        if amt <= cycle_max_wei / 2 && !curiosity.any_supported_suffix(&hid) {
             let sig = format!("testnet_transfer:xegld:{amt}:{operator_destination}");
             let dup = store.records().any(|r| {
                 format!(
@@ -302,7 +311,6 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
                 ) == sig
             });
             if !dup {
-                let hid = format!("fam:{health_family}:scale-{amt}");
                 out.push(CandidateExperiment {
                     id: format!("{cycle_id}:scale-{amt}"),
                     hypothesis_id: hid,
@@ -334,16 +342,18 @@ pub fn construct_candidates(input: &ConstructInput<'_>) -> Vec<CandidateExperime
         }
     }
 
-    // (3) Delta probe (read-only): the top changed signal must appear
-    // in the observation — hypothesis family `signal-delta`.
+    // (3) Delta probe (read-only): the first CHANGED signal whose
+    // observation hypothesis is not yet supported. Family closure is
+    // per-hypothesis (`fam:signal-delta:<key>`) — supporting "minted"
+    // must not suppress an "events" anomaly (live lesson, cycle world-001).
     let delta_family = "signal-delta".to_string();
-    let delta_closed = family_closed(&curiosity_json, &delta_family)
-        || journal.is_some_and(|j| j.family_is_dead(&delta_family));
-    if delta_closed {
+    if journal.is_some_and(|j| j.family_is_dead(&delta_family)) {
         out.truncate(MAX_CONSTRUCTED);
         return out;
     }
-    if let Some(top) = deltas.iter().find(|d| d.delta != 0) {
+    if let Some(top) = deltas.iter().find(|d| {
+        d.delta != 0 && !curiosity.any_supported_suffix(&format!("fam:{delta_family}:{}", d.key))
+    }) {
         out.push(CandidateExperiment {
             id: format!("{cycle_id}:observe-{}", top.key),
             hypothesis_id: format!("fam:{delta_family}:{}", top.key),

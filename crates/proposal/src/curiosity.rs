@@ -92,6 +92,18 @@ impl CuriosityState {
         )
     }
 
+    /// True when ANY belief whose id ENDS WITH `suffix` was supported.
+    /// Multi-lens write path: lenses learn under `fam:<lens>:<leaf>`;
+    /// base construction asks about `<leaf>` — a result proven by one
+    /// agent closes it for all (consensus by evidence, not by name).
+    #[must_use]
+    pub fn any_supported_suffix(&self, suffix: &str) -> bool {
+        self.beliefs
+            .keys()
+            .filter(|k| k.ends_with(suffix))
+            .any(|k| self.is_supported(k))
+    }
+
     /// Record an observed outcome. Pure arithmetic, documented above.
     pub fn update(&mut self, hypothesis_id: &str, outcome: ExperimentOutcome) {
         let mut b = self.belief(hypothesis_id);

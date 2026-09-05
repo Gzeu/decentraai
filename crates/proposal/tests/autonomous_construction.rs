@@ -165,11 +165,20 @@ fn family_closes_after_learning_supported() {
         operator_destination: DEST,
         now_unix: NOW,
     });
+    // Per-hypothesis closure (v0.5.1 lesson): the PROVEN member must not
+    // reappear, but the research line stays open — the NEXT untested
+    // amount parameter IS constructed.
     assert!(
         second
             .iter()
-            .all(|c| !c.hypothesis_id.contains("transfer-health")),
-        "closed family yields no new economic candidates"
+            .all(|c| c.hypothesis_id != probe.hypothesis_id),
+        "supported hypothesis must not be re-tested"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|c| c.hypothesis_id.starts_with("fam:transfer-health:")),
+        "line continues: next parameter probed, not closed"
     );
     // But the delta family is still open → read-only candidate remains.
     assert!(
