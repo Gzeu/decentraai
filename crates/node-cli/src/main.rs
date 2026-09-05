@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod upgrade;
+mod wallet;
 mod world_bridge;
 
 #[derive(Debug, Parser)]
@@ -66,6 +67,12 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    /// Testnet settlement wallet ops (keygen 0600 + read-only address).
+    /// Spend-free by construction; the live lane stays behind its own flag.
+    Wallet {
+        #[command(subcommand)]
+        command: wallet::WalletCommand,
     },
     Worker(WorkerArgs),
     Distributed(DistributedArgs),
@@ -1083,6 +1090,7 @@ async fn main() -> Result<()> {
         } => serve_start(config, model, binary, backend).await,
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
+        Command::Wallet { command } => wallet::wallet_command(command),
         Command::Worker(args) => worker_command(args),
         Command::Distributed(args) => distributed_command(args).await,
         Command::Trust { command } => trust_command(command),
@@ -9502,6 +9510,27 @@ mod tests {
             cli.command,
             Command::Serve {
                 command: ServeCommand::Start { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_wallet_new_and_address() {
+        // Spend-free wallet ops must parse (keygen + read-only address).
+        let cli =
+            Cli::try_parse_from(["decentraai", "wallet", "new", "--secret-file", "/tmp/x.hex"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Wallet {
+                command: wallet::WalletCommand::New(_)
+            }
+        ));
+        let cli = Cli::try_parse_from(["decentraai", "wallet", "address"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Wallet {
+                command: wallet::WalletCommand::Address(_)
             }
         ));
     }
