@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::action::ProposedAction;
+use crate::budget::{ExperimentBudget, MAX_DESTINATION_LEN};
 use crate::error::ProposalError;
 use crate::risk::{ExperimentRiskClass, ResourceCommitment};
 
@@ -132,6 +133,11 @@ pub struct ExperimentProposal {
     pub risk: ExperimentRiskClass,
     /// Claimed economic commitment.
     pub commitment: ResourceCommitment,
+    /// Explicit budget for the `TestnetEconomic` lane. Absent (`None`) for
+    /// sandbox/read-only proposals; REQUIRED for testnet proposals.
+    /// `#[serde(default)]` keeps v0.1 JSON parsing unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ExperimentBudget>,
     /// Ordered steps, 1..=[`MAX_STEPS`].
     pub steps: Vec<ExperimentStep>,
     /// Proposing agent (label).
@@ -200,6 +206,24 @@ fn validate_action(a: &ProposedAction, i: usize) -> Result<(), ProposalError> {
             // Economic actions are structurally valid here so the denial is
             // explicit and typed at the policy layer (never a parse error).
             check_text(&format!("{tag}.detail"), detail)?;
+        }
+        ProposedAction::TestnetTransfer {
+            destination,
+            amount_wei,
+            ..
+        } => {
+            // Same rule: structurally valid, denied/allows decided by policy
+            // against the budget. Bounds still enforced here.
+            if destination.is_empty() || destination.len() > MAX_DESTINATION_LEN {
+                return Err(ProposalError::Bound(format!(
+                    "{tag}.destination: length must be 1..={MAX_DESTINATION_LEN}"
+                )));
+            }
+            if *amount_wei == 0 {
+                return Err(ProposalError::Bound(format!(
+                    "{tag}.amount_wei: must be >= 1"
+                )));
+            }
         }
     }
     Ok(())
