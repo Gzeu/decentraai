@@ -2770,6 +2770,28 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 ));
             }
         }
+        // M15 Research Pressure Trigger (World initiative). Opt-in via the
+        // validated `research_trigger` config section; absent/disabled = the
+        // tick handler reports `disabled` and nothing else changes. This is
+        // the `node` serve path (the systemd service runs through here).
+        if let Some(trigger_cfg) = config.research_trigger.as_ref() {
+            if trigger_cfg.enabled {
+                let rt = decentraai_runtime::research_trigger::ResearchTriggerRuntime::from_config(
+                    trigger_cfg,
+                    config.inference.api_port,
+                    &data_dir,
+                    token.clone(),
+                );
+                tracing::info!(
+                    "research-trigger: enabled (operator {}, budget {} wei, cooldown {} ticks, state {})",
+                    rt.operator_address,
+                    rt.cycle_budget_wei,
+                    trigger_cfg.cooldown_ticks,
+                    rt.state_path.display()
+                );
+                state.attach_research_trigger(std::sync::Arc::new(rt));
+            }
+        }
 
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
