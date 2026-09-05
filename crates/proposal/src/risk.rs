@@ -1,10 +1,10 @@
 //! Risk classes and resource commitments.
 //!
-//! The taxonomy is future-complete on purpose: v0.1 policy allows only
-//! `Sandbox` / `ReadOnly` risk with `None` commitment, but the `Economic`
-//! risk class and the `Cr` / `DCAI` / `Escrow` commitments already exist as
-//! *denied* values — so a future live adapter can be added without
-//! redesigning the schema. Denied is a first-class, tested outcome.
+//! v0.1 allowed only `Sandbox` / `ReadOnly` with `None` commitment.
+//! v0.2 opens exactly one more lane: `TestnetEconomic` — real testnet
+//! effects (never mainnet) inside an explicit [`crate::budget`] and behind
+//! [`crate::economic::TestnetEconomicAuthorization`]. `Economic` stays
+//! denied: there is no mainnet lane, by construction.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,16 +16,24 @@ pub enum ExperimentRiskClass {
     Sandbox,
     /// May read live state (observations) but never writes anything.
     ReadOnly,
-    /// Touches live/economic state. Declared for the future;
-    /// DENIED deterministically in v0.1.
+    /// Touches live/economic state. NO mainnet lane exists: DENIED always.
     Economic,
+    /// Real effects on MultiversX TESTNET only, inside an explicit budget
+    /// and behind testnet authorization. The only live lane in v0.2.
+    TestnetEconomic,
 }
 
 impl ExperimentRiskClass {
-    /// True only for the class v0.1 can never allow.
+    /// True for classes that touch live state (`Economic`, `TestnetEconomic`).
     #[must_use]
     pub fn is_live(self) -> bool {
-        matches!(self, Self::Economic)
+        matches!(self, Self::Economic | Self::TestnetEconomic)
+    }
+
+    /// True only for the lane v0.2 can allow with authorization.
+    #[must_use]
+    pub fn is_testnet(self) -> bool {
+        matches!(self, Self::TestnetEconomic)
     }
 }
 
@@ -65,6 +73,10 @@ mod tests {
         assert!(!ExperimentRiskClass::Sandbox.is_live());
         assert!(!ExperimentRiskClass::ReadOnly.is_live());
         assert!(ExperimentRiskClass::Economic.is_live());
+        assert!(ExperimentRiskClass::TestnetEconomic.is_live());
+        assert!(!ExperimentRiskClass::Sandbox.is_testnet());
+        assert!(ExperimentRiskClass::TestnetEconomic.is_testnet());
+        assert!(!ExperimentRiskClass::Economic.is_testnet());
     }
 
     #[test]
@@ -81,6 +93,7 @@ mod tests {
             ExperimentRiskClass::Sandbox,
             ExperimentRiskClass::ReadOnly,
             ExperimentRiskClass::Economic,
+            ExperimentRiskClass::TestnetEconomic,
         ] {
             let s = serde_json::to_string(&class).unwrap();
             let back: ExperimentRiskClass = serde_json::from_str(&s).unwrap();
