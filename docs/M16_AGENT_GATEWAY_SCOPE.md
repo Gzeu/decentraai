@@ -1,7 +1,8 @@
 # M16 Agent Gateway — Scope v0.1 (BYOA)
 
-> Status: **SCOPE — no implementation.** Nothing below changes code. Each
-> Phase-2 step ends with gates + report + STOP for review.
+> Status: **SCOPE + AS-BUILT (M16 complete, PR #98).** Sections marked
+> [AS-BUILT] record what shipped where the implementation refined this
+> scope; the invariant and all denials below hold as written.
 > Base: `main = 3557a6c` (SEC-01/SEC-02 closed, prod resynced). PR #94 stays
 > an external review — untouched, unmerged; nothing here depends on it.
 
@@ -69,6 +70,11 @@ execute enforces quota + releases on failure
   These constants are tunable only through a scope revision (future
   measurement may justify change; no implementation may silently drift
   them). Expired = unauthenticated, same code path as revoked.
+  - [AS-BUILT] The node config cap `agent_gateway.max_expiry_seconds`
+    (default 86400 = 1 day) binds ON TOP: issuance fails closed when the
+    requested TTL exceeds it. A 7-day default TTL therefore requires the
+    operator to raise the section cap — deliberate friction, documented
+    at the error site, so long-lived credentials are always explicit.
 - **Revocation**: by credential id, immediate effect (checked at auth time
   on every call — no caching of auth decisions beyond the request).
 - **Zeroization**: secret buffers zeroed after hashing/comparison
@@ -147,6 +153,12 @@ execute enforces quota + releases on failure
   containing secrets, decision, evidence id, latency).
 - Every execution returns evidence ids (existing per-domain evidence;
   gateway adds the linking record, not a parallel evidence system).
+  - [AS-BUILT] Linking, not inventing: the gateway audit links the
+    credential id to whatever evidence the tool contract returns
+    (`gateway_tool_call` pre-record + `gateway_tool_done` outcome record).
+    Evidence PRESENCE stays the tool's own contract (a stub result carries
+    none, and the gateway does not fabricate it); fail-closed applies to
+    AUDIT persistence, which is what the gateway owns.
 - Failure semantics for audit-write (binding, per class):
   - **Mutating / privileged operations are fail-closed**: if the audit or
     evidence record cannot be persisted, the call FAILS and no state
@@ -166,6 +178,11 @@ execute enforces quota + releases on failure
 - Per-credential sliding-window rate limit (reuse the consumer
   `rate_windows` pattern; defaults: 60/min reads, 10/min mutations —
   tunable per credential, never above).
+  - [AS-BUILT] One `rate_limit_per_minute` field per credential (default
+    60), applied to ALL calls through the verbatim `check_consumer_rate_limit`
+    path — no second limiter, no parallel system. The read/mutation split
+    stays a future tuning, not a second dimension: mutations are additionally
+    quota-gated, which is the binding constraint.
 - Single-flight per (credential, tool): concurrent identical mutations
   serialize; the loser gets `retry_later`, never a duplicate execution
   (same CAS idiom as the SEC-01 trigger guard).
@@ -199,6 +216,13 @@ execute enforces quota + releases on failure
   capability names. Malformed = `invalid_params`, never coercion.
 - `execute_decision` keeps `confirm:true`; agent credentials additionally
   require quota reservation success BEFORE execution starts.
+  - [AS-BUILT] Origin split, documented because it matters: `dca_` keeps
+    the coarse `authz` scope check verbatim (untouched); `dga_` uses the
+    FINER step-1 `authorize()` instead (explicit `capability` argument is
+    REQUIRED — free-text intents are never mapped by guessing). This is not
+    a bypass: it is a strictly narrower check on a path that remains
+    quota + confirm + rate + single-flight + audit gated, executing through
+    the identical `run_execute_decision` fabric flow.
 - Fuzz-adjacent coverage: unknown tool, unknown field, oversized string,
   negative price, missing confirm — all denial-tested (existing tests
   `unknown_tool_is_invalid_params` et al. are the template).
