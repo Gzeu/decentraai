@@ -63,8 +63,12 @@ execute enforces quota + releases on failure
   and the reputation/API-token files). Plaintext exists only at issuance
   output and in the agent's hands.
 - **TTL**: MANDATORY expiry (unlike `dca_` where expiry is optional).
-  Proposed bound: max 30 days, default 7 days. Expired = unauthenticated,
-  same code path as revoked.
+  Exact values are **policy constants M16 v0.1** — a security specification,
+  NOT measured results: `default = 7 days`, `absolute max = 30 days`,
+  minimum 1 day. Values outside `[1d, 30d]` are rejected at issuance.
+  These constants are tunable only through a scope revision (future
+  measurement may justify change; no implementation may silently drift
+  them). Expired = unauthenticated, same code path as revoked.
 - **Revocation**: by credential id, immediate effect (checked at auth time
   on every call — no caching of auth decisions beyond the request).
 - **Zeroization**: secret buffers zeroed after hashing/comparison
@@ -74,6 +78,46 @@ execute enforces quota + releases on failure
 - **Log/evidence hygiene**: audit records credential ID + capability +
   decision + evidence IDs. NEVER the secret, NEVER prompts/outputs
   (telemetry = counters and latencies only — fabric invariant §5).
+
+### 3.1 Exact issue / revocation ceremony (normative for step 3)
+
+- **Actor**: a human operator holding the master credential. No agent,
+  no API caller, no automation may issue or revoke. (Enforcement: the
+  issuance path requires master auth, same gate as `token create`.)
+- **Issue command** (CLI-first; no HTTP issuance endpoint in v0.1):
+  `decentraai gateway issue --agent <name> --capabilities <csv>`
+  `--quota <ceiling> [--ttl-days <1..30, default 7>]`
+  - Input validation (all fail-closed): name 1–32 chars
+    `[a-zA-Z0-9_-]`; every capability must exist in the `CapabilityKind`
+    taxonomy (unknown = reject, never coerce); quota > 0 and within the
+    node-wide gateway ceiling; ttl-days within `[1, 30]`, default 7.
+  - Secret generation: OS CSPRNG, 256-bit, `dca_`-distinct prefix reserved
+    for gateway credentials (exact prefix fixed at implementation, must
+    not collide with `dca_`/`dsk_`).
+  - **Output (shown ONCE, never stored, never logged)**: the plaintext
+    secret + credential id + capability set + quota + expiry timestamp.
+    The operator transmits the secret to the agent owner out-of-band.
+  - **Storage**: BLAKE3 hash of the secret + metadata row (id, agent,
+    capabilities, quota ceiling + consumed, issued_at, expires_at,
+    revoked flag, issuer). Same 0600 posture as token stores.
+  - **Zeroization**: plaintext buffers zeroed immediately after hashing
+    and after the once-only display write. Secrets never touch `Debug`,
+    `Display`, error strings, audit, or metrics labels.
+- **Inspect command** (master only): `decentraai gateway show --id <id>`
+  returns metadata ONLY (capabilities, quota used/remaining, expiry,
+  revoked flag) — never the secret, never the hash (hashes don't leave
+  the store; comparison happens inside).
+- **Revoke command** (master only): `decentraai gateway revoke --id <id>`
+  flips the revoked flag; effect is immediate because auth resolves the
+  live store on EVERY call (no cached auth decisions, no grace window).
+  Revocation is terminal and audited (`gateway_credential_revoked` with
+  id + issuer + reason; still no secret).
+- **Expiry**: enforced at auth time like revocation; expired and revoked
+  share one denial path and one failure reason (no oracle distinguishing
+  them to unauthenticated callers).
+- Step-3 implementation MUST NOT add issuance over HTTP, MUST NOT widen
+  the actor set, and MUST NOT persist plaintext anywhere. Any deviation
+  is a scope change requiring re-review.
 
 ## 4. Operation classes
 
@@ -103,9 +147,19 @@ execute enforces quota + releases on failure
   containing secrets, decision, evidence id, latency).
 - Every execution returns evidence ids (existing per-domain evidence;
   gateway adds the linking record, not a parallel evidence system).
+- Failure semantics for audit-write (binding, per class):
+  - **Mutating / privileged operations are fail-closed**: if the audit or
+    evidence record cannot be persisted, the call FAILS and no state
+    effect is committed (reservation rolls back, nothing executes).
+    "No evidence = it didn't happen" holds without exception here.
+  - **Read-only operations** have explicitly separate, documented
+    semantics: reads are counted via metrics (counters/latencies); the
+    per-call audit record is best-effort. Rationale, stated plainly: a
+    read cannot change state, so a dropped read-audit leaves no evidence
+    gap with a state effect. Any future read that CAN change state
+    (counters with side effects, lazy materialization) is reclassified
+    as mutating and inherits fail-closed. No silent third category.
 - Read-only calls are counted (metrics), not logged per-call (log hygiene).
-- Audit write failure on a mutating call = the call FAILS (no silent
-  unlogged mutation; best-effort only for reads).
 
 ## 7. Rate-limit + single-flight / concurrency limits
 
