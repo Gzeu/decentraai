@@ -189,6 +189,12 @@ impl GatewayKeyStore {
         })
     }
 
+    /// Fetch a record by key id (for step-1 authorize reconstruction;
+    /// returns a clone — no borrow retained across persistence).
+    pub fn get_by_id(&self, key_id: &str) -> Option<GatewayKeyRecord> {
+        self.keys.values().find(|r| r.key_id == key_id).cloned()
+    }
+
     /// Marks a key as used (updates `last_used_at`). Best-effort persist.
     pub fn touch_used(&mut self, key_id: &str) {
         if let Some(rec) = self.keys.values_mut().find(|r| r.key_id == key_id) {

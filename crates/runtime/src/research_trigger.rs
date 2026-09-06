@@ -35,6 +35,31 @@ use decentraai_proposal::{ResearchJournal, parse_world_view};
 /// sees command lines; same-machine, same-operator by design).
 pub const WORLD_TOKEN_ENV: &str = "DECENTRAAI_WORLD_TOKEN";
 
+/// Parent environment names a triggered child may inherit (M16 phase 7/10:
+/// a spawned research child must NOT inherit any mechanism that enables
+/// Testnet-economic execution — notably NEVER `DECENTRAAI_MX_SIGNER_*` —
+/// nor any other ambient authority; the live lane stays manually invoked
+/// where the OPERATOR's shell provides signing material).
+/// The child still needs `HOME` (loop state files live under it), `PATH`
+/// and `RUST_LOG`; the world token travels via [`WORLD_TOKEN_ENV`] explicitly.
+pub const CHILD_ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "RUST_LOG"];
+
+/// Build the child's environment: allowlisted parent vars only, plus the
+/// world token. Pure (testable): the caller applies it to the command.
+#[must_use]
+pub fn child_env(token: &str) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = CHILD_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| ((*name).to_string(), value))
+        })
+        .collect();
+    env.push((WORLD_TOKEN_ENV.to_string(), token.to_string()));
+    env
+}
+
 /// Node-side trigger configuration, built once from the validated
 /// `research_trigger` config section (see `attach` call site in node-cli).
 #[derive(Debug, Clone)]
@@ -265,11 +290,15 @@ impl ResearchTriggerRuntime {
             self.cycle_budget_wei
         );
         tokio::spawn(async move {
-            let out = tokio::process::Command::new(&exe)
-                .args(&argv)
-                .env(WORLD_TOKEN_ENV, &token)
-                .output()
-                .await;
+            let mut cmd = tokio::process::Command::new(&exe);
+            cmd.args(&argv);
+            // Allowlisted inheritance ONLY (see CHILD_ENV_ALLOWLIST): the
+            // child starts from a clean environment, never the parent's.
+            cmd.env_clear();
+            for (name, value) in child_env(&token) {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().await;
             match out {
                 Ok(o) if o.status.success() => {
                     tracing::info!("research-trigger: child cycle:trigger-{tick} exited ok");
@@ -336,6 +365,35 @@ mod tests {
             "treasury_minted": 0,
             "treasury_burned": 0
         })
+    }
+
+    #[test]
+    fn child_env_inherits_allowlist_only() {
+        // Phase 7/10: no signing material, no seeds, no ambient authority
+        // may EVER reach a spawned child — even if the parent process holds
+        // them. The live lane stays manually invoked by the operator.
+        for forbidden in [
+            "DECENTRAAI_MX_SIGNER_HEX",
+            "DECENTRAAI_MX_SIGNER_HEX_FILE",
+            "MNEMONIC",
+            "SEED",
+            "PRIVATE_KEY",
+            "SECRET",
+        ] {
+            assert!(
+                !CHILD_ENV_ALLOWLIST.contains(&forbidden),
+                "{forbidden} must never be inherited"
+            );
+        }
+        assert!(CHILD_ENV_ALLOWLIST.contains(&"HOME"));
+        assert!(CHILD_ENV_ALLOWLIST.contains(&"PATH"));
+        let env = child_env("tok");
+        assert!(env.iter().any(|(k, v)| k == WORLD_TOKEN_ENV && v == "tok"));
+        assert!(
+            env.iter().all(|(k, _)| {
+                *k == WORLD_TOKEN_ENV || CHILD_ENV_ALLOWLIST.contains(&k.as_str())
+            })
+        );
     }
 
     #[test]

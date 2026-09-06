@@ -197,6 +197,21 @@ impl GateError {
     }
 }
 
+/// M16 single-flight RAII guard: releases the gateway mutation claim on
+/// Drop, so EVERY exit path (success, denial, failure, panic unwind)
+/// releases. Hold as `let _flight = ...` for the mutation body.
+struct GatewayFlightGuard<'a> {
+    state: &'a ApiState,
+    key: String,
+    tool: &'static str,
+}
+
+impl Drop for GatewayFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.state.gateway_release(&self.key, self.tool);
+    }
+}
+
 /// How the caller authenticated on this request.
 #[derive(Debug)]
 pub(crate) enum Auth {
@@ -329,6 +344,11 @@ pub struct ApiState {
     /// when running without compute; consumer quota enforcement is skipped.
     pub(crate) quota_ledger: Option<Arc<StdMutex<decentraai_compute::QuotaLedger>>>,
     consumer_rate_windows: Arc<StdMutex<HashMap<String, VecDeque<Instant>>>>,
+    /// M16 gateway single-flight claims: `"key_id:tool" -> ()` while a
+    /// gateway mutation runs. Same CAS idiom as the SEC-01 trigger guard:
+    /// concurrent identical mutations serialize, the loser gets a
+    /// deterministic retry denial — never a duplicate execution.
+    gateway_inflight: Arc<StdMutex<HashMap<String, ()>>>,
     consumer_usage: UsageCounters,
     tiers: Option<TiersSection>,
     queue: Arc<InferenceQueue>,
@@ -451,6 +471,7 @@ impl ApiState {
             vesper_keys: Arc::new(StdMutex::new(HashMap::new())),
             quota_ledger: None,
             consumer_rate_windows: Arc::new(StdMutex::new(HashMap::new())),
+            gateway_inflight: Arc::new(StdMutex::new(HashMap::new())),
             consumer_usage: Arc::new(StdMutex::new(HashMap::new())),
             tiers,
             queue,
@@ -1281,6 +1302,24 @@ impl ApiState {
         }
         window.push_back(Instant::now());
         Ok(())
+    }
+
+    /// M16 single-flight claim for one gateway mutation (`key_id:tool`).
+    /// `true` = this caller owns the execution; `false` = an identical
+    /// mutation is already running (deny deterministically, retry later).
+    /// Map insert only — the lock is never held across execution.
+    fn gateway_try_claim(&self, key_id: &str, tool: &str) -> bool {
+        let mut inflight = self.gateway_inflight.lock().unwrap();
+        inflight.insert(format!("{key_id}:{tool}"), ()).is_none()
+    }
+
+    /// Release a single-flight claim (all exits, including failures —
+    /// pair with [`GatewayFlightGuard`] so no path forgets).
+    fn gateway_release(&self, key_id: &str, tool: &str) {
+        self.gateway_inflight
+            .lock()
+            .unwrap()
+            .remove(&format!("{key_id}:{tool}"));
     }
 
     /// Whether consumer API keys are enabled (a registry path + shared ledger
@@ -6360,6 +6399,86 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
 /// `min(account.available, ceiling)` → execute through the existing fabric →
 /// settle the real measured tokens → release any unused reservation. No
 /// duplicate accounting; the ledger remains the single source of truth.
+/// M16 gateway authorization through the step-1 pure boundary.
+/// Non-gateway keys pass through untouched (their own scope checks stay
+/// authoritative). Returns the agent name on Allow, or the STABLE denial
+/// reason (the caller renders it — this signature stays small on purpose).
+fn gateway_authorize(
+    state: &ApiState,
+    key_id: &str,
+    capability: &str,
+    class: decentraai_agents::gateway::OperationClass,
+) -> Result<String, &'static str> {
+    use decentraai_agents::gateway::{AuthDecision, GatewayCredential, authorize};
+    if !key_id.starts_with("gk-") {
+        return Ok(String::new());
+    }
+    let Some(path) = state.gateway_keys_path.clone() else {
+        return Err("gateway not configured");
+    };
+    let store = decentraai_tokens::GatewayKeyStore::load(&path)
+        .map_err(|_| "gateway registry unavailable")?;
+    let rec = store
+        .get_by_id(key_id)
+        .ok_or(decentraai_agents::gateway::REASON_INACTIVE)?;
+    let credential = GatewayCredential {
+        id: rec.key_id.clone(),
+        agent_name: rec.agent_name.clone(),
+        capabilities: rec.capabilities.iter().cloned().collect(),
+        quota_ceiling: rec.quota_ceiling,
+        issued_at: rec.created_at,
+        expires_at: rec.expires_at,
+        revoked: rec.revoked,
+    };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match authorize(&credential, capability, class, now_unix) {
+        AuthDecision::Allow { .. } => Ok(rec.agent_name.clone()),
+        AuthDecision::Deny { reason } => Err(reason),
+    }
+}
+
+/// M16 pre-mutation audit (fail-closed): when this record cannot persist,
+/// the mutation MUST NOT run. Post-execution outcome records stay
+/// best-effort (the gate already held). Never carries secrets or prompts —
+/// only ids, tool, capability and the decision.
+fn gateway_audit_pre(
+    state: &ApiState,
+    key_id: &str,
+    agent: &str,
+    tool: &str,
+    capability: &str,
+) -> Result<(), &'static str> {
+    if decentraai_audit::record(
+        &state.info.repo_root.join("logs"),
+        "gateway_tool_call",
+        serde_json::json!({
+            "key_id": key_id,
+            "agent": agent,
+            "tool": tool,
+            "capability": capability,
+            "decision": "allow",
+        }),
+    )
+    .is_err()
+    {
+        return Err("audit unavailable; mutation refused");
+    }
+    Ok(())
+}
+
+/// M16 single-flight denial: deterministic retry signal (429, NOT 403 —
+/// the request is legitimate, only the timing collides).
+fn gateway_flight_denied() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "{\"error\":{\"message\":\"duplicate in-flight mutation for this credential and tool; retry shortly\",\"type\":\"retry_later_error\"}}",
+    )
+        .into_response()
+}
+
 async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
     let Auth::Consumer {
         key_id,
@@ -6371,6 +6490,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     else {
         return forbidden("not a consumer credential");
     };
+    // M16 gateway origin (`dga_`, key id `gk-*`): the same handler serves
+    // both, but gateway mutations additionally pass the step-1 pure
+    // boundary, single-flight, and fail-closed pre-audit below.
+    let is_gateway = key_id.starts_with("gk-");
     let raw = String::from_utf8_lossy(body);
     let mut ctx = mcp_context(state).await;
 
@@ -6383,8 +6506,43 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         if !scopes.iter().any(|s| s == "embeddings" || s == "*") {
             return forbidden("consumer key missing embeddings scope");
         }
+        // M16 gateway pipeline (dga_ only): pure authorize → single-flight
+        // → fail-closed pre-audit. The RAII flight guard releases on EVERY
+        // exit below, including denials and failures.
+        let gateway_agent = if is_gateway {
+            match gateway_authorize(
+                state,
+                key_id,
+                "embeddings",
+                decentraai_agents::gateway::OperationClass::Compute,
+            ) {
+                Ok(agent) => Some(agent),
+                Err(reason) => return forbidden(reason),
+            }
+        } else {
+            None
+        };
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
+        }
+        let _gateway_flight = if is_gateway {
+            if !state.gateway_try_claim(key_id, "decentraai_embeddings") {
+                return gateway_flight_denied();
+            }
+            Some(GatewayFlightGuard {
+                state,
+                key: key_id.clone(),
+                tool: "decentraai_embeddings",
+            })
+        } else {
+            None
+        };
+        if let Some(ref agent) = gateway_agent {
+            if let Err(reason) =
+                gateway_audit_pre(state, key_id, agent, "decentraai_embeddings", "embeddings")
+            {
+                return forbidden(reason);
+            }
         }
         let request_id = format!("{}-{:?}", key_id, std::time::Instant::now());
         let Some(mut guard) =
@@ -6421,6 +6579,14 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         };
         guard.settle(1);
         state.note_token_usage(auth, 1);
+        // M16 gateway outcome record (best-effort — the gate already held).
+        if is_gateway {
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "gateway_tool_done",
+                serde_json::json!({"key_id": key_id, "tool": "decentraai_embeddings", "settled": 1}),
+            );
+        }
         // Return directly (bypass generic handle_message which would look for tool in McpContext)
         let id = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
@@ -6447,8 +6613,46 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 capability
             ));
         }
+        // M16 gateway pipeline (dga_ only): pure authorize on the REQUESTED
+        // capability → single-flight → fail-closed pre-audit.
+        let gateway_agent = if is_gateway {
+            match gateway_authorize(
+                state,
+                key_id,
+                &capability,
+                decentraai_agents::gateway::OperationClass::Compute,
+            ) {
+                Ok(agent) => Some(agent),
+                Err(reason) => return forbidden(reason),
+            }
+        } else {
+            None
+        };
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
+        }
+        let _gateway_flight = if is_gateway {
+            if !state.gateway_try_claim(key_id, "decentraai_compute_request") {
+                return gateway_flight_denied();
+            }
+            Some(GatewayFlightGuard {
+                state,
+                key: key_id.clone(),
+                tool: "decentraai_compute_request",
+            })
+        } else {
+            None
+        };
+        if let Some(ref agent) = gateway_agent {
+            if let Err(reason) = gateway_audit_pre(
+                state,
+                key_id,
+                agent,
+                "decentraai_compute_request",
+                &capability,
+            ) {
+                return forbidden(reason);
+            }
         }
         let p2p = match &state.p2p {
             Some(p) => p.clone(),
@@ -6483,6 +6687,14 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             guard.settle(1);
             state.note_token_usage(auth, 1);
         }
+        // M16 gateway outcome record (best-effort — the gate already held).
+        if is_gateway {
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "gateway_tool_done",
+                serde_json::json!({"key_id": key_id, "tool": "decentraai_compute_request", "ok": success}),
+            );
+        }
         let result_body = serde_json::json!({
             "status": if success { 200 } else { 502 },
             "ok": success,
@@ -6507,18 +6719,63 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         // `execute_decision`: the mutating consumption step, quota-gated.
         // The confirmation gate is enforced inside `run_execute_decision`.
         // SCOPE CHECK: consumers must have explicit "execute" or "*" scope.
-        {
-            use crate::authz::{Operation, Resource, authorize};
-            let actor = auth.to_actor();
-            if let crate::authz::AuthzResult::Denied(reason) =
-                authorize(&actor, Resource::Fabric, Operation::Execute)
-            {
-                return forbidden(&reason.to_string());
+        // M16 gateway origin split: dca_ keeps the coarse authz scope check
+        // below (untouched); dga_ uses the FINER capability-specific step-1
+        // boundary instead (an explicit capability argument is REQUIRED —
+        // free-text intents are never mapped to capabilities by guessing).
+        // Both origins stay quota+confirm gated; nothing is bypassed.
+        let gateway_agent = if is_gateway {
+            let cap = args
+                .get("capability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if cap.is_empty() {
+                return forbidden(
+                    "gateway execute_decision requires an explicit capability argument",
+                );
             }
-        }
+            match gateway_authorize(
+                state,
+                key_id,
+                cap,
+                decentraai_agents::gateway::OperationClass::Compute,
+            ) {
+                Ok(agent) => Some((agent, cap.to_string())),
+                Err(reason) => return forbidden(reason),
+            }
+        } else {
+            {
+                use crate::authz::{Operation, Resource, authorize};
+                let actor = auth.to_actor();
+                if let crate::authz::AuthzResult::Denied(reason) =
+                    authorize(&actor, Resource::Fabric, Operation::Execute)
+                {
+                    return forbidden(&reason.to_string());
+                }
+            }
+            None
+        };
         // Per-key rate limit (frequency), independent from quota.
         if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
             return e.into_response();
+        }
+        // M16 gateway single-flight + fail-closed pre-audit (dga_ only).
+        let _gateway_flight = if is_gateway {
+            if !state.gateway_try_claim(key_id, "execute_decision") {
+                return gateway_flight_denied();
+            }
+            Some(GatewayFlightGuard {
+                state,
+                key: key_id.clone(),
+                tool: "execute_decision",
+            })
+        } else {
+            None
+        };
+        if let Some((ref agent, ref cap)) = gateway_agent {
+            if let Err(reason) = gateway_audit_pre(state, key_id, agent, "execute_decision", cap) {
+                return forbidden(reason);
+            }
         }
         // Quota reservation for this request (request_id from a monotonic
         // timestamp + key — idempotent across a retry of the same key+instant).
@@ -6543,6 +6800,14 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         if ok {
             guard.settle(tokens_used);
             state.note_token_usage(auth, tokens_used);
+        }
+        // M16 gateway outcome record (best-effort — the gate already held).
+        if is_gateway {
+            decentraai_audit::record_best_effort(
+                &state.info.repo_root.join("logs"),
+                "gateway_tool_done",
+                serde_json::json!({"key_id": key_id, "tool": "execute_decision", "ok": ok, "tokens_settled": if ok { tokens_used } else { 0 }}),
+            );
         }
         // On failure the guard's Drop releases the reservation (no leak).
         ctx.execution = serde_json::json!({
@@ -7143,7 +7408,6 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     // Agents never see tools they cannot call — no oracle for
                     // hub/society/memory/economy/control planes. Call-time
                     // scope checks below stay authoritative regardless.
-                    let is_gateway = key_id.starts_with("gk-");
                     tools.retain(|t| {
                         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         if is_gateway {
@@ -22076,6 +22340,214 @@ mod tests {
             gateway_call(&client, api, &plaintext, emb).await.status(),
             429
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_execute_needs_explicit_granted_capability() {
+        // Stricter than dca_ by design: free-text intents are never mapped
+        // to capabilities by guessing; the grant check is capability-exact.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let chat_key = make_gateway_key(dir.path(), &["chat"], "gw-account");
+        let client = reqwest::Client::new();
+        let no_cap = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"execute_decision","arguments":{"intent":"chat","prompt":"hi","confirm":true}}});
+        let r = gateway_call(&client, api, &chat_key, no_cap).await;
+        assert_eq!(r.status(), 403);
+        assert!(r.text().await.unwrap().contains("explicit capability"));
+        // Ungranted capability: stable step-1 reason propagates verbatim.
+        let wrong_cap = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"execute_decision","arguments":{"capability":"translation","prompt":"hi","confirm":true}}});
+        let r = gateway_call(&client, api, &chat_key, wrong_cap).await;
+        assert_eq!(r.status(), 403);
+        assert!(r.text().await.unwrap().contains("capability not granted"));
+        // Granted capability: passes authorization into the fabric run. This
+        // state has no distributed router, so execution fails AFTER the
+        // gates — the reservation must be released (ledger untouched).
+        let ok_cap = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"execute_decision","arguments":{"capability":"chat","prompt":"hi","confirm":true}}});
+        let r = gateway_call(&client, api, &chat_key, ok_cap).await;
+        assert_ne!(r.status(), 403, "granted execute must pass authorization");
+        let available = ledger
+            .lock()
+            .unwrap()
+            .account(&"gw-account".to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        assert_eq!(available, 1000, "failed execution releases the reservation");
+    }
+
+    #[tokio::test]
+    async fn gateway_hidden_planes_deny_direct_calls() {
+        // Phase 4/9 structural denial: hub/society/economy/control tools are
+        // unreachable from gateway credentials even when called directly
+        // (list already hides them — no oracle either way).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let client = reqwest::Client::new();
+        for (name, args) in [
+            (
+                "hub_publish_task",
+                serde_json::json!({"title": "t", "reward": 5, "description": "d"}),
+            ),
+            ("m18_propose_contract", serde_json::json!({"title": "t"})),
+            ("list_consumer_keys", serde_json::json!({})),
+        ] {
+            let r = gateway_call(
+                &client,
+                api,
+                &key,
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name": name, "arguments": args}}),
+            )
+            .await;
+            assert_eq!(r.status(), 403, "{name} must deny for gateway credentials");
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_audit_failure_fails_closed_and_releases_flight() {
+        // Fail-closed proof: repo_root is a FILE, so the pre-mutation audit
+        // record cannot persist → the mutation is refused BEFORE any quota
+        // moves. A second identical call is also 403 (not 429), proving the
+        // single-flight claim released on the deny path (RAII Drop).
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"gw-account".to_string(), "seed-a", Some(1000), None);
+        }
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut info = test_info(dir.path(), None);
+        info.repo_root = blocker;
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some("master-token".to_string()),
+            manager.clone(),
+            info,
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.path().join("db/consumer_keys.json")),
+            Some(ledger.clone()),
+        );
+        state.attach_gateway(
+            decentraai_config::AgentGatewaySection {
+                enabled: true,
+                max_quota_ceiling: 1000,
+                max_rate_limit: 60,
+                max_expiry_seconds: 30 * 86_400,
+                allowed_capabilities: vec![],
+                free_starter: Default::default(),
+            },
+            Some(dir.path().join("db/gateway_keys.json")),
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        // NOTE: the gateway store lives under the REAL dir (repo_root only
+        // poisons the audit path), so auth resolution succeeds.
+        let mut store =
+            decentraai_tokens::GatewayKeyStore::load(&dir.path().join("db/gateway_keys.json"))
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let plaintext = store
+            .create(
+                "aud",
+                vec!["embeddings".to_string()],
+                "gw-account",
+                100,
+                60,
+                now + 86_400,
+            )
+            .unwrap();
+        let client = reqwest::Client::new();
+        let emb = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"decentraai_embeddings","arguments":{"input":"hi"}}});
+        for _ in 0..2 {
+            let r = gateway_call(&client, api, &plaintext, emb.clone()).await;
+            assert_eq!(r.status(), 403, "audit failure must fail closed");
+            assert!(r.text().await.unwrap().contains("audit unavailable"));
+        }
+        let available = ledger
+            .lock()
+            .unwrap()
+            .account(&"gw-account".to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        assert_eq!(available, 1000, "no quota moves when audit fails");
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_flight_helpers_exactly_once() {
+        // Unit-level single-flight (deterministic; the HTTP denial path is
+        // covered by the audit test's second-call-403 assertion above).
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            "http://127.0.0.1:0".to_string(),
+            None,
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        assert!(state.gateway_try_claim("gk-1", "execute_decision"));
+        assert!(!state.gateway_try_claim("gk-1", "execute_decision"));
+        assert!(state.gateway_try_claim("gk-1", "decide"));
+        state.gateway_release("gk-1", "execute_decision");
+        assert!(state.gateway_try_claim("gk-1", "execute_decision"));
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_mutations_leave_no_secrets_on_disk() {
+        // Phase 12 (secret audit, executable): after issuance + real calls,
+        // neither the store file nor the audit log may contain the secret.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let plaintext = make_gateway_key(dir.path(), &["embeddings"], "gw-account");
+        let client = reqwest::Client::new();
+        let _ = gateway_call(
+            &client,
+            api,
+            &plaintext,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decentraai_embeddings","arguments":{"input":"hello"}}}),
+        )
+        .await;
+        let store_raw = std::fs::read_to_string(dir.path().join("db/gateway_keys.json")).unwrap();
+        assert!(!store_raw.contains(&plaintext));
+        let mut found_audit = false;
+        let logs = dir.path().join("logs");
+        if logs.exists() {
+            for entry in std::fs::read_dir(&logs).unwrap().flatten() {
+                let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                assert!(
+                    !content.contains(&plaintext),
+                    "audit must never contain the secret"
+                );
+                if content.contains("gateway_tool_call") {
+                    found_audit = true;
+                }
+            }
+        }
+        assert!(found_audit, "mutation must leave an audit trace");
     }
 
     #[tokio::test]
