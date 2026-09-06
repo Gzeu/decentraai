@@ -366,6 +366,9 @@ pub struct ApiState {
     distributed: Option<Arc<decentraai_distributed::DistributedInference>>,
     agents: Option<Arc<decentraai_distributed::agents::AgentManager>>,
     orchestrator: Option<Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>>,
+    /// M17: assignment lifecycle store (pull model for external executors).
+    orchestration_tasks:
+        Option<Arc<std::sync::Mutex<decentraai_agents::orchestration::AssignmentStore>>>,
     skills: Option<Arc<decentraai_agents::SkillRegistry>>,
     embedding: Option<Arc<decentraai_distributed::embedding::EmbeddingClient>>,
     retrieval: Option<Arc<decentraai_distributed::retrieval_manager::RetrievalManager>>,
@@ -489,6 +492,7 @@ impl ApiState {
             distributed: None,
             agents: None,
             orchestrator: None,
+            orchestration_tasks: None,
             skills: None,
             embedding: None,
             retrieval: None,
@@ -591,6 +595,14 @@ impl ApiState {
         orchestrator: Arc<decentraai_distributed::agent_orchestrator::AgentOrchestrator>,
     ) {
         self.orchestrator = Some(orchestrator);
+    }
+
+    /// M17: attaches the assignment store for collective orchestration.
+    pub fn attach_orchestration(
+        &mut self,
+        store: Arc<std::sync::Mutex<decentraai_agents::orchestration::AssignmentStore>>,
+    ) {
+        self.orchestration_tasks = Some(store);
     }
 
     /// M15: honest local pressure signals for the autonomous engine —
@@ -6479,6 +6491,177 @@ fn gateway_flight_denied() -> Response {
         .into_response()
 }
 
+/// M17: external provider ads derived from live `dga_` credentials
+/// (capabilities == credential grants — an agent can never claim more than
+/// it holds). Reads the registry fresh; secrets are never present.
+fn orchestration_provider_ads(
+    state: &ApiState,
+) -> Vec<decentraai_agents::orchestration::ProviderAd> {
+    use decentraai_agents::orchestration::{ProviderAd, ProviderOrigin};
+    let Some(path) = state.gateway_keys_path.clone() else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    decentraai_tokens::GatewayKeyStore::load(&path)
+        .map(|s| {
+            s.all()
+                .iter()
+                .map(|rec| ProviderAd {
+                    agent_id: rec.agent_name.clone(),
+                    origin: ProviderOrigin::External,
+                    capabilities: rec.capabilities.clone(),
+                    price: 0,
+                    contribution_balance: 0,
+                    last_seen_ms: now,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// M17: handles `orchestrate_propose`. Both requester origins are respected
+/// (no parallel systems): `dga_` passes the pure authorize on the
+/// `orchestrate` capability; `dca_` requires the `orchestrate` scope. Dry-run
+/// assignment happens against the live provider view; requester quota is NOT
+/// locked here (locking happens at fabric dispatch — handlers stay
+/// side-effect-analysis-free).
+async fn orchestration_propose_resp(
+    state: &ApiState,
+    key_id: &str,
+    scopes: &[String],
+    stages_v: &serde_json::Value,
+    total: u64,
+    cap: u64,
+) -> Response {
+    use decentraai_agents::orchestration as orch;
+
+    // Origin authz: gateway pure boundary OR consumer scope, never both-bypass.
+    let auth_ok = if key_id.starts_with("gk-") {
+        gateway_authorize(
+            state,
+            key_id,
+            "orchestrate",
+            decentraai_agents::gateway::OperationClass::Compute,
+        )
+        .is_ok()
+    } else {
+        scopes.iter().any(|s| s == "orchestrate" || s == "*")
+    };
+    if !auth_ok {
+        return forbidden("missing orchestrate scope/capability");
+    }
+
+    // Closed-schema stage extraction (deny on any structural violation).
+    let stages = match stages_v.as_array() {
+        Some(s) if !s.is_empty() && s.len() <= orch::MAX_ORCHESTRATION_STAGES => s,
+        _ => return forbidden("stages must be a non-empty array (max 8)"),
+    };
+    if stages.len() > 8 || total > 80000 || cap > 80000 {
+        return forbidden("plan/price bounds exceeded");
+    }
+
+    let mut assignments = Vec::new();
+    let mut store_lock = state
+        .orchestration_tasks
+        .as_ref()
+        .map(|s| s.lock().unwrap());
+    let plan_id = format!("m17-{}-{}", key_id, now_ms());
+    let ads = orchestration_provider_ads(state);
+    let now = now_ms();
+
+    for st in stages {
+        let stage_id = match st
+            .get("stage_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+        {
+            Some(s) => s.to_string(),
+            None => return forbidden("every stage needs stage_id (<=128 chars)"),
+        };
+        let capability = match st
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+        {
+            Some(s) => s.to_string(),
+            None => return forbidden("every stage needs capability (<=128 chars)"),
+        };
+        let max_price = st.get("max_price").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let req_orch = orch::StageRequirement {
+            capability: capability.clone(),
+            max_price,
+        };
+        let assigned = orch::select_provider(&ads, &req_orch, now)
+            .ok()
+            .map(|ad| ad.agent_id.clone());
+
+        if let Some(store) = store_lock.as_deref_mut() {
+            let _ = store.propose(&plan_id, &stage_id, &capability, max_price, key_id, now);
+            if assigned.is_some() {
+                let _ = store.assign(&plan_id, &stage_id, assigned.as_deref().unwrap_or(""), now);
+            }
+        }
+        assignments.push(serde_json::json!({
+            "stage_id": stage_id,
+            "capability": capability,
+            "max_price": max_price,
+            "assigned_to": assigned,
+        }));
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "result": {"content":[{"type":"text","text": serde_json::to_string(&serde_json::json!({
+        "plan_id": plan_id,
+        "stage_count": stages.len(),
+        "total_price": total,
+        "budget_cap": cap,
+        "dry_run": true,
+        "assignments": assignments,
+    })).unwrap_or_default()}]},
+    });
+    (
+        axum::http::StatusCode::OK,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// M17: handles `orchestrate_status` — ids and verdicts only, never prompts.
+fn orchestration_status_resp(state: &ApiState, plan_id: &str) -> Response {
+    let Some(store) = &state.orchestration_tasks else {
+        return forbidden("orchestration not attached");
+    };
+    let stages: Vec<serde_json::Value> = {
+        let g = store.lock().unwrap();
+        g.plan(plan_id)
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "stage_id": a.stage_id,
+                    "capability": a.capability,
+                    "price": a.price,
+                    "state": format!("{:?}", a.state),
+                })
+            })
+            .collect()
+    };
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "result": {"content":[{"type":"text","text":
+            serde_json::to_string(&serde_json::json!({ "plan_id": plan_id, "stages": stages }))
+                .unwrap_or_default()}]},
+    });
+    (
+        axum::http::StatusCode::OK,
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response()
+}
+
 async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
     let Auth::Consumer {
         key_id,
@@ -7415,6 +7598,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                                 "decide" | "execute_decision" | "discover_capabilities" => true,
                                 "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings"),
                                 "decentraai_compute_request" => !scopes.is_empty(),
+                                // M17: visible only with the explicit grant.
+                                "orchestrate_propose" | "orchestrate_status" => {
+                                    scopes.iter().any(|s| s == "orchestrate")
+                                }
                                 _ => false,
                             };
                         }
@@ -7455,6 +7642,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             // M18 Economic Layer: available with "economy" scope or "*"
                             name if name.starts_with("m18_") => {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
+                            }
+                            "orchestrate_propose" | "orchestrate_status" => {
+                                scopes.iter().any(|s| s == "orchestrate" || s == "*")
                             }
                             _ => true,
                         }
@@ -7816,6 +8006,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         if !scopes.iter().any(|s| s == "arena" || s == "*") {
             return forbidden("consumer key missing arena scope");
         }
+    } else if let Some((stages_v, total, cap)) = crate::mcp::orchestrate_propose_request(&raw) {
+        return orchestration_propose_resp(state, key_id, scopes, &stages_v, total, cap).await;
+    } else if let Some(plan_id) = crate::mcp::orchestrate_status_request(&raw) {
+        return orchestration_status_resp(state, &plan_id);
     } else if crate::mcp::discover_capabilities_request(&raw) {
         // Agent onboarding: discover what this node offers and what scopes are needed.
         // Always available — no scope required.
@@ -22092,6 +22286,10 @@ mod tests {
             },
             Some(dir.join("db/gateway_keys.json")),
         );
+        // M17: assignment store attached on the test harness too.
+        state.attach_orchestration(Arc::new(std::sync::Mutex::new(
+            decentraai_agents::orchestration::AssignmentStore::new(),
+        )));
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
         (api, ledger)
     }
@@ -22548,6 +22746,168 @@ mod tests {
             }
         }
         assert!(found_audit, "mutation must leave an audit trace");
+    }
+
+    // ---- M17 collective orchestration ----
+
+    fn m17_propose_payload(stages: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"orchestrate_propose",
+                "arguments":{"stages": stages, "total_price": 20}}})
+    }
+
+    #[tokio::test]
+    async fn m17_gateway_without_orchestrate_grant_denied_and_hidden() {
+        // setup: gateway key with only chat — propose must deny, list must hide.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key = make_gateway_key(dir.path(), &["chat"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!([
+                {"stage_id":"s1","capability":"chat","max_price":5}
+            ])),
+        )
+        .await;
+        assert_eq!(r.status(), 403, "orchestrate_propose denies without grant");
+        let list = gateway_call(
+            &client,
+            api,
+            &key,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+        assert!(
+            !list.contains("orchestrate_propose"),
+            "tools/list hides it without grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn m17_gateway_granted_propose_returns_dry_run_assignment() {
+        // external providers derive from live credentials: the same agent
+        // appears as a candidate for its own granted capabilities.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key = make_gateway_key(dir.path(), &["chat", "orchestrate"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!([
+                {"stage_id":"s1","capability":"chat","max_price":5}
+            ])),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("\"dry_run\":true"), "dry-run flag present");
+        assert!(text.contains("s1"), "stage id echoed");
+        assert!(
+            text.contains("ext-agent"),
+            "provider discovered from credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn m17_propose_bounds_and_malformed_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key = make_gateway_key(dir.path(), &["orchestrate"], "gw-account");
+        let client = reqwest::Client::new();
+        // 9 stages > bound
+        let stages: Vec<serde_json::Value> = (0..9)
+            .map(|i| {
+                serde_json::json!({
+                    "stage_id": format!("s{i}"), "capability": "chat", "max_price": 1
+                })
+            })
+            .collect();
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!(stages)),
+        )
+        .await;
+        assert_eq!(r.status(), 403, "stage bound denied");
+        // missing stage fields
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!([
+                {"capability": "chat"}
+            ])),
+        )
+        .await;
+        assert_eq!(r.status(), 403, "malformed stage denied");
+    }
+
+    #[tokio::test]
+    async fn m17_status_reports_plan_without_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key = make_gateway_key(dir.path(), &["chat", "orchestrate"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!([
+                {"stage_id":"s1","capability":"chat","max_price":5}
+            ])),
+        )
+        .await;
+        let body: serde_json::Value = r.json().await.unwrap();
+        // plan_id comes from the dry-run result
+        let plan_id = {
+            let text = body["result"]["content"][0]["text"].as_str().unwrap();
+            let v: serde_json::Value = serde_json::from_str(text).unwrap();
+            v["plan_id"].as_str().unwrap().to_string()
+        };
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"tools/call","params":{"name":"orchestrate_status",
+            "arguments":{"plan_id": plan_id}}}),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let raw = r.text().await.unwrap();
+        assert!(raw.contains("s1"));
+        assert!(!raw.contains("capability_arg_secret"), "no payload leaks");
+    }
+
+    #[tokio::test]
+    async fn m17_dca_without_scope_denied() {
+        // consumer (dca_) keys: orchestration requires the orchestrate scope.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let key = make_consumer_key_with_scopes(api, "m17-consumer", &["compute"]).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&m17_propose_payload(serde_json::json!([
+                {"stage_id":"s1","capability":"chat","max_price":5}
+            ])))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
     }
 
     #[tokio::test]

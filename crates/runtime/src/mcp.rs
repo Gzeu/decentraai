@@ -747,6 +747,47 @@ pub fn all_tools() -> Vec<ToolDef> {
         annotations: ToolAnnotations::open_world(),
         },
         ToolDef {
+            name: "orchestrate_propose",
+            description: "M17: propose a multi-stage plan (≤8 stages, closed schema) for collective execution across local + P2P + external providers. Read-only dry-run assignment; requires the `orchestrate` scope/capability grant. Prices are quota-credit bounds; settlement happens per verified stage through the existing idempotent ledger (never autonomously, never on-chain).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "stages": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "stage_id": { "type": "string", "maxLength": 128 },
+                                "capability": { "type": "string", "maxLength": 128, "description": "Hub taxonomy name the stage requires" },
+                                "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 }
+                            },
+                            "required": ["stage_id", "capability", "max_price"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "total_price": { "type": "integer", "minimum": 0 },
+                    "budget_cap": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["stages", "total_price"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "orchestrate_status",
+            description: "M17: read-only plan status — stages, assignment states, settlement outcomes. No prompts/outputs are exposed, only ids and verdicts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string", "maxLength": 128 }
+                },
+                "required": ["plan_id"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
             name: "agent_memory_read",
             description: "Read own personal memory (Identity, Goals, Capabilities, People, Tasks, Relationships, Experiences, Decisions, Lessons). Requires memory scope.",
             input_schema: json!({
@@ -1974,6 +2015,55 @@ pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
         .unwrap_or(60)
         .clamp(1, 120);
     Some((capability, payload, lease))
+}
+
+/// M17: extract `orchestrate_propose` parameters.
+/// Returns `(stages as raw array, total price, requester_budget_cap)`.
+/// Structural validation happens in the handler (closed schema); a malformed
+/// call returns `None` (never parsed as another tool).
+pub fn orchestrate_propose_request(raw: &str) -> Option<(Value, u64, u64)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "orchestrate_propose"
+    {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let stages = args.get("stages")?.clone();
+    let total = args.get("total_price").and_then(|v| v.as_u64())?;
+    let cap = args
+        .get("budget_cap")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(total);
+    Some((stages, total, cap))
+}
+
+/// M17: extract `orchestrate_status` parameters (`plan_id`).
+pub fn orchestrate_status_request(raw: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "orchestrate_status"
+    {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("plan_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(str::to_string)
 }
 
 /// Pure, deterministic intent → capability → local-model resolution.

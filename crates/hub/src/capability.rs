@@ -51,6 +51,10 @@ pub enum CapabilityKind {
     Local,
     SmallModels,
     Experimental,
+    /// M17: the right to request/offer multi-agent orchestrated work through
+    /// the fabric. Never auto-classified from model metadata (no heuristic
+    /// source) — granted explicitly to agent credentials only.
+    Orchestrate,
 }
 
 impl CapabilityKind {
@@ -89,6 +93,7 @@ impl CapabilityKind {
         "local",
         "small_models",
         "experimental",
+        "orchestrate",
     ];
 
     /// Short human label for chips/badges.
@@ -120,6 +125,7 @@ impl CapabilityKind {
             CapabilityKind::Local => "local/edge",
             CapabilityKind::SmallModels => "small models",
             CapabilityKind::Experimental => "experimental",
+            CapabilityKind::Orchestrate => "orchestration",
         }
     }
 }
@@ -156,6 +162,7 @@ impl std::str::FromStr for CapabilityKind {
             "local" => CapabilityKind::Local,
             "small_models" => CapabilityKind::SmallModels,
             "experimental" => CapabilityKind::Experimental,
+            "orchestrate" => CapabilityKind::Orchestrate,
             _ => return Err(()),
         })
     }
@@ -472,7 +479,9 @@ mod tests {
             );
         }
         // And nothing extra: every variant appears exactly once in the list.
-        assert_eq!(CapabilityKind::ALL_NAMES.len(), 26);
+        // 26 model capabilities + `orchestrate` (M17 agent right, never
+        // auto-classified — see the Orchestrate variant docs).
+        assert_eq!(CapabilityKind::ALL_NAMES.len(), 27);
     }
 
     #[test]

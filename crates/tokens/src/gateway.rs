@@ -195,6 +195,13 @@ impl GatewayKeyStore {
         self.keys.values().find(|r| r.key_id == key_id).cloned()
     }
 
+    /// Snapshot of all records (read-only, deterministic order). M17 uses
+    /// this to derive self-advertised external providers; secrets are never
+    /// present in records (hash-only storage).
+    pub fn all(&self) -> Vec<&GatewayKeyRecord> {
+        self.keys.values().collect()
+    }
+
     /// Marks a key as used (updates `last_used_at`). Best-effort persist.
     pub fn touch_used(&mut self, key_id: &str) {
         if let Some(rec) = self.keys.values_mut().find(|r| r.key_id == key_id) {
