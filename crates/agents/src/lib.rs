@@ -52,6 +52,7 @@ pub mod knowledge;
 pub mod matcher;
 pub mod memory;
 pub mod message;
+pub mod orchestration;
 pub mod policy;
 pub mod receipt;
 pub mod registry;
