@@ -27,12 +27,13 @@ pub struct Distribution {
 
 impl Distribution {
     pub fn from_total(total_supply: u64) -> Self {
+        let t = total_supply as u128;
         Self {
-            community_rewards: total_supply * 50 / 100,
-            treasury: total_supply * 20 / 100,
-            team: total_supply * 15 / 100,
-            investors: total_supply * 10 / 100,
-            staking_rewards: total_supply * 5 / 100,
+            community_rewards: ((t * 50) / 100) as u64,
+            treasury: ((t * 20) / 100) as u64,
+            team: ((t * 15) / 100) as u64,
+            investors: ((t * 10) / 100) as u64,
+            staking_rewards: ((t * 5) / 100) as u64,
         }
     }
 }
@@ -59,13 +60,19 @@ impl EmissionSchedule {
     }
 
     pub fn current_emission(&self) -> u64 {
-        let halvings = self.current_block / self.halving_interval_blocks;
-        let base_emission = self.initial_supply / (2u64.pow(halvings as u32));
-        base_emission.min(self.max_supply - self.current_supply())
+        let halvings = (self.current_block / self.halving_interval_blocks).min(63);
+        let divisor = 1u64.checked_shl(halvings as u32).unwrap_or(u64::MAX);
+        let base_emission = self.initial_supply.checked_div(divisor).unwrap_or(0);
+        let current_sup = self.current_supply();
+        base_emission.min(self.max_supply.saturating_sub(current_sup))
     }
 
     pub fn current_supply(&self) -> u64 {
-        self.initial_supply + (self.current_emission() * self.current_block)
+        let halvings = (self.current_block / self.halving_interval_blocks).min(63);
+        let divisor = 1u64.checked_shl(halvings as u32).unwrap_or(u64::MAX);
+        let base_emission = self.initial_supply.checked_div(divisor).unwrap_or(0);
+        let total = self.initial_supply.saturating_add(base_emission.saturating_mul(self.current_block));
+        total.min(self.max_supply)
     }
 
     pub fn increment_block(&mut self) {
@@ -200,13 +207,13 @@ impl RewardsCalculator {
     }
 
     pub fn calculate_reward(
-        &self,
+        &mut self,
         tokens_generated: u64,
         quality_score: f32,      // 0.0 - 1.0
         trust_score: f32,         // 0.0 - 1.0
         uptime_percent: f32,      // 0.0 - 100.0
     ) -> u64 {
-        let base = tokens_generated * self.base_reward_per_token;
+        let base = tokens_generated.saturating_mul(self.base_reward_per_token);
 
         // Quality multiplier (0.5x - 2.0x)
         self.quality_multiplier = 0.5 + (quality_score * 1.5);
@@ -221,12 +228,12 @@ impl RewardsCalculator {
             * self.trust_multiplier
             * self.reliability_multiplier;
 
-        (base as f32 * total_multiplier) as u64
+        (base as f64 * total_multiplier as f64) as u64
     }
 
     /// Calculate rewards with example values
     pub fn example_calculation() -> Vec<(String, u64, f32, f32, f32, u64)> {
-        let calc = Self::new(10); // 10 tokens per token generated
+        let mut calc = Self::new(10); // 10 tokens per token generated
 
         vec![
             ("worker-1".to_string(), 10000, 0.95, 0.98, 99.0, 0),
@@ -257,6 +264,17 @@ mod tests {
     }
 
     #[test]
+    fn test_emission_no_stack_overflow() {
+        let mut schedule = EmissionSchedule::new(1_000_000_000, 0.05);
+        let emission = schedule.current_emission();
+        assert!(emission > 0);
+        let supply = schedule.current_supply();
+        assert!(supply >= schedule.initial_supply);
+        schedule.increment_block();
+        assert_eq!(schedule.current_block, 1);
+    }
+
+    #[test]
     fn test_vesting() {
         let mut vesting = VestingSchedule::new(1_000_000, 12, 48);
         assert_eq!(vesting.vested_amount(), 0); // In cliff
@@ -269,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_rewards_calculation() {
-        let calc = RewardsCalculator::new(10);
+        let mut calc = RewardsCalculator::new(10);
         let reward = calc.calculate_reward(1000, 0.9, 0.95, 98.0);
         assert!(reward > 10000); // Base is 10000, multipliers should increase it
     }
