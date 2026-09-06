@@ -3557,8 +3557,11 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
     let mut failed = vec![];
     let mut resubmitted = vec![];
     for (proof_id, tx_hash) in submitted {
-        match crate::settlement_tx::tx_status(crate::settlement_tx::TESTNET_API_BASE, &tx_hash)
-            .await
+        match crate::settlement_tx::tx_status_typed(
+            crate::settlement_tx::TESTNET_API_BASE,
+            &tx_hash,
+        )
+        .await
         {
             Ok(status) if status == "success" => {
                 let mut world = state.world.lock().await;
@@ -3581,22 +3584,55 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                 crate::world::save_world_state(&path, &world);
                 failed.push(proof_id);
             }
-            Err(e) if e.contains("404") => {
+            Err(crate::settlement_tx::SettlementTxError::TxNotFound(_)) => {
                 // Broadcast accepted but the tx never landed (e.g. a nonce
                 // collision dropped it from the mempool): requeue with a
-                // FRESH nonce and resubmit in this same sweep.
-                let requeued = {
-                    let mut world = state.world.lock().await;
-                    match world.requeue_settlement(&proof_id) {
-                        Ok(()) => {
-                            let path = crate::world::world_path_for(&state.info.repo_root);
-                            crate::world::save_world_state(&path, &world);
-                            true
+                // FRESH nonce and resubmit in this same sweep. F1: this arm
+                // matches the TYPED 404 only — transport/decode failures
+                // fall through to still-pending below, never resubmit.
+                // F2: at the resubmit cap requeue flips the proof to Failed;
+                // route by re-read status so capped proofs land in `failed`.
+                // Single lock scope: the guard drops before any resubmit
+                // below (tokio Mutex is not reentrant — never lock twice).
+                enum RequeueOutcome {
+                    Requeued,
+                    Capped,
+                    Other,
+                }
+                let requeued =
+                    {
+                        let mut world = state.world.lock().await;
+                        match world.requeue_settlement(&proof_id) {
+                            Ok(()) => {
+                                let path = crate::world::world_path_for(&state.info.repo_root);
+                                crate::world::save_world_state(&path, &world);
+                                RequeueOutcome::Requeued
+                            }
+                            Err(_) => {
+                                let capped =
+                                    world.proofs.iter().find(|p| p.id == proof_id).is_some_and(
+                                        |p| p.status == crate::world::SettlementStatus::Failed,
+                                    );
+                                if capped {
+                                    let path = crate::world::world_path_for(&state.info.repo_root);
+                                    crate::world::save_world_state(&path, &world);
+                                    RequeueOutcome::Capped
+                                } else {
+                                    RequeueOutcome::Other
+                                }
+                            }
                         }
-                        Err(_) => false,
+                    };
+                match requeued {
+                    RequeueOutcome::Capped => {
+                        failed.push(proof_id.clone());
                     }
-                };
-                if requeued {
+                    RequeueOutcome::Other => {
+                        still_pending.push(proof_id.clone());
+                    }
+                    RequeueOutcome::Requeued => {}
+                }
+                if matches!(requeued, RequeueOutcome::Requeued) {
                     match settle_proof_best_effort(&state, &proof_id).await {
                         Some((new_hash, _)) => {
                             settle_escrow_for_proof(&state, &proof_id, &new_hash).await;
@@ -3606,9 +3642,8 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                         }
                         None => still_pending.push(proof_id),
                     }
-                } else {
-                    still_pending.push(proof_id);
                 }
+                // Capped → already in `failed`; Other → already still-pending.
             }
             _ => still_pending.push(proof_id),
         }

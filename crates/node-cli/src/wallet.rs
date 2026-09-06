@@ -12,7 +12,6 @@
 //! Preflight companion to `experiment autonomous-cycle --enable-live-testnet`:
 //! generate → verify address → fund via faucet/drip → single bounded cycle.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -54,10 +53,11 @@ pub fn wallet_command(command: WalletCommand) -> Result<()> {
                     args.secret_file.display()
                 );
             }
-            let seed = random_seed()?;
+            let mut seed = random_seed()?;
             write_seed_0600(&args.secret_file, &seed)?;
             let signer = decentraai_economy::signer::Ed25519Signer::from_seed_bytes(&seed);
             let address = decentraai_economy::signer::bech32_address(&signer.verifying_key_bytes());
+            seed.fill(0);
             println!("seed file:  {}", args.secret_file.display());
             println!("address:    {address}");
             println!("chain:      MultiversX testnet only (this key must NEVER fund mainnet)");
@@ -94,13 +94,11 @@ pub fn resolve_address(secret_file: Option<&Path>) -> Result<(String, String)> {
     Ok((address, format!("env {source}")))
 }
 
-/// 32 bytes from the OS CSPRNG (`/dev/urandom`, Unix).
+/// 32 bytes from the OS CSPRNG (same source as
+/// `decentraai-economy --example gen_operator_wallet`: `rand_core::OsRng`).
 fn random_seed() -> Result<[u8; 32]> {
     let mut seed = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .context("opening /dev/urandom")?
-        .read_exact(&mut seed)
-        .context("reading 32 seed bytes")?;
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut seed);
     Ok(seed)
 }
 

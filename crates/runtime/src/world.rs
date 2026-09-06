@@ -244,6 +244,11 @@ pub struct OnChainProof {
     /// txs occupy their nonces, the tracker must not reissue them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<u64>,
+    /// Times this proof was requeued after a dead tx (F2 resubmit cap).
+    /// A persistently-404ing proof terminates as Failed instead of
+    /// consuming fresh nonces forever.
+    #[serde(default)]
+    pub resubmit_count: u32,
     /// Current settlement status.
     pub status: SettlementStatus,
     /// When the proof was generated (tick).
@@ -262,6 +267,10 @@ pub struct OnChainProof {
 fn default_network() -> String {
     "multiversx-testnet".to_string()
 }
+
+/// F2: a proof that 404s this many times in a row is terminal (Failed),
+/// never requeued again. Bounds nonce consumption on persistently-dead txs.
+pub const MAX_SETTLEMENT_RESUBMITS: u32 = 3;
 
 // ─── Quests ──────────────────────────────────────────────────────────
 
@@ -2696,6 +2705,7 @@ impl WorldState {
             capability: capability.to_string(),
             sender: String::new(),
             nonce: None,
+            resubmit_count: 0,
             status: SettlementStatus::Pending,
             created_tick: self.tick,
             submitted_tick: 0,
@@ -2767,20 +2777,37 @@ impl WorldState {
     /// `Pending` (clears tx hash + nonce, keeps sender + evidence). The
     /// sweep path calls this when the chain 404s a submitted hash; the
     /// proof then resubmits with a FRESH nonce instead of rotting.
+    ///
+    /// F2 cap: after [`MAX_SETTLEMENT_RESUBMITS`] requeues the proof is
+    /// terminal — it transitions to `Failed` (`resubmit cap exceeded`)
+    /// instead of consuming nonces forever. The sweep routes the returned
+    /// `Err` by re-reading status: `Failed` → failed list, else still
+    /// pending (e.g. wrong-state races).
     pub fn requeue_settlement(&mut self, proof_id: &str) -> Result<(), String> {
+        let idx = self
+            .proofs
+            .iter()
+            .position(|p| p.id == proof_id)
+            .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
+        if self.proofs[idx].status != SettlementStatus::Submitted {
+            return Err("proof is not in submitted state".to_string());
+        }
+        if self.proofs[idx].resubmit_count >= MAX_SETTLEMENT_RESUBMITS {
+            self.fail_settlement(
+                proof_id,
+                &format!("resubmit cap exceeded ({MAX_SETTLEMENT_RESUBMITS} attempts)"),
+            )?;
+            return Err(format!(
+                "proof '{proof_id}' exceeded resubmit cap; marked failed"
+            ));
+        }
         let (entity_id, evidence_hash) = {
-            let proof = self
-                .proofs
-                .iter_mut()
-                .find(|p| p.id == proof_id)
-                .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
-            if proof.status != SettlementStatus::Submitted {
-                return Err("proof is not in submitted state".to_string());
-            }
+            let proof = &mut self.proofs[idx];
             proof.status = SettlementStatus::Pending;
             proof.tx_hash.clear();
             proof.nonce = None;
             proof.submitted_tick = 0;
+            proof.resubmit_count = proof.resubmit_count.saturating_add(1);
             (proof.entity_id.clone(), proof.evidence_hash.clone())
         };
 
@@ -4095,6 +4122,53 @@ mod tests {
         .unwrap();
         w.confirm_settlement(&pid).unwrap();
         assert!(w.requeue_settlement(&pid).is_err());
+    }
+
+    #[test]
+    fn requeue_capped_proof_goes_failed_not_pending_forever() {
+        // F2: three dead-tx requeues are tolerated; the fourth flips the
+        // proof terminal instead of consuming another fresh nonce.
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "agent-1".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "z".to_string(),
+            location_id: "l".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: String::new(),
+            reputation: 0.0,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        let proof = w
+            .settle_on_chain("quest_completion", "c", "agent-1", 20)
+            .unwrap();
+        let pid = proof.id.clone();
+        let sender = "erd1deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        for attempt in 1..=MAX_SETTLEMENT_RESUBMITS {
+            w.submit_settlement(&pid, &format!("deadhash-{attempt}"), sender, Some(5))
+                .unwrap();
+            w.requeue_settlement(&pid).unwrap();
+            assert_eq!(w.proofs[0].status, SettlementStatus::Pending);
+            assert_eq!(w.proofs[0].resubmit_count, attempt);
+        }
+        // Fourth dead tx: Err + terminal Failed (sweep routes it to failed).
+        w.submit_settlement(&pid, "deadhash-4", sender, Some(5))
+            .unwrap();
+        let err = w.requeue_settlement(&pid).unwrap_err();
+        assert!(err.contains("resubmit cap"), "{err}");
+        assert_eq!(w.proofs[0].status, SettlementStatus::Failed);
+        assert_eq!(w.proofs[0].resubmit_count, MAX_SETTLEMENT_RESUBMITS);
+        // Failed proofs never requeue again (wrong-state refusal).
+        assert!(w.requeue_settlement(&pid).is_err());
+        // Old proofs without the field deserialize as 0 (serde default).
+        let raw = serde_json::to_value(&w.proofs[0]).unwrap();
+        assert_eq!(raw["resubmit_count"], MAX_SETTLEMENT_RESUBMITS);
     }
 
     #[test]
