@@ -10,10 +10,14 @@
 //! the same posture as the reputation store and the API token file.
 
 mod consumer;
+mod gateway;
 mod tiers;
 
 pub use consumer::{
     ConsumerKeyRecord, ConsumerKeyStore, KEY_PREFIX, PREFIX_LEN, hash_key, key_prefix,
+};
+pub use gateway::{
+    GATEWAY_KEY_PREFIX, GATEWAY_PREFIX_LEN, GatewayKeyRecord, GatewayKeyStore, gateway_key_prefix,
 };
 pub use tiers::{SuggestedTier, TierChange, plan_tier_changes};
 
