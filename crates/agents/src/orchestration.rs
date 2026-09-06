@@ -628,3 +628,310 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// N-of-M consensus (v0.1) — replicated stage execution, ONE consensus
+// language (`crate::verification::evaluate_consensus`), no second engine.
+// ---------------------------------------------------------------------------
+
+/// Replicas bound: a requester may ask for 1..=3 providers per stage.
+pub const MAX_REPLICAS: u32 = 3;
+
+/// Idempotency keys per replica (`{replica}` is the 0-based ordinal).
+pub fn reservation_id_replica(plan_id: &str, stage_id: &str, replica: u32) -> String {
+    format!("m17res:{plan_id}:{stage_id}:r{replica}")
+}
+
+/// Per-replica credit key (`m17cr:{plan}:{stage}:rN`).
+pub fn credit_ref_replica(plan_id: &str, stage_id: &str, replica: u32) -> String {
+    format!("m17cr:{plan_id}:{stage_id}:r{replica}")
+}
+
+/// Canonical serialization used to cluster replica outputs: plain JSON
+/// `to_string` of the value with object keys in BTreeMap order — serde_json
+/// preserves map order for `Map` (BTreeMap when `preserve_order` is off);
+/// to stay deterministic regardless of feature flags we canonicalize
+/// recursively here (never from the raw output bytes).
+pub fn canonical_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&map[k.as_str()])))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// One replica's submitted output for the consensus vote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicaOutput {
+    pub agent_id: String,
+    /// The output value (compared by canonical form, never fuzzy).
+    pub value: serde_json::Value,
+    /// The verifier's per-replica confidence `0.0..=1.0` (from the existing
+    /// verification path; a failed `verify_value` yields 0.0).
+    pub confidence: f32,
+}
+
+/// Errors for replica fan-out planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaPlanError {
+    /// `replicas` outside 1..=MAX_REPLICAS.
+    ReplicaBound,
+    /// replicas × max_price exceeds the requester budget cap.
+    BudgetExceeded,
+    /// Fewer distinct providers available than replicas requested.
+    InsufficientDistinctProviders,
+}
+
+/// Select `n` DISTINCT providers for one stage: run the single-provider
+/// selection, then remove the winner and repeat. Deterministic.
+pub fn select_providers<'a>(
+    ads: &'a [ProviderAd],
+    req: &StageRequirement,
+    replicas: u32,
+    budget_cap: u64,
+    now_ms: u64,
+) -> Result<Vec<&'a ProviderAd>, ReplicaPlanError> {
+    if replicas == 0 || replicas > MAX_REPLICAS {
+        return Err(ReplicaPlanError::ReplicaBound);
+    }
+    // Bound spend BEFORE selection: replicas × stage price cap ≤ budget.
+    if req.max_price.saturating_mul(replicas as u64) > budget_cap {
+        return Err(ReplicaPlanError::BudgetExceeded);
+    }
+    let mut excluded: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<&'a ProviderAd> = Vec::new();
+    while (out.len() as u32) < replicas {
+        let owned: Vec<ProviderAd> = ads
+            .iter()
+            .filter(|a| !excluded.contains(a.agent_id.as_str()))
+            .cloned()
+            .collect();
+        let pick = select_provider(&owned, req, now_ms)
+            .map_err(|_| ReplicaPlanError::InsufficientDistinctProviders)?;
+        let pid = pick.agent_id.clone();
+        // Safe: `pick` is a clone of an element of `ads`; re-borrow it.
+        let orig = ads.iter().find(|a| a.agent_id == pid).expect("clone source");
+        out.push(orig);
+        excluded.insert(orig.agent_id.as_str());
+    }
+    Ok(out)
+}
+
+/// Consensus verdict over replica outputs using the ONE consensus language.
+///
+/// How a vote is formed: outputs are clustered by canonical bytes; the
+/// largest cluster (TIE-BREAK: lexicographically smallest canonical string,
+/// deterministic) is the candidate answer; members of that cluster vote
+/// `agrees=true` with their own confidence, all others vote against.
+/// The verdict comes from `evaluate_consensus` — never fabricated here.
+pub fn consensus_verdict(
+    outputs: &[ReplicaOutput],
+    required_agents: u32,
+    agreement_threshold: f32,
+) -> crate::verification::VerificationVerdict {
+    use crate::verification::{ConsensusPolicy, ConsensusResult, evaluate_consensus};
+
+    // Deterministic ordering before clustering (agent_id asc).
+    let mut ordered: Vec<&ReplicaOutput> = outputs.iter().collect();
+    ordered.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+
+    // Cluster by canonical form.
+    let mut clusters: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, o) in ordered.iter().enumerate() {
+        let canon = canonical_json(&o.value);
+        match clusters.iter_mut().find(|(c, _)| *c == canon) {
+            Some((_, members)) => members.push(i),
+            None => clusters.push((canon, vec![i])),
+        }
+    }
+    // Winner: largest cluster; tie → lexicographically smallest canonical.
+    let best = clusters
+        .iter()
+        .max_by(|a, b| {
+            a.1.len()
+                .cmp(&b.1.len())
+                .then_with(|| b.0.cmp(&a.0)) // smaller canonical wins ties
+        })
+        .map(|(c, _)| c.clone());
+
+    let Some(winner) = best else {
+        return crate::verification::VerificationVerdict::Uncertain {
+            reason: "no replica outputs to vote on".to_string(),
+        };
+    };
+
+    let votes: Vec<ConsensusResult> = ordered
+        .iter()
+        .map(|o| ConsensusResult {
+            agent_id: o.agent_id.clone(),
+            agrees: canonical_json(&o.value) == winner,
+            confidence: o.confidence.clamp(0.0, 1.0),
+        })
+        .collect();
+
+    evaluate_consensus(
+        &votes,
+        &ConsensusPolicy {
+            required_agents,
+            agreement_threshold,
+            require_schema: false,
+        },
+    )
+}
+
+/// Per-replica settlement decision: verified replicas settle+credit with
+/// replica-namespaced keys; unverified replicas release. Idempotent via the
+/// ledger on each key — retrying this decision for the same replica can
+/// never double-pay.
+pub fn decide_settle_replica(
+    plan_id: &str,
+    stage_id: &str,
+    replica: u32,
+    verified: bool,
+    price: u64,
+    measures: VerifiedMeasures,
+) -> SettleDecision {
+    if verified {
+        SettleDecision::SettleAndCredit {
+            reservation_id: reservation_id_replica(plan_id, stage_id, replica),
+            credit_ref: credit_ref_replica(plan_id, stage_id, replica),
+            price,
+            measures,
+        }
+    } else {
+        SettleDecision::Release {
+            reservation_id: reservation_id_replica(plan_id, stage_id, replica),
+        }
+    }
+}
+
+#[cfg(test)]
+mod nofm_tests {
+    use super::*;
+    use crate::verification::VerificationVerdict;
+
+    fn out(agent: &str, v: serde_json::Value, conf: f32) -> ReplicaOutput {
+        ReplicaOutput { agent_id: agent.to_string(), value: v, confidence: conf }
+    }
+
+    #[test]
+    fn canonical_json_orders_object_keys() {
+        let a = serde_json::json!({"b":1,"a":2});
+        let b = serde_json::json!({"a":2,"b":1});
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_ne!(canonical_json(&a), canonical_json(&serde_json::json!({"a":2,"b":3})));
+    }
+
+    #[test]
+    fn consensus_two_of_three_identical_outputs_verified() {
+        let v = serde_json::json!({"answer": "42"});
+        let outputs = vec![
+            out("a", v.clone(), 0.9),
+            out("b", serde_json::json!({"answer":"42"}), 0.8), // key order differs
+            out("c", serde_json::json!({"answer": "43"}), 0.1),
+        ];
+        assert_eq!(consensus_verdict(&outputs, 3, 0.5), VerificationVerdict::Verified);
+    }
+
+    #[test]
+    fn consensus_majority_disagrees_rejected() {
+        let outputs = vec![
+            out("a", serde_json::json!(1), 0.9),
+            out("b", serde_json::json!(2), 0.9),
+            out("c", serde_json::json!(3), 0.9),
+        ];
+        assert!(matches!(
+            consensus_verdict(&outputs, 3, 0.8),
+            VerificationVerdict::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn consensus_insufficient_outputs_is_uncertain() {
+        let outputs = vec![out("a", serde_json::json!(1), 0.9)];
+        assert!(matches!(
+            consensus_verdict(&outputs, 2, 0.5),
+            VerificationVerdict::Uncertain { .. }
+        ));
+    }
+
+    #[test]
+    fn consensus_tie_break_deterministic() {
+        // 1-1 tie: lexicographically smallest canonical wins the candidate
+        // slot; threshold 0.5 → Verified for the winner regardless of input order.
+        let mk = |first: &str| {
+            vec![
+                out(first, serde_json::json!({"k":"x"}), 0.5),
+                out(if first == "a" { "c" } else { "a" }, serde_json::json!({"k":"y"}), 0.5),
+            ]
+        };
+        assert_eq!(
+            consensus_verdict(&mk("a"), 2, 0.5),
+            consensus_verdict(&mk("c"), 2, 0.5)
+        );
+    }
+
+    #[test]
+    fn replica_config_enforces_bounds_and_budget() {
+        let ads = vec![
+            ad_for("p1", 5.0, 1000),
+            ad_for("p2", 5.0, 1000),
+            ad_for("p3", 5.0, 1000),
+        ];
+        let req = StageRequirement { capability: "chat".into(), max_price: 10 };
+        // 4 replicas > bound
+        assert_eq!(select_providers(&ads, &req, 4, 100, 1000), Err(ReplicaPlanError::ReplicaBound));
+        // 3 replicas × 10 > budget 25
+        assert_eq!(select_providers(&ads, &req, 3, 25, 1000), Err(ReplicaPlanError::BudgetExceeded));
+        // 3 distinct available → ok, and all distinct
+        let got = select_providers(&ads, &req, 3, 100, 1000).unwrap();
+        let ids: std::collections::HashSet<_> = got.iter().map(|p| p.agent_id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        // 3 replicas but only 2 distinct providers
+        let two = vec![ad_for("p1", 5.0, 1000), ad_for("p2", 5.0, 1000)];
+        assert_eq!(
+            select_providers(&two, &req, 3, 100, 1000),
+            Err(ReplicaPlanError::InsufficientDistinctProviders)
+        );
+    }
+
+    #[test]
+    fn per_replica_settle_keys_are_namespaced_and_stable() {
+        assert_eq!(reservation_id_replica("p", "s", 0), "m17res:p:s:r0");
+        assert_eq!(credit_ref_replica("p", "s", 2), "m17cr:p:s:r2");
+        let m = VerifiedMeasures { tokens_used: Some(1), processing_ms: Some(1) };
+        match decide_settle_replica("p", "s", 1, true, 5, m) {
+            SettleDecision::SettleAndCredit { reservation_id: r, credit_ref: c, .. } => {
+                assert_eq!(r, "m17res:p:s:r1");
+                assert_eq!(c, "m17cr:p:s:r1");
+            }
+            _ => panic!("expected settle"),
+        }
+        assert_eq!(
+            decide_settle_replica("p", "s", 1, false, 5, m),
+            SettleDecision::Release { reservation_id: "m17res:p:s:r1".into() }
+        );
+    }
+
+    fn ad_for(id: &str, _p: f32, seen: u64) -> ProviderAd {
+        ProviderAd {
+            agent_id: id.to_string(),
+            origin: ProviderOrigin::External,
+            capabilities: vec!["chat".to_string()],
+            price: 10,
+            contribution_balance: 0,
+            last_seen_ms: seen,
+        }
+    }
+}
