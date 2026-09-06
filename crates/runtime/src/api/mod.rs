@@ -6502,10 +6502,12 @@ fn orchestration_provider_ads(
         return Vec::new();
     };
     let now = now_ms();
+    let now_unix = now / 1000;
     decentraai_tokens::GatewayKeyStore::load(&path)
         .map(|s| {
             s.all()
                 .iter()
+                .filter(|rec| !rec.revoked && rec.expires_at > now_unix)
                 .map(|rec| ProviderAd {
                     agent_id: rec.agent_name.clone(),
                     origin: ProviderOrigin::External,
@@ -22889,6 +22891,52 @@ mod tests {
         let raw = r.text().await.unwrap();
         assert!(raw.contains("s1"));
         assert!(!raw.contains("capability_arg_secret"), "no payload leaks");
+    }
+
+    #[tokio::test]
+    async fn m17_revoked_key_never_advertised_as_provider() {
+        // A revoked credential must not surface as an external provider:
+        // propose for a capability where the ONLY advertiser is the revoked
+        // key → assigned_to stays null, even though a fresh grant allows
+        // orchestrate_propose itself.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        // revoked advertiser (embeddings is NOT on the orchestrate-requesting key)
+        let stale = make_gateway_key(dir.path(), &["embeddings"], "gw-other");
+        decentraai_tokens::GatewayKeyStore::load(&dir.path().join("db/gateway_keys.json"))
+            .unwrap()
+            .revoke(stale.strip_prefix("dga_").unwrap_or(&stale)) // best effort; name-based below
+            .ok();
+        // revoke by id through the store API (same path as the CLI ceremony)
+        let mut store =
+            decentraai_tokens::GatewayKeyStore::load(&dir.path().join("db/gateway_keys.json"))
+                .unwrap();
+        if let Some(rec) = store
+            .all()
+            .iter()
+            .find(|r| r.agent_name == "ext-agent" && r.owner_account == "gw-other")
+            .map(|r| r.key_id.clone())
+        {
+            store.revoke(&rec).unwrap();
+        }
+        let key = make_gateway_key(dir.path(), &["orchestrate"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key,
+            m17_propose_payload(serde_json::json!([
+                {"stage_id":"s1","capability":"embeddings","max_price":5}
+            ])),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"assigned_to\":null"),
+            "revoked provider must not be assigned: {text}"
+        );
     }
 
     #[tokio::test]
