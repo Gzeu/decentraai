@@ -222,21 +222,52 @@ pub async fn broadcast_tx(api_base: &str, signed_json: &str) -> Result<String, S
 
 /// Poll chain status for a tx hash (`pending` / `success` / `fail` / …).
 pub async fn tx_status(api_base: &str, tx_hash: &str) -> Result<String, String> {
+    tx_status_typed(api_base, tx_hash)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Structured tx-status errors (F1 hardening): callers match on the
+/// VARIANT, never on text. `TxNotFound` means the broadcast never landed
+/// (mempool drop / nonce collision) and is the ONLY case that may requeue
+/// for resubmission; transport and decode failures stay transient.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SettlementTxError {
+    /// The chain answers 404 for this hash: never landed, safe to requeue.
+    #[error("tx not found on chain: {0}")]
+    TxNotFound(String),
+    /// Transport failure or non-404 HTTP: transient, never a requeue signal.
+    #[error("api request failed: {0}")]
+    Request(String),
+    /// 2xx but undecodable / missing status field: transient.
+    #[error("bad response: {0}")]
+    BadResponse(String),
+}
+
+/// Typed tx-status lookup. Same endpoint and semantics as [`tx_status`],
+/// with the failure mode preserved in the type.
+pub async fn tx_status_typed(api_base: &str, tx_hash: &str) -> Result<String, SettlementTxError> {
     let url = format!("{api_base}/transactions/{tx_hash}");
     let resp = reqwest::get(&url)
         .await
-        .map_err(|e| format!("status lookup failed: {e}"))?;
+        .map_err(|e| SettlementTxError::Request(format!("status lookup failed: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(SettlementTxError::TxNotFound(tx_hash.to_string()));
+    }
     if !resp.status().is_success() {
-        return Err(format!("status lookup: http {}", resp.status()));
+        return Err(SettlementTxError::Request(format!(
+            "status lookup: http {}",
+            resp.status()
+        )));
     }
     let v: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("status decode failed: {e}"))?;
+        .map_err(|e| SettlementTxError::BadResponse(format!("status decode failed: {e}")))?;
     v.get("status")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "status response missing status".to_string())
+        .ok_or_else(|| SettlementTxError::BadResponse("status response missing status".to_string()))
 }
 
 /// Full automation for one proof: reserve nonce → sign → broadcast.
@@ -349,6 +380,19 @@ mod tests {
         let guard = nonce_tracker().lock().await;
         assert!(guard.unwrap_or(0) >= 41);
         // Leave the tracker ahead — other tests use explicit values only.
+    }
+
+    #[test]
+    fn typed_status_errors_carry_their_variant() {
+        // F1: the sweep matches on these variants, never on text. Only the
+        // TxNotFound arm may requeue; the strings below assert nothing about
+        // routing (a transport error mentioning "404" must NOT read as one).
+        let not_found = SettlementTxError::TxNotFound("abc".to_string());
+        assert!(matches!(not_found, SettlementTxError::TxNotFound(_)));
+        let transport = SettlementTxError::Request("proxy says 404 weirdly".to_string());
+        assert!(!matches!(transport, SettlementTxError::TxNotFound(_)));
+        assert!(transport.to_string().contains("api request failed"));
+        assert!(not_found.to_string().contains("abc"));
     }
 
     #[test]
