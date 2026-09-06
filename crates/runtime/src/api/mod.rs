@@ -318,6 +318,11 @@ pub struct ApiState {
     hub_pulls: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
     token_store_path: Option<PathBuf>,
     consumer_keys_path: Option<PathBuf>,
+    /// M16 gateway credential registry path (`dga_…`, `db/gateway_keys.json`).
+    gateway_keys_path: Option<PathBuf>,
+    /// M16 gateway config (kill-switch + issuance caps). `None` or
+    /// `enabled=false` = gateway credentials never authenticate.
+    gateway: Option<decentraai_config::AgentGatewaySection>,
     vesper_keys: Arc<StdMutex<HashMap<String, String>>>,
     /// The authoritative quota ledger, `Arc`-shared with the compute manager
     /// (Q2: worker credits and consumer reserve/settle are one ledger). `None`
@@ -441,6 +446,8 @@ impl ApiState {
             dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
+            gateway_keys_path: None,
+            gateway: None,
             vesper_keys: Arc::new(StdMutex::new(HashMap::new())),
             quota_ledger: None,
             consumer_rate_windows: Arc::new(StdMutex::new(HashMap::new())),
@@ -781,6 +788,25 @@ impl ApiState {
         self.quota_ledger = quota_ledger;
     }
 
+    /// M16 gateway (`dga_…`) registry + config. Inert until the section is
+    /// present AND enabled (kill-switch OFF by default); resolution enforces it.
+    pub fn attach_gateway(
+        &mut self,
+        section: decentraai_config::AgentGatewaySection,
+        gateway_keys_path: Option<std::path::PathBuf>,
+    ) {
+        self.gateway = Some(section);
+        self.gateway_keys_path = gateway_keys_path;
+    }
+
+    /// Whether gateway agent credentials may authenticate (registry path +
+    /// shared ledger wired AND section enabled). Read-only.
+    fn gateway_enabled(&self) -> bool {
+        self.gateway.as_ref().is_some_and(|g| g.enabled)
+            && self.gateway_keys_path.is_some()
+            && self.quota_ledger.is_some()
+    }
+
     /// M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust anchors.
     pub fn attach_m18(&mut self, m18: Arc<crate::m18::M18State>) {
         self.m18 = Some(m18);
@@ -946,6 +972,44 @@ impl ApiState {
                                 r.quota_ceiling,
                                 r.rate_limit_per_minute,
                                 r.scopes.clone(),
+                            )
+                        })
+                    };
+                    match record {
+                        Some((key_id, account, quota_ceiling, rate_limit_per_minute, scopes)) => {
+                            store.touch_used(&key_id);
+                            return Ok(Auth::Consumer {
+                                key_id,
+                                account,
+                                quota_ceiling,
+                                rate_limit_per_minute,
+                                scopes,
+                            });
+                        }
+                        None => return Err(GateError::Unauthorized),
+                    }
+                }
+                // M16 gateway agent credentials (dga_…): same Auth::Consumer
+                // shape (quota ledger stays the single truth — no second
+                // ledger, no new money), distinguished downstream by the
+                // `gk-` key id for audit + stricter tool filtering. The
+                // kill-switch denies before any store touch.
+                if presented.starts_with(decentraai_tokens::GATEWAY_KEY_PREFIX) {
+                    if !self.gateway_enabled() {
+                        return Err(GateError::Unauthorized);
+                    }
+                    let path = self.gateway_keys_path.as_ref().unwrap();
+                    let mut store = decentraai_tokens::GatewayKeyStore::load(path)
+                        .map_err(|_| GateError::Unauthorized)?;
+                    let record = {
+                        let rec = store.lookup(presented);
+                        rec.map(|r| {
+                            (
+                                r.key_id.clone(),
+                                r.owner_account.clone(),
+                                r.quota_ceiling,
+                                r.rate_limit_per_minute,
+                                r.capabilities.clone(),
                             )
                         })
                     };
@@ -7075,8 +7139,21 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         if let Some(mut json) = response {
             if let Some(result) = json.get_mut("result") {
                 if let Some(tools) = result.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                    // M16 gateway (`dga_`, key id `gk-*`): STRICTER closed set.
+                    // Agents never see tools they cannot call — no oracle for
+                    // hub/society/memory/economy/control planes. Call-time
+                    // scope checks below stay authoritative regardless.
+                    let is_gateway = key_id.starts_with("gk-");
                     tools.retain(|t| {
                         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if is_gateway {
+                            return match name {
+                                "decide" | "execute_decision" | "discover_capabilities" => true,
+                                "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings"),
+                                "decentraai_compute_request" => !scopes.is_empty(),
+                                _ => false,
+                            };
+                        }
                         match name {
                             "decide" | "execute_decision" => true,
                             "decentraai_embeddings" => {
@@ -21702,6 +21779,303 @@ mod tests {
             .unwrap();
         // A consumer can call `decide` (read-only inference planning).
         assert_eq!(r.status(), 200, "consumer may decide via MCP");
+    }
+
+    // ---- M16 gateway (dga_) consumption flow ------------------------------
+
+    /// Gateway test state: funded `gw-account`, gateway store + section
+    /// attached (enabled per arg). Mirrors `start_consumer_state`.
+    async fn start_gateway_state(
+        dir: &Path,
+        master: String,
+        enabled: bool,
+    ) -> (SocketAddr, Arc<StdMutex<decentraai_compute::QuotaLedger>>) {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        {
+            let mut l = ledger.lock().unwrap();
+            // NOTE: credit() is exactly-once per ref_id GLOBALLY — distinct
+            // ref ids per account, or the second credit is a no-op duplicate.
+            l.credit(&"gw-account".to_string(), "seed-a", Some(1000), None);
+            l.credit(&"gw-other".to_string(), "seed-b", Some(1000), None);
+        }
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master),
+            manager.clone(),
+            test_info(dir, None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.join("db/consumer_keys.json")),
+            Some(ledger.clone()),
+        );
+        state.attach_gateway(
+            decentraai_config::AgentGatewaySection {
+                enabled,
+                max_quota_ceiling: 1000,
+                max_rate_limit: 60,
+                max_expiry_seconds: 30 * 86_400,
+                allowed_capabilities: vec![],
+                free_starter: Default::default(),
+            },
+            Some(dir.join("db/gateway_keys.json")),
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        (api, ledger)
+    }
+
+    /// Issues a gateway credential directly in the store (no HTTP issuance
+    /// exists by design) and returns its plaintext.
+    fn make_gateway_key(dir: &Path, caps: &[&str], account: &str) -> String {
+        let mut store =
+            decentraai_tokens::GatewayKeyStore::load(&dir.join("db/gateway_keys.json")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        store
+            .create(
+                "ext-agent",
+                caps.iter().map(|s| s.to_string()).collect(),
+                account,
+                100,
+                60,
+                now + 7 * 86_400,
+            )
+            .unwrap()
+    }
+
+    async fn gateway_call(
+        client: &reqwest::Client,
+        api: SocketAddr,
+        token: &str,
+        payload: serde_json::Value,
+    ) -> reqwest::Response {
+        client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn gateway_tools(list: &serde_json::Value) -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gateway_disabled_denies_before_store_touch() {
+        // Kill-switch OFF (default): dga_ never authenticates.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), false).await;
+        let plaintext = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &plaintext,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}}),
+        )
+        .await;
+        assert_eq!(r.status(), 401, "disabled gateway denies");
+    }
+
+    #[tokio::test]
+    async fn gateway_unknown_revoked_expired_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let client = reqwest::Client::new();
+        let decide = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}});
+        // Unknown secret.
+        let r = gateway_call(&client, api, "dga_deadbeef", decide.clone()).await;
+        assert_eq!(r.status(), 401);
+        // Revoked: immediate.
+        let plaintext = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let mut store =
+            decentraai_tokens::GatewayKeyStore::load(&dir.path().join("db/gateway_keys.json"))
+                .unwrap();
+        let id = store.lookup(&plaintext).unwrap().key_id.clone();
+        store.revoke(&id).unwrap();
+        let r = gateway_call(&client, api, &plaintext, decide.clone()).await;
+        assert_eq!(r.status(), 401, "revoked denies immediately");
+        // Expired: rewrite the record's expiry into the past.
+        let plaintext2 = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let path = dir.path().join("db/gateway_keys.json");
+        // Reload: the earlier `store` handle predates this key.
+        let fresh = decentraai_tokens::GatewayKeyStore::load(&path).unwrap();
+        let id2 = fresh.lookup(&plaintext2).unwrap().key_id.clone();
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for rec in file["keys"].as_object_mut().unwrap().values_mut() {
+            if rec["key_id"].as_str().unwrap() == id2 {
+                rec["expires_at"] = serde_json::json!(1u64);
+            }
+        }
+        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+        let r = gateway_call(&client, api, &plaintext2, decide).await;
+        assert_eq!(r.status(), 401, "expired denies");
+    }
+
+    #[tokio::test]
+    async fn gateway_decide_allowed_and_list_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let plaintext = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &plaintext,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}}),
+        )
+        .await;
+        assert_eq!(r.status(), 200, "gateway may decide via MCP");
+        // List shows only the closed gateway set (no oracle for the rest).
+        let list: serde_json::Value = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {plaintext}"))
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tools = gateway_tools(&list);
+        assert!(tools.contains(&"decide".to_string()));
+        assert!(tools.contains(&"execute_decision".to_string()));
+        assert!(tools.contains(&"discover_capabilities".to_string()));
+        assert!(tools.contains(&"decentraai_compute_request".to_string()));
+        assert!(
+            !tools.contains(&"decentraai_embeddings".to_string()),
+            "embeddings hidden without the grant"
+        );
+        for hidden in [
+            "hub_publish_task",
+            "society_state",
+            "agent_memory_write",
+            "list_consumer_keys",
+            "pull_model",
+            "serve_model",
+        ] {
+            assert!(
+                !tools.contains(&hidden.to_string()),
+                "{hidden} must stay invisible to gateway credentials"
+            );
+        }
+        // Granted embeddings becomes visible.
+        let emb_key = make_gateway_key(dir.path(), &["embeddings"], "gw-account");
+        let list2: serde_json::Value = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {emb_key}"))
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(gateway_tools(&list2).contains(&"decentraai_embeddings".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gateway_embeddings_grant_gated_and_settles_own_account() {
+        // Impersonation safety: identity (and settlement) always comes from
+        // the credential's account, never from request arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, ledger) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let ocr_key = make_gateway_key(dir.path(), &["ocr"], "gw-account");
+        let client = reqwest::Client::new();
+        let emb_call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"decentraai_embeddings","arguments":{"input":"hello"}}});
+        // Without the grant: denied, nothing spent.
+        let r = gateway_call(&client, api, &ocr_key, emb_call.clone()).await;
+        assert_eq!(r.status(), 403);
+        let before = ledger
+            .lock()
+            .unwrap()
+            .account(&"gw-account".to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        // With the grant: executes against the credential's own account.
+        let emb_key = make_gateway_key(dir.path(), &["embeddings"], "gw-account");
+        let r = gateway_call(&client, api, &emb_key, emb_call).await;
+        assert_eq!(r.status(), 200);
+        let after_a = ledger
+            .lock()
+            .unwrap()
+            .account(&"gw-account".to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        let after_b = ledger
+            .lock()
+            .unwrap()
+            .account(&"gw-other".to_string())
+            .map(|a| a.available)
+            .unwrap_or(0);
+        assert_eq!(
+            before - after_a,
+            1,
+            "exactly 1 unit settles to the credential account"
+        );
+        assert_eq!(after_b, 1000, "other accounts untouched (no impersonation)");
+    }
+
+    #[tokio::test]
+    async fn gateway_rate_limit_exact_boundary() {
+        // Deterministic boundary on a rate-checked mutation (embeddings):
+        // limit 1 → first passes, second is 429. (Read-only `decide` is
+        // intentionally unthrottled — zero mutation surface.)
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let mut store =
+            decentraai_tokens::GatewayKeyStore::load(&dir.path().join("db/gateway_keys.json"))
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let plaintext = store
+            .create(
+                "rl",
+                vec!["embeddings".to_string()],
+                "gw-account",
+                100,
+                1,
+                now + 86_400,
+            )
+            .unwrap();
+        let client = reqwest::Client::new();
+        let emb = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"decentraai_embeddings","arguments":{"input":"hi"}}});
+        assert_eq!(
+            gateway_call(&client, api, &plaintext, emb.clone())
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            gateway_call(&client, api, &plaintext, emb).await.status(),
+            429
+        );
     }
 
     #[tokio::test]

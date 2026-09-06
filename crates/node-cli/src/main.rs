@@ -17,6 +17,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod gateway;
 mod upgrade;
 mod wallet;
 mod world_bridge;
@@ -67,6 +68,12 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    /// M16 Agent Gateway (BYOA): issue/show/revoke/list agent credentials.
+    /// Local operator premise; secret shown exactly once at issuance.
+    Gateway {
+        #[command(subcommand)]
+        command: gateway::GatewayCommand,
     },
     /// Testnet settlement wallet ops (keygen 0600 + read-only address).
     /// Spend-free by construction; the live lane stays behind its own flag.
@@ -1090,6 +1097,7 @@ async fn main() -> Result<()> {
         } => serve_start(config, model, binary, backend).await,
         Command::Pull(args) => pull(args).await,
         Command::Token { command } => token_command(command),
+        Command::Gateway { command } => gateway::gateway_command(command),
         Command::Wallet { command } => wallet::wallet_command(command),
         Command::Worker(args) => worker_command(args),
         Command::Distributed(args) => distributed_command(args).await,
@@ -3250,6 +3258,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(data_dir.join("db/consumer_keys.json")),
             Some(compute_manager.quota_ledger()),
         );
+        // M16 Agent Gateway (BYOA, `dga_…`): registry path + section attach.
+        // Inert until agent_gateway.enabled=true (kill-switch OFF by default).
+        if let Some(gateway_section) = config.agent_gateway.clone() {
+            state.attach_gateway(gateway_section, Some(data_dir.join("db/gateway_keys.json")));
+        }
         // Model Fabric: the provider control plane persists its catalog to
         // `db/providers.json`; credentials stay in memory only (re-entered
         // after restart by design — see ProviderManager docs).
@@ -9531,6 +9544,40 @@ mod tests {
             cli.command,
             Command::Wallet {
                 command: wallet::WalletCommand::Address(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_gateway_issue_revoke() {
+        // BYOA ceremony must parse with all ceremony flags.
+        let cli = Cli::try_parse_from([
+            "decentraai",
+            "gateway",
+            "issue",
+            "--agent",
+            "ext-1",
+            "--capabilities",
+            "ocr,embeddings",
+            "--account",
+            "acct-1",
+            "--quota",
+            "100",
+            "--ttl-days",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gateway {
+                command: gateway::GatewayCommand::Issue(_)
+            }
+        ));
+        let cli = Cli::try_parse_from(["decentraai", "gateway", "revoke", "gk-ab12"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gateway {
+                command: gateway::GatewayCommand::Revoke(_)
             }
         ));
     }
