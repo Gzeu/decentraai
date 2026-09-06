@@ -286,12 +286,16 @@ pub fn evaluate_pressure(
     if view.mission_task_id != state.base_mission {
         signals.push(PressureSignal::MissionChanged);
     }
-    if (view.entity_count as i64 - state.base_entities as i64).abs() >= cfg.min_entity_delta {
+    // SEC-02: unsigned_abs — abs() panics on i64::MIN (unreachable for
+    // memory-bounded counts, but the idiom must be panic-free by construction).
+    if (view.entity_count as i64 - state.base_entities as i64).unsigned_abs()
+        >= cfg.min_entity_delta as u64
+    {
         signals.push(PressureSignal::EntityShift);
     }
     let treasury_then = state.base_minted as i64 + state.base_burned as i64;
     let treasury_now = view.minted as i64 + view.burned as i64;
-    if (treasury_now - treasury_then).abs() >= cfg.min_treasury_delta {
+    if (treasury_now - treasury_then).unsigned_abs() >= cfg.min_treasury_delta as u64 {
         signals.push(PressureSignal::TreasuryFlow);
     }
     if refuted_total(journal).saturating_sub(state.refuted_seen) >= cfg.refuted_burst {
@@ -505,5 +509,51 @@ mod tests {
             &PressureThresholds::default(),
         );
         assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn extreme_magnitudes_never_panic_and_score() {
+        // SEC-02 regression: magnitude math is panic-free by construction
+        // (unsigned_abs — abs() panics on i64::MIN). The MIN input itself is
+        // unreachable (usize counts), so this pins the reachable extreme:
+        // near-i64::MAX populations evaluate and fire the shift signal.
+        let huge = WorldView {
+            tick: 100,
+            entity_count: (i64::MAX / 2) as usize,
+            event_count: 0,
+            mission_task_id: None,
+            minted: (i64::MAX / 2) as u64,
+            burned: 0,
+            entity_ids: vec![],
+            cheapest_service: None,
+            crowded_locations: 0,
+        };
+        let cfg = PressureThresholds {
+            fire_threshold: 1,
+            cooldown_ticks: 0,
+            min_tick_drift: u64::MAX,
+            min_new_events: i64::MAX,
+            ..PressureThresholds::default()
+        };
+        let (_, base) = evaluate_pressure(
+            &huge,
+            &ResearchJournal::new(),
+            &PressureState::default(),
+            &PressureThresholds::default(),
+        );
+        // Same magnitudes, one entity fewer + treasury moved: entity-shift
+        // and treasury-flow must fire without panic.
+        let mut moved = huge.clone();
+        moved.tick += 1;
+        moved.entity_count -= 3;
+        moved.minted += 5;
+        let (d, _) = evaluate_pressure(&moved, &ResearchJournal::new(), &base, &cfg);
+        match d {
+            PressureDecision::Fire { signals, .. } => {
+                assert!(signals.contains(&PressureSignal::EntityShift));
+                assert!(signals.contains(&PressureSignal::TreasuryFlow));
+            }
+            PressureDecision::Skip { reason } => panic!("must fire at extremes: {reason}"),
+        }
     }
 }
