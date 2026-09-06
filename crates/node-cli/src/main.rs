@@ -3121,6 +3121,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // P3.5/P9: the API can trigger collective workflows by delegating to
         // the node's local agents.
         state.attach_orchestrator(agent_orchestrator.clone());
+        // M17: assignment lifecycle store (in-memory; the money side persists
+        // through the shared quota ledger).
+        state.attach_orchestration(std::sync::Arc::new(std::sync::Mutex::new(
+            decentraai_agents::orchestration::AssignmentStore::new(),
+        )));
         // P8: expose the dataset/skill registry to the dashboard (read-only).
         // The persistent registry drives the agent; the demo is shown only as a
         // labelled demonstration (the handler adds it).

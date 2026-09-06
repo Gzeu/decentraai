@@ -43,6 +43,10 @@ fn bounded(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID_LEN
 }
 
+/// Ranking key for provider selection (smaller wins): price asc, then
+/// contribution balance desc (clamped to ±15), then agent_id asc.
+type RankKey<'a> = (u64, std::cmp::Reverse<i64>, &'a str);
+
 /// Where a provider runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderOrigin {
@@ -103,7 +107,7 @@ pub fn select_provider<'a>(
         return Err(SelectionError::NoCapableProvider);
     }
     let mut capable = false;
-    let mut best: Option<(&'a ProviderAd, (u64, std::cmp::Reverse<i64>, &str))> = None;
+    let mut best: Option<(&'a ProviderAd, RankKey<'_>)> = None;
     for ad in ads {
         if !bounded(&ad.agent_id) {
             continue;
@@ -192,7 +196,10 @@ pub enum AssignmentState {
     /// Assigned to an executor, awaiting claim.
     Assigned { executor: String },
     /// Claimed by the executor, work in progress.
-    Claimed { executor: String, claimed_at_ms: u64 },
+    Claimed {
+        executor: String,
+        claimed_at_ms: u64,
+    },
     /// Verified output submitted, settlement applied.
     Settled { executor: String },
     /// Failed (no provider, verification failed, expired…).
@@ -411,8 +418,7 @@ impl AssignmentStore {
     }
 
     pub fn get(&self, plan_id: &str, stage_id: &str) -> Option<&Assignment> {
-        self.items
-            .get(&(plan_id.to_string(), stage_id.to_string()))
+        self.items.get(&(plan_id.to_string(), stage_id.to_string()))
     }
 
     /// All stages of a plan, in proposal order (read-only status surface).
@@ -448,28 +454,57 @@ mod tests {
 
     #[test]
     fn select_prefers_lower_price() {
-        let ads = vec![ad("b", &["chat"], 50, 0, 1000), ad("a", &["chat"], 20, 0, 1000)];
-        assert_eq!(select_provider(&ads, &req("chat", 100), 1100).unwrap().agent_id, "a");
+        let ads = vec![
+            ad("b", &["chat"], 50, 0, 1000),
+            ad("a", &["chat"], 20, 0, 1000),
+        ];
+        assert_eq!(
+            select_provider(&ads, &req("chat", 100), 1100)
+                .unwrap()
+                .agent_id,
+            "a"
+        );
     }
 
     #[test]
     fn select_tie_breaks_by_agent_id_asc() {
-        let ads = vec![ad("b", &["chat"], 20, 0, 1000), ad("a", &["chat"], 20, 0, 1000)];
-        assert_eq!(select_provider(&ads, &req("chat", 100), 1100).unwrap().agent_id, "a");
+        let ads = vec![
+            ad("b", &["chat"], 20, 0, 1000),
+            ad("a", &["chat"], 20, 0, 1000),
+        ];
+        assert_eq!(
+            select_provider(&ads, &req("chat", 100), 1100)
+                .unwrap()
+                .agent_id,
+            "a"
+        );
     }
 
     #[test]
     fn select_contribution_bias_breaks_price_tie() {
-        let ads = vec![ad("b", &["chat"], 20, 0, 1000), ad("a", &["chat"], 20, 10, 1000)];
-        assert_eq!(select_provider(&ads, &req("chat", 100), 1100).unwrap().agent_id, "a");
+        let ads = vec![
+            ad("b", &["chat"], 20, 0, 1000),
+            ad("a", &["chat"], 20, 10, 1000),
+        ];
+        assert_eq!(
+            select_provider(&ads, &req("chat", 100), 1100)
+                .unwrap()
+                .agent_id,
+            "a"
+        );
     }
 
     #[test]
     fn select_contribution_cannot_beat_cheaper_price() {
         // Fairness is a bias, never a dictator: +15 bias < any price gap ≥ 1.
-        let ads = vec![ad("rich", &["chat"], 21, 1000, 1000), ad("cheap", &["chat"], 20, -1000, 1000)];
+        let ads = vec![
+            ad("rich", &["chat"], 21, 1000, 1000),
+            ad("cheap", &["chat"], 20, -1000, 1000),
+        ];
         assert_eq!(
-            select_provider(&ads, &req("chat", 100), 1100).unwrap().agent_id,
+            select_provider(&ads, &req("chat", 100), 1100)
+                .unwrap()
+                .agent_id,
             "cheap"
         );
     }
@@ -499,9 +534,17 @@ mod tests {
     fn settle_keys_are_stable_and_namespaced() {
         assert_eq!(reservation_id("p", "s"), "m17res:p:s");
         assert_eq!(credit_ref("p", "s"), "m17cr:p:s");
-        let m = VerifiedMeasures { tokens_used: Some(10), processing_ms: Some(5) };
+        let m = VerifiedMeasures {
+            tokens_used: Some(10),
+            processing_ms: Some(5),
+        };
         match decide_settle("p", "s", true, 7, m) {
-            SettleDecision::SettleAndCredit { reservation_id: r, credit_ref: c, price: 7, .. } => {
+            SettleDecision::SettleAndCredit {
+                reservation_id: r,
+                credit_ref: c,
+                price: 7,
+                ..
+            } => {
                 assert_eq!(r, "m17res:p:s");
                 assert_eq!(c, "m17cr:p:s");
             }
@@ -520,7 +563,10 @@ mod tests {
         s.assign("p", "s1", "exec-x", 1001).unwrap();
         s.claim("p", "s1", "exec-x", 1002).unwrap();
         s.submit_verified("p", "s1", "exec-x", 1003).unwrap();
-        assert!(matches!(s.get("p", "s1").unwrap().state, AssignmentState::Settled { .. }));
+        assert!(matches!(
+            s.get("p", "s1").unwrap().state,
+            AssignmentState::Settled { .. }
+        ));
         // Re-submit is rejected (ledger idempotency key covers the money).
         assert_eq!(
             s.submit_verified("p", "s1", "exec-x", 1004),
@@ -533,16 +579,23 @@ mod tests {
         let mut s = AssignmentStore::new();
         s.propose("p", "s1", "chat", 10, "req-a", 1000).unwrap();
         s.assign("p", "s1", "exec-x", 1001).unwrap();
-        assert_eq!(s.claim("p", "s1", "intruder", 1002), Err(AssignmentError::BadTransition));
+        assert_eq!(
+            s.claim("p", "s1", "intruder", 1002),
+            Err(AssignmentError::BadTransition)
+        );
     }
 
     #[test]
     fn assignment_enforces_stage_limit_and_price_bound() {
         let mut s = AssignmentStore::new();
         for i in 0..MAX_ORCHESTRATION_STAGES {
-            s.propose("p", &format!("s{i}"), "chat", 10, "req", 1000).unwrap();
+            s.propose("p", &format!("s{i}"), "chat", 10, "req", 1000)
+                .unwrap();
         }
-        assert_eq!(s.propose("p", "sX", "chat", 10, "req", 1000), Err(AssignmentError::StageLimit));
+        assert_eq!(
+            s.propose("p", "sX", "chat", 10, "req", 1000),
+            Err(AssignmentError::StageLimit)
+        );
         assert_eq!(
             s.propose("q", "s1", "chat", MAX_STAGE_PRICE + 1, "req", 1000),
             Err(AssignmentError::PriceBound)
@@ -556,7 +609,10 @@ mod tests {
         s.assign("p", "s1", "exec-x", 1000).unwrap();
         let expired = s.expire(1000 + ASSIGNMENT_TTL_MS + 1);
         assert_eq!(expired.len(), 1);
-        assert!(matches!(s.get("p", "s1").unwrap().state, AssignmentState::Failed { .. }));
+        assert!(matches!(
+            s.get("p", "s1").unwrap().state,
+            AssignmentState::Failed { .. }
+        ));
     }
 
     #[test]
@@ -566,6 +622,9 @@ mod tests {
         s.assign("p", "s1", "exec-x", 1001).unwrap();
         s.claim("p", "s1", "exec-x", 1002).unwrap();
         s.mark_failed("p", "s1", "bad output", 1003).unwrap();
-        assert_eq!(s.mark_failed("p", "s1", "again", 1004), Err(AssignmentError::BadTransition));
+        assert_eq!(
+            s.mark_failed("p", "s1", "again", 1004),
+            Err(AssignmentError::BadTransition)
+        );
     }
 }
