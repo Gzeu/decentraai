@@ -290,3 +290,72 @@ limit), Tier 2 Contributor (shares ≥1 verified model), Tier 3 Core
 (shares large/multiple models, clean reputation). Tiers are earned by
 sharing, measured with the existing catalog + reputation primitives.
 
+## Primordial Mind → World initiative → first economic cycles (2026-09)
+
+Agent Proposal & Experiment Protocol v0.1 landed first (#84, DECOUPLED
+FIRST: pure cognitive core, deny-by-default economics), then grew in
+vertical slices, each proven live before the next: v0.2 bounded testnet
+lane (replay-first executor, cumulative budget) → v0.3 autonomous
+selection (agent scores and picks; verdicts inferred, never declared) →
+v0.4 experiment CONSTRUCTION from signals/deltas → v0.5 persistent
+research journal (longitudinal families) → v0.6 multi-lens consensus
+(generative/conservative/skeptic, +1000bp agreement uplift).
+
+World bridge (#89, vertical slice): `GET /v1/world` becomes a typed
+observation, the selected research becomes a REAL World mission
+(`POST /v1/world/mission`, 409-keep, never a parallel sim).
+
+Autonomous loop v0.7 (#90, `84a83af`, 1806 tests): incremental World
+consumption (`WorldCursor` + information-gain gate + SKIP on steady),
+persistent agent activity (Exploring/Working/Trading/Resting), lenses
+mapped onto REAL entity ids (no fakes), append-only research graph with
+stable ids, economy feedback (refuted ≠ failure), cheapest-service
+recording, atomic persists on every boundary (cursor advances even on
+deny — live lesson world-003/004).
+
+M15 pressure-trigger (#91, `79ff393`): the trigger lives INSIDE the node
+(tick-hook → pure deterministic detector in `proposal::pressure` →
+existing loop as bounded child). The trigger path can NEVER pass
+`--enable-live-testnet` (asserted in tests); token travels via env, never
+argv. Live on prod: baseline tick 8, quiet skips, tick 13 FIRED
+(new-events + tick-drift) → `cycle:trigger-13` ran itself → evidence
+Supported → mission-adopted skips after. Trigger left ENABLED on prod
+(budget 100 wei = read-only-only children, cooldown 20). Live lesson:
+the service boots via `node_start`, not `serve_common` — attach lives on
+both paths (`d9785aa`).
+
+First testnet economic cycles (wallet ops #92, `fbd41df`): fresh wallet
+`erd18ju7q8fluce5ns4y8tze7k4au4yrj47csfkph9lgpyqg0rnzculqxl2j0x` (seed
+0600, existing wallet kept separate), faucet/drip funded. Cycle 1:
+100 wei self-transfer, TX `f7825a44…03da`, success, independently
+verified (sender = receiver, value 100, fee 0.00005, nonce 0→1).
+Cycle 2: the agent once honestly chose read-only despite the armed flag
+(budget is a ceiling, not an order), then probe-250, TX `051793bb…75c6`,
+success, 250 wei. Lane disarmed after (per-invocation flag; trigger
+cannot arm it).
+
+Hardening sprint (#93, `28e8737`, 1835 tests): F1 typed `tx_status`
+errors (sweep matches the 404 VARIANT, never text) + F2 resubmit cap
+(`OnChainProof::resubmit_count`, MAX 3, terminal Failed + sweep routing,
+single lock scope); wallet hardening (OsRng parity + seed zeroize);
+`backup-node.sh` / `restore-node.sh` (manifest + automated secret-shape
+audit — caught raw `dca_` keys in `consumer_keys.json` live; restore
+refuses on live node, proven on scratch); findings doc adopted from PR
+#83 (closed superseded — branch predated the fmt toolchain).
+
+External audit PR #94 (L3/L4, OPEN, not merged): reviewed on-record —
+patches `crates/tokens/src/tokenomics.rs`, which is NOT compiled
+(not declared in `lib.rs`; 0 tests execute), so the fix is a no-op and
+its tests never run in CI; the report marks 7 items remediated with 1
+file patched and mixes 12 vs 16 numbering. SEC-15's math is sound;
+SEC-01 (spawn race, low severity, guards exist) and SEC-02
+(`unsigned_abs` nit, unreachable) concern live code and were assessed
+honestly. `mergeable:false` observed once was transient (main moved
+under the PR base); status at review: CLEAN. Left to its author.
+
+Standing profile after this chapter: 1835 tests green, clippy + fmt
+clean, CI green; prod node on systemd with research trigger on; World
+tick 30+, mission `task-0022`; trigger day-0 baseline saved
+(`experiments/trigger-baseline-2026-09-06.json`, 7-day report due
+2026-09-13).
+
