@@ -47,6 +47,7 @@ pub mod decision;
 pub mod delegation;
 pub mod economy;
 pub mod evidence;
+pub mod gateway;
 pub mod knowledge;
 pub mod matcher;
 pub mod memory;
