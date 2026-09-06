@@ -2788,15 +2788,23 @@ async fn world_tick_handler(State(state): State<ApiState>) -> Response {
     // research. No-op (`disabled`) when unconfigured — zero behavior delta.
     // On Fire the EXISTING autonomous loop spawns as a bounded child
     // (read-only/bounded lane; testnet can never arm from this path).
+    // SEC-01: the single-flight gate serializes concurrent ticks — the
+    // loser skips without touching trigger state.
     let trigger_note = match state.research_trigger.as_ref() {
         None => "disabled".to_string(),
         Some(rt) => {
-            let journal = rt.load_journal();
-            let (report, _) = rt.evaluate(&snapshot, &journal);
-            if report.fired {
-                rt.spawn_child();
+            if !rt.try_begin_cycle() {
+                "skip: previous trigger child still running".to_string()
+            } else {
+                let journal = rt.load_journal();
+                let (report, _) = rt.evaluate(&snapshot, &journal);
+                if report.fired {
+                    rt.spawn_child();
+                } else {
+                    rt.end_cycle();
+                }
+                report.note
             }
-            report.note
         }
     };
     (
@@ -15348,6 +15356,7 @@ mod tests {
                 master_token: None,
                 state_path: state_path.clone(),
                 journal_path: dir.path().join("experiments/research-journal.json"),
+                inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         ));
         let api = serve_api(state, "127.0.0.1", 0).await.unwrap();

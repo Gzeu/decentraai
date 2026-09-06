@@ -20,6 +20,10 @@
 //! - Spawn failure is logged, never fatal to the tick.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use decentraai_proposal::pressure::{
     PressureDecision, PressureState, PressureThresholds, evaluate_pressure,
@@ -49,6 +53,14 @@ pub struct ResearchTriggerRuntime {
     pub state_path: PathBuf,
     /// Research journal path (best-effort read; absent = empty journal).
     pub journal_path: PathBuf,
+    /// SEC-01 single-flight guard: at most one trigger cycle (evaluate →
+    /// spawn → child run) is ever in flight per node process. Tick-time
+    /// races (two concurrent POSTs) serialize here — the loser skips
+    /// WITHOUT touching state, so pressure persists for the next tick.
+    /// In-memory only: a node restart resets it (state file stays the
+    /// durable truth; no stuck flag possible). No locks involved, so no
+    /// deadlock is constructible — only a lock-free CAS.
+    pub inflight: Arc<AtomicBool>,
 }
 
 impl ResearchTriggerRuntime {
@@ -82,7 +94,23 @@ impl ResearchTriggerRuntime {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| data_dir.join("experiments/world-trigger.json")),
             journal_path: PathBuf::from(home).join(".decentraai/experiments/research-journal.json"),
+            inflight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Claim the single-flight slot. `true` = this caller owns the cycle
+    /// and must either spawn (which releases on child exit) or release via
+    /// [`Self::end_cycle`]. `false` = a cycle is already running.
+    #[must_use]
+    pub fn try_begin_cycle(&self) -> bool {
+        self.inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Release the slot without spawning (no-Fire path).
+    pub fn end_cycle(&self) {
+        self.inflight.store(false, Ordering::SeqCst);
     }
 
     /// Load trigger state (reload-first; garbage or absent = fresh state,
@@ -231,6 +259,7 @@ impl ResearchTriggerRuntime {
         let tick = self.load_state().last_evaluated_tick;
         let argv = self.child_argv(tick);
         let token = self.master_token.clone().unwrap_or_default();
+        let inflight = self.inflight.clone();
         tracing::info!(
             "research-trigger: spawning autonomous-cycle (cycle:trigger-{tick}, budget {} wei)",
             self.cycle_budget_wei
@@ -259,6 +288,9 @@ impl ResearchTriggerRuntime {
                     tracing::warn!("research-trigger: child spawn failed: {e}");
                 }
             }
+            // SEC-01: the slot releases exactly once, however the child
+            // ended (ok / non-zero / spawn error) — no stuck guard.
+            inflight.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -291,6 +323,7 @@ mod tests {
                     .as_nanos()
             )),
             journal_path: std::env::temp_dir().join("trigger-test-no-journal.json"),
+            inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -378,5 +411,48 @@ mod tests {
             "pressure must persist for the next tick"
         );
         let _ = std::fs::remove_file(&r.state_path);
+    }
+
+    #[test]
+    fn single_flight_gate_serializes_cycles() {
+        // SEC-01: first claimant owns the cycle; the second skips WITHOUT
+        // touching state; release re-arms. Deterministic, no spawn involved.
+        let r = rt();
+        assert!(r.try_begin_cycle(), "free slot claims");
+        assert!(!r.try_begin_cycle(), "held slot refuses");
+        r.end_cycle();
+        assert!(r.try_begin_cycle(), "released slot claims again");
+        r.end_cycle();
+        let _ = std::fs::remove_file(&r.state_path);
+    }
+
+    #[test]
+    fn concurrent_claimants_elect_exactly_one_owner() {
+        // SEC-01 concurrency verification: N threads hammering the gate
+        // elect EXACTLY one cycle owner (the tick-hook race). Outcome is
+        // deterministic (exactly-once) regardless of scheduling.
+        let r = rt();
+        let shared = std::sync::Arc::new(r);
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                let rt = std::sync::Arc::clone(&shared);
+                let wins = std::sync::Arc::clone(&wins);
+                s.spawn(move || {
+                    if rt.try_begin_cycle() {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            wins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one concurrent claimant must own the cycle"
+        );
+        shared.end_cycle();
+        assert!(shared.try_begin_cycle(), "slot releases after the cycle");
+        shared.end_cycle();
+        let _ = std::fs::remove_file(&shared.state_path);
     }
 }
