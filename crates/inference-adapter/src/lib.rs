@@ -74,7 +74,8 @@ pub struct EngineCapabilities {
     pub kv_report: bool,
     pub prefill_decode_separation: bool,
     pub expert_routing: bool,
-    pub tensor_parallel: bool,
+    /// TP degree: `None` = no support, `Some(n)` = n-way tensor parallelism.
+    pub tensor_parallel: Option<u8>,
     pub continuous_batching: bool,
     pub speculative_decoding: bool,
     pub kv_offload: bool,
@@ -89,7 +90,7 @@ impl EngineCapabilities {
             kv_report: false,
             prefill_decode_separation: false,
             expert_routing: false,
-            tensor_parallel: false,
+            tensor_parallel: None,
             continuous_batching: false,
             speculative_decoding: false,
             kv_offload: false,
@@ -230,7 +231,7 @@ impl OpenAiCompatibleBackend {
             EngineKind::Vllm => EngineCapabilities {
                 kv_report: true,
                 prefill_decode_separation: true,
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 continuous_batching: true,
                 speculative_decoding: true,
                 kv_offload: true,
@@ -241,7 +242,7 @@ impl OpenAiCompatibleBackend {
             EngineKind::Sglang => EngineCapabilities {
                 kv_report: true,
                 prefill_decode_separation: true,
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 continuous_batching: true,
                 speculative_decoding: true,
                 kv_offload: true,

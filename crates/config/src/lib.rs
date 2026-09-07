@@ -401,6 +401,13 @@ pub struct InferenceSection {
     /// Min available capacity (0..1) for a worker to be eligible.
     #[serde(default)]
     pub min_available_capacity: Option<f32>,
+    /// M21: Tensor parallelism degree override. When set, the node launches
+    /// its engine with the given TP degree (e.g. 4 for 4-way TP on 4 GPUs).
+    /// When `None`, TP degree is auto-detected from available GPUs via
+    /// `nvidia-smi` / `CUDA_VISIBLE_DEVICES`. Explicit `Some(0)` disables
+    /// TP (single-GPU / CPU-only).
+    #[serde(default)]
+    pub tensor_parallel_degree: Option<u8>,
 }
 
 /// Generation defaults injected into inference requests that do not

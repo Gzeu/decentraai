@@ -218,7 +218,7 @@ impl StrategyKind {
                 ..EngineCapabilities::conservative()
             },
             Self::CollaborativeModel => EngineCapabilities {
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 pipeline_parallel: true,
                 ..EngineCapabilities::conservative()
             },
@@ -800,7 +800,7 @@ mod tests {
         );
         assert!(
             StrategyKind::CollaborativeModel.meets_capabilities(&EngineCapabilities {
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 pipeline_parallel: true,
                 ..EngineCapabilities::conservative()
             })
@@ -808,7 +808,7 @@ mod tests {
         // CollaborativeModel needs BOTH tensor and pipeline parallel.
         assert!(
             !StrategyKind::CollaborativeModel.meets_capabilities(&EngineCapabilities {
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 ..EngineCapabilities::conservative()
             })
         );

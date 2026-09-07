@@ -448,3 +448,33 @@ Multi-node sync for personal→collective bridge entries.
   bridge entry propagates and lands as Candidate on receiver).
 - **Standing:** 82 suites, 0 failures, clippy clean.
 
+### M21 — Tensor Parallelism (DONE 2026-09-07)
+
+Multi-GPU tensor parallelism for vLLM/Sglang with automatic GPU detection.
+
+- **EngineCapabilities:** `tensor_parallel: bool` → `tensor_parallel: Option<u8>`
+  across all crates (fabric, inference-adapter). `None` = no support;
+  `Some(n)` = n-way TP. Backward-compatible deserializer accepts legacy
+  `bool` format (`false` → `None`, `true` → `Some(1)`).
+- **GPU detection:** `detect_gpu_count()` in runtime: checks
+  `CUDA_VISIBLE_DEVICES` (comma-separated device IDs → count), then
+  `nvidia-smi --query-gpu=index --format=csv,noheader`, falls back to
+  `None`. `resolve_tensor_parallel_degree(config_override)` applies the
+  operator override or auto-detects.
+- **Config:** `tensor_parallel_degree: Option<u8>` in `InferenceSection`.
+  Explicit `Some(0)` disables TP; `Some(n)` forces n-way; `None` = auto.
+- **Engine launch:** vLLM gets `-tp=N`, Sglang gets `--tp=N` injected
+  into `RuntimeConfig.extra_args` when TP degree ≥ 2 and engine matches.
+  Both local `serve start` and `decentraai-worker` paths wired.
+- **Planner:** `meets_capabilities` compares `Option<u8>` TP degree
+  (works via `PartialOrd` on `Option`); `CollaborativeModel` requires
+  `tensor_parallel: Some(1)`.
+- **Probe:** `probe_capabilities` for vLLM/Sglang returns `Some(1)`
+  (conservative sentinel for "supports TP, degree unknown until launched
+  with explicit `-tp`").
+- **Tests:** 3 new — `resolve_tensor_parallel_degree_explicit_override`,
+  `server_args_injects_tensor_parallel_flag`, `server_args_sglang_tp_format`.
+  Golden corpus backward-compat verified (1916 passed, 0 failed).
+- **Landing page:** updated to show M21 tag instead of ROADMAP placeholder.
+- **Standing:** 82 suites, 1916 passed, 0 failed, clippy clean.
+

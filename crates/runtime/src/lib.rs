@@ -141,6 +141,58 @@ pub fn server_args(config: &RuntimeConfig, port: u16) -> Vec<String> {
     args
 }
 
+/// M21: Detect the number of NVIDIA GPUs available for tensor parallelism.
+///
+/// Detection order:
+/// 1. `CUDA_VISIBLE_DEVICES` — comma-separated list of device IDs (e.g.
+///    `"0,1,2,3"` → 4 GPUs). If the env var is set to `""` or `"none"`,
+///    returns 0.
+/// 2. `nvidia-smi --query-gpu=index --format=csv,noheader` — counts rows.
+/// 3. Falls back to `None` (unknown — caller decides).
+pub fn detect_gpu_count() -> Option<u32> {
+    // 1. CUDA_VISIBLE_DEVICES (most reliable on cloud/GPU nodes).
+    if let Ok(val) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        let trimmed = val.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            return Some(0);
+        }
+        let count = trimmed.split(',').filter(|s| !s.trim().is_empty()).count();
+        if count > 0 {
+            return Some(count as u32);
+        }
+    }
+
+    // 2. nvidia-smi (works on bare metal / VMs with GPU passthrough).
+    if let Ok(out) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=index", "--format=csv,noheader"])
+        .output()
+    {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let gpu_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+            if gpu_count > 0 {
+                return Some(gpu_count as u32);
+            }
+        }
+    }
+
+    // 3. Unknown (caller should fall back to single-GPU / CPU mode).
+    None
+}
+
+/// M21: Resolve the effective tensor-parallelism degree. Uses the explicit
+/// config override first, then auto-detects from GPU availability.
+///
+/// Returns `Some(0)` or `None` if TP is disabled / unknown, or `Some(n)`
+/// with `n >= 2` for viable tensor parallelism.
+pub fn resolve_tensor_parallel_degree(config_override: Option<u8>) -> Option<u32> {
+    match config_override {
+        Some(0) => None,
+        Some(n) => Some(n as u32),
+        None => detect_gpu_count(),
+    }
+}
+
 /// Locates the llama-server binary: explicit path, then the override
 /// environment variable, then a PATH search.
 pub fn find_llama_server(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -1110,5 +1162,47 @@ mod tests {
         assert!(!healthy, "fake server never becomes ready");
         assert_eq!(manager.respawns, 1, "one restart was attempted");
         let _ = port;
+    }
+
+    // ── M21: Tensor Parallelism ────────────────────────────────────────
+
+    #[test]
+    fn resolve_tensor_parallel_degree_explicit_override() {
+        assert_eq!(resolve_tensor_parallel_degree(Some(4)), Some(4));
+        assert_eq!(resolve_tensor_parallel_degree(Some(2)), Some(2));
+        assert_eq!(resolve_tensor_parallel_degree(Some(0)), None);
+        assert_eq!(resolve_tensor_parallel_degree(Some(1)), Some(1));
+    }
+
+    #[test]
+    fn server_args_injects_tensor_parallel_flag() {
+        let config = RuntimeConfig {
+            model_path: "/test/model.gguf".into(),
+            bind_host: "127.0.0.1".into(),
+            ctx_size: 4096,
+            parallel: 4,
+            threads: Some(4),
+            ready_timeout: Duration::from_secs(30),
+            extra_args: vec!["-tp=4".into()],
+            port: None,
+        };
+        let args = server_args(&config, 8080);
+        assert!(args.contains(&"-tp=4".to_string()));
+    }
+
+    #[test]
+    fn server_args_sglang_tp_format() {
+        let config = RuntimeConfig {
+            model_path: "/test/model.gguf".into(),
+            bind_host: "127.0.0.1".into(),
+            ctx_size: 4096,
+            parallel: 4,
+            threads: None,
+            ready_timeout: Duration::from_secs(30),
+            extra_args: vec!["--tp=8".into()],
+            port: None,
+        };
+        let args = server_args(&config, 8080);
+        assert!(args.contains(&"--tp=8".to_string()));
     }
 }

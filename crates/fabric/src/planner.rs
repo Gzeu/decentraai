@@ -1616,7 +1616,7 @@ mod tests {
             "vLLM advertises staged transfers"
         );
         assert!(vllm_caps.kv_report, "vLLM advertises KV reporting");
-        assert!(vllm_caps.tensor_parallel, "vLLM advertises tensor parallel");
+        assert!(vllm_caps.tensor_parallel.is_some(), "vLLM advertises tensor parallel");
         assert!(
             !vllm_caps.expert_routing,
             "no engine advertises expert routing today"
@@ -1624,7 +1624,7 @@ mod tests {
         let llama_caps = EngineKind::LlamaServer.advertised_capabilities();
         assert!(!llama_caps.supports_staging());
         assert!(llama_caps.kv_report, "llama-server exposes KV params");
-        assert!(!llama_caps.tensor_parallel);
+        assert!(llama_caps.tensor_parallel.is_none());
         // Ollama / RemoteOpenAI are conservative: no KV report, no staging.
         let ollama_caps = EngineKind::Ollama.advertised_capabilities();
         assert!(!ollama_caps.kv_report);

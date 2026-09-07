@@ -89,17 +89,19 @@ impl EngineKind {
                 kv_report: true,
                 prefill_decode_separation: false,
                 expert_routing: false,
-                tensor_parallel: false,
+                tensor_parallel: None,
                 ..EngineCapabilities::zero_extra()
             },
             // vLLM exports live KV-cache state and a prefill/decode
             // disaggregation surface, and can attend over multiple ranks.
+            // TP degree is unknown until probed; `Some(1)` = "I support TP,
+            // actual degree not yet measured."
             Self::Vllm => EngineCapabilities {
                 streaming: true,
                 kv_report: true,
                 prefill_decode_separation: true,
                 expert_routing: false,
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 continuous_batching: true,
                 speculative_decoding: true,
                 kv_offload: true,
@@ -111,7 +113,7 @@ impl EngineKind {
                 kv_report: true,
                 prefill_decode_separation: true,
                 expert_routing: false,
-                tensor_parallel: true,
+                tensor_parallel: Some(1),
                 continuous_batching: true,
                 speculative_decoding: true,
                 kv_offload: true,
@@ -123,19 +125,19 @@ impl EngineKind {
                 kv_report: false,
                 prefill_decode_separation: false,
                 expert_routing: false,
-                tensor_parallel: false,
+                tensor_parallel: None,
                 ..EngineCapabilities::zero_extra()
             },
             // Transformers: streaming via token-by-token generation; no KV
             // cache reporting or tensor parallelism (single-device by
             // default). Continuous batching depends on the model size and
-            // device; conservative false until probed.
+            // device; conservative None until probed.
             Self::Transformers => EngineCapabilities {
                 streaming: true,
                 kv_report: false,
                 prefill_decode_separation: false,
                 expert_routing: false,
-                tensor_parallel: false,
+                tensor_parallel: None,
                 ..EngineCapabilities::zero_extra()
             },
             // Unknown/remote: be conservative. Safe defaults preserve
@@ -145,7 +147,7 @@ impl EngineKind {
                 kv_report: false,
                 prefill_decode_separation: false,
                 expert_routing: false,
-                tensor_parallel: false,
+                tensor_parallel: None,
                 ..EngineCapabilities::zero_extra()
             },
         }
@@ -171,9 +173,13 @@ pub struct EngineCapabilities {
     pub prefill_decode_separation: bool,
     /// Accepts expert-level routing / selection (distributed MoE).
     pub expert_routing: bool,
-    /// Can shard one model across multiple distributed ranks (tensor
-    /// parallelism) and serve it cooperatively.
-    pub tensor_parallel: bool,
+    /// TP degree (tensor parallelism). `None` (or 0) means the engine does
+    /// NOT support TP; `Some(n)` means the engine is running with n-way TP
+    /// (e.g. 4 GPUs for vLLM `-tp 4`). For engines that support TP but
+    /// have not been probed for their degree, `Some(1)` is the conservative
+    /// "I can do TP but the exact degree is unknown" sentinel.
+    #[serde(default, deserialize_with = "deserialize_tensor_parallel")]
+    pub tensor_parallel: Option<u8>,
     /// Can batch independent requests into one forward pass (vLLM/SGLang
     /// continuous batching). Preferred for BatchFanOut; not required.
     #[serde(default)]
@@ -203,7 +209,7 @@ impl EngineCapabilities {
             kv_report: false,
             prefill_decode_separation: false,
             expert_routing: false,
-            tensor_parallel: false,
+            tensor_parallel: None,
             ..Self::zero_extra()
         }
     }
@@ -217,7 +223,7 @@ impl EngineCapabilities {
             kv_report: false,
             prefill_decode_separation: false,
             expert_routing: false,
-            tensor_parallel: false,
+            tensor_parallel: None,
             continuous_batching: false,
             speculative_decoding: false,
             kv_offload: false,
@@ -231,6 +237,52 @@ impl EngineCapabilities {
     pub fn supports_staging(&self) -> bool {
         self.prefill_decode_separation
     }
+}
+
+/// Backward-compatible deserializer for `tensor_parallel`: accepts both the
+/// legacy `bool` format (`false` → `None`, `true` → `Some(1)`) and the
+/// current `Option<u8>` format. A JSON `null` or missing field maps to `None`.
+fn deserialize_tensor_parallel<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct V;
+
+    impl<'de> de::Visitor<'de> for V {
+        type Value = Option<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean or an integer (u8) or null")
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            // Legacy format: false → None, true → Some(1)
+            Ok(if v { Some(1) } else { None })
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(u8::try_from(v).ok().filter(|&n| n > 0))
+        }
+
+        fn visit_some<D2: de::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(V)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(V)
 }
 
 #[cfg(test)]
@@ -254,7 +306,7 @@ mod tests {
     fn capabilities_round_trip() {
         let capa = EngineKind::Vllm.advertised_capabilities();
         assert!(capa.kv_report);
-        assert!(capa.tensor_parallel);
+        assert!(capa.tensor_parallel.is_some());
         assert!(!capa.expert_routing);
         let json = serde_json::to_string(&capa).unwrap();
         let back: EngineCapabilities = serde_json::from_str(&json).unwrap();
@@ -265,7 +317,7 @@ mod tests {
     fn conservative_only_streams() {
         let c = EngineCapabilities::conservative();
         assert!(c.streaming);
-        assert!(!c.kv_report && !c.tensor_parallel && !c.expert_routing);
+        assert!(!c.kv_report && c.tensor_parallel.is_none() && !c.expert_routing);
     }
 
     #[test]

@@ -4192,6 +4192,36 @@ async fn serve_start(
             .max(1),
     );
 
+    // M21: Tensor parallelism — resolve TP degree and inject the engine
+    // flag when the engine supports it (vLLM `-tp N`, Sglang `--tp N`).
+    let engine_kind = config
+        .inference
+        .engine
+        .as_deref()
+        .map(decentraai_inference_adapter::EngineKind::parse);
+    if let Some(tp) = decentraai_runtime::resolve_tensor_parallel_degree(
+        config.inference.tensor_parallel_degree,
+    ) {
+        if tp >= 2 {
+            let flag = match engine_kind {
+                Some(decentraai_inference_adapter::EngineKind::Sglang) => {
+                    format!("--tp={tp}")
+                }
+                Some(decentraai_inference_adapter::EngineKind::Vllm) => {
+                    format!("-tp={tp}")
+                }
+                _ => {
+                    tracing::debug!(tp, "TP degree detected but engine does not accept -tp flag");
+                    String::new()
+                }
+            };
+            if !flag.is_empty() {
+                tracing::info!(tp, engine = ?engine_kind, "M21 injecting tensor parallelism flag");
+                runtime.extra_args.push(flag);
+            }
+        }
+    }
+
     let server = LlamaServer::spawn(&binary, &runtime).await?;
     let backend_url = server.base_url();
     let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));

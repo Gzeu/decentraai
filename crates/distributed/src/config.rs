@@ -333,6 +333,7 @@ mod tests {
             stale_worker_timeout_ms: None,
             max_queue_depth: None,
             min_available_capacity: None,
+            tensor_parallel_degree: None,
         };
         let cfg = InferenceConfig::from_section(&section);
         assert_eq!(cfg.max_retries, 7, "operator max_retries must win");

@@ -150,6 +150,27 @@ async fn main() -> Result<()> {
             .saturating_sub(usize::from(config.resources.reserve_cpu_cores))
             .max(1),
     );
+    // M21: Tensor parallelism — resolve TP degree and inject engine flag.
+    let engine_kind = config
+        .inference
+        .engine
+        .as_deref()
+        .map(EngineKind::parse);
+    if let Some(tp) = decentraai_runtime::resolve_tensor_parallel_degree(
+        config.inference.tensor_parallel_degree,
+    ) {
+        if tp >= 2 {
+            let flag = match engine_kind {
+                Some(EngineKind::Sglang) => format!("--tp={tp}"),
+                Some(EngineKind::Vllm) => format!("-tp={tp}"),
+                _ => String::new(),
+            };
+            if !flag.is_empty() {
+                tracing::info!(tp, engine = ?engine_kind, "M21 worker: injecting tensor parallelism flag");
+                runtime_cfg.extra_args.push(flag);
+            }
+        }
+    }
     let server = LlamaServer::spawn(&binary, &runtime_cfg).await?;
     let url = server.base_url();
     let backend = OpenAiCompatibleBackend::new(BackendConfig {
