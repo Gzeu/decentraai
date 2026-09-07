@@ -116,6 +116,10 @@ pub struct McpContext {
     pub m18_trust: Value,
     /// M18 Economic Layer: result of last contract/escrow/trust mutation via MCP.
     pub m18_action: Value,
+    /// M22 Diffusion: list of available models on this node.
+    pub diffusion_models: Value,
+    /// M22 Diffusion: result of last image generation operation via MCP.
+    pub diffusion_action: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -1073,6 +1077,27 @@ pub fn all_tools() -> Vec<ToolDef> {
             input_schema: json!({ "type": "object", "properties": {
                 "needs": { "type": "array", "items": { "type": "string" }, "description": "Capability names this agent needs (e.g. [\"ocr\", \"embedding\"])" }
             }, "required": ["needs"], "additionalProperties": false }),
+            annotations: ToolAnnotations::additive(),
+        },
+        // ── M22: Diffusion tools ─────────────────────────────────────
+        ToolDef {
+            name: "diffusion_list_models",
+            description: "List available diffusion models on this node. Shows the configured model ID and whether diffusion is enabled/healthy.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "diffusion_generate",
+            description: "Generate an image from a text prompt using Stable Diffusion. Returns base64-encoded PNG. Prompt/parameters are never logged beyond the subprocess boundary.",
+            input_schema: json!({ "type": "object", "properties": {
+                "prompt": { "type": "string", "description": "Text prompt describing the image to generate" },
+                "negative_prompt": { "type": "string", "description": "Things to avoid in the generated image", "default": "" },
+                "width": { "type": "integer", "description": "Image width in pixels (default 512, max 1024)", "default": 512 },
+                "height": { "type": "integer", "description": "Image height in pixels (default 512, max 1024)", "default": 512 },
+                "steps": { "type": "integer", "description": "Inference steps (default 20, max 50). More steps = higher quality but slower.", "default": 20 },
+                "guidance_scale": { "type": "number", "description": "Classifier-free guidance scale (default 7.5). Higher = more prompt adherence.", "default": 7.5 },
+                "seed": { "type": "integer", "description": "Random seed (-1 = random, 0+ = deterministic)", "default": -1 }
+            }, "required": ["prompt"], "additionalProperties": false }),
             annotations: ToolAnnotations::additive(),
         },
     ]
@@ -2506,6 +2531,9 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "m18_verify_trust" => &ctx.m18_action,
         "m18_trust_score" => &ctx.m18_action,
         "m18_update_needs" => &ctx.m18_action,
+        // M22 — Diffusion
+        "diffusion_list_models" => &ctx.diffusion_models,
+        "diffusion_generate" => &ctx.diffusion_action,
         _ => return None,
     };
     Some(json!({
@@ -2560,6 +2588,8 @@ mod tests {
             m18_escrow: json!([]),
             m18_trust: json!([]),
             m18_action: json!({}),
+            diffusion_models: json!({ "enabled": false, "healthy": false, "models": [] }),
+            diffusion_action: json!({}),
         }
     }
 

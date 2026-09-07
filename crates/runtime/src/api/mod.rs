@@ -8770,6 +8770,13 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             }
         },
         m18_action: serde_json::json!({}),
+        // M22 Diffusion
+        diffusion_models: serde_json::json!({
+            "enabled": state.diffusion.enabled(),
+            "healthy": state.diffusion.healthy(),
+            "models": if state.diffusion.enabled() { vec!["stable-diffusion"] } else { vec![] },
+        }),
+        diffusion_action: serde_json::json!({}),
     }
 }
 
