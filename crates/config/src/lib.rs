@@ -408,6 +408,12 @@ pub struct InferenceSection {
     /// TP (single-GPU / CPU-only).
     #[serde(default)]
     pub tensor_parallel_degree: Option<u8>,
+    /// M23: Optional draft model path for speculative decoding. When set,
+    /// the engine launches with a smaller draft model that generates tokens
+    /// speculatively; the main model verifies them in batch for higher
+    /// throughput. Must be a GGUF file path accessible by the node.
+    #[serde(default)]
+    pub draft_model: Option<String>,
 }
 
 /// Generation defaults injected into inference requests that do not

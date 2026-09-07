@@ -171,6 +171,16 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // M23: Speculative decoding — wire draft model if configured.
+    if let Some(ref draft_path) = config.inference.draft_model {
+        let draft = std::path::PathBuf::from(draft_path);
+        if draft.is_file() {
+            tracing::info!(draft = %draft.display(), "M23 worker: enabling speculative decoding");
+            runtime_cfg.draft_model = Some(draft);
+        } else {
+            tracing::warn!(draft = %draft_path, "M23 worker: draft model not found; speculative decoding disabled");
+        }
+    }
     let server = LlamaServer::spawn(&binary, &runtime_cfg).await?;
     let url = server.base_url();
     let backend = OpenAiCompatibleBackend::new(BackendConfig {

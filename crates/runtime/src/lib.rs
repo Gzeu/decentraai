@@ -96,6 +96,10 @@ pub struct RuntimeConfig {
     /// Productized nodes set this so the dashboard can target the model
     /// backend deterministically before it is ready.
     pub port: Option<u16>,
+    /// M23: Optional draft model path for speculative decoding. When set,
+    /// llama-server runs with `--draft <path>` (draft model generates
+    /// tokens speculatively; the main model verifies them in batch).
+    pub draft_model: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -109,6 +113,7 @@ impl RuntimeConfig {
             ready_timeout: Duration::from_secs(120),
             extra_args: Vec::new(),
             port: None,
+            draft_model: None,
         }
     }
 }
@@ -137,6 +142,13 @@ pub fn server_args(config: &RuntimeConfig, port: u16) -> Vec<String> {
     args.push("--flash-attn".to_string());
     args.push("on".to_string());
     args.push("--jinja".to_string());
+    // M23: speculative decoding via draft model. When a draft model is
+    // configured, llama-server generates tokens speculatively with the
+    // smaller model and verifies them in batch with the main model.
+    if let Some(ref draft) = config.draft_model {
+        args.push("--draft".to_string());
+        args.push(draft.to_string_lossy().into_owned());
+    }
     args.extend(config.extra_args.iter().cloned());
     args
 }
@@ -1185,6 +1197,7 @@ mod tests {
             ready_timeout: Duration::from_secs(30),
             extra_args: vec!["-tp=4".into()],
             port: None,
+            draft_model: None,
         };
         let args = server_args(&config, 8080);
         assert!(args.contains(&"-tp=4".to_string()));
@@ -1201,8 +1214,36 @@ mod tests {
             ready_timeout: Duration::from_secs(30),
             extra_args: vec!["--tp=8".into()],
             port: None,
+            draft_model: None,
         };
         let args = server_args(&config, 8080);
         assert!(args.contains(&"--tp=8".to_string()));
+    }
+
+    // ── M23: Speculative Decoding ──────────────────────────────────────
+
+    #[test]
+    fn server_args_injects_draft_model_flag() {
+        let config = RuntimeConfig {
+            model_path: "/test/model.gguf".into(),
+            bind_host: "127.0.0.1".into(),
+            ctx_size: 4096,
+            parallel: 4,
+            threads: None,
+            ready_timeout: Duration::from_secs(30),
+            extra_args: Vec::new(),
+            port: None,
+            draft_model: Some("/test/draft.gguf".into()),
+        };
+        let args = server_args(&config, 8080);
+        let draft_idx = args.iter().position(|a| a == "--draft").unwrap();
+        assert_eq!(args[draft_idx + 1], "/test/draft.gguf");
+    }
+
+    #[test]
+    fn server_args_no_draft_when_none() {
+        let config = RuntimeConfig::new("/test/model.gguf".into());
+        let args = server_args(&config, 8080);
+        assert!(!args.contains(&"--draft".to_string()));
     }
 }

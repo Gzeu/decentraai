@@ -4222,6 +4222,20 @@ async fn serve_start(
         }
     }
 
+    // M23: Speculative decoding — wire draft model if configured.
+    if let Some(ref draft_path) = config.inference.draft_model {
+        let draft = std::path::PathBuf::from(draft_path);
+        if draft.is_file() {
+            tracing::info!(draft = %draft.display(), "M23 enabling speculative decoding with draft model");
+            runtime.draft_model = Some(draft);
+        } else {
+            tracing::warn!(
+                draft = %draft_path,
+                "M23 draft model not found; speculative decoding disabled"
+            );
+        }
+    }
+
     let server = LlamaServer::spawn(&binary, &runtime).await?;
     let backend_url = server.base_url();
     let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));

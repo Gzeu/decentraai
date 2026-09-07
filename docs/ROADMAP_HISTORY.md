@@ -478,3 +478,23 @@ Multi-GPU tensor parallelism for vLLM/Sglang with automatic GPU detection.
 - **Landing page:** updated to show M21 tag instead of ROADMAP placeholder.
 - **Standing:** 82 suites, 1916 passed, 0 failed, clippy clean.
 
+### M23 — Transformer Speculation / Speculative Decoding (DONE 2026-09-07)
+
+Draft-model speculative decoding wired into engine launch.
+
+- **RuntimeConfig:** `draft_model: Option<PathBuf>` — optional draft model
+  path for speculative decoding.
+- **server_args:** `--draft <path>` injected when `draft_model` is set.
+  llama-server generates tokens speculatively with the smaller draft model
+  and verifies them in batch with the main model.
+- **Config:** `draft_model: Option<String>` in `InferenceSection`. Operator
+  specifies the GGUF path of a smaller draft model.
+- **Engine launch:** Both `serve start` and `decentraai-worker` paths wired.
+  Validates draft model exists at launch time; warns and disables if missing.
+- **Planner:** `SpeculativeDraftVerify` strategy already requires
+  `speculative_decoding: true`; workers with draft models advertise this
+  capability and are preferred for latency-sensitive workloads.
+- **Tests:** 2 new — `server_args_injects_draft_model_flag`,
+  `server_args_no_draft_when_none`. 1918 total, 0 failed.
+- **Standing:** 82 suites, 1918 passed, 0 failed, clippy clean.
+
