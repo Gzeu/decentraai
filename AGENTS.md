@@ -48,7 +48,7 @@ process, never FFI).
 | `milestone/post-m17` | Collective memory sync, personal↔collective bridge, conflict resolution, P2P durability, adaptive reconnect, partition detection |
 | `milestone/m19-memory-bridge` | Memory Bridge Durability: bridge_sync config, propagation-eligible scopes, Verified auto-promote, E2E cross-node sync |
 
-Forward roadmap (agreed): **M15** Autonomous Pressure Trigger + PlacementEngine fairness · **M16** Agent Gateway (BYOA: scoped credentials + MCP execution tools) · **M17** Capability Sharing / Collective Orchestration · **M19** Memory Bridge durability (multi-node) · **M20** Agent World persistence · **M21** Tensor parallelism · **M23** Transformer speculation — **ALL COMPLETE**. Next: **M22** Diffusion inference · **M24** P2P mesh hardening. Full historical detail: `docs/ROADMAP_HISTORY.md`.
+Forward roadmap (agreed): **M15** Autonomous Pressure Trigger + PlacementEngine fairness · **M16** Agent Gateway (BYOA: scoped credentials + MCP execution tools) · **M17** Capability Sharing / Collective Orchestration · **M19** Memory Bridge durability (multi-node) · **M20** Agent World persistence · **M21** Tensor parallelism · **M22** Diffusion inference · **M23** Transformer speculation — **ALL COMPLETE**. Next: **M24** P2P mesh hardening. Full historical detail: `docs/ROADMAP_HISTORY.md`.
 
 ### The agent organization
 

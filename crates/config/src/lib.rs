@@ -41,6 +41,12 @@ pub struct NodeConfig {
     /// `/v1/ocr` returns 404. Enabling requires `<data_dir>/tools/ocr/venv`.
     #[serde(default)]
     pub ocr: Option<OcrSection>,
+    /// M22: Local Diffusion (Stable Diffusion text-to-image via diffusers).
+    /// Absent = diffusion disabled; `/v1/diffusion/t2i` returns 404.
+    /// Enabling requires `<data_dir>/tools/diffusion/venv` with diffusers
+    /// installed. Model is downloaded on first run.
+    #[serde(default)]
+    pub diffusion: Option<DiffusionSection>,
     /// Fabric Intelligence (the reasoning layer between a task and the
     /// deterministic planner). Absent = disabled; `/v1/intel/*` returns 404.
     #[serde(default)]
@@ -555,6 +561,40 @@ pub struct OcrSection {
 
 fn default_ocr_lang() -> String {
     "en".to_string()
+}
+
+/// M22: Diffusion subprocess configuration (Stable Diffusion text-to-image).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffusionSection {
+    /// Enable the Diffusion subprocess at node start. If true but the venv is
+    /// missing, the node logs a warning and serves without diffusion instead
+    /// of failing startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HuggingFace model ID for Stable Diffusion (default:
+    /// `stable-diffusion-v1-5/stable-diffusion-v1-5`). The model is
+    /// downloaded on first run into `<data_dir>/tools/diffusion/models/`.
+    #[serde(default = "default_diffusion_model")]
+    pub model: String,
+    /// Maximum image width/height the API accepts (default: 1024).
+    #[serde(default = "default_diffusion_max_size")]
+    pub max_size: u32,
+    /// Maximum inference steps the API accepts (default: 50).
+    #[serde(default = "default_diffusion_max_steps")]
+    pub max_steps: u32,
+}
+
+fn default_diffusion_model() -> String {
+    "stable-diffusion-v1-5/stable-diffusion-v1-5".to_string()
+}
+
+fn default_diffusion_max_size() -> u32 {
+    1024
+}
+
+fn default_diffusion_max_steps() -> u32 {
+    50
 }
 
 impl Default for OcrSection {

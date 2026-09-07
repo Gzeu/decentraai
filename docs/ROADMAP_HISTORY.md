@@ -498,3 +498,26 @@ Draft-model speculative decoding wired into engine launch.
   `server_args_no_draft_when_none`. 1918 total, 0 failed.
 - **Standing:** 82 suites, 1918 passed, 0 failed, clippy clean.
 
+### M22 — Diffusion Inference (DONE 2026-09-07)
+
+Stable Diffusion text-to-image generation wired into the fabric as a tool
+runtime subprocess (same pattern as OCR/STT/TTS).
+
+- **Python server:** `diffusion_server.py` — HuggingFace `diffusers`
+  library, `StableDiffusionPipeline` with `DPMSolverMultistepScheduler`.
+  Lazy model loading, CPU/GPU auto-detect, attention slicing for CPU.
+  Endpoints: `GET /health`, `POST /v1/diffusion/t2i`, `GET /v1/diffusion/models`.
+- **Rust wrapper:** `DiffusionServer` + `DiffusionManager` in `tools.rs`
+  — follows the proven ToolServer pattern (embedded Python script, venv
+  subprocess, health probe, graceful off when venv missing).
+- **Config:** `DiffusionSection` in `NodeConfig` — `enabled`, `model`
+  (HF model ID), `max_size` (1024), `max_steps` (50). Absent = disabled.
+- **Spawning:** `spawn_tool_runtimes()` returns `DiffusionManager`; wired
+  into `node_start` via `attach_diffusion()`.
+- **API:** `POST /v1/diffusion/t2i` handler — auth, rate limit, proxy to
+  subprocess. Status endpoint reports diffusion enabled/healthy.
+- **Body:** `{"prompt": "...", "negative_prompt": "...", "width": 512,
+  "height": 512, "steps": 20, "guidance_scale": 7.5, "seed": -1}`
+- **Response:** `{"image_b64": "<base64 PNG>", "seed": N}`
+- **Standing:** 82 suites, 1918 passed, 0 failed, clippy clean.
+

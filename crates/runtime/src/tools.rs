@@ -477,6 +477,80 @@ impl TransformersManager {
             .unwrap_or(false)
     }
 }
+
+// ---------------------------------------------------------------------------
+// M22: Diffusion (Stable Diffusion text-to-image via diffusers)
+// ---------------------------------------------------------------------------
+
+const DIFFUSION_SERVER_PY: &str = include_str!("diffusion_server.py");
+
+/// The running Diffusion subprocess + its tool directory. `None` = disabled.
+pub struct DiffusionServer {
+    server: ToolServer,
+}
+
+impl DiffusionServer {
+    /// Spawns and waits for `/health` (model download + load can take minutes
+    /// on first run). Kills the child on timeout.
+    pub async fn spawn(data_dir: &Path, model: &str) -> Result<Self> {
+        let dir = data_dir.join("tools").join("diffusion");
+        let venv_python = dir.join("venv").join("bin").join("python");
+        let args = vec!["--model".to_string(), model.to_string()];
+        let server = ToolServer::start(
+            &dir,
+            &venv_python,
+            DIFFUSION_SERVER_PY,
+            &args,
+            "scripts/setup-diffusion.sh",
+        )?;
+        let port = server.port();
+        // Model download + load can take minutes; generous timeout.
+        if let Err(e) = wait_until_ready("127.0.0.1", port, Duration::from_secs(300)).await {
+            let _ = server.stop().await;
+            return Err(e.context("Diffusion server did not become ready"));
+        }
+        Ok(Self { server })
+    }
+
+    pub fn base_url(&self) -> String {
+        self.server.base_url()
+    }
+}
+
+/// Holds the Diffusion subprocess. `None` server = Diffusion disabled.
+pub struct DiffusionManager {
+    server: Option<DiffusionServer>,
+}
+
+impl DiffusionManager {
+    pub fn new(server: Option<DiffusionServer>) -> Self {
+        Self { server }
+    }
+
+    pub fn disabled() -> Self {
+        Self { server: None }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.server.as_ref().map(|s| s.base_url())
+    }
+
+    /// Health probe for the dashboard /status endpoint.
+    pub fn healthy(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|_| {
+                super::probe_health("127.0.0.1", self.server.as_ref().unwrap().server.port())
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

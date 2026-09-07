@@ -398,6 +398,8 @@ pub struct ApiState {
     ocr: Arc<crate::tools::OcrManager>,
     stt: Arc<crate::tools::SttManager>,
     skills_tool: Arc<crate::tools::HfSkillsManager>,
+    /// M22: Diffusion tool runtime subprocess. `None` = disabled.
+    diffusion: Arc<crate::tools::DiffusionManager>,
     /// Transformers inference backend subprocess. `None` = disabled.
     transformers_tool: Option<Arc<crate::tools::TransformersManager>>,
     knowledge: Option<Arc<decentraai_distributed::knowledge_runtime::KnowledgeRuntime>>,
@@ -514,6 +516,7 @@ impl ApiState {
             ocr: Arc::new(crate::tools::OcrManager::disabled()),
             stt: Arc::new(crate::tools::SttManager::disabled()),
             skills_tool: Arc::new(crate::tools::HfSkillsManager::disabled()),
+            diffusion: Arc::new(crate::tools::DiffusionManager::disabled()),
             transformers_tool: None,
             knowledge: None,
             evidence: None,
@@ -581,6 +584,11 @@ impl ApiState {
     /// Attaches the HF-skills tool runtime (subprocess). Disabled by default.
     pub fn attach_skills_tool(&mut self, skills: Arc<crate::tools::HfSkillsManager>) {
         self.skills_tool = skills;
+    }
+
+    /// M22: Attaches the Diffusion tool runtime (subprocess). Disabled by default.
+    pub fn attach_diffusion(&mut self, diffusion: Arc<crate::tools::DiffusionManager>) {
+        self.diffusion = diffusion;
     }
 
     /// Attaches the Transformers inference backend (Python subprocess).
@@ -1664,6 +1672,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/golden-capture", get(golden_capture_handler))
         .route("/v1/tts", post(tts_handler))
         .route("/v1/ocr", post(ocr_handler))
+        .route("/v1/diffusion/t2i", post(diffusion_t2i_handler))
         .route("/v1/stt", post(stt_handler))
         .route("/v1/job/summarize-pdf", post(job_summarize_pdf_handler))
         .route("/v1/skills/{skill}", post(skills_run_handler))
@@ -4417,6 +4426,10 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         "ocr": {
             "enabled": state.ocr.enabled(),
             "healthy": state.ocr.healthy(),
+        },
+        "diffusion": {
+            "enabled": state.diffusion.enabled(),
+            "healthy": state.diffusion.healthy(),
         },
         "stt": {
             "enabled": state.stt.enabled(),
@@ -9083,6 +9096,101 @@ async fn ocr_handler(State(state): State<ApiState>, headers: HeaderMap, body: St
     };
     (
         StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        text,
+    )
+        .into_response()
+}
+
+/// POST /v1/diffusion/t2i — Stable Diffusion text-to-image generation.
+///
+/// Body: `{"prompt": "...", "negative_prompt": "...", "width": 512, "height": 512,
+///  "steps": 20, "guidance_scale": 7.5, "seed": -1}`. Returns
+/// `{"image_b64": "<base64 PNG>", "seed": N}`. 404 when diffusion is not
+/// enabled on this node.
+async fn diffusion_t2i_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let auth = match state.classify(&headers) {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = state.check_rate_limit(&auth) {
+        return e.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": {"message": "invalid JSON body"}}).to_string(),
+            )
+                .into_response();
+        }
+    };
+    let prompt = payload
+        .get("prompt")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim())
+        .unwrap_or_default();
+    if prompt.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "prompt is required"}}).to_string(),
+        )
+            .into_response();
+    }
+    if !state.diffusion.enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": {"message": "Diffusion is not enabled on this node"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+    let Some(base) = state.diffusion.base_url() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let forwarded = serde_json::json!({
+        "prompt": prompt,
+        "negative_prompt": payload.get("negative_prompt").and_then(|v| v.as_str()).unwrap_or(""),
+        "width": payload.get("width").and_then(|v| v.as_u64()).unwrap_or(512),
+        "height": payload.get("height").and_then(|v| v.as_u64()).unwrap_or(512),
+        "steps": payload.get("steps").and_then(|v| v.as_u64()).unwrap_or(20),
+        "guidance_scale": payload.get("guidance_scale").and_then(|v| v.as_f64()).unwrap_or(7.5),
+        "seed": payload.get("seed").and_then(|v| v.as_i64()).unwrap_or(-1),
+    });
+    let request = match state
+        .client
+        .post(format!("{base}/v1/diffusion/t2i"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(forwarded.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "M22 Diffusion backend unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "Diffusion backend unreachable"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let status = request.status();
+    let text = match request.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "M22 Diffusion backend read failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    (
+        status,
         [(header::CONTENT_TYPE, "application/json")],
         text,
     )

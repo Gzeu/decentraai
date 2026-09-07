@@ -6,8 +6,8 @@ use decentraai_identity::Identity;
 use decentraai_registry::ModelRegistry;
 use decentraai_runtime::settlement_tx;
 use decentraai_runtime::tools::{
-    HfSkillsManager, HfSkillsServer, OcrManager, OcrServer, SttManager, SttServer,
-    TransformersManager, TransformersServer,
+    DiffusionManager, DiffusionServer, HfSkillsManager, HfSkillsServer, OcrManager, OcrServer,
+    SttManager, SttServer, TransformersManager, TransformersServer,
 };
 use decentraai_system_probe::{AdmissionDecision, GpuProbeStatus, SystemSnapshot, probe_gpu};
 use std::fs;
@@ -1465,6 +1465,7 @@ async fn spawn_tool_runtimes(
     Option<SttManager>,
     Option<HfSkillsManager>,
     Option<TransformersManager>,
+    Option<DiffusionManager>,
 ) {
     let mut ocr = None;
     if let Some(cfg) = config.ocr.clone() {
@@ -1534,7 +1535,26 @@ async fn spawn_tool_runtimes(
             }
         }
     }
-    (ocr, stt, skills, tx)
+    // M22: Diffusion (Stable Diffusion text-to-image via diffusers).
+    let mut diffusion = None;
+    if let Some(diff_cfg) = config.diffusion.clone() {
+        if diff_cfg.enabled {
+            match DiffusionServer::spawn(data_dir, &diff_cfg.model).await {
+                Ok(server) => {
+                    info!(
+                        model = %diff_cfg.model,
+                        "M22 Diffusion online (Stable Diffusion subprocess)"
+                    );
+                    diffusion = Some(DiffusionManager::new(Some(server)));
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "M22 Diffusion unavailable (run scripts/setup-diffusion.sh)"
+                ),
+            }
+        }
+    }
+    (ocr, stt, skills, tx, diffusion)
 }
 
 async fn node_start(args: NodeArgs) -> Result<()> {
@@ -2124,6 +2144,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let mut ocr_manager: Option<OcrManager> = None;
     let mut stt_manager: Option<SttManager> = None;
     let mut skills_manager: Option<HfSkillsManager> = None;
+    let mut diffusion_manager: Option<DiffusionManager> = None;
     // DecentraAI Benchmark Lab: populated when an inference executor exists
     // (worker with a servable model). The lab runs single/RAG/collective
     // tasks through the real executor and feeds evidence.
@@ -2135,10 +2156,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // executors so the real tool bindings (name + description + loopback
         // URL) can be attached to the executor. Missing setups fail graceful —
         // the node runs without the tool and logs a warning.
-        let (ocr_new, stt_new, skills_new, tx_new) = spawn_tool_runtimes(&config, &data_dir).await;
+        let (ocr_new, stt_new, skills_new, tx_new, diffusion_new) = spawn_tool_runtimes(&config, &data_dir).await;
         ocr_manager = ocr_new;
         stt_manager = stt_new;
         skills_manager = skills_new;
+        diffusion_manager = diffusion_new;
         // Don't overwrite transformers_manager if the early path (engine=transformers) already set it.
         if tx_new.is_some() && transformers_manager.is_none() {
             transformers_manager = tx_new;
@@ -3134,6 +3156,11 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // for OpenAI-compatible inference backend).
         if let Some(manager) = transformers_manager {
             state.attach_transformers(Arc::new(manager));
+        }
+        // M22: Diffusion: attach the manager spawned earlier (Python subprocess
+        // for Stable Diffusion text-to-image).
+        if let Some(manager) = diffusion_manager {
+            state.attach_diffusion(Arc::new(manager));
         }
         // P1: the AGENTS dashboard view reads the node's agent manager.
         state.attach_agents(agent_manager.clone());
