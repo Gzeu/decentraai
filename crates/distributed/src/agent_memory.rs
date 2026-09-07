@@ -33,7 +33,8 @@ use decentraai_agents::training_export::{TrainingCandidate, training_candidates}
 use decentraai_hub::capability::Provenance;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 /// Errors from the persistent memory store. All recoverable and explainable.
@@ -77,6 +78,11 @@ impl From<rusqlite::Error> for MemoryStoreError {
 /// task.
 pub struct MemoryStore {
     conn: Mutex<Connection>,
+    /// Set to `true` by `write_checked` when an entry is written to an
+    /// eligible scope (public + allow_remote_write + network/fabric/system).
+    /// The periodic propagation loop reads and clears this flag to trigger
+    /// immediate sync after a write, instead of waiting for the next interval.
+    write_trigger: Arc<AtomicBool>,
 }
 
 const CREATE_SCHEMA: &str = "
@@ -378,7 +384,14 @@ impl MemoryStore {
         conn.execute_batch(CREATE_INDEX)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            write_trigger: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Returns a clone of the write-trigger flag. The propagation loop
+    /// polls this flag; when `true`, it propagates immediately and clears it.
+    pub fn write_trigger_flag(&self) -> Arc<AtomicBool> {
+        self.write_trigger.clone()
     }
 
     /// Registers a scope. Fails with [`MemoryStoreError::DuplicateScope`] if
@@ -641,6 +654,11 @@ impl MemoryStore {
         )?;
         enforce_max_entries(&tx, &scope.policy, scope_name, now, 0)?;
         tx.commit()?;
+        // On-write trigger: if this scope is eligible for propagation,
+        // signal the periodic loop to run immediately.
+        if crate::memory_propagator::scope_is_eligible(&scope) {
+            self.write_trigger.store(true, Ordering::Relaxed);
+        }
         if competitors.is_empty() {
             Ok(WriteOutcome::Stored)
         } else {

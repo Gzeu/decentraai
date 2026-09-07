@@ -220,6 +220,40 @@ pub struct Assignment {
     pub updated_at_ms: u64,
 }
 
+/// Per-replica state within a multi-replica stage assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaAssignment {
+    pub plan_id: String,
+    pub stage_id: String,
+    pub replica: u32,
+    pub executor: String,
+    pub state: AssignmentState,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Collected output from a replica for consensus voting.
+#[derive(Debug, Clone)]
+pub struct ReplicaResult {
+    pub plan_id: String,
+    pub stage_id: String,
+    pub replica: u32,
+    pub executor: String,
+    pub output: serde_json::Value,
+    pub confidence: f32,
+    pub submitted_at_ms: u64,
+}
+
+/// Consensus outcome for a multi-replica stage.
+#[derive(Debug, Clone)]
+pub struct ConsensusOutcome {
+    pub plan_id: String,
+    pub stage_id: String,
+    pub verdict: crate::verification::VerificationVerdict,
+    pub outputs: Vec<ReplicaResult>,
+    pub resolved_at_ms: u64,
+}
+
 /// Assignment store errors (no oracle detail leaves the module).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignmentError {
@@ -238,6 +272,12 @@ type Key = (String, String);
 pub struct AssignmentStore {
     plans: HashMap<String, Vec<Key>>,
     items: HashMap<Key, Assignment>,
+    /// Per-replica state machine: `{(plan_id, stage_id): Vec<ReplicaAssignment>}`.
+    replica_items: HashMap<(String, String), Vec<ReplicaAssignment>>,
+    /// Submitted replica outputs keyed by `{(plan_id, stage_id)}`.
+    replica_results: HashMap<(String, String), Vec<ReplicaResult>>,
+    /// Resolved consensus outcomes keyed by `{(plan_id, stage_id)}`.
+    consensus_outcomes: HashMap<(String, String), ConsensusOutcome>,
 }
 
 impl AssignmentStore {
@@ -446,6 +486,174 @@ impl AssignmentStore {
             .get(plan_id)
             .map(|keys| keys.iter().filter_map(|k| self.items.get(k)).collect())
             .unwrap_or_default()
+    }
+
+    // -------------------------------------------------------------------------
+    // N-of-M replica management
+    // -------------------------------------------------------------------------
+
+    /// Initialize per-replica assignments for a multi-replica stage.
+    /// Called once during propose when `replicas > 1`.
+    pub fn init_replicas(
+        &mut self,
+        plan_id: &str,
+        stage_id: &str,
+        replica_count: u32,
+        executors: &[String],
+        now_ms: u64,
+    ) -> Result<(), AssignmentError> {
+        if replica_count == 0 || replica_count as usize > executors.len() {
+            return Err(AssignmentError::Malformed);
+        }
+        let key = (plan_id.to_string(), stage_id.to_string());
+        if self.replica_items.contains_key(&key) {
+            return Err(AssignmentError::BadTransition); // already initialized
+        }
+        let replicas: Vec<ReplicaAssignment> = (0..replica_count)
+            .map(|r| ReplicaAssignment {
+                plan_id: plan_id.to_string(),
+                stage_id: stage_id.to_string(),
+                replica: r,
+                executor: executors[r as usize].clone(),
+                state: AssignmentState::Assigned {
+                    executor: executors[r as usize].clone(),
+                },
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            })
+            .collect();
+        self.replica_items.insert(key, replicas);
+        Ok(())
+    }
+
+    /// Transition one replica from Assigned → Claimed.
+    pub fn claim_replica(
+        &mut self,
+        plan_id: &str,
+        stage_id: &str,
+        replica: u32,
+        executor: &str,
+        now_ms: u64,
+    ) -> Result<(), AssignmentError> {
+        let key = (plan_id.to_string(), stage_id.to_string());
+        let replicas = self
+            .replica_items
+            .get_mut(&key)
+            .ok_or(AssignmentError::Unknown)?;
+        let r = replicas
+            .get_mut(replica as usize)
+            .ok_or(AssignmentError::Unknown)?;
+        match &r.state {
+            AssignmentState::Assigned { executor: e } if e == executor => {
+                r.state = AssignmentState::Claimed {
+                    executor: executor.to_string(),
+                    claimed_at_ms: now_ms,
+                };
+                r.updated_at_ms = now_ms;
+                Ok(())
+            }
+            _ => Err(AssignmentError::BadTransition),
+        }
+    }
+
+    /// Submit a replica's output → Claimed → Settled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_replica(
+        &mut self,
+        plan_id: &str,
+        stage_id: &str,
+        replica: u32,
+        executor: &str,
+        output: serde_json::Value,
+        confidence: f32,
+        now_ms: u64,
+    ) -> Result<(), AssignmentError> {
+        let key = (plan_id.to_string(), stage_id.to_string());
+        let replicas = self
+            .replica_items
+            .get_mut(&key)
+            .ok_or(AssignmentError::Unknown)?;
+        let r = replicas
+            .get_mut(replica as usize)
+            .ok_or(AssignmentError::Unknown)?;
+        match &r.state {
+            AssignmentState::Claimed { executor: e, .. } if e == executor => {
+                r.state = AssignmentState::Settled {
+                    executor: executor.to_string(),
+                };
+                r.updated_at_ms = now_ms;
+
+                let result = ReplicaResult {
+                    plan_id: plan_id.to_string(),
+                    stage_id: stage_id.to_string(),
+                    replica,
+                    executor: executor.to_string(),
+                    output,
+                    confidence,
+                    submitted_at_ms: now_ms,
+                };
+                self.replica_results
+                    .entry(key)
+                    .or_default()
+                    .push(result);
+                Ok(())
+            }
+            _ => Err(AssignmentError::BadTransition),
+        }
+    }
+
+    /// Try to resolve consensus for a multi-replica stage once all replicas
+    /// have submitted (or enough for quorum). Returns the outcome if resolved.
+    pub fn try_consensus(
+        &mut self,
+        plan_id: &str,
+        stage_id: &str,
+        required_agents: u32,
+        agreement_threshold: f32,
+        now_ms: u64,
+    ) -> Option<ConsensusOutcome> {
+        let key = (plan_id.to_string(), stage_id.to_string());
+        // Already resolved?
+        if self.consensus_outcomes.contains_key(&key) {
+            return self.consensus_outcomes.get(&key).cloned();
+        }
+        // Need enough results to form a quorum.
+        let results = self.replica_results.get(&key)?;
+        if (results.len() as u32) < required_agents {
+            return None;
+        }
+
+        let outputs: Vec<ReplicaOutput> = results
+            .iter()
+            .map(|r| ReplicaOutput {
+                agent_id: r.executor.clone(),
+                value: r.output.clone(),
+                confidence: r.confidence,
+            })
+            .collect();
+        let verdict = consensus_verdict(&outputs, required_agents, agreement_threshold);
+        let outcome = ConsensusOutcome {
+            plan_id: plan_id.to_string(),
+            stage_id: stage_id.to_string(),
+            verdict,
+            outputs: results.clone(),
+            resolved_at_ms: now_ms,
+        };
+        self.consensus_outcomes.insert(key.clone(), outcome.clone());
+        self.consensus_outcomes.get(&key).cloned()
+    }
+
+    /// Read-only accessors for status reporting.
+    pub fn replicas(&self, plan_id: &str, stage_id: &str) -> Vec<&ReplicaAssignment> {
+        self.replica_items
+            .get(&(plan_id.to_string(), stage_id.to_string()))
+            .map(|v| v.iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn consensus(&self, plan_id: &str, stage_id: &str) -> Option<&ConsensusOutcome> {
+        self.consensus_outcomes
+            .get(&(plan_id.to_string(), stage_id.to_string()))
     }
 }
 
@@ -991,5 +1199,127 @@ mod nofm_tests {
             contribution_balance: 0,
             last_seen_ms: seen,
         }
+    }
+
+    #[test]
+    fn replica_lifecycle_init_claim_submit_consensus() {
+        let mut store = AssignmentStore::new();
+        let now = 1000;
+
+        // Propose a 2-replica stage.
+        store
+            .propose_with_replicas("p1", "s1", "chat", 10, "requester", 2, now)
+            .unwrap();
+
+        // Initialize replicas.
+        let executors = vec!["prov-a".into(), "prov-b".into()];
+        store.init_replicas("p1", "s1", 2, &executors, now).unwrap();
+
+        // Verify replicas are in Assigned state.
+        let reps = store.replicas("p1", "s1");
+        assert_eq!(reps.len(), 2);
+        assert!(matches!(reps[0].state, AssignmentState::Assigned { .. }));
+        assert!(matches!(reps[1].state, AssignmentState::Assigned { .. }));
+
+        // Claim replica 0.
+        store.claim_replica("p1", "s1", 0, "prov-a", now + 100).unwrap();
+        let reps = store.replicas("p1", "s1");
+        assert!(matches!(reps[0].state, AssignmentState::Claimed { .. }));
+
+        // Claim wrong executor fails.
+        assert_eq!(
+            store.claim_replica("p1", "s1", 0, "prov-wrong", now + 100),
+            Err(AssignmentError::BadTransition)
+        );
+
+        // Submit replica 0 output.
+        store
+            .submit_replica("p1", "s1", 0, "prov-a", serde_json::json!("answer-42"), 0.9, now + 200)
+            .unwrap();
+
+        // Claim + submit replica 1 with same output.
+        store.claim_replica("p1", "s1", 1, "prov-b", now + 150).unwrap();
+        store
+            .submit_replica("p1", "s1", 1, "prov-b", serde_json::json!("answer-42"), 0.8, now + 250)
+            .unwrap();
+
+        // Consensus should be resolved now (2 of 2 submitted).
+        let outcome = store.try_consensus("p1", "s1", 2, 0.5, now + 300);
+        assert!(outcome.is_some(), "consensus should resolve");
+        let c = outcome.unwrap();
+        assert!(matches!(
+            c.verdict,
+            crate::verification::VerificationVerdict::Verified
+        ));
+        assert_eq!(c.outputs.len(), 2);
+
+        // Re-querying returns cached outcome.
+        let c2 = store.try_consensus("p1", "s1", 2, 0.5, now + 400).unwrap();
+        assert_eq!(c.resolved_at_ms, c2.resolved_at_ms);
+    }
+
+    #[test]
+    fn replica_disagreement_rejected() {
+        let mut store = AssignmentStore::new();
+        let now = 1000;
+
+        // 3 replicas, 2 different outputs, 1 agrees with candidate.
+        store
+            .propose_with_replicas("p1", "s1", "chat", 10, "requester", 3, now)
+            .unwrap();
+        let executors = vec!["prov-a".into(), "prov-b".into(), "prov-c".into()];
+        store.init_replicas("p1", "s1", 3, &executors, now).unwrap();
+
+        // prov-a and prov-b say "yes", prov-c says "no" — but use threshold 0.8
+        // so 2/3 = 0.667 < 0.8 → rejected.
+        store.claim_replica("p1", "s1", 0, "prov-a", now + 100).unwrap();
+        store
+            .submit_replica("p1", "s1", 0, "prov-a", serde_json::json!("yes"), 0.9, now + 200)
+            .unwrap();
+        store.claim_replica("p1", "s1", 1, "prov-b", now + 150).unwrap();
+        store
+            .submit_replica("p1", "s1", 1, "prov-b", serde_json::json!("yes"), 0.9, now + 250)
+            .unwrap();
+        store.claim_replica("p1", "s1", 2, "prov-c", now + 170).unwrap();
+        store
+            .submit_replica("p1", "s1", 2, "prov-c", serde_json::json!("no"), 0.9, now + 270)
+            .unwrap();
+
+        // With threshold 0.8, 2/3 = 0.667 is below threshold → Rejected.
+        let outcome = store.try_consensus("p1", "s1", 3, 0.8, now + 300).unwrap();
+        assert!(matches!(
+            outcome.verdict,
+            crate::verification::VerificationVerdict::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn replica_uninitialized_errors() {
+        let mut store = AssignmentStore::new();
+        let now = 1000;
+        store
+            .propose_with_replicas("p1", "s1", "chat", 10, "requester", 2, now)
+            .unwrap();
+        // No init_replicas → claim should fail.
+        assert_eq!(
+            store.claim_replica("p1", "s1", 0, "prov-a", now),
+            Err(AssignmentError::Unknown)
+        );
+    }
+
+    #[test]
+    fn init_replicas_rejects_duplicate() {
+        let mut store = AssignmentStore::new();
+        let now = 1000;
+        store
+            .propose_with_replicas("p1", "s1", "chat", 10, "requester", 2, now)
+            .unwrap();
+        let executors = vec!["prov-a".into(), "prov-b".into()];
+        store.init_replicas("p1", "s1", 2, &executors, now).unwrap();
+        // Double init → error.
+        assert_eq!(
+            store.init_replicas("p1", "s1", 2, &executors, now),
+            Err(AssignmentError::BadTransition)
+        );
     }
 }

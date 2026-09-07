@@ -484,16 +484,16 @@ open      invite    join
 
 | Area | Purpose |
 |---|---|
-| `crates/agents` | Agent OS, Governor logic, workflows and orchestration |
+| `crates/agents` | Agent OS, Governor logic, workflows and orchestration, N-of-M replica consensus |
 | `crates/agent-runtime` | AgentRuntime, SAES goals/learning/pressure/placement/gateway |
 | `crates/agent-hub` | Agent tasks, bids, proposals, teams and settlement |
 | `crates/agent-society` | Social state, trust, reputation and society rules |
 | `crates/agent-personal-memory` | Per-agent persistent Markdown/Obsidian-compatible memory |
-| `crates/distributed` | P2P bindings, CPU Pool and distributed execution primitives |
+| `crates/distributed` | P2P bindings, CPU Pool, distributed execution, knowledge/evidence wiring |
 | `crates/fabric` | deterministic planning, reservations and placement |
-| `crates/p2p` | libp2p transport and peer connectivity |
+| `crates/p2p` | libp2p transport, peer connectivity, known-addresses persistence, partition detection, adaptive reconnect |
 | `crates/compute` | compute/resource abstractions and pressure/assist primitives |
-| `crates/runtime` | node daemon, APIs, World/Hub integration and model runtime |
+| `crates/runtime` | node daemon, APIs, World/Hub integration, model runtime, memory bridge, MCP (45+ tools) |
 | `crates/node-cli` | CLI and node startup / serving lifecycle |
 | `crates/decentraai-economy` | contribution, rewards and settlement primitives |
 | `crates/audit` | evidence and audit infrastructure |

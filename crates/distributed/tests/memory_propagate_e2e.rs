@@ -284,3 +284,116 @@ async fn propagation_cycle_moves_only_travel_worthy_knowledge() -> Result<()> {
 
     Ok(())
 }
+
+/// E2E: bridge-synced entries (personal→collective via memory_bridge) travel
+/// to a remote peer. The sender uses `bridge_sync=true` so the bridge scope
+/// is Network-level and mirrored entries are Verified (travel-worthy). The
+/// receiver accepts them into its own store.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_synced_entries_travel_to_remote_peer() -> Result<()> {
+    let scope_name = "agent.lessons";
+
+    // Receiver: register the same scope (Network-level, public, remote-write).
+    let receiver_store = Arc::new(MemoryStore::open(Path::new(":memory:")).unwrap());
+    let receiver_scope = {
+        let policy = MemoryPolicy::default().public().with_remote_write();
+        MemoryScope::new(scope_name, "governor", MemoryLevel::Network).with_policy(policy)
+    };
+    receiver_store.register_scope(&receiver_scope).unwrap();
+
+    let receiver = P2PNode::new_with_network(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+        decentraai_p2p::NetworkConfig {
+            lan_discovery: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let addr = receiver.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+    {
+        let mut rx = receiver.clone();
+        rx.set_on_memory_sync(receiver_handler(receiver_store.clone()));
+        drop(rx);
+    }
+
+    // Sender: set up bridge scope (Network-level, propagation-eligible).
+    let sender_store = Arc::new(MemoryStore::open(Path::new(":memory:")).unwrap());
+    let bridge_scope = {
+        let policy = MemoryPolicy::default().public().with_remote_write();
+        MemoryScope::new(scope_name, "governor", MemoryLevel::Network).with_policy(policy)
+    };
+    sender_store.register_scope(&bridge_scope).unwrap();
+
+    // Simulate a bridge mirror_write: Verified entry (travel-worthy).
+    let mut bridged = MemoryEntry::new(
+        "bridge:agent-1:lessons:1000",
+        scope_name,
+        "agent-1",
+        "local",
+        "always check the return value",
+    );
+    bridged.created_at_ms = 1000;
+    bridged.meta.status = MemoryStatus::Verified;
+    bridged.meta.kind = decentraai_agents::memory::KnowledgeKind::Learning;
+    bridged.tags = vec!["bridge:personal".to_string(), "kind:lesson".to_string()];
+    sender_store
+        .write_checked(scope_name, &bridged, "agent-1", false, false, false)
+        .unwrap();
+
+    let sender = P2PNode::new_with_network(
+        &Identity::generate(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+        decentraai_p2p::NetworkConfig {
+            lan_discovery: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    sender
+        .dial(&format!("{addr}/p2p/{}", receiver.local_peer_id()))
+        .await
+        .unwrap();
+
+    let cfg = PropagationConfig::default();
+
+    // Wait for propagation.
+    let mut report = PropagationReport::default();
+    for _round in 0..25 {
+        report = propagate_once(
+            &sender_store,
+            &sender,
+            &sender.local_peer_id().to_string(),
+            &cfg,
+        )
+        .await;
+        let have = receiver_store
+            .read(scope_name, "governor", false)
+            .unwrap()
+            .len();
+        if have >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    assert!(
+        report.entries_offered >= 1,
+        "bridge-synced Verified entry should be offered"
+    );
+    assert!(report.peers_targeted >= 1);
+
+    // Receiver: the entry arrived and was downgraded to Candidate (standard
+    // import behavior — trust is local, never from the wire).
+    let seen = receiver_store.read(scope_name, "governor", false).unwrap();
+    assert_eq!(seen.len(), 1, "bridge entry traveled to receiver");
+    assert_eq!(seen[0].meta.status, MemoryStatus::Candidate);
+    assert!(seen[0].content.contains("always check the return value"));
+    assert_eq!(seen[0].author_agent, "agent-1");
+
+    Ok(())
+}

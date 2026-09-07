@@ -41,12 +41,14 @@ process, never FFI).
 |---|---|
 | `milestone/fabric-intelligence` | reasoning layer over the planner; intel PROPOSES validated structured plans (`POST /v1/intel/plan`) |
 | `milestone/sharing-is-caring` | DFCP v1 negotiation + Compute Assist verified LIVE on 3 nodes; contribution credit only on verified success |
+| `milestone/m15-autonomous-pressure` | Self-triggered distributed assist, auto-release, budget-capped economic children |
+| `milestone/m16-agent-gateway` | BYOA: `dga_` scoped credentials, hash-only store, fail-closed pipeline, live read-only proof |
+| `milestone/m17-collective-orchestration` | Pure selection/settlement core, MCP propose/status via M16 pipeline, N-of-M replica consensus |
+| `milestone/m18-trust-economy` | Agent-to-agent contracts, escrow, trust anchors, first live autonomous economic cycles |
+| `milestone/post-m17` | Collective memory sync, personal↔collective bridge, conflict resolution, P2P durability, adaptive reconnect, partition detection |
+| `milestone/m19-memory-bridge` | Memory Bridge Durability: bridge_sync config, propagation-eligible scopes, Verified auto-promote, E2E cross-node sync |
 
-Forward roadmap (agreed): **M15** Autonomous Pressure Trigger +
-PlacementEngine fairness · **M16** Agent Gateway (BYOA: scoped credentials
-+ MCP execution tools) · **M17** Capability Sharing / Collective
-Orchestration · then collective memory, adaptive execution, model
-parallelism. Full historical detail: `docs/ROADMAP_HISTORY.md`.
+Forward roadmap (agreed): **M15** Autonomous Pressure Trigger + PlacementEngine fairness · **M16** Agent Gateway (BYOA: scoped credentials + MCP execution tools) · **M17** Capability Sharing / Collective Orchestration — **ALL COMPLETE**. Next: **M19** Memory Bridge durability (multi-node), **M20** Agent World persistence, **M21** Tensor parallelism. Full historical detail: `docs/ROADMAP_HISTORY.md`.
 
 ### The agent organization
 
@@ -91,7 +93,8 @@ concierge). Rule of thumb:
   kill-on-drop, auto-respawn), admission gate, `api.rs` (axum proxy + Bearer
   auth + dashboard; the dashboard NEVER polls the proxy — only `/status` and
   `/v1/peers`), tool runtimes (OCR/STT/TTS/skills sidecars),
-  `intel_assist.rs` (Sharing is Caring worker/requester), read-only MCP
+  `intel_assist.rs` (Sharing is Caring worker/requester), `memory_bridge.rs`
+  (personal↔collective memory bridge with scope mapping), read-only MCP
   server at `/mcp` (consumer keys get decide+execute; operator/master get
   control-plane tools).
 - `crates/hub` — the ONE capability taxonomy (`CapabilityKind`, 26 kinds,

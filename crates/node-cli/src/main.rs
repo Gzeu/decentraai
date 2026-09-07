@@ -2070,6 +2070,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             relay_enabled: config.network.relay_enabled,
             bootstrap_peers: config.network.bootstrap_peers.clone(),
             max_connections: config.network.max_connections,
+            data_dir: Some(data_dir.clone()),
         },
     )?;
     let bound = p2p_node.listen("/ip4/0.0.0.0/tcp/32937").await?;
@@ -3026,26 +3027,43 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 let _ = p2p_mut;
             }
         }
-        // M19 auto-propagation (OPT-IN via env DECENTRAAI_MEMORY_PROPAGATE=1):
+        // M19 auto-propagation (config: memory_sync.enabled):
         // verified/trusted entries in eligible scopes (public + remote-write +
         // network/fabric/system level) are offered to connected peers every
         // cycle. Deterministic: id-ascending peers, newest-first batches,
         // bounded counts; receivers keep their own gates and downgrade
         // imports to candidate. Off by default — sharing is always a choice.
-        if std::env::var("DECENTRAAI_MEMORY_PROPAGATE").as_deref() == Ok("1") {
+        // Legacy env vars DECENTRAAI_MEMORY_PROPAGATE/SECS still honored as
+        // fallback when memory_sync section is absent.
+        let mem_sync_enabled = config
+            .memory_sync
+            .as_ref()
+            .map(|ms| ms.enabled)
+            .unwrap_or_else(|| std::env::var("DECENTRAAI_MEMORY_PROPAGATE").as_deref() == Ok("1"));
+        if mem_sync_enabled {
             if let Some(store) = agent_memory_store.clone() {
+                let mem_sync_cfg = config.memory_sync.as_ref().cloned().unwrap_or_default();
                 let interval_secs = std::env::var("DECENTRAAI_MEMORY_PROPAGATE_SECS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(60)
+                    .unwrap_or(mem_sync_cfg.interval_secs)
                     .max(10);
                 let p2p_for_prop = distributed.p2p_node().clone();
                 let local = local_peer_id.to_string();
+                let on_write = mem_sync_cfg.on_write;
+                let propagate_flag = store.write_trigger_flag();
                 tokio::spawn(async move {
-                    let cfg =
-                        decentraai_distributed::memory_propagator::PropagationConfig::default();
+                    let cfg = decentraai_distributed::memory_propagator::PropagationConfig {
+                        max_peers: mem_sync_cfg.max_peers,
+                        ..Default::default()
+                    };
                     loop {
-                        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                        // On-write trigger: if a write set the flag, propagate
+                        // immediately instead of waiting for the next interval.
+                        let immediate = on_write && propagate_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                        if !immediate {
+                            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                        }
                         match decentraai_distributed::memory_propagator::propagate_once(
                             &store,
                             &p2p_for_prop,
@@ -3063,6 +3081,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                                     duplicates = report.duplicates,
                                     declined_peers = report.declined_peers,
                                     errors = report.errors,
+                                    on_write = immediate,
                                     "memory propagation cycle"
                                 );
                             }
@@ -3141,6 +3160,21 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // Collective memory (SQLite) for the dashboard + workflow results.
         if let Some(store) = agent_memory_store.clone() {
             state.attach_memory(store);
+        }
+        // Memory bridge (M19): personal → collective scope mapping.
+        // When memory_sync.bridge_sync is enabled, bridged scopes are
+        // propagation-eligible and mirrored entries are auto-promoted
+        // to Verified for cross-node sync.
+        {
+            let bridge_sync = config
+                .memory_sync
+                .as_ref()
+                .map(|ms| ms.bridge_sync)
+                .unwrap_or(false);
+            let mapping = Arc::new(
+                decentraai_runtime::memory_bridge::BridgeMapping::default_mapping(),
+            );
+            state.attach_memory_bridge(mapping, bridge_sync);
         }
         // Model Colony registry (M-I): governance stages persist across
         // restarts; seeds the initial three candidates on first boot.
