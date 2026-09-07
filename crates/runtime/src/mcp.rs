@@ -760,7 +760,8 @@ pub fn all_tools() -> Vec<ToolDef> {
                             "properties": {
                                 "stage_id": { "type": "string", "maxLength": 128 },
                                 "capability": { "type": "string", "maxLength": 128, "description": "Hub taxonomy name the stage requires" },
-                                "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 }
+                                "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 },
+                                "replicas": { "type": "integer", "minimum": 1, "maximum": 3, "description": "N-of-M: number of distinct providers executing this stage (consensus over canonical outputs). Default 1 = M17 single execution." }
                             },
                             "required": ["stage_id", "capability", "max_price"],
                             "additionalProperties": false

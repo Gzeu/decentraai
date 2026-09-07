@@ -6589,17 +6589,38 @@ async fn orchestration_propose_resp(
             None => return forbidden("every stage needs capability (<=128 chars)"),
         };
         let max_price = st.get("max_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let replicas = match st.get("replicas").and_then(|v| v.as_u64()) {
+            Some(n) if (1..=3).contains(&n) => n as u32,
+            Some(_) => return forbidden("stage replicas must be between 1 and 3"),
+            None => 1,
+        };
 
         let req_orch = orch::StageRequirement {
             capability: capability.clone(),
             max_price,
         };
-        let assigned = orch::select_provider(&ads, &req_orch, now)
-            .ok()
-            .map(|ad| ad.agent_id.clone());
+        let selected: Vec<String> = if replicas <= 1 {
+            orch::select_provider(&ads, &req_orch, now)
+                .map(|a| vec![a.agent_id.clone()])
+                .unwrap_or_default()
+        } else {
+            match orch::select_providers(&ads, &req_orch, replicas, cap, now) {
+                Ok(v) => v.iter().map(|a| a.agent_id.clone()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let assigned = selected.first().cloned();
 
         if let Some(store) = store_lock.as_deref_mut() {
-            let _ = store.propose(&plan_id, &stage_id, &capability, max_price, key_id, now);
+            let _ = store.propose_with_replicas(
+                &plan_id,
+                &stage_id,
+                &capability,
+                max_price,
+                key_id,
+                replicas,
+                now,
+            );
             if assigned.is_some() {
                 let _ = store.assign(&plan_id, &stage_id, assigned.as_deref().unwrap_or(""), now);
             }
@@ -6608,7 +6629,9 @@ async fn orchestration_propose_resp(
             "stage_id": stage_id,
             "capability": capability,
             "max_price": max_price,
+            "replicas": replicas,
             "assigned_to": assigned,
+            "replica_providers": selected,
         }));
     }
 
@@ -6645,6 +6668,7 @@ fn orchestration_status_resp(state: &ApiState, plan_id: &str) -> Response {
                     "stage_id": a.stage_id,
                     "capability": a.capability,
                     "price": a.price,
+                    "replicas": a.replicas,
                     "state": format!("{:?}", a.state),
                 })
             })
@@ -22299,6 +22323,10 @@ mod tests {
     /// Issues a gateway credential directly in the store (no HTTP issuance
     /// exists by design) and returns its plaintext.
     fn make_gateway_key(dir: &Path, caps: &[&str], account: &str) -> String {
+        make_gateway_key_named(dir, "ext-agent", caps, account)
+    }
+
+    fn make_gateway_key_named(dir: &Path, name: &str, caps: &[&str], account: &str) -> String {
         let mut store =
             decentraai_tokens::GatewayKeyStore::load(&dir.join("db/gateway_keys.json")).unwrap();
         let now = std::time::SystemTime::now()
@@ -22307,7 +22335,7 @@ mod tests {
             .unwrap_or(0);
         store
             .create(
-                "ext-agent",
+                name,
                 caps.iter().map(|s| s.to_string()).collect(),
                 account,
                 100,
@@ -22955,6 +22983,84 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn m17_nofm_propose_multiple_replicas_assigned_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        // Two distinct external providers advertising chat
+        let _key_a = make_gateway_key_named(dir.path(), "provider-a", &["chat"], "acct-a");
+        let _key_b = make_gateway_key_named(dir.path(), "provider-b", &["chat"], "acct-b");
+
+        let key_req = make_gateway_key(dir.path(), &["orchestrate"], "gw-req");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key_req,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "orchestrate_propose",
+                    "arguments": {
+                        "stages": [
+                            {"stage_id": "s1", "capability": "chat", "max_price": 5, "replicas": 2}
+                        ],
+                        "total_price": 10,
+                        "budget_cap": 20
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let res: serde_json::Value = serde_json::from_str(text).unwrap();
+        let stage = &res["assignments"][0];
+        assert_eq!(stage["replicas"], 2);
+        let providers: Vec<String> = stage["replica_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(providers.len(), 2);
+        assert!(providers.contains(&"provider-a".to_string()));
+        assert!(providers.contains(&"provider-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn m17_nofm_propose_replicas_bound_exceeded_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key_req = make_gateway_key(dir.path(), &["orchestrate"], "gw-req");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key_req,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "orchestrate_propose",
+                    "arguments": {
+                        "stages": [
+                            {"stage_id": "s1", "capability": "chat", "max_price": 5, "replicas": 4}
+                        ],
+                        "total_price": 20,
+                        "budget_cap": 50
+                    }
+                }
+            }),
+        )
+        .await;
         assert_eq!(r.status(), 403);
     }
 

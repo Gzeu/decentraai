@@ -213,6 +213,7 @@ pub struct Assignment {
     pub stage_id: String,
     pub capability: String,
     pub price: u64,
+    pub replicas: u32,
     pub requester: String,
     pub state: AssignmentState,
     pub created_at_ms: u64,
@@ -262,8 +263,25 @@ impl AssignmentStore {
         requester: &str,
         now_ms: u64,
     ) -> Result<(), AssignmentError> {
+        self.propose_with_replicas(plan_id, stage_id, capability, price, requester, 1, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_with_replicas(
+        &mut self,
+        plan_id: &str,
+        stage_id: &str,
+        capability: &str,
+        price: u64,
+        requester: &str,
+        replicas: u32,
+        now_ms: u64,
+    ) -> Result<(), AssignmentError> {
         Self::check_ids(plan_id, stage_id)?;
         if !bounded(capability) || !bounded(requester) {
+            return Err(AssignmentError::Malformed);
+        }
+        if replicas == 0 || replicas > MAX_REPLICAS {
             return Err(AssignmentError::Malformed);
         }
         if price > MAX_STAGE_PRICE {
@@ -285,6 +303,7 @@ impl AssignmentStore {
                 stage_id: stage_id.to_string(),
                 capability: capability.to_string(),
                 price,
+                replicas,
                 requester: requester.to_string(),
                 state: AssignmentState::Proposed,
                 created_at_ms: now_ms,
@@ -659,7 +678,13 @@ pub fn canonical_json(v: &serde_json::Value) -> String {
             keys.sort();
             let inner: Vec<String> = keys
                 .iter()
-                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&map[k.as_str()])))
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical_json(&map[k.as_str()])
+                    )
+                })
                 .collect();
             format!("{{{}}}", inner.join(","))
         }
@@ -721,7 +746,10 @@ pub fn select_providers<'a>(
             .map_err(|_| ReplicaPlanError::InsufficientDistinctProviders)?;
         let pid = pick.agent_id.clone();
         // Safe: `pick` is a clone of an element of `ads`; re-borrow it.
-        let orig = ads.iter().find(|a| a.agent_id == pid).expect("clone source");
+        let orig = ads
+            .iter()
+            .find(|a| a.agent_id == pid)
+            .expect("clone source");
         out.push(orig);
         excluded.insert(orig.agent_id.as_str());
     }
@@ -759,9 +787,7 @@ pub fn consensus_verdict(
     let best = clusters
         .iter()
         .max_by(|a, b| {
-            a.1.len()
-                .cmp(&b.1.len())
-                .then_with(|| b.0.cmp(&a.0)) // smaller canonical wins ties
+            a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(&a.0)) // smaller canonical wins ties
         })
         .map(|(c, _)| c.clone());
 
@@ -822,7 +848,11 @@ mod nofm_tests {
     use crate::verification::VerificationVerdict;
 
     fn out(agent: &str, v: serde_json::Value, conf: f32) -> ReplicaOutput {
-        ReplicaOutput { agent_id: agent.to_string(), value: v, confidence: conf }
+        ReplicaOutput {
+            agent_id: agent.to_string(),
+            value: v,
+            confidence: conf,
+        }
     }
 
     #[test]
@@ -830,7 +860,10 @@ mod nofm_tests {
         let a = serde_json::json!({"b":1,"a":2});
         let b = serde_json::json!({"a":2,"b":1});
         assert_eq!(canonical_json(&a), canonical_json(&b));
-        assert_ne!(canonical_json(&a), canonical_json(&serde_json::json!({"a":2,"b":3})));
+        assert_ne!(
+            canonical_json(&a),
+            canonical_json(&serde_json::json!({"a":2,"b":3}))
+        );
     }
 
     #[test]
@@ -841,7 +874,10 @@ mod nofm_tests {
             out("b", serde_json::json!({"answer":"42"}), 0.8), // key order differs
             out("c", serde_json::json!({"answer": "43"}), 0.1),
         ];
-        assert_eq!(consensus_verdict(&outputs, 3, 0.5), VerificationVerdict::Verified);
+        assert_eq!(
+            consensus_verdict(&outputs, 3, 0.5),
+            VerificationVerdict::Verified
+        );
     }
 
     #[test]
@@ -873,7 +909,11 @@ mod nofm_tests {
         let mk = |first: &str| {
             vec![
                 out(first, serde_json::json!({"k":"x"}), 0.5),
-                out(if first == "a" { "c" } else { "a" }, serde_json::json!({"k":"y"}), 0.5),
+                out(
+                    if first == "a" { "c" } else { "a" },
+                    serde_json::json!({"k":"y"}),
+                    0.5,
+                ),
             ]
         };
         assert_eq!(
@@ -889,11 +929,20 @@ mod nofm_tests {
             ad_for("p2", 5.0, 1000),
             ad_for("p3", 5.0, 1000),
         ];
-        let req = StageRequirement { capability: "chat".into(), max_price: 10 };
+        let req = StageRequirement {
+            capability: "chat".into(),
+            max_price: 10,
+        };
         // 4 replicas > bound
-        assert_eq!(select_providers(&ads, &req, 4, 100, 1000), Err(ReplicaPlanError::ReplicaBound));
+        assert_eq!(
+            select_providers(&ads, &req, 4, 100, 1000),
+            Err(ReplicaPlanError::ReplicaBound)
+        );
         // 3 replicas × 10 > budget 25
-        assert_eq!(select_providers(&ads, &req, 3, 25, 1000), Err(ReplicaPlanError::BudgetExceeded));
+        assert_eq!(
+            select_providers(&ads, &req, 3, 25, 1000),
+            Err(ReplicaPlanError::BudgetExceeded)
+        );
         // 3 distinct available → ok, and all distinct
         let got = select_providers(&ads, &req, 3, 100, 1000).unwrap();
         let ids: std::collections::HashSet<_> = got.iter().map(|p| p.agent_id.clone()).collect();
@@ -910,9 +959,16 @@ mod nofm_tests {
     fn per_replica_settle_keys_are_namespaced_and_stable() {
         assert_eq!(reservation_id_replica("p", "s", 0), "m17res:p:s:r0");
         assert_eq!(credit_ref_replica("p", "s", 2), "m17cr:p:s:r2");
-        let m = VerifiedMeasures { tokens_used: Some(1), processing_ms: Some(1) };
+        let m = VerifiedMeasures {
+            tokens_used: Some(1),
+            processing_ms: Some(1),
+        };
         match decide_settle_replica("p", "s", 1, true, 5, m) {
-            SettleDecision::SettleAndCredit { reservation_id: r, credit_ref: c, .. } => {
+            SettleDecision::SettleAndCredit {
+                reservation_id: r,
+                credit_ref: c,
+                ..
+            } => {
                 assert_eq!(r, "m17res:p:s:r1");
                 assert_eq!(c, "m17cr:p:s:r1");
             }
@@ -920,7 +976,9 @@ mod nofm_tests {
         }
         assert_eq!(
             decide_settle_replica("p", "s", 1, false, 5, m),
-            SettleDecision::Release { reservation_id: "m17res:p:s:r1".into() }
+            SettleDecision::Release {
+                reservation_id: "m17res:p:s:r1".into()
+            }
         );
     }
 
