@@ -33,10 +33,10 @@ use tracing::{debug, info, warn};
 /// Max re-dial attempts for a peer that disconnected, before giving up and
 /// relying on mDNS re-discovery (a peer that left the network permanently
 /// must not be re-dialed forever). Each attempt backs off exponentially.
-pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+pub const RECONNECT_MAX_ATTEMPTS: u32 = 8;
 /// Max re-dial attempts for LAN peers (faster discovery, shorter backoff).
 pub const RECONNECT_MAX_ATTEMPTS_LAN: u32 = 3;
-/// Base backoff (ms) doubled on each reconnect attempt.
+/// Base backoff (ms) doubled on each reconnect attempt with jitter.
 pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
 /// Base backoff for LAN peers (ms) — shorter because LAN peers reconnect fast.
 pub const RECONNECT_BASE_BACKOFF_LAN_MS: u64 = 200;
@@ -997,8 +997,25 @@ impl P2PNode {
                                 let nth = *attempt;
                                 *attempt += 1;
                                 let base_ms = if lan { RECONNECT_BASE_BACKOFF_LAN_MS } else { RECONNECT_BASE_BACKOFF_MS };
+                                // Exponential backoff with ±25% jitter to
+                                // prevent thundering herd when multiple nodes
+                                // reconnect simultaneously. Uses the current
+                                // timestamp nanosecond as a simple entropy
+                                // source (no external deps needed).
+                                let exp_ms = base_ms << nth.min(10);
+                                let jitter_range = exp_ms / 4;
+                                let jitter = if jitter_range > 0 {
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.subsec_nanos() as u64)
+                                        .unwrap_or(0);
+                                    let span = jitter_range * 2 + 1;
+                                    (ts % span) as i64 - jitter_range as i64
+                                } else {
+                                    0
+                                };
                                 let backoff = Duration::from_millis(
-                                    base_ms << nth.min(10),
+                                    (exp_ms as i64 + jitter).max(0) as u64,
                                 );
                                 let sender = reconnect_sender.clone();
                                 tokio::spawn(async move {
