@@ -48,6 +48,7 @@ fn test_node(
             relay_enabled: false,
             bootstrap_peers: vec![],
             max_connections: 8,
+            data_dir: None,
         },
     )
 }
@@ -702,4 +703,65 @@ async fn orchestrator_runs_research_report_workflow_on_remote_agent() {
     drop(messenger_b);
     drop(node_a);
     drop(node_b);
+}
+
+/// Partition detection E2E: two nodes connect, then one is dropped.
+/// The surviving node should detect 0 connected peers.
+#[tokio::test]
+async fn partition_detection_e2e() {
+    let id_a = Identity::generate();
+    let id_b = Identity::generate();
+    let peer_b = libp2p_peer_id(&id_b);
+    let node_a = test_node(&id_a, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)
+        .unwrap();
+    let addr_a = node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    let node_b = test_node(&id_b, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)
+        .unwrap();
+    let _addr_b = node_b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
+
+    // B dials A.
+    node_b
+        .dial(&format!("{addr_a}/p2p/{}", node_a.local_peer_id()))
+        .await
+        .unwrap();
+
+    // Wait for connection to settle.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let snap = node_a.peers_snapshot().await;
+    assert!(
+        snap.connected.contains(&peer_b),
+        "B must be connected to A"
+    );
+    assert!(
+        !snap.partition_detected,
+        "no partition expected while connected"
+    );
+
+    // Drop node B — A should see the disconnect.
+    // Use shutdown to ensure the swarm task breaks and drops the swarm,
+    // which closes TCP connections and triggers a disconnect event on A.
+    node_b.shutdown();
+    // Wait for disconnect to propagate through the swarm event loop.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = node_a.peers_snapshot().await;
+        if !snap.connected.contains(&peer_b) {
+            break;
+        }
+    }
+
+    let snap = node_a.peers_snapshot().await;
+    assert!(
+        !snap.connected.contains(&peer_b),
+        "B must be disconnected after drop"
+    );
+    assert!(
+        snap.connected.is_empty(),
+        "A must have 0 connected peers after B is dropped"
+    );
+
+    // Clean up.
+    drop(node_a);
 }

@@ -104,6 +104,10 @@ pub struct McpContext {
     pub society_action: Value,
     /// Result of last personal memory operation via MCP.
     pub personal_memory_action: Value,
+    /// M19 Collective Memory: result of last scope/entry operation via MCP.
+    pub collective_memory_action: Value,
+    /// M19 Collective Memory: result of conflict resolution operation via MCP.
+    pub memory_conflict_action: Value,
     /// M18 Economic Layer: active contracts snapshot.
     pub m18_contracts: Value,
     /// M18 Economic Layer: escrow records snapshot.
@@ -760,7 +764,8 @@ pub fn all_tools() -> Vec<ToolDef> {
                             "properties": {
                                 "stage_id": { "type": "string", "maxLength": 128 },
                                 "capability": { "type": "string", "maxLength": 128, "description": "Hub taxonomy name the stage requires" },
-                                "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 }
+                                "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 },
+                                "replicas": { "type": "integer", "minimum": 1, "maximum": 3, "description": "N-of-M: number of distinct providers executing this stage (consensus over canonical outputs). Default 1 = M17 single execution." }
                             },
                             "required": ["stage_id", "capability", "max_price"],
                             "additionalProperties": false
@@ -863,6 +868,77 @@ pub fn all_tools() -> Vec<ToolDef> {
             description: "Discover all available capabilities/tools on this node and their required scopes. Essential for external agent onboarding — call this first to learn what you can do and what scopes to request.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         annotations: ToolAnnotations::read_only(),
+        },
+        // M19 — Collective Memory (cross-node shared knowledge)
+        ToolDef {
+            name: "memory_list_scopes",
+            description: "List all registered collective memory scopes on this node. Shows scope name, owner, level, access policy, and entry count. Use this to discover what shared knowledge is available.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "memory_read_entries",
+            description: "Read entries from a collective memory scope. Returns entries sorted newest-first. Access is gated by the scope's policy (read permission required).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "Scope name (e.g. 'team.knowledge', 'fabric.lessons')" },
+                    "reader_agent": { "type": "string", "description": "Agent ID requesting read access" },
+                    "limit": { "type": "integer", "description": "Max entries to return (default: 50, max: 200)", "minimum": 1, "maximum": 200 }
+                },
+                "required": ["scope", "reader_agent"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "memory_write_entry",
+            description: "Write a new entry to a collective memory scope. Access is gated by the scope's policy (write permission required). Entries with duplicate content are rejected. Competing claims about the same subject are linked, never overwritten.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "Target scope name" },
+                    "entry_id": { "type": "string", "description": "Stable entry id (unique within scope)", "maxLength": 128 },
+                    "content": { "type": "string", "description": "Knowledge content (max 4096 chars)", "maxLength": 4096 },
+                    "author_agent": { "type": "string", "description": "Authoring agent ID" },
+                    "subject_key": { "type": "string", "description": "Optional subject key for conflict grouping", "maxLength": 256 },
+                    "kind": { "type": "string", "enum": ["observation", "learning", "decision", "execution"], "description": "Knowledge kind (default: observation)" }
+                },
+                "required": ["scope", "entry_id", "content", "author_agent"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::additive(),
+        },
+        // M19 — Collective Memory conflict resolution
+        ToolDef {
+            name: "memory_list_conflicts",
+            description: "List subjects with competing claims in a collective memory scope. Shows each subject's ranked claims (by status strength, confidence, timestamp). Use this to discover unresolved knowledge conflicts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "Scope name to scan for conflicts" },
+                    "reader_agent": { "type": "string", "description": "Agent ID requesting read access" },
+                    "limit": { "type": "integer", "description": "Max conflicting subjects to return (default: 20)", "minimum": 1, "maximum": 100 }
+                },
+                "required": ["scope", "reader_agent"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "memory_resolve_conflict",
+            description: "Resolve a conflict by marking losing claims as Obsolete. Shows the ranked claims first, then marks all non-winning active claims as Obsolete. The winning claim (highest status strength, then confidence, then oldest) is preserved. This is an irreversible lifecycle transition.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "Scope name" },
+                    "subject_key": { "type": "string", "description": "Subject key grouping the competing claims" },
+                    "resolver_agent": { "type": "string", "description": "Agent performing the resolution" }
+                },
+                "required": ["scope", "subject_key", "resolver_agent"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::destructive(),
         },
         // M18 — MultiversX Trust & Economic Layer
         ToolDef {
@@ -2177,6 +2253,111 @@ pub fn m18_tool_request(raw: &str) -> Option<(String, Value)> {
     Some((name.to_string(), args))
 }
 
+/// Extracts a `memory_list_scopes` tool call. Returns `Some(())` if matched.
+pub fn memory_list_scopes_request(raw: &str) -> Option<()> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "memory_list_scopes" {
+        return None;
+    }
+    Some(())
+}
+
+/// Extracts a `memory_read_entries` tool call. Returns (scope, reader_agent, limit).
+pub fn memory_read_entries_request(raw: &str) -> Option<(String, String, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "memory_read_entries" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let scope = args.get("scope").and_then(|v| v.as_str())?.to_string();
+    let reader_agent = args
+        .get("reader_agent")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .min(200) as usize;
+    Some((scope, reader_agent, limit))
+}
+
+/// Extracts a `memory_write_entry` tool call. Returns the arguments Value.
+pub fn memory_write_entry_request(raw: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "memory_write_entry" {
+        return None;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+}
+
+/// Extracts a `memory_list_conflicts` tool call. Returns (scope, reader_agent, limit).
+pub fn memory_list_conflicts_request(raw: &str) -> Option<(String, String, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "memory_list_conflicts" {
+        return None;
+    }
+    let args = msg.get("params")?.get("arguments")?;
+    let scope = args.get("scope")?.as_str()?.to_string();
+    let reader_agent = args.get("reader_agent")?.as_str()?.to_string();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(100) as usize;
+    Some((scope, reader_agent, limit))
+}
+
+/// Extracts a `memory_resolve_conflict` tool call. Returns (scope, subject_key, resolver_agent).
+pub fn memory_resolve_conflict_request(raw: &str) -> Option<(String, String, String)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "memory_resolve_conflict" {
+        return None;
+    }
+    let args = msg.get("params")?.get("arguments")?;
+    let scope = args.get("scope")?.as_str()?.to_string();
+    let subject_key = args.get("subject_key")?.as_str()?.to_string();
+    let resolver_agent = args.get("resolver_agent")?.as_str()?.to_string();
+    Some((scope, subject_key, resolver_agent))
+}
+
 /// Handles one JSON-RPC 2.0 MCP message and returns an optional response.
 /// Returns `None` for notifications (no `id`), which MCP clients do not await.
 pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
@@ -2302,6 +2483,13 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "agent_memory_snapshot" => &ctx.personal_memory_action,
         "agent_memory_export" => &ctx.personal_memory_action,
         "discover_capabilities" => &ctx.personal_memory_action,
+        // M19 — Collective Memory
+        "memory_list_scopes" => &ctx.collective_memory_action,
+        "memory_read_entries" => &ctx.collective_memory_action,
+        "memory_write_entry" => &ctx.collective_memory_action,
+        // M19 — Collective Memory conflict resolution
+        "memory_list_conflicts" => &ctx.memory_conflict_action,
+        "memory_resolve_conflict" => &ctx.memory_conflict_action,
         // M18 — Economic Layer
         "m18_list_contracts" => &ctx.m18_contracts,
         "m18_get_contract" => &ctx.m18_action,
@@ -2366,6 +2554,8 @@ mod tests {
             hub_action: json!({}),
             society_action: json!({}),
             personal_memory_action: json!({}),
+            collective_memory_action: json!({}),
+            memory_conflict_action: json!({}),
             m18_contracts: json!([]),
             m18_escrow: json!([]),
             m18_trust: json!([]),

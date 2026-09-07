@@ -24,6 +24,7 @@ pub mod intel_assist;
 pub mod job;
 pub mod m18;
 pub mod mcp;
+pub mod memory_bridge;
 pub mod providers_api;
 pub mod queue;
 pub mod research_trigger;

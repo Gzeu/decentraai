@@ -359,3 +359,92 @@ tick 30+, mission `task-0022`; trigger day-0 baseline saved
 (`experiments/trigger-baseline-2026-09-06.json`, 7-day report due
 2026-09-13).
 
+### Post-M17 — Collective Memory, N-of-M Consensus, P2P Durability (DONE 2026-09-07)
+
+All 13 planned items delivered in a single session. Workspace at ~2000+
+tests, 82 suites, clippy clean.
+
+#### Collective Memory — Sync, Bridge, Conflict Resolution
+
+- **Config-based sync gating:** `MemorySyncSection` in YAML config
+  (`memory_sync.enabled`, `interval_secs`, `on_write`, `max_peers`).
+  Legacy `DECENTRAAI_MEMORY_PROPAGATE=1` env fallback preserved.
+  `Arc<AtomicBool>` write-trigger flag for immediate propagation on
+  eligible writes.
+- **MCP tools:** `memory_list_scopes`, `memory_read_entries`,
+  `memory_write_entry` — consumer-key gated via `memory` scope. Added to
+  consumer permission check, dispatch chain, and `discover_capabilities`
+  scope mapping.
+- **E2E tests:** `mcp_collective_memory_list_write_read_flow` (full CRUD
+  flow: list → write → read → dup rejection → bad scope),
+  `memory_write_triggers_propagation_flag`.
+- **Bridge personal ↔ collective:** `memory_bridge.rs` module with
+  `BridgeMapping` (category → collective scope config), `mirror_write()`
+  (personal write → collective scope), `read_bridged()` (collective
+  entries → augmented snapshot), `ensure_bridged_scopes()` (startup).
+  Default mapping: lessons→`agent.lessons`, decisions→`agent.decisions`,
+  experiences→`agent.experiences`. Wired into consumer handler write path
+  (mirror after success) and read path (augment with `bridged_collective`).
+- **Conflict resolution MCP tools:** `memory_list_conflicts` (groups
+  entries by `subject_key`, ranks claims by status strength/confidence/
+  timestamp, read-only), `memory_resolve_conflict` (marks losing claims
+  as `Obsolete` via `transition_status`, destructive annotation). Both
+  gated by `memory` scope.
+
+#### N-of-M Consensus — Per-Replica State Machine
+
+- **Store extensions:** `ReplicaAssignment`, `ReplicaResult`,
+  `ConsensusOutcome` structs; `AssignmentStore` extended with
+  `replica_items`, `replica_results`, `consensus_outcomes` HashMaps.
+  Methods: `init_replicas()`, `claim_replica()`, `submit_replica()`,
+  `try_consensus()` (quorum-aware, cached), `replicas()`, `consensus()`.
+- **MCP wiring:** `orchestration_propose_resp` auto-calls
+  `init_replicas()` when `replicas > 1`; MCP `orchestrate_status` shows
+  `replica_details[]` + `consensus` object per stage.
+- **Tests:** 4 unit tests — `replica_lifecycle_init_claim_submit_consensus`,
+  `replica_disagreement_rejected`, `replica_uninitialized_errors`,
+  `init_replicas_rejects_duplicate`.
+
+#### P2P Durability — Persistence, Partition Detection, Adaptive Reconnect
+
+- **known_addresses persistence:** `load_known_addresses()` /
+  `save_known_addresses()` (JSON, atomic tmp+rename). `NetworkConfig.
+  data_dir: Option<PathBuf>`. Event loop loads at startup, saves on every
+  insert (mDNS, disconnect, Kademlia). node-cli wired with
+  `data_dir: Some(data_dir.clone())`.
+- **Transfer resume:** bitmap persistence at `staging/<manifest_id>.done`
+  (already existed).
+- **Partition detection:** `partition_detected_at: Option<Instant>` in
+  event loop. Set when 0 connected peers + all reconnect budgets exhausted.
+  Cleared on any new `ConnectionEstablished`. Exposed as
+  `partition_detected: bool` in `PeersSnapshot`. E2E test:
+  `partition_detection_e2e`.
+- **Adaptive reconnect (LAN vs WAN):** LAN detection via
+  `is_lan_address()` (private IPs, loopback, link-local). LAN:
+  `RECONNECT_MAX_ATTEMPTS_LAN=3`, `RECONNECT_BASE_BACKOFF_LAN_MS=200`.
+  WAN: `RECONNECT_MAX_ATTEMPTS=5`, `RECONNECT_BASE_BACKOFF_MS=500`. Unit
+  tests for `is_lan_address` and `known_addresses_roundtrip_persistence`.
+
+### M19 — Memory Bridge Durability (DONE 2026-09-07)
+
+Multi-node sync for personal→collective bridge entries.
+
+- **Config:** `bridge_sync: bool` in `MemorySyncSection` (default: false).
+  When enabled, bridge scopes are propagation-eligible and mirrored
+  entries are auto-promoted to Verified for cross-node sync.
+- **Scope creation:** `ensure_bridged_scopes` creates scopes with
+  `level=Network` + `allow_remote_write=true` when bridge_sync=true
+  (propagation-eligible); `level=Node` when false (local-only). Both
+  modes require `allow_remote_write=true` because the bridge writes as
+  the agent (not scope owner).
+- **Entry promotion:** `mirror_write` sets `MemoryStatus::Verified` on
+  mirrored entries when bridge_sync=true, making them travel-worthy for
+  the memory propagator.
+- **Node-cli wiring:** reads `config.memory_sync.bridge_sync`, creates
+  default bridge mapping, calls `state.attach_memory_bridge(mapping,
+  bridge_sync)`.
+- **Tests:** 7 unit tests (scope level, entry status), 1 E2E test
+  (`bridge_synced_entries_travel_to_remote_peer` — two real P2P nodes,
+  bridge entry propagates and lands as Candidate on receiver).
+- **Standing:** 82 suites, 0 failures, clippy clean.
+

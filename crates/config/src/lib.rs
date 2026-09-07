@@ -79,6 +79,12 @@ pub struct NodeConfig {
     /// instead of llama-server. Requires `<data_dir>/tools/transformers/venv`.
     #[serde(default)]
     pub transformers: Option<TransformersSection>,
+    /// Collective memory sync. Absent = disabled (propagation never runs).
+    /// When enabled, verified/trusted entries in eligible scopes travel to
+    /// connected peers periodically and optionally on-write. Replaces the
+    /// legacy `DECENTRAAI_MEMORY_PROPAGATE` env var.
+    #[serde(default)]
+    pub memory_sync: Option<MemorySyncSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1171,6 +1177,71 @@ impl DcaiSection {
     }
 }
 
+/// Collective memory sync configuration. Absent = sync disabled (same as
+/// the legacy `DECENTRAAI_MEMORY_PROPAGATE=1` env var, which this replaces).
+/// When enabled, verified/trusted entries in eligible scopes (public +
+/// allow_remote_write + network/fabric/system level) are propagated to
+/// connected peers automatically.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySyncSection {
+    /// Enable automatic memory propagation to connected peers.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Propagation interval in seconds (minimum 10, default 60).
+    #[serde(default = "default_memory_sync_interval_secs")]
+    pub interval_secs: u64,
+    /// Trigger propagation after a write to an eligible scope (on-write).
+    /// When false, only periodic propagation runs.
+    #[serde(default = "default_true")]
+    pub on_write: bool,
+    /// Maximum connected peers targeted per propagation cycle.
+    #[serde(default = "default_memory_sync_max_peers")]
+    pub max_peers: usize,
+    /// Bridge sync: when enabled, bridge scopes are created as
+    /// propagation-eligible (level=Network, allow_remote_write=true) and
+    /// mirrored entries are auto-promoted to Verified status so they travel
+    /// to peers. Disabled by default (bridge stays local-only).
+    #[serde(default)]
+    pub bridge_sync: bool,
+}
+
+fn default_memory_sync_interval_secs() -> u64 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_memory_sync_max_peers() -> usize {
+    4
+}
+
+impl MemorySyncSection {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.interval_secs < 10 {
+            return Err("memory_sync.interval_secs must be at least 10".into());
+        }
+        if self.max_peers == 0 {
+            return Err("memory_sync.max_peers must be at least 1".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for MemorySyncSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_memory_sync_interval_secs(),
+            on_write: default_true(),
+            max_peers: default_memory_sync_max_peers(),
+            bridge_sync: false,
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -1223,6 +1294,10 @@ impl NodeConfig {
         if let Some(dcai) = &self.dcai {
             dcai.validate()
                 .map_err(|e| ConfigError::Validation(format!("dcai: {e}")))?;
+        }
+        if let Some(ms) = &self.memory_sync {
+            ms.validate()
+                .map_err(|e| ConfigError::Validation(format!("memory_sync: {e}")))?;
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(

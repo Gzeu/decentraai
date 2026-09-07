@@ -34,8 +34,12 @@ use tracing::{debug, info, warn};
 /// relying on mDNS re-discovery (a peer that left the network permanently
 /// must not be re-dialed forever). Each attempt backs off exponentially.
 pub const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+/// Max re-dial attempts for LAN peers (faster discovery, shorter backoff).
+pub const RECONNECT_MAX_ATTEMPTS_LAN: u32 = 3;
 /// Base backoff (ms) doubled on each reconnect attempt.
 pub const RECONNECT_BASE_BACKOFF_MS: u64 = 500;
+/// Base backoff for LAN peers (ms) — shorter because LAN peers reconnect fast.
+pub const RECONNECT_BASE_BACKOFF_LAN_MS: u64 = 200;
 /// A connection that survived at least this long counts as "stable": only
 /// its drop resets the redial budget. Short-lived connections (sub-second
 /// churn, typically dial collisions over a stale NAT address) must NOT
@@ -63,6 +67,9 @@ pub struct NetworkConfig {
     /// Upper bound on concurrent connections (reserved for connection limits;
     /// currently informational).
     pub max_connections: u16,
+    /// Optional data directory for persistence (known_addresses, etc.).
+    /// `None` = no persistence (e.g. tests).
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -80,6 +87,7 @@ impl NetworkConfig {
             relay_enabled: false,
             bootstrap_peers: Vec::new(),
             max_connections: 50,
+            data_dir: None,
         }
     }
 }
@@ -97,6 +105,66 @@ fn parse_bootstrap_peer(s: &str) -> Result<(PeerId, Multiaddr)> {
         _ => bail!("bootstrap multiaddr must end with /p2p/<PeerId>: {s:?}"),
     };
     Ok((peer_id, addr))
+}
+
+/// Load known peer addresses from disk (JSON). Returns empty map on missing file.
+fn load_known_addresses(path: &std::path::Path) -> HashMap<PeerId, Multiaddr> {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) else {
+        warn!(?path, "failed to parse known_addresses file, starting fresh");
+        return HashMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, v)| {
+            let peer_id: PeerId = k.parse().ok()?;
+            let addr: Multiaddr = v.parse().ok()?;
+            Some((peer_id, addr))
+        })
+        .collect()
+}
+
+/// Persist known peer addresses to disk (atomic: tmp + rename).
+fn save_known_addresses(
+    path: &std::path::Path,
+    addresses: &HashMap<PeerId, Multiaddr>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let map: HashMap<String, String> = addresses
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let json = serde_json::to_string(&map)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Returns `true` if the multiaddr points to a private/LAN IP range
+/// (10.x, 172.16-31.x, 192.168.x, 127.x, link-local).
+fn is_lan_address(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                return ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local();
+            }
+            Protocol::Dns4(_) | Protocol::Dns6(_) => {
+                // Hostnames are WAN by default (could be LAN but we err on
+                // the safe side — longer backoff is less disruptive than
+                // assuming LAN and reconnecting too aggressively).
+                return false;
+            }
+            _ => continue,
+        }
+    }
+    false
 }
 
 /// Request/response protocol carrying serialized decentraai-protocol messages.
@@ -368,6 +436,9 @@ pub struct PeersSnapshot {
     /// (e.g. our public IP behind NAT). Advertised on the swarm so remote
     /// peers can dial us directly.
     pub external_addresses: Vec<Multiaddr>,
+    /// Whether the node detected a network partition (all peers disconnected
+    /// AND reconnect budget exhausted). Cleared when any peer reconnects.
+    pub partition_detected: bool,
 }
 
 /// Handler for inbound inference requests (see `P2PNode::set_on_infer_request`).
@@ -703,6 +774,12 @@ impl P2PNode {
         let on_memory_sync: SharedHandler<MemorySyncHandler> =
             Arc::new(tokio::sync::Mutex::new(None));
         let on_memory_sync_loop = on_memory_sync.clone();
+        let known_addresses_path = network.data_dir.map(|d| d.join("p2p/known_addresses.json"));
+        let known_addresses = if let Some(ref path) = known_addresses_path {
+            load_known_addresses(path)
+        } else {
+            HashMap::new()
+        };
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -718,7 +795,20 @@ impl P2PNode {
             let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
             // Last known address per peer, kept so a disconnect can be
             // re-dialed without waiting for another mDNS announcement.
-            let mut known_addresses: HashMap<PeerId, Multiaddr> = HashMap::new();
+            let mut known_addresses: HashMap<PeerId, Multiaddr> = known_addresses;
+            // Macro to persist known_addresses after mutations.
+            macro_rules! persist_known {
+                () => {
+                    if let Some(ref path) = known_addresses_path {
+                        if let Err(e) = save_known_addresses(path, &known_addresses) {
+                            warn!(error = %e, "failed to persist known_addresses");
+                        }
+                    }
+                };
+            }
+            // Partition detection: timestamp when the last peer disconnected
+            // and all reconnect attempts were exhausted. `None` = healthy.
+            let mut partition_detected_at: Option<std::time::Instant> = None;
             // Our own listen addresses (the node's LAN identity).
             let mut local_addresses: Vec<Multiaddr> = Vec::new();
             // Addresses observed for us by remote peers via identify (our
@@ -804,6 +894,7 @@ impl P2PNode {
                                     addresses: known_addresses.clone(),
                                     local_addresses: local_addresses.clone(),
                                     external_addresses: external_addresses.clone(),
+                                    partition_detected: partition_detected_at.is_some(),
                                 });
                             }
                             Command::Shutdown => break,
@@ -822,6 +913,14 @@ impl P2PNode {
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 info!(%peer_id, "peer connected");
+                                // Partition recovery: any new connection
+                                // clears the partition state.
+                                if partition_detected_at.take().is_some() {
+                                    info!(
+                                        %peer_id,
+                                        "network partition cleared: peer reconnected"
+                                    );
+                                }
                                 connected_since.insert(peer_id, std::time::Instant::now());
                                 if !connected.contains(&peer_id) {
                                     connected.push(peer_id);
@@ -863,6 +962,7 @@ impl P2PNode {
                                     endpoint
                                 {
                                     known_addresses.insert(peer_id, address.clone());
+                                    persist_known!();
                                 }
                                 let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
                                 let addr_known = known_addresses.get(&peer_id).cloned();
@@ -873,15 +973,32 @@ impl P2PNode {
                                     reconnect_attempts.remove(&peer_id);
                                     continue;
                                 };
-                                if *attempt >= RECONNECT_MAX_ATTEMPTS {
+                                // Adaptive reconnect: LAN peers get faster
+                                // backoff and fewer attempts (they're on the
+                                // same subnet, reconnection should be fast).
+                                let lan = is_lan_address(&addr);
+                                let max_attempts = if lan { RECONNECT_MAX_ATTEMPTS_LAN } else { RECONNECT_MAX_ATTEMPTS };
+                                if *attempt >= max_attempts {
                                     reconnect_attempts.remove(&peer_id);
-                                    debug!(%peer_id, "reconnect budget exhausted; waiting for mDNS");
+                                    debug!(%peer_id, lan, "reconnect budget exhausted; waiting for mDNS");
+                                    // Partition detection: if no peers
+                                    // remain connected and all known
+                                    // peers have exhausted their
+                                    // reconnect budget, the node is
+                                    // likely network-isolated.
+                                    if connected.is_empty() && reconnect_attempts.is_empty() {
+                                        partition_detected_at = Some(std::time::Instant::now());
+                                        warn!(
+                                            "network partition detected: 0 connected peers, all reconnect budgets exhausted"
+                                        );
+                                    }
                                     continue;
                                 }
                                 let nth = *attempt;
                                 *attempt += 1;
+                                let base_ms = if lan { RECONNECT_BASE_BACKOFF_LAN_MS } else { RECONNECT_BASE_BACKOFF_MS };
                                 let backoff = Duration::from_millis(
-                                    RECONNECT_BASE_BACKOFF_MS << nth.min(10),
+                                    base_ms << nth.min(10),
                                 );
                                 let sender = reconnect_sender.clone();
                                 tokio::spawn(async move {
@@ -891,8 +1008,9 @@ impl P2PNode {
                                 debug!(
                                     %peer_id,
                                     attempt = nth + 1,
-                                    max = RECONNECT_MAX_ATTEMPTS,
+                                    max = max_attempts,
                                     backoff_ms = backoff.as_millis(),
+                                    lan,
                                     "scheduled reconnect dial"
                                 );
                             }
@@ -903,6 +1021,7 @@ impl P2PNode {
                                     info!(%peer, %addr, "mDNS discovered peer");
                                     swarm.add_peer_address(peer, addr.clone());
                                     known_addresses.insert(peer, addr.clone());
+                                    persist_known!();
                                     // mDNS discovery is passive: it only adds
                                     // addresses to the peerstore. Dial so the
                                     // connection is actually established and
@@ -1259,6 +1378,7 @@ impl P2PNode {
                                 kad::Event::RoutablePeer { peer, address },
                             )) => {
                                 known_addresses.insert(peer, address.clone());
+                                persist_known!();
                             }
                             SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(
                                 kad::Event::OutboundQueryProgressed { .. },
@@ -1639,5 +1759,55 @@ mod tests {
         assert!(!c.relay_enabled);
         assert!(c.bootstrap_peers.is_empty());
         assert_eq!(c.max_connections, 50);
+        assert!(c.data_dir.is_none());
+    }
+
+    #[test]
+    fn known_addresses_roundtrip_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2p/known_addresses.json");
+
+        let mut map = HashMap::new();
+        let peer1: PeerId = "12D3KooWDpE7rFzM2WKkHZbAHKEBM2W3GZA24bQZ5N5c7R8AhBSk"
+            .parse()
+            .unwrap();
+        let addr1: Multiaddr = "/ip4/192.168.1.10/tcp/4001".parse().unwrap();
+        map.insert(peer1, addr1.clone());
+
+        save_known_addresses(&path, &map).unwrap();
+        let loaded = load_known_addresses(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&peer1), Some(&addr1));
+    }
+
+    #[test]
+    fn load_known_addresses_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent/addresses.json");
+        let loaded = load_known_addresses(&path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_known_addresses_corrupt_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "{invalid json!!!").unwrap();
+        let loaded = load_known_addresses(&path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn is_lan_address_detects_private_ranges() {
+        // Private LAN addresses.
+        assert!(is_lan_address(&"/ip4/192.168.1.10/tcp/4001".parse().unwrap()));
+        assert!(is_lan_address(&"/ip4/10.0.0.5/tcp/4001".parse().unwrap()));
+        assert!(is_lan_address(&"/ip4/172.16.0.1/tcp/4001".parse().unwrap()));
+        assert!(is_lan_address(&"/ip4/127.0.0.1/tcp/4001".parse().unwrap()));
+        // Public WAN address.
+        assert!(!is_lan_address(&"/ip4/8.8.8.8/tcp/4001".parse().unwrap()));
+        assert!(!is_lan_address(&"/ip4/1.1.1.1/tcp/4001".parse().unwrap()));
+        // DNS hostnames are WAN by default.
+        assert!(!is_lan_address(&"/dns4/example.com/tcp/4001".parse().unwrap()));
     }
 }

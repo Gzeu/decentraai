@@ -376,6 +376,11 @@ pub struct ApiState {
     pub memory: Option<Arc<decentraai_distributed::agent_memory::MemoryStore>>,
     /// Per-agent personal memory store (Markdown workspaces).
     pub personal_memory: Option<Arc<decentraai_agent_personal_memory::PersonalMemoryStore>>,
+    /// Memory bridge: personal → collective scope mapping. `None` = bridge disabled.
+    pub memory_bridge: Option<Arc<crate::memory_bridge::BridgeMapping>>,
+    /// When true, bridge scopes are propagation-eligible and mirrored
+    /// entries are auto-promoted to Verified for cross-node sync.
+    pub bridge_sync: bool,
     /// Model Colony registry (M-I): governance stages persist across
     /// restarts via db/model_intel.json; shared with the intel/route/
     /// governance handlers.
@@ -498,6 +503,8 @@ impl ApiState {
             retrieval: None,
             memory: None,
             personal_memory: None,
+            memory_bridge: None,
+            bridge_sync: false,
             research_trigger: None,
             model_intel: None,
             model_intel_path: None,
@@ -718,6 +725,26 @@ impl ApiState {
         memory: Arc<decentraai_distributed::agent_memory::MemoryStore>,
     ) {
         self.memory = Some(memory);
+    }
+
+    /// Attaches the personal→collective memory bridge with default mapping.
+    /// Ensures the bridged collective scopes exist.
+    pub fn attach_memory_bridge(
+        &mut self,
+        mapping: Arc<crate::memory_bridge::BridgeMapping>,
+        bridge_sync: bool,
+    ) {
+        // Ensure bridged scopes exist if memory store is attached.
+        if let Some(ref memory) = self.memory {
+            crate::memory_bridge::ensure_bridged_scopes(
+                memory,
+                &mapping,
+                "governor", // default owner for bridged scopes
+                bridge_sync,
+            );
+        }
+        self.memory_bridge = Some(mapping);
+        self.bridge_sync = bridge_sync;
     }
 
     /// Attaches the Model Colony registry backed by `path` (JSON). Loads an
@@ -6066,6 +6093,129 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         ctx.personal_memory_action =
             decentraai_agent_personal_memory::mcp::build_memory_export_response(markdown);
     }
+    // M19 — Collective Memory (cross-node shared knowledge)
+    if crate::mcp::memory_list_scopes_request(&raw).is_some() {
+        if let Some(ref memory) = state.memory {
+            let scopes = memory.list_scopes().unwrap_or_default();
+            let items: Vec<serde_json::Value> = scopes
+                .iter()
+                .map(|s| {
+                    let entry_count = memory
+                        .read(&s.name, "governor", true)
+                        .map(|e| e.len())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "name": s.name,
+                        "owner": s.owner_agent,
+                        "level": format!("{:?}", s.level),
+                        "access": format!("{:?}", s.policy.access),
+                        "allow_remote_write": s.policy.allow_remote_write,
+                        "entry_count": entry_count,
+                    })
+                })
+                .collect();
+            ctx.collective_memory_action = serde_json::json!({
+                "scopes": items,
+                "total": items.len(),
+            });
+        } else {
+            ctx.collective_memory_action =
+                serde_json::json!({"error": "memory store not attached"});
+        }
+    }
+    if let Some((scope, reader_agent, limit)) = crate::mcp::memory_read_entries_request(&raw) {
+        if let Some(ref memory) = state.memory {
+            match memory.read(&scope, &reader_agent, true) {
+                Ok(entries) => {
+                    let items: Vec<serde_json::Value> = entries
+                        .into_iter()
+                        .take(limit)
+                        .map(|e| {
+                            serde_json::json!({
+                                "entry_id": e.entry_id,
+                                "author": e.author_agent,
+                                "node": e.author_node,
+                                "content": e.content,
+                                "subject": e.meta.subject_key,
+                                "kind": format!("{:?}", e.meta.kind),
+                                "status": format!("{:?}", e.meta.status),
+                                "version": e.meta.version,
+                                "created_at_ms": e.created_at_ms,
+                            })
+                        })
+                        .collect();
+                    ctx.collective_memory_action = serde_json::json!({
+                        "scope": scope,
+                        "entries": items,
+                        "count": items.len(),
+                    });
+                }
+                Err(e) => {
+                    ctx.collective_memory_action =
+                        serde_json::json!({"error": e.to_string()});
+                }
+            }
+        } else {
+            ctx.collective_memory_action =
+                serde_json::json!({"error": "memory store not attached"});
+        }
+    }
+    if let Some(args) = crate::mcp::memory_write_entry_request(&raw) {
+        if let Some(ref memory) = state.memory {
+            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let entry_id = args.get("entry_id").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let author_agent = args.get("author_agent").and_then(|v| v.as_str()).unwrap_or("");
+            let subject_key = args.get("subject_key").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("observation");
+
+            if scope.is_empty() || entry_id.is_empty() || content.is_empty() {
+                ctx.collective_memory_action =
+                    serde_json::json!({"error": "scope, entry_id, and content are required"});
+            } else {
+                let kind_meta: decentraai_agents::memory::KnowledgeKind =
+                    match kind {
+                        "learning" => decentraai_agents::memory::KnowledgeKind::Learning,
+                        "decision" => decentraai_agents::memory::KnowledgeKind::Decision,
+                        "execution" => decentraai_agents::memory::KnowledgeKind::Execution,
+                        _ => decentraai_agents::memory::KnowledgeKind::Observation,
+                    };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut entry = decentraai_agents::memory::MemoryEntry::new(
+                    entry_id,
+                    scope,
+                    author_agent,
+                    "mcp-client",
+                    content,
+                );
+                entry.created_at_ms = now_ms;
+                entry.meta.subject_key = subject_key.to_string();
+                entry.meta.kind = kind_meta;
+                // Writer is NOT the scope owner (external agent via MCP).
+                // Write with trusted=false, verified_provenance=false.
+                match memory.write_checked(scope, &entry, author_agent, false, false, false) {
+                    Ok(outcome) => {
+                        ctx.collective_memory_action = serde_json::json!({
+                            "success": true,
+                            "scope": scope,
+                            "entry_id": entry_id,
+                            "outcome": format!("{:?}", outcome),
+                        });
+                    }
+                    Err(e) => {
+                        ctx.collective_memory_action =
+                            serde_json::json!({"error": e.to_string()});
+                    }
+                }
+            }
+        } else {
+            ctx.collective_memory_action =
+                serde_json::json!({"error": "memory store not attached"});
+        }
+    }
     // M18 — Economic Layer mutations (contract/escrow/trust)
     if let Some((tool_name, args)) = crate::mcp::m18_tool_request(&raw) {
         if let Some(ref m18) = state.m18 {
@@ -6589,17 +6739,41 @@ async fn orchestration_propose_resp(
             None => return forbidden("every stage needs capability (<=128 chars)"),
         };
         let max_price = st.get("max_price").and_then(|v| v.as_u64()).unwrap_or(0);
+        let replicas = match st.get("replicas").and_then(|v| v.as_u64()) {
+            Some(n) if (1..=3).contains(&n) => n as u32,
+            Some(_) => return forbidden("stage replicas must be between 1 and 3"),
+            None => 1,
+        };
 
         let req_orch = orch::StageRequirement {
             capability: capability.clone(),
             max_price,
         };
-        let assigned = orch::select_provider(&ads, &req_orch, now)
-            .ok()
-            .map(|ad| ad.agent_id.clone());
+        let selected: Vec<String> = if replicas <= 1 {
+            orch::select_provider(&ads, &req_orch, now)
+                .map(|a| vec![a.agent_id.clone()])
+                .unwrap_or_default()
+        } else {
+            match orch::select_providers(&ads, &req_orch, replicas, cap, now) {
+                Ok(v) => v.iter().map(|a| a.agent_id.clone()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let assigned = selected.first().cloned();
 
         if let Some(store) = store_lock.as_deref_mut() {
-            let _ = store.propose(&plan_id, &stage_id, &capability, max_price, key_id, now);
+            let _ = store.propose_with_replicas(
+                &plan_id,
+                &stage_id,
+                &capability,
+                max_price,
+                key_id,
+                replicas,
+                now,
+            );
+            if replicas > 1 && !selected.is_empty() {
+                let _ = store.init_replicas(&plan_id, &stage_id, replicas, &selected, now);
+            }
             if assigned.is_some() {
                 let _ = store.assign(&plan_id, &stage_id, assigned.as_deref().unwrap_or(""), now);
             }
@@ -6608,7 +6782,9 @@ async fn orchestration_propose_resp(
             "stage_id": stage_id,
             "capability": capability,
             "max_price": max_price,
+            "replicas": replicas,
             "assigned_to": assigned,
+            "replica_providers": selected,
         }));
     }
 
@@ -6641,11 +6817,37 @@ fn orchestration_status_resp(state: &ApiState, plan_id: &str) -> Response {
         g.plan(plan_id)
             .iter()
             .map(|a| {
+                // Include per-replica detail when replicas > 1.
+                let replica_details: Vec<serde_json::Value> = if a.replicas > 1 {
+                    g.replicas(&a.plan_id, &a.stage_id)
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "replica": r.replica,
+                                "executor": r.executor,
+                                "state": format!("{:?}", r.state),
+                            })
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // Include consensus outcome if resolved.
+                let consensus = g.consensus(&a.plan_id, &a.stage_id).map(|c| {
+                    serde_json::json!({
+                        "verdict": format!("{:?}", c.verdict),
+                        "outputs_count": c.outputs.len(),
+                        "resolved_at_ms": c.resolved_at_ms,
+                    })
+                });
                 serde_json::json!({
                     "stage_id": a.stage_id,
                     "capability": a.capability,
                     "price": a.price,
+                    "replicas": a.replicas,
                     "state": format!("{:?}", a.state),
+                    "replica_details": replica_details,
+                    "consensus": consensus,
                 })
             })
             .collect()
@@ -7635,7 +7837,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             "agent_memory_read"
                             | "agent_memory_search"
                             | "agent_memory_snapshot"
-                            | "agent_memory_export" => {
+                            | "agent_memory_export"
+                            | "memory_list_scopes"
+                            | "memory_read_entries"
+                            | "memory_write_entry" => {
                                 scopes.iter().any(|s| s == "memory" || s == "*")
                             }
                             "discover_capabilities" => true, // always available for onboarding
@@ -7892,8 +8097,29 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 relationship_summaries: HashMap::new(),
             }
         });
-        ctx.personal_memory_action =
-            decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+        // Bridge: augment snapshot with collective entries from bridged scopes.
+        let mut response = decentraai_agent_personal_memory::mcp::build_memory_snapshot_response(&snapshot);
+        if let (Some(memory), Some(bridge)) = (&state.memory, &state.memory_bridge) {
+            let bridged_lessons = crate::memory_bridge::read_bridged(
+                memory, bridge, &agent_id, "lessons", 10,
+            );
+            let bridged_decisions = crate::memory_bridge::read_bridged(
+                memory, bridge, &agent_id, "decisions", 10,
+            );
+            let bridged_experiences = crate::memory_bridge::read_bridged(
+                memory, bridge, &agent_id, "experiences", 10,
+            );
+            if !bridged_lessons.is_empty() || !bridged_decisions.is_empty() || !bridged_experiences.is_empty() {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("bridged_collective".to_string(), serde_json::json!({
+                        "lessons": bridged_lessons,
+                        "decisions": bridged_decisions,
+                        "experiences": bridged_experiences,
+                    }));
+                }
+            }
+        }
+        ctx.personal_memory_action = response;
     } else if let Some((agent_id, _query, categories, limit)) =
         crate::mcp::agent_memory_search_request(&raw)
     {
@@ -7973,10 +8199,263 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             .await;
         ctx.personal_memory_action = match res {
             Ok(_) => {
+                // Bridge: mirror to collective scope if configured.
+                if let (Some(memory), Some(bridge)) = (&state.memory, &state.memory_bridge) {
+                    let content = entry.get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    crate::memory_bridge::mirror_write(
+                        memory, bridge, &agent_id, &category, content, now,
+                        state.bridge_sync,
+                    );
+                }
                 serde_json::json!({"success": true, "message": format!("Updated {} for {}", category, agent_id)})
             }
             Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
         };
+    } else if crate::mcp::memory_list_scopes_request(&raw).is_some() {
+        // Collective memory: list scopes (consumer, memory scope required)
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if let Some(ref memory) = state.memory {
+            let scopes_list = memory.list_scopes().unwrap_or_default();
+            let items: Vec<serde_json::Value> = scopes_list
+                .iter()
+                .map(|s| {
+                    let entry_count = memory
+                        .read(&s.name, "governor", true)
+                        .map(|e| e.len())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "name": s.name,
+                        "owner": s.owner_agent,
+                        "level": format!("{:?}", s.level),
+                        "access": format!("{:?}", s.policy.access),
+                        "allow_remote_write": s.policy.allow_remote_write,
+                        "entry_count": entry_count,
+                    })
+                })
+                .collect();
+            ctx.collective_memory_action = serde_json::json!({"scopes": items, "total": items.len()});
+        } else {
+            ctx.collective_memory_action = serde_json::json!({"error": "memory store not attached"});
+        }
+    } else if let Some((scope, reader_agent, limit)) = crate::mcp::memory_read_entries_request(&raw) {
+        // Collective memory: read entries (consumer, memory scope required)
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if let Some(ref memory) = state.memory {
+            match memory.read(&scope, &reader_agent, true) {
+                Ok(entries) => {
+                    let items: Vec<serde_json::Value> = entries
+                        .into_iter()
+                        .take(limit)
+                        .map(|e| {
+                            serde_json::json!({
+                                "entry_id": e.entry_id,
+                                "author": e.author_agent,
+                                "node": e.author_node,
+                                "content": e.content,
+                                "subject": e.meta.subject_key,
+                                "kind": format!("{:?}", e.meta.kind),
+                                "status": format!("{:?}", e.meta.status),
+                                "version": e.meta.version,
+                                "created_at_ms": e.created_at_ms,
+                            })
+                        })
+                        .collect();
+                    ctx.collective_memory_action = serde_json::json!({
+                        "scope": scope,
+                        "entries": items,
+                        "count": items.len(),
+                    });
+                }
+                Err(e) => {
+                    ctx.collective_memory_action = serde_json::json!({"error": e.to_string()});
+                }
+            }
+        } else {
+            ctx.collective_memory_action = serde_json::json!({"error": "memory store not attached"});
+        }
+    } else if let Some(args) = crate::mcp::memory_write_entry_request(&raw) {
+        // Collective memory: write entry (consumer, memory scope required)
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if let Some(ref memory) = state.memory {
+            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let entry_id = args.get("entry_id").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let author_agent = args.get("author_agent").and_then(|v| v.as_str()).unwrap_or("");
+            let subject_key = args.get("subject_key").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("observation");
+
+            if scope.is_empty() || entry_id.is_empty() || content.is_empty() {
+                ctx.collective_memory_action = serde_json::json!({"error": "scope, entry_id, and content are required"});
+            } else {
+                let kind_meta: decentraai_agents::memory::KnowledgeKind = match kind {
+                    "learning" => decentraai_agents::memory::KnowledgeKind::Learning,
+                    "decision" => decentraai_agents::memory::KnowledgeKind::Decision,
+                    "execution" => decentraai_agents::memory::KnowledgeKind::Execution,
+                    _ => decentraai_agents::memory::KnowledgeKind::Observation,
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut entry = decentraai_agents::memory::MemoryEntry::new(
+                    entry_id, scope, author_agent, "mcp-client", content,
+                );
+                entry.created_at_ms = now_ms;
+                entry.meta.subject_key = subject_key.to_string();
+                entry.meta.kind = kind_meta;
+                match memory.write_checked(scope, &entry, author_agent, false, false, false) {
+                    Ok(outcome) => {
+                        ctx.collective_memory_action = serde_json::json!({
+                            "success": true,
+                            "scope": scope,
+                            "entry_id": entry_id,
+                            "outcome": format!("{:?}", outcome),
+                        });
+                    }
+                    Err(e) => {
+                        ctx.collective_memory_action = serde_json::json!({"error": e.to_string()});
+                    }
+                }
+            }
+        } else {
+            ctx.collective_memory_action = serde_json::json!({"error": "memory store not attached"});
+        }
+    } else if let Some((scope, reader_agent, limit)) = crate::mcp::memory_list_conflicts_request(&raw) {
+        // Conflict resolution: list subjects with competing claims.
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if let Some(ref memory) = state.memory {
+            match memory.read(&scope, &reader_agent, true) {
+                Ok(entries) => {
+                    // Group entries by subject_key.
+                    let mut subjects: std::collections::HashMap<String, Vec<&decentraai_agents::memory::MemoryEntry>> =
+                        std::collections::HashMap::new();
+                    for e in &entries {
+                        if !e.meta.subject_key.is_empty() && e.meta.status.is_active() {
+                            subjects.entry(e.meta.subject_key.clone()).or_default().push(e);
+                        }
+                    }
+                    // Filter to subjects with >1 active claim (conflicts).
+                    let mut conflicts: Vec<serde_json::Value> = Vec::new();
+                    for (subject, claims) in &subjects {
+                        if claims.len() < 2 {
+                            continue;
+                        }
+                        let owned: Vec<decentraai_agents::memory::MemoryEntry> =
+                            claims.iter().map(|e| (*e).clone()).collect();
+                        let ranked = decentraai_agents::memory::rank_claims(&owned);
+                        let claim_details: Vec<serde_json::Value> = ranked
+                            .iter()
+                            .map(|e| {
+                                serde_json::json!({
+                                    "entry_id": e.entry_id,
+                                    "author": e.author_agent,
+                                    "content": e.content,
+                                    "status": format!("{:?}", e.meta.status),
+                                    "confidence": e.meta.detail.as_ref().map(|d| d.confidence).unwrap_or(0),
+                                    "created_at_ms": e.created_at_ms,
+                                })
+                            })
+                            .collect();
+                        conflicts.push(serde_json::json!({
+                            "subject_key": subject,
+                            "claim_count": claims.len(),
+                            "ranked_claims": claim_details,
+                        }));
+                    }
+                    conflicts.truncate(limit);
+                    ctx.memory_conflict_action = serde_json::json!({
+                        "scope": scope,
+                        "conflicts": conflicts,
+                        "total_conflicting_subjects": conflicts.len(),
+                    });
+                }
+                Err(e) => {
+                    ctx.memory_conflict_action = serde_json::json!({"error": e.to_string()});
+                }
+            }
+        } else {
+            ctx.memory_conflict_action = serde_json::json!({"error": "memory store not attached"});
+        }
+    } else if let Some((scope, subject_key, resolver_agent)) = crate::mcp::memory_resolve_conflict_request(&raw) {
+        // Conflict resolution: mark losing claims as Obsolete.
+        if !scopes.iter().any(|s| s == "memory" || s == "*") {
+            return forbidden("consumer key missing memory scope");
+        }
+        if let Some(ref memory) = state.memory {
+            match memory.read(&scope, &resolver_agent, true) {
+                Ok(entries) => {
+                    // Filter to competing claims for this subject.
+                    let claims: Vec<&decentraai_agents::memory::MemoryEntry> = entries
+                        .iter()
+                        .filter(|e| e.meta.subject_key == subject_key && e.meta.status.is_active())
+                        .collect();
+                    if claims.len() < 2 {
+                        ctx.memory_conflict_action = serde_json::json!({
+                            "scope": scope,
+                            "subject_key": subject_key,
+                            "outcome": "no_conflict",
+                            "message": format!("only {} active claim(s) for this subject", claims.len()),
+                        });
+                    } else {
+                        // rank_claims expects &[MemoryEntry], not &[&MemoryEntry].
+                        let owned: Vec<decentraai_agents::memory::MemoryEntry> =
+                            claims.iter().map(|e| (*e).clone()).collect();
+                        let ranked = decentraai_agents::memory::rank_claims(&owned);
+                        let winner_id = ranked.first().map(|e| e.entry_id.clone());
+                        let mut obsoleted = Vec::new();
+                        // Mark all non-winning claims as Obsolete.
+                        for claim in &claims {
+                            if Some(&claim.entry_id) == winner_id.as_ref() {
+                                continue;
+                            }
+                            match memory.transition_status(
+                                &scope,
+                                &claim.entry_id,
+                                decentraai_agents::memory::MemoryStatus::Obsolete,
+                                &resolver_agent,
+                                "mcp_conflict_resolution",
+                            ) {
+                                Ok(()) => obsoleted.push(claim.entry_id.clone()),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        entry_id = claim.entry_id,
+                                        error = %e,
+                                        "failed to obsolete losing claim"
+                                    );
+                                }
+                            }
+                        }
+                        ctx.memory_conflict_action = serde_json::json!({
+                            "scope": scope,
+                            "subject_key": subject_key,
+                            "outcome": "resolved",
+                            "winner": winner_id,
+                            "obsoleted": obsoleted,
+                            "resolver": resolver_agent,
+                        });
+                    }
+                }
+                Err(e) => {
+                    ctx.memory_conflict_action = serde_json::json!({"error": e.to_string()});
+                }
+            }
+        } else {
+            ctx.memory_conflict_action = serde_json::json!({"error": "memory store not attached"});
+        }
     } else if crate::mcp::hub_state_request(&raw) {
         if !scopes.iter().any(|s| s == "hub" || s == "*") {
             return forbidden("consumer key missing hub scope");
@@ -8041,7 +8520,10 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 | "agent_memory_search"
                 | "agent_memory_snapshot"
                 | "agent_memory_export"
-                | "agent_memory_write" => "memory",
+                | "agent_memory_write"
+                | "memory_list_scopes"
+                | "memory_read_entries"
+                | "memory_write_entry" => "memory",
                 "arena_state" | "arena_act" => "arena",
                 _ => "none",
             };
@@ -8241,6 +8723,8 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         hub_action: serde_json::json!({}),
         society_action: serde_json::json!({}),
         personal_memory_action: serde_json::json!({}),
+        collective_memory_action: serde_json::json!({}),
+        memory_conflict_action: serde_json::json!({}),
         // M18 Economic Layer snapshots
         m18_contracts: {
             if let Some(ref m18) = state.m18 {
@@ -22299,6 +22783,10 @@ mod tests {
     /// Issues a gateway credential directly in the store (no HTTP issuance
     /// exists by design) and returns its plaintext.
     fn make_gateway_key(dir: &Path, caps: &[&str], account: &str) -> String {
+        make_gateway_key_named(dir, "ext-agent", caps, account)
+    }
+
+    fn make_gateway_key_named(dir: &Path, name: &str, caps: &[&str], account: &str) -> String {
         let mut store =
             decentraai_tokens::GatewayKeyStore::load(&dir.join("db/gateway_keys.json")).unwrap();
         let now = std::time::SystemTime::now()
@@ -22307,7 +22795,7 @@ mod tests {
             .unwrap_or(0);
         store
             .create(
-                "ext-agent",
+                name,
                 caps.iter().map(|s| s.to_string()).collect(),
                 account,
                 100,
@@ -22955,6 +23443,84 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn m17_nofm_propose_multiple_replicas_assigned_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        // Two distinct external providers advertising chat
+        let _key_a = make_gateway_key_named(dir.path(), "provider-a", &["chat"], "acct-a");
+        let _key_b = make_gateway_key_named(dir.path(), "provider-b", &["chat"], "acct-b");
+
+        let key_req = make_gateway_key(dir.path(), &["orchestrate"], "gw-req");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key_req,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "orchestrate_propose",
+                    "arguments": {
+                        "stages": [
+                            {"stage_id": "s1", "capability": "chat", "max_price": 5, "replicas": 2}
+                        ],
+                        "total_price": 10,
+                        "budget_cap": 20
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let res: serde_json::Value = serde_json::from_str(text).unwrap();
+        let stage = &res["assignments"][0];
+        assert_eq!(stage["replicas"], 2);
+        let providers: Vec<String> = stage["replica_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(providers.len(), 2);
+        assert!(providers.contains(&"provider-a".to_string()));
+        assert!(providers.contains(&"provider-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn m17_nofm_propose_replicas_bound_exceeded_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_gateway_state(dir.path(), "master-token".to_string(), true).await;
+        let key_req = make_gateway_key(dir.path(), &["orchestrate"], "gw-req");
+        let client = reqwest::Client::new();
+        let r = gateway_call(
+            &client,
+            api,
+            &key_req,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "orchestrate_propose",
+                    "arguments": {
+                        "stages": [
+                            {"stage_id": "s1", "capability": "chat", "max_price": 5, "replicas": 4}
+                        ],
+                        "total_price": 20,
+                        "budget_cap": 50
+                    }
+                }
+            }),
+        )
+        .await;
         assert_eq!(r.status(), 403);
     }
 
@@ -23939,5 +24505,225 @@ mod tests {
         assert!(token_openclaw.starts_with("dca_"));
         assert!(token_claude.starts_with("dca_"));
         assert!(token_chatgpt.starts_with("dca_"));
+    }
+
+    #[tokio::test]
+    async fn mcp_collective_memory_list_write_read_flow() {
+        use decentraai_agents::memory::{MemoryLevel, MemoryPolicy, MemoryScope, MemoryAccess};
+        use decentraai_distributed::agent_memory::MemoryStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let master = "master-token".to_string();
+
+        // Create a real MemoryStore and register an eligible scope.
+        let memory_path = dir.path().join("db/agent_memory.sqlite");
+        std::fs::create_dir_all(memory_path.parent().unwrap()).unwrap();
+        let memory = Arc::new(MemoryStore::open(&memory_path).unwrap());
+        let policy = MemoryPolicy {
+            access: MemoryAccess::Public,
+            allow_remote_write: true,
+            ..Default::default()
+        };
+        let scope = MemoryScope::new("fabric.lessons", "governor", MemoryLevel::Fabric)
+            .with_policy(policy);
+        memory.register_scope(&scope).unwrap();
+
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master.clone()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.path().join("db/consumer_keys.json")),
+            Some(Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+                decentraai_compute::ContributionPolicy::default(),
+            )))),
+        );
+        state.attach_memory(memory.clone());
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+
+        let client = reqwest::Client::new();
+        // Create a consumer key for the test agent.
+        let key_resp = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", format!("Bearer {master}"))
+            .json(&serde_json::json!({
+                "account": "mem-agent",
+                "quota_ceiling": 1000,
+                "rate_limit_per_minute": 100,
+                "scopes": ["hub", "memory", "society", "arena"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let key_status = key_resp.status();
+        let key_body: serde_json::Value = key_resp.json().await.unwrap();
+        assert!(key_status.is_success(), "create_key failed: status={key_status} body={key_body}");
+        let token = key_body["token"].as_str().unwrap().to_string();
+
+        let mcp_call = |payload: serde_json::Value| {
+            let client = client.clone();
+            let token = token.clone();
+            async move {
+                let resp = client
+                    .post(format!("http://{api}/mcp"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+                    .unwrap();
+                resp.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+
+        // 1. memory_list_scopes — verify our scope appears
+        let r = mcp_call(serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"memory_list_scopes","arguments":{}}
+        })).await;
+        eprintln!("MCP list_scopes response: {}", serde_json::to_string_pretty(&r).unwrap());
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let scopes = body["scopes"].as_array().unwrap();
+        assert!(
+            scopes.iter().any(|s| s["name"] == "fabric.lessons"),
+            "scope must appear in list: {:?}",
+            scopes
+        );
+
+        // 2. memory_write_entry — write an entry
+        let r = mcp_call(serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_write_entry","arguments":{
+                "scope": "fabric.lessons",
+                "entry_id": "lesson-001",
+                "content": "Always verify manifests before use",
+                "author_agent": "mem-agent",
+                "subject_key": "q:manifests",
+                "kind": "learning"
+            }}
+        })).await;
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["success"], true, "write must succeed: {body}");
+
+        // 3. memory_read_entries — read back the entry
+        let r = mcp_call(serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_read_entries","arguments":{
+                "scope": "fabric.lessons",
+                "reader_agent": "mem-agent",
+                "limit": 10
+            }}
+        })).await;
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "must read back the written entry");
+        assert_eq!(entries[0]["entry_id"], "lesson-001");
+        assert_eq!(
+            entries[0]["content"],
+            "Always verify manifests before use"
+        );
+
+        // 4. Duplicate write is rejected (content dedup)
+        let r = mcp_call(serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"memory_write_entry","arguments":{
+                "scope": "fabric.lessons",
+                "entry_id": "lesson-002",
+                "content": "Always verify manifests before use",
+                "author_agent": "mem-agent"
+            }}
+        })).await;
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            body["outcome"].as_str().unwrap_or("").contains("Duplicate"),
+            "duplicate must be rejected: {body}"
+        );
+
+        // 5. Write to non-existent scope fails
+        let r = mcp_call(serde_json::json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"memory_write_entry","arguments":{
+                "scope": "nonexistent.scope",
+                "entry_id": "x",
+                "content": "test",
+                "author_agent": "mem-agent"
+            }}
+        })).await;
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(body.get("error").is_some(), "must fail on unknown scope: {body}");
+    }
+
+    #[tokio::test]
+    async fn memory_write_triggers_propagation_flag() {
+        use decentraai_agents::memory::{MemoryLevel, MemoryPolicy, MemoryScope, MemoryAccess};
+        use decentraai_distributed::agent_memory::MemoryStore;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("db/agent_memory.sqlite");
+        std::fs::create_dir_all(memory_path.parent().unwrap()).unwrap();
+        let memory = MemoryStore::open(&memory_path).unwrap();
+
+        // Register an eligible scope (public + remote_write + fabric level).
+        let policy = MemoryPolicy {
+            access: MemoryAccess::Public,
+            allow_remote_write: true,
+            ..Default::default()
+        };
+        let scope = MemoryScope::new("fabric.lessons", "governor", MemoryLevel::Fabric)
+            .with_policy(policy);
+        memory.register_scope(&scope).unwrap();
+
+        let flag = memory.write_trigger_flag();
+        assert!(!flag.load(Ordering::Relaxed), "flag starts clear");
+
+        // Write to an eligible scope → flag should be set.
+        let entry = decentraai_agents::memory::MemoryEntry::new(
+            "e1", "fabric.lessons", "agent-a", "node-1", "test content",
+        );
+        memory
+            .write_checked("fabric.lessons", &entry, "agent-a", true, false, false)
+            .unwrap();
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "flag must be set after write to eligible scope"
+        );
+
+        // Clear the flag (simulates propagation loop reading it).
+        flag.store(false, Ordering::Relaxed);
+
+        // Write to a NON-eligible scope (private) → flag should NOT be set.
+        let private_policy = MemoryPolicy {
+            access: MemoryAccess::Private,
+            ..Default::default()
+        };
+        let private_scope = MemoryScope::new("agent.notes", "agent-a", MemoryLevel::Agent)
+            .with_policy(private_policy);
+        memory.register_scope(&private_scope).unwrap();
+
+        let entry2 = decentraai_agents::memory::MemoryEntry::new(
+            "e2", "agent.notes", "agent-a", "node-1", "private note",
+        );
+        memory
+            .write_checked("agent.notes", &entry2, "agent-a", true, false, false)
+            .unwrap();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "flag must NOT be set after write to non-eligible scope"
+        );
     }
 }
