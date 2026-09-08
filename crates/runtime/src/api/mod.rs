@@ -21281,6 +21281,10 @@ mod tests {
         vec![("ocr".to_string(), "verified".to_string())]
     }
 
+    fn claims_inferred_chat() -> Vec<(String, String)> {
+        vec![("chat".to_string(), "inferred".to_string())]
+    }
+
     #[test]
     fn worker_cap_verified_claim_plus_compatible_worker_can_run() {
         let peer = decentraai_p2p::PeerId::random();
@@ -21312,6 +21316,101 @@ mod tests {
         assert_eq!(r.node_name, "dca-node1");
         assert_eq!(r.peer_id, peer.to_string());
         assert_ne!(r.node_id, r.peer_id);
+    }
+
+    #[test]
+    fn worker_cap_inferred_claim_follows_evidence_bar() {
+        // Same serving worker, INFERRED chat claim: evidence "any" (the
+        // `decide` default) runs it with honestly-labeled INFERRED
+        // provenance, while evidence "verified" refuses. Regression: the
+        // bar was ignored and every INFERRED model was unschedulable via
+        // decide even though execution would run it.
+        let peer = decentraai_p2p::PeerId::random();
+        let adv = cap_adv(
+            &peer,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (true, false),
+        );
+        let any = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "chat",
+            "any",
+            &claims_inferred_chat(),
+        );
+        assert_eq!(any.verdict, WorkerCapVerdict::CanRun);
+        let cap = any.checks.iter().find(|c| c.check == "capability").unwrap();
+        assert!(cap.pass && cap.state == "INFERRED");
+        let strict = worker_capability_verdict(
+            &adv,
+            true,
+            "qwen.gguf",
+            "chat",
+            "verified",
+            &claims_inferred_chat(),
+        );
+        assert_eq!(strict.verdict, WorkerCapVerdict::CannotRun);
+        let cap = strict
+            .checks
+            .iter()
+            .find(|c| c.check == "capability")
+            .unwrap();
+        assert!(!cap.pass && cap.state == "INFERRED");
+    }
+
+    #[test]
+    fn aggregate_reasons_name_every_failing_worker() {
+        // Two workers failing the same gates must BOTH appear in reasons.
+        // Regression: dedup by (check, state) hid the second worker, so the
+        // counts disagreed with the visible lines.
+        let p1 = decentraai_p2p::PeerId::random();
+        let p2 = decentraai_p2p::PeerId::random();
+        let a1 = cap_adv(
+            &p1,
+            "dca-node1",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (false, false),
+        );
+        let a2 = cap_adv(
+            &p2,
+            "dca-node2",
+            "llama_server",
+            8192,
+            Some(8192),
+            (1024, 2048),
+            (false, false),
+        );
+        let r1 = worker_capability_verdict(
+            &a1,
+            true,
+            "qwen.gguf",
+            "chat",
+            "any",
+            &claims_inferred_chat(),
+        );
+        let r2 = worker_capability_verdict(
+            &a2,
+            true,
+            "qwen.gguf",
+            "chat",
+            "any",
+            &claims_inferred_chat(),
+        );
+        assert_eq!(r1.verdict, WorkerCapVerdict::CannotRun);
+        assert_eq!(r2.verdict, WorkerCapVerdict::CannotRun);
+        let fit = aggregate_can_i_run(&[r1, r2]);
+        assert_eq!(fit.cannot_run_count, 2);
+        let text = fit.reasons.join("\n");
+        assert!(text.contains("dca-node1"), "first worker missing: {text}");
+        assert!(text.contains("dca-node2"), "second worker missing: {text}");
     }
 
     // ---- variant quantization classifier (INFERRED, never VERIFIED) ----

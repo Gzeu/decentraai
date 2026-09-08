@@ -790,6 +790,9 @@ pub(crate) fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
         }
         WorkerCapVerdict::CannotRun => {
             // Report the first few distinct blockers across CANNOT_RUN workers.
+            // The dedup key includes the worker: two workers failing the same
+            // gate are two facts, and hiding the second makes the counts
+            // disagree with the visible lines.
             let mut seen = std::collections::BTreeSet::new();
             for r in results
                 .iter()
@@ -797,7 +800,7 @@ pub(crate) fn aggregate_can_i_run(results: &[WorkerCapResult]) -> FabricCapFit {
             {
                 for c in &r.checks {
                     if !c.pass {
-                        let key = format!("{}:{}", c.check, c.state);
+                        let key = format!("{}:{}:{}", r.peer_id, c.check, c.state);
                         if seen.insert(key) {
                             reasons.push(format!(
                                 "{} ({} / {}): {} — {}",
@@ -953,6 +956,10 @@ pub(crate) fn worker_capability_verdict_with_policy(
     let mut checks: Vec<WorkerCheck> = Vec::new();
 
     // Capability verdict via the existing resolver (honest provenance).
+    // The evidence bar comes from the caller (`decide` defaults to "any"):
+    // a VERIFIED requirement is only satisfied by VERIFIED claims, while
+    // "any" also accepts INFERRED ones — the provenance stays visible in
+    // `state` either way, so nothing is ever over-claimed.
     // When there is NO capability data at all (empty claims), the honest state
     // is UNKNOWN — the resolver would report MISSING, but "no data" is distinct
     // from "claims exist and none match". Never convert UNKNOWN into success or
@@ -970,7 +977,11 @@ pub(crate) fn worker_capability_verdict_with_policy(
             .iter()
             .map(|(c, p)| (c.as_str(), p.as_str()))
             .collect();
-        decentraai_fabric::planner::resolve_capability_requirement(capability, &claim_refs)
+        decentraai_fabric::planner::resolve_capability_requirement_with_evidence(
+            capability,
+            &claim_refs,
+            evidence == "verified",
+        )
     };
     let cap_pass = cap_view.satisfied;
     checks.push(WorkerCheck {

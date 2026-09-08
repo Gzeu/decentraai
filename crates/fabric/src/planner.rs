@@ -794,32 +794,37 @@ pub(crate) fn network_score(link: &LinkMetrics) -> f32 {
 /// either `"verified"` or `"inferred"`. The fabric deliberately does NOT depend
 /// on the registry or hub crates — it only consumes the resolved shapes.
 ///
-/// Honesty semantics (the requirement is interpreted as needing VERIFIED
-/// evidence):
+/// Honesty semantics with an explicit evidence bar (`require_verified`):
 /// - a matching claim with provenance `"verified"` → satisfied, `"VERIFIED"`;
-/// - else a matching claim with provenance `"inferred"` → NOT satisfied,
-///   `"INFERRED"` (an inferred claim never satisfies a verified requirement);
-/// - else → NOT satisfied, `"MISSING"`.
+/// - else a matching claim with provenance `"inferred"` → satisfied with
+///   `"INFERRED"` iff the bar is NOT verified (an inferred claim never
+///   satisfies a verified requirement, but it does satisfy an "any"
+///   requirement — the provenance stays visible either way);
+/// - else → NOT satisfied, `"MISSING"` (no data is never success).
 ///
 /// `label` is derived purely from the capability name (`'_'` → `' '`); it never
 /// invents a label not derivable from the name. Capability matching is
 /// case-insensitive on the snake_case names.
-pub fn resolve_capability_requirement(
+pub fn resolve_capability_requirement_with_evidence(
     required_capability: &str,
     claims: &[(&str, &str)],
+    require_verified: bool,
 ) -> CapabilityRequirementView {
     let eq = |name: &str| name.eq_ignore_ascii_case(required_capability);
     let matching = claims.iter().filter(|(cap, _)| eq(cap)).collect::<Vec<_>>();
 
-    let (satisfied, evidence) = if matching
+    let has_verified = matching
         .iter()
-        .any(|(_, prov)| prov.eq_ignore_ascii_case("verified"))
-    {
+        .any(|(_, prov)| prov.eq_ignore_ascii_case("verified"));
+    let has_inferred = matching
+        .iter()
+        .any(|(_, prov)| prov.eq_ignore_ascii_case("inferred"));
+
+    let (satisfied, evidence) = if has_verified {
         (true, "VERIFIED")
-    } else if matching
-        .iter()
-        .any(|(_, prov)| prov.eq_ignore_ascii_case("inferred"))
-    {
+    } else if has_inferred && !require_verified {
+        (true, "INFERRED")
+    } else if has_inferred {
         (false, "INFERRED")
     } else {
         (false, "MISSING")
@@ -831,6 +836,17 @@ pub fn resolve_capability_requirement(
         satisfied,
         evidence: evidence.to_string(),
     }
+}
+
+/// Legacy entry point: the requirement is interpreted as needing VERIFIED
+/// evidence (execution-planner notes path). New projection code should take
+/// the evidence bar explicitly via
+/// [`resolve_capability_requirement_with_evidence`].
+pub fn resolve_capability_requirement(
+    required_capability: &str,
+    claims: &[(&str, &str)],
+) -> CapabilityRequirementView {
+    resolve_capability_requirement_with_evidence(required_capability, claims, true)
 }
 
 /// Builds the honest capability-requirement verdict for a request, or `None`
@@ -1504,6 +1520,29 @@ mod tests {
         let view = resolve_capability_requirement("ocr", &[("ocr", "inferred")]);
         assert!(!view.satisfied);
         assert_eq!(view.evidence, "INFERRED");
+    }
+
+    #[test]
+    fn evidence_bar_any_accepts_inferred_verified_bar_does_not() {
+        // The evidence bar is explicit: "any" accepts INFERRED provenance
+        // (still reported as INFERRED, never upgraded), "verified" does not.
+        // MISSING fails under both bars — no data is never success.
+        let any =
+            resolve_capability_requirement_with_evidence("ocr", &[("ocr", "inferred")], false);
+        assert!(any.satisfied);
+        assert_eq!(any.evidence, "INFERRED");
+        let strict =
+            resolve_capability_requirement_with_evidence("ocr", &[("ocr", "inferred")], true);
+        assert!(!strict.satisfied);
+        assert_eq!(strict.evidence, "INFERRED");
+        let missing_any =
+            resolve_capability_requirement_with_evidence("ocr", &[("asr", "verified")], false);
+        assert!(!missing_any.satisfied);
+        assert_eq!(missing_any.evidence, "MISSING");
+        let verified_ok =
+            resolve_capability_requirement_with_evidence("ocr", &[("ocr", "verified")], true);
+        assert!(verified_ok.satisfied);
+        assert_eq!(verified_ok.evidence, "VERIFIED");
     }
 
     #[test]
