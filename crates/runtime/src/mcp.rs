@@ -2091,6 +2091,44 @@ pub fn discover_capabilities_request(raw: &str) -> bool {
         == Some("discover_capabilities")
 }
 
+/// M22: Extract `diffusion_generate` parameters from an MCP tools/call.
+/// Returns `(prompt, negative_prompt, width, height, steps, guidance_scale, seed)`.
+pub fn diffusion_generate_request(raw: &str) -> Option<(String, String, u32, u32, u32, f64, i64)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "diffusion_generate" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let prompt = args.get("prompt").and_then(|v| v.as_str())?.to_string();
+    if prompt.is_empty() || prompt.len() > 4000 {
+        return None;
+    }
+    let negative_prompt = args
+        .get("negative_prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
+    let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
+    let steps = args
+        .get("steps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as u32;
+    let guidance_scale = args
+        .get("guidance_scale")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(7.5);
+    let seed = args.get("seed").and_then(|v| v.as_i64()).unwrap_or(-1);
+    Some((prompt, negative_prompt, width.min(1024), height.min(1024), steps.min(50), guidance_scale, seed))
+}
+
 /// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).
 pub fn compute_request(raw: &str) -> Option<(String, Value, u64)> {
     let msg: Value = serde_json::from_str(raw).ok()?;
@@ -3483,5 +3521,118 @@ mod tests {
             r["result"]["capabilities"]["tools"].is_object(),
             "capabilities.tools must be present for ChatGPT connector"
         );
+    }
+
+    // ── M22 diffusion_generate_request unit tests ──────────────
+
+    #[test]
+    fn diffusion_generate_valid_request_parses_all_fields() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"a cat","negative_prompt":"blurry","width":768,"height":1024,"steps":30,"guidance_scale":8.0,"seed":42}}}"#;
+        let r = diffusion_generate_request(raw).unwrap();
+        assert_eq!(r.0, "a cat");
+        assert_eq!(r.1, "blurry");
+        assert_eq!(r.2, 768);
+        assert_eq!(r.3, 1024);
+        assert_eq!(r.4, 30);
+        assert_eq!(r.5, 8.0);
+        assert_eq!(r.6, 42);
+    }
+
+    #[test]
+    fn diffusion_generate_defaults_when_args_omitted() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"hello"}}}"#;
+        let r = diffusion_generate_request(raw).unwrap();
+        assert_eq!(r.0, "hello");
+        assert_eq!(r.1, "");
+        assert_eq!(r.2, 512);
+        assert_eq!(r.3, 512);
+        assert_eq!(r.4, 20);
+        assert_eq!(r.5, 7.5);
+        assert_eq!(r.6, -1);
+    }
+
+    #[test]
+    fn diffusion_generate_caps_width_height_steps() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"x","width":2048,"height":4000,"steps":100}}}"#;
+        let r = diffusion_generate_request(raw).unwrap();
+        assert_eq!(r.2, 1024, "width capped at 1024");
+        assert_eq!(r.3, 1024, "height capped at 1024");
+        assert_eq!(r.4, 50, "steps capped at 50");
+    }
+
+    #[test]
+    fn diffusion_generate_rejects_empty_prompt() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":""}}}"#;
+        assert!(diffusion_generate_request(raw).is_none());
+    }
+
+    #[test]
+    fn diffusion_generate_rejects_long_prompt() {
+        let prompt = "x".repeat(4001);
+        let raw = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"diffusion_generate","arguments":{{"prompt":"{prompt}"}}}}}}"#
+        );
+        assert!(diffusion_generate_request(&raw).is_none());
+    }
+
+    #[test]
+    fn diffusion_generate_rejects_non_mcp_message() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert!(diffusion_generate_request(raw).is_none());
+    }
+
+    #[test]
+    fn diffusion_generate_rejects_wrong_tool_name() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"some_other_tool","arguments":{"prompt":"x"}}}"#;
+        assert!(diffusion_generate_request(raw).is_none());
+    }
+
+    #[test]
+    fn diffusion_generate_rejects_malformed_json() {
+        assert!(diffusion_generate_request("not-json").is_none());
+    }
+
+    // ── M22 diffusion MCP integration tests ────────────────────
+
+    #[test]
+    fn diffusion_list_models_returns_snapshot_from_context() {
+        let mut c = ctx();
+        c.diffusion_models = json!({
+            "enabled": true,
+            "healthy": true,
+            "models": ["stable-diffusion-v1-5", "sdxl-base-1.0"]
+        });
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diffusion_list_models","arguments":{}}}"#).unwrap();
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("stable-diffusion-v1-5"));
+        assert!(content.contains("sdxl-base-1.0"));
+        assert!(content.contains("enabled"));
+    }
+
+    #[test]
+    fn diffusion_generate_returns_action_result_from_context() {
+        // Simulates the HTTP async layer having populated diffusion_action
+        // with the backend's real response (base64 PNG placeholder).
+        let mut c = ctx();
+        c.diffusion_action = json!({
+            "image_b64": "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAKklEQVR42mP8z8AQVhhG...",
+            "seed": 42,
+            "width": 512,
+            "height": 512,
+            "model": "stable-diffusion-v1-5"
+        });
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"a cat"}}}"#).unwrap();
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(content.contains("iVBORw0KGgo"), "backend image result must be returned");
+        assert!(content.contains("stable-diffusion-v1-5"));
+    }
+
+    #[test]
+    fn diffusion_generate_empty_action_returns_empty_object() {
+        // When the HTTP layer hasn't populated the action yet (read-only
+        // snapshot path), handle_message returns the empty default.
+        let c = ctx(); // diffusion_action defaults to json!({})
+        let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"test"}}}"#).unwrap();
+        assert_eq!(r["result"]["content"][0]["text"], "{}");
     }
 }

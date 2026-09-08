@@ -50,6 +50,39 @@ pub const RECONNECT_STABLE_SECS: u64 = 30;
 /// this list grows without limit on WAN links.
 pub const MAX_EXTERNAL_ADDRESSES: usize = 8;
 
+/// M24: Per-peer connection quality metrics. Tracked in the event loop and
+/// exposed to the planner via `P2PNode::peer_quality()` for routing decisions.
+#[derive(Debug, Clone, Default)]
+pub struct PeerQuality {
+    /// Total successful connections to this peer.
+    pub connect_success: u32,
+    /// Total failed connection attempts (timeout, refused, etc.).
+    pub connect_failures: u32,
+    /// When the last successful connection was established.
+    pub last_success: Option<std::time::Instant>,
+    /// Running average RTT in milliseconds (exponential moving average).
+    pub avg_rtt_ms: Option<f64>,
+}
+
+impl PeerQuality {
+    /// Stability score for the planner: higher = more stable. Combines
+    /// success rate and recency. Range: 0.0 (never connected) to 1.0
+    /// (always succeeds, connected recently).
+    pub fn stability_score(&self) -> f64 {
+        let total = self.connect_success + self.connect_failures;
+        if total == 0 {
+            return 0.0;
+        }
+        let success_rate = self.connect_success as f64 / total as f64;
+        let recency = self.last_success.map(|t| {
+            let age_secs = t.elapsed().as_secs_f64();
+            // Decay: 1.0 at t=0, 0.5 at 5min, ~0.0 at 30min
+            (-age_secs / 300.0).exp()
+        }).unwrap_or(0.0);
+        0.7 * success_rate + 0.3 * recency
+    }
+}
+
 /// Transport/discovery options for a node. Defaults to LAN-only (mDNS), which
 /// preserves the original single-subnet behaviour exactly. To reach peers
 /// across NAT / subnets, enable the DHT and optionally relay.
@@ -522,6 +555,8 @@ pub struct P2PNode {
     /// Memory-sync dispatch slot. `None` = this node does not accept memory
     /// sync; inbound batches get an explicit `declined` response.
     on_memory_sync: SharedHandler<MemorySyncHandler>,
+    /// M24: Per-peer connection quality, shared with the swarm event loop.
+    peer_quality: std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, PeerQuality>>>,
 }
 
 impl P2PNode {
@@ -780,6 +815,10 @@ impl P2PNode {
         } else {
             HashMap::new()
         };
+        // M24: Shared peer quality map between P2PNode and the swarm event loop.
+        let peer_quality_shared: std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, PeerQuality>>> =
+            std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let peer_quality_loop = peer_quality_shared.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -793,6 +832,10 @@ impl P2PNode {
             // Per-peer reconnect attempts since the last successful connection,
             // so a peer that went away doesn't get dialed forever.
             let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
+            // M24: Per-peer connection quality tracking for the planner.
+            // Tracks success/failure counts, last success time, and
+            // average RTT to help the planner prefer stable peers.
+            let mut peer_quality: HashMap<PeerId, PeerQuality> = HashMap::new();
             // Last known address per peer, kept so a disconnect can be
             // re-dialed without waiting for another mDNS announcement.
             let mut known_addresses: HashMap<PeerId, Multiaddr> = known_addresses;
@@ -815,6 +858,8 @@ impl P2PNode {
             // public IP behind NAT). Advertised on the swarm so peers can
             // dial us directly; surfaced for the control plane.
             let mut external_addresses: Vec<Multiaddr> = Vec::new();
+            // M24: Periodic sync of connection quality to the shared Arc.
+            let mut quality_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
             loop {
                 tokio::select! {
@@ -921,6 +966,10 @@ impl P2PNode {
                                         "network partition cleared: peer reconnected"
                                     );
                                 }
+                                // M24: track connection quality.
+                                let quality = peer_quality.entry(peer_id).or_default();
+                                quality.connect_success += 1;
+                                quality.last_success = Some(std::time::Instant::now());
                                 connected_since.insert(peer_id, std::time::Instant::now());
                                 if !connected.contains(&peer_id) {
                                     connected.push(peer_id);
@@ -980,6 +1029,9 @@ impl P2PNode {
                                 let max_attempts = if lan { RECONNECT_MAX_ATTEMPTS_LAN } else { RECONNECT_MAX_ATTEMPTS };
                                 if *attempt >= max_attempts {
                                     reconnect_attempts.remove(&peer_id);
+                                    // M24: track connection failure.
+                                    let quality = peer_quality.entry(peer_id).or_default();
+                                    quality.connect_failures += 1;
                                     debug!(%peer_id, lan, "reconnect budget exhausted; waiting for mDNS");
                                     // Partition detection: if no peers
                                     // remain connected and all known
@@ -1431,6 +1483,14 @@ impl P2PNode {
                             _ => {}
                         }
                     }
+                    _ = quality_sync_interval.tick() => {
+                        // M24: Periodically snapshot local peer quality into
+                        // the shared Arc so P2PNode::peer_quality() readers
+                        // get fresh data without locking the event loop.
+                        if !peer_quality.is_empty() {
+                            *peer_quality_loop.write().await = peer_quality.clone();
+                        }
+                    }
                 }
             }
         });
@@ -1444,6 +1504,7 @@ impl P2PNode {
             on_cancel,
             on_manifest,
             on_memory_sync,
+            peer_quality: peer_quality_shared,
         })
     }
 
@@ -1520,6 +1581,13 @@ impl P2PNode {
 
     pub fn shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
+    }
+
+    /// M24: Returns per-peer connection quality snapshots. Used by the planner
+    /// to prefer stable peers (high stability_score) when multiple workers
+    /// offer the same capability.
+    pub async fn peer_quality(&self) -> HashMap<PeerId, PeerQuality> {
+        self.peer_quality.read().await.clone()
     }
 
     /// Returns the PeerIds of currently connected peers. Best-effort: an
@@ -1826,5 +1894,46 @@ mod tests {
         assert!(!is_lan_address(&"/ip4/1.1.1.1/tcp/4001".parse().unwrap()));
         // DNS hostnames are WAN by default.
         assert!(!is_lan_address(&"/dns4/example.com/tcp/4001".parse().unwrap()));
+    }
+
+    #[test]
+    fn peer_quality_default_stability_zero() {
+        let q = PeerQuality::default();
+        assert_eq!(q.stability_score(), 0.0);
+    }
+
+    #[test]
+    fn peer_quality_stability_rewards_success_and_recency() {
+        let clean = PeerQuality {
+            connect_success: 10,
+            connect_failures: 0,
+            last_success: Some(std::time::Instant::now()),
+            avg_rtt_ms: Some(15.0),
+        };
+        let score_clean = clean.stability_score();
+        // 0.7 * 1.0 + 0.3 * ~1.0 = ~1.0
+        assert!(score_clean > 0.95, "clean link should have high stability score: {score_clean}");
+
+        let flaky = PeerQuality {
+            connect_success: 5,
+            connect_failures: 5,
+            last_success: Some(std::time::Instant::now()),
+            avg_rtt_ms: Some(50.0),
+        };
+        let score_flaky = flaky.stability_score();
+        // 0.7 * 0.5 + 0.3 * ~1.0 = ~0.65
+        assert!(score_flaky < score_clean, "flaky link should score lower than clean link");
+        assert!(score_flaky > 0.5, "flaky link with recent success should score around 0.65: {score_flaky}");
+    }
+
+    #[test]
+    fn peer_quality_stability_all_failures_is_zero() {
+        let q = PeerQuality {
+            connect_success: 0,
+            connect_failures: 10,
+            last_success: None,
+            avg_rtt_ms: None,
+        };
+        assert_eq!(q.stability_score(), 0.0);
     }
 }

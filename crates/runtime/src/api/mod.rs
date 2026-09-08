@@ -4713,13 +4713,81 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
     let raw0 = &raw;
     if crate::mcp::execution_request(raw0).is_some()
         || crate::mcp::serve_model_request(raw0).is_some()
-        || crate::mcp::pull_model_request(raw0).is_some()
-    {
-        if let Err(e) = state.require_master(&headers) {
-            return e.into_response();
-        }
-    }
-    let mut ctx = mcp_context(&state).await;
+         || crate::mcp::pull_model_request(raw0).is_some()
+     {
+         if let Err(e) = state.require_master(&headers) {
+             return e.into_response();
+         }
+     }
+     // M22: diffusion_generate for operator/master tokens via MCP.
+     // Same backend proxy as the consumer path, but auth is already
+     // established by the operator/master gate above (no scope check
+     // needed — operator/master have full control-plane access).
+     if let Some((prompt, neg, w, h, steps, cfg, seed)) =
+         crate::mcp::diffusion_generate_request(&raw)
+     {
+         if !state.diffusion.enabled() {
+             return (
+                 StatusCode::NOT_FOUND,
+                 serde_json::json!({"error": {"message": "Diffusion is not enabled on this node"}})
+                     .to_string(),
+             )
+                 .into_response();
+         }
+         let Some(base) = state.diffusion.base_url() else {
+             return StatusCode::NOT_FOUND.into_response();
+         };
+         let forwarded = serde_json::json!({
+             "prompt": prompt,
+             "negative_prompt": neg,
+             "width": w,
+             "height": h,
+             "steps": steps,
+             "guidance_scale": cfg,
+             "seed": seed,
+         });
+         let request = match state
+             .client
+             .post(format!("{base}/v1/diffusion/t2i"))
+             .header(axum::http::header::CONTENT_TYPE, "application/json")
+             .body(forwarded.to_string())
+             .send()
+             .await
+         {
+             Ok(r) => r,
+             Err(e) => {
+                 tracing::warn!(error = %e, "M22 Diffusion backend unreachable (operator/master MCP)");
+                 return (
+                     StatusCode::BAD_GATEWAY,
+                     serde_json::json!({"error": {"message": "Diffusion backend unreachable"}})
+                         .to_string(),
+                 )
+                     .into_response();
+             }
+         };
+         let text = match request.text().await {
+             Ok(t) => t,
+             Err(e) => {
+                 tracing::warn!(error = %e, "M22 Diffusion backend read failed (operator/master MCP)");
+                 return StatusCode::BAD_GATEWAY.into_response();
+             }
+         };
+         let id = serde_json::from_str::<serde_json::Value>(&raw)
+             .ok()
+             .and_then(|v| v.get("id").cloned())
+             .unwrap_or(serde_json::Value::Null);
+         let body = serde_json::json!({
+             "jsonrpc": "2.0",
+             "id": id,
+             "result": {"content": [{"type": "text", "text": text}]}
+         });
+         return (
+             [(axum::http::header::CONTENT_TYPE, "application/json")],
+             serde_json::to_string(&body).unwrap_or_default(),
+         )
+             .into_response();
+     }
+     let mut ctx = mcp_context(&state).await;
     // A `search_models_by_capability` call needs a live Hub lookup: precompute
     // its result here (the MCP layer is I/O-free). Unknown/invalid capability
     // values yield an empty honest result, never a fabricated positive.
@@ -6996,6 +7064,76 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             "jsonrpc": "2.0",
             "id": id,
             "result": {"content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]}
+        });
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&body).unwrap_or_default(),
+        )
+            .into_response();
+    } else if let Some((prompt, neg, w, h, steps, cfg, seed)) =
+        crate::mcp::diffusion_generate_request(&raw)
+    {
+        // M22: diffusion_generate — text-to-image via Stable Diffusion subprocess.
+        if !scopes.iter().any(|s| s == "image_generation" || s == "*") {
+            return forbidden("consumer key missing image_generation scope");
+        }
+        if let Err(e) = state.check_consumer_rate_limit(key_id, *rate_limit_per_minute) {
+            return e.into_response();
+        }
+        if !state.diffusion.enabled() {
+            return (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error": {"message": "Diffusion is not enabled on this node"}})
+                    .to_string(),
+            )
+                .into_response();
+        }
+        let Some(base) = state.diffusion.base_url() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let forwarded = serde_json::json!({
+            "prompt": prompt,
+            "negative_prompt": neg,
+            "width": w,
+            "height": h,
+            "steps": steps,
+            "guidance_scale": cfg,
+            "seed": seed,
+        });
+        let request = match state
+            .client
+            .post(format!("{base}/v1/diffusion/t2i"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(forwarded.to_string())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "M22 Diffusion backend unreachable");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"error": {"message": "Diffusion backend unreachable"}})
+                        .to_string(),
+                )
+                    .into_response();
+            }
+        };
+        let text = match request.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "M22 Diffusion backend read failed");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"content": [{"type": "text", "text": text}]}
         });
         return (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
