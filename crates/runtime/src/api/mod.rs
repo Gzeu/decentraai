@@ -8097,7 +8097,22 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         || raw.contains("\"method\":\"ping\"")
         || raw.contains("\"method\":\"notifications/initialized\"")
     {
-        // Read-only discovery — allowed for consumer keys.
+        // MCP lifecycle for consumer keys: initialize/ping/notifications
+        // are read-only protocol with no scope implications — the same
+        // responses as the master path. Without this arm the request fell
+        // through to the final `forbidden`, so spec-compliant clients
+        // (which always open with `initialize`) got 403 on the first call.
+        // Notifications yield no body (HTTP 202).
+        match crate::mcp::handle_message(&ctx, &raw) {
+            Some(json) => {
+                return (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&json).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+            None => return StatusCode::ACCEPTED.into_response(),
+        }
     } else if crate::mcp::society_state_request(&raw) {
         // Society read-only tools for consumers (require "society" scope)
         if !scopes.iter().any(|s| s == "society" || s == "*") {
@@ -17161,6 +17176,77 @@ mod tests {
         );
 
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// MCP lifecycle over a scoped consumer key: a spec-compliant client
+    /// opens with `initialize` and must NOT get 403 (regression: the
+    /// lifecycle arm fell through to `forbidden`, so ChatGPT/Claude-style
+    /// connectors failed on the very first call while raw tools/list
+    /// worked).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_consumer_key_completes_lifecycle_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _ledger) =
+            start_consumer_state(dir.path(), "mcp-lifecycle-master".to_string()).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+        let created: serde_json::Value = client
+            .post(format!("{base}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer mcp-lifecycle-master")
+            .json(&serde_json::json!({
+                "account": "lifecycle-probe",
+                "quota_ceiling": 100,
+                "rate_limit_per_minute": 60,
+                "scopes": ["execute", "inference"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let key = created["token"].as_str().unwrap().to_string();
+        assert!(key.starts_with("dca_"));
+        let call = |body: &str| {
+            client
+                .post(format!("{base}/mcp"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {key}"))
+                .body(body.to_string())
+        };
+
+        // 1. initialize negotiates the protocol (was 403 before the fix).
+        let init = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#)
+            .send().await.unwrap();
+        assert_eq!(init.status(), 200);
+        let ij: serde_json::Value = init.json().await.unwrap();
+        assert_eq!(ij["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(ij["result"]["serverInfo"]["name"], "decentraai-mcp");
+
+        // 2. ping answers empty.
+        let ping = call(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ping.status(), 200);
+        let pj: serde_json::Value = ping.json().await.unwrap();
+        assert_eq!(pj["result"], serde_json::json!({}));
+
+        // 3. notifications/initialized yields no body (202).
+        let notif = call(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(notif.status(), 202);
+        assert!(notif.text().await.unwrap().is_empty());
+
+        // 4. tools/list still works on the same key.
+        let list = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 200);
     }
 
     #[cfg(unix)]
