@@ -4800,12 +4800,14 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let Some(base) = state.diffusion.base_url() else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        // M22: honour the operator caps carried by the DiffusionManager
+        // (defaults 1024/50 = extractor parity; stricter config clamps here).
         let forwarded = serde_json::json!({
             "prompt": prompt,
             "negative_prompt": neg,
-            "width": w,
-            "height": h,
-            "steps": steps,
+            "width": state.diffusion.clamp_dim(w),
+            "height": state.diffusion.clamp_dim(h),
+            "steps": state.diffusion.clamp_steps(steps),
             "guidance_scale": cfg,
             "seed": seed,
         });
@@ -7160,12 +7162,14 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         let Some(base) = state.diffusion.base_url() else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        // M22: honour the operator caps carried by the DiffusionManager
+        // (defaults 1024/50 = extractor parity; stricter config clamps here).
         let forwarded = serde_json::json!({
             "prompt": prompt,
             "negative_prompt": neg,
-            "width": w,
-            "height": h,
-            "steps": steps,
+            "width": state.diffusion.clamp_dim(w),
+            "height": state.diffusion.clamp_dim(h),
+            "steps": state.diffusion.clamp_steps(steps),
             "guidance_scale": cfg,
             "seed": seed,
         });
@@ -9391,6 +9395,16 @@ async fn diffusion_t2i_handler(
         )
             .into_response();
     }
+    // M22 parity with the MCP `diffusion_generate` extractor: over-long
+    // prompts are rejected before touching the backend.
+    if prompt.len() > crate::tools::DIFFUSION_MAX_PROMPT_CHARS {
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": {"message": "prompt exceeds 4000 characters"}})
+                .to_string(),
+        )
+            .into_response();
+    }
     if !state.diffusion.enabled() {
         return (
             StatusCode::NOT_FOUND,
@@ -9402,12 +9416,15 @@ async fn diffusion_t2i_handler(
     let Some(base) = state.diffusion.base_url() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // M22: clamp caller dimensions/steps against the operator caps carried
+    // by the DiffusionManager (defaults 1024/50 = MCP + Python parity).
+    // Oversized values shrink to the cap instead of burning backend CPU.
     let forwarded = serde_json::json!({
         "prompt": prompt,
         "negative_prompt": payload.get("negative_prompt").and_then(|v| v.as_str()).unwrap_or(""),
-        "width": payload.get("width").and_then(|v| v.as_u64()).unwrap_or(512),
-        "height": payload.get("height").and_then(|v| v.as_u64()).unwrap_or(512),
-        "steps": payload.get("steps").and_then(|v| v.as_u64()).unwrap_or(20),
+        "width": state.diffusion.clamp_dim(payload.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32),
+        "height": state.diffusion.clamp_dim(payload.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32),
+        "steps": state.diffusion.clamp_steps(payload.get("steps").and_then(|v| v.as_u64()).unwrap_or(20) as u32),
         "guidance_scale": payload.get("guidance_scale").and_then(|v| v.as_f64()).unwrap_or(7.5),
         "seed": payload.get("seed").and_then(|v| v.as_i64()).unwrap_or(-1),
     });

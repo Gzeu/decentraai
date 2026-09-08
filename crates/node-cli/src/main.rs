@@ -1545,7 +1545,10 @@ async fn spawn_tool_runtimes(
                         model = %diff_cfg.model,
                         "M22 Diffusion online (Stable Diffusion subprocess)"
                     );
-                    diffusion = Some(DiffusionManager::new(Some(server)));
+                    diffusion = Some(
+                        DiffusionManager::new(Some(server))
+                            .with_limits(diff_cfg.max_size, diff_cfg.max_steps),
+                    );
                 }
                 Err(e) => warn!(
                     error = %e,

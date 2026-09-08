@@ -517,18 +517,63 @@ impl DiffusionServer {
     }
 }
 
+/// M22: maximum prompt length accepted by the diffusion surface (REST +
+/// MCP). Mirrors the MCP extractor bound so both doors share one policy.
+pub const DIFFUSION_MAX_PROMPT_CHARS: usize = 4000;
+
 /// Holds the Diffusion subprocess. `None` server = Diffusion disabled.
+/// `max_size` / `max_steps` are the operator caps from `DiffusionSection`
+/// (defaults 1024/50); the REST handler clamps caller input against them
+/// before proxying, so oversized requests are rejected cheaply instead of
+/// burning minutes of CPU in the Python backend (which keeps its own
+/// 1024/50 clamp as the last line of defense).
 pub struct DiffusionManager {
     server: Option<DiffusionServer>,
+    max_size: u32,
+    max_steps: u32,
 }
 
 impl DiffusionManager {
     pub fn new(server: Option<DiffusionServer>) -> Self {
-        Self { server }
+        Self {
+            server,
+            max_size: 1024,
+            max_steps: 50,
+        }
+    }
+
+    /// Applies the operator caps from config. Zero values are sanitized to
+    /// 1 so a misconfigured cap can never clamp every request to 0.
+    pub fn with_limits(mut self, max_size: u32, max_steps: u32) -> Self {
+        self.max_size = max_size.max(1);
+        self.max_steps = max_steps.max(1);
+        self
     }
 
     pub fn disabled() -> Self {
-        Self { server: None }
+        Self {
+            server: None,
+            max_size: 1024,
+            max_steps: 50,
+        }
+    }
+
+    pub fn max_size(&self) -> u32 {
+        self.max_size
+    }
+
+    pub fn max_steps(&self) -> u32 {
+        self.max_steps
+    }
+
+    /// Upper-bound clamp for one image dimension against the operator cap.
+    pub fn clamp_dim(&self, v: u32) -> u32 {
+        v.min(self.max_size)
+    }
+
+    /// Upper-bound clamp for inference steps against the operator cap.
+    pub fn clamp_steps(&self, s: u32) -> u32 {
+        s.min(self.max_steps)
     }
 
     pub fn enabled(&self) -> bool {
@@ -559,5 +604,34 @@ mod tests {
     fn site_packages_finder_tolerates_missing_lib() {
         let missing = Path::new("/nonexistent/venv/bin/python");
         assert!(find_site_packages(missing).is_none());
+    }
+
+    #[test]
+    fn diffusion_manager_default_caps_match_mcp_and_python() {
+        // REST parity: defaults must equal the MCP extractor clamp
+        // (1024/50 in mcp.rs) and the Python backend clamp.
+        let m = DiffusionManager::disabled();
+        assert_eq!(m.max_size(), 1024);
+        assert_eq!(m.max_steps(), 50);
+        assert_eq!(m.clamp_dim(4096), 1024);
+        assert_eq!(m.clamp_dim(512), 512);
+        assert_eq!(m.clamp_steps(100), 50);
+        assert_eq!(m.clamp_steps(20), 20);
+    }
+
+    #[test]
+    fn diffusion_manager_with_limits_honours_operator_caps() {
+        let m = DiffusionManager::disabled().with_limits(512, 10);
+        assert_eq!(m.max_size(), 512);
+        assert_eq!(m.max_steps(), 10);
+        assert_eq!(m.clamp_dim(1024), 512);
+        assert_eq!(m.clamp_steps(50), 10);
+    }
+
+    #[test]
+    fn diffusion_manager_with_limits_sanitizes_zero() {
+        let m = DiffusionManager::disabled().with_limits(0, 0);
+        assert_eq!(m.max_size(), 1);
+        assert_eq!(m.max_steps(), 1);
     }
 }
