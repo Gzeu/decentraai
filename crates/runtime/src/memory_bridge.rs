@@ -17,8 +17,10 @@ use std::collections::HashMap;
 
 use tracing::{debug, warn};
 
-use decentraai_agents::memory::{KnowledgeKind, MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope};
 use decentraai_agents::memory::MemoryAccess;
+use decentraai_agents::memory::{
+    KnowledgeKind, MemoryEntry, MemoryLevel, MemoryPolicy, MemoryScope,
+};
 use decentraai_distributed::agent_memory::MemoryStore;
 
 /// Configuration for one personal→collective bridge.
@@ -109,8 +111,7 @@ pub fn ensure_bridged_scopes(
             allow_remote_write: true,
             ..Default::default()
         };
-        let scope = MemoryScope::new(scope_name, owner_agent, level)
-            .with_policy(policy);
+        let scope = MemoryScope::new(scope_name, owner_agent, level).with_policy(policy);
         if let Err(e) = memory.register_scope(&scope) {
             warn!(
                 category,
@@ -301,10 +302,7 @@ mod tests {
             },
         );
         assert!(m.get("custom").is_some());
-        assert_eq!(
-            m.get("custom").unwrap().collective_scope,
-            "custom.scope"
-        );
+        assert_eq!(m.get("custom").unwrap().collective_scope, "custom.scope");
     }
 
     #[test]
@@ -314,9 +312,21 @@ mod tests {
         ensure_bridged_scopes(&store, &mapping, "governor", false);
         let scopes = store.list_scopes().unwrap();
         for s in &scopes {
-            if s.name == "agent.lessons" || s.name == "agent.decisions" || s.name == "agent.experiences" {
-                assert_eq!(s.level, MemoryLevel::Node, "scope {} should be Node level when bridge_sync=false", s.name);
-                assert!(s.policy.allow_remote_write, "scope {} needs allow_remote_write for bridge writes", s.name);
+            if s.name == "agent.lessons"
+                || s.name == "agent.decisions"
+                || s.name == "agent.experiences"
+            {
+                assert_eq!(
+                    s.level,
+                    MemoryLevel::Node,
+                    "scope {} should be Node level when bridge_sync=false",
+                    s.name
+                );
+                assert!(
+                    s.policy.allow_remote_write,
+                    "scope {} needs allow_remote_write for bridge writes",
+                    s.name
+                );
             }
         }
     }
@@ -328,10 +338,26 @@ mod tests {
         ensure_bridged_scopes(&store, &mapping, "governor", true);
         let scopes = store.list_scopes().unwrap();
         for s in &scopes {
-            if s.name == "agent.lessons" || s.name == "agent.decisions" || s.name == "agent.experiences" {
-                assert_eq!(s.level, MemoryLevel::Network, "scope {} should be Network level when bridge_sync=true", s.name);
-                assert!(s.policy.allow_remote_write, "scope {} should allow remote write when bridge_sync=true", s.name);
-                assert!(matches!(s.policy.access, MemoryAccess::Public), "scope {} should be Public access", s.name);
+            if s.name == "agent.lessons"
+                || s.name == "agent.decisions"
+                || s.name == "agent.experiences"
+            {
+                assert_eq!(
+                    s.level,
+                    MemoryLevel::Network,
+                    "scope {} should be Network level when bridge_sync=true",
+                    s.name
+                );
+                assert!(
+                    s.policy.allow_remote_write,
+                    "scope {} should allow remote write when bridge_sync=true",
+                    s.name
+                );
+                assert!(
+                    matches!(s.policy.access, MemoryAccess::Public),
+                    "scope {} should be Public access",
+                    s.name
+                );
             }
         }
     }
@@ -341,10 +367,22 @@ mod tests {
         let store = in_memory_store();
         let mapping = BridgeMapping::default_mapping();
         ensure_bridged_scopes(&store, &mapping, "governor", true);
-        mirror_write(&store, &mapping, "agent-1", "lessons", "test lesson content", 1000, true);
+        mirror_write(
+            &store,
+            &mapping,
+            "agent-1",
+            "lessons",
+            "test lesson content",
+            1000,
+            true,
+        );
         let entries = store.read("agent.lessons", "reader", true).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].meta.status, MemoryStatus::Verified, "entry should be Verified when bridge_sync=true");
+        assert_eq!(
+            entries[0].meta.status,
+            MemoryStatus::Verified,
+            "entry should be Verified when bridge_sync=true"
+        );
         assert!(entries[0].content.contains("test lesson content"));
         assert_eq!(entries[0].author_agent, "agent-1");
     }
@@ -354,9 +392,21 @@ mod tests {
         let store = in_memory_store();
         let mapping = BridgeMapping::default_mapping();
         ensure_bridged_scopes(&store, &mapping, "governor", false);
-        mirror_write(&store, &mapping, "agent-1", "lessons", "test lesson content", 2000, false);
+        mirror_write(
+            &store,
+            &mapping,
+            "agent-1",
+            "lessons",
+            "test lesson content",
+            2000,
+            false,
+        );
         let entries = store.read("agent.lessons", "reader", true).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].meta.status, MemoryStatus::Candidate, "entry should be Candidate when bridge_sync=false");
+        assert_eq!(
+            entries[0].meta.status,
+            MemoryStatus::Candidate,
+            "entry should be Candidate when bridge_sync=false"
+        );
     }
 }

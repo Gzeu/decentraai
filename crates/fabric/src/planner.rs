@@ -1616,7 +1616,10 @@ mod tests {
             "vLLM advertises staged transfers"
         );
         assert!(vllm_caps.kv_report, "vLLM advertises KV reporting");
-        assert!(vllm_caps.tensor_parallel.is_some(), "vLLM advertises tensor parallel");
+        assert!(
+            vllm_caps.tensor_parallel.is_some(),
+            "vLLM advertises tensor parallel"
+        );
         assert!(
             !vllm_caps.expert_routing,
             "no engine advertises expert routing today"

@@ -33,8 +33,8 @@ use decentraai_agents::training_export::{TrainingCandidate, training_candidates}
 use decentraai_hub::capability::Provenance;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Errors from the persistent memory store. All recoverable and explainable.

@@ -2156,7 +2156,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // executors so the real tool bindings (name + description + loopback
         // URL) can be attached to the executor. Missing setups fail graceful —
         // the node runs without the tool and logs a warning.
-        let (ocr_new, stt_new, skills_new, tx_new, diffusion_new) = spawn_tool_runtimes(&config, &data_dir).await;
+        let (ocr_new, stt_new, skills_new, tx_new, diffusion_new) =
+            spawn_tool_runtimes(&config, &data_dir).await;
         ocr_manager = ocr_new;
         stt_manager = stt_new;
         skills_manager = skills_new;
@@ -3085,7 +3086,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     loop {
                         // On-write trigger: if a write set the flag, propagate
                         // immediately instead of waiting for the next interval.
-                        let immediate = on_write && propagate_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                        let immediate = on_write
+                            && propagate_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
                         if !immediate {
                             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
                         }
@@ -3201,9 +3203,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                 .as_ref()
                 .map(|ms| ms.bridge_sync)
                 .unwrap_or(false);
-            let mapping = Arc::new(
-                decentraai_runtime::memory_bridge::BridgeMapping::default_mapping(),
-            );
+            let mapping =
+                Arc::new(decentraai_runtime::memory_bridge::BridgeMapping::default_mapping());
             state.attach_memory_bridge(mapping, bridge_sync);
         }
         // Model Colony registry (M-I): governance stages persist across
@@ -4229,9 +4230,9 @@ async fn serve_start(
         .engine
         .as_deref()
         .map(decentraai_inference_adapter::EngineKind::parse);
-    if let Some(tp) = decentraai_runtime::resolve_tensor_parallel_degree(
-        config.inference.tensor_parallel_degree,
-    ) {
+    if let Some(tp) =
+        decentraai_runtime::resolve_tensor_parallel_degree(config.inference.tensor_parallel_degree)
+    {
         if tp >= 2 {
             let flag = match engine_kind {
                 Some(decentraai_inference_adapter::EngineKind::Sglang) => {

@@ -74,11 +74,14 @@ impl PeerQuality {
             return 0.0;
         }
         let success_rate = self.connect_success as f64 / total as f64;
-        let recency = self.last_success.map(|t| {
-            let age_secs = t.elapsed().as_secs_f64();
-            // Decay: 1.0 at t=0, 0.5 at 5min, ~0.0 at 30min
-            (-age_secs / 300.0).exp()
-        }).unwrap_or(0.0);
+        let recency = self
+            .last_success
+            .map(|t| {
+                let age_secs = t.elapsed().as_secs_f64();
+                // Decay: 1.0 at t=0, 0.5 at 5min, ~0.0 at 30min
+                (-age_secs / 300.0).exp()
+            })
+            .unwrap_or(0.0);
         0.7 * success_rate + 0.3 * recency
     }
 }
@@ -146,7 +149,10 @@ fn load_known_addresses(path: &std::path::Path) -> HashMap<PeerId, Multiaddr> {
         return HashMap::new();
     };
     let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) else {
-        warn!(?path, "failed to parse known_addresses file, starting fresh");
+        warn!(
+            ?path,
+            "failed to parse known_addresses file, starting fresh"
+        );
         return HashMap::new();
     };
     map.into_iter()
@@ -184,9 +190,7 @@ fn is_lan_address(addr: &Multiaddr) -> bool {
     for protocol in addr.iter() {
         match protocol {
             Protocol::Ip4(ip) => {
-                return ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local();
+                return ip.is_loopback() || ip.is_private() || ip.is_link_local();
             }
             Protocol::Dns4(_) | Protocol::Dns6(_) => {
                 // Hostnames are WAN by default (could be LAN but we err on
@@ -859,7 +863,8 @@ impl P2PNode {
             // dial us directly; surfaced for the control plane.
             let mut external_addresses: Vec<Multiaddr> = Vec::new();
             // M24: Periodic sync of connection quality to the shared Arc.
-            let mut quality_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut quality_sync_interval =
+                tokio::time::interval(std::time::Duration::from_secs(30));
 
             loop {
                 tokio::select! {
@@ -1885,7 +1890,9 @@ mod tests {
     #[test]
     fn is_lan_address_detects_private_ranges() {
         // Private LAN addresses.
-        assert!(is_lan_address(&"/ip4/192.168.1.10/tcp/4001".parse().unwrap()));
+        assert!(is_lan_address(
+            &"/ip4/192.168.1.10/tcp/4001".parse().unwrap()
+        ));
         assert!(is_lan_address(&"/ip4/10.0.0.5/tcp/4001".parse().unwrap()));
         assert!(is_lan_address(&"/ip4/172.16.0.1/tcp/4001".parse().unwrap()));
         assert!(is_lan_address(&"/ip4/127.0.0.1/tcp/4001".parse().unwrap()));
@@ -1893,7 +1900,9 @@ mod tests {
         assert!(!is_lan_address(&"/ip4/8.8.8.8/tcp/4001".parse().unwrap()));
         assert!(!is_lan_address(&"/ip4/1.1.1.1/tcp/4001".parse().unwrap()));
         // DNS hostnames are WAN by default.
-        assert!(!is_lan_address(&"/dns4/example.com/tcp/4001".parse().unwrap()));
+        assert!(!is_lan_address(
+            &"/dns4/example.com/tcp/4001".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -1912,7 +1921,10 @@ mod tests {
         };
         let score_clean = clean.stability_score();
         // 0.7 * 1.0 + 0.3 * ~1.0 = ~1.0
-        assert!(score_clean > 0.95, "clean link should have high stability score: {score_clean}");
+        assert!(
+            score_clean > 0.95,
+            "clean link should have high stability score: {score_clean}"
+        );
 
         let flaky = PeerQuality {
             connect_success: 5,
@@ -1922,8 +1934,14 @@ mod tests {
         };
         let score_flaky = flaky.stability_score();
         // 0.7 * 0.5 + 0.3 * ~1.0 = ~0.65
-        assert!(score_flaky < score_clean, "flaky link should score lower than clean link");
-        assert!(score_flaky > 0.5, "flaky link with recent success should score around 0.65: {score_flaky}");
+        assert!(
+            score_flaky < score_clean,
+            "flaky link should score lower than clean link"
+        );
+        assert!(
+            score_flaky > 0.5,
+            "flaky link with recent success should score around 0.65: {score_flaky}"
+        );
     }
 
     #[test]

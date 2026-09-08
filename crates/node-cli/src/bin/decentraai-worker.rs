@@ -151,14 +151,10 @@ async fn main() -> Result<()> {
             .max(1),
     );
     // M21: Tensor parallelism — resolve TP degree and inject engine flag.
-    let engine_kind = config
-        .inference
-        .engine
-        .as_deref()
-        .map(EngineKind::parse);
-    if let Some(tp) = decentraai_runtime::resolve_tensor_parallel_degree(
-        config.inference.tensor_parallel_degree,
-    ) {
+    let engine_kind = config.inference.engine.as_deref().map(EngineKind::parse);
+    if let Some(tp) =
+        decentraai_runtime::resolve_tensor_parallel_degree(config.inference.tensor_parallel_degree)
+    {
         if tp >= 2 {
             let flag = match engine_kind {
                 Some(EngineKind::Sglang) => format!("--tp={tp}"),

@@ -2117,16 +2117,21 @@ pub fn diffusion_generate_request(raw: &str) -> Option<(String, String, u32, u32
         .to_string();
     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
     let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
-    let steps = args
-        .get("steps")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as u32;
+    let steps = args.get("steps").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
     let guidance_scale = args
         .get("guidance_scale")
         .and_then(|v| v.as_f64())
         .unwrap_or(7.5);
     let seed = args.get("seed").and_then(|v| v.as_i64()).unwrap_or(-1);
-    Some((prompt, negative_prompt, width.min(1024), height.min(1024), steps.min(50), guidance_scale, seed))
+    Some((
+        prompt,
+        negative_prompt,
+        width.min(1024),
+        height.min(1024),
+        steps.min(50),
+        guidance_scale,
+        seed,
+    ))
 }
 
 /// Extract `decentraai_compute_request` parameters (L1 ASSIST, DFCP).
@@ -2372,9 +2377,7 @@ pub fn memory_write_entry_request(raw: &str) -> Option<Value> {
     if name != "memory_write_entry" {
         return None;
     }
-    msg.get("params")
-        .and_then(|p| p.get("arguments"))
-        .cloned()
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
 }
 
 /// Extracts a `memory_list_conflicts` tool call. Returns (scope, reader_agent, limit).
@@ -3623,7 +3626,10 @@ mod tests {
         });
         let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"a cat"}}}"#).unwrap();
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(content.contains("iVBORw0KGgo"), "backend image result must be returned");
+        assert!(
+            content.contains("iVBORw0KGgo"),
+            "backend image result must be returned"
+        );
         assert!(content.contains("stable-diffusion-v1-5"));
     }
 

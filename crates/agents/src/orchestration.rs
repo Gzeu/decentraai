@@ -592,10 +592,7 @@ impl AssignmentStore {
                     confidence,
                     submitted_at_ms: now_ms,
                 };
-                self.replica_results
-                    .entry(key)
-                    .or_default()
-                    .push(result);
+                self.replica_results.entry(key).or_default().push(result);
                 Ok(())
             }
             _ => Err(AssignmentError::BadTransition),
@@ -1222,7 +1219,9 @@ mod nofm_tests {
         assert!(matches!(reps[1].state, AssignmentState::Assigned { .. }));
 
         // Claim replica 0.
-        store.claim_replica("p1", "s1", 0, "prov-a", now + 100).unwrap();
+        store
+            .claim_replica("p1", "s1", 0, "prov-a", now + 100)
+            .unwrap();
         let reps = store.replicas("p1", "s1");
         assert!(matches!(reps[0].state, AssignmentState::Claimed { .. }));
 
@@ -1234,13 +1233,31 @@ mod nofm_tests {
 
         // Submit replica 0 output.
         store
-            .submit_replica("p1", "s1", 0, "prov-a", serde_json::json!("answer-42"), 0.9, now + 200)
+            .submit_replica(
+                "p1",
+                "s1",
+                0,
+                "prov-a",
+                serde_json::json!("answer-42"),
+                0.9,
+                now + 200,
+            )
             .unwrap();
 
         // Claim + submit replica 1 with same output.
-        store.claim_replica("p1", "s1", 1, "prov-b", now + 150).unwrap();
         store
-            .submit_replica("p1", "s1", 1, "prov-b", serde_json::json!("answer-42"), 0.8, now + 250)
+            .claim_replica("p1", "s1", 1, "prov-b", now + 150)
+            .unwrap();
+        store
+            .submit_replica(
+                "p1",
+                "s1",
+                1,
+                "prov-b",
+                serde_json::json!("answer-42"),
+                0.8,
+                now + 250,
+            )
             .unwrap();
 
         // Consensus should be resolved now (2 of 2 submitted).
@@ -1272,17 +1289,47 @@ mod nofm_tests {
 
         // prov-a and prov-b say "yes", prov-c says "no" — but use threshold 0.8
         // so 2/3 = 0.667 < 0.8 → rejected.
-        store.claim_replica("p1", "s1", 0, "prov-a", now + 100).unwrap();
         store
-            .submit_replica("p1", "s1", 0, "prov-a", serde_json::json!("yes"), 0.9, now + 200)
+            .claim_replica("p1", "s1", 0, "prov-a", now + 100)
             .unwrap();
-        store.claim_replica("p1", "s1", 1, "prov-b", now + 150).unwrap();
         store
-            .submit_replica("p1", "s1", 1, "prov-b", serde_json::json!("yes"), 0.9, now + 250)
+            .submit_replica(
+                "p1",
+                "s1",
+                0,
+                "prov-a",
+                serde_json::json!("yes"),
+                0.9,
+                now + 200,
+            )
             .unwrap();
-        store.claim_replica("p1", "s1", 2, "prov-c", now + 170).unwrap();
         store
-            .submit_replica("p1", "s1", 2, "prov-c", serde_json::json!("no"), 0.9, now + 270)
+            .claim_replica("p1", "s1", 1, "prov-b", now + 150)
+            .unwrap();
+        store
+            .submit_replica(
+                "p1",
+                "s1",
+                1,
+                "prov-b",
+                serde_json::json!("yes"),
+                0.9,
+                now + 250,
+            )
+            .unwrap();
+        store
+            .claim_replica("p1", "s1", 2, "prov-c", now + 170)
+            .unwrap();
+        store
+            .submit_replica(
+                "p1",
+                "s1",
+                2,
+                "prov-c",
+                serde_json::json!("no"),
+                0.9,
+                now + 270,
+            )
             .unwrap();
 
         // With threshold 0.8, 2/3 = 0.667 is below threshold → Rejected.

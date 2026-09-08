@@ -712,12 +712,22 @@ async fn partition_detection_e2e() {
     let id_a = Identity::generate();
     let id_b = Identity::generate();
     let peer_b = libp2p_peer_id(&id_b);
-    let node_a = test_node(&id_a, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)
-        .unwrap();
+    let node_a = test_node(
+        &id_a,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
     let addr_a = node_a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
 
-    let node_b = test_node(&id_b, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_CHUNK_MESSAGE_BYTES, None)
-        .unwrap();
+    let node_b = test_node(
+        &id_b,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+        None,
+    )
+    .unwrap();
     let _addr_b = node_b.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
 
     // B dials A.
@@ -730,10 +740,7 @@ async fn partition_detection_e2e() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let snap = node_a.peers_snapshot().await;
-    assert!(
-        snap.connected.contains(&peer_b),
-        "B must be connected to A"
-    );
+    assert!(snap.connected.contains(&peer_b), "B must be connected to A");
     assert!(
         !snap.partition_detected,
         "no partition expected while connected"
