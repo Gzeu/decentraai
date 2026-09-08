@@ -2786,6 +2786,9 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             Some(distributed.p2p_node().clone()),
         );
         state.set_dashboard(config.node.dashboard);
+        // Chat history (USER DATA, per authenticated caller — never logging):
+        // `db/chat_history.json` (0600), created lazily on the first turn.
+        state.attach_chat_history(Some(data_dir.join("db/chat_history.json")));
         // Personal Memory store (per-agent Markdown workspaces)
         let pm_store = std::sync::Arc::new(
             decentraai_agent_personal_memory::PersonalMemoryStore::new(&data_dir),
@@ -4366,6 +4369,8 @@ async fn serve_common(
         None,
     );
     state.set_dashboard(config.node.dashboard);
+    // Chat history (USER DATA, per authenticated caller — never logging).
+    state.attach_chat_history(Some(data_dir.join("db/chat_history.json")));
     // M18 — MultiversX Trust & Economic Layer (lightweight mode)
     {
         let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));

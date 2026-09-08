@@ -1756,7 +1756,7 @@ const sendChat = async (prompt) => {
     let workerHint = pinnedNode();
     // Backward-compatible: an explicit remote:<node>:<file> model also pins a node.
     if (!workerHint && sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
-    const body = JSON.stringify({ model: currentModel(), messages: hist, stream, ...(workerHint ? { worker_hint: workerHint } : {}) });
+    const body = JSON.stringify({ model: currentModel(), messages: hist, stream, conversation_id: currentSessionId, ...(workerHint ? { worker_hint: workerHint } : {}) });
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
     // A 401 here means the stored token is wrong for THIS node (or missing).
     // Surface it immediately with the fix, instead of a bare API error string.

@@ -56,6 +56,8 @@ use crate::wallet_auth::{
 
 pub(crate) mod admin;
 pub(crate) use admin::*;
+pub(crate) mod chat;
+pub(crate) use chat::*;
 pub(crate) mod execute;
 pub(crate) use execute::*;
 pub(crate) mod fabric_intel;
@@ -333,6 +335,11 @@ pub struct ApiState {
     hub_pulls: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
     token_store_path: Option<PathBuf>,
     consumer_keys_path: Option<PathBuf>,
+    /// Chat history store path (`db/chat_history.json`). `None` = history
+    /// endpoints report "not enabled" and the proxy records nothing. Chat
+    /// history is USER DATA (per-caller conversations), never logging — see
+    /// `crate::chat_history` for the invariant-#5 boundary.
+    pub(crate) chat_history_path: Option<PathBuf>,
     /// M16 gateway credential registry path (`dga_…`, `db/gateway_keys.json`).
     gateway_keys_path: Option<PathBuf>,
     /// M16 gateway config (kill-switch + issuance caps). `None` or
@@ -476,6 +483,7 @@ impl ApiState {
             dashboard: DashboardVersion::V1,
             token_store_path,
             consumer_keys_path: None,
+            chat_history_path: None,
             gateway_keys_path: None,
             gateway: None,
             vesper_keys: Arc::new(StdMutex::new(HashMap::new())),
@@ -854,6 +862,48 @@ impl ApiState {
     ) {
         self.consumer_keys_path = consumer_keys_path;
         self.quota_ledger = quota_ledger;
+    }
+
+    /// Attaches server-side chat history (`db/chat_history.json`). The store
+    /// file is created lazily on the first recorded turn. History is USER
+    /// DATA scoped per authenticated caller — never logging (invariant #5);
+    /// see `crate::chat_history`.
+    pub fn attach_chat_history(&mut self, path: Option<std::path::PathBuf>) {
+        self.chat_history_path = path;
+    }
+
+    /// Records one assistant turn into the caller's chat history (best
+    /// effort: persistence failures warn WITHOUT content and never break
+    /// inference). Returns the final conversation id, or `None` when the
+    /// store is not wired or the turn carries nothing worth persisting.
+    pub(crate) fn record_chat_turn(
+        &self,
+        capture: &crate::chat_history::ChatCapture,
+        assistant_reply: &str,
+    ) -> Option<String> {
+        if assistant_reply.is_empty() {
+            return None;
+        }
+        let path = self.chat_history_path.as_ref()?;
+        let mut store = match crate::chat_history::ChatStore::load(path) {
+            Ok(store) => store,
+            Err(_) => {
+                tracing::warn!("chat history store unavailable, skipping turn");
+                return None;
+            }
+        };
+        match store.record(
+            &capture.owner,
+            capture.conversation_id.as_deref(),
+            &capture.messages,
+            assistant_reply,
+        ) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                tracing::warn!("chat history record failed, skipping turn");
+                None
+            }
+        }
     }
 
     /// M16 gateway (`dga_…`) registry + config. Inert until the section is
@@ -1525,6 +1575,8 @@ async fn openapi_handler() -> Response {
         "paths": {
             "/v1/models": { "get": { "operationId": "listModels", "summary": "List served models", "responses": { "200": { "description": "Model list" }, "401": { "description": "Unauthorized" } } } },
             "/v1/chat/completions": { "post": { "operationId": "chatCompletions", "summary": "Streamed or single chat completion", "responses": { "200": { "description": "Chat completion (SSE when stream=true)" }, "429": { "description": "Rate limited" } } } },
+            "/v1/conversations": { "get": { "operationId": "listConversations", "summary": "List my chat conversations (metadata)", "responses": { "200": { "description": "Conversation list" }, "401": { "description": "Unauthorized" } } }, "delete": { "operationId": "deleteAllConversations", "summary": "Delete all my chat conversations", "responses": { "200": { "description": "Delete count" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/conversations/{id}": { "get": { "operationId": "getConversation", "summary": "Load one owned conversation", "responses": { "200": { "description": "Conversation" }, "401": { "description": "Unauthorized" }, "404": { "description": "Not found" } } }, "delete": { "operationId": "deleteConversation", "summary": "Delete one owned conversation", "responses": { "200": { "description": "Delete result" }, "401": { "description": "Unauthorized" } } } },
             "/v1/completions": { "post": { "operationId": "completions", "summary": "Text completion", "responses": { "200": { "description": "Completion" } } } },
             "/status": { "get": { "operationId": "status", "summary": "Node status snapshot (dashboard)", "responses": { "200": { "description": "Status" } } } },
             "/v1/token": { "get": { "operationId": "tokenInfo", "summary": "Issued-token summary", "responses": { "200": { "description": "Tokens" } } } },
@@ -1695,6 +1747,17 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/models/{id}", get(model_detail_handler))
         .route("/v1/completions", post(proxy_handler))
         .route("/v1/chat/completions", post(proxy_handler))
+        // Chat history (USER DATA, per authenticated caller — never logging).
+        .route("/v1/conversations", get(list_conversations_handler))
+        .route(
+            "/v1/conversations",
+            delete(delete_all_conversations_handler),
+        )
+        .route("/v1/conversations/{id}", get(get_conversation_handler))
+        .route(
+            "/v1/conversations/{id}",
+            delete(delete_conversation_handler),
+        )
         .route("/v1/batch", post(batch_handler))
         // P14 - Compute contribution / credits (read-only projections)
         .route("/v1/contribution", get(contribution_state_handler))
@@ -14834,6 +14897,23 @@ async fn pump_sse_with_keepalive<S, E>(
     }
 }
 
+/// Attaches the chat-history conversation id to a successful chat response.
+/// The header carries only the opaque id (no content); clients that pinned
+/// the turn already know it, new conversations learn it here.
+pub(crate) fn with_conversation_header(mut response: Response, id: Option<&str>) -> Response {
+    if let Some(id) = id {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(
+                crate::chat_history::CONVERSATION_ID_HEADER.as_bytes(),
+            ),
+            axum::http::HeaderValue::from_str(id),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
 /// Proxies a streaming inference response to the caller chunk-by-chunk while
 /// recording the same best-effort metrics the non-streaming path does. The
 /// channel lets a drop of the client cut upstream early; the spawned task
@@ -14846,6 +14926,7 @@ fn stream_inference(
     started: Instant,
     upstream: reqwest::Response,
     content_type: Option<axum::http::header::HeaderValue>,
+    chat_capture: Option<crate::chat_history::ChatCapture>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(64);
     let buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -14870,6 +14951,14 @@ fn stream_inference(
                     .tokens_generated
                     .fetch_add(completion, Ordering::SeqCst);
                 state.note_token_usage(&auth, completion);
+            }
+            // Chat history (USER DATA): persist the turn once the full reply
+            // is drained. Failures are silent by design — history never
+            // breaks inference, and nothing content-bearing is logged.
+            if let Some(capture) = chat_capture.as_ref() {
+                if let Some(reply) = crate::chat_history::parse_assistant_sse(&text) {
+                    state.record_chat_turn(capture, &reply);
+                }
             }
         }
     });
@@ -15203,11 +15292,48 @@ async fn proxy_with_auth(
     // The body the proxy will actually forward (caller sampling defaults
     // folded in), computed once up front so the proxy-boundary caps see the
     // exact prompt/max_tokens and it can be reused for the request below.
-    let outgoing = if is_inference {
+    let mut outgoing = if is_inference {
         apply_generation_defaults(&*state.runtime_generation.read().await, &body)
     } else {
         body.to_vec()
     };
+    // Server-side chat history (USER DATA, never logging — see
+    // `crate::chat_history`): pin the turn to the caller's conversation and
+    // strip the pin so backends always see a clean OpenAI body. The capture
+    // (owner + user-visible messages) is consumed by every serving path
+    // below (local / fabric / provider, streaming or not). Turns without a
+    // stable identity (`Open`) are never persisted.
+    let is_chat = method == Method::POST && uri.path() == "/v1/chat/completions";
+    let mut chat_capture: Option<crate::chat_history::ChatCapture> =
+        if is_chat && state.chat_history_path.is_some() {
+            match serde_json::from_slice::<serde_json::Value>(&outgoing) {
+                Ok(mut value) => {
+                    let conversation_id = crate::chat_history::extract_conversation_id(&value);
+                    if crate::chat_history::strip_conversation_id(&mut value) {
+                        outgoing = serde_json::to_vec(&value).unwrap_or(outgoing);
+                    }
+                    let messages = crate::chat_history::user_visible_messages(&value);
+                    crate::chat_history::owner_key(&auth).map(|owner| {
+                        crate::chat_history::ChatCapture {
+                            owner,
+                            conversation_id,
+                            messages,
+                        }
+                    })
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+    // Pre-resolve a fresh id so streaming responses (which return before the
+    // upstream finishes) can already carry it in a header. The id is only
+    // persisted when the backend actually produces a reply.
+    if let Some(capture) = chat_capture.as_mut() {
+        if capture.conversation_id.is_none() {
+            capture.conversation_id = Some(crate::chat_history::new_conversation_id());
+        }
+    }
     if is_inference {
         if let Err(e) = state.check_model_access(&auth, &body) {
             return e.into_response();
@@ -15273,7 +15399,6 @@ async fn proxy_with_auth(
     // fabric), or an explicit model name (local wins over remote, as before).
     // Decided *before* the queue join so a remote request never holds a local
     // backend slot (the worker has its own queue).
-    let mut outgoing = outgoing;
     if is_inference && uri.path() == "/v1/chat/completions" {
         // Model Fabric: a request for a connected provider model (symbolic
         // hash `prov-…`, provider handle `provider:{id}:{model}`, or the raw
@@ -15288,7 +15413,9 @@ async fn proxy_with_auth(
             .and_then(|v| v["model"].as_str().map(str::to_string))
             .is_some_and(|m| m == "__auto__" || m == "auto");
         if !is_auto_model {
-            if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
+            if let Some(provider_route) =
+                resolve_provider_model(&state, &outgoing, chat_capture.as_ref()).await
+            {
                 return provider_route;
             }
         }
@@ -15371,7 +15498,8 @@ async fn proxy_with_auth(
                             // enabled provider model). The fabric still wins
                             // when it has any model, keeping local-first.
                             if let Some(provider_route) =
-                                resolve_provider_model(&state, &outgoing).await
+                                resolve_provider_model(&state, &outgoing, chat_capture.as_ref())
+                                    .await
                             {
                                 return provider_route;
                             }
@@ -15416,6 +15544,7 @@ async fn proxy_with_auth(
                         model_hash,
                         model_name,
                         &outgoing,
+                        chat_capture.clone(),
                     )
                     .await;
                 }
@@ -15429,7 +15558,9 @@ async fn proxy_with_auth(
         } else if is_auto_model {
             // No fabric plane at all → `auto` still resolves through the
             // provider cost-aware selection (best enabled provider model).
-            if let Some(provider_route) = resolve_provider_model(&state, &outgoing).await {
+            if let Some(provider_route) =
+                resolve_provider_model(&state, &outgoing, chat_capture.as_ref()).await
+            {
                 return provider_route;
             }
         }
@@ -15498,6 +15629,9 @@ async fn proxy_with_auth(
             let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
             if wants_stream && status.is_success() {
                 let local_headers = local_origin_headers(&state);
+                let conv_id = chat_capture
+                    .as_ref()
+                    .and_then(|c| c.conversation_id.clone());
                 let mut response = stream_inference(
                     state,
                     auth,
@@ -15505,7 +15639,9 @@ async fn proxy_with_auth(
                     started,
                     upstream,
                     content_type,
+                    chat_capture.clone(),
                 );
+                response = with_conversation_header(response, conv_id.as_deref());
                 if let Some((origin, node)) = local_headers {
                     response.headers_mut().insert("x-decentra-origin", origin);
                     response.headers_mut().insert("x-decentra-node", node);
@@ -15530,7 +15666,19 @@ async fn proxy_with_auth(
                 state.requests_failed.fetch_add(1, Ordering::SeqCst);
                 // Q2: no work completed; the guard releases the reservation.
             }
+            // Chat history (USER DATA): persist the turn once the backend
+            // produced a successful reply. Only the chat endpoint carries
+            // conversations; silent on failure by design.
+            let conv_id = if is_chat {
+                chat_capture.as_ref().and_then(|capture| {
+                    crate::chat_history::parse_assistant_json(&bytes)
+                        .and_then(|reply| state.record_chat_turn(capture, &reply))
+                })
+            } else {
+                None
+            };
             let mut response = (status, bytes).into_response();
+            response = with_conversation_header(response, conv_id.as_deref());
             if let Some(value) = content_type {
                 response.headers_mut().insert(header::CONTENT_TYPE, value);
             }
@@ -15601,6 +15749,7 @@ async fn route_remote_chat(
     model_hash: String,
     model: String,
     outgoing: &[u8],
+    chat_capture: Option<crate::chat_history::ChatCapture>,
 ) -> Response {
     let distributed = match &state.distributed {
         Some(d) => d.clone(),
@@ -15671,11 +15820,16 @@ async fn route_remote_chat(
         let started2 = started;
         let worker2 = worker;
         let node2 = node_id;
+        // Chat history moves into the drain task: the full reply is only
+        // known after the stream completes.
+        let chat_cap2 = chat_capture.clone();
         tokio::spawn(async move {
+            let mut reply = String::new();
             while let Some(chunk) = progress_rx.recv().await {
                 if chunk.is_empty() {
                     continue;
                 }
+                reply.push_str(&chunk);
                 let payload = format!(
                     "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
                     serde_json::to_string(&chunk).unwrap_or_else(|_| "\"\"".to_string())
@@ -15696,6 +15850,13 @@ async fn route_remote_chat(
                         prompt_tokens, resp.tokens_used
                     );
                     state2.record_inference(&path2, started2.elapsed(), usage.as_bytes());
+                    // Chat history (USER DATA): persist once the streamed
+                    // reply is complete. Silent on failure by design.
+                    if let Some(capture) = chat_cap2.as_ref() {
+                        if !reply.is_empty() {
+                            state2.record_chat_turn(capture, &reply);
+                        }
+                    }
                     format!(
                         "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}\n\n",
                         prompt_tokens, resp.tokens_used
@@ -15722,6 +15883,12 @@ async fn route_remote_chat(
             header::HeaderValue::from_static("text/event-stream"),
         );
         tag_remote_response(&mut response, &worker2, &node2);
+        response = with_conversation_header(
+            response,
+            chat_capture
+                .as_ref()
+                .and_then(|c| c.conversation_id.as_deref()),
+        );
         return response;
     }
 
@@ -15735,6 +15902,14 @@ async fn route_remote_chat(
             );
             state.record_inference(&path, started.elapsed(), usage_json.as_bytes());
             state.note_token_usage(&auth, resp.tokens_used.into());
+            // Chat history (USER DATA): the reply is fully buffered here.
+            let conv_id = chat_capture.as_ref().and_then(|capture| {
+                if resp.output.is_empty() {
+                    None
+                } else {
+                    state.record_chat_turn(capture, &resp.output)
+                }
+            });
             let created = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -15761,6 +15936,7 @@ async fn route_remote_chat(
                 header::HeaderValue::from_static("application/json"),
             );
             tag_remote_response(&mut response, &worker, &node_id);
+            response = with_conversation_header(response, conv_id.as_deref());
             response
         }
         Err(e) => {
@@ -17173,7 +17349,7 @@ mod tests {
             "model": "auto",
             "messages": [{"role": "user", "content": "hi"}],
         });
-        let resp = resolve_provider_model(&state, &serde_json::to_vec(&outgoing).unwrap())
+        let resp = resolve_provider_model(&state, &serde_json::to_vec(&outgoing).unwrap(), None)
             .await
             .expect("auto must resolve to the connected provider model");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -17184,6 +17360,348 @@ mod tests {
         assert_eq!(
             json["choices"][0]["message"]["content"],
             "auto-routed from provider"
+        );
+        manager.lock().await.shutdown().await.unwrap();
+    }
+
+    /// Fake engine for chat-history tests: answers with what it saw, proving
+    /// the proxy stripped `conversation_id` before forwarding (backends see
+    /// a clean OpenAI body) while still serving a real completion.
+    #[cfg(unix)]
+    fn chat_echo_engine() -> Router {
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { "{\"object\":\"list\",\"data\":[{\"id\":\"tinyllama\"}]}" }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|body: String| async move {
+                    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let saw = value
+                        .get("conversation_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("none");
+                    serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": format!("saw:{saw}")},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    })
+                    .to_string()
+                }),
+            )
+    }
+
+    /// Master-auth headers for the chat-history endpoint tests.
+    #[cfg(unix)]
+    fn chat_auth_headers() -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            reqwest::header::HeaderValue::from_static("Bearer secret"),
+        );
+        headers
+    }
+
+    #[cfg(unix)]
+    fn chat_test_state(
+        dir: &Path,
+        manager: Arc<Mutex<ServeManager>>,
+        master: Option<String>,
+    ) -> ApiState {
+        let mut state = ApiState::new(
+            // Fallback only: the live manager above always resolves first.
+            "http://127.0.0.1:1".to_string(),
+            master,
+            manager,
+            test_info(dir, None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_chat_history(Some(dir.join("db/chat_history.json")));
+        state
+    }
+
+    /// End-to-end: a real chat turn through the proxy is recorded server-side
+    /// (stripped id, no system prompt stored, header returned), served back
+    /// through the endpoints, and survives a server restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_history_e2e_proxy_records_and_endpoints_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        // The live manager serves the echo engine: the proxy forwards to the
+        // manager's address, so turns really traverse proxy → engine.
+        let manager = test_manager_with(dir.path(), chat_echo_engine()).await;
+        let state = chat_test_state(dir.path(), manager.clone(), Some("secret".to_string()));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+
+        // Turn 1: explicit conversation pin + a system message (must NOT be
+        // stored — only user-visible messages are user data).
+        let resp = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .headers(chat_auth_headers())
+            .json(&serde_json::json!({
+                "model": "tinyllama",
+                "conversation_id": "chat-pin_01",
+                "messages": [
+                    {"role": "system", "content": "hidden instructions"},
+                    {"role": "user", "content": "remember the word BANANA"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let conv_header = resp
+            .headers()
+            .get("x-conversation-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(conv_header, "chat-pin_01");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The engine never saw the pin: it was stripped before forwarding.
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "saw:none",
+            "conversation_id must be stripped before the backend"
+        );
+
+        // The turn landed in history under the master's owner scope.
+        let list: serde_json::Value = client
+            .get(format!("http://{api}/v1/conversations"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let convos = list["conversations"].as_array().unwrap();
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0]["id"], "chat-pin_01");
+        assert_eq!(convos[0]["message_count"], 2);
+
+        let full: serde_json::Value = client
+            .get(format!("http://{api}/v1/conversations/chat-pin_01"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let messages = full["conversation"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "remember the word BANANA");
+        assert_eq!(messages[1]["role"], "assistant");
+        // No system message (client-sent or server-injected) is stored.
+        assert!(
+            !messages.iter().any(|m| m["role"] == "system"),
+            "system prompts must never be persisted"
+        );
+
+        // Turn 2 without a pin: a fresh id is issued via header. This turn
+        // has no client system message, so the server injects its configured
+        // prompt into the forwarded body — it must still not be stored.
+        let resp2 = client
+            .post(format!("http://{api}/v1/chat/completions"))
+            .headers(chat_auth_headers())
+            .json(&serde_json::json!({
+                "model": "tinyllama",
+                "messages": [{"role": "user", "content": "second chat"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), 200);
+        let fresh_id = resp2
+            .headers()
+            .get("x-conversation-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(fresh_id.starts_with("conv-"), "fresh id issued: {fresh_id}");
+
+        let raw_store = std::fs::read_to_string(dir.path().join("db/chat_history.json")).unwrap();
+        assert!(
+            !raw_store.contains("Test system line."),
+            "server-injected system prompt leaked into the store"
+        );
+        assert!(
+            !raw_store.contains("hidden instructions"),
+            "client system prompt leaked into the store"
+        );
+
+        // Restart: rebuild state over the same data dir; history survives.
+        let manager2 = test_manager_with(dir.path(), chat_echo_engine()).await;
+        let state2 = chat_test_state(dir.path(), manager2.clone(), Some("secret".to_string()));
+        let api2 = serve_api(state2, "127.0.0.1", 0).await.unwrap();
+        let list2: serde_json::Value = client
+            .get(format!("http://{api2}/v1/conversations"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list2["conversations"].as_array().unwrap().len(), 2);
+
+        // Delete one, then delete-all.
+        let del: serde_json::Value = client
+            .delete(format!("http://{api2}/v1/conversations/chat-pin_01"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(del["deleted"], true);
+        let del_all: serde_json::Value = client
+            .delete(format!("http://{api2}/v1/conversations"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(del_all["deleted"], 1);
+        manager.lock().await.shutdown().await.unwrap();
+        manager2.lock().await.shutdown().await.unwrap();
+    }
+
+    /// Auth + isolation: wrong/missing credentials are denied, owners cannot
+    /// see each other, and open (unauthenticated) callers get no history.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_history_endpoints_auth_and_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path()).await;
+        // Seed a foreign conversation directly in the store file.
+        {
+            let path = dir.path().join("db/chat_history.json");
+            let mut store = crate::chat_history::ChatStore::load(&path).unwrap();
+            store
+                .record(
+                    "acc:alice",
+                    Some("alice-conv"),
+                    &[("user".to_string(), "alice secret".to_string())],
+                    "alice reply",
+                )
+                .unwrap();
+        }
+        let state = chat_test_state(dir.path(), manager.clone(), Some("secret".to_string()));
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let mut wrong_headers = reqwest::header::HeaderMap::new();
+        wrong_headers.insert(
+            "authorization",
+            reqwest::header::HeaderValue::from_static("Bearer wrong"),
+        );
+
+        // No credentials → 401 (master is configured).
+        let r = client
+            .get(format!("http://{api}/v1/conversations"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // Wrong token → 401.
+        let r = client
+            .get(format!("http://{api}/v1/conversations"))
+            .headers(wrong_headers.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // Master sees nothing of Alice's (different owner scope).
+        let list: serde_json::Value = client
+            .get(format!("http://{api}/v1/conversations"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(list["conversations"].as_array().unwrap().is_empty());
+        // Foreign id: 404 on get, false on delete (no existence oracle).
+        let r = client
+            .get(format!("http://{api}/v1/conversations/alice-conv"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+        let del: serde_json::Value = client
+            .delete(format!("http://{api}/v1/conversations/alice-conv"))
+            .headers(chat_auth_headers())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(del["deleted"], false);
+        // Alice's conversation is untouched.
+        let raw = std::fs::read_to_string(dir.path().join("db/chat_history.json")).unwrap();
+        assert!(raw.contains("alice secret"));
+
+        // Open node (no master configured): even with the store wired,
+        // unauthenticated callers have no stable identity → 401.
+        let manager2 = test_manager(dir.path()).await;
+        let open_state = chat_test_state(dir.path(), manager2.clone(), None);
+        let open_api = serve_api(open_state, "127.0.0.1", 0).await.unwrap();
+        let r = client
+            .get(format!("http://{open_api}/v1/conversations"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        manager.lock().await.shutdown().await.unwrap();
+        manager2.lock().await.shutdown().await.unwrap();
+    }
+
+    /// A node without the store wired answers honestly instead of failing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_history_disabled_reports_not_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = start_backend().await;
+        let manager = test_manager(dir.path()).await;
+        let state = ApiState::new(
+            format!("http://{backend}"),
+            Some("secret".to_string()),
+            manager.clone(),
+            test_info(dir.path(), None),
+            None,
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        let api = serve_api(state, "127.0.0.1", 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let r = client
+            .get(format!("http://{api}/v1/conversations"))
+            .header("Authorization", "Bearer secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "chat history is not enabled on this node"
         );
         manager.lock().await.shutdown().await.unwrap();
     }

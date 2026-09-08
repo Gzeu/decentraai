@@ -514,7 +514,15 @@ fn record_provider_audit(state: &ApiState, event: &str, details: serde_json::Val
 ///
 /// Never sends credentials anywhere except the configured provider base URL;
 /// the request body is forwarded as-is (OpenAI-compatible contract).
-pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option<Response> {
+///
+/// `chat_capture`, when present, records the served turn into the caller's
+/// chat history (USER DATA, best-effort — never breaks inference, never
+/// logs content; see `crate::chat_history`).
+pub async fn resolve_provider_model(
+    state: &ApiState,
+    outgoing: &[u8],
+    chat_capture: Option<&crate::chat_history::ChatCapture>,
+) -> Option<Response> {
     let Some(providers) = &state.providers else {
         return None;
     };
@@ -599,11 +607,17 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
             Ok(mut token_stream) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 let model_name = model.to_string();
+                // Chat history moves into the drain task: the full reply is
+                // only known after the stream completes.
+                let chat_state = state.clone();
+                let chat_cap = chat_capture.cloned();
                 tokio::spawn(async move {
                     let mut seq: u64 = 0;
+                    let mut reply = String::new();
                     while let Some(chunk) = token_stream.next().await {
                         match chunk {
                             Ok(c) => {
+                                reply.push_str(&c.text);
                                 let event = format!(
                                     "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":{},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":{}}}]}}\n\n",
                                     c.request_id,
@@ -632,6 +646,13 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
                         .await;
                     drop(tx);
                     let _ = seq;
+                    // Chat history (USER DATA): persist once the streamed
+                    // reply is complete. Silent on failure by design.
+                    if let Some(capture) = chat_cap.as_ref() {
+                        if !reply.is_empty() {
+                            chat_state.record_chat_turn(capture, &reply);
+                        }
+                    }
                 });
                 let body = axum::body::Body::from_stream(futures::stream::unfold(
                     rx,
@@ -642,6 +663,12 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
                     axum::http::header::CONTENT_TYPE,
                     axum::http::HeaderValue::from_static("text/event-stream"),
                 );
+                if let Some(capture) = chat_capture {
+                    response = crate::api::with_conversation_header(
+                        response,
+                        capture.conversation_id.as_deref(),
+                    );
+                }
                 Some(response)
             }
             Err(e) => Some(provider_error_response(&e)),
@@ -666,13 +693,21 @@ pub async fn resolve_provider_model(state: &ApiState, outgoing: &[u8]) -> Option
                         "total_tokens": resp.tokens_used.unwrap_or(0),
                     }
                 });
-                Some(
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        json_body.to_string(),
-                    )
-                        .into_response(),
+                // Chat history (USER DATA): the reply is fully buffered here.
+                let conv_id = chat_capture.and_then(|capture| {
+                    if resp.output.is_empty() {
+                        None
+                    } else {
+                        state.record_chat_turn(capture, &resp.output)
+                    }
+                });
+                let mut response = (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    json_body.to_string(),
                 )
+                    .into_response();
+                response = crate::api::with_conversation_header(response, conv_id.as_deref());
+                Some(response)
             }
             Err(e) => Some(provider_error_response(&e)),
         }

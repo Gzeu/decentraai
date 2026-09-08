@@ -12,6 +12,7 @@
 pub mod api;
 pub mod arena;
 pub mod authz;
+pub mod chat_history;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod economic_agent;

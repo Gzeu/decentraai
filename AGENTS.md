@@ -126,7 +126,9 @@ tests passing):
    committed or transmitted; external API keys are read from env AT CALL
    TIME and redacted on every error path; the API binds loopback only.
 5. **Prompts and outputs are never logged.** Telemetry = counters and
-   latencies only.
+   latencies only. Explicit user-requested chat history (`db/chat_history.json`,
+   per-caller conversations) is USER DATA, not logging — see
+   `crates/runtime/src/chat_history.rs` for the boundary.
 6. **The inference engine is a subprocess.** Health probes, kill-on-drop,
    binary-swap upgrades; ephemeral ports mean backend URLs must be resolved
    LIVE per request, never cached at boot.
