@@ -8009,7 +8009,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             serde_json::to_string(&body).unwrap_or_default(),
         )
             .into_response();
-    } else if raw.contains("\"method\":\"tools/list\"") {
+    } else if jsonrpc_method_is(&raw, "tools/list") {
         // RBAC-filtered tool list: consumer sees only tools matching its scopes.
         let response = crate::mcp::handle_message(&ctx, &raw);
         if let Some(mut json) = response {
@@ -8093,9 +8093,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             serde_json::to_string(&serde_json::json!({})).unwrap_or_default(),
         )
             .into_response();
-    } else if raw.contains("\"method\":\"initialize\"")
-        || raw.contains("\"method\":\"ping\"")
-        || raw.contains("\"method\":\"notifications/initialized\"")
+    } else if jsonrpc_method_is(&raw, "initialize")
+        || jsonrpc_method_is(&raw, "ping")
+        || jsonrpc_method_is(&raw, "notifications/initialized")
     {
         // MCP lifecycle for consumer keys: initialize/ping/notifications
         // are read-only protocol with no scope implications — the same
@@ -16055,6 +16055,19 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// Top-level JSON-RPC `method` of an MCP body, whitespace-tolerant.
+/// Substring matching (`raw.contains("\"method\":\"tools/list\"")`) breaks
+/// on pretty-printed JSON — Python/JS serializers emit `"method": "…"`
+/// with a space, so real clients were routed to `forbidden` (403).
+/// Exact top-level match is also more correct: a nested occurrence inside
+/// `params` must not route the request.
+fn jsonrpc_method_is(raw: &str, method: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => v.get("method").and_then(|m| m.as_str()) == Some(method),
+        Err(_) => false,
+    }
+}
+
 fn forbidden(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -17247,6 +17260,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list.status(), 200);
+
+        // 5. Pretty-printed JSON (space after colon, as Python/JS
+        // serializers emit) routes identically — regression: substring
+        // matching 403'd every real-world client.
+        let spaced_init = call(r#"{"jsonrpc": "2.0", "id": 11, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "probe", "version": "0"}}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spaced_init.status(), 200);
+        let spaced_list = call(r#"{"jsonrpc": "2.0", "id": 12, "method": "tools/list"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spaced_list.status(), 200);
+        let spaced_call = call(r#"{"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "discover_capabilities", "arguments": {}}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spaced_call.status(), 200);
     }
 
     #[cfg(unix)]
