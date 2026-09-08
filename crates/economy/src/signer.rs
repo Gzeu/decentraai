@@ -162,8 +162,7 @@ impl TransactionSigner for Ed25519Signer {
 /// `wallet_auth`).
 pub fn bech32_address(verifying_key: &[u8; 32]) -> String {
     let hrp = Hrp::parse("erd").expect("static HRP is valid");
-    bech32::encode::<Bech32>(hrp, verifying_key)
-        .expect("bech32 encoding of 32 bytes never fails")
+    bech32::encode::<Bech32>(hrp, verifying_key).expect("bech32 encoding of 32 bytes never fails")
 }
 
 /// Load the operator wallet signer from secret injection.

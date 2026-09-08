@@ -9400,8 +9400,7 @@ async fn diffusion_t2i_handler(
     if prompt.len() > crate::tools::DIFFUSION_MAX_PROMPT_CHARS {
         return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": {"message": "prompt exceeds 4000 characters"}})
-                .to_string(),
+            serde_json::json!({"error": {"message": "prompt exceeds 4000 characters"}}).to_string(),
         )
             .into_response();
     }
