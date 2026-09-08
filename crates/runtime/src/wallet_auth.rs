@@ -1,5 +1,6 @@
 use base64::Engine as _;
-use bech32::{FromBase32, ToBase32, Variant, decode, encode};
+use bech32::primitives::decode::CheckedHrpstring;
+use bech32::{Bech32, Hrp};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -148,13 +149,15 @@ pub fn wallet_auth_path_for(repo_root: &Path) -> PathBuf {
 }
 
 pub fn validate_wallet_address(address: &str) -> Result<[u8; 32], WalletAuthError> {
-    let (hrp, data, variant) =
-        decode(address).map_err(|_| WalletAuthError::InvalidAddress(address.to_string()))?;
-    if hrp.as_str() != "erd" || variant != Variant::Bech32 {
+    // Strict `Bech32` checksum (NOT Bech32m): `CheckedHrpstring::<Bech32>`
+    // rejects bech32m payloads exactly like the old `variant != Bech32`
+    // gate. Free `decode()` would accept both — must not use it here.
+    let checked = CheckedHrpstring::new::<Bech32>(address)
+        .map_err(|_| WalletAuthError::InvalidAddress(address.to_string()))?;
+    if checked.hrp().as_str() != "erd" {
         return Err(WalletAuthError::InvalidAddress(address.to_string()));
     }
-    let bytes = Vec::<u8>::from_base32(&data)
-        .map_err(|_| WalletAuthError::InvalidAddress(address.to_string()))?;
+    let bytes: Vec<u8> = checked.byte_iter().collect();
     if bytes.len() != 32 {
         return Err(WalletAuthError::InvalidAddress(address.to_string()));
     }
@@ -164,7 +167,9 @@ pub fn validate_wallet_address(address: &str) -> Result<[u8; 32], WalletAuthErro
 }
 
 pub fn encode_wallet_address(public_key: &[u8; 32]) -> Result<String, WalletAuthError> {
-    encode("erd", public_key.to_base32(), Variant::Bech32)
+    let hrp =
+        Hrp::parse("erd").map_err(|_| WalletAuthError::InvalidAddress("encode".to_string()))?;
+    bech32::encode::<Bech32>(hrp, public_key)
         .map_err(|_| WalletAuthError::InvalidAddress("encode".to_string()))
 }
 
@@ -455,6 +460,34 @@ mod tests {
         let decoded = validate_wallet_address(&address).unwrap();
         assert_eq!(decoded, *identity.public_key().as_bytes());
         assert!(validate_wallet_address("erd1invalid").is_err());
+    }
+
+    #[test]
+    fn chain_vectors_decode_and_reencode_identically() {
+        // Golden cross-version proof (bech32 0.9 → 0.12): these are real
+        // MultiversX chain addresses (ESDT system SC + devnet contracts),
+        // produced long before this migration. The BIP-173 `Bech32`
+        // checksum is unchanged, so 0.12 must decode them to 32 bytes and
+        // re-encode byte-identically.
+        for vector in [
+            "erd1qqqqqqqqqqqqqpgqzcufga3vm5r44xe3ukzyl4dmhpsvalrkkgjqeyu68x",
+            "erd1qqqqqqqqqqqqqpgqvax6z79cvyz9gkfwg57hqume352p7s7rd8ss4g3t43",
+            "erd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu",
+        ] {
+            let bytes = validate_wallet_address(vector).unwrap();
+            assert_eq!(bytes.len(), 32);
+            let reencoded = encode_wallet_address(&bytes).unwrap();
+            assert_eq!(reencoded, vector);
+        }
+    }
+
+    #[test]
+    fn foreign_hrp_and_bech32m_checksum_are_rejected() {
+        // BIP-350 `abc1…` vector: wrong HRP *and* a Bech32m checksum.
+        // Rejected on the strict gate (either the HRP or the checksum leg
+        // fires — the old code rejected it via `variant != Bech32`/HRP too).
+        assert!(validate_wallet_address("abc14w46h2at4w46h2at4w46h2at958ngu").is_err());
+        assert!(validate_wallet_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! [`UnsignedTxIntent`]: crate::multiversx_tx::UnsignedTxIntent
 
 use crate::multiversx_tx::UnsignedTxIntent;
-use bech32::{ToBase32 as _, Variant, encode};
+use bech32::{Bech32, Hrp};
 use ed25519_dalek::{Signer as _, Verifier as _};
 use std::fmt;
 
@@ -155,8 +155,14 @@ impl TransactionSigner for Ed25519Signer {
 
 /// Derive the MultiversX bech32 (`erd1…`) address for a verifying key.
 /// Pure function of public bytes — safe to log, store, and compare.
+///
+/// bech32 0.12: raw bytes in, lowercase `Bech32`-checksum string out. The
+/// checksum algorithm is unchanged since BIP-173, so addresses are
+/// byte-identical to the 0.9-era encodings (see the chain-vector test in
+/// `wallet_auth`).
 pub fn bech32_address(verifying_key: &[u8; 32]) -> String {
-    encode("erd", verifying_key.to_base32(), Variant::Bech32)
+    let hrp = Hrp::parse("erd").expect("static HRP is valid");
+    bech32::encode::<Bech32>(hrp, verifying_key)
         .expect("bech32 encoding of 32 bytes never fails")
 }
 
