@@ -660,11 +660,20 @@ impl P2PNode {
         let keypair = Keypair::ed25519_from_bytes(identity.signing_key_bytes())
             .context("deriving libp2p keypair from node identity")?;
         let peer_id = PeerId::from(&keypair.public());
-        // mDNS honours the config flag (M19 fix): tests and nodes that set
-        // `lan_discovery: false` must stay invisible on the segment instead
-        // of being auto-discovered by every neighbour.
-        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-            .context("creating mDNS behaviour")?;
+        // mDNS honours the config flag end to end: `lan_discovery: false`
+        // disables the behaviour entirely (`Toggle`), so the node neither
+        // announces on multicast nor reacts to neighbours. Gating only the
+        // reaction side (as before) still leaked announcements, making the
+        // node visible on the segment and letting parallel loopback E2E
+        // tests cross-discover each other.
+        let mdns_behaviour = Toggle::from(if network.lan_discovery {
+            Some(
+                mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                    .context("creating mDNS behaviour")?,
+            )
+        } else {
+            None
+        });
         let codec = FrameCodec {
             // Directional caps (review, security): inbound REQUESTS from peers
             // are all control-plane messages (manifest/catalog/chunk/infer/
@@ -919,12 +928,18 @@ impl P2PNode {
                                 // request_response auto-dials in that case.
                                 let mut peers = connected.clone();
                                 if network.lan_discovery {
-                                    // Only act on discovery when enabled;
-                                    // otherwise unknown peers are never
-                                    // proactively contacted.
-                                    for peer in swarm.behaviour_mut().mdns.discovered_nodes() {
-                                        if !peers.contains(peer) {
-                                            peers.push(*peer);
+                                    // `Toggle`-off mDNS discovers nothing even
+                                    // if this flag were bypassed: a disabled
+                                    // behaviour yields no peers here.
+                                    let discovered: Vec<PeerId> = swarm
+                                        .behaviour_mut()
+                                        .mdns
+                                        .as_mut()
+                                        .map(|mdns| mdns.discovered_nodes().copied().collect())
+                                        .unwrap_or_default();
+                                    for peer in discovered {
+                                        if !peers.contains(&peer) {
+                                            peers.push(peer);
                                         }
                                     }
                                 }
@@ -1620,7 +1635,12 @@ impl P2PNode {
 
 #[derive(NetworkBehaviour)]
 struct NodeBehaviour {
-    mdns: mdns::tokio::Behaviour,
+    /// mDNS LAN discovery. `Toggle` off (`lan_discovery: false`) keeps the
+    /// node invisible on the segment: no multicast announcements and no
+    /// reaction to neighbours (same pattern as `kad` below). A disabled
+    /// mDNS emits no events, so the `Mdns(Discovered)` arm below is
+    /// unreachable; its `lan_discovery` guard stays as defense in depth.
+    mdns: Toggle<mdns::tokio::Behaviour>,
     messages: request_response::Behaviour<FrameCodec>,
     /// Identify: exchanges listen/observed addresses so peers learn each
     /// other's external addresses across NAT.
