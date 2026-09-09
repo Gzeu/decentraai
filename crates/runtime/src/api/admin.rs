@@ -635,6 +635,95 @@ pub(crate) async fn persist_capability_claims_after_pull(
         }
     }
 }
+/// POST /api/admin/registry/rescan — backfill capability claims for local
+/// models that carry none (pre-claims registries, e.g. Aug 2026, or models
+/// copied in by hand). Master only.
+///
+/// Re-scans the models dir (registers new files, prunes missing — never
+/// wipes existing claims, see `register_model`), then classifies every
+/// claim-less model with the Hub filename heuristics (`INFERRED`
+/// provenance — the same honesty rule as pulls without metadata). Models
+/// that already carry claims are NEVER touched.
+pub(crate) async fn admin_registry_rescan_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    if let Err(e) = state.require_master(&headers) {
+        return e.into_response();
+    }
+    let models_dir = state.info.repo_root.join("models");
+    let registry_path = state.info.repo_root.join("db/registry.json");
+    let mut registry = match decentraai_registry::ModelRegistry::load(&registry_path) {
+        Ok(r) => r,
+        Err(_) => match decentraai_registry::ModelRegistry::new(models_dir.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({"error": {"message": format!("registry unavailable: {e:#}"), "type": "registry_error"}})
+                        .to_string(),
+                )
+                    .into_response();
+            }
+        },
+    };
+    if let Err(e) = registry.scan_directory(&models_dir) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": {"message": format!("rescan failed: {e:#}"), "type": "registry_error"}})
+                .to_string(),
+        )
+            .into_response();
+    }
+    let mut backfilled = 0usize;
+    let mut files: Vec<String> = Vec::new();
+    let already_had_claims = registry
+        .list_models()
+        .iter()
+        .filter(|m| !m.capability_claims.is_empty())
+        .count();
+    let pending: Vec<String> = registry
+        .list_models()
+        .iter()
+        .filter(|m| m.capability_claims.is_empty())
+        .map(|m| m.relative_path.clone())
+        .collect();
+    for rel in pending {
+        let caps = decentraai_hub::capability::classify(None, &[], &rel);
+        let claims = capability_records_from_hub(&caps);
+        if claims.is_empty() {
+            continue;
+        }
+        if registry
+            .set_capability_claims(&rel, claims)
+            .unwrap_or(false)
+        {
+            backfilled += 1;
+            files.push(rel);
+        }
+    }
+    if let Some(parent) = registry_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = registry.save(&registry_path) {
+        tracing::warn!("failed to save registry after rescan: {e:#}");
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "registry_rescan",
+        serde_json::json!({"backfilled": backfilled, "already_had_claims": already_had_claims}),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({"backfilled": backfilled, "already_had_claims": already_had_claims, "models": files})
+            .to_string(),
+    )
+        .into_response()
+}
 pub(crate) async fn admin_hub_pull_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,

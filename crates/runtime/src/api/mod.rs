@@ -1810,6 +1810,11 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/admin/models/remove",
             post(admin_models_remove_handler),
         )
+        // Registry rescan: backfill capability claims for claim-less models.
+        .route(
+            "/api/admin/registry/rescan",
+            post(admin_registry_rescan_handler),
+        )
         .route(
             "/api/admin/settings/generation",
             post(admin_settings_generation_handler),
@@ -17279,6 +17284,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spaced_call.status(), 200);
+    }
+
+    /// Registry rescan backfills capability claims for claim-less models
+    /// (pre-claims registries): master-only, idempotent, never touches
+    /// models that already carry claims.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_registry_rescan_backfills_claimless_models() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("models/qwen2.5-coder-0.5b-instruct-q8_0.gguf"),
+            b"fake-gguf-bytes",
+        )
+        .unwrap();
+        let (api, manager) =
+            start_stateful_api(dir.path(), Some("rescan-master".into()), None).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{api}");
+        let rescan = |auth: Option<&str>| {
+            let mut req = client.post(format!("{base}/api/admin/registry/rescan"));
+            if let Some(token) = auth {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            req
+        };
+        // Unauthenticated → 401.
+        let anon = rescan(None).send().await.unwrap();
+        assert_eq!(anon.status(), 401);
+        // Master → one model backfilled with heuristic claims.
+        let r1: serde_json::Value = rescan(Some("rescan-master"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r1["backfilled"], 1);
+        assert!(
+            r1["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.as_str().unwrap().contains("coder"))
+        );
+        // Idempotent: second run backfills nothing.
+        let r2: serde_json::Value = rescan(Some("rescan-master"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r2["backfilled"], 0);
+        assert_eq!(r2["already_had_claims"], 1);
+
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
