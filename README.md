@@ -585,6 +585,54 @@ The next product layers should be driven by observed agent behavior in the World
 
 ---
 
+## 🔌 Local OpenAI-Compatible API
+
+The DecentraAI node serves a full **OpenAI-compatible REST API** locally, enabling any AI client (Perchance, custom agents, scripts) to connect directly:
+
+```
+Endpoint:    http://localhost:8080/v1/chat/completions
+Models:      17 GGUF models (qwen2.5-3b, qwen2.5-0.5b, Llama-3.2-1B, etc.)
+Auth:        Bearer token (subscription key)
+Models List: http://localhost:8080/v1/models
+```
+
+### Perchance Integration
+
+To use the local node as an AI backend in Perchance:
+
+1. **Generate a subscription token**:
+   ```bash
+   decentraai token create --name "perchance-local" --tier 2
+   ```
+2. **In Perchance project** → Settings → AI Plugins → Add OpenAI-compatible endpoint:
+   - **URL**: `http://localhost:8080/v1/chat/completions`
+   - **API Key**: `dsk_...` (your subscription token)
+   - **Model**: `qwen2.5-3b-instruct-q4_k_m.gguf`
+3. **In Perchance code**, use `superFetch` to call the local endpoint:
+   ```js
+   const response = await superFetch('/v1/chat/completions', {
+     model: 'qwen2.5-3b-instruct-q4_k_m.gguf',
+     messages: [{role: 'user', content: prompt}],
+     max_tokens: 512
+   }, 'http://localhost:8080', {Authorization: 'Bearer ' + LOCAL_API_KEY});
+   ```
+
+### Quick Start
+
+```bash
+# Start the node
+decentraai node --config ~/.decentraai/node.yaml
+
+# Test the API
+curl -H "Authorization: Bearer $(cat ~/.decentraai/runtime/api.token)" \
+  http://localhost:8080/v1/chat/completions \
+  -d '{"model":"qwen2.5-3b-instruct-q4_k_m.gguf","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+```
+
+> **Note**: The local token (`~/.decentraai/runtime/api.token`) must be kept secret. Never commit it to version control.
+
+---
+
 ## ⚖️ License
 
 Apache-2.0. See [`LICENSE`](LICENSE).
