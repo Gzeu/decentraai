@@ -1593,14 +1593,22 @@ impl P2PNode {
         if peer == self.peer_id {
             // Self-delivery: libp2p cannot dial self, so a coordinator that
             // placed work on its own worker would always fail here
-            // ("Failed to dial the requested peer"). Run the payload through
-            // the SAME generic handler the swarm loop uses for remote
-            // requests (InferRequest → inference callback, frames → tracker
-            // feed, announcements/ping likewise) — identical bytes in,
+            // ("Failed to dial the requested peer"). Mirror the swarm loop
+            // order exactly: inference requests run through the registered
+            // on_infer callback first, everything else (result/progress
+            // frames → tracker feed, announcements, ping) through the same
+            // generic handler remote requests hit. Identical bytes in,
             // identical bytes out, no network round-trip and no trust
-            // downgrade (self is authentic by construction). Without a
-            // registered handler, fall through to the swarm path below
-            // (unchanged behavior).
+            // downgrade (self is authentic by construction). With neither
+            // registered, fall through to the swarm path below (unchanged).
+            if let Ok(infer_req) = decentraai_protocol::deserialize_message::<
+                decentraai_protocol::InferRequest,
+            >(&payload, DEFAULT_MAX_MESSAGE_BYTES)
+            {
+                if let Some(cb) = self.on_infer.lock().await.clone() {
+                    return cb(peer, infer_req);
+                }
+            }
             if let Some(h) = self.local_handler.clone() {
                 return h.handle(&payload);
             }
@@ -1861,6 +1869,48 @@ mod tests {
         let payload = decentraai_protocol::serialize_message(&req).unwrap();
         let resp = node.request(self_peer, payload).await.unwrap();
         assert_eq!(resp, b"self-pong");
+    }
+
+    /// Inference requests prefer the registered on_infer callback (swarm
+    /// loop order); the generic handler is the fallback for frames and
+    /// other payloads.
+    #[tokio::test]
+    async fn request_to_self_prefers_on_infer_callback() {
+        let identity = decentraai_identity::Identity::generate();
+        let mut node = P2PNode::new(
+            &identity,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
+            None,
+        )
+        .unwrap();
+        let self_peer = node.local_peer_id();
+        node.set_on_infer_request(move |_peer, req| {
+            assert_eq!(req.prompt, "infer-ping");
+            Ok(b"infer-pong".to_vec())
+        });
+        let req = decentraai_protocol::InferRequest {
+            request_id: uuid::Uuid::nil(),
+            trace_id: "self-test".to_string(),
+            created_at: "2026-09-08T00:00:00Z".to_string(),
+            deadline_at: "2026-09-08T00:05:00Z".to_string(),
+            model_hash: "h".to_string(),
+            sender_peer_id: self_peer,
+            prompt: "infer-ping".to_string(),
+            max_tokens: 8,
+            temperature: 0.0,
+            top_p: 1.0,
+            timeout_ms: 5000,
+            stream: false,
+            priority: 0,
+            session_id: None,
+            nonce: 1,
+            sender_public_key: None,
+            signature: None,
+        };
+        let payload = decentraai_protocol::serialize_message(&req).unwrap();
+        let resp = node.request(self_peer, payload).await.unwrap();
+        assert_eq!(resp, b"infer-pong");
     }
 
     #[tokio::test]
