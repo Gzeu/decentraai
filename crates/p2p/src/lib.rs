@@ -559,6 +559,12 @@ pub struct P2PNode {
     /// Memory-sync dispatch slot. `None` = this node does not accept memory
     /// sync; inbound batches get an explicit `declined` response.
     on_memory_sync: SharedHandler<MemorySyncHandler>,
+    /// The generic request handler, shared with the swarm loop. Used for
+    /// loopback self-delivery in [`P2PNode::request`]: libp2p cannot dial
+    /// self, so requests addressed to our own PeerId run through the exact
+    /// same handler a remote request would hit (identical bytes in,
+    /// identical bytes out).
+    local_handler: Option<Arc<dyn RequestHandler>>,
     /// M24: Per-peer connection quality, shared with the swarm event loop.
     peer_quality: std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, PeerQuality>>>,
 }
@@ -832,6 +838,7 @@ impl P2PNode {
         let peer_quality_shared: std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, PeerQuality>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let peer_quality_loop = peer_quality_shared.clone();
+        let local_handler = handler.clone();
         tokio::spawn(async move {
             let mut pending: HashMap<
                 request_response::OutboundRequestId,
@@ -1525,6 +1532,7 @@ impl P2PNode {
             on_manifest,
             on_memory_sync,
             peer_quality: peer_quality_shared,
+            local_handler,
         })
     }
 
@@ -1586,18 +1594,15 @@ impl P2PNode {
             // Self-delivery: libp2p cannot dial self, so a coordinator that
             // placed work on its own worker would always fail here
             // ("Failed to dial the requested peer"). Run the payload through
-            // the SAME inbound inference callback a remote request would hit
-            // (identical bytes in, identical bytes out) — no network
-            // round-trip, no trust downgrade (self is authentic by
-            // construction). Non-inference payloads fall through to the
-            // swarm path below (unchanged behavior).
-            if let Ok(infer_req) = decentraai_protocol::deserialize_message::<
-                decentraai_protocol::InferRequest,
-            >(&payload, DEFAULT_MAX_MESSAGE_BYTES)
-            {
-                if let Some(cb) = self.on_infer.lock().await.clone() {
-                    return cb(peer, infer_req);
-                }
+            // the SAME generic handler the swarm loop uses for remote
+            // requests (InferRequest → inference callback, frames → tracker
+            // feed, announcements/ping likewise) — identical bytes in,
+            // identical bytes out, no network round-trip and no trust
+            // downgrade (self is authentic by construction). Without a
+            // registered handler, fall through to the swarm path below
+            // (unchanged behavior).
+            if let Some(h) = self.local_handler.clone() {
+                return h.handle(&payload);
             }
         }
         let (reply, rx) = oneshot::channel();
@@ -1808,25 +1813,32 @@ mod tests {
     }
 
     /// A coordinator that places work on itself must not fail: libp2p cannot
-    /// dial self, so `request()` short-circuits to the local inference
-    /// callback with identical bytes (regression: "Failed to dial the
-    /// requested peer" whenever the planner chose the entry node itself).
+    /// dial self, so `request()` short-circuits through the same generic
+    /// handler the swarm loop uses for remote requests (regression:
+    /// "Failed to dial the requested peer" whenever the planner chose the
+    /// entry node itself).
     #[tokio::test]
-    async fn request_to_self_uses_local_infer_callback() {
+    async fn request_to_self_uses_local_handler() {
+        struct Stub;
+        impl RequestHandler for Stub {
+            fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+                let req = decentraai_protocol::deserialize_message::<
+                    decentraai_protocol::InferRequest,
+                >(request, DEFAULT_MAX_MESSAGE_BYTES)
+                .unwrap();
+                assert_eq!(req.prompt, "self-ping");
+                Ok(b"self-pong".to_vec())
+            }
+        }
         let identity = decentraai_identity::Identity::generate();
-        let mut node = P2PNode::new(
+        let node = P2PNode::new(
             &identity,
             DEFAULT_MAX_MESSAGE_BYTES,
             DEFAULT_MAX_CHUNK_MESSAGE_BYTES,
-            None,
+            Some(std::sync::Arc::new(Stub)),
         )
         .unwrap();
         let self_peer = node.local_peer_id();
-        node.set_on_infer_request(move |peer, req| {
-            assert_eq!(peer, self_peer);
-            assert_eq!(req.prompt, "self-ping");
-            Ok(b"self-pong".to_vec())
-        });
         let req = decentraai_protocol::InferRequest {
             request_id: uuid::Uuid::nil(),
             trace_id: "self-test".to_string(),
