@@ -643,3 +643,74 @@ Apache-2.0. See [`LICENSE`](LICENSE).
   <strong>DecentraAI</strong><br>
   <sub>Observe. Decide. Collaborate. Execute. Verify. Learn.</sub>
 </p>
+
+---
+
+## 🔗 Perchance Agent Integration — MCP Flow
+
+The Perchance agent integrates with the DecentraAI fabric through the MCP protocol. The fabric's `decide` MCP tool routes tasks through the intelligence layer, which can call external OpenAI-compatible providers.
+
+### Architecture
+
+```text
+Perchance SPA (browser)
+       │
+       │  MCP tools/call
+       ▼
+Fabric MCP (decentraai.duckdns.org/mcp)
+       │
+       │  decide → select_provider()
+       ▼
+fabric_intelligence.external (OpenAiCompatProvider)
+       │
+       │  POST {base_url}/chat/completions
+       ▼
+Local Node or External API
+       │
+       │  Response
+       ▼
+Perchance Agent
+```
+
+### Configuration
+
+**Local node** (`~/.decentraai/node.yaml`):
+```yaml
+fabric_intelligence:
+  enabled: true
+  policy: external_first    # or fallback, local_first, external_only
+  external:
+    base_url: http://127.0.0.1:8080/v1
+    api_key_env: DECENTRAAI_EXTERNAL_KEY
+    model: qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+**Fabric VPS** (`/home/decentraai/.decentraai/node.yaml`):
+```yaml
+fabric_intelligence:
+  policy: external_first
+  external:
+    base_url: http://127.0.0.1/v1   # or remote node URL
+    api_key_env: DECENTRAAI_EXTERNAL_KEY
+    model: qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+### Token
+```bash
+# Create subscription token
+decentraai token create --name "perchance-local" --tier 2
+# Token: dsk_29753b5aae514d6877d8eee00d9320f26c8f306334265527cbb84a189fbe6ce5
+```
+
+### Perchance MCP Call Flow
+1. Perchance agent calls `decide` on `decentraai.duckdns.org/mcp` with Bearer `dca_26396c0b...`
+2. Fabric's `select_provider(policy=external_first, external_configured=true)` → selects External
+3. `OpenAiCompatProvider::analyze()` → POST to `{base_url}/chat/completions`
+4. External provider returns model response
+5. Fabric returns `TaskPlan` to Perchance agent
+6. Perchance agent generates text using its own AI (`generateText` plugin)
+
+### Environment Variable
+```bash
+export DECENTRAAI_EXTERNAL_KEY=dsk_29753b5aae514d6877d8eee00d9320f26c8f306334265527cbb84a189fbe6ce5
+```
