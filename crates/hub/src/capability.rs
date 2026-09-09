@@ -397,6 +397,21 @@ pub fn classify(pipeline_tag: Option<&str>, tags: &[String], id: &str) -> ModelC
         );
         push_unique(&mut claims, CapabilityKind::Audio, Provenance::Inferred);
     }
+    // Instruction-tuned / conversational filename markers: `-instruct`
+    // (or the `-it` / `chat` family markers) states the weights were tuned
+    // for instruction-following dialogue — Chat is INFERRED, never VERIFIED
+    // (honesty rule §49: a filename is not metadata). The `-it` check is
+    // boundary-aware so ordinary words containing "it" never match.
+    if name_has("instruct") || name_has("chat") {
+        push_unique(&mut claims, CapabilityKind::Chat, Provenance::Inferred);
+    }
+    if id_lower.ends_with("-it")
+        || id_lower.contains("-it-")
+        || id_lower.contains("-it.")
+        || id_lower.contains("_it_")
+    {
+        push_unique(&mut claims, CapabilityKind::Chat, Provenance::Inferred);
+    }
     if name_has("tinyllama")
         || name_has("small")
         || name_has("phi-3-mini")
@@ -627,5 +642,46 @@ mod tests {
         assert!(caps.claims.iter().any(|c| {
             c.capability == CapabilityKind::Embeddings && c.provenance == Provenance::Verified
         }));
+    }
+
+    #[test]
+    fn instruct_filename_infers_chat_never_verified() {
+        // Live case (2026-09-09): qwen2.5-3b-instruct served locally but
+        // claim-less, so decide(chat) found zero candidates. A filename is
+        // not metadata — Chat must be INFERRED, never VERIFIED (§49).
+        let caps = classify(None, &tags(&[]), "qwen2.5-3b-instruct-q4_k_m.gguf");
+        assert!(caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Inferred
+        }));
+        assert!(!caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Verified
+        }));
+    }
+
+    #[test]
+    fn it_suffix_filename_infers_chat() {
+        let caps = classify(None, &tags(&[]), "Gemma-3-1B-it-Q4_K_M.gguf");
+        assert!(caps.claims.iter().any(|c| {
+            c.capability == CapabilityKind::Chat && c.provenance == Provenance::Inferred
+        }));
+    }
+
+    #[test]
+    fn plain_weights_filename_claims_no_chat() {
+        // Honesty cuts both ways: a bare base-model filename states nothing
+        // conversational, so no Chat claim at all.
+        let caps = classify(None, &tags(&[]), "Qwen3-0.6B-Q8_0.gguf");
+        assert!(
+            !caps.claims.iter().any(|c| c.capability == CapabilityKind::Chat),
+            "claims: {:?}",
+            caps.claims
+        );
+        // And the boundary-aware `-it` check must not fire on ordinary words.
+        let caps = classify(None, &tags(&[]), "org/smith-weights");
+        assert!(
+            !caps.claims.iter().any(|c| c.capability == CapabilityKind::Chat),
+            "claims: {:?}",
+            caps.claims
+        );
     }
 }
