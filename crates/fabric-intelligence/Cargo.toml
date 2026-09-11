@@ -17,6 +17,8 @@ decentraai-hub = { path = "../hub" }
 # same shared inference budget as every other layer (7e849a9) — a tighter
 # intelligence timeout would cut healthy slow-prefill planning runs.
 decentraai-config = { path = "../config" }
+decentraai-agents = { path = "../agents" }
+decentraai-mx-supernova = { path = "../mx-supernova" }
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["time"] }
 

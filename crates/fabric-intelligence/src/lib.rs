@@ -28,6 +28,7 @@ pub mod policy;
 pub mod provider;
 pub mod redact;
 pub mod runtime;
+pub mod supernova;
 pub mod telemetry;
 pub mod validation;
 
@@ -36,6 +37,7 @@ pub use plan::{PlanCapability, PlanError, TaskPlan};
 pub use policy::{ProviderChoice, SelectionPolicy};
 pub use provider::{IntelligenceProvider, LocalLlamaProvider, OpenAiCompatProvider, ProviderError};
 pub use runtime::{FabricIntelligence, PlanOutcome};
+pub use supernova::*;
 pub use telemetry::{IntelTelemetry, ProviderKind};
 pub use validation::PlanValidation;
 

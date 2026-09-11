@@ -219,10 +219,15 @@ pub struct MemoryEntry {
     /// observation / candidate / v1.
     #[serde(default)]
     pub meta: MemoryMeta,
+    /// Supernova-specific kind extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supernova_kind: Option<SupernovaKnowledgeKind>,
 }
 
 impl MemoryEntry {
     /// A minimal entry with the given identity and author facts.
+    /// Supernova tagging is opt-in via [`Self::with_supernova_kind`] so the
+    /// common path stays non-breaking.
     pub fn new(
         entry_id: impl Into<String>,
         scope: impl Into<String>,
@@ -241,6 +246,7 @@ impl MemoryEntry {
             expires_at_ms: None,
             provenance: None,
             meta: MemoryMeta::default(),
+            supernova_kind: None,
         }
     }
 
@@ -288,6 +294,13 @@ impl MemoryEntry {
         self.meta.detail = Some(detail);
         self
     }
+
+    /// Tags the entry with a Supernova-specific knowledge kind
+    /// (MultiversX Supernova v2.0.8 observation surface).
+    pub fn with_supernova_kind(mut self, kind: SupernovaKnowledgeKind) -> Self {
+        self.supernova_kind = Some(kind);
+        self
+    }
 }
 
 /// What kind of knowledge a memory entry carries (M18 knowledge objects).
@@ -318,6 +331,31 @@ pub enum KnowledgeKind {
     ModelEvaluation,
     /// Research output (reports, experiment results).
     Research,
+}
+
+/// Supernova-specific knowledge kinds for tracking execution results,
+/// finality states, and transition decisions.
+///
+/// These extend the base KnowledgeKind enum to support Supernova integration
+/// with MultiversX Supernova v2.0.8.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SupernovaKnowledgeKind {
+    /// Execution result record (nonce, hash, gas usage, timestamp)
+    #[default]
+    Execution,
+    /// Finality confirmation state
+    Finality,
+    /// Epoch transition decision
+    EpochTransition,
+    /// Round timing observation
+    RoundTiming,
+    /// Transaction pool state observation
+    TxPoolState,
+    /// Cross-shard execution observation
+    CrossShardExecution,
 }
 
 /// Lifecycle status of a collective-memory entry.

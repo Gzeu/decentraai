@@ -40,6 +40,7 @@ pub struct BridgeMapping(HashMap<String, BridgeConfig>);
 
 impl BridgeMapping {
     /// The default mapping: lessons, decisions, and experiences are bridged.
+    /// Supernova categories are added for DecentraAI integration with MultiversX.
     pub fn default_mapping() -> Self {
         let mut m = HashMap::new();
         m.insert(
@@ -64,6 +65,43 @@ impl BridgeMapping {
                 collective_scope: "agent.experiences".to_string(),
                 kind: KnowledgeKind::Observation,
                 tags: vec!["bridge:personal".to_string(), "kind:experience".to_string()],
+            },
+        );
+        // Supernova integration categories
+        m.insert(
+            "supernova-lessons".to_string(),
+            BridgeConfig {
+                collective_scope: "agent.supernova.lessons".to_string(),
+                kind: KnowledgeKind::Learning,
+                tags: vec![
+                    "bridge:personal".to_string(),
+                    "kind:lesson".to_string(),
+                    "supernova:v2.0.8".to_string(),
+                ],
+            },
+        );
+        m.insert(
+            "supernova-decisions".to_string(),
+            BridgeConfig {
+                collective_scope: "agent.supernova.decisions".to_string(),
+                kind: KnowledgeKind::Decision,
+                tags: vec![
+                    "bridge:personal".to_string(),
+                    "kind:decision".to_string(),
+                    "supernova:v2.0.8".to_string(),
+                ],
+            },
+        );
+        m.insert(
+            "supernova-execution".to_string(),
+            BridgeConfig {
+                collective_scope: "agent.supernova.execution".to_string(),
+                kind: KnowledgeKind::Execution,
+                tags: vec![
+                    "bridge:personal".to_string(),
+                    "kind:execution".to_string(),
+                    "supernova:v2.0.8".to_string(),
+                ],
             },
         );
         Self(m)
