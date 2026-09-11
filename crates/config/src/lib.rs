@@ -1311,7 +1311,10 @@ pub struct MxSupernovaSection {
     #[serde(default)]
     pub enabled: bool,
     /// Proxy base URL (default the public testnet API — public data, no
-    /// secret). Any `http(s)` URL is accepted so devnet/local proxies work.
+    /// secret). Any `http(s)` URL is accepted so devnet/local proxies work;
+    /// mainnet read-only observing uses `https://api.multiversx.com` with
+    /// `chain_id: "1"` below. Observing is always read-only — submission
+    /// stays on the testnet lane regardless of this URL.
     #[serde(default = "default_mx_api_base")]
     pub api_base: String,
     /// Shard polled for the periodic snapshot (default 2 = operator lane).
@@ -1336,7 +1339,9 @@ pub struct MxSupernovaSection {
     /// 440). Both thresholds are required for an active verdict.
     #[serde(default)]
     pub enable_round: Option<u64>,
-    /// Expected chain id (default `T`). Mismatch fails closed at runtime.
+    /// Expected chain id (default `T`; `"1"` observes mainnet read-only).
+    /// Mismatch fails closed at runtime. Mainnet observing is safe by
+    /// construction: this section cannot authorize submission anywhere.
     #[serde(default = "default_mx_chain_id")]
     pub chain_id: String,
 }

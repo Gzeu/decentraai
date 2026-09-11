@@ -518,6 +518,48 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_first_class_verdict() {
+        // Live mainnet values (chain "1", v2.0.8.0, 2026-09-12): the SAME
+        // pinned rule decides — no testnet assumption anywhere in the path.
+        let s = SupernovaStatus::observe(2234, 32320452, Some(ActivationConfig::TEMPLATE_DEFAULT));
+        assert!(s.active);
+        assert_eq!(s.round_duration_ms, SupernovaStatus::SUPERNOVA_ROUND_MS);
+        assert!(s.timing_consistent_with(600));
+        let cfg = NetworkConfig {
+            chain_id: "1".to_string(),
+            round_duration_ms: 600,
+            software_version: "v2.0.8.0".to_string(),
+            rounds_per_epoch: 144000,
+        };
+        assert!(cfg.timing_matches_supernova());
+    }
+
+    #[test]
+    fn mainnet_tx_lifts_to_valid_execution_result() {
+        // Shape + values of a real mainnet tx (public chain data).
+        let tx = TxObservation {
+            tx_hash: "3ae06ccce9566147ab6c6e719b57570f2a7cf636f318743b22ab7ad8c1f03b42".to_string(),
+            nonce: 99151,
+            sender: "erd1e2r4m874a7whe5n2sftrxqy758kl3s6gvs8ekmac2yuhxlg70shs5lhc7t".to_string(),
+            receiver: "erd1qqqqqqqqqqqqqpgq4luh53qlc8ehlzmvxm06v0rs8r5q5p6h45qs9dx4vm".to_string(),
+            sender_shard: 1,
+            receiver_shard: 1,
+            status: "success".to_string(),
+            gas_limit: 21671646,
+            gas_used: 11444132,
+            timestamp_ms: 1789168266000,
+            round: 32332161,
+            epoch: 2234,
+            miniblock_hash: "124953791c2e5df65ebb80ce896e9107f5cb2cdf02f8ba34d49b4fc269bc3198"
+                .to_string(),
+        };
+        assert!(tx.is_success());
+        let r = tx.execution_result("mainnet-block", true);
+        assert!(r.is_valid());
+        assert_eq!(r.shard_id, 1);
+    }
+
+    #[test]
     fn shard_zero_and_nonce_zero_are_valid() {
         let r = ExecutionResult {
             nonce: 0,
