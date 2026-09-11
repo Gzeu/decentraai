@@ -368,7 +368,7 @@ mod tests {
         let cfg = proxy(&base).network_config().await.unwrap();
         assert_eq!(cfg.chain_id, "T");
         assert_eq!(cfg.round_duration_ms, 600);
-        assert!(cfg.looks_supernova());
+        assert!(cfg.timing_matches_supernova());
     }
 
     #[tokio::test]
