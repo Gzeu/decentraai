@@ -12,6 +12,8 @@ chrono.workspace = true
 decentraai-agents = { path = "../agents" }
 # Fabric Intelligence: the reasoning layer between a task and the planner.
 decentraai-fabric-intelligence = { path = "../fabric-intelligence" }
+# Supernova observer (O1): read-only Proxy types + poll/track. No submission.
+decentraai-mx-supernova = { path = "../mx-supernova" }
 # DFCP messages (Sharing is Caring resource negotiation).
 decentraai-protocol = { path = "../protocol" }
 # M15 Research Pressure Trigger: pure detector (no I/O, deterministic).

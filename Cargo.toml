@@ -32,6 +32,7 @@ members = [
   "crates/policy-engine",
   "crates/proposal",
   "crates/introspection-api",
+  "crates/mx-supernova",
 ]
 resolver = "2"
 

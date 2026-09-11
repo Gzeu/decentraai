@@ -437,6 +437,9 @@ pub struct ApiState {
     /// form. Set (via config, after token creation) = the same code paths
     /// denominate in DCAI — pure configuration, no logic switch.
     pub dcai: Option<decentraai_config::DcaiSection>,
+    /// MultiversX Supernova observer (O1, read-only). `None` = disabled:
+    /// `/v1/mx/*` returns 404 and zero Proxy traffic happens.
+    pub mx_observer: Option<Arc<crate::mx_observer::MxObserverHandle>>,
 }
 
 impl ApiState {
@@ -516,6 +519,7 @@ impl ApiState {
             memory_bridge: None,
             bridge_sync: false,
             research_trigger: None,
+            mx_observer: None,
             model_intel: None,
             model_intel_path: None,
             talent_tree: None,
@@ -938,6 +942,18 @@ impl ApiState {
         rt: Arc<crate::research_trigger::ResearchTriggerRuntime>,
     ) {
         self.research_trigger = Some(rt);
+    }
+
+    /// Supernova observer: attach the validated handle (or nothing for
+    /// disabled). Spawns the background poll loop on attach.
+    pub fn attach_mx_observer(
+        &mut self,
+        handle: Option<Arc<crate::mx_observer::MxObserverHandle>>,
+    ) {
+        if let Some(h) = &handle {
+            h.spawn();
+        }
+        self.mx_observer = handle;
     }
 
     /// DCAI identifier slot: attach the validated config section (or
@@ -1674,6 +1690,8 @@ pub fn build_router(state: ApiState) -> Router {
             post(world_settle_confirm_handler),
         )
         .route("/v1/world/proofs", get(world_proofs_handler))
+        .route("/v1/mx/status", get(mx_status_handler))
+        .route("/v1/mx/track", get(mx_track_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -3701,9 +3719,12 @@ async fn world_settle_check_handler(
                         drop(world);
                         settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
                         anchor_provider_trust(&state, &proof_id).await;
+                        // A1: Supernova correlation is additive evidence —
+                        // the confirm decision above stands on its own.
+                        let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
                         (
                             StatusCode::OK,
-                            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash})),
+                            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash, "supernova": supernova})),
                         )
                             .into_response()
                     }
@@ -3717,15 +3738,19 @@ async fn world_settle_check_handler(
                 let _ = world.fail_settlement(&proof_id, &format!("chain status: {status}"));
                 let path = crate::world::world_path_for(&state.info.repo_root);
                 crate::world::save_world_state(&path, &world);
+                drop(world);
+                let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
                 (
                     StatusCode::OK,
-                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "failed", "chain_status": status})),
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "failed", "chain_status": status, "supernova": supernova})),
                 )
                     .into_response()
             } else {
+                drop(world);
+                let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
                 (
                     StatusCode::OK,
-                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "pending", "chain_status": status})),
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "pending", "chain_status": status, "supernova": supernova})),
                 )
                     .into_response()
             }
@@ -3735,6 +3760,107 @@ async fn world_settle_check_handler(
             Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
+    }
+}
+
+/// GET /v1/mx/status — Supernova network snapshot (read-only).
+///
+/// Disabled observer → 404. No successful poll yet → `pending: true` with
+/// no snapshot (honest, not an empty object). Telemetry-safe: counters and
+/// ids only, never payloads.
+async fn mx_status_handler(State(state): State<ApiState>) -> Response {
+    let Some(obs) = &state.mx_observer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "mx observer disabled (mx_supernova section absent/off)"})),
+        )
+            .into_response();
+    };
+    match obs.last().await {
+        Some(snap) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "supernova": snap.details()})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "supernova": null, "pending": true})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/mx/track?hash=… — full lifecycle of one tx hash (read-only).
+///
+/// `not-indexed` 404s are normal under async execution (poll again);
+/// every other non-final outcome is 200 with an honest `detail` reason.
+async fn mx_track_handler(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(obs) = &state.mx_observer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "mx observer disabled (mx_supernova section absent/off)"})),
+        )
+            .into_response();
+    };
+    let hash = params.get("hash").cloned().unwrap_or_default();
+    if hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "hash query param required"})),
+        )
+            .into_response();
+    }
+    match obs.track(&hash).await {
+        Ok(t) => {
+            let status = if t.detail == "not-indexed" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "tx_hash": t.tx_hash,
+                    "detail": t.detail,
+                    "status": t.tx.as_ref().map(|x| x.status.clone()),
+                    "execution": t.execution,
+                    "finality": t.finality,
+                    "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{hash}"),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// A1 boundary: best-effort Supernova correlation for a submitted tx.
+///
+/// Returns a JSON object (or `None` when the observer is disabled or the
+/// lookup fails). NEVER fails the caller: the existing check decision
+/// stands on its own; this is additive evidence only.
+async fn mx_correlate_best_effort(state: &ApiState, tx_hash: &str) -> Option<serde_json::Value> {
+    let obs = state.mx_observer.as_ref()?;
+    if tx_hash.is_empty() {
+        return None;
+    }
+    match obs.track(tx_hash).await {
+        Ok(t) => Some(serde_json::json!({
+            "detail": t.detail,
+            "chain_status": t.tx.as_ref().map(|x| x.status.clone()),
+            "finality_reached": t.finality.finality_reached,
+            "proof_seen": t.finality.proof_seen,
+            "execution_valid": t.execution.as_ref().is_some_and(|e| e.is_valid()),
+        })),
+        Err(_) => None,
     }
 }
 

@@ -2839,6 +2839,28 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             }
         }
 
+        // O1 Supernova observer (read-only). Opt-in via the validated
+        // `mx_supernova` config section; absent/disabled = `/v1/mx/*`
+        // returns 404 and zero Proxy traffic happens.
+        if let Some(mx_cfg) = config.mx_supernova.as_ref() {
+            match decentraai_runtime::mx_observer::MxObserverHandle::from_section(mx_cfg) {
+                Ok(handle) => {
+                    if handle.is_some() {
+                        tracing::info!(
+                            "mx-supernova observer: enabled ({} shard {}, poll {}s)",
+                            mx_cfg.api_base,
+                            mx_cfg.shard,
+                            mx_cfg.poll_interval_secs
+                        );
+                    }
+                    state.attach_mx_observer(handle);
+                }
+                Err(e) => {
+                    tracing::warn!("mx-supernova observer NOT attached: {e}");
+                }
+            }
+        }
+
         // M18+: let the dashboard proxy route chat inference to trusted remote
         // workers that advertise the requested model (fabric chat routing).
         let dist_handle = std::sync::Arc::new(distributed.clone());
@@ -4409,6 +4431,27 @@ async fn serve_common(
                 rt.state_path.display()
             );
             state.attach_research_trigger(std::sync::Arc::new(rt));
+        }
+    }
+    // O1 Supernova observer (read-only). Opt-in via the validated
+    // `mx_supernova` config section; absent/disabled = `/v1/mx/*`
+    // returns 404 and zero Proxy traffic happens.
+    if let Some(mx_cfg) = config.mx_supernova.as_ref() {
+        match decentraai_runtime::mx_observer::MxObserverHandle::from_section(mx_cfg) {
+            Ok(handle) => {
+                if handle.is_some() {
+                    tracing::info!(
+                        "mx-supernova observer: enabled ({} shard {}, poll {}s)",
+                        mx_cfg.api_base,
+                        mx_cfg.shard,
+                        mx_cfg.poll_interval_secs
+                    );
+                }
+                state.attach_mx_observer(handle);
+            }
+            Err(e) => {
+                tracing::warn!("mx-supernova observer NOT attached: {e}");
+            }
         }
     }
     let api_addr = serve_api(state, &bind_address, api_port).await?;
