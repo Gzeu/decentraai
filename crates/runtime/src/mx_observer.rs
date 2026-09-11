@@ -32,7 +32,13 @@ impl MxObserverHandle {
             cfg.poll_interval_secs * 1000,
             cfg.timeout_ms,
             cfg.max_bytes,
-            cfg.enable_epoch,
+            match (cfg.enable_epoch, cfg.enable_round) {
+                (Some(e), Some(r)) => Some(decentraai_mx_supernova::ActivationConfig {
+                    supernova_enable_epoch: e,
+                    supernova_enable_round: r,
+                }),
+                _ => None,
+            },
             Some(cfg.chain_id.clone()),
         )
         .map_err(|e| format!("mx_supernova: {e}"))?;

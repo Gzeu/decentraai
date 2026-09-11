@@ -77,13 +77,15 @@ async fn main() {
     println!("EXPLORER https://testnet-explorer.multiversx.com/transactions/{tx_hash}");
 
     // Supernova-aware tracking to finality (bounded: 60 polls × 2s).
+    // Pinned activation: v2.0.8 template thresholds (epoch 2, round 440).
+    let activation = Some(decentraai_mx_supernova::ActivationConfig::TEMPLATE_DEFAULT);
     let cfg = decentraai_mx_supernova::ObserverConfig::new(
         api_base,
         2,
         30_000,
         15_000,
         262_144,
-        None,
+        activation,
         Some("T".to_string()),
     )
     .expect("observer config builds");
@@ -117,13 +119,15 @@ async fn main() {
 /// track of the historical probe tx).
 async fn demonstrate_observer(api_base: &str) {
     let proxy = decentraai_mx_supernova::MxProxy::with_defaults(api_base).expect("proxy builds");
+    // Pinned activation: v2.0.8 template thresholds (epoch 2, round 440).
+    let activation = Some(decentraai_mx_supernova::ActivationConfig::TEMPLATE_DEFAULT);
     let cfg = decentraai_mx_supernova::ObserverConfig::new(
         api_base,
         2,
         30_000,
         15_000,
         262_144,
-        None,
+        activation,
         Some("T".to_string()),
     )
     .expect("observer config builds");

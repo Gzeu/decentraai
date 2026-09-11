@@ -1326,10 +1326,16 @@ pub struct MxSupernovaSection {
     /// Per-response byte cap (default 256KiB).
     #[serde(default = "default_mx_max_bytes")]
     pub max_bytes: usize,
-    /// Operator override for the Supernova enable epoch. Absent = decide
-    /// from the live 600ms-round heuristic (verified on testnet T2.0.8.0).
+    /// Pinned `SupernovaEnableEpoch` for the observed network (official
+    /// `enableEpochs.toml`; v2.0.8 template default 2). Absent = verdict
+    /// stays inactive (fail-closed). Round timing is never a substitute.
     #[serde(default)]
     pub enable_epoch: Option<u64>,
+    /// Pinned `SupernovaEnableRound` (`enableRounds.toml /
+    /// [RoundActivations.SupernovaEnableRound]`; v2.0.8 template default
+    /// 440). Both thresholds are required for an active verdict.
+    #[serde(default)]
+    pub enable_round: Option<u64>,
     /// Expected chain id (default `T`). Mismatch fails closed at runtime.
     #[serde(default = "default_mx_chain_id")]
     pub chain_id: String,
@@ -1400,6 +1406,7 @@ impl Default for MxSupernovaSection {
             timeout_ms: default_mx_timeout_ms(),
             max_bytes: default_mx_max_bytes(),
             enable_epoch: None,
+            enable_round: None,
             chain_id: default_mx_chain_id(),
         }
     }

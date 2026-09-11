@@ -13,8 +13,8 @@
 
 use crate::proxy::MxProxy;
 use crate::types::{
-    ChainStatus, ExecutionResult, FinalityState, NetworkConfig, ObserverSnapshotDetails,
-    SupernovaError, SupernovaStatus, TxObservation,
+    ActivationConfig, ChainStatus, ExecutionResult, FinalityState, NetworkConfig,
+    ObserverSnapshotDetails, SupernovaError, SupernovaStatus, TxObservation,
 };
 
 /// Minimum poll interval (ms): 600ms rounds exist, but the Proxy is shared
@@ -37,11 +37,14 @@ pub struct ObserverConfig {
     pub timeout_ms: u64,
     /// Per-response byte cap.
     pub max_bytes: usize,
-    /// Operator override for the Supernova enable epoch (`None` = decide
-    /// from the live 600ms-round heuristic).
-    pub enable_epoch: Option<u64>,
-    /// Expected chain id (`Some("T")` on testnet lane). Mismatch fails
-    /// closed — observing mainnet with testnet goggles is a bug, not data.
+    /// Pinned Supernova activation (`SupernovaEnableEpoch` +
+    /// `SupernovaEnableRound` for the observed network, from the official
+    /// `enableEpochs.toml` / `enableRounds.toml`). `None` = unconfigured ⇒
+    /// verdict stays inactive (fail-closed). Round timing is NEVER a
+    /// substitute: it is corroborating telemetry only.
+    pub activation: Option<ActivationConfig>,
+    /// Expected chain id (`Some("T")` testnet, `Some("1")` mainnet).
+    /// Mismatch fails closed — wrong goggles are a bug, not data.
     pub expected_chain_id: Option<String>,
 }
 
@@ -54,7 +57,7 @@ impl ObserverConfig {
         poll_interval_ms: u64,
         timeout_ms: u64,
         max_bytes: usize,
-        enable_epoch: Option<u64>,
+        activation: Option<ActivationConfig>,
         expected_chain_id: Option<String>,
     ) -> Result<Self, SupernovaError> {
         let api_base = api_base.into();
@@ -70,7 +73,7 @@ impl ObserverConfig {
             poll_interval_ms,
             timeout_ms,
             max_bytes,
-            enable_epoch,
+            activation,
             expected_chain_id,
         })
     }
@@ -110,14 +113,10 @@ pub async fn poll_once(
         }
     }
     let chain = proxy.chain_status(cfg.shard).await?;
-    // Explicit operator config wins; otherwise the live-verified heuristic
-    // (600ms rounds ⇔ Supernova timing) decides. Unknown is never active —
-    // that rule lives in SupernovaStatus::observe for the explicit path.
-    let mut status = SupernovaStatus::observe(chain.epoch, chain.round, cfg.enable_epoch);
-    if cfg.enable_epoch.is_none() {
-        status.active = net.looks_supernova();
-        status.round_duration_ms = net.round_duration_ms;
-    }
+    // The official two-flag rule, evaluated against the pinned config.
+    // No heuristic, no timing shortcut: 600ms rounds are corroboration
+    // (reported via timing_consistent), never the verdict.
+    let status = SupernovaStatus::observe(chain.epoch, chain.round, cfg.activation);
     Ok(ObserverSnapshot {
         net,
         chain,
@@ -235,6 +234,9 @@ impl ObserverSnapshot {
             round: self.chain.round,
             active: self.status.active,
             round_duration_ms: self.status.round_duration_ms,
+            timing_consistent: self
+                .status
+                .timing_consistent_with(self.net.round_duration_ms),
             nonce: self.chain.nonce,
             highest_final_nonce: self.chain.highest_final_nonce,
             last_executed_nonce: self.chain.last_executed_nonce,
@@ -250,7 +252,16 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn cfg() -> ObserverConfig {
-        ObserverConfig::new("http://127.0.0.1:1", 2, 30_000, 10_000, 262_144, None, None).unwrap()
+        ObserverConfig::new(
+            "http://127.0.0.1:1",
+            2,
+            30_000,
+            10_000,
+            262_144,
+            Some(ActivationConfig::TEMPLATE_DEFAULT),
+            None,
+        )
+        .unwrap()
     }
 
     fn snap() -> ObserverSnapshot {
@@ -269,7 +280,11 @@ mod tests {
                 highest_final_nonce: 90,
                 last_executed_nonce: 95,
             },
-            status: SupernovaStatus::observe(5790, 28253981, None),
+            status: SupernovaStatus::observe(
+                5790,
+                28253981,
+                Some(ActivationConfig::TEMPLATE_DEFAULT),
+            ),
             at_ms: 1,
         }
     }
@@ -332,26 +347,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_heuristic_and_override() {
-        // Heuristic path: 600ms rounds → active.
+    async fn poll_two_flag_rule_no_heuristic() {
+        // 600ms timing present, but the verdict follows ONLY the pinned rule.
         let base = serve_seq(vec![
             ("/network/config".to_string(), 200,
                 r#"{"data":{"config":{"erd_chain_id":"T","erd_round_duration":600,"erd_latest_tag_software_version":"T2.0.8.0","erd_rounds_per_epoch":12000}}}"#.to_string()),
             ("/network/status/2".to_string(), 200, STATUS.to_string()),
         ])
         .await;
+        // Pinned past thresholds (epoch 5790 >= 2, round 28254010 >= 440).
         let c = cfg();
         let s = poll_once(&MxProxy::with_defaults(&base).unwrap(), &c, 7)
             .await
             .unwrap();
         assert!(s.status.active);
         assert_eq!(s.at_ms, 7);
-        // Explicit enable_epoch in the future wins over the heuristic.
-        let c2 = ObserverConfig::new(&base, 2, 30_000, 10_000, 262_144, Some(9999), None).unwrap();
+        // Timing corroboration is reported, not decided.
+        assert!(s.details().timing_consistent);
+        // Same timing, future epoch threshold → inactive (pre-activation).
+        let c2 = ObserverConfig::new(
+            &base,
+            2,
+            30_000,
+            10_000,
+            262_144,
+            Some(ActivationConfig {
+                supernova_enable_epoch: 9999,
+                supernova_enable_round: 1,
+            }),
+            None,
+        )
+        .unwrap();
         let s2 = poll_once(&MxProxy::with_defaults(&base).unwrap(), &c2, 7)
             .await
             .unwrap();
         assert!(!s2.status.active);
+        // No pinned config at all → inactive despite 600ms rounds.
+        let c3 = ObserverConfig::new(&base, 2, 30_000, 10_000, 262_144, None, None).unwrap();
+        let s3 = poll_once(&MxProxy::with_defaults(&base).unwrap(), &c3, 7)
+            .await
+            .unwrap();
+        assert!(!s3.status.active);
     }
 
     #[tokio::test]

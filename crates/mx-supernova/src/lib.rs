@@ -37,6 +37,7 @@ pub use proxy::{
     DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, MAX_BYTES_CEILING, MxProxy, TIMEOUT_CEILING_MS,
 };
 pub use types::{
-    BlockObservation, ChainStatus, ExecutionResult, FinalityState, MxTxRef, NetworkConfig,
-    ObserverSnapshotDetails, ProofSummary, SupernovaError, SupernovaStatus, TxObservation,
+    ActivationConfig, BlockObservation, ChainStatus, ExecutionResult, FinalityState, MxTxRef,
+    NetworkConfig, ObserverSnapshotDetails, ProofSummary, SupernovaError, SupernovaStatus,
+    TxObservation,
 };
