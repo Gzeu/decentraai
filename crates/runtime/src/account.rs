@@ -22,12 +22,19 @@ pub const MX_EXTENSION_PROVIDER_URL: &str =
 /// Pinned MultiversX signing providers (jsDelivr `+esm` browser builds).
 pub const MX_WALLETCONNECT_PROVIDER_URL: &str =
     "https://cdn.jsdelivr.net/npm/@multiversx/sdk-wallet-connect-provider@6.1.5/+esm";
+/// Pinned client-side QR renderer (no data leaves the browser).
+pub const MX_QR_RENDERER_URL: &str = "https://cdn.jsdelivr.net/npm/qrcode@1.5.4/+esm";
+/// WalletConnect Cloud project ID (free at https://cloud.walletconnect.com).
+/// Empty = xPortal button shows setup guidance instead of pairing.
+pub const MX_WALLETCONNECT_PROJECT_ID: &str = "";
 
 /// The account onboarding HTML (no-store; all state via the wallet API).
 pub fn account_html() -> String {
     ACCOUNT_HTML
         .replace("/*__MX_EXTENSION_URL__*/", MX_EXTENSION_PROVIDER_URL)
         .replace("/*__MX_WC_URL__*/", MX_WALLETCONNECT_PROVIDER_URL)
+        .replace("/*__MX_QR_URL__*/", MX_QR_RENDERER_URL)
+        .replace("/*__MX_WC_PROJECT__*/", MX_WALLETCONNECT_PROJECT_ID)
 }
 
 const ACCOUNT_HTML: &str = r##"<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Cont</title>
@@ -78,7 +85,8 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 <div class="row" style="margin-top:8px"><button class="primary" onclick="manualLogin()">2. Verifică și intră →</button></div>
 </div>
 <div id="wcBox" class="hidden">
-<label>Scanează / împerechează în xPortal:</label>
+<div id="wcQr" style="margin:8px 0"></div>
+<label>URI împerechere (backup dacă QR-ul nu se randează):</label>
 <pre id="wcUri" style="display:block"></pre>
 <div class="row" style="margin-top:8px"><button onclick="copyWc()">Copiază URI împerechere</button></div>
 <p class="sub" style="margin:8px 0 0">xPortal → WalletConnect → lipește URI-ul (sau scanează dacă îl vezi ca QR în alt client). Aprobă conectarea, apoi semnează mesajul challenge.</p>
@@ -229,22 +237,45 @@ async function providerSign(p,message){
   }
 }
 // ---- metoda: xPortal prin WalletConnect (QR/URI) ----
+// API real v6.1.5 (din bundle, nu din memorie): constructor POZIȚIONAL
+// (callbacks, chainId, relayUrl, projectId); init(); connect() →
+// {uri, approval}; login({approval}) leagă sesiunea; getAddress() e
+// sincron. Callback-urile sunt apelate necondiționat → nu pot fi {}.
+const MX_WC_PROJECT='/*__MX_WC_PROJECT__*/';
+const MX_QR_URL='/*__MX_QR_URL__*/';
+async function renderQr(uri){
+  $('wcUri').textContent=uri;
+  const box=$('wcQr');if(!box)return;
+  try{
+    const qm=await import(MX_QR_URL);
+    const QR=qm.default||qm;
+    box.innerHTML=await QR.toString(uri,{type:'svg',margin:1,width:220});
+  }catch(e){box.innerHTML='<span class="warn">QR indisponibil — copiază URI-ul de mai jos.</span>';}
+}
 async function connectXportal(){
+  if(!MX_WC_PROJECT){say('out2','xPortal e în configurare: îi trebuie un WalletConnect Project ID (gratuit, 2 minute pe cloud.walletconnect.com, apoi îl pune operatorul în pagină). Până atunci: DeFi Extension sau Manual — ambele funcționează acum.','warn');return;}
   say('out2','Se încarcă provider-ul WalletConnect…','');
   try{
     const mod=await import('/*__MX_WC_URL__*/');
-    const WC=mod.WalletConnectV2Provider||mod.WalletConnectProvider||mod.default;
-    if(!WC)throw new Error('SDK încărcat, dar nu găsesc provider-ul (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
-    const p=new WC({chainId:S.net==='multiversx-mainnet'?'1':'T'});
-    if(typeof p.init==='function')await p.init();
-    if(typeof p.login!=='function')throw new Error('provider fără login(). Încearcă Manual.');
-    const out=await p.login();
-    let uri=out&&out.uri?out.uri:(typeof out==='string'?out:null);
-    let approval=out&&out.approval?out.approval:null;
-    if(uri){S.wcUri=uri;$('wcUri').textContent=uri;$('wcBox').classList.remove('hidden');say('out2','Împerechează xPortal, apoi aprobă. Aștept…','');}
-    if(approval)await approval();
+    const WC=mod.WalletConnectV2Provider||mod.WalletConnectProvider
+      ||(mod.default&&(mod.default.WalletConnectV2Provider||mod.default.WalletConnectProvider))
+      ||mod.default;
+    if(typeof WC!=='function')throw new Error('SDK încărcat, dar constructorul lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
+    const p=new WC(
+      {onClientLogin:()=>{},onClientLogout:()=>{},onClientEvent:()=>{}},
+      S.net==='multiversx-mainnet'?'1':'T',
+      'wss://relay.walletconnect.com',
+      MX_WC_PROJECT
+    );
+    await p.init();
+    const {uri,approval}=await p.connect();
+    if(!uri)throw new Error('fără URI de împerechere. Încearcă Manual.');
+    S.wcUri=uri;$('wcBox').classList.remove('hidden');
+    await renderQr(uri);
+    say('out2','Scanează QR-ul cu xPortal, aprobă conectarea, apoi semnează mesajul. Aștept…','');
+    await p.login({approval});
     const addr=await providerAddress(p);
-    if(!addr)throw new Error('conectat, dar adresa lipsește (formă necunoscută: verifică consola). Încearcă Manual.');
+    if(!addr)throw new Error('conectat, dar adresa lipsește. Încearcă Manual.');
     const chal=await getChallenge(addr);
     const sig=await providerSign(p,chal.message);
     if(!sig)throw new Error('semnătură ilizibilă. Încearcă Manual.');
@@ -294,6 +325,8 @@ mod tests {
             "/v1/auth/wallet/network",
             "getInstance",
             "signMessage({data",
+            "cloud.walletconnect.com",
+            "cdn.jsdelivr.net/npm/qrcode@1.5.4/+esm",
             "arătată o singură dată",
             "Revocă + re-emite",
             "dca_",
@@ -320,7 +353,11 @@ mod tests {
     #[test]
     fn provider_urls_are_pinned_versions() {
         // No @latest / floating tags: reproducible client, no supply-chain drift.
-        for url in [MX_EXTENSION_PROVIDER_URL, MX_WALLETCONNECT_PROVIDER_URL] {
+        for url in [
+            MX_EXTENSION_PROVIDER_URL,
+            MX_WALLETCONNECT_PROVIDER_URL,
+            MX_QR_RENDERER_URL,
+        ] {
             assert!(url.starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
             assert!(url.ends_with("/+esm"));
             assert!(!url.contains("@latest"), "must pin exact version: {url}");
