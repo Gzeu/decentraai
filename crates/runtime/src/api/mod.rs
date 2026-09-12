@@ -2338,6 +2338,10 @@ async fn wallet_key_handler(
     /// enough for real onboarding (matches the consumer test baseline).
     const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
     const SELF_SERVE_RATE_PER_MIN: u32 = 50;
+    /// Starter grant: spendable units so the first chat works immediately.
+    /// Seeded only when the account has nothing spendable (re-issues after
+    /// revoke don't re-grant) — same pattern as world onboarding.
+    const SELF_SERVE_STARTER_QUOTA: u64 = 100;
 
     let session_token = body
         .get("session_token")
@@ -2430,8 +2434,37 @@ async fn wallet_key_handler(
             "key_prefix": decentraai_tokens::key_prefix(&plaintext),
             "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "starter_quota": SELF_SERVE_STARTER_QUOTA,
         }),
     );
+    // Seed starter quota so the first inference works immediately. Only
+    // when the account has nothing spendable: rotation re-issues must not
+    // mint free quota (same pattern as world onboarding).
+    let mut starter_granted = false;
+    if let Some(ledger) = &state.quota_ledger {
+        let mut l = ledger.lock().unwrap();
+        let has = l
+            .account(&session.agent_id)
+            .map_or(0, |a| a.spendable())
+            > 0;
+        if !has {
+            let ref_id = format!(
+                "wallet-onboard-seed-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            l.credit(
+                &session.agent_id,
+                &ref_id,
+                Some(SELF_SERVE_STARTER_QUOTA as u32),
+                None,
+            );
+            starter_granted = true;
+        }
+        drop(l);
+    }
     let key_id = store
         .lookup(&plaintext)
         .map(|r| r.key_id.clone())
@@ -2447,6 +2480,8 @@ async fn wallet_key_handler(
             "wallet": session.wallet_address,
             "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "starter_quota": SELF_SERVE_STARTER_QUOTA,
+            "starter_granted": starter_granted,
             "scopes": [],
             "note": "shown once; only its hash and prefix are stored",
         })),
@@ -24130,7 +24165,7 @@ mod tests {
     async fn wallet_self_serve_key_then_mcp() {
         // xPortal-style onboarding: login → self-issued dca_ key → MCP.
         let dir = tempfile::tempdir().unwrap();
-        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let (api, ledger) = start_consumer_state(dir.path(), "master-token".to_string()).await;
         let client = reqwest::Client::new();
         let (wallet, session) = wallet_session(api).await;
         let issued: serde_json::Value = client
@@ -24144,6 +24179,15 @@ mod tests {
             .unwrap();
         assert_eq!(issued["ok"], true, "self-serve issuance works");
         assert_eq!(issued["wallet"].as_str().unwrap(), wallet);
+        assert_eq!(issued["starter_granted"], true, "first issuance seeds quota");
+        // Starter quota landed on the wallet agent's ledger account.
+        let spendable = ledger
+            .lock()
+            .unwrap()
+            .account(&wallet)
+            .map(|a| a.spendable())
+            .unwrap_or(0);
+        assert_eq!(spendable, 100, "starter grant funds the first chats");
         let token = issued["token"].as_str().unwrap().to_string();
         assert!(token.starts_with("dca_"), "OpenAI-compatible fabric key");
         assert!(!issued["key_id"].as_str().unwrap().is_empty());
@@ -24243,6 +24287,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reissued["ok"], true);
+        assert_eq!(
+            reissued["starter_granted"], false,
+            "rotation must not mint free quota"
+        );
         let new_token = reissued["token"].as_str().unwrap().to_string();
         assert_ne!(new_token, old_token, "rotation must mint fresh plaintext");
         assert_ne!(

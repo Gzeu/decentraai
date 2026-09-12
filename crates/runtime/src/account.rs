@@ -136,7 +136,7 @@ async function mintKey(){
   if(r.status!==200||!r.json.ok)throw new Error('key: '+(r.json.error||r.status));
   S.key=r.json.token;S.keyId=r.json.key_id;
   $('keyPlain').textContent=r.json.token;
-  $('keyInfo').innerHTML='Cont <code>'+esc(r.json.account)+'</code> · wallet <code>'+esc(r.json.wallet)+'</code><br>key_id <code>'+esc(r.json.key_id)+'</code> · cotă '+r.json.quota_ceiling+' · '+r.json.rate_limit_per_minute+'/min';
+  $('keyInfo').innerHTML='Cont <code>'+esc(r.json.account)+'</code> · wallet <code>'+esc(r.json.wallet)+'</code><br>key_id <code>'+esc(r.json.key_id)+'</code> · cotă '+r.json.quota_ceiling+' · '+r.json.rate_limit_per_minute+'/min · start '+(r.json.starter_granted?r.json.starter_quota+' (grant)':'0 (deja alimentat)');
   try{localStorage.setItem('decentraai.account.key',r.json.token);localStorage.setItem('decentraai.account.key_id',r.json.key_id);}catch(_){}
   $('step3').classList.remove('hidden');showSnippets(r.json.token);
   say('out2','Autentificat ca '+r.json.wallet+'. Cheia de mai sus NU se mai arată — copiaz-o acum.','ok');
