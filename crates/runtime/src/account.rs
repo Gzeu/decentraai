@@ -20,10 +20,21 @@
 /// First-party MultiversX code only — no external accounts, no relays.
 pub const MX_EXTENSION_PROVIDER_URL: &str =
     "https://cdn.jsdelivr.net/npm/@multiversx/sdk-extension-provider@5.1.2/+esm";
+/// Pinned cross-window Web Wallet provider (popup, official wallet URLs).
+pub const MX_XWINDOW_PROVIDER_URL: &str =
+    "https://cdn.jsdelivr.net/npm/@multiversx/sdk-web-wallet-cross-window-provider@3.2.2/+esm";
+/// Pinned sdk-core (documented SignableMessage shape for signMessage).
+pub const MX_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/@multiversx/sdk-core@15.3.1/+esm";
+/// Official Web Wallet URLs (popup target per selected network).
+pub const MX_WEB_WALLET_MAINNET: &str = "https://wallet.multiversx.com";
+pub const MX_WEB_WALLET_TESTNET: &str = "https://testnet-wallet.multiversx.com";
 
 /// The account onboarding HTML (no-store; all state via the wallet API).
 pub fn account_html() -> String {
-    ACCOUNT_HTML.replace("/*__MX_EXTENSION_URL__*/", MX_EXTENSION_PROVIDER_URL)
+    ACCOUNT_HTML
+        .replace("/*__MX_EXTENSION_URL__*/", MX_EXTENSION_PROVIDER_URL)
+        .replace("/*__MX_XWINDOW_URL__*/", MX_XWINDOW_PROVIDER_URL)
+        .replace("/*__MX_CORE_URL__*/", MX_CORE_URL)
 }
 
 const ACCOUNT_HTML: &str = r##"<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Cont</title>
@@ -63,6 +74,7 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 <div class="card" id="step2"><h2><span class="n">2</span>Conectează wallet-ul</h2>
 <div class="row">
 <button id="mExt" onclick="connectExtension()">DeFi Extension</button>
+<button id="mWeb" onclick="connectXWindow()">Web Wallet (popup)</button>
 <button id="mXpo" onclick="showXportal()">xPortal (aplicație)</button>
 <button id="mMan" onclick="showManual()">Manual / alt wallet</button>
 </div>
@@ -72,9 +84,9 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 </div>
 <div id="manualBox" class="hidden">
 <label>Adresă wallet (erd1…)</label><input id="manAddr" placeholder="erd1…" autocomplete="off">
-<div class="row" style="margin-top:8px"><button onclick="manualChallenge()">1. Cere mesaj de semnat</button></div>
+<div class="row" style="margin-top:8px"><button onclick="manualChallenge()">1. Cere mesaj de semnat</button><button onclick="copyMsg()">Copiază mesajul</button></div>
 <pre id="manMsg" style="display:none"></pre>
-<label>Semnătură (hex sau base64) a mesajului de mai sus</label><textarea id="manSig" rows="3" placeholder="semnează mesajul în wallet-ul tău, lipește aici" autocomplete="off"></textarea>
+<label>Semnătură (hex sau base64) a mesajului de mai sus — se verifică automat la lipire</label><textarea id="manSig" rows="3" placeholder="semnează mesajul în wallet-ul tău, lipește aici" autocomplete="off" onpaste="setTimeout(manualLogin,300)"></textarea>
 <div class="row" style="margin-top:8px"><button class="primary" onclick="manualLogin()">2. Verifică și intră →</button></div>
 </div>
 <pre id="out2"></pre>
@@ -162,6 +174,36 @@ async function rotateKey(){
   S.key=null;await mintKey();
 }
 function copyKey(){const t=S.key||'(nemaifișată)';navigator.clipboard.writeText(t).then(()=>say('out2','Cheia e în clipboard.','ok'));}
+function copyMsg(){if(S.manChal)navigator.clipboard.writeText(S.manChal.message).then(()=>say('out2','Mesaj copiat — semnează-l exact în wallet și lipește semnătura.','ok'));else say('out2','Cere întâi mesajul (pasul 1).','err');}
+// Documented SignableMessage shape (sdk-core, cached import). The docs
+// pass `new SignableMessage({message})` — providers read the documented
+// field; raw {data} stays as fallback.
+let _coreMod=null;
+async function signableMessage(bytes){
+  try{
+    if(!_coreMod)_coreMod=await import('/*__MX_CORE_URL__*/');
+    const SM=_coreMod.SignableMessage||(_coreMod.default&&_coreMod.default.SignableMessage);
+    if(typeof SM==='function')return new SM({message:bytes});
+  }catch(_){}
+  return null;
+}
+async function providerSign(p,message){
+  const bytes=msgBytes(message);
+  if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual.');
+  const doc=await signableMessage(bytes);
+  const shapes=[];
+  if(doc)shapes.push(doc);
+  shapes.push({data:bytes});
+  shapes.push(message);
+  let last=null;
+  for(const shape of shapes){
+    try{const sig=extractSig(await p.signMessage(shape,{}));if(sig)return sig;}
+    catch(e){last=e;}
+  }
+  // Some providers mutate the passed object instead of returning.
+  if(doc&&doc.signature){const sig=extractSig(doc);if(sig)return sig;}
+  throw new Error('semnare eșuată ('+String((last&&last.message)||last).slice(0,120)+'). Încearcă Manual.');
+}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 // ---- metoda: DeFi Extension (SDK pin-uit, import dinamic) ----
 // Provider-ul e SINGLETON: getInstance(), nu create/new. init() confirmă
@@ -208,6 +250,29 @@ async function connectExtension(){
     say('out2','Extension: '+String(e.message||e).slice(0,300)+dbg,'err');
   }
 }
+// ---- metoda: Web Wallet cross-window (popup oficial, fără conturi) ----
+async function connectXWindow(){
+  say('out2','Se încarcă provider-ul Web Wallet…','');
+  try{
+    const mod=await import('/*__MX_XWINDOW_URL__*/');
+    const XW=mod.CrossWindowProvider
+      ||(mod.default&&(mod.default.CrossWindowProvider||mod.default));
+    if(typeof XW!=='function'&&typeof XW.getInstance!=='function')throw new Error('SDK încărcat, dar CrossWindowProvider lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
+    const p=typeof XW.getInstance==='function'?XW.getInstance():new XW();
+    if(typeof p.init==='function')await p.init();
+    const wurl=S.net==='multiversx-mainnet'?'https://wallet.multiversx.com':'https://testnet-wallet.multiversx.com';
+    if(typeof p.setWalletUrl==='function')p.setWalletUrl(wurl);
+    say('out2','Se deschide Web Wallet-ul oficial ('+wurl+') — autentifică-te acolo…','');
+    const loginOut=await p.login();
+    const addr=(typeof loginOut==='string'&&loginOut)||await providerAddress(p);
+    if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
+    say('out2','Conectat: '+addr+' — cere challenge…','');
+    const chal=await getChallenge(addr);
+    const sig=await providerSign(p,chal.message);
+    if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
+    await doVerify(addr,chal.challenge_id,sig);
+  }catch(e){say('out2','Web Wallet: '+String(e.message||e).slice(0,300),'err');}
+}
 function msgBytes(s){return new TextEncoder().encode(s);}
 function addrOf(a){
   if(!a)return null;
@@ -238,16 +303,6 @@ async function providerAddress(p){
   if(Array.isArray(p.accounts)&&p.accounts[0])return p.accounts[0];
   if(typeof p.getAccount==='function'){try{const a=await p.getAccount();if(a&&(a.address||typeof a==='string'))return a.address||a;}catch(_){}}
   return null;
-}
-// signMessage across provider shapes: {data: bytes} first, plain string fallback.
-async function providerSign(p,message){
-  const bytes=msgBytes(message);
-  if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual.');
-  try{return extractSig(await p.signMessage({data:bytes}));}
-  catch(e1){
-    try{return extractSig(await p.signMessage(message));}
-    catch(e2){throw new Error('semnare eșuată ('+String(e1.message||e1).slice(0,120)+'). Încearcă Manual.');}
-  }
 }
 // ---- metoda: xPortal (aplicație) — ghidare first-party, fără relay extern ----
 function showXportal(){$('xpoBox').classList.remove('hidden');say('out2','xPortal: vezi caseta de mai sus — fără conturi externe, fără QR extern.','');}
@@ -286,6 +341,7 @@ mod tests {
             "multiversx-testnet",
             "multiversx-mainnet",
             "DeFi Extension",
+            "Web Wallet (popup)",
             "xPortal (aplicație)",
             "Manual / alt wallet",
             "/v1/auth/wallet/challenge",
@@ -307,6 +363,14 @@ mod tests {
             "extension provider URL must be pinned"
         );
         assert!(
+            html.contains(MX_XWINDOW_PROVIDER_URL),
+            "cross-window provider URL must be pinned"
+        );
+        assert!(
+            html.contains(MX_CORE_URL),
+            "sdk-core URL must be pinned"
+        );
+        assert!(
             !html.contains("/*__MX_EXTENSION_URL__*/"),
             "URL placeholders must be substituted"
         );
@@ -323,9 +387,14 @@ mod tests {
     fn provider_urls_are_pinned_versions() {
         // No @latest / floating tags: reproducible client, no supply-chain drift.
         // First-party MultiversX only.
-        assert!(MX_EXTENSION_PROVIDER_URL
-            .starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
-        assert!(MX_EXTENSION_PROVIDER_URL.ends_with("/+esm"));
-        assert!(!MX_EXTENSION_PROVIDER_URL.contains("@latest"));
+        for url in [
+            MX_EXTENSION_PROVIDER_URL,
+            MX_XWINDOW_PROVIDER_URL,
+            MX_CORE_URL,
+        ] {
+            assert!(url.starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
+            assert!(url.ends_with("/+esm"));
+            assert!(!url.contains("@latest"), "must pin exact version: {url}");
+        }
     }
 }
