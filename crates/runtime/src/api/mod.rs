@@ -3722,6 +3722,21 @@ async fn world_settle_check_handler(
                         // A1: Supernova correlation is additive evidence —
                         // the confirm decision above stands on its own.
                         let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
+                        // Persist the correlation on the proof (best-effort:
+                        // never fails the confirm, old proofs stay valid).
+                        if let Some(s) = &supernova {
+                            let detail = s
+                                .get("detail")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string());
+                            let fin = s.get("finality_reached").and_then(|v| v.as_bool());
+                            let seen = s.get("proof_seen").and_then(|v| v.as_bool());
+                            let mut world = state.world.lock().await;
+                            if world.record_supernova(&proof_id, detail, fin, seen).is_ok() {
+                                let path = crate::world::world_path_for(&state.info.repo_root);
+                                crate::world::save_world_state(&path, &world);
+                            }
+                        }
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash, "supernova": supernova})),
@@ -3999,6 +4014,37 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                 // Capped → already in `failed`; Other → already still-pending.
             }
             _ => still_pending.push(proof_id),
+        }
+    }
+
+    // A1 completion: Supernova correlation for sweep-confirmed proofs.
+    // Same best-effort rule as the check path — never fails the sweep,
+    // short locks only, one bounded track per proof.
+    for proof_id in &confirmed {
+        let tx_hash = {
+            let world = state.world.lock().await;
+            world
+                .proofs
+                .iter()
+                .find(|p| &p.id == proof_id)
+                .map(|p| p.tx_hash.clone())
+                .unwrap_or_default()
+        };
+        if tx_hash.is_empty() {
+            continue;
+        }
+        if let Some(s) = mx_correlate_best_effort(&state, &tx_hash).await {
+            let detail = s
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let fin = s.get("finality_reached").and_then(|v| v.as_bool());
+            let seen = s.get("proof_seen").and_then(|v| v.as_bool());
+            let mut world = state.world.lock().await;
+            if world.record_supernova(proof_id, detail, fin, seen).is_ok() {
+                let path = crate::world::world_path_for(&state.info.repo_root);
+                crate::world::save_world_state(&path, &world);
+            }
         }
     }
 
