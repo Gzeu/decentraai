@@ -55,6 +55,9 @@ pub struct TrustAnchor {
     /// Contract ID if this anchor is tied to a service contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_id: Option<String>,
+    /// Chain settlement backing this anchor (economic finality layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<ChainSettlement>,
 }
 
 /// A checkpoint: multiple anchors bundled for periodic on-chain anchoring.
@@ -113,6 +116,70 @@ pub struct AnchorParams {
     pub verified: bool,
     pub micro_cu: u64,
     pub contract_id: Option<String>,
+    /// Chain settlement backing this anchor (`None` = off-chain or
+    /// pre-correlation anchor). When present, its fingerprint enters the
+    /// canonical hash, so a settled anchor and an unsettled one over the
+    /// same evidence hash DIFFER (no silent upgrade of trust).
+    pub settlement: Option<ChainSettlement>,
+}
+
+/// On-chain settlement evidence attached to a trust anchor.
+///
+/// The tx hash is a fact from our own submission lane; the finality fields
+/// are Supernova observations (`None` detail = unobserved, never negative).
+/// This is the economic-finality layer: trust carries its own settlement
+/// proof instead of pointing at it from afar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainSettlement {
+    /// Chain transaction hash anchoring the settled action.
+    pub tx_hash: String,
+    /// Supernova track detail at observation (`final`, `not-finalized`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Chain finality (execution + proof) observed.
+    #[serde(default)]
+    pub finality_reached: bool,
+    /// Finality proof seen.
+    #[serde(default)]
+    pub proof_seen: bool,
+}
+
+/// Canonical form for anchor self-hash. Single definition used by both
+/// recording and verification (they must never drift). The settlement
+/// fingerprint joins ONLY when present, so legacy anchors verify exactly
+/// as before.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_form(
+    agent_wallet: &str,
+    evidence_hash: &str,
+    capability: &str,
+    quality_score: u8,
+    verified: bool,
+    micro_cu: u64,
+    settlement: Option<&ChainSettlement>,
+    timestamp: u64,
+) -> String {
+    let settlement_fp = settlement.map(|s| {
+        format!(
+            "{}:{}:{}:{}",
+            s.tx_hash,
+            s.detail.as_deref().unwrap_or("?"),
+            s.finality_reached,
+            s.proof_seen
+        )
+    });
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        agent_wallet,
+        evidence_hash,
+        capability,
+        quality_score,
+        verified,
+        micro_cu,
+        settlement_fp.as_deref().unwrap_or(""),
+        timestamp
+    )
 }
 
 impl TrustStore {
@@ -139,16 +206,15 @@ impl TrustStore {
             now
         );
 
-        // Build canonical form for self-hash.
-        let canonical = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            params.agent_wallet,
-            params.evidence_hash,
-            params.capability,
+        let canonical = canonical_form(
+            &params.agent_wallet,
+            &params.evidence_hash,
+            &params.capability,
             params.quality_score,
             params.verified,
             params.micro_cu,
-            now
+            params.settlement.as_ref(),
+            now,
         );
         let hash = blake3::hash(canonical.as_bytes());
         let anchor_hash: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
@@ -165,6 +231,7 @@ impl TrustStore {
             anchor_hash: anchor_hash.clone(),
             created_at: now,
             contract_id: params.contract_id.clone(),
+            settlement: params.settlement.clone(),
         };
 
         self.anchors.insert(anchor_id.clone(), anchor.clone());
@@ -176,15 +243,15 @@ impl TrustStore {
 
     /// Verifies an anchor's integrity: recomputes the hash and checks chain.
     pub fn verify_anchor(&self, anchor: &TrustAnchor) -> Result<(), TrustError> {
-        let canonical = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            anchor.agent_wallet,
-            anchor.evidence_hash,
-            anchor.capability,
+        let canonical = canonical_form(
+            &anchor.agent_wallet,
+            &anchor.evidence_hash,
+            &anchor.capability,
             anchor.quality_score,
             anchor.verified,
             anchor.micro_cu,
-            anchor.created_at
+            anchor.settlement.as_ref(),
+            anchor.created_at,
         );
         let hash = blake3::hash(canonical.as_bytes());
         let expected: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
@@ -284,6 +351,7 @@ mod tests {
             verified,
             micro_cu: cu,
             contract_id: None,
+            settlement: None,
         }
     }
 
@@ -371,5 +439,54 @@ mod tests {
         let back: TrustStore = serde_json::from_str(&json).unwrap();
         assert_eq!(back.anchors.len(), 1);
         assert_eq!(back.trust_score(&wallet()), 1.0);
+    }
+
+    #[test]
+    fn settlement_changes_hash_and_verifies() {
+        // Same evidence, one anchor settled and one not: different hashes
+        // (no silent trust upgrade), both verify through the shared form.
+        let mut store = TrustStore::default();
+        let plain = store
+            .record_anchor(&params("ev-set", "ocr", 90, true, 500_000), 1000)
+            .unwrap()
+            .clone();
+        assert!(plain.settlement.is_none());
+        assert!(store.verify_anchor(&plain).is_ok());
+        let settled_params = AnchorParams {
+            settlement: Some(ChainSettlement {
+                tx_hash: "08a21463".to_string(),
+                detail: Some("final".to_string()),
+                finality_reached: true,
+                proof_seen: true,
+            }),
+            ..params("ev-set2", "ocr", 90, true, 500_000)
+        };
+        let settled = store.record_anchor(&settled_params, 1000).unwrap().clone();
+        assert_eq!(settled.settlement.as_ref().unwrap().tx_hash, "08a21463");
+        assert!(store.verify_anchor(&settled).is_ok());
+        assert_ne!(plain.anchor_hash, settled.anchor_hash);
+        // Same evidence+settlement at another timestamp still differs only
+        // by time (deterministic shape, no randomness).
+        let again = store
+            .record_anchor(
+                &AnchorParams {
+                    evidence_hash: "ev-set3".to_string(),
+                    ..settled_params.clone()
+                },
+                1000,
+            )
+            .unwrap()
+            .clone();
+        assert!(store.verify_anchor(&again).is_ok());
+    }
+
+    #[test]
+    fn legacy_anchor_json_without_settlement_parses() {
+        let raw = r#"{"anchor_id":"ta-1","agent_wallet":"erd1x",
+            "evidence_hash":"ev","capability":"chat","quality_score":90,
+            "verified":true,"micro_cu":100,"anchor_hash":"h","created_at":1}"#;
+        let a: TrustAnchor = serde_json::from_str(raw).unwrap();
+        assert!(a.settlement.is_none());
+        assert!(a.contract_id.is_none());
     }
 }

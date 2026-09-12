@@ -333,6 +333,7 @@ async fn apply_action(
                     verified: true,
                     micro_cu: price,
                     contract_id: Some(contract_id.clone()),
+                    settlement: None,
                 };
                 if let Err(e) = trust.record_anchor(&provider_params, m18.current_tick()) {
                     return Err(format!("provider trust anchor failed: {}", e));
@@ -346,6 +347,7 @@ async fn apply_action(
                     verified: true,
                     micro_cu: price,
                     contract_id: Some(contract_id.clone()),
+                    settlement: None,
                 };
                 if let Err(e) = trust.record_anchor(&consumer_params, m18.current_tick()) {
                     return Err(format!("consumer trust anchor failed: {}", e));
@@ -398,6 +400,7 @@ async fn apply_action(
                 verified: *quality_score >= 80,
                 micro_cu: *micro_cu,
                 contract_id: contract_id.clone(),
+                settlement: None,
             };
             let mut trust = m18.trust.lock().map_err(|e| format!("lock: {}", e))?;
             trust

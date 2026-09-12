@@ -4074,7 +4074,7 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
         Some(m) => m,
         None => return,
     };
-    let (wallet, evidence, capability, amount) = {
+    let (wallet, evidence, capability, amount, settlement) = {
         let world = state.world.lock().await;
         match world.proofs.iter().find(|p| p.id == proof_id) {
             Some(p) => {
@@ -4092,7 +4092,21 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
                 } else {
                     p.capability.clone()
                 };
-                (ew, p.evidence_hash.clone(), cap, p.amount)
+                // Economic-finality layer: when the proof carries a chain
+                // tx (submitted via the lane) plus Supernova observations,
+                // the anchor embeds them — trust with its settlement proof.
+                // Proofs without chain data anchor exactly as before.
+                let settlement = if p.tx_hash.is_empty() {
+                    None
+                } else {
+                    Some(decentraai_economy::trust_anchor::ChainSettlement {
+                        tx_hash: p.tx_hash.clone(),
+                        detail: p.supernova_detail.clone(),
+                        finality_reached: p.supernova_final.unwrap_or(false),
+                        proof_seen: p.supernova_proof_seen.unwrap_or(false),
+                    })
+                };
+                (ew, p.evidence_hash.clone(), cap, p.amount, settlement)
             }
             None => return,
         }
@@ -4106,6 +4120,7 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
         verified: true,
         micro_cu: amount,
         contract_id: escrow_id,
+        settlement,
     };
     let now = crate::m18::now_secs_public();
     if let Ok(mut trust) = m18.trust.lock() {
@@ -5657,6 +5672,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                             verified: true,
                             micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
                             contract_id: None,
+                            settlement: None,
                         };
                         let mut trust = m18.trust.lock().unwrap();
                         let _ = trust.record_anchor(&params, tick);
@@ -5811,6 +5827,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     verified: true,
                     micro_cu: per_member_cu,
                     contract_id: None,
+                    settlement: None,
                 };
                 let _ = trust.record_anchor(&params, now);
             }
@@ -6236,6 +6253,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     verified: true,
                     micro_cu: total_reward / outcome.team_members.len().max(1) as u64,
                     contract_id: None,
+                    settlement: None,
                 };
                 let mut trust = m18.trust.lock().unwrap();
                 let _ = trust.record_anchor(&params, tick);
@@ -6800,6 +6818,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                         verified: v,
                         micro_cu: cu,
                         contract_id: cid,
+                        settlement: None,
                     };
                     let mut trust = m18.trust.lock().unwrap();
                     match trust.record_anchor(&params, now) {
@@ -8053,6 +8072,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             verified: true,
                             micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
                             contract_id: None,
+                            settlement: None,
                         };
                         let mut trust = m18.trust.lock().unwrap();
                         let _ = trust.record_anchor(&params, tick);
