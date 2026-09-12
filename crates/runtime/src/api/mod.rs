@@ -6972,6 +6972,8 @@ async fn orchestration_propose_resp(
 async fn orchestration_execute_resp(
     state: &ApiState,
     key_id: &str,
+    account: &str,
+    quota_ceiling: u64,
     scopes: &[String],
     params: crate::mcp::OrchestrateExecuteParams,
 ) -> Response {
@@ -7017,28 +7019,40 @@ async fn orchestration_execute_resp(
         schema_json: params.schema_json.clone(),
     };
     let exec = FabricExecutor::new(&distributed);
+    // Quota first (same discipline as every mutating consumer path): no
+    // spendable quota, no execution. The guard settles on measured usage
+    // after a successful drive, releases on any other exit (RAII).
+    let request_id = format!("nofm:{}:{}:{}", params.plan_id, params.stage_id, key_id);
+    let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, quota_ceiling)
+    {
+        Some(g) => g,
+        None => return forbidden("no spendable quota for this consumer account"),
+    };
     match drive_stage(&store, &exec, &spec).await {
-        Ok(out) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "plan_id": params.plan_id,
-                "stage_id": params.stage_id,
-                "verified": out.verified,
-                "verify_detail": out.verify_detail,
-                "worker": out.receipt.worker_node,
-                "output": out.output,
-                "tokens_used": out.tokens_used,
-                "duration_ms": out.duration_ms,
-                "consensus": out.consensus.as_ref().map(|c| serde_json::json!({
-                    "verdict": format!("{:?}", c.verdict),
-                    "outputs_count": c.outputs.len(),
+        Ok(out) => {
+            guard.settle(out.tokens_used as u64);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "plan_id": params.plan_id,
+                    "stage_id": params.stage_id,
+                    "verified": out.verified,
+                    "verify_detail": out.verify_detail,
+                    "worker": out.receipt.worker_node,
+                    "output": out.output,
+                    "tokens_used": out.tokens_used,
+                    "duration_ms": out.duration_ms,
+                    "consensus": out.consensus.as_ref().map(|c| serde_json::json!({
+                        "verdict": format!("{:?}", c.verdict),
+                        "outputs_count": c.outputs.len(),
+                    })),
+                    "settle": format!("{:?}", out.settle),
+                    "receipt": out.receipt,
                 })),
-                "settle": format!("{:?}", out.settle),
-                "receipt": out.receipt,
-            })),
-        )
-            .into_response(),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"ok": false, "error": e.to_string()})),
@@ -8858,7 +8872,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     } else if let Some(plan_id) = crate::mcp::orchestrate_status_request(&raw) {
         return orchestration_status_resp(state, &plan_id);
     } else if let Some(params) = crate::mcp::orchestrate_execute_request(&raw) {
-        return orchestration_execute_resp(state, key_id, scopes, params).await;
+        return orchestration_execute_resp(state, key_id, account, *quota_ceiling, scopes, params)
+            .await;
     } else if crate::mcp::discover_capabilities_request(&raw) {
         // Agent onboarding: discover what this node offers and what scopes are needed.
         // Always available — no scope required.
