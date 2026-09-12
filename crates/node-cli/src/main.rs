@@ -9211,26 +9211,54 @@ fn spawn_agent_broadcaster(
     p2p_node: decentraai_p2p::P2PNode,
 ) {
     use decentraai_compute::DEFAULT_ADVERTISEMENT_INTERVAL_MS;
+    use decentraai_distributed::supervisor::{Supervisor, heartbeat_now_ms};
+    use std::sync::atomic::Ordering;
+
+    let supervisor = std::sync::Arc::new(Supervisor::new(
+        "agent-broadcaster",
+        DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+    ));
+    let sup = std::sync::Arc::clone(&supervisor);
+    // Same M24 hardening as the compute broadcaster: a silent death here
+    // would freeze the fabric's agent view with no signal. The supervisor
+    // revives the worker on stale beat or finished handle.
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            DEFAULT_ADVERTISEMENT_INTERVAL_MS,
-        ));
-        loop {
-            interval.tick().await;
-            match agent_manager.advertisement_wire_bytes() {
-                Ok(bytes) => p2p_node.announce(bytes),
-                Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
-            }
-            // Expire remote agent views that have not refreshed (pure
-            // bookkeeping — never touches trust or reputation).
-            let stale =
-                std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
-            let evicted = agent_manager.prune_stale(stale);
-            if evicted > 0 {
-                tracing::debug!(evicted, "pruned stale remote agent views");
-            }
-        }
+        sup.run(move |beat| {
+            let agent_manager = std::sync::Arc::clone(&agent_manager);
+            let p2p_node = p2p_node.clone();
+            tokio::spawn(async move {
+                loop {
+                    agent_broadcast_tick(&agent_manager, &p2p_node).await;
+                    beat.store(heartbeat_now_ms(), Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+                    ))
+                    .await;
+                }
+            })
+        })
+        .await;
     });
+}
+
+/// One agent advertisement beat. Infallible by contract: failures log and
+/// return so the worker loop (and its heartbeat) survives.
+async fn agent_broadcast_tick(
+    agent_manager: &Arc<decentraai_distributed::agents::AgentManager>,
+    p2p_node: &decentraai_p2p::P2PNode,
+) {
+    use decentraai_compute::DEFAULT_STALE_AFTER_MS;
+    match agent_manager.advertisement_wire_bytes() {
+        Ok(bytes) => p2p_node.announce(bytes),
+        Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
+    }
+    // Expire remote agent views that have not refreshed (pure
+    // bookkeeping — never touches trust or reputation).
+    let stale = std::time::Duration::from_millis(DEFAULT_STALE_AFTER_MS);
+    let evicted = agent_manager.prune_stale(stale);
+    if evicted > 0 {
+        tracing::debug!(evicted, "pruned stale remote agent views");
+    }
 }
 
 /// Parses `http://host:port/...` into `(host, port)`. Returns `None` on an
