@@ -16,6 +16,7 @@ pub mod chat_history;
 pub mod dashboard;
 pub mod dashboard_v2;
 pub mod economic_agent;
+pub mod engine_pid;
 pub mod fabric_dashboard;
 pub mod fabric_flow;
 pub mod fabric_landing;
@@ -421,6 +422,12 @@ impl LlamaServer {
         self.port
     }
 
+    /// OS PID of the child (for crash-proof PID tracking in `engine_pid`).
+    /// `None` when the platform does not report one.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
@@ -443,7 +450,11 @@ impl LlamaServer {
 impl Drop for LlamaServer {
     fn drop(&mut self) {
         // Backstop only: the process may already be dead after stop().
+        // try_wait reaps the zombie when the kill already landed — a
+        // SIGKILLed parent still orphans live children, which is what the
+        // startup `engine_pid::reap_stale` pass is for.
         let _ = self.child.start_kill();
+        let _ = self.child.try_wait();
     }
 }
 

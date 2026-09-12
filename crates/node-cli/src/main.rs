@@ -1638,6 +1638,8 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     let node_name = config.node.name.clone();
     let api_port = config.inference.api_port;
     let bind_address = config.inference.bind_address.clone();
+    // M24 orphan hygiene: reap engines recorded by runs that never cleaned up.
+    reap_stale_engines(&data_dir);
 
     let identity_path = data_dir.join("identity/key.pem");
     let identity = if identity_path.exists() {
@@ -1726,6 +1728,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             match LlamaServer::start(&binary, &runtime) {
                 Ok(server) => {
                     backend_url = server.base_url();
+                    record_engine(&data_dir, "main", &server);
                     *live_engine_url.lock().unwrap() = Some(backend_url.clone());
                     let resolver_state = live_engine_url.clone();
                     let backend = OpenAiCompatibleBackend::new(BackendConfig {
@@ -1751,9 +1754,16 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                     let parallel = config.inference.max_concurrent_requests;
                     let reserve_cores = config.resources.reserve_cpu_cores;
                     let binary_for_factory = binary.clone();
+                    let factory_pid_dir = decentraai_runtime::engine_pid::pid_dir_for(&data_dir);
                     provision_factory = Some(Arc::new(move |model_path: PathBuf| {
                         let binary = binary_for_factory.clone();
+                        let pid_dir = factory_pid_dir.clone();
                         Box::pin(async move {
+                            let role = model_path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("provisioned");
+                            let role = format!("prov-{role}");
                             let mut cfg = RuntimeConfig::new(model_path);
                             cfg.ctx_size = max_ctx;
                             cfg.parallel = parallel;
@@ -1764,6 +1774,14 @@ async fn node_start(args: NodeArgs) -> Result<()> {
                                     .max(1),
                             );
                             let server = LlamaServer::spawn(&binary, &cfg).await?;
+                            if let Some(pid) = server.pid() {
+                                let _ = decentraai_runtime::engine_pid::record(
+                                    &pid_dir,
+                                    &role,
+                                    pid,
+                                    server.port(),
+                                );
+                            }
                             let backend_cfg = BackendConfig {
                                 base_url: server.base_url(),
                                 model: "provisioned".to_string(),
@@ -3405,6 +3423,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         // Stop the local llama-server we own before exiting (if any).
         if let Some(server) = maybe_server.take() {
             let _ = server.stop().await;
+            clear_engine(&data_dir, "main");
         }
         distributed.shutdown();
         return result;
@@ -3415,6 +3434,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
     // Clean shutdown: stop the llama-server we own and the distributed node.
     if let Some(server) = maybe_server.take() {
         let _ = server.stop().await;
+        clear_engine(&data_dir, "main");
     }
     distributed.shutdown();
     Ok(())
@@ -3595,6 +3615,36 @@ fn expand_tilde(value: &str) -> PathBuf {
         return PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(rest);
     }
     PathBuf::from(value)
+}
+
+/// M24 engine-orphan hygiene (2026-09-09 incident: 11 orphaned llama-server
+/// processes held ~4.5GB). Graceful stops already kill+wait; orphans come
+/// from runs that never clean up (SIGKILL/OOM/power). Every spawn below is
+/// recorded; this pass reaps recorded PIDs that are still OUR engines.
+fn reap_stale_engines(data_dir: &std::path::Path) {
+    use decentraai_runtime::engine_pid as ep;
+    for (role, outcome) in ep::reap_stale(&ep::pid_dir_for(data_dir)) {
+        tracing::warn!(role = %role, outcome = ?outcome, "startup engine record examined");
+    }
+}
+
+/// Record a freshly spawned engine so a later run can reap it if this one
+/// never cleans up. The old process (if any) must already be stopped — this
+/// only tracks, never kills.
+fn record_engine(data_dir: &std::path::Path, role: &str, server: &decentraai_runtime::LlamaServer) {
+    use decentraai_runtime::engine_pid as ep;
+    if let Some(pid) = server.pid() {
+        let dir = ep::pid_dir_for(data_dir);
+        if let Err(e) = ep::record(&dir, role, pid, server.port()) {
+            tracing::warn!(role = %role, error = %e, "engine pid record failed (orphan reap degraded)");
+        }
+    }
+}
+
+/// Forget a cleanly stopped engine.
+fn clear_engine(data_dir: &std::path::Path, role: &str) {
+    use decentraai_runtime::engine_pid as ep;
+    ep::clear(&ep::pid_dir_for(data_dir), role);
 }
 fn scan(args: ScanArgs) -> Result<()> {
     let scan_dir = expand_tilde(&args.directory);
@@ -4101,6 +4151,8 @@ async fn serve_start(
     let data_dir = expand_tilde(&config.node.data_dir);
     let idle_timeout =
         Duration::from_secs(u64::from(config.inference.idle_model_unload_minutes) * 60);
+    // M24 orphan hygiene: reap engines recorded by runs that never cleaned up.
+    reap_stale_engines(&data_dir);
 
     // Q3 remote backend: the model runs on a remote OpenAI-compatible
     // server; this node keeps auth/tiers/queue/dashboard local. No local
@@ -4186,6 +4238,7 @@ async fn serve_start(
         .await?;
         tokio::signal::ctrl_c().await?;
         manager.lock().await.shutdown().await?;
+        clear_engine(&data_dir, "main");
         return Ok(());
     }
 
@@ -4271,6 +4324,7 @@ async fn serve_start(
     }
 
     let server = LlamaServer::spawn(&binary, &runtime).await?;
+    record_engine(&data_dir, "main", &server);
     let backend_url = server.base_url();
     let manager = Arc::new(Mutex::new(ServeManager::new(server, idle_timeout)));
 
@@ -4294,7 +4348,7 @@ async fn serve_start(
         manager.clone(),
         model_name,
         model_size_bytes,
-        data_dir,
+        data_dir.clone(),
         config.inference.bind_address.clone(),
         config.inference.api_port,
         false,
@@ -4308,6 +4362,7 @@ async fn serve_start(
     );
     tokio::signal::ctrl_c().await?;
     manager.lock().await.shutdown().await?;
+    clear_engine(&data_dir, "main");
     let _ = api_addr;
     Ok(())
 }
@@ -8471,6 +8526,8 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // This ensures we use the same peer_id that P2PNode will use
     let keypair = Libp2pKeypair::ed25519_from_bytes(identity.signing_key_bytes())
         .expect("Failed to create libp2p keypair from identity");
+    // M24 orphan hygiene: reap engines recorded by runs that never cleaned up.
+    reap_stale_engines(&data_dir);
     let local_peer_id = Libp2pPeerId::from(keypair.public());
 
     // Load the registry if one exists; the node serves its models.
@@ -8532,6 +8589,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 .max(1),
         );
         let server = LlamaServer::spawn(&binary, &runtime_cfg).await?;
+        record_engine(&data_dir, "main", &server);
         let url = server.base_url();
         maybe_server = Some(server);
 
@@ -8561,9 +8619,16 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
         let parallel = config.inference.max_concurrent_requests;
         let reserve_cores = config.resources.reserve_cpu_cores;
         let binary_for_factory = binary.clone();
+        let factory_pid_dir = decentraai_runtime::engine_pid::pid_dir_for(&data_dir);
         provision_factory = Some(std::sync::Arc::new(move |model_path: PathBuf| {
             let binary = binary_for_factory.clone();
+            let pid_dir = factory_pid_dir.clone();
             Box::pin(async move {
+                let role = model_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("provisioned");
+                let role = format!("prov-{role}");
                 let mut cfg = RuntimeConfig::new(model_path);
                 cfg.ctx_size = max_ctx;
                 cfg.parallel = parallel;
@@ -8574,6 +8639,10 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                         .max(1),
                 );
                 let server = LlamaServer::spawn(&binary, &cfg).await?;
+                if let Some(pid) = server.pid() {
+                    let _ =
+                        decentraai_runtime::engine_pid::record(&pid_dir, &role, pid, server.port());
+                }
                 let backend_cfg = BackendConfig {
                     base_url: server.base_url(),
                     model: "provisioned".to_string(),
@@ -8887,6 +8956,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
     // If we spawned a local llama-server for worker mode, stop it cleanly.
     if let Some(server) = maybe_server.take() {
         let _ = server.stop().await;
+        clear_engine(&data_dir, "main");
     }
 
     distributed.shutdown();
@@ -9018,78 +9088,118 @@ async fn spawn_compute_broadcaster(
     manager: Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>>,
     live_engine_url: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<()> {
-    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+    use decentraai_distributed::supervisor::{Supervisor, heartbeat_now_ms};
+    use std::sync::atomic::Ordering;
 
+    let interval_ms = compute_manager.advertisement_interval_ms();
+    let supervisor = std::sync::Arc::new(Supervisor::new("compute-broadcaster", interval_ms));
+    let sup = std::sync::Arc::clone(&supervisor);
+    // M24 hardening: the bare fire-and-forget loop died silently once
+    // (mesh decay over ~5h, zero workers with a healthy engine). The
+    // supervisor revives the worker when its beat goes stale or the task
+    // finishes — a panic anywhere in the tick can no longer kill
+    // advertisements quietly.
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            compute_manager.advertisement_interval_ms(),
-        ));
-        loop {
-            interval.tick().await;
-            // M24: gate the advertisement on live engine health. A dead engine
-            // means this node is not a usable worker this beat. The engine
-            // address comes from the SINGLE authoritative source (the supervisor-
-            // published live URL cache, falling back to the ServeManager's live
-            // base_url), so a respawn on a new port is always probed and a frozen
-            // startup URL can never suppress or wrongly enable advertisement.
-            let health_sockaddr = match (&live_engine_url, &manager) {
-                (Some(cache), _) => cache
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .and_then(|u| parse_http_addr(&u).map(|(h, p)| format!("{h}:{p}"))),
-                (None, Some(m)) => m
-                    .lock()
-                    .await
-                    .base_url()
-                    .as_deref()
-                    .and_then(parse_http_addr)
-                    .map(|(h, p)| format!("{h}:{p}")),
-                (None, None) => None,
-            };
-            if let Some(addr) = &health_sockaddr {
-                let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
-                if !alive {
-                    tracing::warn!(
-                        "skipping worker advertisement: local inference engine not reachable at {addr}"
-                    );
-                    continue;
-                }
-            }
-            let snapshot = SystemSnapshot::collect();
-            let gpu = probe_gpu();
-            // Advertise the latest probe; served_models and available_models
-            // come from the last full advertisement stored in the manager (the
-            // on-disk model set is recomputed at registration, not re-hashed on
-            // every heartbeat).
-            let workers = compute_manager.workers().await;
-            let (served_models, available_models) = workers
-                .iter()
-                .find(|w| w.peer_id == compute_manager.local_peer())
-                .map(|w| {
-                    (
-                        w.capability.served_models.clone(),
-                        w.capability.available_models.clone(),
+        sup.run(move |beat| {
+            let compute_manager = std::sync::Arc::clone(&compute_manager);
+            let p2p_node = p2p_node.clone();
+            let manager = manager.clone();
+            let live_engine_url = live_engine_url.clone();
+            tokio::spawn(async move {
+                loop {
+                    compute_broadcast_tick(
+                        &compute_manager,
+                        &p2p_node,
+                        can_provision,
+                        &manager,
+                        &live_engine_url,
                     )
-                })
-                .unwrap_or_default();
-            let adv = compute_manager
-                .advertise_local(
-                    snapshot,
-                    gpu,
-                    served_models,
-                    available_models,
-                    can_provision,
-                )
-                .await;
-            // P3: sign the advertisement when the node has a signing key set,
-            // so recipients authenticate it (anti-spoof).
-            if let Ok(bytes) = compute_manager.advertisement_wire_bytes(&adv) {
-                p2p_node.announce(bytes);
-            }
-        }
+                    .await;
+                    beat.store(heartbeat_now_ms(), Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        compute_manager.advertisement_interval_ms(),
+                    ))
+                    .await;
+                }
+            })
+        })
+        .await;
     });
     Ok(())
+}
+
+/// One compute advertisement beat. Infallible by contract: every failure
+/// path logs and returns so the worker loop (and its heartbeat) survives.
+async fn compute_broadcast_tick(
+    compute_manager: &std::sync::Arc<decentraai_distributed::ComputeManager>,
+    p2p_node: &decentraai_p2p::P2PNode,
+    can_provision: bool,
+    manager: &Option<Arc<tokio::sync::Mutex<decentraai_runtime::ServeManager>>>,
+    live_engine_url: &Option<Arc<std::sync::Mutex<Option<String>>>>,
+) {
+    use decentraai_system_probe::{SystemSnapshot, probe_gpu};
+
+    // M24: gate the advertisement on live engine health. A dead engine
+    // means this node is not a usable worker this beat. The engine
+    // address comes from the SINGLE authoritative source (the supervisor-
+    // published live URL cache, falling back to the ServeManager's live
+    // base_url), so a respawn on a new port is always probed and a frozen
+    // startup URL can never suppress or wrongly enable advertisement.
+    let health_sockaddr = match (live_engine_url, manager) {
+        (Some(cache), _) => cache
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .and_then(|u| parse_http_addr(&u).map(|(h, p)| format!("{h}:{p}"))),
+        (None, Some(m)) => m
+            .lock()
+            .await
+            .base_url()
+            .as_deref()
+            .and_then(parse_http_addr)
+            .map(|(h, p)| format!("{h}:{p}")),
+        (None, None) => None,
+    };
+    if let Some(addr) = &health_sockaddr {
+        let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
+        if !alive {
+            tracing::warn!(
+                "skipping worker advertisement: local inference engine not reachable at {addr}"
+            );
+            return;
+        }
+    }
+    let snapshot = SystemSnapshot::collect();
+    let gpu = probe_gpu();
+    // Advertise the latest probe; served_models and available_models
+    // come from the last full advertisement stored in the manager (the
+    // on-disk model set is recomputed at registration, not re-hashed on
+    // every heartbeat).
+    let workers = compute_manager.workers().await;
+    let (served_models, available_models) = workers
+        .iter()
+        .find(|w| w.peer_id == compute_manager.local_peer())
+        .map(|w| {
+            (
+                w.capability.served_models.clone(),
+                w.capability.available_models.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let adv = compute_manager
+        .advertise_local(
+            snapshot,
+            gpu,
+            served_models,
+            available_models,
+            can_provision,
+        )
+        .await;
+    // P3: sign the advertisement when the node has a signing key set,
+    // so recipients authenticate it (anti-spoof).
+    if let Ok(bytes) = compute_manager.advertisement_wire_bytes(&adv) {
+        p2p_node.announce(bytes);
+    }
 }
 
 /// P1 (Collective Intelligence): periodically broadcast this node's logical
@@ -9101,26 +9211,54 @@ fn spawn_agent_broadcaster(
     p2p_node: decentraai_p2p::P2PNode,
 ) {
     use decentraai_compute::DEFAULT_ADVERTISEMENT_INTERVAL_MS;
+    use decentraai_distributed::supervisor::{Supervisor, heartbeat_now_ms};
+    use std::sync::atomic::Ordering;
+
+    let supervisor = std::sync::Arc::new(Supervisor::new(
+        "agent-broadcaster",
+        DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+    ));
+    let sup = std::sync::Arc::clone(&supervisor);
+    // Same M24 hardening as the compute broadcaster: a silent death here
+    // would freeze the fabric's agent view with no signal. The supervisor
+    // revives the worker on stale beat or finished handle.
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            DEFAULT_ADVERTISEMENT_INTERVAL_MS,
-        ));
-        loop {
-            interval.tick().await;
-            match agent_manager.advertisement_wire_bytes() {
-                Ok(bytes) => p2p_node.announce(bytes),
-                Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
-            }
-            // Expire remote agent views that have not refreshed (pure
-            // bookkeeping — never touches trust or reputation).
-            let stale =
-                std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
-            let evicted = agent_manager.prune_stale(stale);
-            if evicted > 0 {
-                tracing::debug!(evicted, "pruned stale remote agent views");
-            }
-        }
+        sup.run(move |beat| {
+            let agent_manager = std::sync::Arc::clone(&agent_manager);
+            let p2p_node = p2p_node.clone();
+            tokio::spawn(async move {
+                loop {
+                    agent_broadcast_tick(&agent_manager, &p2p_node).await;
+                    beat.store(heartbeat_now_ms(), Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+                    ))
+                    .await;
+                }
+            })
+        })
+        .await;
     });
+}
+
+/// One agent advertisement beat. Infallible by contract: failures log and
+/// return so the worker loop (and its heartbeat) survives.
+async fn agent_broadcast_tick(
+    agent_manager: &Arc<decentraai_distributed::agents::AgentManager>,
+    p2p_node: &decentraai_p2p::P2PNode,
+) {
+    use decentraai_compute::DEFAULT_STALE_AFTER_MS;
+    match agent_manager.advertisement_wire_bytes() {
+        Ok(bytes) => p2p_node.announce(bytes),
+        Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
+    }
+    // Expire remote agent views that have not refreshed (pure
+    // bookkeeping — never touches trust or reputation).
+    let stale = std::time::Duration::from_millis(DEFAULT_STALE_AFTER_MS);
+    let evicted = agent_manager.prune_stale(stale);
+    if evicted > 0 {
+        tracing::debug!(evicted, "pruned stale remote agent views");
+    }
 }
 
 /// Parses `http://host:port/...` into `(host, port)`. Returns `None` on an

@@ -17,6 +17,7 @@ decentraai-protocol = { path = "../protocol" }
 # M15 Research Pressure Trigger: pure detector (no I/O, deterministic).
 decentraai-proposal = { path = "../proposal" }
 libp2p.workspace = true
+libc.workspace = true
 decentraai-audit = { path = "../audit" }
 decentraai-compute = { path = "../compute" }
 decentraai-config = { path = "../config" }
