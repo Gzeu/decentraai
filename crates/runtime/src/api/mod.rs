@@ -1637,6 +1637,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
+        .route("/v1/auth/wallet/key", post(wallet_key_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
@@ -2298,6 +2299,145 @@ async fn wallet_verify_handler(
         )
             .into_response(),
     }
+}
+
+/// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
+///
+/// A live wallet session mints ONE OpenAI-compatible consumer key (`dca_`)
+/// bound to the wallet's agent, reusing the exact issuance path as the
+/// admin endpoint (same store, same hash-only persistence, same once-only
+/// plaintext, same audit shape with a distinct event name).
+///
+/// Rules (all fail-closed): the session must be live (expiry enforced by
+/// the wallet store); one active key per agent (repeats return 409 with the
+/// key_id — plaintext is shown exactly once, at creation, never re-shown);
+/// baseline surface only with empty scopes (decide + quota-gated reads)
+/// and a modest ceiling/rate, while privileged scopes stay on the admin
+/// grant path; the consumer ledger must be attached (same gate as admin).
+/// The key is fabric-scoped (chain-agnostic): it works identically for
+/// testnet and mainnet wallets. Chain submission stays on its own lane.
+async fn wallet_key_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    /// Self-serve defaults: modest enough to be safe unattended, useful
+    /// enough for real onboarding (matches the consumer test baseline).
+    const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
+    const SELF_SERVE_RATE_PER_MIN: u32 = 50;
+
+    let session_token = body
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "session_token required (log in via /v1/auth/wallet/verify first)"})),
+        )
+            .into_response();
+    }
+    let session = match state.wallet_session_for_token(session_token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({"ok": false, "error": "unknown or expired wallet session"}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    if !state.consumer_enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+        )
+            .into_response();
+    }
+    let path = match &state.consumer_keys_path {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+            )
+                .into_response();
+        }
+    };
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": "consumer key store unreadable"})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(existing) = store
+        .list()
+        .iter()
+        .find(|r| r.owner_account == session.agent_id && !r.revoked && !store.is_expired(r))
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "key already issued for this wallet agent",
+                "key_id": existing.key_id,
+                "note": "plaintext is shown exactly once, at creation; rotate via revoke + reissue",
+            })),
+        )
+            .into_response();
+    }
+    let plaintext = match store.create(
+        &session.agent_id,
+        SELF_SERVE_QUOTA_CEILING,
+        SELF_SERVE_RATE_PER_MIN,
+        Vec::new(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "consumer_key_self_issued",
+        serde_json::json!({
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
+            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+        }),
+    );
+    let key_id = store
+        .lookup(&plaintext)
+        .map(|r| r.key_id.clone())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "token": plaintext,
+            "key_id": key_id,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
+            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "scopes": [],
+            "note": "shown once; only its hash and prefix are stored",
+        })),
+    )
+        .into_response()
 }
 
 /// GET /v1/auth/wallet/session — introspect the current wallet session.
@@ -23826,6 +23966,111 @@ mod tests {
             .unwrap();
         // A consumer can call `decide` (read-only inference planning).
         assert_eq!(r.status(), 200, "consumer may decide via MCP");
+    }
+
+    /// Wallet login helper: challenge → sign with a fresh key → verify.
+    /// Returns `(wallet_address, session_token)`. Mirrors the xPortal flow
+    /// (arbitrary message bytes signed by the wallet key).
+    async fn wallet_session(api: SocketAddr) -> (String, String) {
+        use ed25519_dalek::SigningKey;
+        let client = reqwest::Client::new();
+        // Deterministic throwaway test key (no funds, no network, never real).
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        let chal: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/challenge"))
+            .json(&serde_json::json!({"wallet_address": wallet}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(chal["wallet_address"].as_str().unwrap(), wallet);
+        let message = chal["message"].as_str().unwrap();
+        let sig = signing.sign(message.as_bytes());
+        let login: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/verify"))
+            .json(&serde_json::json!({
+                "wallet_address": wallet,
+                "challenge_id": chal["challenge_id"].as_str().unwrap(),
+                "signature": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = login["session_token"].as_str().unwrap().to_string();
+        assert!(session.starts_with("wx_"));
+        (wallet, session)
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_then_mcp() {
+        // xPortal-style onboarding: login → self-issued dca_ key → MCP.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let (wallet, session) = wallet_session(api).await;
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(issued["ok"], true, "self-serve issuance works");
+        assert_eq!(issued["wallet"].as_str().unwrap(), wallet);
+        let token = issued["token"].as_str().unwrap().to_string();
+        assert!(token.starts_with("dca_"), "OpenAI-compatible fabric key");
+        assert!(!issued["key_id"].as_str().unwrap().is_empty());
+        // The self-issued key drives MCP planning like any consumer key.
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "self-issued key reaches MCP");
+        // Second issuance for the same wallet refuses (no duplicate keys,
+        // plaintext shown exactly once).
+        let again = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 409);
+        let body: serde_json::Value = again.json().await.unwrap();
+        assert!(body["key_id"].as_str().unwrap().starts_with("ck-"));
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_rejects_bad_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        for (payload, want) in [
+            (serde_json::json!({}), 400),
+            (serde_json::json!({"session_token": "wx_nope"}), 401),
+        ] {
+            let r = client
+                .post(format!("http://{api}/v1/auth/wallet/key"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), want);
+        }
     }
 
     // ---- M16 gateway (dga_) consumption flow ------------------------------
