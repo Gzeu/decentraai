@@ -1026,12 +1026,13 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "m18_settle_escrow",
-            description: "Release and settle escrow for a completed contract. Requires evidence hash and MultiversX tx hash.",
+            description: "Release and settle escrow for a completed contract. Requires evidence hash and MultiversX tx hash. Pass network so verifiers query the right chain API.",
             input_schema: json!({ "type": "object", "properties": {
                 "escrow_id": { "type": "string", "description": "Escrow record ID (same as contract ID)" },
                 "evidence_hash": { "type": "string", "description": "BLAKE3 evidence hash from execution" },
                 "amount_micro_cu": { "type": "integer", "description": "Settlement amount in micro-CU" },
-                "tx_hash": { "type": "string", "description": "MultiversX transaction hash" }
+                "tx_hash": { "type": "string", "description": "MultiversX transaction hash" },
+                "network": { "type": "string", "description": "Chain of the tx: multiversx-testnet | multiversx-mainnet" }
             }, "required": ["escrow_id", "evidence_hash", "amount_micro_cu", "tx_hash"], "additionalProperties": false }),
             annotations: ToolAnnotations::additive(),
         },

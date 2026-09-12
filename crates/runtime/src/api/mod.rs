@@ -3931,11 +3931,12 @@ async fn settle_world_trade(
     };
 
     // 3. Best-effort chain submission → record + escrow settle.
+    // The broadcast lane here is testnet-only by construction.
     match settle_proof_best_effort(state, &proof_id).await {
         Some((tx_hash, sender)) => {
             if let (Some(m), Some(eid)) = (m18.as_ref(), escrow_id.clone()) {
                 let now = crate::m18::now_secs_public();
-                let _ = crate::m18::settle_world_sale(m, &eid, &tx_hash, price, now);
+                let _ = crate::m18::settle_world_sale(m, &eid, &tx_hash, price, now, Some("multiversx-testnet"));
             }
             Some(TradeSettlement {
                 proof_id,
@@ -4269,16 +4270,16 @@ async fn settle_escrow_for_proof(state: &ApiState, proof_id: &str, tx_hash: &str
         Some(m) => m,
         None => return,
     };
-    let (evidence_hash, amount) = {
+    let (evidence_hash, amount, network) = {
         let world = state.world.lock().await;
         match world.proofs.iter().find(|p| p.id == proof_id) {
-            Some(p) => (p.evidence_hash.clone(), p.amount),
+            Some(p) => (p.evidence_hash.clone(), p.amount, p.network.clone()),
             None => return,
         }
     };
     if let Some(escrow_id) = crate::m18::escrow_for_evidence(&m18, &evidence_hash) {
         let now = crate::m18::now_secs_public();
-        let _ = crate::m18::settle_world_sale(&m18, &escrow_id, tx_hash, amount, now);
+        let _ = crate::m18::settle_world_sale(&m18, &escrow_id, tx_hash, amount, now, Some(&network));
     }
 }
 
@@ -6896,11 +6897,12 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     let tx = args.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("");
+                    let net = args.get("network").and_then(|v| v.as_str());
                     let mut escrow = m18.escrow.lock().unwrap();
                     if let Err(e) = escrow.release_escrow(id, ev, now) {
                         serde_json::json!({"error": e.to_string()})
                     } else {
-                        match escrow.settle_escrow(id, tx, amt, now) {
+                        match escrow.settle_escrow(id, tx, amt, now, net) {
                             Ok(()) => {
                                 let r = escrow.get_escrow(id).unwrap().clone();
                                 drop(escrow);
