@@ -112,6 +112,15 @@ function say(el,msg,cls){const e=$(el);e.style.display='block';e.textContent=msg
 function purpose(){return 'onboard:'+(S.net==='multiversx-mainnet'?'mainnet':'testnet');}
 function setNet(n){S.net=n;$('netT').className=n.endsWith('testnet')?'sel':'';$('netM').className=n.endsWith('mainnet')?'sel':'';}
 setNet(S.net);
+// Node chain binding on page load (public endpoint — no session needed).
+// The signed challenge binds this server-side value; the toggle below
+// only records intent.
+(async function loadNetwork(){
+  try{
+    const r=await fetch('/v1/auth/wallet/network');const j=await r.json();
+    if(j&&j.network){S.nodeNet=j.network;$('nodeNet').textContent='nod: '+j.network;$('nodeNet2').textContent=j.network;}
+  }catch(_){$('nodeNet').textContent='nod: necunoscut';$('nodeNet2').textContent='necunoscut';}
+})();
 async function api(path,method,body){const r=await fetch(path,{method:method||'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));return{status:r.status,json:j};}
 async function getChallenge(addr){
   const r=await api('/v1/auth/wallet/challenge','POST',{wallet_address:addr,purpose:purpose()});
@@ -136,7 +145,7 @@ async function mintKey(){
   if(r.status!==200||!r.json.ok)throw new Error('key: '+(r.json.error||r.status));
   S.key=r.json.token;S.keyId=r.json.key_id;
   $('keyPlain').textContent=r.json.token;
-  $('keyInfo').innerHTML='Cont <code>'+esc(r.json.account)+'</code> · wallet <code>'+esc(r.json.wallet)+'</code><br>key_id <code>'+esc(r.json.key_id)+'</code> · cotă '+r.json.quota_ceiling+' · '+r.json.rate_limit_per_minute+'/min · start '+(r.json.starter_granted?r.json.starter_quota+' (grant)':'0 (deja alimentat)');
+  $('keyInfo').innerHTML='Cont <code>'+esc(r.json.account)+'</code> · wallet <code>'+esc(r.json.wallet)+'</code><br>key_id <code>'+esc(r.json.key_id)+'</code> · cotă '+r.json.quota_ceiling+' · '+r.json.rate_limit_per_minute+'/min · start '+(r.json.starter_granted?r.json.starter_quota+' (grant)':'0 (deja alimentat)')+'<br>scope-uri <code>'+esc((r.json.scopes||[]).join(', '))+'</code> (embeddings + compute + memorie proprie; orchestrare/hub rămân pe admin)';
   try{localStorage.setItem('decentraai.account.key',r.json.token);localStorage.setItem('decentraai.account.key_id',r.json.key_id);}catch(_){}
   $('step3').classList.remove('hidden');showSnippets(r.json.token);
   say('out2','Autentificat ca '+r.json.wallet+'. Cheia de mai sus NU se mai arată — copiaz-o acum.','ok');
@@ -162,35 +171,62 @@ function copyKey(){const t=S.key||'(nemaifișată)';navigator.clipboard.writeTex
 function copyWc(){if(S.wcUri)navigator.clipboard.writeText(S.wcUri).then(()=>say('out2','URI împerechere copiat — lipește-l în xPortal → WalletConnect.','ok'));}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 // ---- metoda: DeFi Extension (SDK pin-uit, import dinamic) ----
+// Provider-ul e SINGLETON: getInstance(), nu create/new. init() confirmă
+// extensia (window.multiversxWallet); login() populează account.address;
+// signMessage({data: bytes}) întoarce sdk-core Message.
 async function connectExtension(){
   say('out2','Se încarcă provider-ul DeFi…','');
   try{
     const mod=await import('/*__MX_EXTENSION_URL__*/');
-    const Provider=mod.ExtensionProvider||mod.default;
-    if(!Provider||typeof Provider.create!=='function')throw new Error('SDK încărcat, dar ExtensionProvider.create lipsește (formă neașteptată). Încearcă Manual.');
-    const p=await Provider.create();
+    const Provider=mod.ExtensionProvider||(mod.default&&mod.default.ExtensionProvider);
+    if(!Provider)throw new Error('SDK încărcat, dar ExtensionProvider lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
+    const p=typeof Provider.getInstance==='function'?Provider.getInstance():new Provider();
     if(typeof p.init==='function')await p.init();
+    if(typeof p.isInitialized==='function'&&!p.isInitialized())throw new Error('Extensia DeFi/MultiversX nu e instalată sau nu e activată pentru site-ul ăsta.');
     if(typeof p.login!=='function')throw new Error('provider fără login(). Încearcă Manual.');
     await p.login();
-    const addr=p.account&&p.account.address?p.account.address:(p.address||null);
+    const addr=await providerAddress(p);
     if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
     say('out2','Conectat: '+addr+' — cere challenge…','');
     const chal=await getChallenge(addr);
-    if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual mesajul din challenge.');
-    const signed=await p.signMessage(chal.message);
-    const sig=extractSig(signed);
+    const sig=await providerSign(p,chal.message);
     if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
     await doVerify(addr,chal.challenge_id,sig);
   }catch(e){say('out2','Extension: '+String(e.message||e).slice(0,300),'err');}
 }
+function msgBytes(s){return new TextEncoder().encode(s);}
 function extractSig(signed){
   if(!signed)return null;
   if(typeof signed==='string')return signed;
   const s=signed.signature||signed;
+  if(!s)return null;
   if(typeof s==='string')return s;
+  // Buffer/Uint8Array (sdk-core Message.signature) → hex
+  if(typeof s.length==='number'&&typeof s.toString==='function'){
+    try{const h=s.toString('hex');if(/^[0-9a-fA-F]{128}$/.test(h))return h;}catch(_){}
+    try{let h='';for(let i=0;i<s.length;i++)h+=s[i].toString(16).padStart(2,'0');if(/^[0-9a-fA-F]{128}$/.test(h))return h;}catch(_){}
+  }
   if(s&&typeof s.hex==='function')try{return s.hex();}catch(_){}
-  if(s&&typeof s.toString==='function'&&s.toString()!=='[object Object]')return s.toString();
   return null;
+}
+async function providerAddress(p){
+  if(!p)return null;
+  if(p.account&&p.account.address)return p.account.address;
+  if(typeof p.getAddress==='function'){try{const a=await p.getAddress();if(a)return a;}catch(_){}}
+  if(typeof p.address==='string'&&p.address)return p.address;
+  if(Array.isArray(p.accounts)&&p.accounts[0])return p.accounts[0];
+  if(typeof p.getAccount==='function'){try{const a=await p.getAccount();if(a&&(a.address||typeof a==='string'))return a.address||a;}catch(_){}}
+  return null;
+}
+// signMessage across provider shapes: {data: bytes} first, plain string fallback.
+async function providerSign(p,message){
+  const bytes=msgBytes(message);
+  if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual.');
+  try{return extractSig(await p.signMessage({data:bytes}));}
+  catch(e1){
+    try{return extractSig(await p.signMessage(message));}
+    catch(e2){throw new Error('semnare eșuată ('+String(e1.message||e1).slice(0,120)+'). Încearcă Manual.');}
+  }
 }
 // ---- metoda: xPortal prin WalletConnect (QR/URI) ----
 async function connectXportal(){
@@ -207,11 +243,10 @@ async function connectXportal(){
     let approval=out&&out.approval?out.approval:null;
     if(uri){S.wcUri=uri;$('wcUri').textContent=uri;$('wcBox').classList.remove('hidden');say('out2','Împerechează xPortal, apoi aprobă. Aștept…','');}
     if(approval)await approval();
-    const addr=p.account&&p.account.address?p.account.address:(p.address||null);
-    if(!addr)throw new Error('conectat, dar adresa lipsește. Încearcă Manual.');
+    const addr=await providerAddress(p);
+    if(!addr)throw new Error('conectat, dar adresa lipsește (formă necunoscută: verifică consola). Încearcă Manual.');
     const chal=await getChallenge(addr);
-    if(typeof p.signMessage!=='function')throw new Error('conectat, dar fără signMessage(). Semnează manual.');
-    const sig=extractSig(await p.signMessage(chal.message));
+    const sig=await providerSign(p,chal.message);
     if(!sig)throw new Error('semnătură ilizibilă. Încearcă Manual.');
     await doVerify(addr,chal.challenge_id,sig);
   }catch(e){say('out2','xPortal: '+String(e.message||e).slice(0,300),'err');}
@@ -256,6 +291,9 @@ mod tests {
             "/v1/auth/wallet/challenge",
             "/v1/auth/wallet/verify",
             "/v1/auth/wallet/key",
+            "/v1/auth/wallet/network",
+            "getInstance",
+            "signMessage({data",
             "arătată o singură dată",
             "Revocă + re-emite",
             "dca_",

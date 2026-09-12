@@ -1636,6 +1636,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/world/join", get(world_join_page_handler))
         .route("/world/skill.md", get(world_skill_handler))
         .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
+        .route("/v1/auth/wallet/network", get(wallet_network_handler))
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
         .route("/v1/auth/wallet/key", post(wallet_key_handler).delete(wallet_key_revoke_handler))
@@ -2253,6 +2254,21 @@ async fn world_skill_handler() -> Response {
     ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], md).into_response()
 }
 
+/// GET /v1/auth/wallet/network — public chain binding of this node.
+/// Lets the /account page show which chain wallets bind to BEFORE login
+/// (the signed challenge binds this server-side value; clients cannot
+/// spoof it). No secret, no session required.
+async fn wallet_network_handler(State(_state): State<ApiState>) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "network": crate::wallet_auth::network_name(),
+        })),
+    )
+        .into_response()
+}
+
 /// POST /v1/auth/wallet/challenge — issue a signed-login challenge for a
 /// MultiversX wallet address.
 async fn wallet_challenge_handler(
@@ -2325,9 +2341,11 @@ async fn wallet_verify_handler(
 /// Rules (all fail-closed): the session must be live (expiry enforced by
 /// the wallet store); one active key per agent (repeats return 409 with the
 /// key_id — plaintext is shown exactly once, at creation, never re-shown);
-/// baseline surface only with empty scopes (decide + quota-gated reads)
-/// and a modest ceiling/rate, while privileged scopes stay on the admin
-/// grant path; the consumer ledger must be attached (same gate as admin).
+/// self-serve scopes (embeddings, compute, own memory) on top of the
+/// baseline, with a modest ceiling/rate, while orchestration, hub teams and
+/// privileged scopes stay on the admin grant path; the consumer ledger must
+/// be attached (same gate as admin). First issuance also seeds starter
+/// quota (no re-grant on rotation).
 /// The key is fabric-scoped (chain-agnostic): it works identically for
 /// testnet and mainnet wallets. Chain submission stays on its own lane.
 async fn wallet_key_handler(
@@ -2338,6 +2356,10 @@ async fn wallet_key_handler(
     /// enough for real onboarding (matches the consumer test baseline).
     const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
     const SELF_SERVE_RATE_PER_MIN: u32 = 50;
+    /// Self-serve scopes (owner-approved): baseline 27 tools + embeddings,
+    /// compute-assist and OWN personal memory. Orchestration, hub teams and
+    /// master control-plane stay on the admin grant path.
+    const SELF_SERVE_SCOPES: [&str; 3] = ["embeddings", "compute", "memory"];
     /// Starter grant: spendable units so the first chat works immediately.
     /// Seeded only when the account has nothing spendable (re-issues after
     /// revoke don't re-grant) — same pattern as world onboarding.
@@ -2409,11 +2431,12 @@ async fn wallet_key_handler(
         )
             .into_response();
     }
+    let scopes: Vec<String> = SELF_SERVE_SCOPES.iter().map(|s| s.to_string()).collect();
     let plaintext = match store.create(
         &session.agent_id,
         SELF_SERVE_QUOTA_CEILING,
         SELF_SERVE_RATE_PER_MIN,
-        Vec::new(),
+        scopes.clone(),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -2435,6 +2458,7 @@ async fn wallet_key_handler(
             "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
             "starter_quota": SELF_SERVE_STARTER_QUOTA,
+            "scopes": scopes,
         }),
     );
     // Seed starter quota so the first inference works immediately. Only
@@ -2482,7 +2506,7 @@ async fn wallet_key_handler(
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
             "starter_quota": SELF_SERVE_STARTER_QUOTA,
             "starter_granted": starter_granted,
-            "scopes": [],
+            "scopes": scopes,
             "note": "shown once; only its hash and prefix are stored",
         })),
     )
@@ -24180,6 +24204,35 @@ mod tests {
         assert_eq!(issued["ok"], true, "self-serve issuance works");
         assert_eq!(issued["wallet"].as_str().unwrap(), wallet);
         assert_eq!(issued["starter_granted"], true, "first issuance seeds quota");
+        let scopes: Vec<String> = issued["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert_eq!(scopes, vec!["embeddings", "compute", "memory"]);
+        // Scoped tools become visible on MCP tools/list for the new key.
+        let listed_token = issued["token"].as_str().unwrap().to_string();
+        let listed: serde_json::Value = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {listed_token}"))
+            .json(&serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        for want in ["decentraai_embeddings", "decentraai_compute_request", "agent_memory_read"] {
+            assert!(names.contains(&want.to_string()), "scoped tool visible: {want}");
+        }
         // Starter quota landed on the wallet agent's ledger account.
         let spendable = ledger
             .lock()
@@ -24338,6 +24391,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn wallet_network_reports_chain_binding() {
+        // Public, no session: the /account badge reads this on page load.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .get(format!("http://{api}/v1/auth/wallet/network"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(!body["network"].as_str().unwrap_or("").is_empty());
     }
 
     #[tokio::test]

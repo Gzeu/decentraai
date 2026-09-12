@@ -132,7 +132,7 @@ pub enum WalletAuthError {
     Serde(#[from] serde_json::Error),
 }
 
-fn network_name() -> String {
+pub(crate) fn network_name() -> String {
     std::env::var("DECENTRAAI_MX_NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.to_string())
 }
 
