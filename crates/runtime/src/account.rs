@@ -189,9 +189,19 @@ async function connectExtension(){
     // server oricum): ce i s-a cerut extensiei vs ce a înapoiat.
     S.lastSig=null;
     const m=$('manMsg');m.style.display='block';m.textContent='Mesaj trimis la semnat (byte-cu-byte):\n'+chal.message;
-    const sig=await providerSign(p,chal.message);
+    // Semnare brută: păstrăm obiectul Message întreg pentru tripla
+    // verificare de adrese (login vs ecoul semnăturii vs citire curentă).
+    const p2=p;
+    let signedRaw=null;
+    try{signedRaw=await p2.signMessage({data:msgBytes(chal.message)});}
+    catch(e1){signedRaw=await p2.signMessage(chal.message);}
+    const sig=extractSig(signedRaw);
     if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
     S.lastSig=sig;
+    const echoAddr=addrOf(signedRaw&&(signedRaw.address||(signedRaw||{}).address));
+    const curAddr=await providerAddress(p2);
+    if(echoAddr&&echoAddr!==addr)m.textContent+='\n\nATENȚIE: extensia a ecouat adresa '+echoAddr+' (login: '+addr+'). Conturi diferite!';
+    if(curAddr&&curAddr!==addr)m.textContent+='\n\nATENȚIE: adresa curentă în extensie e '+curAddr+' (login: '+addr+'). Selecteaz-o pe cea de login!';
     await doVerify(addr,chal.challenge_id,sig);
   }catch(e){
     const dbg=S.lastSig?(' [debug: sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
@@ -199,6 +209,13 @@ async function connectExtension(){
   }
 }
 function msgBytes(s){return new TextEncoder().encode(s);}
+function addrOf(a){
+  if(!a)return null;
+  if(typeof a==='string')return a;
+  try{if(typeof a.bech32==='function')return a.bech32();}catch(_){}
+  try{const s=String(a);if(s.startsWith('erd1'))return s;}catch(_){}
+  return null;
+}
 function extractSig(signed){
   if(!signed)return null;
   if(typeof signed==='string')return signed;
