@@ -2274,7 +2274,7 @@ pub fn orchestrate_execute_request(raw: &str) -> Option<OrchestrateExecuteParams
     let max_tokens = args
         .get("max_tokens")
         .and_then(|v| v.as_u64())
-        .filter(|&n| n >= 1 && n <= 4096)
+        .filter(|n| (1..=4096).contains(n))
         .unwrap_or(64) as u32;
     let max_price = args.get("max_price").and_then(|v| v.as_u64())?;
     if max_price > 10000 {
