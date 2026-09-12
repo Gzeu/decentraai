@@ -356,11 +356,14 @@ mod tests {
         for url in [
             MX_EXTENSION_PROVIDER_URL,
             MX_WALLETCONNECT_PROVIDER_URL,
-            MX_QR_RENDERER_URL,
         ] {
             assert!(url.starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
             assert!(url.ends_with("/+esm"));
             assert!(!url.contains("@latest"), "must pin exact version: {url}");
         }
+        // Client-side QR renderer: same pin discipline, different vendor.
+        assert!(MX_QR_RENDERER_URL.starts_with("https://cdn.jsdelivr.net/npm/qrcode@"));
+        assert!(MX_QR_RENDERER_URL.ends_with("/+esm"));
+        assert!(!MX_QR_RENDERER_URL.contains("@latest"));
     }
 }
