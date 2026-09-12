@@ -50,6 +50,7 @@ tracing.workspace = true
 bech32.workspace = true
 hex.workspace = true
 base64.workspace = true
+ed25519-dalek.workspace = true
 
 # DCAI / economy crate for token issuance (dcai subcommands).
 decentraai-economy = { path = "../economy" }
