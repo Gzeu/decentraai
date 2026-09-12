@@ -192,17 +192,21 @@ async function providerSign(p,message){
   if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual.');
   const doc=await signableMessage(bytes);
   const shapes=[];
-  if(doc)shapes.push(doc);
-  shapes.push({data:bytes});
-  shapes.push(message);
-  let last=null;
-  for(const shape of shapes){
-    try{const sig=extractSig(await p.signMessage(shape,{}));if(sig)return sig;}
-    catch(e){last=e;}
+  if(doc)shapes.push(['doc',doc]);
+  shapes.push(['data',{data:bytes}]);
+  shapes.push(['str',message]);
+  const errs=[];
+  for(const [name,shape] of shapes){
+    try{
+      const out=await p.signMessage(shape,{});
+      const sig=extractSig(out);
+      if(sig){S.lastShape=name;return sig;}
+      errs.push(name+': fără semnătură în răspuns');
+    }catch(e){errs.push(name+': '+String(e.message||e).slice(0,150));}
   }
   // Some providers mutate the passed object instead of returning.
-  if(doc&&doc.signature){const sig=extractSig(doc);if(sig)return sig;}
-  throw new Error('semnare eșuată ('+String((last&&last.message)||last).slice(0,120)+'). Încearcă Manual.');
+  if(doc&&doc.signature){const sig=extractSig(doc);if(sig){S.lastShape='doc-mutated';return sig;}}
+  throw new Error('semnare eșuată ['+errs.join(' | ').slice(0,420)+']. Încearcă Manual.');
 }
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 // ---- metoda: DeFi Extension (SDK pin-uit, import dinamic) ----
@@ -246,12 +250,14 @@ async function connectExtension(){
     if(curAddr&&curAddr!==addr)m.textContent+='\n\nATENȚIE: adresa curentă în extensie e '+curAddr+' (login: '+addr+'). Selecteaz-o pe cea de login!';
     await doVerify(addr,chal.challenge_id,sig);
   }catch(e){
-    const dbg=S.lastSig?(' [debug: sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
+    const dbg=S.lastSig?(' [debug: shape='+(S.lastShape||'?')+' sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
     say('out2','Extension: '+String(e.message||e).slice(0,300)+dbg,'err');
   }
 }
 // ---- metoda: Web Wallet cross-window (popup oficial, fără conturi) ----
+function popupsAllowed(){try{const t=window.open('about:blank','_blank','width=10,height=10');if(!t||t.closed)return false;t.close();return true;}catch(_){return false;}}
 async function connectXWindow(){
+  if(!popupsAllowed()){say('out2','Web Wallet are nevoie de popup-uri: permite-le pentru site-ul ăsta (pictograma din bara de adrese), apoi reîncearcă.','warn');return;}
   say('out2','Se încarcă provider-ul Web Wallet…','');
   try{
     const mod=await import('/*__MX_XWINDOW_URL__*/');
