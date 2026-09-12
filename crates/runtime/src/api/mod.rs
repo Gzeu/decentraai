@@ -6964,6 +6964,89 @@ async fn orchestration_propose_resp(
         .into_response()
 }
 
+/// N-of-M engine: handles `orchestrate_execute` — drives ONE stage through
+/// real execution (same origin authz as propose: gateway `orchestrate`
+/// capability or consumer `orchestrate`/`*` scope). The model is resolved
+/// to a hash, never guessed; settlement decisions are returned, never
+/// applied (no double credit — the live path's single credit stands).
+async fn orchestration_execute_resp(
+    state: &ApiState,
+    key_id: &str,
+    scopes: &[String],
+    params: crate::mcp::OrchestrateExecuteParams,
+) -> Response {
+    use decentraai_distributed::nofm_engine::{FabricExecutor, StageSpec, drive_stage};
+
+    let auth_ok = if key_id.starts_with("gk-") {
+        gateway_authorize(
+            state,
+            key_id,
+            "orchestrate",
+            decentraai_agents::gateway::OperationClass::Compute,
+        )
+        .is_ok()
+    } else {
+        scopes.iter().any(|s| s == "orchestrate" || s == "*")
+    };
+    if !auth_ok {
+        return forbidden("orchestrate grant required");
+    }
+    let Some(store) = state.orchestration_tasks.clone() else {
+        return forbidden("orchestration not attached");
+    };
+    let Some(distributed) = state.distributed.clone() else {
+        return forbidden("distributed inference not attached");
+    };
+    let Some(model_hash) = crate::api::fabric_intel::resolve_model_hash(state, &params.model).await
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": format!("model '{}' has no advertised hash on the fabric", params.model)})),
+        )
+            .into_response();
+    };
+    let spec = StageSpec {
+        plan_id: params.plan_id.clone(),
+        stage_id: params.stage_id.clone(),
+        capability: params.capability.clone(),
+        prompt: params.prompt.clone(),
+        model_hash,
+        max_tokens: params.max_tokens,
+        max_price: params.max_price,
+        requester: key_id.to_string(),
+        schema_json: params.schema_json.clone(),
+    };
+    let exec = FabricExecutor::new(&distributed);
+    match drive_stage(&store, &exec, &spec).await {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "plan_id": params.plan_id,
+                "stage_id": params.stage_id,
+                "verified": out.verified,
+                "verify_detail": out.verify_detail,
+                "worker": out.receipt.worker_node,
+                "output": out.output,
+                "tokens_used": out.tokens_used,
+                "duration_ms": out.duration_ms,
+                "consensus": out.consensus.as_ref().map(|c| serde_json::json!({
+                    "verdict": format!("{:?}", c.verdict),
+                    "outputs_count": c.outputs.len(),
+                })),
+                "settle": format!("{:?}", out.settle),
+                "receipt": out.receipt,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// M17: handles `orchestrate_status` — ids and verdicts only, never prompts.
 fn orchestration_status_resp(state: &ApiState, plan_id: &str) -> Response {
     let Some(store) = &state.orchestration_tasks else {
@@ -8032,7 +8115,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                                 "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings"),
                                 "decentraai_compute_request" => !scopes.is_empty(),
                                 // M17: visible only with the explicit grant.
-                                "orchestrate_propose" | "orchestrate_status" => {
+                                "orchestrate_propose"
+                                | "orchestrate_status"
+                                | "orchestrate_execute" => {
                                     scopes.iter().any(|s| s == "orchestrate")
                                 }
                                 _ => false,
@@ -8079,7 +8164,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             name if name.starts_with("m18_") => {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
-                            "orchestrate_propose" | "orchestrate_status" => {
+                            "orchestrate_propose"
+                            | "orchestrate_status"
+                            | "orchestrate_execute" => {
                                 scopes.iter().any(|s| s == "orchestrate" || s == "*")
                             }
                             _ => true,
@@ -8770,6 +8857,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         return orchestration_propose_resp(state, key_id, scopes, &stages_v, total, cap).await;
     } else if let Some(plan_id) = crate::mcp::orchestrate_status_request(&raw) {
         return orchestration_status_resp(state, &plan_id);
+    } else if let Some(params) = crate::mcp::orchestrate_execute_request(&raw) {
+        return orchestration_execute_resp(state, key_id, scopes, params).await;
     } else if crate::mcp::discover_capabilities_request(&raw) {
         // Agent onboarding: discover what this node offers and what scopes are needed.
         // Always available — no scope required.
@@ -8804,6 +8893,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 | "memory_read_entries"
                 | "memory_write_entry" => "memory",
                 "arena_state" | "arena_act" => "arena",
+                "orchestrate_propose" | "orchestrate_status" | "orchestrate_execute" => {
+                    "orchestrate"
+                }
                 _ => "none",
             };
             capabilities.insert(
@@ -24543,6 +24635,33 @@ mod tests {
             .json(&m17_propose_payload(serde_json::json!([
                 {"stage_id":"s1","capability":"chat","max_price":5}
             ])))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn nofm_execute_without_scope_denied() {
+        // Same gate as propose: execute needs the orchestrate scope.
+        // (With the scope but no attached engine the handler fails closed
+        //  at the model-resolution step, never at auth — auth is checked
+        //  first and independently here.)
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let key = make_consumer_key_with_scopes(api, "nofm-consumer", &["compute"]).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"orchestrate_execute","arguments":{
+                    "plan_id":"p1","stage_id":"s1","capability":"chat",
+                    "prompt":"hi","model":"qwen.gguf",
+                    "max_tokens":16,"max_price":5
+                }}
+            }))
             .send()
             .await
             .unwrap();
