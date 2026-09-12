@@ -554,6 +554,11 @@ pub async fn resolve_provider_model(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+    // Tool passthrough (additive): when the caller advertises OpenAI `tools`,
+    // forward them verbatim to the provider backend. Backends with function
+    // calling (or a compatible emulation) answer with `tool_calls`;
+    // without tools the request shape is unchanged.
+    let tools = body_val.get("tools").cloned();
 
     // Resolve the model to a connected provider model. Only enabled models
     // are reachable. An explicit provider handle wins over name matching;
@@ -600,6 +605,7 @@ pub async fn resolve_provider_model(
         max_tokens,
         temperature,
         top_p: 0.9,
+        tools,
     };
 
     if wants_stream {
@@ -618,19 +624,40 @@ pub async fn resolve_provider_model(
                         match chunk {
                             Ok(c) => {
                                 reply.push_str(&c.text);
-                                let event = format!(
-                                    "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":{},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":{}}}]}}\n\n",
-                                    c.request_id,
-                                    chrono::Utc::now().timestamp(),
-                                    serde_json::to_string(&model_name)
-                                        .unwrap_or_else(|_| "\"\"".to_string()),
-                                    serde_json::to_string(&c.text)
-                                        .unwrap_or_else(|_| "\"\"".to_string()),
-                                    c.finish_reason
-                                        .as_ref()
-                                        .map(|_| "\"stop\"".to_string())
-                                        .unwrap_or_else(|| "null".to_string()),
-                                );
+                                // Tool-call chunk passthrough: backends that
+                                // answer with tool_calls (native or emulated)
+                                // surface them as delta.tool_calls so agent
+                                // harnesses can execute the loop. Text chunks
+                                // keep the historical shape.
+                                let event = match c.tool_calls {
+                                    Some(calls) => format!(
+                                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":{},\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":{}}},\"finish_reason\":{}}}]}}\n\n",
+                                        c.request_id,
+                                        chrono::Utc::now().timestamp(),
+                                        serde_json::to_string(&model_name)
+                                            .unwrap_or_else(|_| "\"\"".to_string()),
+                                        serde_json::to_string(&calls)
+                                            .unwrap_or_else(|_| "[]".to_string()),
+                                        c.finish_reason
+                                            .as_ref()
+                                            .map(|f| serde_json::to_string(f)
+                                                .unwrap_or_else(|_| "\"tool_calls\"".to_string()))
+                                            .unwrap_or_else(|| "\"tool_calls\"".to_string()),
+                                    ),
+                                    None => format!(
+                                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":{},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":{}}}]}}\n\n",
+                                        c.request_id,
+                                        chrono::Utc::now().timestamp(),
+                                        serde_json::to_string(&model_name)
+                                            .unwrap_or_else(|_| "\"\"".to_string()),
+                                        serde_json::to_string(&c.text)
+                                            .unwrap_or_else(|_| "\"\"".to_string()),
+                                        c.finish_reason
+                                            .as_ref()
+                                            .map(|_| "\"stop\"".to_string())
+                                            .unwrap_or_else(|| "null".to_string()),
+                                    ),
+                                };
                                 let _ = tx
                                     .send(Ok::<Bytes, std::convert::Infallible>(Bytes::from(event)))
                                     .await;
@@ -677,6 +704,27 @@ pub async fn resolve_provider_model(
         match adapter.complete(&request).await {
             Ok(resp) => {
                 let created = chrono::Utc::now().timestamp();
+                // Tool-call passthrough: when the backend answered with
+                // tool_calls, emit a spec-compliant assistant message
+                // (content null + tool_calls + finish_reason tool_calls) so
+                // agent harnesses can execute the loop. Plain text replies
+                // keep the historical shape.
+                let decentraai_inference_adapter::BackendResponse {
+                    output,
+                    tokens_used,
+                    finish_reason,
+                    tool_calls,
+                } = resp;
+                let (message, finish) = match tool_calls {
+                    Some(calls) => (
+                        json!({ "role": "assistant", "content": null, "tool_calls": calls }),
+                        "tool_calls".to_string(),
+                    ),
+                    None => (
+                        json!({ "role": "assistant", "content": output.clone() }),
+                        finish_reason.unwrap_or_else(|| "stop".to_string()),
+                    ),
+                };
                 let json_body = json!({
                     "id": format!("chatcmpl-prov-{}", model_entry.model_id),
                     "object": "chat.completion",
@@ -684,21 +732,21 @@ pub async fn resolve_provider_model(
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "message": { "role": "assistant", "content": resp.output },
-                        "finish_reason": resp.finish_reason.unwrap_or_else(|| "stop".to_string()),
+                        "message": message,
+                        "finish_reason": finish,
                     }],
                     "usage": {
                         "prompt_tokens": 0,
-                        "completion_tokens": resp.tokens_used.unwrap_or(0),
-                        "total_tokens": resp.tokens_used.unwrap_or(0),
+                        "completion_tokens": tokens_used.unwrap_or(0),
+                        "total_tokens": tokens_used.unwrap_or(0),
                     }
                 });
                 // Chat history (USER DATA): the reply is fully buffered here.
                 let conv_id = chat_capture.and_then(|capture| {
-                    if resp.output.is_empty() {
+                    if output.is_empty() {
                         None
                     } else {
-                        state.record_chat_turn(capture, &resp.output)
+                        state.record_chat_turn(capture, &output)
                     }
                 });
                 let mut response = (
