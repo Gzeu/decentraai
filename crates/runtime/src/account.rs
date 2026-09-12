@@ -238,9 +238,7 @@ async function connectExtension(){
     // Semnare brută: păstrăm obiectul Message întreg pentru tripla
     // verificare de adrese (login vs ecoul semnăturii vs citire curentă).
     const p2=p;
-    let signedRaw=null;
-    try{signedRaw=await p2.signMessage({data:msgBytes(chal.message)});}
-    catch(e1){signedRaw=await p2.signMessage(chal.message);}
+    let signedRaw=await (async()=>{try{const o=await p2.signMessage({data:msgBytes(chal.message)});S.lastShape='data';return o;}catch(e1){const o=await p2.signMessage(chal.message);S.lastShape='str';return o;}})();
     const sig=extractSig(signedRaw);
     if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
     S.lastSig=sig;
