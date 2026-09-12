@@ -274,10 +274,16 @@ async function connectXWindow(){
     if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
     say('out2','Conectat: '+addr+' — cere challenge…','');
     const chal=await getChallenge(addr);
+    S.lastSig=null;
+    const m=$('manMsg');m.style.display='block';m.textContent='Mesaj trimis la semnat (byte-cu-byte):\n'+chal.message;
     const sig=await providerSign(p,chal.message);
     if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
+    S.lastSig=sig;
     await doVerify(addr,chal.challenge_id,sig);
-  }catch(e){say('out2','Web Wallet: '+String(e.message||e).slice(0,300),'err');}
+  }catch(e){
+    const dbg=S.lastSig?(' [debug: shape='+(S.lastShape||'?')+' sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
+    say('out2','Web Wallet: '+String(e.message||e).slice(0,200)+dbg,'err');
+  }
 }
 function msgBytes(s){return new TextEncoder().encode(s);}
 function addrOf(a){
