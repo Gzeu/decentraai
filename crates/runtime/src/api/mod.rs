@@ -1632,12 +1632,13 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/hub/events", get(crate::hub::hub_events_handler))
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/world", get(world_html_handler))
+        .route("/account", get(account_page_handler))
         .route("/world/join", get(world_join_page_handler))
         .route("/world/skill.md", get(world_skill_handler))
         .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
-        .route("/v1/auth/wallet/key", post(wallet_key_handler))
+        .route("/v1/auth/wallet/key", post(wallet_key_handler).delete(wallet_key_revoke_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
@@ -1980,6 +1981,19 @@ async fn arena_dashboard_handler(State(_state): State<ApiState>) -> Response {
 /// GET /hub — Agent Hub spectator (Issue #63 Hub). Task market + auction + teams.
 async fn hub_dashboard_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::hub::hub_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /account — wallet onboarding page (public, no master required).
+/// Testnet/mainnet intent → wallet signature → ONE `dca_` key (once-only),
+/// opening the OpenAI-compatible API + MCP. Served no-store.
+async fn account_page_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::account::account_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -2435,6 +2449,110 @@ async fn wallet_key_handler(
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
             "scopes": [],
             "note": "shown once; only its hash and prefix are stored",
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /v1/auth/wallet/key — self-serve key revocation (rotation, step 1).
+///
+/// A live wallet session revokes the wallet agent's active consumer key.
+/// The plaintext is NOT required (shown once, at creation); the session
+/// proves ownership. After revocation, POST /v1/auth/wallet/key mints a
+/// fresh key — revoke + reissue is the rotation ceremony the 409 path
+/// advertises. No active key → 404 (nothing to revoke). All fail-closed.
+async fn wallet_key_revoke_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let session_token = body
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "session_token required (log in via /v1/auth/wallet/verify first)"})),
+        )
+            .into_response();
+    }
+    let session = match state.wallet_session_for_token(session_token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({"ok": false, "error": "unknown or expired wallet session"}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    if !state.consumer_enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+        )
+            .into_response();
+    }
+    let path = match &state.consumer_keys_path {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+            )
+                .into_response();
+        }
+    };
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": "consumer key store unreadable"})),
+            )
+                .into_response();
+        }
+    };
+    let (key_id, prefix) = match store.list().iter().find(|r| {
+        r.owner_account == session.agent_id && !r.revoked && !store.is_expired(r)
+    }) {
+        Some(r) => (r.key_id.clone(), r.prefix.clone()),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"ok": false, "error": "no active key for this wallet agent"})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = store.revoke(&key_id) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "consumer_key_self_revoked",
+        serde_json::json!({
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "key_id": key_id,
+            "key_prefix": prefix,
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "key_id": key_id,
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "note": "revoked; reissue via POST /v1/auth/wallet/key",
         })),
     )
         .into_response()
@@ -24071,6 +24189,143 @@ mod tests {
                 .unwrap();
             assert_eq!(r.status(), want);
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_revoke_then_reissue() {
+        // Rotation ceremony: issue → revoke (old key dies) → reissue (fresh key).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let (_, session) = wallet_session(api).await;
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let old_token = issued["token"].as_str().unwrap().to_string();
+        let old_key_id = issued["key_id"].as_str().unwrap().to_string();
+        // Revoke via the live session (plaintext NOT required — shown once).
+        let revoked = client
+            .delete(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), 200);
+        let body: serde_json::Value = revoked.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["key_id"].as_str().unwrap(), old_key_id);
+        // The revoked key stops authenticating immediately.
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {old_token}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "revoked key must not reach MCP");
+        // Reissue mints a FRESH key (rotation complete).
+        let reissued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reissued["ok"], true);
+        let new_token = reissued["token"].as_str().unwrap().to_string();
+        assert_ne!(new_token, old_token, "rotation must mint fresh plaintext");
+        assert_ne!(
+            reissued["key_id"].as_str().unwrap(),
+            old_key_id,
+            "rotation must mint a fresh key id"
+        );
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {new_token}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "fresh key reaches MCP");
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_revoke_needs_key_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        // Malformed / unknown sessions fail closed, like issuance.
+        for (payload, want) in [
+            (serde_json::json!({}), 400),
+            (serde_json::json!({"session_token": "wx_nope"}), 401),
+        ] {
+            let r = client
+                .delete(format!("http://{api}/v1/auth/wallet/key"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), want);
+        }
+        // Live session but no key yet → 404 (nothing to revoke).
+        let (_, session) = wallet_session(api).await;
+        let r = client
+            .delete(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn account_page_serves_no_store() {
+        // GET /account: public onboarding page, no-store, wired to the
+        // wallet endpoints, provider URLs substituted (no placeholders).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .get(format!("http://{api}/account"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            r.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = r.text().await.unwrap();
+        for marker in [
+            "DecentraAI — Cont",
+            "/v1/auth/wallet/challenge",
+            "/v1/auth/wallet/verify",
+            "/v1/auth/wallet/key",
+            "cdn.jsdelivr.net/npm/@multiversx/",
+            "Revocă + re-emite",
+        ] {
+            assert!(body.contains(marker), "missing marker: {marker}");
+        }
+        assert!(
+            !body.contains("/*__MX_"),
+            "provider URL placeholders must be substituted"
+        );
     }
 
     // ---- M16 gateway (dga_) consumption flow ------------------------------

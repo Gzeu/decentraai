@@ -9,6 +9,7 @@
 //! config mode and the live hardware budgets from the system probe, and
 //! rejections are written to the audit log (M6).
 
+pub mod account;
 pub mod api;
 pub mod arena;
 pub mod authz;
