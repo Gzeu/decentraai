@@ -120,6 +120,7 @@ pub async fn auth_command(command: AuthCommand) -> Result<()> {
         AuthCommand::Whoami(args) => {
             let key_path = args.key_file.unwrap_or_else(default_key_path);
             let stored = load_key(&key_path)?;
+            let client = reqwest::Client::new();
             let r = client
                 .get(format!("{}/v1/models", args.node))
                 .header("Authorization", format!("Bearer {}", stored.token))
@@ -130,6 +131,22 @@ pub async fn auth_command(command: AuthCommand) -> Result<()> {
                 anyhow::bail!("key rejected (HTTP {}) — rotate via `auth new`", r.status());
             }
             println!("ok:       {} ({}) @ {}", stored.address, stored.key_id, args.node);
+            // Live quota for the agent's own account (best-effort display).
+            let q: serde_json::Value = client
+                .post(format!("{}/mcp", args.node))
+                .header("Authorization", format!("Bearer {}", stored.token))
+                .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "get_quota", "arguments": {}}}))
+                .send()
+                .await
+                .context("MCP get_quota")?
+                .json()
+                .await
+                .context("parsing quota")?;
+            match find_account_numbers(&q, &stored.account) {
+                Some((avail, spent)) => println!("quota:    available {avail}, spendable {spent}"),
+                None => println!("quota:    (unparsed snapshot)"),
+            }
             Ok(())
         }
         AuthCommand::Revoke(args) => {
@@ -276,8 +293,7 @@ fn load_key(path: &Path) -> Result<StoredKey> {
 }
 
 /// Replace the stored token with the empty string (post-revoke hygiene).
-fn scrub_key_token(path: &Path) -> Result<()> {
-    if !path.exists() {
+fn scrub_key_token(path: &Path) -> Result<()> {    if !path.exists() {
         return Ok(());
     }
     let mut stored = load_key(path)?;
@@ -315,6 +331,39 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Find (available, spendable) for `account` inside a get_quota snapshot.
+/// Walks nested objects/arrays; matches on "account"/"owner"/"address"
+/// fields equal to the account, then reads sibling numerics. Pure —
+/// the snapshot shape may evolve without breaking the CLI.
+fn find_account_numbers(v: &serde_json::Value, account: &str) -> Option<(u64, u64)> {
+    match v {
+        serde_json::Value::Object(map) => {
+            let is_mine = ["account", "owner", "address", "agent", "agent_id"]
+                .iter()
+                .any(|k| map.get(*k).and_then(|x| x.as_str()) == Some(account));
+            if is_mine {
+                let num = |keys: &[&str]| {
+                    keys.iter()
+                        .filter_map(|k| map.get(*k).and_then(|x| x.as_u64()))
+                        .next()
+                };
+                if let (Some(a), Some(s)) = (
+                    num(&["available", "spendable", "balance"]),
+                    num(&["spendable", "available", "balance"]),
+                ) {
+                    return Some((a, s));
+                }
+            }
+            map.values().filter_map(|x| find_account_numbers(x, account)).next()
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|x| find_account_numbers(x, account))
+            .next(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -357,8 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn seed_create_is_0600_and_stable() {
-        let path = tmp("seed");
+    fn quota_snapshot_extraction() {
+        let snap = serde_json::json!({
+            "result": {
+                "accounts": [
+                    {"account": "other", "available": 5, "spendable": 5},
+                    {"owner": "erd1mine", "available": 100, "spendable": 95, "earned": 100}
+                ],
+                "totals": {"available": 105}
+            }
+        });
+        assert_eq!(
+            find_account_numbers(&snap, "erd1mine"),
+            Some((100, 95))
+        );
+        assert_eq!(find_account_numbers(&snap, "nobody"), None);
+    }
+
+    #[test]
+    fn seed_create_is_0600_and_stable() {        let path = tmp("seed");
         std::fs::remove_file(&path).unwrap_or(());
         let s1 = load_or_create_seed(&path).unwrap();
         let s2 = load_or_create_seed(&path).unwrap();
