@@ -180,6 +180,9 @@ async function connectExtension(){
     await p.login();
     const addr=await providerAddress(p);
     if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
+    // Poartă anti-confuzie: extensia poate semna cu alt cont decât cel
+    // întors la login (mai multe adrese). Utilizatorul confirmă explicit.
+    if(!confirm('Portofel conectat:\n\n'+addr+'\n\nVerifică în extensia DeFi că ACEASTĂ adresă e cea selectată activ. Dacă ai mai multe adrese, selecteaz-o pe aceasta acum.\n\nContinui cu semnarea?')){say('out2','Oprit de tine. Selectează adresa în extensie și reîncearcă — sau Manual.','warn');return;}
     say('out2','Conectat: '+addr+' — cere challenge…','');
     const chal=await getChallenge(addr);
     // Debug vizibil (semnătura e publică prin construcție — ajunge la
