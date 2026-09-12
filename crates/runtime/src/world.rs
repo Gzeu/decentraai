@@ -262,6 +262,17 @@ pub struct OnChainProof {
     /// MultiversX testnet network.
     #[serde(default = "default_network")]
     pub network: String,
+    /// Supernova track detail at confirmation (`final`, `not-finalized`,
+    /// …). `None` = observed without Supernova correlation (observer
+    /// disabled or pre-correlation proofs). Pure evidence, never a gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supernova_detail: Option<String>,
+    /// Whether chain finality (execution + proof) was observed at confirm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supernova_final: Option<bool>,
+    /// Whether a finality proof was seen at confirm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supernova_proof_seen: Option<bool>,
 }
 
 fn default_network() -> String {
@@ -2711,6 +2722,9 @@ impl WorldState {
             submitted_tick: 0,
             confirmed_tick: 0,
             network: intent.network.clone(),
+            supernova_detail: None,
+            supernova_final: None,
+            supernova_proof_seen: None,
         };
 
         self.record_event(WorldEvent {
@@ -2977,6 +2991,36 @@ impl WorldState {
             evidence_id: Some(evidence_hash),
         });
 
+        Ok(())
+    }
+
+    /// Record Supernova correlation on a proof (A1 completion).
+    ///
+    /// Best-effort evidence only: writes the track outcome observed at
+    /// confirm time. Never changes status, never fails the settlement —
+    /// `None` detail simply leaves prior values untouched. Old serialised
+    /// proofs (without these fields) parse unchanged via serde defaults.
+    pub fn record_supernova(
+        &mut self,
+        proof_id: &str,
+        detail: Option<String>,
+        finality_reached: Option<bool>,
+        proof_seen: Option<bool>,
+    ) -> Result<(), String> {
+        let proof = self
+            .proofs
+            .iter_mut()
+            .find(|p| p.id == proof_id)
+            .ok_or_else(|| format!("proof '{proof_id}' not found"))?;
+        if detail.is_some() {
+            proof.supernova_detail = detail;
+        }
+        if finality_reached.is_some() {
+            proof.supernova_final = finality_reached;
+        }
+        if proof_seen.is_some() {
+            proof.supernova_proof_seen = proof_seen;
+        }
         Ok(())
     }
 
@@ -4381,5 +4425,60 @@ mod tests {
         assert!(w.accept_quest("q-dup", "a1").is_ok());
         assert!(matches!(w.quests[0].status, QuestStatus::Active));
         assert_eq!(w.quests[0].accepted_by.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn record_supernova_is_additive_evidence_only() {
+        let mut w = WorldState::default();
+        w.entities.push(WorldEntity {
+            id: "agent-1".to_string(),
+            name: "Agent".to_string(),
+            entity_type: "agent".to_string(),
+            zone_id: "central-hub".to_string(),
+            location_id: "hub-plaza".to_string(),
+            state: EntityState::Idle,
+            capabilities: vec![],
+            needs: vec![],
+            wallet: "erd1test".to_string(),
+            reputation: 0.5,
+            credits: 100,
+            activity: String::new(),
+            last_move_tick: 0,
+            inventory: vec![],
+        });
+        let proof = w
+            .settle_on_chain("quest_completion", "Quest done", "agent-1", 20)
+            .unwrap();
+        // Unknown proof → error, status untouched.
+        assert!(w.record_supernova("nope", None, None, None).is_err());
+        // None detail leaves prior values alone.
+        assert!(w.record_supernova(&proof.id, None, None, None).is_ok());
+        let p = w.proofs.iter().find(|p| p.id == proof.id).unwrap();
+        assert!(p.supernova_detail.is_none());
+        // Real correlation persists.
+        assert!(
+            w.record_supernova(&proof.id, Some("final".to_string()), Some(true), Some(true))
+                .is_ok()
+        );
+        let p = w.proofs.iter().find(|p| p.id == proof.id).unwrap();
+        assert_eq!(p.supernova_detail.as_deref(), Some("final"));
+        assert_eq!(p.supernova_final, Some(true));
+        assert_eq!(p.supernova_proof_seen, Some(true));
+        // Status never touched by recording.
+        assert!(matches!(p.status, SettlementStatus::Pending));
+    }
+
+    #[test]
+    fn legacy_proof_json_without_supernova_fields_parses() {
+        // Pre-correlation persisted proofs must load unchanged.
+        let raw = r#"{"id":"e1","action_type":"quest_completion","description":"d",
+            "entity_id":"a","amount":20,"evidence_hash":"h","tx_data":"x",
+            "tx_hash":"","capability":"","sender":"","nonce":null,
+            "resubmit_count":0,"status":"pending","created_tick":1,
+            "submitted_tick":0,"confirmed_tick":0,"network":"multiversx-testnet"}"#;
+        let p: OnChainProof = serde_json::from_str(raw).unwrap();
+        assert!(p.supernova_detail.is_none());
+        assert!(p.supernova_final.is_none());
+        assert!(p.supernova_proof_seen.is_none());
     }
 }
