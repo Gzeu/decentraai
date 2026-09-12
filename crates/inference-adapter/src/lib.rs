@@ -147,6 +147,11 @@ pub struct BackendRequest {
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
+    /// Optional OpenAI `tools` array, forwarded verbatim to OpenAI-compatible
+    /// backends that support function calling (or emulate it, e.g. the
+    /// Perchance bridge with PERCHANCE_EMULATE_TOOLS=1). `None` = plain chat,
+    /// preserving the historical request shape byte-for-byte.
+    pub tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +159,9 @@ pub struct BackendResponse {
     pub output: String,
     pub tokens_used: Option<u32>,
     pub finish_reason: Option<String>,
+    /// Raw OpenAI `tool_calls` array when the backend returned
+    /// `finish_reason == "tool_calls"`. `None` for plain text replies.
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +170,9 @@ pub struct StreamChunk {
     pub sequence: u64,
     pub text: String,
     pub finish_reason: Option<String>,
+    /// Raw OpenAI `delta.tool_calls` payload when a streamed chunk carries
+    /// tool calls instead of text. `None` for plain text chunks.
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Error)]
@@ -330,7 +341,8 @@ impl InferenceBackend for OpenAiCompatibleBackend {
 
     async fn complete(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
         self.validate(&request)?;
-        let body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": false});
+        let mut body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": false});
+        insert_tools(&mut body, request.tools);
         let response = self
             .auth(self.client.post(self.endpoint("v1/chat/completions")))
             .json(&body)
@@ -356,15 +368,17 @@ impl InferenceBackend for OpenAiCompatibleBackend {
             .next()
             .ok_or_else(|| BackendError::Protocol("missing choice".into()))?;
         Ok(BackendResponse {
-            output: choice.message.content,
+            output: choice.message.content.unwrap_or_default(),
             tokens_used: raw.usage.and_then(|u| u.completion_tokens),
             finish_reason: choice.finish_reason,
+            tool_calls: choice.message.tool_calls,
         })
     }
 
     async fn stream(&self, request: BackendRequest) -> Result<TokenStream, BackendError> {
         self.validate(&request)?;
-        let body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": true});
+        let mut body = serde_json::json!({"model": self.config.model, "messages": [{"role": "user", "content": request.prompt}], "max_tokens": request.max_tokens, "temperature": request.temperature, "top_p": request.top_p, "stream": true});
+        insert_tools(&mut body, request.tools);
         let response = self
             .auth(self.client.post(self.endpoint("v1/chat/completions")))
             .json(&body)
@@ -399,7 +413,11 @@ struct OpenAiChoice {
 }
 #[derive(Debug, Deserialize)]
 struct OpenAiMessage {
-    content: String,
+    // `content` is null on assistant messages that only carry tool calls.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
 }
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
@@ -416,7 +434,18 @@ struct OpenAiStreamChoice {
 }
 #[derive(Debug, Deserialize)]
 struct OpenAiDelta {
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
+}
+
+/// Forward tool definitions only when the caller supplied them; without
+/// tools the body is byte-identical to the historical shape.
+fn insert_tools(body: &mut serde_json::Value, tools: Option<serde_json::Value>) {
+    if let (Some(obj), Some(tools)) = (body.as_object_mut(), tools) {
+        obj.insert("tools".to_string(), tools);
+    }
 }
 
 fn parse_sse<S, E>(
@@ -440,8 +469,11 @@ where
                 let parsed: OpenAiStreamResponse = match serde_json::from_str(data) { Ok(v) => v, Err(e) => { yield Err(BackendError::Protocol(e.to_string())); return; } };
                 let choice = match parsed.choices.into_iter().next() { Some(v) => v, None => continue };
                 let text = choice.delta.content.unwrap_or_default();
-                if text.is_empty() && choice.finish_reason.is_none() { continue; }
-                yield Ok(StreamChunk { request_id: request_id.clone(), sequence, text, finish_reason: choice.finish_reason }); sequence += 1;
+                // Keep tool_calls-only chunks (empty text + tool_calls payload);
+                // skip only chunks carrying neither text, tool calls, nor a
+                // finish reason (e.g. bare role deltas).
+                if text.is_empty() && choice.delta.tool_calls.is_none() && choice.finish_reason.is_none() { continue; }
+                yield Ok(StreamChunk { request_id: request_id.clone(), sequence, text, finish_reason: choice.finish_reason, tool_calls: choice.delta.tool_calls }); sequence += 1;
             }
         }
     }
@@ -487,6 +519,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.7,
             top_p: 0.9,
+            tools: None,
         };
         assert!(matches!(b.validate(&r), Err(BackendError::PromptTooLarge)));
     }
@@ -503,6 +536,7 @@ mod tests {
             max_tokens: 3,
             temperature: 0.7,
             top_p: 0.9,
+            tools: None,
         };
         assert!(matches!(
             b.validate(&r),

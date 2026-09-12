@@ -93,6 +93,7 @@ pub mod knowledge_runtime;
 pub mod memory_propagator;
 pub mod model_performance;
 pub mod mp;
+pub mod nofm_engine;
 pub mod p2p_handler;
 pub mod pool;
 pub mod probe;
@@ -102,6 +103,7 @@ pub mod replay;
 pub mod retrieval_manager;
 pub mod router;
 pub mod session;
+pub mod supervisor;
 pub mod tool_calling;
 pub mod tracker;
 pub mod worker;
@@ -1961,6 +1963,9 @@ async fn stream_request_to_terminal(
         max_tokens: queued.request.max_tokens,
         temperature: queued.request.temperature,
         top_p: queued.request.top_p,
+        // DFCP assist path carries plain prompts; tools stay on the
+        // OpenAI-compatible provider path (resolve_provider_model).
+        tools: None,
     };
 
     let stream = match backend.stream(backend_req).await {

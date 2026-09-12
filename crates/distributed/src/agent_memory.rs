@@ -268,6 +268,7 @@ pub fn sync_entry_to_memory(entry: SyncMemoryEntry, target_scope: &str) -> Memor
         expires_at_ms: None,
         provenance: None,
         meta,
+        supernova_kind: None,
     };
     // Local identity for this imported knowledge: subject keys still group
     // conflicts; ids stay stable for dedup across re-sends.
@@ -980,6 +981,7 @@ fn entry_from_row_with_embedding(
             created_at_ms: row.get::<_, i64>(6)? as u64,
             expires_at_ms: row.get::<_, Option<i64>>(7)?.map(|ms| ms as u64),
             provenance,
+            supernova_kind: None,
             meta,
         },
         embedding.unwrap_or_default(),

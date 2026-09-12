@@ -699,11 +699,11 @@ fabric_intelligence:
 ```bash
 # Create subscription token
 decentraai token create --name "perchance-local" --tier 2
-# Token: dsk_REDACTED-rotated-2026-09-12
+# Token: <shown once at creation - never paste real tokens in docs>
 ```
 
 ### Perchance MCP Call Flow
-1. Perchance agent calls `decide` on `decentraai.duckdns.org/mcp` with Bearer `dca_KEY-PREFIX-REDACTED...`
+1. Perchance agent calls `decide` on `decentraai.duckdns.org/mcp` with its own Bearer token
 2. Fabric's `select_provider(policy=external_first, external_configured=true)` → selects External
 3. `OpenAiCompatProvider::analyze()` → POST to `{base_url}/chat/completions`
 4. External provider returns model response
@@ -712,5 +712,5 @@ decentraai token create --name "perchance-local" --tier 2
 
 ### Environment Variable
 ```bash
-export DECENTRAAI_EXTERNAL_KEY=dsk_REDACTED-rotated-2026-09-12
+export DECENTRAAI_EXTERNAL_KEY=<paste-key-at-runtime-never-commit>
 ```

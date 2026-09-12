@@ -1,0 +1,84 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Node boot</title>
+<style>
+:root{--bg:#05070d;--panel:#0d121c;--line:#182234;--text:#e8eef6;--muted:#8fa0b3;--accent:#22d3ee;--ok:#34d399;--warn:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:15px/1.6 system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:32px;max-width:520px;width:100%}
+h1{font-size:22px;margin-bottom:2px}.h1dot{color:var(--accent)}
+.sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+.bar{height:8px;border-radius:999px;background:#14203a;overflow:hidden;margin:8px 0 20px}
+.bar>i{display:block;height:100%;width:5%;border-radius:999px;background:linear-gradient(90deg,var(--accent),#6366f1);transition:width .5s}
+.stage{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid #14203a;font-size:14px}
+.stage:last-of-type{border-bottom:0}
+.dot{width:10px;height:10px;border-radius:999px;background:#26334d;flex:none;transform:translateY(1px)}
+.dot.run{background:var(--warn);animation:pulse 1s infinite alternate}
+.dot.ok{background:var(--ok)}
+@keyframes pulse{from{opacity:.4}to{opacity:1}}
+.meta{margin-left:auto;color:var(--muted);font-size:12px;font-family:ui-monospace,monospace}
+.cta{margin-top:20px;display:none;text-align:center}
+.cta a{display:inline-block;padding:10px 22px;border-radius:10px;border:1px solid var(--accent);color:var(--text);text-decoration:none}
+.cta a:hover{background:rgba(34,211,238,.12)}
+.note{margin-top:12px;color:var(--muted);font-size:12px;text-align:center}
+.mono{font-family:ui-monospace,monospace}
+</style></head><body>
+<div class="card">
+<h1><span class="h1dot">●</span> DecentraAI</h1>
+<div class="sub">node boot — waiting for the engine to become ready</div>
+<div class="bar"><i id="progress"></i></div>
+<div class="stage"><span class="dot" id="d-api"></span><span>API online</span><span class="meta" id="m-api">…</span></div>
+<div class="stage"><span class="dot" id="d-engine"></span><span>Inference engine loaded</span><span class="meta" id="m-engine">…</span></div>
+<div class="stage"><span class="dot" id="d-models"></span><span>Models registered</span><span class="meta" id="m-models">…</span></div>
+<div class="stage"><span class="dot" id="d-ready"></span><span>Ready to serve</span><span class="meta" id="m-ready">…</span></div>
+<div class="cta" id="cta"><a href="/ui2" id="enter">Enter dashboard →</a><div class="note" id="countdown"></div></div>
+<div class="note">Live state only — this page polls the public <span class="mono">/status</span> snapshot and never touches inference endpoints.</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const TARGET="/ui2";
+let done=false,cdTimer=null;
+function setStage(name,state,meta){
+  const d=$("d-"+name),m=$("m-"+name);
+  d.className="dot"+(state==="ok"?" ok":state==="run"?" run":"");
+  if(meta!==undefined)m.textContent=meta;
+}
+function setProgress(pct){$("progress").style.width=pct+"%";}
+async function tick(){
+  if(done)return;
+  setStage("api","run","contacting…");
+  setProgress(10);
+  let s=null;
+  try{
+    const r=await fetch("/status",{cache:"no-store"});
+    if(!r.ok)throw new Error("http "+r.status);
+    s=await r.json();
+  }catch(e){
+    setStage("api","run","retrying…");
+    setProgress(5);
+    return;
+  }
+  setStage("api","ok","online");
+  let pct=25;
+  const loaded=!!s.model_loaded, model=s.model||"—";
+  setStage("engine",loaded?"ok":"run",loaded?String(model):"loading…");
+  if(loaded)pct=55;
+  const n=Array.isArray(s.available_models)?s.available_models.length:0;
+  const modelsOk=n>0;
+  setStage("models",modelsOk?"ok":"run",modelsOk?n+" model"+(n>1?"s":""):"waiting…");
+  if(modelsOk)pct=80;
+  const ready=loaded&&modelsOk;
+  setStage("ready",ready?"ok":"run",ready?"yes":"…");
+  if(ready){
+    setProgress(100);
+    done=true;
+    $("cta").style.display="block";
+    let s3=3;
+    const cd=$("countdown");
+    cd.textContent="redirecting in "+s3+"s…";
+    cdTimer=setInterval(()=>{s3--;if(s3<=0){clearInterval(cdTimer);location.href=TARGET;}else cd.textContent="redirecting in "+s3+"s…";},1000);
+  }else setProgress(pct);
+}
+$("enter").addEventListener("click",()=>{if(cdTimer)clearInterval(cdTimer);});
+setInterval(tick,2000);
+tick();
+</script>
+</body></html>

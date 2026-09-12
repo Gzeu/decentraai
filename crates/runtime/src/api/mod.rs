@@ -437,6 +437,9 @@ pub struct ApiState {
     /// form. Set (via config, after token creation) = the same code paths
     /// denominate in DCAI — pure configuration, no logic switch.
     pub dcai: Option<decentraai_config::DcaiSection>,
+    /// MultiversX Supernova observer (O1, read-only). `None` = disabled:
+    /// `/v1/mx/*` returns 404 and zero Proxy traffic happens.
+    pub mx_observer: Option<Arc<crate::mx_observer::MxObserverHandle>>,
 }
 
 impl ApiState {
@@ -516,6 +519,7 @@ impl ApiState {
             memory_bridge: None,
             bridge_sync: false,
             research_trigger: None,
+            mx_observer: None,
             model_intel: None,
             model_intel_path: None,
             talent_tree: None,
@@ -938,6 +942,18 @@ impl ApiState {
         rt: Arc<crate::research_trigger::ResearchTriggerRuntime>,
     ) {
         self.research_trigger = Some(rt);
+    }
+
+    /// Supernova observer: attach the validated handle (or nothing for
+    /// disabled). Spawns the background poll loop on attach.
+    pub fn attach_mx_observer(
+        &mut self,
+        handle: Option<Arc<crate::mx_observer::MxObserverHandle>>,
+    ) {
+        if let Some(h) = &handle {
+            h.spawn();
+        }
+        self.mx_observer = handle;
     }
 
     /// DCAI identifier slot: attach the validated config section (or
@@ -1609,6 +1625,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/ui2", get(dashboard_v2_handler))
         .route("/fabric", get(fabric_dashboard_handler))
         .route("/landing", get(fabric_landing_handler))
+        .route("/loading", get(loading_handler))
         .route("/flow", get(fabric_flow_handler))
         .route("/arena", get(arena_dashboard_handler))
         .route("/v1/arena/state", get(crate::arena::arena_state_handler))
@@ -1637,6 +1654,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
+        .route("/v1/auth/wallet/key", post(wallet_key_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
@@ -1674,6 +1692,8 @@ pub fn build_router(state: ApiState) -> Router {
             post(world_settle_confirm_handler),
         )
         .route("/v1/world/proofs", get(world_proofs_handler))
+        .route("/v1/mx/status", get(mx_status_handler))
+        .route("/v1/mx/track", get(mx_track_handler))
         .route("/vesper", get(vesper_handler))
         .route("/vesper/", get(vesper_handler))
         .route("/vesper/agents", get(vesper_agents_handler))
@@ -1957,6 +1977,19 @@ async fn fabric_dashboard_handler(State(_state): State<ApiState>) -> Response {
 /// /status snapshot. Read-only.
 async fn fabric_landing_handler(State(_state): State<ApiState>) -> Response {
     let html = crate::fabric_landing::fabric_landing_html();
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// GET /loading — node boot splash: stages engine readiness from the
+/// public /status snapshot, then links the live dashboard. Read-only,
+/// self-contained (no external sources).
+async fn loading_handler(State(_state): State<ApiState>) -> Response {
+    let html = crate::loading::loading_html();
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -2298,6 +2331,145 @@ async fn wallet_verify_handler(
         )
             .into_response(),
     }
+}
+
+/// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
+///
+/// A live wallet session mints ONE OpenAI-compatible consumer key (`dca_`)
+/// bound to the wallet's agent, reusing the exact issuance path as the
+/// admin endpoint (same store, same hash-only persistence, same once-only
+/// plaintext, same audit shape with a distinct event name).
+///
+/// Rules (all fail-closed): the session must be live (expiry enforced by
+/// the wallet store); one active key per agent (repeats return 409 with the
+/// key_id — plaintext is shown exactly once, at creation, never re-shown);
+/// baseline surface only with empty scopes (decide + quota-gated reads)
+/// and a modest ceiling/rate, while privileged scopes stay on the admin
+/// grant path; the consumer ledger must be attached (same gate as admin).
+/// The key is fabric-scoped (chain-agnostic): it works identically for
+/// testnet and mainnet wallets. Chain submission stays on its own lane.
+async fn wallet_key_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    /// Self-serve defaults: modest enough to be safe unattended, useful
+    /// enough for real onboarding (matches the consumer test baseline).
+    const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
+    const SELF_SERVE_RATE_PER_MIN: u32 = 50;
+
+    let session_token = body
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "session_token required (log in via /v1/auth/wallet/verify first)"})),
+        )
+            .into_response();
+    }
+    let session = match state.wallet_session_for_token(session_token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({"ok": false, "error": "unknown or expired wallet session"}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    if !state.consumer_enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+        )
+            .into_response();
+    }
+    let path = match &state.consumer_keys_path {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"ok": false, "error": "consumer keys are not enabled on this node"})),
+            )
+                .into_response();
+        }
+    };
+    let mut store = match decentraai_tokens::ConsumerKeyStore::load(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": "consumer key store unreadable"})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(existing) = store
+        .list()
+        .iter()
+        .find(|r| r.owner_account == session.agent_id && !r.revoked && !store.is_expired(r))
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "key already issued for this wallet agent",
+                "key_id": existing.key_id,
+                "note": "plaintext is shown exactly once, at creation; rotate via revoke + reissue",
+            })),
+        )
+            .into_response();
+    }
+    let plaintext = match store.create(
+        &session.agent_id,
+        SELF_SERVE_QUOTA_CEILING,
+        SELF_SERVE_RATE_PER_MIN,
+        Vec::new(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let a = state.info.repo_root.join("logs/audit.jsonl");
+    let _ = decentraai_audit::record(
+        a.parent().unwrap_or(&state.info.repo_root),
+        "consumer_key_self_issued",
+        serde_json::json!({
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
+            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+        }),
+    );
+    let key_id = store
+        .lookup(&plaintext)
+        .map(|r| r.key_id.clone())
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "token": plaintext,
+            "key_id": key_id,
+            "key_prefix": decentraai_tokens::key_prefix(&plaintext),
+            "account": session.agent_id,
+            "wallet": session.wallet_address,
+            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
+            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "scopes": [],
+            "note": "shown once; only its hash and prefix are stored",
+        })),
+    )
+        .into_response()
 }
 
 /// GET /v1/auth/wallet/session — introspect the current wallet session.
@@ -3701,9 +3873,27 @@ async fn world_settle_check_handler(
                         drop(world);
                         settle_escrow_for_proof(&state, &proof_id, &tx_hash).await;
                         anchor_provider_trust(&state, &proof_id).await;
+                        // A1: Supernova correlation is additive evidence —
+                        // the confirm decision above stands on its own.
+                        let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
+                        // Persist the correlation on the proof (best-effort:
+                        // never fails the confirm, old proofs stay valid).
+                        if let Some(s) = &supernova {
+                            let detail = s
+                                .get("detail")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string());
+                            let fin = s.get("finality_reached").and_then(|v| v.as_bool());
+                            let seen = s.get("proof_seen").and_then(|v| v.as_bool());
+                            let mut world = state.world.lock().await;
+                            if world.record_supernova(&proof_id, detail, fin, seen).is_ok() {
+                                let path = crate::world::world_path_for(&state.info.repo_root);
+                                crate::world::save_world_state(&path, &world);
+                            }
+                        }
                         (
                             StatusCode::OK,
-                            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash})),
+                            Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "confirmed", "tx_hash": tx_hash, "supernova": supernova})),
                         )
                             .into_response()
                     }
@@ -3717,15 +3907,19 @@ async fn world_settle_check_handler(
                 let _ = world.fail_settlement(&proof_id, &format!("chain status: {status}"));
                 let path = crate::world::world_path_for(&state.info.repo_root);
                 crate::world::save_world_state(&path, &world);
+                drop(world);
+                let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
                 (
                     StatusCode::OK,
-                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "failed", "chain_status": status})),
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "failed", "chain_status": status, "supernova": supernova})),
                 )
                     .into_response()
             } else {
+                drop(world);
+                let supernova = mx_correlate_best_effort(&state, &tx_hash).await;
                 (
                     StatusCode::OK,
-                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "pending", "chain_status": status})),
+                    Json(serde_json::json!({"ok": true, "proof_id": proof_id, "status": "pending", "chain_status": status, "supernova": supernova})),
                 )
                     .into_response()
             }
@@ -3735,6 +3929,107 @@ async fn world_settle_check_handler(
             Json(serde_json::json!({"ok": false, "error": e})),
         )
             .into_response(),
+    }
+}
+
+/// GET /v1/mx/status — Supernova network snapshot (read-only).
+///
+/// Disabled observer → 404. No successful poll yet → `pending: true` with
+/// no snapshot (honest, not an empty object). Telemetry-safe: counters and
+/// ids only, never payloads.
+async fn mx_status_handler(State(state): State<ApiState>) -> Response {
+    let Some(obs) = &state.mx_observer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "mx observer disabled (mx_supernova section absent/off)"})),
+        )
+            .into_response();
+    };
+    match obs.last().await {
+        Some(snap) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "supernova": snap.details()})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "supernova": null, "pending": true})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/mx/track?hash=… — full lifecycle of one tx hash (read-only).
+///
+/// `not-indexed` 404s are normal under async execution (poll again);
+/// every other non-final outcome is 200 with an honest `detail` reason.
+async fn mx_track_handler(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(obs) = &state.mx_observer else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "mx observer disabled (mx_supernova section absent/off)"})),
+        )
+            .into_response();
+    };
+    let hash = params.get("hash").cloned().unwrap_or_default();
+    if hash.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "hash query param required"})),
+        )
+            .into_response();
+    }
+    match obs.track(&hash).await {
+        Ok(t) => {
+            let status = if t.detail == "not-indexed" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "tx_hash": t.tx_hash,
+                    "detail": t.detail,
+                    "status": t.tx.as_ref().map(|x| x.status.clone()),
+                    "execution": t.execution,
+                    "finality": t.finality,
+                    "explorer": format!("https://testnet-explorer.multiversx.com/transactions/{hash}"),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// A1 boundary: best-effort Supernova correlation for a submitted tx.
+///
+/// Returns a JSON object (or `None` when the observer is disabled or the
+/// lookup fails). NEVER fails the caller: the existing check decision
+/// stands on its own; this is additive evidence only.
+async fn mx_correlate_best_effort(state: &ApiState, tx_hash: &str) -> Option<serde_json::Value> {
+    let obs = state.mx_observer.as_ref()?;
+    if tx_hash.is_empty() {
+        return None;
+    }
+    match obs.track(tx_hash).await {
+        Ok(t) => Some(serde_json::json!({
+            "detail": t.detail,
+            "chain_status": t.tx.as_ref().map(|x| x.status.clone()),
+            "finality_reached": t.finality.finality_reached,
+            "proof_seen": t.finality.proof_seen,
+            "execution_valid": t.execution.as_ref().is_some_and(|e| e.is_valid()),
+        })),
+        Err(_) => None,
     }
 }
 
@@ -3876,6 +4171,37 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
         }
     }
 
+    // A1 completion: Supernova correlation for sweep-confirmed proofs.
+    // Same best-effort rule as the check path — never fails the sweep,
+    // short locks only, one bounded track per proof.
+    for proof_id in &confirmed {
+        let tx_hash = {
+            let world = state.world.lock().await;
+            world
+                .proofs
+                .iter()
+                .find(|p| &p.id == proof_id)
+                .map(|p| p.tx_hash.clone())
+                .unwrap_or_default()
+        };
+        if tx_hash.is_empty() {
+            continue;
+        }
+        if let Some(s) = mx_correlate_best_effort(&state, &tx_hash).await {
+            let detail = s
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let fin = s.get("finality_reached").and_then(|v| v.as_bool());
+            let seen = s.get("proof_seen").and_then(|v| v.as_bool());
+            let mut world = state.world.lock().await;
+            if world.record_supernova(proof_id, detail, fin, seen).is_ok() {
+                let path = crate::world::world_path_for(&state.info.repo_root);
+                crate::world::save_world_state(&path, &world);
+            }
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -3902,7 +4228,7 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
         Some(m) => m,
         None => return,
     };
-    let (wallet, evidence, capability, amount) = {
+    let (wallet, evidence, capability, amount, settlement) = {
         let world = state.world.lock().await;
         match world.proofs.iter().find(|p| p.id == proof_id) {
             Some(p) => {
@@ -3920,7 +4246,21 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
                 } else {
                     p.capability.clone()
                 };
-                (ew, p.evidence_hash.clone(), cap, p.amount)
+                // Economic-finality layer: when the proof carries a chain
+                // tx (submitted via the lane) plus Supernova observations,
+                // the anchor embeds them — trust with its settlement proof.
+                // Proofs without chain data anchor exactly as before.
+                let settlement = if p.tx_hash.is_empty() {
+                    None
+                } else {
+                    Some(decentraai_economy::trust_anchor::ChainSettlement {
+                        tx_hash: p.tx_hash.clone(),
+                        detail: p.supernova_detail.clone(),
+                        finality_reached: p.supernova_final.unwrap_or(false),
+                        proof_seen: p.supernova_proof_seen.unwrap_or(false),
+                    })
+                };
+                (ew, p.evidence_hash.clone(), cap, p.amount, settlement)
             }
             None => return,
         }
@@ -3934,6 +4274,7 @@ async fn anchor_provider_trust(state: &ApiState, proof_id: &str) {
         verified: true,
         micro_cu: amount,
         contract_id: escrow_id,
+        settlement,
     };
     let now = crate::m18::now_secs_public();
     if let Ok(mut trust) = m18.trust.lock() {
@@ -5485,6 +5826,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                             verified: true,
                             micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
                             contract_id: None,
+                            settlement: None,
                         };
                         let mut trust = m18.trust.lock().unwrap();
                         let _ = trust.record_anchor(&params, tick);
@@ -5639,6 +5981,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     verified: true,
                     micro_cu: per_member_cu,
                     contract_id: None,
+                    settlement: None,
                 };
                 let _ = trust.record_anchor(&params, now);
             }
@@ -6064,6 +6407,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     verified: true,
                     micro_cu: total_reward / outcome.team_members.len().max(1) as u64,
                     contract_id: None,
+                    settlement: None,
                 };
                 let mut trust = m18.trust.lock().unwrap();
                 let _ = trust.record_anchor(&params, tick);
@@ -6628,6 +6972,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                         verified: v,
                         micro_cu: cu,
                         contract_id: cid,
+                        settlement: None,
                     };
                     let mut trust = m18.trust.lock().unwrap();
                     match trust.record_anchor(&params, now) {
@@ -6962,6 +7307,103 @@ async fn orchestration_propose_resp(
         serde_json::to_string(&body).unwrap_or_default(),
     )
         .into_response()
+}
+
+/// N-of-M engine: handles `orchestrate_execute` — drives ONE stage through
+/// real execution (same origin authz as propose: gateway `orchestrate`
+/// capability or consumer `orchestrate`/`*` scope). The model is resolved
+/// to a hash, never guessed; settlement decisions are returned, never
+/// applied (no double credit — the live path's single credit stands).
+async fn orchestration_execute_resp(
+    state: &ApiState,
+    key_id: &str,
+    account: &str,
+    quota_ceiling: u64,
+    scopes: &[String],
+    params: crate::mcp::OrchestrateExecuteParams,
+) -> Response {
+    use decentraai_distributed::nofm_engine::{FabricExecutor, StageSpec, drive_stage};
+
+    let auth_ok = if key_id.starts_with("gk-") {
+        gateway_authorize(
+            state,
+            key_id,
+            "orchestrate",
+            decentraai_agents::gateway::OperationClass::Compute,
+        )
+        .is_ok()
+    } else {
+        scopes.iter().any(|s| s == "orchestrate" || s == "*")
+    };
+    if !auth_ok {
+        return forbidden("orchestrate grant required");
+    }
+    let Some(store) = state.orchestration_tasks.clone() else {
+        return forbidden("orchestration not attached");
+    };
+    let Some(distributed) = state.distributed.clone() else {
+        return forbidden("distributed inference not attached");
+    };
+    let Some(model_hash) = crate::api::fabric_intel::resolve_model_hash(state, &params.model).await
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": format!("model '{}' has no advertised hash on the fabric", params.model)})),
+        )
+            .into_response();
+    };
+    let spec = StageSpec {
+        plan_id: params.plan_id.clone(),
+        stage_id: params.stage_id.clone(),
+        capability: params.capability.clone(),
+        prompt: params.prompt.clone(),
+        model_hash,
+        max_tokens: params.max_tokens,
+        max_price: params.max_price,
+        requester: key_id.to_string(),
+        schema_json: params.schema_json.clone(),
+    };
+    let exec = FabricExecutor::new(&distributed);
+    // Quota first (same discipline as every mutating consumer path): no
+    // spendable quota, no execution. The guard settles on measured usage
+    // after a successful drive, releases on any other exit (RAII).
+    let request_id = format!("nofm:{}:{}:{}", params.plan_id, params.stage_id, key_id);
+    let mut guard = match state.reserve_consumer_quota(account, key_id, &request_id, quota_ceiling)
+    {
+        Some(g) => g,
+        None => return forbidden("no spendable quota for this consumer account"),
+    };
+    match drive_stage(&store, &exec, &spec).await {
+        Ok(out) => {
+            guard.settle(out.tokens_used as u64);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "plan_id": params.plan_id,
+                    "stage_id": params.stage_id,
+                    "verified": out.verified,
+                    "verify_detail": out.verify_detail,
+                    "worker": out.receipt.worker_node,
+                    "output": out.output,
+                    "tokens_used": out.tokens_used,
+                    "duration_ms": out.duration_ms,
+                    "consensus": out.consensus.as_ref().map(|c| serde_json::json!({
+                        "verdict": format!("{:?}", c.verdict),
+                        "outputs_count": c.outputs.len(),
+                    })),
+                    "settle": format!("{:?}", out.settle),
+                    "receipt": out.receipt,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// M17: handles `orchestrate_status` — ids and verdicts only, never prompts.
@@ -7881,6 +8323,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             verified: true,
                             micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
                             contract_id: None,
+                            settlement: None,
                         };
                         let mut trust = m18.trust.lock().unwrap();
                         let _ = trust.record_anchor(&params, tick);
@@ -8032,7 +8475,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                                 "decentraai_embeddings" => scopes.iter().any(|s| s == "embeddings"),
                                 "decentraai_compute_request" => !scopes.is_empty(),
                                 // M17: visible only with the explicit grant.
-                                "orchestrate_propose" | "orchestrate_status" => {
+                                "orchestrate_propose"
+                                | "orchestrate_status"
+                                | "orchestrate_execute" => {
                                     scopes.iter().any(|s| s == "orchestrate")
                                 }
                                 _ => false,
@@ -8079,7 +8524,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             name if name.starts_with("m18_") => {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
-                            "orchestrate_propose" | "orchestrate_status" => {
+                            "orchestrate_propose"
+                            | "orchestrate_status"
+                            | "orchestrate_execute" => {
                                 scopes.iter().any(|s| s == "orchestrate" || s == "*")
                             }
                             _ => true,
@@ -8770,6 +9217,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         return orchestration_propose_resp(state, key_id, scopes, &stages_v, total, cap).await;
     } else if let Some(plan_id) = crate::mcp::orchestrate_status_request(&raw) {
         return orchestration_status_resp(state, &plan_id);
+    } else if let Some(params) = crate::mcp::orchestrate_execute_request(&raw) {
+        return orchestration_execute_resp(state, key_id, account, *quota_ceiling, scopes, params)
+            .await;
     } else if crate::mcp::discover_capabilities_request(&raw) {
         // Agent onboarding: discover what this node offers and what scopes are needed.
         // Always available — no scope required.
@@ -8804,6 +9254,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 | "memory_read_entries"
                 | "memory_write_entry" => "memory",
                 "arena_state" | "arena_act" => "arena",
+                "orchestrate_propose" | "orchestrate_status" | "orchestrate_execute" => {
+                    "orchestrate"
+                }
                 _ => "none",
             };
             capabilities.insert(
@@ -23828,6 +24281,111 @@ mod tests {
         assert_eq!(r.status(), 200, "consumer may decide via MCP");
     }
 
+    /// Wallet login helper: challenge → sign with a fresh key → verify.
+    /// Returns `(wallet_address, session_token)`. Mirrors the xPortal flow
+    /// (arbitrary message bytes signed by the wallet key).
+    async fn wallet_session(api: SocketAddr) -> (String, String) {
+        use ed25519_dalek::SigningKey;
+        let client = reqwest::Client::new();
+        // Deterministic throwaway test key (no funds, no network, never real).
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        let chal: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/challenge"))
+            .json(&serde_json::json!({"wallet_address": wallet}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(chal["wallet_address"].as_str().unwrap(), wallet);
+        let message = chal["message"].as_str().unwrap();
+        let sig = signing.sign(message.as_bytes());
+        let login: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/verify"))
+            .json(&serde_json::json!({
+                "wallet_address": wallet,
+                "challenge_id": chal["challenge_id"].as_str().unwrap(),
+                "signature": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = login["session_token"].as_str().unwrap().to_string();
+        assert!(session.starts_with("wx_"));
+        (wallet, session)
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_then_mcp() {
+        // xPortal-style onboarding: login → self-issued dca_ key → MCP.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let (wallet, session) = wallet_session(api).await;
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(issued["ok"], true, "self-serve issuance works");
+        assert_eq!(issued["wallet"].as_str().unwrap(), wallet);
+        let token = issued["token"].as_str().unwrap().to_string();
+        assert!(token.starts_with("dca_"), "OpenAI-compatible fabric key");
+        assert!(!issued["key_id"].as_str().unwrap().is_empty());
+        // The self-issued key drives MCP planning like any consumer key.
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"decide","arguments":{"intent":"chat","prompt":"hi"}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "self-issued key reaches MCP");
+        // Second issuance for the same wallet refuses (no duplicate keys,
+        // plaintext shown exactly once).
+        let again = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 409);
+        let body: serde_json::Value = again.json().await.unwrap();
+        assert!(body["key_id"].as_str().unwrap().starts_with("ck-"));
+    }
+
+    #[tokio::test]
+    async fn wallet_self_serve_key_rejects_bad_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        for (payload, want) in [
+            (serde_json::json!({}), 400),
+            (serde_json::json!({"session_token": "wx_nope"}), 401),
+        ] {
+            let r = client
+                .post(format!("http://{api}/v1/auth/wallet/key"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), want);
+        }
+    }
+
     // ---- M16 gateway (dga_) consumption flow ------------------------------
 
     /// Gateway test state: funded `gw-account`, gateway store + section
@@ -24543,6 +25101,33 @@ mod tests {
             .json(&m17_propose_payload(serde_json::json!([
                 {"stage_id":"s1","capability":"chat","max_price":5}
             ])))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn nofm_execute_without_scope_denied() {
+        // Same gate as propose: execute needs the orchestrate scope.
+        // (With the scope but no attached engine the handler fails closed
+        //  at the model-resolution step, never at auth — auth is checked
+        //  first and independently here.)
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let key = make_consumer_key_with_scopes(api, "nofm-consumer", &["compute"]).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{api}/mcp"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"orchestrate_execute","arguments":{
+                    "plan_id":"p1","stage_id":"s1","capability":"chat",
+                    "prompt":"hi","model":"qwen.gguf",
+                    "max_tokens":16,"max_price":5
+                }}
+            }))
             .send()
             .await
             .unwrap();

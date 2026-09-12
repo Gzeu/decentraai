@@ -672,14 +672,20 @@ mod tests {
         // conversational, so no Chat claim at all.
         let caps = classify(None, &tags(&[]), "Qwen3-0.6B-Q8_0.gguf");
         assert!(
-            !caps.claims.iter().any(|c| c.capability == CapabilityKind::Chat),
+            !caps
+                .claims
+                .iter()
+                .any(|c| c.capability == CapabilityKind::Chat),
             "claims: {:?}",
             caps.claims
         );
         // And the boundary-aware `-it` check must not fire on ordinary words.
         let caps = classify(None, &tags(&[]), "org/smith-weights");
         assert!(
-            !caps.claims.iter().any(|c| c.capability == CapabilityKind::Chat),
+            !caps
+                .claims
+                .iter()
+                .any(|c| c.capability == CapabilityKind::Chat),
             "claims: {:?}",
             caps.claims
         );

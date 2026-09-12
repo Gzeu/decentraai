@@ -139,6 +139,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .badge.faint{background:rgba(255,255,255,.05);color:var(--muted)}
 .badge.remote{background:rgba(139,92,246,.16);color:var(--remote)}
 .badge.local{background:rgba(52,211,153,.10);color:var(--ok)}
+.badge.perchance{background:rgba(251,146,60,.16);color:#fb923c}
 /* provenance badges — compact, lowercase, letter-spaced; distinct from status */
 .badge.pv{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:1px 7px;border:1px solid transparent;font-weight:700}
 .badge.pv.ok{color:var(--ok);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.06)}
@@ -1665,6 +1666,7 @@ const currentModel = () => {
   const v = chatModel.value || '';
   if (v === '__auto__') return 'auto';
   if (v.startsWith('remote:')) { const i = v.indexOf(':', 7); return v.slice(i + 1); }
+  if (v === 'perchance') return 'perchance:gzeu';
   return v || activeModel;
 };
 // The node the user pinned for chat (__auto__ = fabric best, local = this node,
@@ -1752,43 +1754,48 @@ const sendChat = async (prompt) => {
   chatStatus.textContent = 'routing & generating…';
   const t0 = performance.now();
   try {
-    const sel = chatModel.value || '';
-    let workerHint = pinnedNode();
-    // Backward-compatible: an explicit remote:<node>:<file> model also pins a node.
-    if (!workerHint && sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
-    const body = JSON.stringify({ model: currentModel(), messages: hist, stream, conversation_id: currentSessionId, ...(workerHint ? { worker_hint: workerHint } : {}) });
-    const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
-    // A 401 here means the stored token is wrong for THIS node (or missing).
-    // Surface it immediately with the fix, instead of a bare API error string.
-    if (r.status === 401) {
-      addMsg('node', 'error: missing or invalid API token — use "change token" (top right) and paste the master token or dca_ key for THIS node.');
-      chatStatus.textContent = 'unauthorized';
-      toast('invalid or missing token', true);
-      openLoginOverlay();
-      return;
-    }
-    const servedEl = $('chat-served');
-    let servedOrigin = '', servedNode = '';
-    if (servedEl) {
-      const origin = r.headers.get('x-decentra-origin') || '';
-      const worker = r.headers.get('x-decentra-worker') || '';
-      const node = r.headers.get('x-decentra-node') || '';
-      servedOrigin = origin; servedNode = node || worker;
-      if (origin === 'remote') {
-        servedEl.textContent = 'served by ' + servedNode + ' · remote';
-        servedEl.className = 'badge remote';
-      } else if (origin === 'local') {
-        servedEl.textContent = 'served locally' + (servedNode ? ' · ' + servedNode : '');
-        servedEl.className = 'badge local';
-      } else {
-        servedEl.textContent = '';
-      }
-    }
-    // Per-message provenance: which node + model actually produced THIS reply.
-    const prov =
-      servedOrigin === 'remote' ? '· served by ' + (servedNode || 'remote worker')
-      : servedOrigin === 'local' ? '· served locally'
-      : '';
+     const sel = chatModel.value || '';
+     let workerHint = pinnedNode();
+     // Backward-compatible: an explicit remote:<node>:<file> model also pins a node.
+     if (!workerHint && sel.startsWith('remote:')) { const i = sel.indexOf(':', 7); workerHint = sel.slice(7, i); }
+     const body = JSON.stringify({ model: currentModel(), messages: hist, stream, conversation_id: currentSessionId, ...(workerHint ? { worker_hint: workerHint } : {}) });
+     const r = await fetch('/v1/chat/completions', { method: 'POST', headers, body, signal: controller.signal });
+     // A 401 here means the stored token is wrong for THIS node (or missing).
+     // Surface it immediately with the fix, instead of a bare API error string.
+     if (r.status === 401) {
+       addMsg('node', 'error: missing or invalid API token — use "change token" (top right) and paste the master token or dca_ key for THIS node.');
+       chatStatus.textContent = 'unauthorized';
+       toast('invalid or missing token', true);
+       openLoginOverlay();
+       return;
+     }
+     const servedEl = $('chat-served');
+     let servedOrigin = '', servedNode = '';
+     if (servedEl) {
+       const origin = r.headers.get('x-decentra-origin') || '';
+       const worker = r.headers.get('x-decentra-worker') || '';
+       const node = r.headers.get('x-decentra-node') || '';
+       servedOrigin = origin; servedNode = node || worker;
+       if (isPerchance) {
+         servedEl.textContent = 'perchance:gzeu';
+         servedEl.className = 'badge perchance';
+       } else if (origin === 'remote') {
+         servedEl.textContent = 'served by ' + servedNode + ' · remote';
+         servedEl.className = 'badge remote';
+       } else if (origin === 'local') {
+         servedEl.textContent = 'served locally' + (servedNode ? ' · ' + servedNode : '');
+         servedEl.className = 'badge local';
+       } else {
+         servedEl.textContent = '';
+       }
+     }
+     // Per-message provenance: which node + model actually produced THIS reply.
+     const isPerchance = currentModel() === 'perchance:gzeu';
+     const prov =
+       isPerchance ? '· Perchance AI · model: perchance:gzeu'
+       : servedOrigin === 'remote' ? '· served by ' + (servedNode || 'remote worker')
+       : servedOrigin === 'local' ? '· served locally'
+       : '';
     let answer = '', tokens = null;
     if (stream && r.ok && r.body) { const out = await readSse(r, prov); answer = out.text; tokens = out.tokens; if (out.streamError) { addMsg('node', '(stream error: ' + out.streamError + ')'); } }
     else {
@@ -5206,6 +5213,15 @@ const populateChatModels = (s, c, force) => {
   auto.value = '__auto__';
   auto.textContent = 'Auto (best available)';
   chatModel.appendChild(auto);
+  // Perchance AI model — routes through the fabric's external
+  // intelligence provider (OpenAiCompatProvider) for AI-generated
+  // responses. Requires DECENTRAAI_EXTERNAL_KEY to be set.
+  if (filter === '__auto__' || filter === 'local') {
+    const perchance = document.createElement('option');
+    perchance.value = 'perchance';
+    perchance.textContent = 'perchance:gzeu';
+    chatModel.appendChild(perchance);
+  }
   // Local models only when the filter is auto or local. The local engine
   // serves exactly ONE model (the active one); listing the whole registry
   // here would offer files that cannot be served and the proxy would

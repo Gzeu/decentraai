@@ -3,7 +3,7 @@
   "local_api": {
     "endpoint": "http://localhost:8080/v1/chat/completions",
     "models_endpoint": "http://localhost:8080/v1/models",
-    "api_key": "dsk_REDACTED-rotated-2026-09-12",
+    "api_key": "REDACTED-set-via-env-never-commit",
     "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
     "default_model": "qwen2.5-3b-instruct-q4_k_m.gguf",
     "fallback_model": "qwen2.5-0.5b-instruct-q8_0.gguf",
@@ -30,7 +30,7 @@
     "perchance_integration": {
       "setup": "Perchance project settings → AI Plugins → Add OpenAI-compatible endpoint",
       "endpoint_url": "http://localhost:8080/v1/chat/completions",
-      "api_key": "dsk_REDACTED-rotated-2026-09-12",
+      "api_key": "REDACTED-set-via-env-never-commit",
       "model_name": "qwen2.5-3b-instruct-q4_k_m.gguf",
       "note": "Perchance runs in browser on your laptop, so localhost:8080 is accessible"
     }

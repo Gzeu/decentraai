@@ -12,6 +12,7 @@ fn request() -> BackendRequest {
         max_tokens: 8,
         temperature: 0.7,
         top_p: 0.9,
+        tools: None,
     }
 }
 
@@ -46,6 +47,82 @@ async fn complete_maps_openai_response() {
     let response = backend.complete(request()).await.unwrap();
     assert_eq!(response.output, "hello back");
     assert_eq!(response.tokens_used, Some(2));
+    completion.assert_async().await;
+}
+
+#[tokio::test]
+async fn complete_forwards_tools_and_parses_tool_calls() {
+    let server = MockServer::start_async().await;
+    let completion = server.mock_async(|when, then| { when.method(POST).path("/v1/chat/completions").body_includes("\"tools\""); then.status(200).json_body(serde_json::json!({"choices": [{"message": {"content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"df -h\"}"}}]}, "finish_reason": "tool_calls"}], "usage": {"completion_tokens": 5}})); }).await;
+    let backend = OpenAiCompatibleBackend::new(BackendConfig {
+        base_url: server.base_url(),
+        model: "test-model".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut req = request();
+    req.tools = Some(serde_json::json!([{"type": "function", "function": {"name": "bash"}}]));
+    let response = backend.complete(req).await.unwrap();
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.tokens_used, Some(5));
+    let calls = response.tool_calls.expect("tool_calls parsed");
+    assert!(calls.to_string().contains("bash"));
+    completion.assert_async().await;
+}
+
+#[tokio::test]
+async fn complete_plain_chat_shape_unchanged() {
+    let server = MockServer::start_async().await;
+    let completion = server.mock_async(|when, then| { when.method(POST).path("/v1/chat/completions"); then.status(200).json_body(serde_json::json!({"choices": [{"message": {"content": "plain"}, "finish_reason": "stop"}]})); }).await;
+    let backend = OpenAiCompatibleBackend::new(BackendConfig {
+        base_url: server.base_url(),
+        ..Default::default()
+    })
+    .unwrap();
+    let response = backend.complete(request()).await.unwrap();
+    assert_eq!(response.output, "plain");
+    assert!(response.tool_calls.is_none());
+    completion.assert_async().await;
+}
+
+#[tokio::test]
+async fn stream_passes_through_tool_calls_chunks() {
+    let server = MockServer::start_async().await;
+    let stream_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let completion = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(stream_body);
+        })
+        .await;
+    let backend = OpenAiCompatibleBackend::new(BackendConfig {
+        base_url: server.base_url(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut req = request();
+    req.tools = Some(serde_json::json!([{"type": "function", "function": {"name": "bash"}}]));
+    let mut stream = backend.stream(req).await.unwrap();
+    let mut saw_tools = false;
+    let mut finishes = vec![];
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        if chunk.tool_calls.is_some() {
+            saw_tools = true;
+        }
+        if let Some(f) = chunk.finish_reason {
+            finishes.push(f);
+        }
+    }
+    assert!(saw_tools, "tool_calls chunk passes through");
+    assert!(finishes.contains(&"tool_calls".to_string()));
     completion.assert_async().await;
 }
 

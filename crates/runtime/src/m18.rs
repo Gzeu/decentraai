@@ -549,6 +549,7 @@ pub async fn trust_record_handler(
         verified: req.verified,
         micro_cu: req.micro_cu,
         contract_id: req.contract_id,
+        settlement: None,
     };
     let mut trust = m18.trust.lock().unwrap();
     match trust.record_anchor(&params, now) {

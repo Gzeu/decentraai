@@ -91,6 +91,11 @@ pub struct NodeConfig {
     /// legacy `DECENTRAAI_MEMORY_PROPAGATE` env var.
     #[serde(default)]
     pub memory_sync: Option<MemorySyncSection>,
+    /// MultiversX Supernova observer (O1). Absent = disabled; `/v1/mx/*`
+    /// returns 404 and no Proxy traffic happens. Read-only: this section
+    /// can never authorize submission (the testnet lane owns that).
+    #[serde(default)]
+    pub mx_supernova: Option<MxSupernovaSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1295,6 +1300,123 @@ impl Default for MemorySyncSection {
     }
 }
 
+/// MultiversX Supernova observer (O1): read-only Proxy polling that feeds
+/// `GET /v1/mx/*`. Absent/disabled = zero Proxy traffic, endpoints 404.
+/// This section CANNOT authorize submission — the bounded testnet lane
+/// (`settlement_tx` + world settle handlers) owns every live effect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MxSupernovaSection {
+    /// Master switch. Default false: zero behavior change when absent/off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Proxy base URL (default the public testnet API — public data, no
+    /// secret). Any `http(s)` URL is accepted so devnet/local proxies work;
+    /// mainnet read-only observing uses `https://api.multiversx.com` with
+    /// `chain_id: "1"` below. Observing is always read-only — submission
+    /// stays on the testnet lane regardless of this URL.
+    #[serde(default = "default_mx_api_base")]
+    pub api_base: String,
+    /// Shard polled for the periodic snapshot (default 2 = operator lane).
+    #[serde(default = "default_mx_shard")]
+    pub shard: u32,
+    /// Snapshot poll interval in seconds (10..3600, default 30).
+    #[serde(default = "default_mx_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Per-request timeout in ms (1..120000, default 10000).
+    #[serde(default = "default_mx_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Per-response byte cap (default 256KiB).
+    #[serde(default = "default_mx_max_bytes")]
+    pub max_bytes: usize,
+    /// Pinned `SupernovaEnableEpoch` for the observed network (official
+    /// `enableEpochs.toml`; v2.0.8 template default 2). Absent = verdict
+    /// stays inactive (fail-closed). Round timing is never a substitute.
+    #[serde(default)]
+    pub enable_epoch: Option<u64>,
+    /// Pinned `SupernovaEnableRound` (`enableRounds.toml /
+    /// [RoundActivations.SupernovaEnableRound]`; v2.0.8 template default
+    /// 440). Both thresholds are required for an active verdict.
+    #[serde(default)]
+    pub enable_round: Option<u64>,
+    /// Expected chain id (default `T`; `"1"` observes mainnet read-only).
+    /// Mismatch fails closed at runtime. Mainnet observing is safe by
+    /// construction: this section cannot authorize submission anywhere.
+    #[serde(default = "default_mx_chain_id")]
+    pub chain_id: String,
+}
+
+fn default_mx_api_base() -> String {
+    "https://testnet-api.multiversx.com".to_string()
+}
+
+fn default_mx_shard() -> u32 {
+    2
+}
+
+fn default_mx_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_mx_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_mx_max_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_mx_chain_id() -> String {
+    "T".to_string()
+}
+
+impl MxSupernovaSection {
+    /// Boot-time sanity. Every rule has a test below.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.api_base.starts_with("http://") || self.api_base.starts_with("https://")) {
+            return Err("mx_supernova.api_base must be http(s)".into());
+        }
+        if self.poll_interval_secs < 10 || self.poll_interval_secs > 3600 {
+            return Err(format!(
+                "mx_supernova.poll_interval_secs must be 10..=3600, got {}",
+                self.poll_interval_secs
+            ));
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > 120_000 {
+            return Err(format!(
+                "mx_supernova.timeout_ms must be 1..=120000, got {}",
+                self.timeout_ms
+            ));
+        }
+        if self.max_bytes == 0 || self.max_bytes > 8 * 1024 * 1024 {
+            return Err(format!(
+                "mx_supernova.max_bytes must be 1..=8388608, got {}",
+                self.max_bytes
+            ));
+        }
+        if self.chain_id.trim().is_empty() {
+            return Err("mx_supernova.chain_id must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for MxSupernovaSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_mx_api_base(),
+            shard: default_mx_shard(),
+            poll_interval_secs: default_mx_poll_interval_secs(),
+            timeout_ms: default_mx_timeout_ms(),
+            max_bytes: default_mx_max_bytes(),
+            enable_epoch: None,
+            enable_round: None,
+            chain_id: default_mx_chain_id(),
+        }
+    }
+}
+
 impl NodeConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)?;
@@ -1351,6 +1473,10 @@ impl NodeConfig {
         if let Some(ms) = &self.memory_sync {
             ms.validate()
                 .map_err(|e| ConfigError::Validation(format!("memory_sync: {e}")))?;
+        }
+        if let Some(mx) = &self.mx_supernova {
+            mx.validate()
+                .map_err(|e| ConfigError::Validation(format!("mx_supernova: {e}")))?;
         }
         if self.network.max_connections == 0 {
             return Err(ConfigError::Validation(
@@ -2344,6 +2470,54 @@ security:
     fn dcai_unknown_field_is_rejected() {
         let yaml = "token_identifier: DCAI-a1b2c3\nchain_id: T\ntotken: 1\n";
         let result: Result<DcaiSection, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    /// `mx_supernova:` absent = all-disabled defaults; validation is
+    /// bounds-only (this section can never authorize submission).
+    #[test]
+    fn mx_supernova_defaults_disabled_and_valid() {
+        let section: MxSupernovaSection = serde_yaml::from_str("{}").unwrap();
+        assert!(!section.enabled);
+        assert_eq!(section.chain_id, "T");
+        assert_eq!(section.poll_interval_secs, 30);
+        assert!(section.validate().is_ok());
+    }
+
+    #[test]
+    fn mx_supernova_bounds_fail_closed() {
+        let mut ok = MxSupernovaSection::default();
+        assert!(ok.validate().is_ok());
+        let bad_base = MxSupernovaSection {
+            api_base: "ftp://x".into(),
+            ..ok.clone()
+        };
+        assert!(bad_base.validate().is_err());
+        for secs in [0, 9, 3601] {
+            let bad = MxSupernovaSection {
+                poll_interval_secs: secs,
+                ..ok.clone()
+            };
+            assert!(bad.validate().is_err(), "poll {secs} must fail");
+        }
+        let bad_chain = MxSupernovaSection {
+            chain_id: "  ".into(),
+            ..ok.clone()
+        };
+        assert!(bad_chain.validate().is_err());
+        let bad_bytes = MxSupernovaSection {
+            max_bytes: 0,
+            ..ok.clone()
+        };
+        assert!(bad_bytes.validate().is_err());
+        let _ = &mut ok;
+    }
+
+    /// Unknown fields inside `mx_supernova:` are a config typo.
+    #[test]
+    fn mx_supernova_unknown_field_is_rejected() {
+        let yaml = "enabled: true\napi_bass: https://x\n";
+        let result: Result<MxSupernovaSection, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
     }
 }

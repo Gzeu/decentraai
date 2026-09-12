@@ -82,7 +82,7 @@ impl std::error::Error for PlanError {}
 /// Closed-schema mirror of [`TaskPlan`] used for deserialization.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawPlan {
+pub struct RawPlan {
     intent: String,
     capabilities: Vec<RawCapability>,
     workflow: Vec<String>,
@@ -91,7 +91,7 @@ struct RawPlan {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCapability {
+pub struct RawCapability {
     name: String,
     #[serde(default = "default_true")]
     required: bool,

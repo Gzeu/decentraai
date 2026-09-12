@@ -427,6 +427,7 @@ pub fn trust_anchor_for_work(
         verified: quality_score >= 80, // Auto-verify high quality
         micro_cu,
         contract_id,
+        settlement: None,
     }
 }
 

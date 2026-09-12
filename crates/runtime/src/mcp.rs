@@ -797,6 +797,26 @@ pub fn all_tools() -> Vec<ToolDef> {
         annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
+            name: "orchestrate_execute",
+            description: "N-of-M engine (N=1 milestone): drive ONE proposed-shape stage through real execution — assign, claim, run on the fabric's existing inference engine, structurally verify the real output, record the replica vote, resolve single-replica verification, decide settlement, return a compute receipt. Requires the `orchestrate` scope/capability grant (same gate as propose). Inference never moves: execution is the existing route_request; this tool only walks the verification states around it. Settlement decisions are returned, never applied here (no double credit).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string", "maxLength": 128 },
+                    "stage_id": { "type": "string", "maxLength": 128 },
+                    "capability": { "type": "string", "maxLength": 128, "description": "Hub taxonomy name (record vocabulary)" },
+                    "prompt": { "type": "string", "maxLength": 8000 },
+                    "model": { "type": "string", "maxLength": 256, "description": "Served model file name (resolved to a hash; never guessed)" },
+                    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 4096 },
+                    "max_price": { "type": "integer", "minimum": 0, "maximum": 10000 },
+                    "schema_json": { "type": "string", "maxLength": 2000, "description": "Optional JSON-schema hint for structural verification" }
+                },
+                "required": ["plan_id", "stage_id", "capability", "prompt", "model", "max_price"],
+                "additionalProperties": false
+            }),
+        annotations: ToolAnnotations::open_world(),
+        },
+        ToolDef {
             name: "agent_memory_read",
             description: "Read own personal memory (Identity, Goals, Capabilities, People, Tasks, Relationships, Experiences, Decisions, Lessons). Requires memory scope.",
             input_schema: json!({
@@ -2208,6 +2228,72 @@ pub fn orchestrate_status_request(raw: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty() && s.len() <= 128)
         .map(str::to_string)
+}
+
+/// N-of-M engine: validated parameters for one `orchestrate_execute` call.
+/// Closed schema — malformed calls return `None`, never a partial spec.
+#[derive(Debug, Clone)]
+pub struct OrchestrateExecuteParams {
+    pub plan_id: String,
+    pub stage_id: String,
+    pub capability: String,
+    pub prompt: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub max_price: u64,
+    pub schema_json: Option<String>,
+}
+
+fn bounded_id(v: &serde_json::Value) -> Option<String> {
+    v.as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(str::to_string)
+}
+
+/// N-of-M engine: extract `orchestrate_execute` parameters.
+pub fn orchestrate_execute_request(raw: &str) -> Option<OrchestrateExecuteParams> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    if msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?
+        != "orchestrate_execute"
+    {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let str_field = |k: &str, max: usize| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= max)
+            .map(str::to_string)
+    };
+    let max_tokens = args
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .filter(|n| (1..=4096).contains(n))
+        .unwrap_or(64) as u32;
+    let max_price = args.get("max_price").and_then(|v| v.as_u64())?;
+    if max_price > 10000 {
+        return None;
+    }
+    Some(OrchestrateExecuteParams {
+        plan_id: bounded_id(args.get("plan_id")?)?,
+        stage_id: bounded_id(args.get("stage_id")?)?,
+        capability: str_field("capability", 128)?,
+        prompt: str_field("prompt", 8000)?,
+        model: str_field("model", 256)?,
+        max_tokens,
+        max_price,
+        schema_json: args
+            .get("schema_json")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= 2000)
+            .map(str::to_string),
+    })
 }
 
 /// Pure, deterministic intent → capability → local-model resolution.
@@ -3640,5 +3726,54 @@ mod tests {
         let c = ctx(); // diffusion_action defaults to json!({})
         let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"test"}}}"#).unwrap();
         assert_eq!(r["result"]["content"][0]["text"], "{}");
+    }
+
+    fn execute_call(args: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "orchestrate_execute", "arguments": args},
+        })
+        .to_string()
+    }
+
+    fn valid_args() -> serde_json::Value {
+        serde_json::json!({
+            "plan_id": "p1", "stage_id": "s1", "capability": "chat",
+            "prompt": "hi", "model": "qwen.gguf",
+            "max_tokens": 64, "max_price": 100,
+        })
+    }
+
+    #[test]
+    fn orchestrate_execute_parses_closed_schema() {
+        let p = orchestrate_execute_request(&execute_call(valid_args())).expect("parses");
+        assert_eq!(
+            (p.plan_id, p.stage_id),
+            ("p1".to_string(), "s1".to_string())
+        );
+        assert_eq!(p.max_tokens, 64);
+        assert!(p.schema_json.is_none());
+    }
+
+    #[test]
+    fn orchestrate_execute_rejects_malformed() {
+        // Wrong tool name.
+        assert!(orchestrate_execute_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"decide","arguments":{}}}"#
+        )
+        .is_none());
+        // Missing required field.
+        let mut bad = valid_args();
+        bad.as_object_mut().unwrap().remove("prompt");
+        assert!(orchestrate_execute_request(&execute_call(bad)).is_none());
+        // Over bounds.
+        let mut big = valid_args();
+        big["max_price"] = serde_json::json!(99999);
+        assert!(orchestrate_execute_request(&execute_call(big)).is_none());
+        let mut big2 = valid_args();
+        big2["plan_id"] = serde_json::json!("x".repeat(200));
+        assert!(orchestrate_execute_request(&execute_call(big2)).is_none());
+        // Not JSON at all.
+        assert!(orchestrate_execute_request("nope").is_none());
     }
 }
