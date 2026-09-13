@@ -1028,6 +1028,46 @@ impl ApiState {
         Ok(challenge)
     }
 
+    fn wallet_native_login(
+        &self,
+        req: crate::wallet_auth::WalletNativeAuthRequest,
+    ) -> Result<WalletLoginResponse, crate::wallet_auth::WalletAuthError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut store = self.wallet_auth.lock().unwrap();
+        let login = store.verify_native_auth(req, now)?;
+        let _ = store.save(&self.wallet_auth_path);
+        drop(store);
+        if let Some(pm) = &self.personal_memory {
+            let agent_id = login.agent_id.clone();
+            let wallet_address = login.wallet_address.clone();
+            let display_name = login.display_name.clone();
+            let verified_at = now;
+            let pm = pm.clone();
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                let _ = handle.block_on(async move {
+                    let _ = pm
+                        .write_entry(&agent_id, |memory| {
+                            update_identity_memory_frontmatter(
+                                &mut memory.identity,
+                                &wallet_address,
+                                &agent_id,
+                                display_name.as_deref(),
+                                verified_at,
+                            );
+                            Ok(())
+                        })
+                        .await;
+                    Ok::<(), ()>(())
+                });
+            });
+        }
+        Ok(login)
+    }
+
     fn presented_token(headers: &HeaderMap) -> Option<&str> {
         headers
             .get(header::AUTHORIZATION)
@@ -1637,6 +1677,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/world/skill.md", get(world_skill_handler))
         .route("/v1/auth/wallet/challenge", post(wallet_challenge_handler))
         .route("/v1/auth/wallet/network", get(wallet_network_handler))
+        .route("/v1/auth/wallet/native-auth", post(wallet_native_auth_handler))
+        .route("/v1/auth/wallet/blockhash", get(wallet_blockhash_handler))
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
         .route("/v1/auth/wallet/key", post(wallet_key_handler).delete(wallet_key_revoke_handler))
@@ -2326,6 +2368,99 @@ async fn wallet_verify_handler(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/auth/wallet/native-auth — official MultiversX wallet login.
+///
+/// Body: `{wallet_address, token, signature[, agent_id, display_name]}` where
+/// token = `b64url(origin).blockhash.ttl.b64url(extra)` and the wallet signed
+/// `address + token`. Issues the SAME session shape as the challenge flow —
+/// key issuance, rotation, quota seeding and audit downstream are shared.
+async fn wallet_native_auth_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let req = match serde_json::from_value::<crate::wallet_auth::WalletNativeAuthRequest>(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid request: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    match state.wallet_native_login(req) {
+        Ok(login) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&login).unwrap_or_else(|_| "{}".to_string()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/auth/wallet/blockhash?network=testnet|mainnet — latest block hash
+/// from the public MultiversX API, for building native-auth tokens
+/// client-side. Read-only; no auth required.
+async fn wallet_blockhash_handler(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let base = match params.get("network").map(|s| s.as_str()) {
+        Some("mainnet") => "https://api.multiversx.com",
+        Some("testnet") => "https://testnet-api.multiversx.com",
+        Some("devnet") => "https://devnet-api.multiversx.com",
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "network must be testnet|mainnet|devnet"})),
+            )
+                .into_response();
+        }
+    };
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": "http client unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    let resp = client
+        .get(format!("{base}/blocks?size=1&fields=hash"))
+        .send()
+        .await
+        .ok();
+    let mut hash: Option<String> = None;
+    if let Some(r) = resp {
+        if let Ok(j) = r.json::<serde_json::Value>().await {
+            hash = j
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("hash"))
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    match hash {
+        Some(h) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "network": params.get("network"), "hash": h})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": "chain API unreachable"})),
         )
             .into_response(),
     }
@@ -24396,8 +24531,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_network_reports_chain_binding() {
-        // Public, no session: the /account badge reads this on page load.
+    async fn wallet_native_auth_issues_session_and_key() {
+        // Official flow shape end-to-end: token + addr+token signature
+        // → live session → self-issued dca_ key (same downstream as verify).
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!(
+            "{}.{}.{}.{}",
+            b64.encode("https://decentraai.duckdns.org"),
+            "cd".repeat(32),
+            600,
+            b64.encode(r#"{"app":"t"}"#)
+        );
+        let sig = signing.sign(format!("{wallet}{token}").as_bytes());
+        let login: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/native-auth"))
+            .json(&serde_json::json!({
+                "wallet_address": wallet,
+                "token": token,
+                "signature": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = login["session_token"].as_str().unwrap().to_string();
+        assert!(session.starts_with("wx_"), "native-auth yields session");
+        assert_eq!(login["wallet_address"].as_str().unwrap(), wallet);
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/wallet/key"))
+            .json(&serde_json::json!({"session_token": session}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(issued["ok"], true);
+        assert!(issued["token"].as_str().unwrap().starts_with("dca_"));
+        // Replay of the same token is refused even with a valid signature.
+        let again = client
+            .post(format!("http://{api}/v1/auth/wallet/native-auth"))
+            .json(&serde_json::json!({
+                "wallet_address": wallet,
+                "token": token,
+                "signature": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn wallet_network_reports_chain_binding() {        // Public, no session: the /account badge reads this on page load.
         let dir = tempfile::tempdir().unwrap();
         let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
         let client = reqwest::Client::new();

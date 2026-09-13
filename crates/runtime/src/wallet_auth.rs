@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 const DEFAULT_NETWORK: &str = "multiversx-testnet";
 const CHALLENGE_TTL_SECS: u64 = 300;
 const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+/// Native-auth token TTL bounds (seconds): prevents forever-tokens.
+const NATIVE_AUTH_MIN_TTL: u64 = 60;
+const NATIVE_AUTH_MAX_TTL: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletIdentityBinding {
@@ -55,6 +58,9 @@ pub struct WalletAuthStore {
     pub bindings: BTreeMap<String, WalletIdentityBinding>,
     pub challenges: BTreeMap<String, WalletChallengeRecord>,
     pub sessions: BTreeMap<String, WalletSessionRecord>,
+    /// Consumed native-auth tokens (token → used_at): one-time use, no replay.
+    #[serde(default)]
+    pub used_tokens: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +89,20 @@ pub struct WalletChallengeResponse {
 pub struct WalletVerifyRequest {
     pub wallet_address: String,
     pub challenge_id: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Native-auth login request (official MultiversX wallet flow).
+/// Token: `b64url(origin).blockhash.ttl.b64url(extra)`; the wallet signs
+/// `address + token` and the server verifies with the address key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletNativeAuthRequest {
+    pub wallet_address: String,
+    pub token: String,
     pub signature: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -126,6 +146,14 @@ pub enum WalletAuthError {
     SessionExpired,
     #[error("wallet binding conflict")]
     BindingConflict,
+    #[error("malformed native-auth token")]
+    MalformedToken,
+    #[error("native-auth origin not allowed")]
+    OriginNotAllowed,
+    #[error("native-auth token expired or ttl out of range")]
+    TokenExpired,
+    #[error("native-auth token already used")]
+    TokenReplay,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -134,6 +162,25 @@ pub enum WalletAuthError {
 
 pub(crate) fn network_name() -> String {
     std::env::var("DECENTRAAI_MX_NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.to_string())
+}
+
+/// Origins allowed to mint native-auth tokens (exact match on the token's
+/// decoded origin). Comma-separated override via DECENTRAAI_AUTH_ORIGINS.
+pub(crate) fn auth_origins() -> Vec<String> {
+    std::env::var("DECENTRAAI_AUTH_ORIGINS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            vec![
+                "https://decentraai.duckdns.org".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+                "http://localhost:8080".to_string(),
+            ]
+        })
 }
 
 #[allow(dead_code)]
@@ -246,6 +293,8 @@ impl WalletAuthStore {
         self.challenges
             .retain(|_, c| c.expires_at > now && c.used_at.is_none());
         self.sessions.retain(|_, s| s.expires_at > now);
+        self.used_tokens
+            .retain(|_, used_at| *used_at + SESSION_TTL_SECS > now);
     }
 
     pub fn issue_challenge(
@@ -387,6 +436,122 @@ impl WalletAuthStore {
         })
     }
 
+    /// Verify a native-auth login token (official MultiversX wallet flow).
+    ///
+    /// Token: `b64url(origin).blockhash.ttl.b64url(extra)`; the wallet signs
+    /// `address + token`. Checks, all fail-closed: well-formed address and
+    /// token shape, 64-hex blockhash, ttl in range, origin allow-listed,
+    /// signature verifies, token never used before. On success it issues the
+    /// same session shape as the challenge flow, so key issuance and rotation
+    /// downstream are shared.
+    pub fn verify_native_auth(
+        &mut self,
+        req: WalletNativeAuthRequest,
+        now: u64,
+    ) -> Result<WalletLoginResponse, WalletAuthError> {
+        self.cleanup(now);
+        let wallet_bytes = validate_wallet_address(&req.wallet_address)?;
+        let canonical_address = encode_wallet_address(&wallet_bytes)?;
+        let parts: Vec<&str> = req.token.split('.').collect();
+        if parts.len() != 4
+            || parts.iter().any(|p| p.is_empty())
+            || parts[1].len() != 64
+            || !parts[1].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(WalletAuthError::MalformedToken);
+        }
+        let ttl: u64 = parts[2]
+            .parse()
+            .map_err(|_| WalletAuthError::MalformedToken)?;
+        if !(NATIVE_AUTH_MIN_TTL..=NATIVE_AUTH_MAX_TTL).contains(&ttl) {
+            return Err(WalletAuthError::TokenExpired);
+        }
+        let origin = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|_| WalletAuthError::MalformedToken)?;
+        let origin = String::from_utf8(origin).map_err(|_| WalletAuthError::MalformedToken)?;
+        if !auth_origins().iter().any(|o| o == &origin) {
+            return Err(WalletAuthError::OriginNotAllowed);
+        }
+        let extra = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[3])
+            .map_err(|_| WalletAuthError::MalformedToken)?;
+        let _: serde_json::Value =
+            serde_json::from_slice(&extra).map_err(|_| WalletAuthError::MalformedToken)?;
+        // One-time use: same token twice is a replay, even with a valid sig.
+        if self.used_tokens.contains_key(&req.token) {
+            return Err(WalletAuthError::TokenReplay);
+        }
+        let sig_bytes = decode_signature(&req.signature)?;
+        let sig = Signature::from_bytes(&sig_bytes);
+        let pk = VerifyingKey::from_bytes(&wallet_bytes)
+            .map_err(|_| WalletAuthError::SignatureInvalid)?;
+        let signed = format!("{}{}", canonical_address, req.token);
+        pk.verify(signed.as_bytes(), &sig)
+            .map_err(|_| WalletAuthError::SignatureInvalid)?;
+        self.used_tokens.insert(req.token.clone(), now);
+
+        let agent_id = if let Some(existing) = self.bindings.get(&canonical_address) {
+            if let Some(requested) = req.agent_id.as_ref() {
+                if requested != &existing.agent_id {
+                    return Err(WalletAuthError::BindingConflict);
+                }
+            }
+            existing.agent_id.clone()
+        } else {
+            req.agent_id
+                .clone()
+                .unwrap_or_else(|| default_agent_id(&canonical_address))
+        };
+        let display_name = req.display_name.clone().or_else(|| {
+            self.bindings
+                .get(&canonical_address)
+                .and_then(|b| b.display_name.clone())
+        });
+        let binding = self
+            .bindings
+            .entry(canonical_address.clone())
+            .or_insert_with(|| WalletIdentityBinding {
+                wallet_address: canonical_address.clone(),
+                agent_id: agent_id.clone(),
+                display_name: display_name.clone(),
+                network: network_name(),
+                bound_at: now,
+                verified_at: now,
+                last_seen_at: now,
+            });
+        binding.agent_id = agent_id.clone();
+        binding.display_name = display_name.clone();
+        binding.verified_at = now;
+        binding.last_seen_at = now;
+
+        let session_token = session_token();
+        let token_tag = format!("native-{}", &req.token[..req.token.len().min(12)]);
+        let session = WalletSessionRecord {
+            session_token: session_token.clone(),
+            wallet_address: canonical_address.clone(),
+            agent_id: agent_id.clone(),
+            challenge_id: token_tag.clone(),
+            purpose: "native-auth".to_string(),
+            issued_at: now,
+            expires_at: now.saturating_add(SESSION_TTL_SECS),
+            last_seen_at: Some(now),
+        };
+        self.sessions.insert(session_token.clone(), session.clone());
+
+        Ok(WalletLoginResponse {
+            wallet_address: canonical_address,
+            agent_id: agent_id.clone(),
+            session_token,
+            session_expires_at: session.expires_at,
+            challenge_id: token_tag,
+            message: req.token,
+            network: network_name(),
+            display_name,
+            pylon_identity_path: format!("agents/{agent_id}/Identity.md"),
+        })
+    }
+
     pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {
         self.cleanup(now);
         self.sessions
@@ -451,6 +616,120 @@ mod tests {
 
     fn address_from_identity(identity: &Identity) -> String {
         encode_wallet_address(identity.public_key().as_bytes()).unwrap()
+    }
+
+    fn native_token(origin: &str, ttl: u64) -> String {
+        use base64::Engine as _;
+        let o = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(origin);
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"app":"t"}"#);
+        format!("{o}.{}.{ttl}.{e}", "ab".repeat(32))
+    }
+
+    #[test]
+    fn native_auth_login_ok_and_replay_rejected() {
+        // Official flow shape: wallet signs `address + token`.
+        let identity = Identity::generate();
+        let address = address_from_identity(&identity);
+        let mut store = WalletAuthStore::default();
+        let token = native_token("https://decentraai.duckdns.org", 600);
+        let sig = identity.sign(format!("{address}{token}").as_bytes());
+        let login = store
+            .verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: token.clone(),
+                    signature: hex::encode(sig.to_bytes()),
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(login.wallet_address, address);
+        assert_eq!(login.agent_id, address);
+        assert!(login.session_token.starts_with("wx_"));
+        assert!(store.session_for_token(&login.session_token, 105).is_some());
+        // Same token twice = replay, even with a valid signature.
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token,
+                    signature: hex::encode(sig.to_bytes()),
+                    agent_id: None,
+                    display_name: None,
+                },
+                106,
+            ),
+            Err(WalletAuthError::TokenReplay)
+        ));
+    }
+
+    #[test]
+    fn native_auth_rejects_bad_token_origin_ttl_sig() {
+        let identity = Identity::generate();
+        let address = address_from_identity(&identity);
+        let mut store = WalletAuthStore::default();
+        let good = native_token("https://decentraai.duckdns.org", 600);
+        let sign = |msg: &str| hex::encode(identity.sign(msg.as_bytes()).to_bytes());
+        // Bad origin.
+        let bad_origin = native_token("https://evil.example", 600);
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: bad_origin.clone(),
+                    signature: sign(&format!("{address}{bad_origin}")),
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::OriginNotAllowed)
+        ));
+        // TTL out of range.
+        let bad_ttl = native_token("https://decentraai.duckdns.org", 99999);
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: bad_ttl,
+                    signature: sign(&format!("{address}{good}")),
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::TokenExpired)
+        ));
+        // Malformed token.
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: "not.a.token".to_string(),
+                    signature: sign("x"),
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::MalformedToken)
+        ));
+        // Wrong signature (signed different bytes).
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: good.clone(),
+                    signature: sign("wrong-bytes"),
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::SignatureInvalid)
+        ));
     }
 
     #[test]

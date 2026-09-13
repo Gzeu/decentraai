@@ -202,6 +202,22 @@ async function rotateKey(){
 }
 function copyKey(){const t=S.key||'(nemaifișată)';navigator.clipboard.writeText(t).then(()=>say('out2','Cheia e în clipboard.','ok'));}
 function copyMsg(){if(S.manChal)navigator.clipboard.writeText(S.manChal.message).then(()=>say('out2','Mesaj copiat — semnează-l exact în wallet și lipește semnătura.','ok'));else say('out2','Cere întâi mesajul (pasul 1).','err');}
+function b64urlStr(s){const b=new TextEncoder().encode(s);let bin='';for(let i=0;i<b.length;i++)bin+=String.fromCharCode(b[i]);return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+// Native-auth token (official shape): b64url(origin).blockhash.ttl.b64url(extra).
+async function nativeToken(){
+  const net=S.net==='multiversx-mainnet'?'mainnet':'testnet';
+  const r=await fetch('/v1/auth/wallet/blockhash?network='+net);
+  const j=await r.json();
+  if(!j.ok||!/^[0-9a-fA-F]{64}$/.test(j.hash||''))throw new Error('blockhash indisponibil — reîncearcă.');
+  const extra=b64urlStr(JSON.stringify({app:'decentraai-account'}));
+  return b64urlStr(location.origin)+'.'+j.hash+'.600.'+extra;
+}
+async function doNativeVerify(addr,token,sig){
+  const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
+  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status));
+  S.session=r.json.session_token;S.addr=r.json.wallet_address;
+  await mintKey();
+}
 // Documented SignableMessage shape (sdk-core, cached import). The docs
 // pass `new SignableMessage({message})` — providers read the documented
 // field; raw {data} stays as fallback.
@@ -277,9 +293,26 @@ async function connectExtension(){
     const Provider=mod.ExtensionProvider||(mod.default&&mod.default.ExtensionProvider);
     if(!Provider)throw new Error('SDK încărcat, dar ExtensionProvider lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
     const p=typeof Provider.getInstance==='function'?Provider.getInstance():new Provider();
-    if(typeof p.init==='function')await p.init();
+    await p.init();
     if(typeof p.isInitialized==='function'&&!p.isInitialized())throw new Error('Extensia DeFi/MultiversX nu e instalată sau nu e activată pentru site-ul ăsta.');
     if(typeof p.login!=='function')throw new Error('provider fără login(). Încearcă Manual.');
+    // Calea oficială: login cu token native-auth (portofelul semnează
+    // token-ul; semnătura se verifică server-side, ca la SDK-ul oficial).
+    try{
+      const token=await nativeToken();
+      await p.login({token:token});
+      const addr2=await providerAddress(p);
+      if(!addr2)throw new Error('login-token ok, dar adresa lipsește.');
+      const accSig=p.account&&p.account.signature?p.account.signature:null;
+      const sig=extractSig(accSig);
+      if(!sig)throw new Error('login-token ok, dar fără semnătură — reîncearcă.');
+      say('out2','Token nativ semnat de '+addr2+' — verific…','');
+      await doNativeVerify(addr2,token,sig);
+      return;
+    }catch(e){
+      if(!/login-token|semnătură|adresă|blockhash/.test(String(e.message||e)))throw e;
+      say('out2','Native-auth indisponibil ('+String(e.message||e).slice(0,120)+') — fallback challenge clasic…','warn');
+    }
     await p.login();
     const addr=await providerAddress(p);
     if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
@@ -416,6 +449,8 @@ mod tests {
             "/v1/auth/wallet/verify",
             "/v1/auth/wallet/key",
             "/v1/auth/wallet/network",
+            "/v1/auth/wallet/native-auth",
+            "/v1/auth/wallet/blockhash",
             "getInstance",
             "signMessage({data",
             "xPortal (aplicație)",
