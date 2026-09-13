@@ -568,8 +568,21 @@ pub async fn hub_events_handler(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
+    // Optional per-task filter (the feed itself is task-agnostic).
+    // Applied AFTER the tail window over a max window, so a filtered task
+    // with old events is still found.
+    let task_filter: Option<String> = params.get("task_id").cloned();
     let hub = state.hub.lock().await;
-    let events = hub.events_since(since, limit.min(200));
+    let window = if task_filter.is_some() { 200 } else { limit.min(200) };
+    let events: Vec<_> = hub
+        .events_since(since, window)
+        .into_iter()
+        .filter(|e| {
+            task_filter
+                .as_deref()
+                .is_none_or(|t| e.task_id.as_deref() == Some(t))
+        })
+        .collect();
     Json(serde_json::json!({"tick": hub.tick, "events": events}))
 }
 

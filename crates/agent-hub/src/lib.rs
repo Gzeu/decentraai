@@ -379,19 +379,46 @@ impl HubState {
         self.tick += 1;
     }
 
+    /// Feed window: events at/after `since`, OLDEST-first (append-safe),
+    /// but capped to the NEWEST `limit` — the tail, not the head. (A
+    /// head-window starves followers once the log exceeds `limit`.)
     pub fn events_since(&self, since: u64, limit: usize) -> Vec<HubEvent> {
-        self.events
+        let filtered: Vec<_> = self
+            .events
             .iter()
             .filter(|e| e.tick >= since)
-            .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        let skip = filtered.len().saturating_sub(limit);
+        filtered.into_iter().skip(skip).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_since_returns_newest_window_oldest_first() {
+        // Regression: the feed must serve the TAIL, not the head — a
+        // head-window starves followers once the log exceeds `limit`.
+        let mut hub = HubState::new();
+        for i in 0..5 {
+            hub.tick = i;
+            hub.push_event("t", format!("e{i}"), None, None);
+        }
+        let win = hub.events_since(0, 2);
+        assert_eq!(win.len(), 2);
+        assert_eq!(win[0].detail, "e3");
+        assert_eq!(win[1].detail, "e4");
+        // `since` still filters, then the tail applies within it.
+        let win = hub.events_since(4, 10);
+        assert_eq!(win.len(), 1);
+        assert_eq!(win[0].detail, "e4");
+        // Zero limit = empty, never a panic.
+        assert!(hub.events_since(0, 0).is_empty());
+    }
+
     #[test]
     fn task_bid_team_settle_flow() {
         let mut hub = HubState::new();

@@ -391,13 +391,17 @@ impl ArenaWorld {
         self.agents.get(id)
     }
 
+    /// Same tail-window contract as the hub feed (see agent-hub): oldest-
+    /// first within the window, capped to the NEWEST `limit` events.
     pub fn events_since(&self, since_tick: u64, limit: usize) -> Vec<ArenaEvent> {
-        self.events
+        let filtered: Vec<_> = self
+            .events
             .iter()
             .filter(|e| e.tick >= since_tick)
-            .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        let skip = filtered.len().saturating_sub(limit);
+        filtered.into_iter().skip(skip).collect()
     }
 }
 
@@ -515,5 +519,24 @@ mod tests {
         assert_eq!(w.events.len(), 3);
         let since = w.events_since(3, 10);
         assert!(since.iter().all(|e| e.tick >= 3));
+    }
+
+    #[test]
+    fn events_since_serves_tail_not_head() {
+        // Same contract as the hub feed: newest `limit`, oldest-first.
+        let mut w = ArenaWorld::new(10, 10);
+        w.max_events = 100;
+        w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5))
+            .unwrap();
+        for i in 0..5 {
+            w.apply("a1", ActionKind::Observe, None, format!("see{i}"), None)
+                .unwrap();
+            w.advance_tick();
+        }
+        let win = w.events_since(0, 2);
+        assert_eq!(win.len(), 2);
+        assert!(win[0].tick <= win[1].tick, "chronological within window");
+        let newest = w.events.back().unwrap().tick;
+        assert_eq!(win[1].tick, newest, "window ends at the tail");
     }
 }
