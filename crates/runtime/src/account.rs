@@ -214,7 +214,7 @@ async function nativeToken(){
 }
 async function doNativeVerify(addr,token,sig){
   const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
-  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status));
+  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [debug: sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…]');
   S.session=r.json.session_token;S.addr=r.json.wallet_address;
   await mintKey();
 }
@@ -306,6 +306,7 @@ async function connectExtension(){
       const accSig=p.account&&p.account.signature?p.account.signature:null;
       const sig=extractSig(accSig);
       if(!sig)throw new Error('login-token ok, dar fără semnătură — reîncearcă.');
+      S.lastSig=sig;S.lastToken=token;
       say('out2','Token nativ semnat de '+addr2+' — verific…','');
       await doNativeVerify(addr2,token,sig);
       return;
