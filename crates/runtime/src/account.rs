@@ -386,8 +386,21 @@ async function genIdentity(){
 // Provider-ul e SINGLETON: getInstance(), nu create/new. init() confirmă
 // extensia (window.multiversxWallet); login() populează account.address;
 // signMessage({data: bytes}) întoarce sdk-core Message.
+function detectWallets(){
+  const found=[];
+  try{
+    if(window.multiversxWallet)found.push('DeFi/MultiversX (multiversxWallet)');
+    if(window.elrondWallet)found.push('legacy (elrondWallet)');
+    if(window.xportal)found.push('xPortal (xportal)');
+    if(window.maiarProvider)found.push('maiarProvider');
+    if(window.multiversXWallet)found.push('multiversXWallet');
+  }catch(_){}
+  return found;
+}
 async function connectExtension(){
-  say('out2','Se încarcă provider-ul DeFi…','');
+  const wallets=detectWallets();
+  const det='Portofele detectate: '+(wallets.length?wallets.join(' + '):'NICIUNUL (extensia lipsește/oprită)')+'.'+(wallets.length>1?' ATENȚIE: mai multe extensii pe același canal — dezactivează-le pe toate înafara de una!':'');
+  say('out2',det+' Se încarcă provider-ul DeFi…','');
   try{
     const mod=await import('/*__MX_EXTENSION_URL__*/');
     const Provider=mod.ExtensionProvider||(mod.default&&mod.default.ExtensionProvider);
