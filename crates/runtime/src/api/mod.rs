@@ -2383,10 +2383,12 @@ async fn wallet_verify_handler(
 
 /// POST /v1/auth/wallet/native-auth — official MultiversX wallet login.
 ///
-/// Body: `{wallet_address, token, signature[, agent_id, display_name]}` where
-/// token = `b64url(origin).blockhash.ttl.b64url(extra)` and the wallet signed
-/// `address + token`. Issues the SAME session shape as the challenge flow —
-/// key issuance, rotation, quota seeding and audit downstream are shared.
+/// Body: `{wallet_address, token, signature[, network, agent_id,
+/// display_name]}` where token = `b64url(origin).blockhash.ttl.b64url(extra)`
+/// and the wallet signed the Elrond digest of `address + token` (legacy:
+/// `address + token + {}`). Issues the SAME session shape as the challenge
+/// flow — key issuance, rotation, quota seeding and audit downstream are
+/// shared. The block must be real + unexpired on the resolved chain.
 async fn wallet_native_auth_handler(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -2401,8 +2403,33 @@ async fn wallet_native_auth_handler(
                 .into_response();
         }
     };
-    match state.wallet_native_login(req) {
-        Ok(login) => (
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    match crate::wallet_auth::parse_login_token(&req.token) {
+        Ok((_, blockhash, ttl)) => {
+            match resolve_token_network(&state.client, req.network.as_deref(), &blockhash).await
+            {
+                Ok(network) => {
+                    if let Err(e) =
+                        check_block_on_chain(&state.client, &network, &blockhash, ttl, now).await
+                    {
+                        return e;
+                    }
+                }
+                Err(e) => return e,
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    match state.wallet_native_login(req) {        Ok(login) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::to_string(&login).unwrap_or_else(|_| "{}".to_string()),
@@ -2661,6 +2688,100 @@ fn issue_wallet_consumer_key(
 /// wallet agent already holds a key (plaintext is never re-shown —
 /// rotate via revoke + reissue); 400 malformed, 401 bad signature/origin,
 /// 403 never (onboarding is self-serve).
+/// Check a native-auth block against its chain: the hash must EXIST on the
+/// declared network (token↔network mismatch refused) and `timestamp + ttl`
+/// must still cover now (real expiry, not just ttl range). Upstream failure
+/// is an honest 502 — login is rare, fail-closed beats fail-open.
+#[allow(clippy::result_large_err)]
+async fn check_block_on_chain(
+    client: &reqwest::Client,
+    network: &str,
+    blockhash: &str,
+    ttl: u64,
+    now: u64,
+) -> Result<(), Response> {
+    let url = format!(
+        "{}/blocks/{}?fields=hash,timestamp",
+        crate::wallet_auth::chain_api_base(network),
+        blockhash
+    );
+    let block: serde_json::Value = match client.get(&url).send().await {
+        Ok(r) => match r.json().await {
+            Ok(j) => j,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"ok": false, "error": "chain API unreadable"})),
+                )
+                    .into_response());
+            }
+        },
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"ok": false, "error": "chain API unreachable"})),
+            )
+                .into_response());
+        }
+    };
+    if block.get("hash").and_then(|h| h.as_str()) != Some(blockhash) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": format!("unknown block hash on {network} (token-network mismatch?)")})),
+        )
+            .into_response());
+    }
+    let ts = block.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0);
+    if ts == 0 || ts.saturating_add(ttl) <= now {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"ok": false, "error": "native-auth token expired"})),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Resolve which chain a token lives on: the declared `network` param when
+/// present (validated name), otherwise probe testnet → mainnet → devnet for
+/// the blockhash. Returns the network whose chain owns the block.
+#[allow(clippy::result_large_err)]
+async fn resolve_token_network(
+    client: &reqwest::Client,
+    declared: Option<&str>,
+    blockhash: &str,
+) -> Result<String, Response> {
+    if let Some(net) = declared {
+        if !crate::wallet_auth::is_known_network(net) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "unknown network (testnet|mainnet|devnet)"})),
+            )
+                .into_response());
+        }
+        return Ok(net.to_string());
+    }
+    for net in ["testnet", "mainnet", "devnet"] {
+        let url = format!(
+            "{}/blocks/{}?fields=hash",
+            crate::wallet_auth::chain_api_base(net),
+            blockhash
+        );
+        if let Ok(r) = client.get(&url).send().await {
+            if let Ok(j) = r.json::<serde_json::Value>().await {
+                if j.get("hash").and_then(|h| h.as_str()) == Some(blockhash) {
+                    return Ok(net.to_string());
+                }
+            }
+        }
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"ok": false, "error": "unknown block hash on every known chain"})),
+    )
+        .into_response())
+}
+
 async fn wallet_native_exchange_handler(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -2692,6 +2813,52 @@ async fn wallet_native_exchange_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // Fast gates before any chain fetch: envelope shape + ttl range.
+    let login_token = match crate::wallet_auth::parse_access_token(&req.access_token) {
+        Ok((_, lt, _)) => lt,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "malformed native-auth token"})),
+            )
+                .into_response();
+        }
+    };
+    let (_origin, blockhash, ttl) =
+        match crate::wallet_auth::parse_login_token(&login_token) {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"ok": false, "error": "malformed native-auth token"})),
+                )
+                    .into_response();
+            }
+        };
+    // Origin gate BEFORE any chain fetch: unauthorized origins are refused
+    // without spending upstream calls (the store re-checks on verify).
+    let token_origin =
+        crate::wallet_auth::extract_token_origin(&login_token).unwrap_or_default();
+    if !crate::wallet_auth::auth_origins()
+        .iter()
+        .any(|o| o == &token_origin)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"ok": false, "error": format!("native-auth origin not allowed (token origin was '{token_origin}')")})),
+        )
+            .into_response();
+    }
+    // Chain binding: resolve the network, then demand a real, unexpired
+    // block there. A fake blockhash or a token↔network mismatch stops here.
+    let network =
+        match resolve_token_network(&state.client, req.network.as_deref(), &blockhash).await {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+    if let Err(e) = check_block_on_chain(&state.client, &network, &blockhash, ttl, now).await {
+        return e;
+    }
     // Scope the store lock: verify + persist, then RELEASE before any
     // further locking (re-locking the same mutex would deadlock).
     let login = {
@@ -2730,12 +2897,67 @@ async fn wallet_native_exchange_handler(
             return (status, Json(serde_json::json!({"ok": false, "error": error}))).into_response();
         }
     };
-    issue_wallet_consumer_key(
+    let chain = crate::wallet_auth::chain_endpoints(&network);
+    // Idempotent provisioning: an address that already holds a key gets
+    // 200 + key_id + full meta (network, chain, scopes, quotas) but NO
+    // plaintext — the hash-only store never re-shows it. The client keeps
+    // its stored key and adopts the meta (no hardcoded endpoints).
+    if state.consumer_enabled() {
+        if let Some(path) = state.consumer_keys_path.as_ref() {
+            if let Ok(store) = decentraai_tokens::ConsumerKeyStore::load(path) {
+                if let Some(existing) = store
+                    .list()
+                    .iter()
+                    .find(|r| r.owner_account == login.agent_id && !r.revoked && !store.is_expired(r))
+                {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            "consumerKey": None::<String>,
+                            "key_id": existing.key_id,
+                            "account": login.agent_id,
+                            "wallet": login.wallet_address,
+                            "network": network,
+                            "chain": chain,
+                            "scopes": existing.scopes,
+                            "quota_ceiling": existing.quota_ceiling,
+                            "rate_limit_per_minute": existing.rate_limit_per_minute,
+                            "note": "key already issued for this wallet: plaintext is shown exactly once, at creation — kept client-side; rotate via revoke + reissue",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    let minted = issue_wallet_consumer_key(
         &state,
         &login.agent_id,
         &login.wallet_address,
         crate::wallet_auth::wallet_power_users().contains(&login.wallet_address),
-    )
+    );
+    // Enrich the fresh-issuance body with network + chain (provisioning).
+    let (parts, body) = minted.into_parts();
+    match axum::body::to_bytes(body, 65536).await {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(mut json) => {
+                json["network"] = serde_json::json!(network);
+                json["chain"] = chain;
+                let bytes =
+                    axum::body::Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
+                axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+            }
+            Err(_) => axum::response::Response::from_parts(
+                parts,
+                axum::body::Body::from(bytes),
+            ),
+        },
+        Err(_) => axum::response::Response::from_parts(
+            parts,
+            axum::body::Body::empty(),
+        ),
+    }
 }
 
 /// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
@@ -24671,11 +24893,13 @@ mod tests {
     async fn wallet_native_auth_issues_session_and_key() {
         // Official flow shape end-to-end: token + addr+token signature
         // → live session → self-issued dca_ key (same downstream as verify).
+        // The block must be REAL (chain-existence gate) — fetched live.
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         let dir = tempfile::tempdir().unwrap();
         let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
         let client = reqwest::Client::new();
+        let blockhash = live_blockhash(&client).await;
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
             .expect("test key encodes");
@@ -24683,7 +24907,7 @@ mod tests {
         let token = format!(
             "{}.{}.{}.{}",
             b64.encode("https://decentraai.duckdns.org"),
-            "cd".repeat(32),
+            blockhash,
             600,
             b64.encode(r#"{"app":"t"}"#)
         );
@@ -24729,16 +24953,35 @@ mod tests {
         assert_eq!(again.status(), 400);
     }
 
+    /// A REAL recent testnet block hash (chain-binding tests need a block
+    /// that exists — fake hashes are refused by the existence check).
+    /// Requires network; the E2E suite already assumes it.
+    async fn live_blockhash(client: &reqwest::Client) -> String {
+        client
+            .get("https://testnet-api.multiversx.com/blocks?size=1&fields=hash")
+            .send()
+            .await
+            .expect("test needs testnet-api")
+            .json::<serde_json::Value>()
+            .await
+            .expect("test needs testnet-api JSON")[0]["hash"]
+            .as_str()
+            .expect("block hash shape")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn wallet_native_exchange_mints_consumer_key() {
         // Shape B (third-party console contract): accessToken envelope →
-        // verify → dca_ issuance. Uses a bare-hostname origin + 86400s TTL
-        // (official SDK defaults) to lock the interoperable surface.
+        // verify → dca_ issuance + chain provisioning. Uses a bare-hostname
+        // origin + 86400s TTL (official SDK defaults) to lock the
+        // interoperable surface.
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         let dir = tempfile::tempdir().unwrap();
         let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
         let client = reqwest::Client::new();
+        let blockhash = live_blockhash(&client).await;
         let signing = SigningKey::from_bytes(&[9u8; 32]);
         let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
             .expect("test key encodes");
@@ -24747,7 +24990,7 @@ mod tests {
             let token = format!(
                 "{}.{}.{}.{}",
                 b64.encode("decentraai.duckdns.org"),
-                "ab".repeat(32),
+                blockhash,
                 86400,
                 b64.encode(format!(r#"{{"n":"{nonce}"}}"#))
             );
@@ -24778,6 +25021,10 @@ mod tests {
         let key = issued["token"].as_str().unwrap().to_string();
         assert!(key.starts_with("dca_"), "OpenAI-compatible key");
         assert_eq!(issued["consumerKey"].as_str().unwrap(), key);
+        // Provisioning: network + chain endpoints adopted by the client.
+        assert_eq!(issued["network"], "testnet");
+        assert_eq!(issued["chain"]["wallet"], "https://testnet-wallet.multiversx.com");
+        assert!(issued["chain"]["mcp"].as_str().unwrap().ends_with("/mcp"));
         // Same envelope twice = replay (the token bought one exchange).
         let replay = client
             .post(format!("http://{api}/v1/auth/native"))
@@ -24786,16 +25033,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.status(), 400);
-        // Fresh token, same wallet = already issued (plaintext never re-shown).
+        // Fresh token, same wallet = idempotent 200 with key_id + meta but
+        // NO plaintext (hash-only store never re-shows it).
         let second = client
             .post(format!("http://{api}/v1/auth/native"))
             .json(&serde_json::json!({"accessToken": mint("second")}))
             .send()
             .await
             .unwrap();
-        assert_eq!(second.status(), 409);
+        assert_eq!(second.status(), 200);
         let body: serde_json::Value = second.json().await.unwrap();
         assert!(body["key_id"].as_str().is_some());
+        assert!(body["consumerKey"].is_null());
+        assert_eq!(body["network"], "testnet");
+        assert!(body["chain"]["api"].as_str().unwrap().contains("testnet"));
     }
 
     #[tokio::test]
@@ -24814,10 +25065,11 @@ mod tests {
         // listed address is unique to this test.
         unsafe { std::env::set_var("DECENTRAAI_WALLET_POWER_USERS", wallet.clone()) };
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let blockhash = live_blockhash(&client).await;
         let token = format!(
             "{}.{}.{}.{}",
             b64.encode("decentraai.duckdns.org"),
-            "ab".repeat(32),
+            blockhash,
             86400,
             b64.encode("{}")
         );
@@ -24853,10 +25105,13 @@ mod tests {
         let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
             .expect("test key encodes");
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        // Live block: forgeries must survive the chain-existence gate to
+        // reach the signature check (fake hashes stop earlier, by design).
+        let blockhash = live_blockhash(&client).await;
         let token = format!(
             "{}.{}.{}.{}",
             b64.encode("decentraai.duckdns.org"),
-            "ef".repeat(32),
+            blockhash,
             86400,
             b64.encode("{}")
         );
@@ -24925,6 +25180,14 @@ mod tests {
         assert_eq!(r.status(), 401);
         let body: serde_json::Value = r.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("evil.example"));
+        // Token↔network mismatch: a real testnet block declared as mainnet.
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": access(&signing), "network": "mainnet"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
     }
 
     #[tokio::test]

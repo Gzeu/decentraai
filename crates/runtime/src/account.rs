@@ -30,6 +30,9 @@ pub const MX_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/@multiversx/sdk-core
 pub const MX_NOBLE_ED25519_URL: &str = "https://cdn.jsdelivr.net/npm/@noble/ed25519@1.7.3/+esm";
 /// Pinned bech32 (same version MultiversX ships): pubkey → erd1 address.
 pub const MX_BECH32_URL: &str = "https://cdn.jsdelivr.net/npm/bech32@1.1.4/+esm";
+/// Pinned noble hashes (keccak_256 for the Elrond signing digest — local
+/// pre-verify of wallet signatures before hitting the server).
+pub const MX_NOBLE_HASHES_URL: &str = "https://cdn.jsdelivr.net/npm/@noble/hashes@1.8.0/+esm";
 /// Official Web Wallet URLs (popup target per selected network).
 pub const MX_WEB_WALLET_MAINNET: &str = "https://wallet.multiversx.com";
 pub const MX_WEB_WALLET_TESTNET: &str = "https://testnet-wallet.multiversx.com";
@@ -42,6 +45,7 @@ pub fn account_html() -> String {
         .replace("/*__MX_CORE_URL__*/", MX_CORE_URL)
         .replace("/*__MX_NOBLE_URL__*/", MX_NOBLE_ED25519_URL)
         .replace("/*__MX_BECH32_URL__*/", MX_BECH32_URL)
+        .replace("/*__MX_HASHES_URL__*/", MX_NOBLE_HASHES_URL)
 }
 
 const ACCOUNT_HTML: &str = r##"<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Cont</title>
@@ -232,8 +236,19 @@ async function doNativeVerify(addr,token,sig){
     const okAT=await ed.verify(sb,te.encode(addr+token),new Uint8Array(pub));
     let okTO=false;
     try{okTO=await ed.verify(sb,te.encode(token),new Uint8Array(pub));}catch(_){}
-    local='addr+token:'+(okAT?'OK':'NU')+' token-singur:'+(okTO?'OK':'NU');
-    if(okTO&&!okAT){S.nativeVariant='token-only';}
+    // Digestul Elrond (ce semnează wallet-urile reale): keccak(prefix+len+msg).
+    let okDG=false,okLG=false;
+    try{
+      const hMod=await import('/*__MX_HASHES_URL__*/');
+      const keccak=(hMod.keccak_256||(hMod.default&&hMod.default.keccak_256));
+      if(typeof keccak==='function'){
+        const pre=te.encode('\x17Elrond Signed Message:\n');
+        const dig=(s)=>{const m=te.encode(s);const L=te.encode(String(m.length));const b=new Uint8Array(pre.length+L.length+m.length);b.set(pre,0);b.set(L,pre.length);b.set(m,pre.length+L.length);return keccak(b);};
+        try{okDG=await ed.verify(sb,dig(addr+token),new Uint8Array(pub));}catch(_){}
+        try{okLG=await ed.verify(sb,dig(addr+token+'{}'),new Uint8Array(pub));}catch(_){}
+      }
+    }catch(_){}
+    local='raw addr+token:'+(okAT?'OK':'NU')+' raw token:'+(okTO?'OK':'NU')+' digest:'+(okDG?'OK':'NU')+' legacy:'+(okLG?'OK':'NU');
   }catch(e){local='eroare-local:'+String(e.message||e).slice(0,80);}
   const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
   if(r.status!==200){
@@ -614,6 +629,10 @@ mod tests {
             !html.contains("/*__MX_EXTENSION_URL__*/"),
             "URL placeholders must be substituted"
         );
+        assert!(
+            !html.contains("/*__MX_HASHES_URL__*/"),
+            "hashes URL placeholder must be substituted"
+        );
         // No secret material in the template: the identity seed lives only
         // in the visitor's localStorage, never in served HTML.
         for bad in ["dsk_", "BEGIN PRIVATE", "mnemonic"] {
@@ -639,7 +658,7 @@ mod tests {
             assert!(!url.contains("@latest"), "must pin exact version: {url}");
         }
         // Crypto primitives: same pin discipline, different vendors.
-        for url in [MX_NOBLE_ED25519_URL, MX_BECH32_URL] {
+        for url in [MX_NOBLE_ED25519_URL, MX_BECH32_URL, MX_NOBLE_HASHES_URL] {
             assert!(url.starts_with("https://cdn.jsdelivr.net/npm/"));
             assert!(url.ends_with("/+esm"));
             assert!(!url.contains("@latest"), "must pin exact version: {url}");

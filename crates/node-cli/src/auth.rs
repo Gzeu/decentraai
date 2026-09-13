@@ -159,7 +159,9 @@ pub async fn auth_command(command: AuthCommand) -> Result<()> {
                 if args.network == "mainnet" { "mainnet" } else { "testnet" }
             );
             let session = if args.native {
-                // Official token flow: blockhash → token → sign(addr+token).
+                // Official token flow: blockhash → token → sign the Elrond
+                // digest (keccak256(prefix + len + msg)) — byte-identical to
+                // what real wallet software signs (same verifier server-side).
                 let bh: serde_json::Value = client
                     .get(format!(
                         "{}/v1/auth/wallet/blockhash?network={}",
@@ -181,7 +183,7 @@ pub async fn auth_command(command: AuthCommand) -> Result<()> {
                     86400,
                     b64.encode("{}")
                 );
-                let sig = signing.sign(format!("{address}{token}").as_bytes());
+                let sig = sign_elrond_digest(&signing, format!("{address}{token}").as_bytes());
                 let login: serde_json::Value = client
                     .post(format!("{}/v1/auth/wallet/native-auth", args.node))
                     .json(&serde_json::json!({
@@ -359,6 +361,21 @@ fn load_pem_seed(path: &Path) -> Result<[u8; 32]> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(seed_slice);
     Ok(seed)
+}
+
+/// Sign the Elrond message digest (what the fabric verifies for wallets):
+/// `ed25519(signing, keccak256("\x17Elrond Signed Message:\n" + len + msg))`.
+fn sign_elrond_digest(
+    signing: &ed25519_dalek::SigningKey,
+    msg: &[u8],
+) -> ed25519_dalek::Signature {
+    use sha3::Digest as _;
+    let mut h = sha3::Keccak256::new();
+    h.update(b"\x17Elrond Signed Message:\n");
+    h.update(msg.len().to_string().as_bytes());
+    h.update(msg);
+    let digest: [u8; 32] = h.finalize().into();
+    signing.sign(&digest)
 }
 
 /// Bare hostname of the node URL (native-auth origin convention: the
