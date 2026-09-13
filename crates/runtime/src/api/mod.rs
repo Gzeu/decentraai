@@ -2477,16 +2477,23 @@ async fn wallet_blockhash_handler(
 /// Self-serve issuance shared by the first-party session endpoint
 /// (`POST /v1/auth/wallet/key`) and the third-party exchange endpoint
 /// (`POST /v1/auth/native`). Same store, same hash-only persistence, same
-/// once-only plaintext, same audit shape (distinct event per caller), same
-/// starter-quota rule: seed only when the account has nothing spendable.
+/// once-only plaintext, same starter-quota rule: seed only when the account
+/// has nothing spendable.
+///
+/// `power` (wallet listed in `DECENTRAAI_WALLET_POWER_USERS`) elevates the
+/// grant to wildcard scope + large ceiling — still a revocable,
+/// quota-gated `dca_` consumer key, NEVER master/operator. The audit event
+/// differs so power grants are distinguishable in the log.
 ///
 /// Rules (all fail-closed): one active key per agent (repeats return 409
 /// with the key_id — plaintext is shown exactly once, at creation, never
-/// re-shown); self-serve scopes (embeddings, compute, own memory);
-/// orchestration, hub teams and privileged scopes stay on the admin grant
-/// path. The key is fabric-scoped (chain-agnostic): identical for testnet
-/// and mainnet wallets. A wallet NEVER yields a master/operator credential.
-fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address: &str) -> Response {
+/// re-shown). The key is fabric-scoped (chain-agnostic).
+fn issue_wallet_consumer_key(
+    state: &ApiState,
+    agent_id: &String,
+    wallet_address: &str,
+    power: bool,
+) -> Response {
     /// Self-serve defaults: modest enough to be safe unattended, useful
     /// enough for real onboarding (matches the consumer test baseline).
     const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
@@ -2495,6 +2502,11 @@ fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address
     /// compute-assist and OWN personal memory. Orchestration, hub teams and
     /// master control-plane stay on the admin grant path.
     const SELF_SERVE_SCOPES: [&str; 3] = ["embeddings", "compute", "memory"];
+    /// Power grant (listed wallets only): wildcard scope + large ceiling so
+    /// the owner's console associates full powers automatically at wallet
+    /// login. Still consumer-grade: revocable, rate-gated, audited.
+    const POWER_QUOTA_CEILING: u64 = 100000;
+    const POWER_RATE_PER_MIN: u32 = 1000;
     /// Starter grant: spendable units so the first chat works immediately.
     /// Seeded only when the account has nothing spendable (re-issues after
     /// revoke don't re-grant) — same pattern as world onboarding.
@@ -2543,13 +2555,17 @@ fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address
         )
             .into_response();
     }
-    let scopes: Vec<String> = SELF_SERVE_SCOPES.iter().map(|s| s.to_string()).collect();
-    let plaintext = match store.create(
-        agent_id,
-        SELF_SERVE_QUOTA_CEILING,
-        SELF_SERVE_RATE_PER_MIN,
-        scopes.clone(),
-    ) {
+    let (ceiling, rate) = if power {
+        (POWER_QUOTA_CEILING, POWER_RATE_PER_MIN)
+    } else {
+        (SELF_SERVE_QUOTA_CEILING, SELF_SERVE_RATE_PER_MIN)
+    };
+    let scopes: Vec<String> = if power {
+        vec!["*".to_string()]
+    } else {
+        SELF_SERVE_SCOPES.iter().map(|s| s.to_string()).collect()
+    };
+    let plaintext = match store.create(agent_id, ceiling, rate, scopes.clone()) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -2562,13 +2578,18 @@ fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address
     let a = state.info.repo_root.join("logs/audit.jsonl");
     let _ = decentraai_audit::record(
         a.parent().unwrap_or(&state.info.repo_root),
-        "consumer_key_self_issued",
+        if power {
+            "consumer_key_power_issued"
+        } else {
+            "consumer_key_self_issued"
+        },
         serde_json::json!({
             "account": agent_id,
             "wallet": wallet_address,
+            "power": power,
             "key_prefix": decentraai_tokens::key_prefix(&plaintext),
-            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
-            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "quota_ceiling": ceiling,
+            "rate_limit_per_minute": rate,
             "starter_quota": SELF_SERVE_STARTER_QUOTA,
             "scopes": scopes,
         }),
@@ -2612,11 +2633,12 @@ fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address
             "key_prefix": decentraai_tokens::key_prefix(&plaintext),
             "account": agent_id,
             "wallet": wallet_address,
-            "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
-            "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
+            "quota_ceiling": ceiling,
+            "rate_limit_per_minute": rate,
             "starter_quota": SELF_SERVE_STARTER_QUOTA,
             "starter_granted": starter_granted,
             "scopes": scopes,
+            "power": power,
             "note": "shown once; only its hash and prefix are stored",
         })),
     )
@@ -2708,7 +2730,12 @@ async fn wallet_native_exchange_handler(
             return (status, Json(serde_json::json!({"ok": false, "error": error}))).into_response();
         }
     };
-    issue_wallet_consumer_key(&state, &login.agent_id, &login.wallet_address)
+    issue_wallet_consumer_key(
+        &state,
+        &login.agent_id,
+        &login.wallet_address,
+        crate::wallet_auth::wallet_power_users().contains(&login.wallet_address),
+    )
 }
 
 /// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
@@ -2745,7 +2772,13 @@ async fn wallet_key_handler(
         }
     };
     // Shared self-serve issuance (same store/quotas/audit as /v1/auth/native).
-    issue_wallet_consumer_key(&state, &session.agent_id, &session.wallet_address)
+    // Listed wallets associate elevated powers automatically at login.
+    issue_wallet_consumer_key(
+        &state,
+        &session.agent_id,
+        &session.wallet_address,
+        crate::wallet_auth::wallet_power_users().contains(&session.wallet_address),
+    )
 }
 
 /// DELETE /v1/auth/wallet/key — self-serve key revocation (rotation, step 1).
@@ -24763,6 +24796,49 @@ mod tests {
         assert_eq!(second.status(), 409);
         let body: serde_json::Value = second.json().await.unwrap();
         assert!(body["key_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn wallet_native_exchange_power_grant() {
+        // Listed wallets associate elevated powers automatically: wildcard
+        // scope + large ceiling, still a revocable dca_ (never master).
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let signing = SigningKey::from_bytes(&[21u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        // SAFETY: test-only mutation of a var no other test reads; the
+        // listed address is unique to this test.
+        unsafe { std::env::set_var("DECENTRAAI_WALLET_POWER_USERS", wallet.clone()) };
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!(
+            "{}.{}.{}.{}",
+            b64.encode("decentraai.duckdns.org"),
+            "ab".repeat(32),
+            86400,
+            b64.encode("{}")
+        );
+        let sig = signing.sign(format!("{wallet}{token}").as_bytes());
+        let access = format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&token), hex::encode(sig.to_bytes()));
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": access}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // SAFETY: restores the pre-test environment (see above).
+        unsafe { std::env::remove_var("DECENTRAAI_WALLET_POWER_USERS") };
+        assert_eq!(issued["ok"], true, "power exchange mints: {issued}");
+        assert_eq!(issued["power"], true);
+        assert_eq!(issued["scopes"], serde_json::json!(["*"]));
+        assert_eq!(issued["quota_ceiling"], 100000);
+        assert!(issued["token"].as_str().unwrap().starts_with("dca_"));
     }
 
     #[tokio::test]

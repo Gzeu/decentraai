@@ -250,6 +250,25 @@ pub fn extract_token_origin(login_token: &str) -> Option<String> {
     String::from_utf8(raw).ok()
 }
 
+/// Wallet addresses entitled to ELEVATED self-serve grants on the exchange
+/// path (comma-separated `DECENTRAAI_WALLET_POWER_USERS`). A listed wallet
+/// still receives a revocable, quota-gated `dca_` consumer key — never a
+/// master/operator credential — but with wildcard scope and a large
+/// ceiling, so the owner's console associates full powers automatically at
+/// wallet login, with no human ever handling plaintext. Exact match on the
+/// canonical address; empty by default (everyone else gets the modest
+/// self-serve grant).
+pub(crate) fn wallet_power_users() -> Vec<String> {
+    std::env::var("DECENTRAAI_WALLET_POWER_USERS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| Vec::new())
+}
+
 #[allow(dead_code)]
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
