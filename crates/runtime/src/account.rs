@@ -99,6 +99,7 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 <div class="row" style="margin-top:8px"><button class="primary" onclick="manualLogin()">2. Verifică și intră →</button></div>
 </div>
 <pre id="out2"></pre>
+<div class="row" style="margin-top:8px"><button onclick="copyNativeDbg()">copiază debug nativ (pentru Pylon)</button></div>
 </div>
 
 <div class="card hidden" id="step3"><h2><span class="n">3</span>Cheia ta <span class="badge">arătată o singură dată</span></h2>
@@ -235,9 +236,17 @@ async function doNativeVerify(addr,token,sig){
     if(okTO&&!okAT){S.nativeVariant='token-only';}
   }catch(e){local='eroare-local:'+String(e.message||e).slice(0,80);}
   const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
-  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [local: '+local+' | sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…]');
+  if(r.status!==200){
+    S.lastDbg={addr:addr,token:token,sig:sig,local:local};
+    throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [local: '+local+' | sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…] (tripletul complet e în butonul „copiază debug nativ" de mai jos)');
+  }
   S.session=r.json.session_token;S.addr=r.json.wallet_address;
   await mintKey();
+}
+function copyNativeDbg(){
+  const d=S.lastDbg;
+  if(!d){say('out2','Niciun debug nativ de copiat — încearcă întâi extensia.','warn');return;}
+  navigator.clipboard.writeText(JSON.stringify(d)).then(()=>say('out2','Debug complet copiat ('+d.sig.length+' sig chars, token '+d.token.length+' chars) — lipește-l lui Pylon.','ok'));
 }
 // ---- canal brut erdw-inpage (fără SDK): op 'connect' + token STRING ----
 // Forma exactă pe care o vorbește extensia oficială (același canal ca
@@ -395,6 +404,7 @@ async function connectExtension(){
       token=await nativeToken();
       say('out2','Token nativ emis — aștept semnătura extensiei…','');
       const raw=await extRawLogin(token);
+      if(!confirm('Extensia raportează adresa:\n\n'+raw.addr+'\n\nVerifică în extensia DeFi că ACEASTĂ adresă e cea selectată activ (extensia poate semna cu alt cont!). Continui?')){say('out2','Oprit de tine. Selectează adresa în extensie și reîncearcă.','warn');return;}
       say('out2','Token nativ semnat de '+raw.addr+' — verific…','');
       S.lastSig=raw.sig;S.lastToken=token;
       await doNativeVerify(raw.addr,token,raw.sig);
