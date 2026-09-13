@@ -215,8 +215,27 @@ async function nativeToken(){
   return b64urlStr(location.hostname)+'.'+j.hash+'.86400.'+extra;
 }
 async function doNativeVerify(addr,token,sig){
+  // Verificare LOCALĂ înainte de server (noble+bech32 deja pin-uite):
+  // deosebește transport/encoding (local ok, server nu) de bytes greșiți
+  // (nici local nu iese) și detectează varianta semnată (adresă+token vs
+  // doar token). Rezultatul ajunge în debug, nu mai ghicim.
+  let local='neverificat';
+  try{
+    const edMod=await import('/*__MX_NOBLE_URL__*/');const ed=edMod.default||edMod;
+    const bMod=await import('/*__MX_BECH32_URL__*/');const B=bMod.bech32||bMod.default||bMod;
+    const dec=B.decode(addr);
+    if(dec.prefix!=='erd')throw new Error('prefix neașteptat la adresă');
+    const pub=(typeof B.fromWords==='function')?B.fromWords(dec.words):(()=>{const out=[];let acc=0,bits=0;for(const v of dec.words){acc=(acc<<5)|v;bits+=5;while(bits>=8){bits-=8;out.push((acc>>>bits)&0xff);acc&=(1<<bits)-1;}}return out;})();
+    const te=new TextEncoder();
+    const sb=unhex(sig);
+    const okAT=await ed.verify(sb,te.encode(addr+token),new Uint8Array(pub));
+    let okTO=false;
+    try{okTO=await ed.verify(sb,te.encode(token),new Uint8Array(pub));}catch(_){}
+    local='addr+token:'+(okAT?'OK':'NU')+' token-singur:'+(okTO?'OK':'NU');
+    if(okTO&&!okAT){S.nativeVariant='token-only';}
+  }catch(e){local='eroare-local:'+String(e.message||e).slice(0,80);}
   const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
-  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [debug: sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…]');
+  if(r.status!==200)throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [local: '+local+' | sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…]');
   S.session=r.json.session_token;S.addr=r.json.wallet_address;
   await mintKey();
 }
