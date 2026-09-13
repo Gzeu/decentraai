@@ -25,6 +25,12 @@ pub struct WalletIdentityBinding {
     pub bound_at: u64,
     pub verified_at: u64,
     pub last_seen_at: u64,
+    /// Name of the wallet-provisioned operator subscription token in the
+    /// node token registry (`dsk_…`, tier 3, operator role). `None` = never
+    /// provisioned (unlisted wallets never get one). The plaintext lives
+    /// only in the issuance response; here just the name for idempotency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_token_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,6 +630,7 @@ impl WalletAuthStore {
                 network: network_name(),
                 bound_at: now,
                 verified_at: now,
+                operator_token_name: None,
                 last_seen_at: now,
             });
         binding.agent_id = agent_id.clone();
@@ -722,6 +729,7 @@ impl WalletAuthStore {
                 network: network_name(),
                 bound_at: now,
                 verified_at: now,
+                operator_token_name: None,
                 last_seen_at: now,
             });
         binding.agent_id = agent_id.clone();

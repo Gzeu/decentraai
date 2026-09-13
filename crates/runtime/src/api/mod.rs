@@ -2782,6 +2782,98 @@ async fn resolve_token_network(
         .into_response())
 }
 
+/// Provision the wallet's operator subscription token (`dsk_…`, tier 3,
+/// operator role) on the exchange path — power-listed wallets ONLY.
+///
+/// Same idempotency as consumer issuance: first login mints (plaintext
+/// shown once), later logins return meta with a null token. The binding
+/// records the token NAME (never the secret). Unlisted wallets and nodes
+/// without a token store get nulls + a note — never an error, never a
+/// master/operator credential by accident.
+fn provision_wallet_operator(
+    state: &ApiState,
+    wallet_address: &str,
+    power: bool,
+) -> serde_json::Value {
+    let none = |note: &str| {
+        serde_json::json!({
+            "operatorKey": None::<String>,
+            "operator_key": None::<serde_json::Value>,
+            "operator_note": note,
+        })
+    };
+    if !power {
+        return none("operator provisioning is limited to listed wallets");
+    }
+    let tpath = match state.token_store_path.as_ref() {
+        Some(p) => p.clone(),
+        None => return none("operator token store is not configured on this node"),
+    };
+    // Deterministic per-wallet name: re-provisioning finds the same record.
+    let name = format!(
+        "wallet-{}",
+        &blake3::hash(wallet_address.as_bytes()).to_hex().to_string()[..12]
+    );
+    let mut tstore = match decentraai_tokens::TokenStore::load(&tpath) {
+        Ok(s) => s,
+        Err(_) => return none("operator token store unreadable"),
+    };
+    if let Some(rec) = tstore
+        .list()
+        .iter()
+        .find(|r| r.name == name && !r.revoked)
+    {
+        {
+            let mut w = state.wallet_auth.lock().unwrap();
+            if let Some(b) = w.bindings.get_mut(wallet_address) {
+                if b.operator_token_name.as_deref() != Some(name.as_str()) {
+                    b.operator_token_name = Some(name.clone());
+                    let _ = w.save(&state.wallet_auth_path);
+                }
+            }
+        }
+        return serde_json::json!({
+            "operatorKey": None::<String>,
+            "operator_key": {"name": rec.name, "tier": rec.tier, "role": rec.role.name()},
+            "operator_note": "already provisioned: plaintext shown exactly once, at creation — kept client-side",
+        });
+    }
+    match tstore.create_with_role(
+        &name,
+        decentraai_tokens::Tier::CORE,
+        None,
+        decentraai_tokens::Role::Operator,
+    ) {
+        Ok(plaintext) => {
+            let a = state.info.repo_root.join("logs/audit.jsonl");
+            let _ = decentraai_audit::record(
+                a.parent().unwrap_or(&state.info.repo_root),
+                "operator_token_wallet_issued",
+                serde_json::json!({
+                    "account": wallet_address,
+                    "wallet": wallet_address,
+                    "name": name,
+                    "tier": 3,
+                    "role": "operator",
+                }),
+            );
+            {
+                let mut w = state.wallet_auth.lock().unwrap();
+                if let Some(b) = w.bindings.get_mut(wallet_address) {
+                    b.operator_token_name = Some(name.clone());
+                    let _ = w.save(&state.wallet_auth_path);
+                }
+            }
+            serde_json::json!({
+                "operatorKey": plaintext,
+                "operator_key": {"name": name, "tier": 3, "role": "operator"},
+                "operator_note": "shown once; only its hash is stored",
+            })
+        }
+        Err(e) => none(&format!("operator issuance failed: {e}")),
+    }
+}
+
 async fn wallet_native_exchange_handler(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -2898,6 +2990,8 @@ async fn wallet_native_exchange_handler(
         }
     };
     let chain = crate::wallet_auth::chain_endpoints(&network);
+    let power =
+        crate::wallet_auth::wallet_power_users().contains(&login.wallet_address);
     // Idempotent provisioning: an address that already holds a key gets
     // 200 + key_id + full meta (network, chain, scopes, quotas) but NO
     // plaintext — the hash-only store never re-shows it. The client keeps
@@ -2910,6 +3004,7 @@ async fn wallet_native_exchange_handler(
                     .iter()
                     .find(|r| r.owner_account == login.agent_id && !r.revoked && !store.is_expired(r))
                 {
+                    let op = provision_wallet_operator(&state, &login.wallet_address, power);
                     return (
                         StatusCode::OK,
                         Json(serde_json::json!({
@@ -2923,6 +3018,10 @@ async fn wallet_native_exchange_handler(
                             "scopes": existing.scopes,
                             "quota_ceiling": existing.quota_ceiling,
                             "rate_limit_per_minute": existing.rate_limit_per_minute,
+                            "operatorKey": op["operatorKey"],
+                            "operator_key": op["operator_key"],
+                            "operator_note": op["operator_note"],
+                            "power": power,
                             "note": "key already issued for this wallet: plaintext is shown exactly once, at creation — kept client-side; rotate via revoke + reissue",
                         })),
                     )
@@ -2935,15 +3034,19 @@ async fn wallet_native_exchange_handler(
         &state,
         &login.agent_id,
         &login.wallet_address,
-        crate::wallet_auth::wallet_power_users().contains(&login.wallet_address),
+        power,
     );
-    // Enrich the fresh-issuance body with network + chain (provisioning).
+    // Enrich the fresh-issuance body with network + chain + operator.
+    let op = provision_wallet_operator(&state, &login.wallet_address, power);
     let (parts, body) = minted.into_parts();
     match axum::body::to_bytes(body, 65536).await {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(mut json) => {
                 json["network"] = serde_json::json!(network);
                 json["chain"] = chain;
+                json["operatorKey"] = op["operatorKey"].clone();
+                json["operator_key"] = op["operator_key"].clone();
+                json["operator_note"] = op["operator_note"].clone();
                 let bytes =
                     axum::body::Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
                 axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
@@ -25049,48 +25152,102 @@ mod tests {
         assert!(body["chain"]["api"].as_str().unwrap().contains("testnet"));
     }
 
+    /// Consumer state PLUS a subscription-token registry, so wallet
+    /// operator provisioning (`dsk_…` tier 3) can be exercised end-to-end.
+    async fn start_wallet_provision_state(
+        dir: &Path,
+        master: String,
+    ) -> SocketAddr {
+        let backend = start_backend().await;
+        let manager = test_manager(dir).await;
+        let ledger = Arc::new(StdMutex::new(decentraai_compute::QuotaLedger::new(
+            decentraai_compute::ContributionPolicy::default(),
+        )));
+        {
+            let mut l = ledger.lock().unwrap();
+            l.credit(&"consumer-account".to_string(), "seed", Some(1000), None);
+        }
+        let mut state = ApiState::new(
+            format!("http://{backend}"),
+            Some(master),
+            manager.clone(),
+            test_info(dir, None),
+            Some(dir.join("db/tokens.json")),
+            None,
+            test_queue(),
+            None,
+            None,
+        );
+        state.attach_consumer(
+            Some(dir.join("db/consumer_keys.json")),
+            Some(ledger.clone()),
+        );
+        serve_api(state, "127.0.0.1", 0).await.unwrap()
+    }
+
     #[tokio::test]
-    async fn wallet_native_exchange_power_grant() {
-        // Listed wallets associate elevated powers automatically: wildcard
-        // scope + large ceiling, still a revocable dca_ (never master).
+    async fn wallet_exchange_provisions_operator_for_listed_wallets() {
+        // Power-listed wallet: first exchange mints BOTH the power consumer
+        // key (wildcard scope) and the operator subscription token
+        // (plaintexts shown once); the second returns meta with nulls
+        // (idempotent, hash-only). Single test owns the env var (parallel
+        // tests must not share it).
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         let dir = tempfile::tempdir().unwrap();
-        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let api = start_wallet_provision_state(dir.path(), "master-token".to_string()).await;
         let client = reqwest::Client::new();
-        let signing = SigningKey::from_bytes(&[21u8; 32]);
+        let blockhash = live_blockhash(&client).await;
+        let signing = SigningKey::from_bytes(&[23u8; 32]);
         let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
             .expect("test key encodes");
-        // SAFETY: test-only mutation of a var no other test reads; the
-        // listed address is unique to this test.
+        // SAFETY: this is the only test that mutates this var; the listed
+        // address is unique, so concurrent readers are unaffected.
         unsafe { std::env::set_var("DECENTRAAI_WALLET_POWER_USERS", wallet.clone()) };
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let blockhash = live_blockhash(&client).await;
-        let token = format!(
-            "{}.{}.{}.{}",
-            b64.encode("decentraai.duckdns.org"),
-            blockhash,
-            86400,
-            b64.encode("{}")
-        );
-        let sig = signing.sign(format!("{wallet}{token}").as_bytes());
-        let access = format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&token), hex::encode(sig.to_bytes()));
-        let issued: serde_json::Value = client
+        let mint = |nonce: &str| {
+            let token = format!(
+                "{}.{}.{}.{}",
+                b64.encode("decentraai.duckdns.org"),
+                blockhash,
+                86400,
+                b64.encode(format!(r#"{{"n":"{nonce}"}}"#))
+            );
+            let sig = signing.sign(format!("{wallet}{token}").as_bytes());
+            format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&token), hex::encode(sig.to_bytes()))
+        };
+        let first: serde_json::Value = client
             .post(format!("http://{api}/v1/auth/native"))
-            .json(&serde_json::json!({"accessToken": access}))
+            .json(&serde_json::json!({"accessToken": mint("op1"), "network": "testnet"}))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        // SAFETY: restores the pre-test environment (see above).
+        assert_eq!(first["ok"], true, "operator provisioning: {first}");
+        assert_eq!(first["power"], true);
+        assert_eq!(first["scopes"], serde_json::json!(["*"]));
+        assert_eq!(first["quota_ceiling"], 100000);
+        assert!(first["token"].as_str().unwrap().starts_with("dca_"));
+        let opkey = first["operatorKey"].as_str().unwrap().to_string();
+        assert!(opkey.starts_with("dsk_"), "operator subscription token");
+        assert_eq!(first["operator_key"]["role"], "operator");
+        assert_eq!(first["operator_key"]["tier"], 3);
+        let opname = first["operator_key"]["name"].as_str().unwrap().to_string();
+        // Second exchange (fresh token): both plaintexts null, same ids.
+        let r2 = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": mint("op2"), "network": "testnet"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), 200);
+        let second: serde_json::Value = r2.json().await.unwrap();
         unsafe { std::env::remove_var("DECENTRAAI_WALLET_POWER_USERS") };
-        assert_eq!(issued["ok"], true, "power exchange mints: {issued}");
-        assert_eq!(issued["power"], true);
-        assert_eq!(issued["scopes"], serde_json::json!(["*"]));
-        assert_eq!(issued["quota_ceiling"], 100000);
-        assert!(issued["token"].as_str().unwrap().starts_with("dca_"));
+        assert!(second["consumerKey"].is_null());
+        assert!(second["operatorKey"].is_null());
+        assert_eq!(second["operator_key"]["name"].as_str().unwrap(), opname);
     }
 
     #[tokio::test]
