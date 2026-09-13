@@ -144,9 +144,10 @@ async function doVerify(addr,chalId,sig){
 }
 async function mintKey(){
   const r=await api('/v1/auth/wallet/key','POST',{session_token:S.session});
-  if(r.status===409){ // deja emisă: arată key_id + oferă rotația
-    say('out2','Ai deja o cheie ('+r.json.key_id+'). O poți roti mai jos — plaintext-ul vechi nu se mai arată.','warn');
-    S.keyId=r.json.key_id;showManageOnly();return;
+  if(r.status===409){ // cheie existentă: RECUNOAȘTERE, nu re-emitere
+    S.keyId=r.json.key_id;
+    await showRecognized();
+    return;
   }
   if(r.status!==200||!r.json.ok)throw new Error('key: '+(r.json.error||r.status));
   S.key=r.json.token;S.keyId=r.json.key_id;
@@ -160,6 +161,24 @@ function showManageOnly(){
   $('keyPlain').textContent='(ascunsă — emisă anterior; rotește pentru una nouă)';
   $('keyInfo').innerHTML='key_id <code>'+esc(S.keyId)+'</code> · apasă <b>Revocă + re-emite</b> pentru o cheie nouă (cea veche moare instant).';
   $('step3').classList.remove('hidden');
+}
+// Recunoaștere: wallet-ul are deja cheie. Arată cine ești + cota LIVE
+// (sesiunea wallet poate citi get_quota, spre deosebire de cheia dca_)
+// + rotație. Snippet-urile vin doar cu cheie proaspătă (după rotație).
+async function showRecognized(){
+  let quotaLine='cotă: (indisponibilă)';
+  try{
+    const r=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+S.session},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'get_quota',arguments:{}}})});
+    const j=await r.json();
+    const txt=j&&j.result&&j.result.content&&j.result.content[0]&&j.result.content[0].text;
+    const q=txt?JSON.parse(txt):null;
+    const acc=q&&(q.accounts||[]).find(a=>a.account===S.addr);
+    if(acc)quotaLine='disponibil <b>'+acc.available+'</b> · câștigat '+acc.earned+' · cheltuit '+acc.consumed;
+  }catch(_){}
+  $('keyPlain').textContent='Bine ai revenit — cheia ta e activă.';
+  $('keyInfo').innerHTML='Cont <code>'+esc(S.addr)+'</code><br>key_id <code>'+esc(S.keyId)+'</code> · '+quotaLine+'<br>Plaintext-ul nu se mai arată (arătat o singură dată, la emitere). Pentru snippet-uri de conectare: apasă <b>Revocă + re-emite</b>.';
+  $('step3').classList.remove('hidden');
+  say('out2','Recunoscut: '+S.addr+' (cheie '+S.keyId+').','ok');
 }
 function showSnippets(tok){
   const base=location.origin+'/v1';
@@ -363,6 +382,7 @@ mod tests {
             "xPortal (aplicație)",
             "showXportal",
             "arătată o singură dată",
+            "Bine ai revenit",
             "Revocă + re-emite",
             "dca_",
         ] {
