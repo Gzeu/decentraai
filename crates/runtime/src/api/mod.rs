@@ -1631,6 +1631,13 @@ async fn openapi_handler() -> Response {
             "/api/admin/worker/trust": { "post": { "operationId": "adminTrustWorker", "summary": "Approve a worker (master only)", "responses": { "200": { "description": "Trusted" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/worker/revoke": { "post": { "operationId": "adminRevokeWorker", "summary": "Revoke a worker (master only)", "responses": { "200": { "description": "Revoked" }, "401": { "description": "Unauthorized" } } } },
             "/api/admin/events": { "get": { "operationId": "adminAuditEvents", "summary": "Recent audit events (master only)", "responses": { "200": { "description": "Events" }, "401": { "description": "Unauthorized" } } } },
+            "/v1/auth/native": { "post": { "operationId": "walletNativeExchange", "summary": "Wallet login exchange: {accessToken} -> dca_ consumer key (self-serve, wallets are consumer-only)", "responses": { "200": { "description": "Issued key (shown once)" }, "400": { "description": "Malformed/replayed token" }, "401": { "description": "Bad signature or origin" }, "409": { "description": "Key already issued for this wallet" } } } },
+            "/v1/auth/wallet/challenge": { "post": { "operationId": "walletChallenge", "summary": "Issue a signable login challenge", "responses": { "200": { "description": "Challenge" } } } },
+            "/v1/auth/wallet/verify": { "post": { "operationId": "walletVerify", "summary": "Verify a challenge signature -> session", "responses": { "200": { "description": "Session" }, "401": { "description": "Bad signature" } } } },
+            "/v1/auth/wallet/native-auth": { "post": { "operationId": "walletNativeAuth", "summary": "Verify a native-auth login token -> session", "responses": { "200": { "description": "Session" }, "400": { "description": "Replayed token" }, "401": { "description": "Bad signature or origin" } } } },
+            "/v1/auth/wallet/key": { "post": { "operationId": "walletSelfIssueKey", "summary": "Mint the wallet agent dca_ key (session, once-only plaintext)", "responses": { "200": { "description": "Issued key (shown once)" }, "409": { "description": "Key already issued" } } }, "delete": { "operationId": "walletRevokeKey", "summary": "Revoke the wallet agent key (session)", "responses": { "200": { "description": "Revoked" } } } },
+            "/v1/auth/wallet/network": { "get": { "operationId": "walletNetwork", "summary": "Server chain binding for wallet onboarding", "responses": { "200": { "description": "Network" } } } },
+            "/v1/auth/wallet/blockhash": { "get": { "operationId": "walletBlockhash", "summary": "Fresh block hash for native-auth token minting", "responses": { "200": { "description": "Block hash" } } } },
             "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
         }
     });
@@ -1682,6 +1689,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/auth/wallet/verify", post(wallet_verify_handler))
         .route("/v1/auth/wallet/session", get(wallet_session_handler))
         .route("/v1/auth/wallet/key", post(wallet_key_handler).delete(wallet_key_revoke_handler))
+        .route("/v1/auth/native", post(wallet_native_exchange_handler))
         .route("/v1/world", get(world_snapshot_handler))
         .route("/v1/world/skill", get(world_skill_handler))
         .route("/v1/world/join", post(world_join_handler))
@@ -2466,27 +2474,19 @@ async fn wallet_blockhash_handler(
     }
 }
 
-/// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
+/// Self-serve issuance shared by the first-party session endpoint
+/// (`POST /v1/auth/wallet/key`) and the third-party exchange endpoint
+/// (`POST /v1/auth/native`). Same store, same hash-only persistence, same
+/// once-only plaintext, same audit shape (distinct event per caller), same
+/// starter-quota rule: seed only when the account has nothing spendable.
 ///
-/// A live wallet session mints ONE OpenAI-compatible consumer key (`dca_`)
-/// bound to the wallet's agent, reusing the exact issuance path as the
-/// admin endpoint (same store, same hash-only persistence, same once-only
-/// plaintext, same audit shape with a distinct event name).
-///
-/// Rules (all fail-closed): the session must be live (expiry enforced by
-/// the wallet store); one active key per agent (repeats return 409 with the
-/// key_id — plaintext is shown exactly once, at creation, never re-shown);
-/// self-serve scopes (embeddings, compute, own memory) on top of the
-/// baseline, with a modest ceiling/rate, while orchestration, hub teams and
-/// privileged scopes stay on the admin grant path; the consumer ledger must
-/// be attached (same gate as admin). First issuance also seeds starter
-/// quota (no re-grant on rotation).
-/// The key is fabric-scoped (chain-agnostic): it works identically for
-/// testnet and mainnet wallets. Chain submission stays on its own lane.
-async fn wallet_key_handler(
-    State(state): State<ApiState>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
+/// Rules (all fail-closed): one active key per agent (repeats return 409
+/// with the key_id — plaintext is shown exactly once, at creation, never
+/// re-shown); self-serve scopes (embeddings, compute, own memory);
+/// orchestration, hub teams and privileged scopes stay on the admin grant
+/// path. The key is fabric-scoped (chain-agnostic): identical for testnet
+/// and mainnet wallets. A wallet NEVER yields a master/operator credential.
+fn issue_wallet_consumer_key(state: &ApiState, agent_id: &String, wallet_address: &str) -> Response {
     /// Self-serve defaults: modest enough to be safe unattended, useful
     /// enough for real onboarding (matches the consumer test baseline).
     const SELF_SERVE_QUOTA_CEILING: u64 = 1000;
@@ -2500,29 +2500,6 @@ async fn wallet_key_handler(
     /// revoke don't re-grant) — same pattern as world onboarding.
     const SELF_SERVE_STARTER_QUOTA: u64 = 100;
 
-    let session_token = body
-        .get("session_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if session_token.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok": false, "error": "session_token required (log in via /v1/auth/wallet/verify first)"})),
-        )
-            .into_response();
-    }
-    let session = match state.wallet_session_for_token(session_token) {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::json!({"ok": false, "error": "unknown or expired wallet session"}),
-                ),
-            )
-                .into_response();
-        }
-    };
     if !state.consumer_enabled() {
         return (
             StatusCode::NOT_FOUND,
@@ -2553,7 +2530,7 @@ async fn wallet_key_handler(
     if let Some(existing) = store
         .list()
         .iter()
-        .find(|r| r.owner_account == session.agent_id && !r.revoked && !store.is_expired(r))
+        .find(|r| &r.owner_account == agent_id && !r.revoked && !store.is_expired(r))
     {
         return (
             StatusCode::CONFLICT,
@@ -2568,7 +2545,7 @@ async fn wallet_key_handler(
     }
     let scopes: Vec<String> = SELF_SERVE_SCOPES.iter().map(|s| s.to_string()).collect();
     let plaintext = match store.create(
-        &session.agent_id,
+        agent_id,
         SELF_SERVE_QUOTA_CEILING,
         SELF_SERVE_RATE_PER_MIN,
         scopes.clone(),
@@ -2587,8 +2564,8 @@ async fn wallet_key_handler(
         a.parent().unwrap_or(&state.info.repo_root),
         "consumer_key_self_issued",
         serde_json::json!({
-            "account": session.agent_id,
-            "wallet": session.wallet_address,
+            "account": agent_id,
+            "wallet": wallet_address,
             "key_prefix": decentraai_tokens::key_prefix(&plaintext),
             "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
@@ -2602,10 +2579,7 @@ async fn wallet_key_handler(
     let mut starter_granted = false;
     if let Some(ledger) = &state.quota_ledger {
         let mut l = ledger.lock().unwrap();
-        let has = l
-            .account(&session.agent_id)
-            .map_or(0, |a| a.spendable())
-            > 0;
+        let has = l.account(agent_id).map_or(0, |a| a.spendable()) > 0;
         if !has {
             let ref_id = format!(
                 "wallet-onboard-seed-{}",
@@ -2615,7 +2589,7 @@ async fn wallet_key_handler(
                     .unwrap_or(0)
             );
             l.credit(
-                &session.agent_id,
+                agent_id,
                 &ref_id,
                 Some(SELF_SERVE_STARTER_QUOTA as u32),
                 None,
@@ -2633,10 +2607,11 @@ async fn wallet_key_handler(
         Json(serde_json::json!({
             "ok": true,
             "token": plaintext,
+            "consumerKey": plaintext,
             "key_id": key_id,
             "key_prefix": decentraai_tokens::key_prefix(&plaintext),
-            "account": session.agent_id,
-            "wallet": session.wallet_address,
+            "account": agent_id,
+            "wallet": wallet_address,
             "quota_ceiling": SELF_SERVE_QUOTA_CEILING,
             "rate_limit_per_minute": SELF_SERVE_RATE_PER_MIN,
             "starter_quota": SELF_SERVE_STARTER_QUOTA,
@@ -2646,6 +2621,131 @@ async fn wallet_key_handler(
         })),
     )
         .into_response()
+}
+
+/// POST /v1/auth/native — third-party wallet exchange (Shape B).
+///
+/// The exact contract the Perchance orchestrator speaks: it signs the user
+/// in with a real MultiversX wallet (extension/Web Wallet) and POSTs
+/// `{accessToken, address?, network?, origin?}` where
+/// `accessToken = b64url(address).b64url(loginToken).sigHex`. The fabric
+/// verifies the SAME native-auth core as the first-party login
+/// (shape/ttl/origin/signature, one-time consumption — a token buys exactly
+/// one exchange), then mints-or-reuses the wallet's `dca_` consumer key via
+/// the shared self-serve issuance above.
+///
+/// Responses: 200 + `{ok, token: dca_…, …}` on first issuance (the
+/// `{consumerKey}` shape the client accepts); 409 + `key_id` when the
+/// wallet agent already holds a key (plaintext is never re-shown —
+/// rotate via revoke + reissue); 400 malformed, 401 bad signature/origin,
+/// 403 never (onboarding is self-serve).
+async fn wallet_native_exchange_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let req: crate::wallet_auth::WalletNativeExchangeRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok": false, "error": "body must be {accessToken, address?, network?, origin?}"})),
+            )
+                .into_response();
+        }
+    };
+    // Pre-decode the token origin so denials can echo it: the operator
+    // copies the exact string into DECENTRAAI_AUTH_ORIGINS (echoing the
+    // caller's own token origin leaks nothing new).
+    let attempted_origin = req
+        .access_token
+        .split('.')
+        .nth(1)
+        .and_then(|_| {
+            crate::wallet_auth::parse_access_token(&req.access_token)
+                .ok()
+                .map(|(_, login_token, _)| login_token)
+        })
+        .and_then(|t| crate::wallet_auth::extract_token_origin(&t));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Scope the store lock: verify + persist, then RELEASE before any
+    // further locking (re-locking the same mutex would deadlock).
+    let login = {
+        let mut store = state.wallet_auth.lock().unwrap();
+        let result = store.verify_access_token(req, now);
+        let _ = store.save(&state.wallet_auth_path);
+        result
+    };
+    let login = match login {
+        Ok(l) => l,
+        Err(e) => {
+            let attempted = attempted_origin.unwrap_or_default();
+            let origin_hint = if attempted.is_empty() {
+                String::new()
+            } else {
+                format!(" (token origin was '{attempted}')")
+            };
+            let (status, error) = match &e {
+                crate::wallet_auth::WalletAuthError::OriginNotAllowed => (
+                    StatusCode::UNAUTHORIZED,
+                    format!("native-auth origin not allowed{origin_hint}"),
+                ),
+                crate::wallet_auth::WalletAuthError::SignatureInvalid => {
+                    (StatusCode::UNAUTHORIZED, "signature verification failed".to_string())
+                }
+                crate::wallet_auth::WalletAuthError::TokenReplay => (
+                    StatusCode::BAD_REQUEST,
+                    "native-auth token already used".to_string(),
+                ),
+                crate::wallet_auth::WalletAuthError::AddressMismatch => (
+                    StatusCode::BAD_REQUEST,
+                    "address does not match accessToken".to_string(),
+                ),
+                _ => (StatusCode::BAD_REQUEST, "malformed native-auth token".to_string()),
+            };
+            return (status, Json(serde_json::json!({"ok": false, "error": error}))).into_response();
+        }
+    };
+    issue_wallet_consumer_key(&state, &login.agent_id, &login.wallet_address)
+}
+
+/// POST /v1/auth/wallet/key — xPortal self-serve onboarding.
+///
+/// A live wallet session mints ONE OpenAI-compatible consumer key (`dca_`)
+/// bound to the wallet's agent via the shared [`issue_wallet_consumer_key`]
+/// issuance (same store, same hash-only persistence, same once-only
+/// plaintext, same audit shape with a distinct event name).
+async fn wallet_key_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let session_token = body
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "error": "session_token required (log in via /v1/auth/wallet/verify first)"})),
+        )
+            .into_response();
+    }
+    let session = match state.wallet_session_for_token(session_token) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    serde_json::json!({"ok": false, "error": "unknown or expired wallet session"}),
+                ),
+            )
+                .into_response();
+        }
+    };
+    // Shared self-serve issuance (same store/quotas/audit as /v1/auth/native).
+    issue_wallet_consumer_key(&state, &session.agent_id, &session.wallet_address)
 }
 
 /// DELETE /v1/auth/wallet/key — self-serve key revocation (rotation, step 1).
@@ -19150,6 +19250,10 @@ mod tests {
         assert_eq!(spec["info"]["version"], "1.0.0");
         assert!(spec["paths"]["/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/v1/compute"].is_object());
+        // Wallet onboarding surface is discoverable (third-party consoles
+        // probe it before offering login-with-wallet).
+        assert!(spec["paths"]["/v1/auth/native"].is_object());
+        assert!(spec["paths"]["/v1/auth/wallet/key"].is_object());
         manager.lock().await.shutdown().await.unwrap();
     }
 
@@ -24590,6 +24694,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn wallet_native_exchange_mints_consumer_key() {
+        // Shape B (third-party console contract): accessToken envelope →
+        // verify → dca_ issuance. Uses a bare-hostname origin + 86400s TTL
+        // (official SDK defaults) to lock the interoperable surface.
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mint = |nonce: &str| {
+            let token = format!(
+                "{}.{}.{}.{}",
+                b64.encode("decentraai.duckdns.org"),
+                "ab".repeat(32),
+                86400,
+                b64.encode(format!(r#"{{"n":"{nonce}"}}"#))
+            );
+            let sig = signing.sign(format!("{wallet}{token}").as_bytes());
+            format!(
+                "{}.{}.{}",
+                b64.encode(&wallet),
+                b64.encode(&token),
+                hex::encode(sig.to_bytes())
+            )
+        };
+        let access = mint("first");
+        let issued: serde_json::Value = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({
+                "accessToken": access,
+                "address": wallet,
+                "network": "testnet",
+                "origin": "decentraai.duckdns.org",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(issued["ok"], true, "exchange mints: {issued}");
+        let key = issued["token"].as_str().unwrap().to_string();
+        assert!(key.starts_with("dca_"), "OpenAI-compatible key");
+        assert_eq!(issued["consumerKey"].as_str().unwrap(), key);
+        // Same envelope twice = replay (the token bought one exchange).
+        let replay = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": access}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), 400);
+        // Fresh token, same wallet = already issued (plaintext never re-shown).
+        let second = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": mint("second")}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 409);
+        let body: serde_json::Value = second.json().await.unwrap();
+        assert!(body["key_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn wallet_native_exchange_rejects_forgeries() {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let other = SigningKey::from_bytes(&[12u8; 32]);
+        let wallet = crate::wallet_auth::encode_wallet_address(&signing.verifying_key().to_bytes())
+            .expect("test key encodes");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!(
+            "{}.{}.{}.{}",
+            b64.encode("decentraai.duckdns.org"),
+            "ef".repeat(32),
+            86400,
+            b64.encode("{}")
+        );
+        let access = |sig: &SigningKey| {
+            let s = sig.sign(format!("{wallet}{token}").as_bytes());
+            format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&token), hex::encode(s.to_bytes()))
+        };
+        // Wrong key signs → 401.
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": access(&other)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        // Claimed address ≠ token address → 400.
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": access(&signing), "address": "erd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        // Malformed envelope (2 parts) → 400.
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": "abc.def"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        // Past-TTL token → refused (ttl below the 60s floor).
+        let stale_token = format!(
+            "{}.{}.{}.{}",
+            b64.encode("decentraai.duckdns.org"),
+            "ef".repeat(32),
+            10,
+            b64.encode("{}")
+        );
+        let s = signing.sign(format!("{wallet}{stale_token}").as_bytes());
+        let stale = format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&stale_token), hex::encode(s.to_bytes()));
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": stale}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        // Disallowed origin → 401 that echoes the attempted origin so the
+        // operator can copy it into DECENTRAAI_AUTH_ORIGINS.
+        let foreign_token = format!(
+            "{}.{}.{}.{}",
+            b64.encode("evil.example"),
+            "ef".repeat(32),
+            86400,
+            b64.encode("{}")
+        );
+        let s = signing.sign(format!("{wallet}{foreign_token}").as_bytes());
+        let foreign = format!("{}.{}.{}", b64.encode(&wallet), b64.encode(&foreign_token), hex::encode(s.to_bytes()));
+        let r = client
+            .post(format!("http://{api}/v1/auth/native"))
+            .json(&serde_json::json!({"accessToken": foreign}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("evil.example"));
     }
 
     #[tokio::test]

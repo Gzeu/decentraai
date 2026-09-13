@@ -10,8 +10,10 @@ const DEFAULT_NETWORK: &str = "multiversx-testnet";
 const CHALLENGE_TTL_SECS: u64 = 300;
 const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 /// Native-auth token TTL bounds (seconds): prevents forever-tokens.
+/// Upper bound 86400 matches the official JS `sdk-native-auth-client`
+/// default and third-party consoles built on it (Perchance orchestrator).
 const NATIVE_AUTH_MIN_TTL: u64 = 60;
-const NATIVE_AUTH_MAX_TTL: u64 = 3600;
+const NATIVE_AUTH_MAX_TTL: u64 = 86400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletIdentityBinding {
@@ -110,6 +112,53 @@ pub struct WalletNativeAuthRequest {
     pub display_name: Option<String>,
 }
 
+/// Native-auth exchange request (third-party console contract, Shape B).
+/// `accessToken = b64url(address).b64url(loginToken).sigHex` — the exact
+/// envelope `@multiversx/sdk-native-auth-client` wallets produce and the
+/// Perchance orchestrator sends to `POST /v1/auth/native`. Optional fields
+/// are cross-checks only; the token itself is authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletNativeExchangeRequest {
+    #[serde(rename = "accessToken")]
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// Split an `accessToken` envelope into (address, login_token, sig_hex).
+/// Fail-closed on shape: exactly 3 non-empty dot parts, first two valid
+/// b64url UTF-8, third an even-length hex string.
+pub fn parse_access_token(access_token: &str) -> Result<(String, String, String), WalletAuthError> {
+    if access_token.len() > 4096 {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    let address = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|_| WalletAuthError::MalformedToken)?,
+    )
+    .map_err(|_| WalletAuthError::MalformedToken)?;
+    let login_token = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|_| WalletAuthError::MalformedToken)?,
+    )
+    .map_err(|_| WalletAuthError::MalformedToken)?;
+    let sig = parts[2];
+    if sig.len() != 128 || !sig.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    Ok((address, login_token, sig.to_string()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletLoginResponse {
     pub wallet_address: String,
@@ -166,6 +215,10 @@ pub(crate) fn network_name() -> String {
 
 /// Origins allowed to mint native-auth tokens (exact match on the token's
 /// decoded origin). Comma-separated override via DECENTRAAI_AUTH_ORIGINS.
+/// Both bare hostnames (the official JS SDK default: `location.hostname`)
+/// and full origins are accepted so first-party pages and third-party
+/// consoles (e.g. a Perchance app with its Auth-origin field pointed at the
+/// fabric host) work without server changes.
 pub(crate) fn auth_origins() -> Vec<String> {
     std::env::var("DECENTRAAI_AUTH_ORIGINS")
         .map(|v| {
@@ -176,11 +229,25 @@ pub(crate) fn auth_origins() -> Vec<String> {
         })
         .unwrap_or_else(|_| {
             vec![
+                "decentraai.duckdns.org".to_string(),
                 "https://decentraai.duckdns.org".to_string(),
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
                 "http://127.0.0.1:8080".to_string(),
                 "http://localhost:8080".to_string(),
             ]
         })
+}
+
+/// Best-effort decode of a login token's origin (for error messages only —
+/// never trusted). Lets an operator copy the exact string into
+/// DECENTRAAI_AUTH_ORIGINS.
+pub fn extract_token_origin(login_token: &str) -> Option<String> {
+    let first = login_token.split('.').next()?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(first)
+        .ok()?;
+    String::from_utf8(raw).ok()
 }
 
 #[allow(dead_code)]
@@ -552,8 +619,47 @@ impl WalletAuthStore {
         })
     }
 
-    pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {
-        self.cleanup(now);
+    /// Verify a third-party `accessToken` envelope (Shape B exchange).
+    ///
+    /// Parses `b64url(address).b64url(loginToken).sigHex`, cross-checks the
+    /// optional convenience fields (address/origin must match the token when
+    /// present — fail-closed on confusion), then delegates to the exact same
+    /// [`Self::verify_native_auth`] core: same shape/ttl/origin/signature
+    /// gates, same one-time consumption. Returns the canonical address plus
+    /// the issued session login (callers mint a credential off it).
+    pub fn verify_access_token(
+        &mut self,
+        req: WalletNativeExchangeRequest,
+        now: u64,
+    ) -> Result<WalletLoginResponse, WalletAuthError> {
+        if req.access_token.len() > 4096 {
+            return Err(WalletAuthError::MalformedToken);
+        }
+        let (address, login_token, sig_hex) = parse_access_token(&req.access_token)?;
+        if let Some(claimed) = req.address.as_ref() {
+            if claimed != &address {
+                return Err(WalletAuthError::AddressMismatch);
+            }
+        }
+        if let Some(claimed_origin) = req.origin.as_ref() {
+            match extract_token_origin(&login_token) {
+                Some(token_origin) if &token_origin == claimed_origin => {}
+                _ => return Err(WalletAuthError::OriginNotAllowed),
+            }
+        }
+        self.verify_native_auth(
+            WalletNativeAuthRequest {
+                wallet_address: address,
+                token: login_token,
+                signature: sig_hex,
+                agent_id: None,
+                display_name: None,
+            },
+            now,
+        )
+    }
+
+    pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {        self.cleanup(now);
         self.sessions
             .get(token)
             .cloned()

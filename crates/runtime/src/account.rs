@@ -69,6 +69,7 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 </style></head><body>
 <h1>● DecentraAI <span>Cont</span><span class="badge" id="nodeNet">nod: …</span></h1>
 <p class="sub">Conectează wallet-ul MultiversX (testnet sau mainnet) și primești cheia de acces în fabrică — <code>dca_</code>, compatibilă OpenAI. Fără cont anterior, fără master.</p>
+<!-- Console terțe (ex. orchestratorul Perchance): login cu portofelul via POST /v1/auth/native {accessToken} → {consumerKey}; Bearer accessToken direct pe /mcp NU e acceptat (401, fail-closed) — schimbul emite cheia revocabilă. -->
 
 <div class="card" id="step1"><h2><span class="n">1</span>Rețeaua ta</h2>
 <div class="row">
@@ -204,13 +205,14 @@ function copyKey(){const t=S.key||'(nemaifișată)';navigator.clipboard.writeTex
 function copyMsg(){if(S.manChal)navigator.clipboard.writeText(S.manChal.message).then(()=>say('out2','Mesaj copiat — semnează-l exact în wallet și lipește semnătura.','ok'));else say('out2','Cere întâi mesajul (pasul 1).','err');}
 function b64urlStr(s){const b=new TextEncoder().encode(s);let bin='';for(let i=0;i<b.length;i++)bin+=String.fromCharCode(b[i]);return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
 // Native-auth token (official shape): b64url(origin).blockhash.ttl.b64url(extra).
+// Origin = bare hostname (the official JS SDK default — servers allow-list
+// it; full-URL origins also accepted server-side). TTL 86400 = SDK default.
 async function nativeToken(){
-  const net=S.net==='multiversx-mainnet'?'mainnet':'testnet';
-  const r=await fetch('/v1/auth/wallet/blockhash?network='+net);
+  const r=await fetch('/v1/auth/wallet/blockhash?network='+(S.net==='multiversx-mainnet'?'mainnet':'testnet'));
   const j=await r.json();
   if(!j.ok||!/^[0-9a-fA-F]{64}$/.test(j.hash||''))throw new Error('blockhash indisponibil — reîncearcă.');
-  const extra=b64urlStr(JSON.stringify({app:'decentraai-account'}));
-  return b64urlStr(location.origin)+'.'+j.hash+'.600.'+extra;
+  const extra=b64urlStr(JSON.stringify({}));
+  return b64urlStr(location.hostname)+'.'+j.hash+'.86400.'+extra;
 }
 async function doNativeVerify(addr,token,sig){
   const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
@@ -218,6 +220,76 @@ async function doNativeVerify(addr,token,sig){
   S.session=r.json.session_token;S.addr=r.json.wallet_address;
   await mintKey();
 }
+// ---- canal brut erdw-inpage (fără SDK): op 'connect' + token STRING ----
+// Forma exactă pe care o vorbește extensia oficială (același canal ca
+// provider-ul SDK): postMessage({target:'erdw-inpage',type:'connect',
+// data:<loginToken>}), răspuns 'erdw-contentScript'/connectResponse cu
+// {address, signature}. Fără dependențe, fără singleton-uri.
+function extRaw(op,data,timeoutMs){
+  return new Promise((resolve,reject)=>{
+    let done=false;
+    const timer=setTimeout(()=>fin(false,new Error('extensia nu a răspuns — e deblocată?')),timeoutMs||90000);
+    function fin(ok,v){if(done)return;done=true;clearTimeout(timer);window.removeEventListener('message',h);if(ok)resolve(v);else reject(v);}
+    function h(ev){const d=ev&&ev.data;if(!d||typeof d!=='object')return;if(String(d.target||'').toLowerCase()!=='erdw-contentscript')return;if(/cancel/i.test(String(d.type||''))){fin(false,new Error('anulat în wallet'));return;}fin(true,d.data);}
+    window.addEventListener('message',h,false);
+    try{window.postMessage({target:'erdw-inpage',type:op,data:data},window.origin);}catch(e){fin(false,e);}
+  });
+}
+async function extRawLogin(token){
+  const res=await extRaw('connect',token);
+  const addr=res&&(res.address||(res.data&&res.data.address));
+  const sig=res&&(res.signature||(res.data&&res.data.signature));
+  if(!addr||!sig)throw new Error('extensia n-a întors adresă/semnătură (anulat?).');
+  return{addr:String(addr),sig:String(sig)};
+}
+// ---- Web Wallet oficial: hook/login (wallet-ul semnează token-ul) ----
+// Popup-ul răspunde LOGIN_RESPONSE către window.opener; același-tab
+// revine cu ?address=…&signature=… (token-ul stă în sessionStorage).
+function webHookUrl(token){
+  const wurl=S.net==='multiversx-mainnet'?'https://wallet.multiversx.com':'https://testnet-wallet.multiversx.com';
+  const cb=location.origin+location.pathname;
+  return wurl+'/hook/login?token='+encodeURIComponent(token)+'&callbackUrl='+encodeURIComponent(cb);
+}
+async function connectWebHook(){
+  const token=await nativeToken();
+  try{sessionStorage.setItem('decentraai.pending.native',token);}catch(_){}
+  say('out2','Se deschide Web Wallet-ul oficial — autentifică-te acolo…','');
+  const got=await new Promise((resolve)=>{
+    let done=false;
+    function h(ev){
+      try{
+        const d=ev&&ev.data;if(!d||typeof d!=='object')return;
+        if(!/^LOGIN_RESPONSE$/i.test(String(d.type||'')))return;
+        if(!/wallet\.multiversx\.com$/i.test(String(ev.origin||'')))return;
+        const data=(d.payload&&d.payload.data)||d.data||{};
+        if(data.address&&data.signature){done=true;window.removeEventListener('message',h);resolve({address:String(data.address),signature:String(data.signature)});}
+      }catch(_){}
+    }
+    window.addEventListener('message',h,false);
+    let popup=null;
+    try{popup=window.open(webHookUrl(token),'mx-web-wallet','width=520,height=780');}catch(_){popup=null;}
+    if(popup&&!popup.closed){setTimeout(()=>{if(!done){window.removeEventListener('message',h);resolve(null);}},180000);}
+    else{try{location.href=webHookUrl(token);}catch(_){}resolve(null);}
+  });
+  if(!got)throw new Error('fără răspuns de la Web Wallet.');
+  S.lastSig=got.signature;S.lastToken=token;
+  say('out2','Token nativ semnat de '+got.address+' — verific…','');
+  await doNativeVerify(got.address,token,got.signature);
+}
+// Revenire același-tab din hook/login (?address&signature).
+(function webHookCallback(){
+  try{
+    const q=location.search||'';if(q.length<3)return;
+    const p=new URLSearchParams(q.replace(/^\?/,''));const addr=p.get('address'),sig=p.get('signature');
+    if(!addr||!sig)return;
+    let token=null;try{token=sessionStorage.getItem('decentraai.pending.native');}catch(_){}
+    try{history.replaceState(null,'',location.origin+location.pathname+(location.hash||''));}catch(_){}
+    if(!token){say('out2','Web Wallet a răspuns, dar token-ul de login lipsește (alt tab?). Reîncearcă.','err');return;}
+    say('out2','Răspuns Web Wallet — verific…','');
+    S.lastSig=sig;S.lastToken=token;
+    doNativeVerify(addr,token,sig).catch(e=>say('out2','Web Wallet: '+String(e.message||e).slice(0,300),'err'));
+  }catch(_){}
+})();
 // Documented SignableMessage shape (sdk-core, cached import). The docs
 // pass `new SignableMessage({message})` — providers read the documented
 // field; raw {data} stays as fallback.
@@ -296,10 +368,23 @@ async function connectExtension(){
     await p.init();
     if(typeof p.isInitialized==='function'&&!p.isInitialized())throw new Error('Extensia DeFi/MultiversX nu e instalată sau nu e activată pentru site-ul ăsta.');
     if(typeof p.login!=='function')throw new Error('provider fără login(). Încearcă Manual.');
-    // Calea oficială: login cu token native-auth (portofelul semnează
-    // token-ul; semnătura se verifică server-side, ca la SDK-ul oficial).
+    // Calea oficială: token native-auth semnat de portofel.
+    // Întâi canalul brut (forma exactă a extensiei: 'connect' + STRING),
+    // apoi provider-ul SDK, apoi challenge-ul clasic.
+    let token=null;
     try{
-      const token=await nativeToken();
+      token=await nativeToken();
+      say('out2','Token nativ emis — aștept semnătura extensiei…','');
+      const raw=await extRawLogin(token);
+      say('out2','Token nativ semnat de '+raw.addr+' — verific…','');
+      S.lastSig=raw.sig;S.lastToken=token;
+      await doNativeVerify(raw.addr,token,raw.sig);
+      return;
+    }catch(e){
+      say('out2','Canal brut indisponibil ('+String(e.message||e).slice(0,120)+') — încerc provider-ul…','warn');
+    }
+    try{
+      if(!token)token=await nativeToken();
       await p.login({token:token});
       const addr2=await providerAddress(p);
       if(!addr2)throw new Error('login-token ok, dar adresa lipsește.');
@@ -343,9 +428,13 @@ async function connectExtension(){
     say('out2','Extension: '+String(e.message||e).slice(0,300)+dbg,'err');
   }
 }
-// ---- metoda: Web Wallet cross-window (popup oficial, fără conturi) ----
+// ---- metoda: Web Wallet (hook/login oficial, apoi provider popup) ----
 function popupsAllowed(){try{const t=window.open('about:blank','_blank','width=10,height=10');if(!t||t.closed)return false;t.close();return true;}catch(_){return false;}}
 async function connectXWindow(){
+  // Întâi fluxul oficial hook/login (wallet-ul semnează token-ul nativ);
+  // la eșec, provider-ul cross-window clasic cu challenge.
+  try{await connectWebHook();return;}
+  catch(e){say('out2','hook/login indisponibil ('+String(e.message||e).slice(0,120)+') — încerc provider-ul…','warn');}
   if(!popupsAllowed()){say('out2','Web Wallet are nevoie de popup-uri: permite-le pentru site-ul ăsta (pictograma din bara de adrese), apoi reîncearcă.','warn');return;}
   say('out2','Se încarcă provider-ul Web Wallet…','');
   try{
@@ -452,6 +541,10 @@ mod tests {
             "/v1/auth/wallet/network",
             "/v1/auth/wallet/native-auth",
             "/v1/auth/wallet/blockhash",
+            "/v1/auth/native",
+            "/hook/login",
+            "LOGIN_RESPONSE",
+            "erdw-inpage",
             "getInstance",
             "signMessage({data",
             "xPortal (aplicație)",
