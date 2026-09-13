@@ -25,6 +25,11 @@ pub const MX_XWINDOW_PROVIDER_URL: &str =
     "https://cdn.jsdelivr.net/npm/@multiversx/sdk-web-wallet-cross-window-provider@3.2.2/+esm";
 /// Pinned sdk-core (documented SignableMessage shape for signMessage).
 pub const MX_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/@multiversx/sdk-core@15.3.1/+esm";
+/// Pinned noble ed25519 (sync browser build): in-page identity keygen +
+/// signing. The page controls every byte — no wallet software involved.
+pub const MX_NOBLE_ED25519_URL: &str = "https://cdn.jsdelivr.net/npm/@noble/ed25519@1.7.3/+esm";
+/// Pinned bech32 (same version MultiversX ships): pubkey → erd1 address.
+pub const MX_BECH32_URL: &str = "https://cdn.jsdelivr.net/npm/bech32@1.1.4/+esm";
 /// Official Web Wallet URLs (popup target per selected network).
 pub const MX_WEB_WALLET_MAINNET: &str = "https://wallet.multiversx.com";
 pub const MX_WEB_WALLET_TESTNET: &str = "https://testnet-wallet.multiversx.com";
@@ -35,6 +40,8 @@ pub fn account_html() -> String {
         .replace("/*__MX_EXTENSION_URL__*/", MX_EXTENSION_PROVIDER_URL)
         .replace("/*__MX_XWINDOW_URL__*/", MX_XWINDOW_PROVIDER_URL)
         .replace("/*__MX_CORE_URL__*/", MX_CORE_URL)
+        .replace("/*__MX_NOBLE_URL__*/", MX_NOBLE_ED25519_URL)
+        .replace("/*__MX_BECH32_URL__*/", MX_BECH32_URL)
 }
 
 const ACCOUNT_HTML: &str = r##"<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Cont</title>
@@ -75,6 +82,7 @@ code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(-
 <div class="row">
 <button id="mExt" onclick="connectExtension()">DeFi Extension</button>
 <button id="mWeb" onclick="connectXWindow()">Web Wallet (popup)</button>
+<button id="mGen" onclick="genIdentity()">Generează identitate locală</button>
 <button id="mXpo" onclick="showXportal()">xPortal (aplicație)</button>
 <button id="mMan" onclick="showManual()">Manual / alt wallet</button>
 </div>
@@ -228,6 +236,36 @@ async function providerSign(p,message){
   throw new Error('semnare eșuată ['+errs.join(' | ').slice(0,420)+']. Încearcă Manual.');
 }
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// ---- metoda: identitate locală (zero wallet software) ----
+// Cheia se naște în browser (CSPRNG), adresa = bech32(pubkey), semnarea
+// e locală pe bytes-ii exacți ai challenge-ului. Calea care nu poate
+// pica din cauza vreunui wallet: noi controlăm toți bytes-ii.
+// Cheia privată rămâne în localStorage (profilul browserului): identitate
+// de fabrică (acces API), NU ține fonduri — pentru fonduri, wallet-ul.
+function hexBytes(b){return [...b].map(x=>x.toString(16).padStart(2,'0')).join('');}
+function unhex(h){const o=new Uint8Array(h.length/2);for(let i=0;i<o.length;i++)o[i]=parseInt(h.substr(i*2,2),16);return o;}
+async function genIdentity(){
+  say('out2','Se generează identitatea…','');
+  try{
+    const edMod=await import('/*__MX_NOBLE_URL__*/');
+    const ed=edMod.default||edMod;
+    const bMod=await import('/*__MX_BECH32_URL__*/');
+    const B=bMod.bech32||bMod.default||bMod;
+    if(typeof ed.getPublicKey!=='function'||typeof ed.sign!=='function')throw new Error('librăria ed25519 nu s-a încărcat. Reîncearcă.');
+    if(typeof B.encode!=='function'||typeof B.toWords!=='function')throw new Error('librăria bech32 nu s-a încărcat. Reîncearcă.');
+    let seedHex=null;
+    try{seedHex=localStorage.getItem('decentraai.identity.seed');}catch(_){}
+    let priv;
+    if(seedHex&&/^[0-9a-fA-F]{64}$/.test(seedHex)){priv=unhex(seedHex);}
+    else{priv=crypto.getRandomValues(new Uint8Array(32));try{localStorage.setItem('decentraai.identity.seed',hexBytes(priv));}catch(_){}}
+    const pub=await ed.getPublicKey(priv);
+    const addr=B.encode('erd',B.toWords(pub));
+    say('out2','Identitate: '+addr+' — cere challenge…','');
+    const chal=await getChallenge(addr);
+    const sig=hexBytes(await ed.sign(msgBytes(chal.message),priv));
+    await doVerify(addr,chal.challenge_id,sig);
+  }catch(e){say('out2','Identitate locală: '+String(e.message||e).slice(0,300),'err');}
+}
 // ---- metoda: DeFi Extension (SDK pin-uit, import dinamic) ----
 // Provider-ul e SINGLETON: getInstance(), nu create/new. init() confirmă
 // extensia (window.multiversxWallet); login() populează account.address;
@@ -371,6 +409,7 @@ mod tests {
             "multiversx-mainnet",
             "DeFi Extension",
             "Web Wallet (popup)",
+            "Generează identitate locală",
             "xPortal (aplicație)",
             "Manual / alt wallet",
             "/v1/auth/wallet/challenge",
@@ -404,7 +443,9 @@ mod tests {
             !html.contains("/*__MX_EXTENSION_URL__*/"),
             "URL placeholders must be substituted"
         );
-        for bad in ["dsk_", "BEGIN PRIVATE", "seed"] {
+        // No secret material in the template: the identity seed lives only
+        // in the visitor's localStorage, never in served HTML.
+        for bad in ["dsk_", "BEGIN PRIVATE", "mnemonic"] {
             assert!(!html.contains(bad), "template must not contain: {bad}");
         }
         // First-party only: no WalletConnect/QR/external-relay references.
@@ -423,6 +464,12 @@ mod tests {
             MX_CORE_URL,
         ] {
             assert!(url.starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
+            assert!(url.ends_with("/+esm"));
+            assert!(!url.contains("@latest"), "must pin exact version: {url}");
+        }
+        // Crypto primitives: same pin discipline, different vendors.
+        for url in [MX_NOBLE_ED25519_URL, MX_BECH32_URL] {
+            assert!(url.starts_with("https://cdn.jsdelivr.net/npm/"));
             assert!(url.ends_with("/+esm"));
             assert!(!url.contains("@latest"), "must pin exact version: {url}");
         }
