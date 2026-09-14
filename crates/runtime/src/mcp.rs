@@ -535,11 +535,12 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "hub_execute",
-            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation.",
+            description: "Execute a Hub task via team (MCP, dca_): task_id. Distributes reward via QuotaLedger to team members by share, generates evidence, advances reputation. Re-executing a settled task is idempotent (returns existing evidence). Optional deliverable_hash (64 hex) binds a work artifact, surfaced in the settlement receipt.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string", "description": "Task id to execute" }
+                    "task_id": { "type": "string", "description": "Task id to execute" },
+                    "deliverable_hash": { "type": "string", "description": "Optional hash of the work deliverable (64 hex chars)" }
                 },
                 "required": ["task_id"],
                 "additionalProperties": false
