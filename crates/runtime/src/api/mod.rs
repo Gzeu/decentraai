@@ -6295,6 +6295,25 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     .into_response();
             }
         };
+        // Deliverable hash validated before anything mutates (same rule as
+        // the REST path; receipt-grade binding for passports).
+        let deliverable = match args.get("deliverable_hash") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(dh) if dh.len() == 64 && dh.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    Some(dh.to_string())
+                }
+                _ => {
+                    ctx.hub_action =
+                        serde_json::json!({"error": "deliverable_hash must be 64 hex chars"});
+                    return (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&ctx.hub_action).unwrap_or_default(),
+                    )
+                        .into_response();
+                }
+            },
+        };
         hub.mark_executing(&task_id);
         let team_members: Vec<(String, u8)> = hub
             .teams
@@ -6326,7 +6345,15 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                 }
             }
         }
-        hub.settle(&task_id, Some(evidence_id.clone()));
+        // Receipt-grade record (same as the REST path — no divergence).
+        let _settle_tick = hub.tick;
+        hub.record_settlement(
+            &task_id,
+            evidence_id.clone(),
+            executor.to_string(),
+            _settle_tick,
+            deliverable.clone(),
+        );
         hub.advance_tick();
         let path = crate::hub::hub_path_for(&state.info.repo_root);
         crate::hub::save_hub_state(&path, &hub);
@@ -8696,6 +8723,28 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     .into_response();
             }
         };
+        // Deliverable hash validated before anything mutates (same rule as
+        // the REST path; receipt-grade binding for passports).
+        let deliverable = match args.get("deliverable_hash") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(dh) if dh.len() == 64 && dh.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    Some(dh.to_string())
+                }
+                _ => {
+                    let id = serde_json::from_str::<serde_json::Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.get("id").cloned())
+                        .unwrap_or(serde_json::Value::Null);
+                    let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32602, "message": "deliverable_hash must be 64 hex chars"}});
+                    return (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&body).unwrap_or_default(),
+                    )
+                        .into_response();
+                }
+            },
+        };
         hub.mark_executing(&task_id);
         let team_members: Vec<(String, u8)> = hub
             .teams
@@ -8723,7 +8772,15 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 }
             }
         }
-        hub.settle(&task_id, Some(evidence_id.clone()));
+        // Receipt-grade record (same as the REST path — no divergence).
+        let _settle_tick = hub.tick;
+        hub.record_settlement(
+            &task_id,
+            evidence_id.clone(),
+            account.clone(),
+            _settle_tick,
+            deliverable.clone(),
+        );
         hub.advance_tick();
         let path = crate::hub::hub_path_for(&state.info.repo_root);
         crate::hub::save_hub_state(&path, &hub);
@@ -25350,8 +25407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_settle_receipt_round_trip() {
-        // Settle → receipt: winners with ledger refs, recomputable
+    async fn hub_settle_receipt_round_trip() {        // Settle → receipt: winners with ledger refs, recomputable
         // preimage, deliverable binding. Unknown task → 404, bad
         // deliverable hash → 400 (fail-fast, nothing mutates).
         let dir = tempfile::tempdir().unwrap();
@@ -25425,6 +25481,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nf.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn hub_mcp_consumer_execute_sets_receipt_fields() {
+        // The MCP consumer path used to settle WITHOUT receipt fields
+        // (duplicated settle logic). It must now record actor/tick/evidence
+        // like every other path — verified through the public receipt.
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let created: serde_json::Value = client
+            .post(format!("http://{api}/api/admin/consumer-key/create"))
+            .header("Authorization", "Bearer master-token")
+            .json(&serde_json::json!({
+                "account": "mcp-probe",
+                "quota_ceiling": 100,
+                "rate_limit_per_minute": 10,
+                "scopes": ["hub"],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let dca = created["token"].as_str().unwrap().to_string();
+        let mcp = |name: &str, args: serde_json::Value| {
+            client
+                .post(format!("http://{api}/mcp"))
+                .header("Authorization", format!("Bearer {dca}"))
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": args},
+                }))
+        };
+        let pubbed: serde_json::Value = mcp(
+            "hub_publish_task",
+            serde_json::json!({"title": "mcp receipt probe", "reward": 7}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let text = pubbed["result"]["content"][0]["text"].as_str().unwrap();
+        let tid = serde_json::from_str::<serde_json::Value>(text).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let exec: serde_json::Value = mcp(
+            "hub_execute",
+            serde_json::json!({"task_id": tid}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let exec_text = exec["result"]["content"][0]["text"].as_str().unwrap();
+        let exec_json: serde_json::Value = serde_json::from_str(exec_text).unwrap();
+        assert!(exec_json["evidence_id"].as_str().is_some(), "execute: {exec}");
+        let r: serde_json::Value = client
+            .get(format!("http://{api}/v1/hub/settle/{tid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "settled");
+        assert_eq!(r["settled_by"], "mcp-probe");
+        assert!(r["settled_tick"].as_u64().is_some());
+        assert!(r["evidence_id"].as_str().is_some());
+        assert!(r["evidence_preimage"].as_str().is_some());
+        assert_eq!(r["evidence_recovered"], false);
     }
 
     #[tokio::test]

@@ -622,6 +622,53 @@ pub async fn hub_settle_receipt_handler(
             serde_json::json!({"id": b.id, "bidder": b.bidder, "price": b.price, "tick": b.created_tick})
         })
         .collect();
+    // Recomputable preimage (authoritative, never inferred).
+    // Legacy records (settled before receipt fields existed) carry no
+    // actor/tick: recover the actor cryptographically — the settlement tick
+    // from the settlement_done event, then the unique candidate whose
+    // blake3(hub:task:actor:tick) matches the evidence. A match is a
+    // verification, not an inference; no match stays null.
+    // (Runs under the hub lock, before it is released below.)
+    let (settled_by, settled_tick, recovered) = match (&task.settled_by, &task.settled_tick) {
+        (Some(by), Some(tick)) => (Some(by.clone()), Some(*tick), false),
+        _ => {
+            let ev_tick = hub
+                .events
+                .iter()
+                .rev()
+                .find(|e| e.task_id.as_deref() == Some(task_id.as_str()) && e.kind == "settlement_done")
+                .map(|e| e.tick);
+            match (task.evidence_id.clone(), ev_tick) {
+                (Some(ev), Some(tick)) => {
+                    let mut candidates: Vec<String> = team
+                        .iter()
+                        .map(|(a, _)| a.clone())
+                        .collect();
+                    candidates.extend(
+                        hub.bids
+                            .values()
+                            .filter(|b| b.task_id == task_id)
+                            .map(|b| b.bidder.clone()),
+                    );
+                    candidates.push(task.issuer.clone());
+                    candidates.push("operator".to_string());
+                    candidates.push("open".to_string());
+                    let hit = candidates.into_iter().find(|cand| {
+                        blake3::hash(format!("hub:{task_id}:{cand}:{tick}").as_bytes())
+                            .to_hex()
+                            .to_string()
+                            == ev
+                    });
+                    (
+                        hit.clone(),
+                        if hit.is_some() { Some(tick) } else { None },
+                        hit.is_some(),
+                    )
+                }
+                _ => (None, None, false),
+            }
+        }
+    };
     drop(hub);
     // Society side (best-effort: empty when the task predates society).
     let society = state.society.lock().await;
@@ -676,8 +723,7 @@ pub async fn hub_settle_receipt_handler(
             }));
         }
     }
-    // Recomputable preimage (authoritative, never inferred).
-    let preimage = match (&task.settled_by, &task.settled_tick) {
+    let preimage = match (&settled_by, &settled_tick) {
         (Some(by), Some(tick)) => Some(format!("hub:{task_id}:{by}:{tick}")),
         _ => None,
     };
@@ -691,10 +737,11 @@ pub async fn hub_settle_receipt_handler(
             "reward": task.reward,
             "required_capability": task.required_capability,
             "created_tick": task.created_tick,
-            "settled_tick": task.settled_tick,
+            "settled_tick": settled_tick,
             "evidence_id": task.evidence_id,
-            "settled_by": task.settled_by,
+            "settled_by": settled_by,
             "evidence_preimage": preimage,
+            "evidence_recovered": recovered,
             "deliverable_hash": task.deliverable_hash,
             "winners": winners,
             "bids": bids,
