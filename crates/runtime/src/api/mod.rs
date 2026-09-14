@@ -1604,7 +1604,7 @@ pub fn apply_generation_defaults(generation: &GenerationSection, body: &[u8]) ->
 /// OpenAPI 3.0 document (H6): the public, versioned contract for the
 /// `/v1/*` surface. Always served (no auth) so tooling can introspect it.
 async fn openapi_handler() -> Response {
-    let spec = serde_json::json!({
+    let mut spec = serde_json::json!({
         "openapi": "3.0.0",
         "info": {
             "title": "DecentraAI Node API",
@@ -1643,6 +1643,20 @@ async fn openapi_handler() -> Response {
             "/sse": { "get": { "operationId": "fabricStream", "summary": "Multiplexed SSE feed (hub + arena events)", "responses": { "200": { "description": "text/event-stream" } } } }
         }
     });
+    // World reads live outside the giant literal above (macro recursion
+    // budget): merged here, one small object per route.
+    if let Some(paths) = spec.get_mut("paths").and_then(|p| p.as_object_mut()) {
+        for (route, op, summary, desc) in [
+            ("/v1/world", "worldSnapshot", "Open-world snapshot (public read)", "World state"),
+            ("/v1/world/skill", "worldSkill", "World skill info (public read)", "Skill"),
+            ("/v1/world/entity", "worldEntity", "World entity lookup (public read)", "Entity"),
+        ] {
+            paths.insert(
+                route.to_string(),
+                serde_json::json!({ "get": { "operationId": op, "summary": summary, "responses": { "200": { "description": desc } } } }),
+            );
+        }
+    }
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
@@ -19799,6 +19813,7 @@ mod tests {
         assert!(spec["paths"]["/v1/auth/native"].is_object());
         assert!(spec["paths"]["/v1/auth/wallet/key"].is_object());
         assert!(spec["paths"]["/sse"].is_object());
+        assert!(spec["paths"]["/v1/world"].is_object());
         manager.lock().await.shutdown().await.unwrap();
     }
 
