@@ -1085,6 +1085,7 @@ dependencies = [
  "decentraai-runtime",
  "decentraai-system-probe",
  "decentraai-tokens",
+ "ed25519-dalek 3.0.0",
  "hex",
  "libp2p",
  "rand_core 0.6.4",

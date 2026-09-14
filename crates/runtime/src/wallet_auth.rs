@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 const DEFAULT_NETWORK: &str = "multiversx-testnet";
 const CHALLENGE_TTL_SECS: u64 = 300;
 const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+/// Native-auth token TTL bounds (seconds): prevents forever-tokens.
+/// Upper bound 86400 matches the official JS `sdk-native-auth-client`
+/// default and third-party consoles built on it (Perchance orchestrator).
+const NATIVE_AUTH_MIN_TTL: u64 = 60;
+const NATIVE_AUTH_MAX_TTL: u64 = 86400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletIdentityBinding {
@@ -20,6 +25,12 @@ pub struct WalletIdentityBinding {
     pub bound_at: u64,
     pub verified_at: u64,
     pub last_seen_at: u64,
+    /// Name of the wallet-provisioned operator subscription token in the
+    /// node token registry (`dsk_…`, tier 3, operator role). `None` = never
+    /// provisioned (unlisted wallets never get one). The plaintext lives
+    /// only in the issuance response; here just the name for idempotency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_token_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +66,9 @@ pub struct WalletAuthStore {
     pub bindings: BTreeMap<String, WalletIdentityBinding>,
     pub challenges: BTreeMap<String, WalletChallengeRecord>,
     pub sessions: BTreeMap<String, WalletSessionRecord>,
+    /// Consumed native-auth tokens (token → used_at): one-time use, no replay.
+    #[serde(default)]
+    pub used_tokens: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +102,71 @@ pub struct WalletVerifyRequest {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+/// Native-auth login request (official MultiversX wallet flow).
+/// Token: `b64url(origin).blockhash.ttl.b64url(extra)`; the wallet signs
+/// the Elrond digest of `address + token` (legacy: `address + token + {}`).
+/// Optional `network` pins the chain the block must live on (refuses
+/// token↔network mismatch); absent, the server probes the known chains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletNativeAuthRequest {
+    pub wallet_address: String,
+    pub token: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Native-auth exchange request (third-party console contract, Shape B).
+/// `accessToken = b64url(address).b64url(loginToken).sigHex` — the exact
+/// envelope `@multiversx/sdk-native-auth-client` wallets produce and the
+/// Perchance orchestrator sends to `POST /v1/auth/native`. Optional fields
+/// are cross-checks only; the token itself is authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletNativeExchangeRequest {
+    #[serde(rename = "accessToken")]
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// Split an `accessToken` envelope into (address, login_token, sig_hex).
+/// Fail-closed on shape: exactly 3 non-empty dot parts, first two valid
+/// b64url UTF-8, third an even-length hex string.
+pub fn parse_access_token(access_token: &str) -> Result<(String, String, String), WalletAuthError> {
+    if access_token.len() > 4096 {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    let address = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|_| WalletAuthError::MalformedToken)?,
+    )
+    .map_err(|_| WalletAuthError::MalformedToken)?;
+    let login_token = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|_| WalletAuthError::MalformedToken)?,
+    )
+    .map_err(|_| WalletAuthError::MalformedToken)?;
+    let sig = parts[2];
+    if sig.len() != 128 || !sig.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    Ok((address, login_token, sig.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,14 +205,208 @@ pub enum WalletAuthError {
     SessionExpired,
     #[error("wallet binding conflict")]
     BindingConflict,
+    #[error("malformed native-auth token")]
+    MalformedToken,
+    #[error("native-auth origin not allowed")]
+    OriginNotAllowed,
+    #[error("native-auth token expired or ttl out of range")]
+    TokenExpired,
+    #[error("native-auth token already used")]
+    TokenReplay,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 }
 
-fn network_name() -> String {
+/// Elrond/MultiversX message-signing digest (what real wallet software
+/// signs — NOT the raw message).
+///
+/// `keccak256("\x17Elrond Signed Message:\n" + len_ascii + msg)`, the
+/// Ethereum-`personal_sign` shape adapted for Elrond (0x17 = 23 = length of
+/// the prefix line). Proven live against DeFi-extension signatures (Sep
+/// 2026): raw `addr+token` NEVER verifies from wallet software, the digest
+/// does — in canonic (`addr+token`) and legacy (`addr+token+{}`) forms.
+pub fn signable_digest(msg: &[u8]) -> [u8; 32] {
+    use sha3::Digest as _;
+    let mut h = sha3::Keccak256::new();
+    h.update(b"\x17Elrond Signed Message:\n");
+    h.update(msg.len().to_string().as_bytes());
+    h.update(msg);
+    h.finalize().into()
+}
+
+/// Verify a wallet signature against every known-good message form.
+/// Order: wallet-native digests first (canonic, legacy), then the raw form
+/// (own CLI/synthetic signers). All forms bind the same key to the same
+/// server-issued bytes; one-time consumption upstream stops replays.
+fn verify_sig_variants(
+    pk: &VerifyingKey,
+    sig: &Signature,
+    address: &str,
+    token_or_message: &str,
+) -> bool {
+    use sha3::Digest as _;
+    let canonic = format!("{address}{token_or_message}");
+    // 1-2. wallet digests (keccak, canonic + legacy).
+    for candidate in [canonic.clone(), canonic.clone() + "{}"] {
+        let mut h = sha3::Keccak256::new();
+        h.update(b"\x17Elrond Signed Message:\n");
+        h.update(candidate.len().to_string().as_bytes());
+        h.update(candidate.as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        if pk.verify(&digest, sig).is_ok() {
+            return true;
+        }
+    }
+    // 3. raw form (own CLI + synthetic test signers).
+    pk.verify(canonic.as_bytes(), sig).is_ok()
+}
+
+/// Verify a bare server message (challenge flow): Elrond digest first
+/// (wallet `signMessage` implementations digest like native-auth), then raw
+/// (own CLI + manual paste of a raw signature).
+fn verify_sig_message(pk: &VerifyingKey, sig: &Signature, message: &str) -> bool {
+    use sha3::Digest as _;
+    let mut h = sha3::Keccak256::new();
+    h.update(b"\x17Elrond Signed Message:\n");
+    h.update(message.len().to_string().as_bytes());
+    h.update(message.as_bytes());
+    let digest: [u8; 32] = h.finalize().into();
+    pk.verify(&digest, sig).is_ok() || pk.verify(message.as_bytes(), sig).is_ok()
+}
+
+pub(crate) fn network_name() -> String {
     std::env::var("DECENTRAAI_MX_NETWORK").unwrap_or_else(|_| DEFAULT_NETWORK.to_string())
+}
+
+/// Origins allowed to mint native-auth tokens (exact match on the token's
+/// decoded origin). Comma-separated override via DECENTRAAI_AUTH_ORIGINS.
+/// Both bare hostnames (the official JS SDK default: `location.hostname`)
+/// and full origins are accepted so first-party pages and third-party
+/// consoles (e.g. a Perchance app with its Auth-origin field pointed at the
+/// fabric host) work without server changes.
+pub(crate) fn auth_origins() -> Vec<String> {
+    std::env::var("DECENTRAAI_AUTH_ORIGINS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            vec![
+                "decentraai.duckdns.org".to_string(),
+                "https://decentraai.duckdns.org".to_string(),
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+                "http://localhost:8080".to_string(),
+            ]
+        })
+}
+
+/// Best-effort decode of a login token's origin (for error messages only —
+/// never trusted). Lets an operator copy the exact string into
+/// DECENTRAAI_AUTH_ORIGINS.
+pub fn extract_token_origin(login_token: &str) -> Option<String> {
+    let first = login_token.split('.').next()?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(first)
+        .ok()?;
+    String::from_utf8(raw).ok()
+}
+
+/// Wallet addresses entitled to ELEVATED self-serve grants on the exchange
+/// path (comma-separated `DECENTRAAI_WALLET_POWER_USERS`). A listed wallet
+/// still receives a revocable, quota-gated `dca_` consumer key — never a
+/// master/operator credential — but with wildcard scope and a large
+/// ceiling, so the owner's console associates full powers automatically at
+/// wallet login, with no human ever handling plaintext. Exact match on the
+/// canonical address; empty by default (everyone else gets the modest
+/// self-serve grant).
+pub(crate) fn wallet_power_users() -> Vec<String> {
+    std::env::var("DECENTRAAI_WALLET_POWER_USERS")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| Vec::new())
+}
+
+/// MultiversX chain API base for a declared network (canonical lowercase).
+/// Unknown names fall back to testnet — callers validate first and refuse
+/// mismatches explicitly.
+pub fn chain_api_base(network: &str) -> &'static str {
+    match network {
+        "mainnet" => "https://api.multiversx.com",
+        "devnet" => "https://devnet-api.multiversx.com",
+        _ => "https://testnet-api.multiversx.com",
+    }
+}
+
+/// Whether a network name is one the fabric binds (`testnet`/`mainnet`/`devnet`).
+pub fn is_known_network(network: &str) -> bool {
+    matches!(network, "testnet" | "mainnet" | "devnet")
+}
+
+/// Public chain endpoints for a resolved network, so wallet clients adopt
+/// them from the provisioning response instead of hardcoding. `mcp` is the
+/// fabric's own public endpoint (override via `DECENTRAAI_PUBLIC_MCP_URL`).
+pub fn chain_endpoints(network: &str) -> serde_json::Value {
+    let (api, wallet, explorer) = match network {
+        "mainnet" => (
+            "https://api.multiversx.com",
+            "https://wallet.multiversx.com",
+            "https://explorer.multiversx.com",
+        ),
+        "devnet" => (
+            "https://devnet-api.multiversx.com",
+            "https://devnet-wallet.multiversx.com",
+            "https://devnet-explorer.multiversx.com",
+        ),
+        _ => (
+            "https://testnet-api.multiversx.com",
+            "https://testnet-wallet.multiversx.com",
+            "https://testnet-explorer.multiversx.com",
+        ),
+    };
+    let mcp = std::env::var("DECENTRAAI_PUBLIC_MCP_URL")
+        .unwrap_or_else(|_| "https://decentraai.duckdns.org/mcp".to_string());
+    serde_json::json!({"api": api, "wallet": wallet, "explorer": explorer, "mcp": mcp})
+}
+
+/// Split a login token into (origin, blockhash, ttl_seconds). Shape +
+/// ttl-range enforced here so handlers fail fast before any chain fetch.
+pub fn parse_login_token(login_token: &str) -> Result<(String, String, u64), WalletAuthError> {
+    let parts: Vec<&str> = login_token.split('.').collect();
+    if parts.len() != 4
+        || parts.iter().any(|p| p.is_empty())
+        || parts[1].len() != 64
+        || !parts[1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(WalletAuthError::MalformedToken);
+    }
+    let ttl: u64 = parts[2]
+        .parse()
+        .map_err(|_| WalletAuthError::MalformedToken)?;
+    if !(NATIVE_AUTH_MIN_TTL..=NATIVE_AUTH_MAX_TTL).contains(&ttl) {
+        return Err(WalletAuthError::TokenExpired);
+    }
+    let origin = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|_| WalletAuthError::MalformedToken)?,
+    )
+    .map_err(|_| WalletAuthError::MalformedToken)?;
+    let extra = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[3])
+        .map_err(|_| WalletAuthError::MalformedToken)?;
+    let _: serde_json::Value =
+        serde_json::from_slice(&extra).map_err(|_| WalletAuthError::MalformedToken)?;
+    Ok((origin, parts[1].to_string(), ttl))
 }
 
 #[allow(dead_code)]
@@ -246,6 +519,8 @@ impl WalletAuthStore {
         self.challenges
             .retain(|_, c| c.expires_at > now && c.used_at.is_none());
         self.sessions.retain(|_, s| s.expires_at > now);
+        self.used_tokens
+            .retain(|_, used_at| *used_at + SESSION_TTL_SECS > now);
     }
 
     pub fn issue_challenge(
@@ -322,8 +597,9 @@ impl WalletAuthStore {
         let sig = Signature::from_bytes(&sig_bytes);
         let pk = VerifyingKey::from_bytes(&wallet_bytes)
             .map_err(|_| WalletAuthError::SignatureInvalid)?;
-        pk.verify(challenge.message.as_bytes(), &sig)
-            .map_err(|_| WalletAuthError::SignatureInvalid)?;
+        if !verify_sig_message(&pk, &sig, &challenge.message) {
+            return Err(WalletAuthError::SignatureInvalid);
+        }
         challenge.used_at = Some(now);
 
         let agent_id = if let Some(existing) = self.bindings.get(&canonical_address) {
@@ -354,6 +630,7 @@ impl WalletAuthStore {
                 network: network_name(),
                 bound_at: now,
                 verified_at: now,
+                operator_token_name: None,
                 last_seen_at: now,
             });
         binding.agent_id = agent_id.clone();
@@ -387,8 +664,148 @@ impl WalletAuthStore {
         })
     }
 
-    pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {
+    /// Verify a native-auth login token (official MultiversX wallet flow).
+    ///
+    /// Token: `b64url(origin).blockhash.ttl.b64url(extra)`; the wallet signs
+    /// `address + token`. Checks, all fail-closed: well-formed address and
+    /// token shape, 64-hex blockhash, ttl in range, origin allow-listed,
+    /// signature verifies, token never used before. On success it issues the
+    /// same session shape as the challenge flow, so key issuance and rotation
+    /// downstream are shared.
+    pub fn verify_native_auth(
+        &mut self,
+        req: WalletNativeAuthRequest,
+        now: u64,
+    ) -> Result<WalletLoginResponse, WalletAuthError> {
         self.cleanup(now);
+        let wallet_bytes = validate_wallet_address(&req.wallet_address)?;
+        let canonical_address = encode_wallet_address(&wallet_bytes)?;
+        // Shared shape/ttl/origin/extra gates (chain freshness is enforced
+        // by the async handlers via the block timestamp, not here).
+        let (origin, _blockhash, _ttl) = parse_login_token(&req.token)?;
+        if !auth_origins().iter().any(|o| o == &origin) {
+            return Err(WalletAuthError::OriginNotAllowed);
+        }
+        // One-time use: same token twice is a replay, even with a valid sig.
+        if self.used_tokens.contains_key(&req.token) {
+            return Err(WalletAuthError::TokenReplay);
+        }
+        let sig_bytes = decode_signature(&req.signature)?;
+        let sig = Signature::from_bytes(&sig_bytes);
+        let pk = VerifyingKey::from_bytes(&wallet_bytes)
+            .map_err(|_| WalletAuthError::SignatureInvalid)?;
+        // Wallet software signs the Elrond digest, not the raw message
+        // (canonic + legacy forms); own CLI signs raw. Accept all proven
+        // forms — every one binds this key to these exact token bytes.
+        if !verify_sig_variants(&pk, &sig, &canonical_address, &req.token) {
+            return Err(WalletAuthError::SignatureInvalid);
+        }
+        self.used_tokens.insert(req.token.clone(), now);
+
+        let agent_id = if let Some(existing) = self.bindings.get(&canonical_address) {
+            if let Some(requested) = req.agent_id.as_ref() {
+                if requested != &existing.agent_id {
+                    return Err(WalletAuthError::BindingConflict);
+                }
+            }
+            existing.agent_id.clone()
+        } else {
+            req.agent_id
+                .clone()
+                .unwrap_or_else(|| default_agent_id(&canonical_address))
+        };
+        let display_name = req.display_name.clone().or_else(|| {
+            self.bindings
+                .get(&canonical_address)
+                .and_then(|b| b.display_name.clone())
+        });
+        let binding = self
+            .bindings
+            .entry(canonical_address.clone())
+            .or_insert_with(|| WalletIdentityBinding {
+                wallet_address: canonical_address.clone(),
+                agent_id: agent_id.clone(),
+                display_name: display_name.clone(),
+                network: network_name(),
+                bound_at: now,
+                verified_at: now,
+                operator_token_name: None,
+                last_seen_at: now,
+            });
+        binding.agent_id = agent_id.clone();
+        binding.display_name = display_name.clone();
+        binding.verified_at = now;
+        binding.last_seen_at = now;
+
+        let session_token = session_token();
+        let token_tag = format!("native-{}", &req.token[..req.token.len().min(12)]);
+        let session = WalletSessionRecord {
+            session_token: session_token.clone(),
+            wallet_address: canonical_address.clone(),
+            agent_id: agent_id.clone(),
+            challenge_id: token_tag.clone(),
+            purpose: "native-auth".to_string(),
+            issued_at: now,
+            expires_at: now.saturating_add(SESSION_TTL_SECS),
+            last_seen_at: Some(now),
+        };
+        self.sessions.insert(session_token.clone(), session.clone());
+
+        Ok(WalletLoginResponse {
+            wallet_address: canonical_address,
+            agent_id: agent_id.clone(),
+            session_token,
+            session_expires_at: session.expires_at,
+            challenge_id: token_tag,
+            message: req.token,
+            network: network_name(),
+            display_name,
+            pylon_identity_path: format!("agents/{agent_id}/Identity.md"),
+        })
+    }
+
+    /// Verify a third-party `accessToken` envelope (Shape B exchange).
+    ///
+    /// Parses `b64url(address).b64url(loginToken).sigHex`, cross-checks the
+    /// optional convenience fields (address/origin must match the token when
+    /// present — fail-closed on confusion), then delegates to the exact same
+    /// [`Self::verify_native_auth`] core: same shape/ttl/origin/signature
+    /// gates, same one-time consumption. Returns the canonical address plus
+    /// the issued session login (callers mint a credential off it).
+    pub fn verify_access_token(
+        &mut self,
+        req: WalletNativeExchangeRequest,
+        now: u64,
+    ) -> Result<WalletLoginResponse, WalletAuthError> {
+        if req.access_token.len() > 4096 {
+            return Err(WalletAuthError::MalformedToken);
+        }
+        let (address, login_token, sig_hex) = parse_access_token(&req.access_token)?;
+        if let Some(claimed) = req.address.as_ref() {
+            if claimed != &address {
+                return Err(WalletAuthError::AddressMismatch);
+            }
+        }
+        if let Some(claimed_origin) = req.origin.as_ref() {
+            match extract_token_origin(&login_token) {
+                Some(token_origin) if &token_origin == claimed_origin => {}
+                _ => return Err(WalletAuthError::OriginNotAllowed),
+            }
+        }
+        self.verify_native_auth(
+            WalletNativeAuthRequest {
+                wallet_address: address,
+                token: login_token,
+                signature: sig_hex,
+                network: None,
+                agent_id: None,
+                display_name: None,
+            },
+            now,
+        )
+    }
+
+    pub fn session_for_token(&mut self, token: &str, now: u64) -> Option<WalletSessionRecord> {        self.cleanup(now);
         self.sessions
             .get(token)
             .cloned()
@@ -451,6 +868,159 @@ mod tests {
 
     fn address_from_identity(identity: &Identity) -> String {
         encode_wallet_address(identity.public_key().as_bytes()).unwrap()
+    }
+
+    fn native_token(origin: &str, ttl: u64) -> String {
+        use base64::Engine as _;
+        let o = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(origin);
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"app":"t"}"#);
+        format!("{o}.{}.{ttl}.{e}", "ab".repeat(32))
+    }
+
+    #[test]
+    fn wallet_elrond_digest_verifies_real_extension_signatures() {
+        // Interop lock (Sep 2026): real DeFi-extension signatures over
+        // native-auth tokens. The wallet signs keccak256(prefix+len+msg),
+        // NOT the raw message — in canonic (`addr+token`, mainnet wallet)
+        // and legacy (`addr+token+{}`, testnet wallet) forms. Addresses and
+        // signatures are public by construction (on-chain + sent to server).
+        let cases = [
+            (
+                "erd154tm8nu953lnen33zqxwq3mc9hz8y37mclyvmpdrszv9umcyys7q0p3f90",
+                "ZGVjZW50cmFhaS5kdWNrZG5zLm9yZw.ceeee9addff372ff736887e5289d8eb9f715eaa41a34be7ed75480b15e008340.86400.e30",
+                "3942616ad7e267b2d538e48358923ccd3533729b47015cb06c86e90cd751fab6231cb308bb765fbadff0aebaa8fd2cf4dffba4e4939ca73876bea231eee62200",
+            ),
+            (
+                "erd1ws6ery9eknznsl33ghf72hexkv72j5f6hsnvjrs04hwxyzm66pxq2qv0cn",
+                "ZGVjZW50cmFhaS5kdWNrZG5zLm9yZw.6da5d2a31d2c74856a0a31f18fd7b3727df62b2154ceb92e1f256f7bf02da7fc.86400.e30",
+                "914d471bf8bc753c9612ac45478a95271980fab7a72dbcba0ea85919bf3734dcf99ec8d1d057f2f4e45c50897ea150c1b3c7fe6a4fccb4ceaf15638f4e74cc0e",
+            ),
+        ];
+        for (addr, token, sig_hex) in cases {
+            let bytes = validate_wallet_address(addr).unwrap();
+            let pk = VerifyingKey::from_bytes(&bytes).unwrap();
+            let sig_bytes = decode_signature(sig_hex).unwrap();
+            let sig = Signature::from_bytes(&sig_bytes);
+            assert!(
+                verify_sig_variants(&pk, &sig, addr, token),
+                "real wallet signature must verify for {addr}"
+            );
+            // A tampered token must NOT verify under the same signature.
+            assert!(!verify_sig_variants(&pk, &sig, addr, &format!("{token}tampered")));
+        }
+    }
+
+    #[test]
+    fn native_auth_login_ok_and_replay_rejected() {
+        // Official flow shape: wallet signs `address + token`.
+        let identity = Identity::generate();
+        let address = address_from_identity(&identity);
+        let mut store = WalletAuthStore::default();
+        let token = native_token("https://decentraai.duckdns.org", 600);
+        let sig = identity.sign(format!("{address}{token}").as_bytes());
+        let login = store
+            .verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: token.clone(),
+                    signature: hex::encode(sig.to_bytes()),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(login.wallet_address, address);
+        assert_eq!(login.agent_id, address);
+        assert!(login.session_token.starts_with("wx_"));
+        assert!(store.session_for_token(&login.session_token, 105).is_some());
+        // Same token twice = replay, even with a valid signature.
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token,
+                    signature: hex::encode(sig.to_bytes()),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                106,
+            ),
+            Err(WalletAuthError::TokenReplay)
+        ));
+    }
+
+    #[test]
+    fn native_auth_rejects_bad_token_origin_ttl_sig() {
+        let identity = Identity::generate();
+        let address = address_from_identity(&identity);
+        let mut store = WalletAuthStore::default();
+        let good = native_token("https://decentraai.duckdns.org", 600);
+        let sign = |msg: &str| hex::encode(identity.sign(msg.as_bytes()).to_bytes());
+        // Bad origin.
+        let bad_origin = native_token("https://evil.example", 600);
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: bad_origin.clone(),
+                    signature: sign(&format!("{address}{bad_origin}")),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::OriginNotAllowed)
+        ));
+        // TTL out of range.
+        let bad_ttl = native_token("https://decentraai.duckdns.org", 99999);
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: bad_ttl,
+                    signature: sign(&format!("{address}{good}")),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::TokenExpired)
+        ));
+        // Malformed token.
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: "not.a.token".to_string(),
+                    signature: sign("x"),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::MalformedToken)
+        ));
+        // Wrong signature (signed different bytes).
+        assert!(matches!(
+            store.verify_native_auth(
+                WalletNativeAuthRequest {
+                    wallet_address: address.clone(),
+                    token: good.clone(),
+                    signature: sign("wrong-bytes"),
+                    network: None,
+                    agent_id: None,
+                    display_name: None,
+                },
+                100,
+            ),
+            Err(WalletAuthError::SignatureInvalid)
+        ));
     }
 
     #[test]

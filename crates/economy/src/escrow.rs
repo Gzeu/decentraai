@@ -62,6 +62,11 @@ pub struct EscrowRecord {
     /// MultiversX testnet tx hash (once settled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
+    /// Chain the tx hash lives on ("multiversx-testnet" | "multiversx-mainnet").
+    /// Verifiers MUST query this chain's API — checking a testnet hash on
+    /// mainnet yields a false "not on chain" verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
     /// When the escrow was created.
     pub created_at: u64,
     /// When the status last changed.
@@ -144,6 +149,7 @@ impl EscrowLedger {
             status: EscrowStatus::Held,
             evidence_hash: None,
             tx_hash: None,
+            network: None,
             created_at: now,
             updated_at: now,
         };
@@ -182,6 +188,7 @@ impl EscrowLedger {
         tx_hash: &str,
         amount_micro_cu: u64,
         now: u64,
+        network: Option<&str>,
     ) -> Result<(), EscrowError> {
         let record = self
             .records
@@ -207,6 +214,7 @@ impl EscrowLedger {
         }
         record.status = EscrowStatus::Settled;
         record.tx_hash = Some(tx_hash.to_string());
+        record.network = network.map(|n| n.to_string());
         record.updated_at = now;
         Ok(())
     }
@@ -222,6 +230,7 @@ impl EscrowLedger {
         escrow_id: &str,
         tx_hash: &str,
         now: u64,
+        network: Option<&str>,
     ) -> Result<(), EscrowError> {
         let record = self
             .records
@@ -234,6 +243,7 @@ impl EscrowLedger {
             ));
         }
         record.tx_hash = Some(tx_hash.to_string());
+        record.network = network.map(|n| n.to_string());
         record.updated_at = now;
         Ok(())
     }
@@ -254,7 +264,7 @@ impl EscrowLedger {
         let tx_ref = format!("mx-testnet-{:06}", self.local_counter);
 
         // Settle.
-        self.settle_escrow(&request.escrow_id, &tx_ref, request.amount_micro_cu, now)?;
+        self.settle_escrow(&request.escrow_id, &tx_ref, request.amount_micro_cu, now, None)?;
 
         Ok(SettlementOutcome {
             escrow_id: request.escrow_id.clone(),
@@ -328,19 +338,42 @@ mod tests {
         let c = make_contract();
         ledger.create_escrow(&c, 300).unwrap();
         // Non-settled escrows refuse reanchor.
-        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400).is_err());
+        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400, None).is_err());
         ledger.release_escrow(&c.contract_id, "ev96", 400).unwrap();
-        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400).is_err());
+        assert!(ledger.reanchor_escrow(&c.contract_id, "h2", 400, None).is_err());
         ledger
-            .settle_escrow(&c.contract_id, "deadh00", 5_000_000, 500)
+            .settle_escrow(&c.contract_id, "deadh00", 5_000_000, 500, Some("multiversx-testnet"))
             .unwrap();
         // Same evidence, replacement hash: allowed.
         ledger
-            .reanchor_escrow(&c.contract_id, "liveh11", 600)
+            .reanchor_escrow(&c.contract_id, "liveh11", 600, Some("multiversx-testnet"))
             .unwrap();
         let r = ledger.records.get(&c.contract_id).unwrap();
         assert_eq!(r.status, EscrowStatus::Settled);
         assert_eq!(r.tx_hash.as_deref(), Some("liveh11"));
+        assert_eq!(r.network.as_deref(), Some("multiversx-testnet"));
+    }
+
+    #[test]
+    fn network_recorded_and_survives_json() {
+        // The Perchance-portal verdict bug: verifiers must know which
+        // chain API to query, so the network rides with the record.
+        let mut ledger = EscrowLedger::default();
+        let c = make_contract();
+        ledger.create_escrow(&c, 300).unwrap();
+        assert!(ledger.get_escrow(&c.contract_id).unwrap().network.is_none());
+        ledger.release_escrow(&c.contract_id, "evnet", 400).unwrap();
+        ledger
+            .settle_escrow(&c.contract_id, "h64", 5_000_000, 500, Some("multiversx-testnet"))
+            .unwrap();
+        let r = ledger.get_escrow(&c.contract_id).unwrap();
+        assert_eq!(r.network.as_deref(), Some("multiversx-testnet"));
+        let back: EscrowLedger =
+            serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(
+            back.get_escrow(&c.contract_id).unwrap().network.as_deref(),
+            Some("multiversx-testnet")
+        );
     }
 
     #[test]
@@ -369,7 +402,7 @@ mod tests {
         );
 
         ledger
-            .settle_escrow(&c.contract_id, "tx-123", 5_000_000, 500)
+            .settle_escrow(&c.contract_id, "tx-123", 5_000_000, 500, None)
             .unwrap();
         assert_eq!(
             ledger.get_escrow(&c.contract_id).unwrap().status,
@@ -394,7 +427,7 @@ mod tests {
             .release_escrow(&c.contract_id, "hash-1", 400)
             .unwrap();
         ledger
-            .settle_escrow(&c.contract_id, "tx-1", 5_000_000, 500)
+            .settle_escrow(&c.contract_id, "tx-1", 5_000_000, 500, None)
             .unwrap();
 
         // Try to settle the same evidence again via a second escrow
@@ -408,7 +441,7 @@ mod tests {
             .release_escrow(&c2.contract_id, "hash-1", 700)
             .unwrap(); // same hash
         assert!(matches!(
-            ledger.settle_escrow(&c2.contract_id, "tx-2", 5_000_000, 800),
+            ledger.settle_escrow(&c2.contract_id, "tx-2", 5_000_000, 800, None),
             Err(EscrowError::DoubleSettlement(_))
         ));
     }
@@ -422,7 +455,7 @@ mod tests {
             .release_escrow(&c.contract_id, "hash-2", 400)
             .unwrap();
         assert!(matches!(
-            ledger.settle_escrow(&c.contract_id, "tx-1", 9_999_999, 500),
+            ledger.settle_escrow(&c.contract_id, "tx-1", 9_999_999, 500, None),
             Err(EscrowError::AmountMismatch { .. })
         ));
     }

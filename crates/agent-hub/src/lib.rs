@@ -26,6 +26,23 @@ pub struct HubTask {
     pub status: TaskStatus,
     pub created_tick: u64,
     pub deadline_tick: Option<u64>,
+    /// Tick at which the task settled (`None` = not settled). Set together
+    /// with `evidence_id` — the pair makes the evidence preimage
+    /// (`hub:<task>:<actor>:<tick>`) recomputable by anyone, which passport
+    /// anchoring depends on. Old records without these fields still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_tick: Option<u64>,
+    /// BLAKE3 evidence id minted at settle time (`None` = not settled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+    /// Actor the evidence was computed for (request actor at execute time).
+    /// Stored so the preimage is authoritative, never inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_by: Option<String>,
+    /// Optional hash of the work deliverable (64 hex chars), bound at
+    /// execute time. Binds the settlement to an artifact for passports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliverable_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +193,10 @@ impl HubState {
             status: TaskStatus::Open,
             created_tick: self.tick,
             deadline_tick: None,
+            settled_tick: None,
+            evidence_id: None,
+            settled_by: None,
+            deliverable_hash: None,
         };
         self.tasks.insert(id.clone(), task.clone());
         self.push_event(
@@ -375,23 +396,159 @@ impl HubState {
         );
     }
 
+    /// Authoritative settlement record: status + tick + evidence + actor +
+    /// optional deliverable hash, all on the task itself. The evidence
+    /// preimage (`hub:<task>:<actor>:<tick>`) becomes recomputable from the
+    /// receipt — passports anchor on this, never on inference.
+    pub fn record_settlement(
+        &mut self,
+        task_id: &str,
+        evidence_id: String,
+        actor: String,
+        tick: u64,
+        deliverable_hash: Option<String>,
+    ) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Settled;
+            t.settled_tick = Some(tick);
+            t.evidence_id = Some(evidence_id.clone());
+            t.settled_by = Some(actor);
+            t.deliverable_hash = deliverable_hash;
+        }
+        self.push_event(
+            "settlement_done",
+            format!("settlement for {}", task_id),
+            Some(task_id.to_string()),
+            Some(evidence_id),
+        );
+    }
+
     pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
 
+    /// Recover the evidence actor for legacy records (settled before
+    /// receipt fields existed): the unique candidate whose
+    /// `blake3("hub:<task>:<actor>:<tick>")` matches the evidence. A match
+    /// is a cryptographic verification, not an inference; `None` stays null.
+    /// Callers assemble candidates from team members, bidders, issuer, and
+    /// the well-known fallback actors.
+    pub fn recover_evidence_actor(
+        task_id: &str,
+        evidence: &str,
+        tick: u64,
+        candidates: &[String],
+    ) -> Option<String> {
+        candidates.iter().find(|cand| {
+            blake3::hash(format!("hub:{task_id}:{cand}:{tick}").as_bytes())
+                .to_hex()
+                .to_string()
+                == evidence
+        }).cloned()
+    }
+
+    /// Feed window: events at/after `since`, OLDEST-first (append-safe),
+    /// but capped to the NEWEST `limit` — the tail, not the head. (A
+    /// head-window starves followers once the log exceeds `limit`.)
     pub fn events_since(&self, since: u64, limit: usize) -> Vec<HubEvent> {
-        self.events
+        let filtered: Vec<_> = self
+            .events
             .iter()
             .filter(|e| e.tick >= since)
-            .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        let skip = filtered.len().saturating_sub(limit);
+        filtered.into_iter().skip(skip).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recover_evidence_actor_verifies_not_guesses() {
+        // Real vectors: task-0097 (twin probe) and task-0096-adjacent shape.
+        let ev97 = blake3::hash(b"hub:task-0097:agent:pylon-verify:334")
+            .to_hex()
+            .to_string();
+        let cands = vec![
+            "operator".to_string(),
+            "agent:pylon-verify".to_string(),
+            "open".to_string(),
+        ];
+        assert_eq!(
+            HubState::recover_evidence_actor("task-0097", &ev97, 334, &cands),
+            Some("agent:pylon-verify".to_string())
+        );
+        // Wrong tick or unknown actor pool → None (stays null, never inferred).
+        assert_eq!(
+            HubState::recover_evidence_actor("task-0097", &ev97, 335, &cands),
+            None
+        );
+        assert_eq!(
+            HubState::recover_evidence_actor(
+                "task-0097",
+                &ev97,
+                334,
+                &["operator".to_string()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn record_settlement_binds_receipt_fields_and_single_event() {
+        let mut hub = HubState::new();
+        let task = hub.publish_task(
+            "alice".into(),
+            "t".into(),
+            "d".into(),
+            100,
+            None,
+        );
+        let before = hub.events.len();
+        hub.record_settlement(
+            &task.id,
+            "ev123".into(),
+            "bob".into(),
+            7,
+            Some("ab".repeat(32)),
+        );
+        let t = hub.tasks.get(&task.id).unwrap();
+        assert_eq!(t.status, TaskStatus::Settled);
+        assert_eq!(t.settled_tick, Some(7));
+        assert_eq!(t.evidence_id.as_deref(), Some("ev123"));
+        assert_eq!(t.settled_by.as_deref(), Some("bob"));
+        let expect_dh = "ab".repeat(32);
+        assert_eq!(t.deliverable_hash.as_deref(), Some(expect_dh.as_str()));
+        // Exactly one settlement event (record subsumes settle).
+        assert_eq!(hub.events.len(), before + 1);
+        let ev = hub.events.back().unwrap();
+        assert_eq!(ev.kind, "settlement_done");
+        assert_eq!(ev.evidence_id.as_deref(), Some("ev123"));
+    }
+
+    #[test]
+    fn events_since_returns_newest_window_oldest_first() {        // Regression: the feed must serve the TAIL, not the head — a
+        // head-window starves followers once the log exceeds `limit`.
+        let mut hub = HubState::new();
+        for i in 0..5 {
+            hub.tick = i;
+            hub.push_event("t", format!("e{i}"), None, None);
+        }
+        let win = hub.events_since(0, 2);
+        assert_eq!(win.len(), 2);
+        assert_eq!(win[0].detail, "e3");
+        assert_eq!(win[1].detail, "e4");
+        // `since` still filters, then the tail applies within it.
+        let win = hub.events_since(4, 10);
+        assert_eq!(win.len(), 1);
+        assert_eq!(win[0].detail, "e4");
+        // Zero limit = empty, never a panic.
+        assert!(hub.events_since(0, 0).is_empty());
+    }
+
     #[test]
     fn task_bid_team_settle_flow() {
         let mut hub = HubState::new();

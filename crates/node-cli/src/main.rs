@@ -21,6 +21,7 @@ mod gateway;
 mod upgrade;
 mod wallet;
 mod world_bridge;
+mod auth;
 
 #[derive(Debug, Parser)]
 #[command(name = "decentraai", version, about = "DecentraAI node control CLI")]
@@ -80,6 +81,13 @@ enum Command {
     Wallet {
         #[command(subcommand)]
         command: wallet::WalletCommand,
+    },
+    /// Agent self-onboarding: wallet challenge→sign→session→`dca_` key,
+    /// fully non-interactive. The agent owns a throwaway identity (0600);
+    /// token stored 0600, never printed.
+    Auth {
+        #[command(subcommand)]
+        command: auth::AuthCommand,
     },
     Worker(WorkerArgs),
     Distributed(DistributedArgs),
@@ -1099,6 +1107,7 @@ async fn main() -> Result<()> {
         Command::Token { command } => token_command(command),
         Command::Gateway { command } => gateway::gateway_command(command),
         Command::Wallet { command } => wallet::wallet_command(command),
+        Command::Auth { command } => auth::auth_command(command).await,
         Command::Worker(args) => worker_command(args),
         Command::Distributed(args) => distributed_command(args).await,
         Command::Trust { command } => trust_command(command),

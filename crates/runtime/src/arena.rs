@@ -22,6 +22,14 @@ use tokio::sync::Mutex;
 
 pub type SharedArena = Arc<Mutex<ArenaWorld>>;
 
+/// Wall-clock seconds (arena catch-up cadence; pure std).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub fn new_shared_arena() -> SharedArena {
     Arc::new(Mutex::new(ArenaWorld::new(20, 20)))
 }
@@ -126,6 +134,7 @@ pub async fn arena_join_handler(
 
     let mut arena = state.arena.lock().await;
     let agent = ArenaAgent::new(agent_id.clone(), account_id.clone(), name, x, y);
+    arena.catch_up(now_secs());
     match arena.join(agent) {
         Ok(()) => {
             let tick = arena.tick;
@@ -258,8 +267,11 @@ pub async fn arena_action_handler(
     } else {
         rationale
     };
-    match arena.apply(
-        &agent_id,
+    // Time catch-up before mutating: idle ticks accrue + agents regen, so
+    // the world pulses even between visits (direction #5). Reads never do
+    // this (no poll-driven tick inflation).
+    arena.catch_up(now_secs());
+    match arena.apply(        &agent_id,
         req.action,
         req.target,
         effective_rationale,

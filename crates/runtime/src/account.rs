@@ -1,0 +1,667 @@
+//! GET /account — wallet onboarding page (xPortal self-serve, M16-era).
+//!
+//! Public, no master required. Flow: pick network intent (testnet/mainnet)
+//! → connect wallet (DeFi extension, xPortal QR, or manual paste) → the
+//! wallet signs the backend challenge → session → ONE `dca_` consumer key,
+//! shown exactly once, opening both doors (OpenAI-compatible API + MCP).
+//!
+//! Security boundaries (same as the other public pages):
+//! - The page is served `no-store`; prompts/outputs are never logged.
+//! - Only key PREFIXES ever appear in errors; plaintext lives in the
+//!   issuance response + the user's clipboard/localStorage, never in logs.
+//! - The signed message binds the SERVER network (`DECENTRAAI_MX_NETWORK`);
+//!   the network toggle records intent (`purpose=onboard:<net>`), it cannot
+//!   spoof chain binding. Keys are fabric-scoped (chain-agnostic).
+//! - The MultiversX SDKs load from pinned jsDelivr `+esm` URLs — the single
+//!   external dependency of this page. Offline, or if a provider API
+//!   drifts, every flow degrades to manual paste (zero-dep, always works).
+
+/// Pinned MultiversX signing provider (jsDelivr `+esm` browser build).
+/// First-party MultiversX code only — no external accounts, no relays.
+pub const MX_EXTENSION_PROVIDER_URL: &str =
+    "https://cdn.jsdelivr.net/npm/@multiversx/sdk-extension-provider@5.1.2/+esm";
+/// Pinned cross-window Web Wallet provider (popup, official wallet URLs).
+pub const MX_XWINDOW_PROVIDER_URL: &str =
+    "https://cdn.jsdelivr.net/npm/@multiversx/sdk-web-wallet-cross-window-provider@3.2.2/+esm";
+/// Pinned sdk-core (documented SignableMessage shape for signMessage).
+pub const MX_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/@multiversx/sdk-core@15.3.1/+esm";
+/// Pinned noble ed25519 (sync browser build): in-page identity keygen +
+/// signing. The page controls every byte — no wallet software involved.
+pub const MX_NOBLE_ED25519_URL: &str = "https://cdn.jsdelivr.net/npm/@noble/ed25519@1.7.3/+esm";
+/// Pinned bech32 (same version MultiversX ships): pubkey → erd1 address.
+pub const MX_BECH32_URL: &str = "https://cdn.jsdelivr.net/npm/bech32@1.1.4/+esm";
+/// Pinned noble hashes (keccak_256 for the Elrond signing digest — local
+/// pre-verify of wallet signatures before hitting the server).
+pub const MX_NOBLE_HASHES_URL: &str = "https://cdn.jsdelivr.net/npm/@noble/hashes@1.8.0/+esm";
+/// Official Web Wallet URLs (popup target per selected network).
+pub const MX_WEB_WALLET_MAINNET: &str = "https://wallet.multiversx.com";
+pub const MX_WEB_WALLET_TESTNET: &str = "https://testnet-wallet.multiversx.com";
+
+/// The account onboarding HTML (no-store; all state via the wallet API).
+pub fn account_html() -> String {
+    ACCOUNT_HTML
+        .replace("/*__MX_EXTENSION_URL__*/", MX_EXTENSION_PROVIDER_URL)
+        .replace("/*__MX_XWINDOW_URL__*/", MX_XWINDOW_PROVIDER_URL)
+        .replace("/*__MX_CORE_URL__*/", MX_CORE_URL)
+        .replace("/*__MX_NOBLE_URL__*/", MX_NOBLE_ED25519_URL)
+        .replace("/*__MX_BECH32_URL__*/", MX_BECH32_URL)
+        .replace("/*__MX_HASHES_URL__*/", MX_NOBLE_HASHES_URL)
+}
+
+const ACCOUNT_HTML: &str = r##"<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DecentraAI — Cont</title>
+<style>
+:root{--bg:#070a12;--panel:#0f172a;--line:#1f2a44;--text:#e6eef8;--muted:#8aa0b8;--accent:#22d3ee;--ok:#34d399;--warn:#fbbf24;--err:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}body{background:radial-gradient(1000px 600px at 30% -10%,#1a2540 0%,transparent 60%),var(--bg);color:var(--text);font:14px/1.6 system-ui,sans-serif;padding:24px;max-width:640px;margin:0 auto}
+h1{font-size:24px;margin-bottom:4px}h1 span{color:var(--accent)}p.sub{color:var(--muted);margin-bottom:16px}
+.card{background:linear-gradient(180deg,#0f172a 0%,#0b1222 100%);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:14px;box-shadow:0 6px 20px #0006}
+.card h2{font-size:15px;margin-bottom:8px}.card h2 .n{display:inline-block;width:22px;height:22px;border-radius:50%;background:#1a2a4a;border:1px solid #2a3a5e;text-align:center;font-size:12px;line-height:20px;margin-right:8px;color:var(--accent)}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{padding:10px 14px;border-radius:10px;border:1px solid #2a3a5e;background:linear-gradient(180deg,#1a2a4a,#12203a);color:var(--text);font-weight:600;cursor:pointer}
+button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:not-allowed}
+button.primary{border-color:var(--accent)}button.danger{border-color:var(--err)}
+button.sel{border-color:var(--ok);box-shadow:0 0 0 1px var(--ok)}
+input,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #22304a;background:#0a0e16;color:var(--text);font-size:13px;margin-top:6px;font-family:ui-monospace,monospace}
+label{font-size:12px;color:var(--muted);display:block;margin-top:10px}
+pre{margin-top:12px;background:#0a0e16;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;color:var(--muted)}
+#out2{display:none}
+.ok{color:var(--ok)}.err{color:var(--err)}.warn{color:var(--warn)}
+.keybox{font-size:15px;color:var(--ok);border:1px dashed var(--ok);padding:12px;border-radius:10px;margin-top:10px;word-break:break-all;user-select:all}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted);margin-left:8px}
+a{color:var(--accent);text-decoration:none}
+.hidden{display:none}
+code{background:#0a0e16;padding:1px 6px;border-radius:6px;border:1px solid var(--line);font-size:12px}
+</style></head><body>
+<h1>● DecentraAI <span>Cont</span><span class="badge" id="nodeNet">nod: …</span></h1>
+<p class="sub">Conectează wallet-ul MultiversX (testnet sau mainnet) și primești cheia de acces în fabrică — <code>dca_</code>, compatibilă OpenAI. Fără cont anterior, fără master.</p>
+<!-- Console terțe (ex. orchestratorul Perchance): login cu portofelul via POST /v1/auth/native {accessToken} → {consumerKey}; Bearer accessToken direct pe /mcp NU e acceptat (401, fail-closed) — schimbul emite cheia revocabilă. -->
+
+<div class="card" id="step1"><h2><span class="n">1</span>Rețeaua ta</h2>
+<div class="row">
+<button id="netT" onclick="setNet('multiversx-testnet')">Testnet</button>
+<button id="netM" onclick="setNet('multiversx-mainnet')">Mainnet</button>
+</div>
+<p class="sub" style="margin:8px 0 0">Intenție înregistrată + semnată în challenge (<code>purpose=onboard:…</code>). Legarea de lanț o face nodul (<code id="nodeNet2">…</code>) — cheia fabricii e valabilă oricum.</p>
+</div>
+
+<div class="card" id="step2"><h2><span class="n">2</span>Conectează wallet-ul</h2>
+<div class="row">
+<button id="mExt" onclick="connectExtension()">DeFi Extension</button>
+<button id="mWeb" onclick="connectXWindow()">Web Wallet (popup)</button>
+<button id="mGen" onclick="genIdentity()">Generează identitate locală</button>
+<button id="mXpo" onclick="showXportal()">xPortal (aplicație)</button>
+<button id="mMan" onclick="showManual()">Manual / alt wallet</button>
+</div>
+<div id="xpoBox" class="hidden">
+<p class="sub" style="margin:4px 0 0">xPortal pe telefon nu se poate împerechea direct fără relay extern — de aceea pagina nu-l cere. Calea first-party: <b>1)</b> tastează adresa mai jos → <b>2)</b> cere mesajul → <b>3)</b> semnează mesajul exact în xPortal → <b>4)</b> lipește semnătura și verifică. Totul mai jos, zero dependențe.</p>
+<div class="row" style="margin-top:8px"><button class="primary" onclick="showManual()">Continuă cu semnare manuală →</button></div>
+</div>
+<div id="manualBox" class="hidden">
+<label>Adresă wallet (erd1…)</label><input id="manAddr" placeholder="erd1…" autocomplete="off">
+<div class="row" style="margin-top:8px"><button onclick="manualChallenge()">1. Cere mesaj de semnat</button><button onclick="copyMsg()">Copiază mesajul</button></div>
+<pre id="manMsg" style="display:none"></pre>
+<label>Semnătură (hex sau base64) a mesajului de mai sus — se verifică automat la lipire</label><textarea id="manSig" rows="3" placeholder="semnează mesajul în wallet-ul tău, lipește aici" autocomplete="off" onpaste="setTimeout(manualLogin,300)"></textarea>
+<div class="row" style="margin-top:8px"><button class="primary" onclick="manualLogin()">2. Verifică și intră →</button></div>
+</div>
+<pre id="out2"></pre>
+<div class="row" style="margin-top:8px"><button onclick="copyNativeDbg()">copiază debug nativ (pentru Pylon)</button></div>
+</div>
+
+<div class="card hidden" id="step3"><h2><span class="n">3</span>Cheia ta <span class="badge">arătată o singură dată</span></h2>
+<div id="keyInfo"></div>
+<div class="keybox" id="keyPlain"></div>
+<div class="row" style="margin-top:10px">
+<button class="primary" onclick="copyKey()">Copiază cheia</button>
+<button class="danger" onclick="rotateKey()">Revocă + re-emite</button>
+</div>
+<p class="sub" style="margin:8px 0 0">Salvată și în browser (localStorage). Serverul păstrează doar hash + prefix. Pierdută = revocă + re-emite, durează 5 secunde.</p>
+</div>
+
+<div class="card hidden" id="step4"><h2><span class="n">4</span>Folosește-o — o cheie, două uși</h2>
+<label>OpenAI-compatibil (chat, embeddings)</label>
+<pre id="snipOpenai" style="display:block"></pre>
+<label>MCP (agenți)</label>
+<pre id="snipMcp" style="display:block"></pre>
+</div>
+
+<p class="sub">Cheia are cote modeste (1000 unități, 50/min) — suficient pentru onboarding real. Pagini: <a href="/ui2">dashboard</a> · <a href="/fabric">fabric</a> · <a href="/world/join">world/join</a></p>
+
+<script>
+const S={net:'multiversx-testnet',addr:null,chal:null,session:null,key:null,keyId:null,nodeNet:null};
+const $=id=>document.getElementById(id);
+function say(el,msg,cls){const e=$(el);e.style.display='block';e.textContent=msg;e.className=cls||'';}
+function purpose(){return 'onboard:'+(S.net==='multiversx-mainnet'?'mainnet':'testnet');}
+function setNet(n){S.net=n;$('netT').className=n.endsWith('testnet')?'sel':'';$('netM').className=n.endsWith('mainnet')?'sel':'';}
+setNet(S.net);
+// Node chain binding on page load (public endpoint — no session needed).
+// The signed challenge binds this server-side value; the toggle below
+// only records intent.
+(async function loadNetwork(){
+  try{
+    const r=await fetch('/v1/auth/wallet/network');const j=await r.json();
+    if(j&&j.network){S.nodeNet=j.network;$('nodeNet').textContent='nod: '+j.network;$('nodeNet2').textContent=j.network;}
+  }catch(_){$('nodeNet').textContent='nod: necunoscut';$('nodeNet2').textContent='necunoscut';}
+})();
+async function api(path,method,body){const r=await fetch(path,{method:method||'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));return{status:r.status,json:j};}
+async function getChallenge(addr){
+  const r=await api('/v1/auth/wallet/challenge','POST',{wallet_address:addr,purpose:purpose()});
+  if(r.status!==200)throw new Error('challenge: '+(r.json.error||r.status));
+  S.nodeNet=r.json.network;$('nodeNet').textContent='nod: '+r.json.network;$('nodeNet2').textContent=r.json.network;
+  if(r.json.network==='multiversx-testnet'&&S.net==='multiversx-mainnet')say('out2','Atenție: nodul e pe TESTNET, tu ai ales MAINNET. Cheia fabricii funcționează oricum.','warn');
+  if(r.json.network==='multiversx-mainnet'&&S.net==='multiversx-testnet')say('out2','Atenție: nodul e pe MAINNET, tu ai ales TESTNET. Cheia fabricii funcționează oricum.','warn');
+  return r.json;
+}
+async function doVerify(addr,chalId,sig){
+  const r=await api('/v1/auth/wallet/verify','POST',{wallet_address:addr,challenge_id:chalId,signature:sig});
+  if(r.status!==200)throw new Error('verify: '+(r.json.error||r.status));
+  S.session=r.json.session_token;S.addr=r.json.wallet_address;
+  await mintKey();
+}
+async function mintKey(){
+  const r=await api('/v1/auth/wallet/key','POST',{session_token:S.session});
+  if(r.status===409){ // cheie existentă: RECUNOAȘTERE, nu re-emitere
+    S.keyId=r.json.key_id;
+    await showRecognized();
+    return;
+  }
+  if(r.status!==200||!r.json.ok)throw new Error('key: '+(r.json.error||r.status));
+  S.key=r.json.token;S.keyId=r.json.key_id;
+  $('keyPlain').textContent=r.json.token;
+  $('keyInfo').innerHTML='Cont <code>'+esc(r.json.account)+'</code> · wallet <code>'+esc(r.json.wallet)+'</code><br>key_id <code>'+esc(r.json.key_id)+'</code> · cotă '+r.json.quota_ceiling+' · '+r.json.rate_limit_per_minute+'/min · start '+(r.json.starter_granted?r.json.starter_quota+' (grant)':'0 (deja alimentat)')+'<br>scope-uri <code>'+esc((r.json.scopes||[]).join(', '))+'</code> (embeddings + compute + memorie proprie; orchestrare/hub rămân pe admin)';
+  try{localStorage.setItem('decentraai.account.key',r.json.token);localStorage.setItem('decentraai.account.key_id',r.json.key_id);}catch(_){}
+  $('step3').classList.remove('hidden');showSnippets(r.json.token);
+  say('out2','Autentificat ca '+r.json.wallet+'. Cheia de mai sus NU se mai arată — copiaz-o acum.','ok');
+}
+function showManageOnly(){
+  $('keyPlain').textContent='(ascunsă — emisă anterior; rotește pentru una nouă)';
+  $('keyInfo').innerHTML='key_id <code>'+esc(S.keyId)+'</code> · apasă <b>Revocă + re-emite</b> pentru o cheie nouă (cea veche moare instant).';
+  $('step3').classList.remove('hidden');
+}
+// Recunoaștere: wallet-ul are deja cheie. Arată cine ești + cota LIVE
+// (sesiunea wallet poate citi get_quota, spre deosebire de cheia dca_)
+// + rotație. Snippet-urile vin doar cu cheie proaspătă (după rotație).
+async function showRecognized(){
+  let quotaLine='cotă: (indisponibilă)';
+  try{
+    const r=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+S.session},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'get_quota',arguments:{}}})});
+    const j=await r.json();
+    const txt=j&&j.result&&j.result.content&&j.result.content[0]&&j.result.content[0].text;
+    const q=txt?JSON.parse(txt):null;
+    const acc=q&&(q.accounts||[]).find(a=>a.account===S.addr);
+    if(acc)quotaLine='disponibil <b>'+acc.available+'</b> · câștigat '+acc.earned+' · cheltuit '+acc.consumed;
+  }catch(_){}
+  $('keyPlain').textContent='Bine ai revenit — cheia ta e activă.';
+  $('keyInfo').innerHTML='Cont <code>'+esc(S.addr)+'</code><br>key_id <code>'+esc(S.keyId)+'</code> · '+quotaLine+'<br>Plaintext-ul nu se mai arată (arătat o singură dată, la emitere). Pentru snippet-uri de conectare: apasă <b>Revocă + re-emite</b>.';
+  $('step3').classList.remove('hidden');
+  say('out2','Recunoscut: '+S.addr+' (cheie '+S.keyId+').','ok');
+}
+function showSnippets(tok){
+  const base=location.origin+'/v1';
+  $('snipOpenai').textContent='import OpenAI from "openai";\nconst ai=new OpenAI({baseURL:"'+base+'",apiKey:"'+tok+'"});\nawait ai.chat.completions.create({model:"auto",messages:[{role:"user",content:"salut"}]});';
+  $('snipMcp').textContent='curl -X POST '+location.origin+'/mcp \\\n -H "Authorization: Bearer '+tok+'" \\\n -H "Content-Type: application/json" \\\n -d \'{"jsonrpc":"2.0","id":1,"method":"tools/list"}\'';
+  $('step4').classList.remove('hidden');
+}
+async function rotateKey(){
+  if(!S.session){say('out2','Sesiune expirată — reconectează wallet-ul (pasul 2).','err');return;}
+  const d=await api('/v1/auth/wallet/key','DELETE',{session_token:S.session});
+  if(d.status!==200){say('out2','revoke: '+(d.json.error||d.status),'err');return;}
+  S.key=null;await mintKey();
+}
+function copyKey(){const t=S.key||'(nemaifișată)';navigator.clipboard.writeText(t).then(()=>say('out2','Cheia e în clipboard.','ok'));}
+function copyMsg(){if(S.manChal)navigator.clipboard.writeText(S.manChal.message).then(()=>say('out2','Mesaj copiat — semnează-l exact în wallet și lipește semnătura.','ok'));else say('out2','Cere întâi mesajul (pasul 1).','err');}
+function b64urlStr(s){const b=new TextEncoder().encode(s);let bin='';for(let i=0;i<b.length;i++)bin+=String.fromCharCode(b[i]);return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+// Native-auth token (official shape): b64url(origin).blockhash.ttl.b64url(extra).
+// Origin = bare hostname (the official JS SDK default — servers allow-list
+// it; full-URL origins also accepted server-side). TTL 86400 = SDK default.
+async function nativeToken(){
+  const r=await fetch('/v1/auth/wallet/blockhash?network='+(S.net==='multiversx-mainnet'?'mainnet':'testnet'));
+  const j=await r.json();
+  if(!j.ok||!/^[0-9a-fA-F]{64}$/.test(j.hash||''))throw new Error('blockhash indisponibil — reîncearcă.');
+  const extra=b64urlStr(JSON.stringify({}));
+  return b64urlStr(location.hostname)+'.'+j.hash+'.86400.'+extra;
+}
+async function doNativeVerify(addr,token,sig){
+  // Verificare LOCALĂ înainte de server (noble+bech32 deja pin-uite):
+  // deosebește transport/encoding (local ok, server nu) de bytes greșiți
+  // (nici local nu iese) și detectează varianta semnată (adresă+token vs
+  // doar token). Rezultatul ajunge în debug, nu mai ghicim.
+  let local='neverificat';
+  try{
+    const edMod=await import('/*__MX_NOBLE_URL__*/');const ed=edMod.default||edMod;
+    const bMod=await import('/*__MX_BECH32_URL__*/');const B=bMod.bech32||bMod.default||bMod;
+    const dec=B.decode(addr);
+    if(dec.prefix!=='erd')throw new Error('prefix neașteptat la adresă');
+    const pub=(typeof B.fromWords==='function')?B.fromWords(dec.words):(()=>{const out=[];let acc=0,bits=0;for(const v of dec.words){acc=(acc<<5)|v;bits+=5;while(bits>=8){bits-=8;out.push((acc>>>bits)&0xff);acc&=(1<<bits)-1;}}return out;})();
+    const te=new TextEncoder();
+    const sb=unhex(sig);
+    const okAT=await ed.verify(sb,te.encode(addr+token),new Uint8Array(pub));
+    let okTO=false;
+    try{okTO=await ed.verify(sb,te.encode(token),new Uint8Array(pub));}catch(_){}
+    // Digestul Elrond (ce semnează wallet-urile reale): keccak(prefix+len+msg).
+    let okDG=false,okLG=false;
+    try{
+      const hMod=await import('/*__MX_HASHES_URL__*/');
+      const keccak=(hMod.keccak_256||(hMod.default&&hMod.default.keccak_256));
+      if(typeof keccak==='function'){
+        const pre=te.encode('\x17Elrond Signed Message:\n');
+        const dig=(s)=>{const m=te.encode(s);const L=te.encode(String(m.length));const b=new Uint8Array(pre.length+L.length+m.length);b.set(pre,0);b.set(L,pre.length);b.set(m,pre.length+L.length);return keccak(b);};
+        try{okDG=await ed.verify(sb,dig(addr+token),new Uint8Array(pub));}catch(_){}
+        try{okLG=await ed.verify(sb,dig(addr+token+'{}'),new Uint8Array(pub));}catch(_){}
+      }
+    }catch(_){}
+    local='raw addr+token:'+(okAT?'OK':'NU')+' raw token:'+(okTO?'OK':'NU')+' digest:'+(okDG?'OK':'NU')+' legacy:'+(okLG?'OK':'NU');
+  }catch(e){local='eroare-local:'+String(e.message||e).slice(0,80);}
+  const r=await api('/v1/auth/wallet/native-auth','POST',{wallet_address:addr,token:token,signature:sig});
+  if(r.status!==200){
+    S.lastDbg={addr:addr,token:token,sig:sig,local:local};
+    throw new Error('native-auth: '+((r.json&&r.json.error)||r.status)+' [local: '+local+' | sig='+sig.slice(0,64)+'… token='+token.slice(0,80)+'…] (tripletul complet e în butonul „copiază debug nativ" de mai jos)');
+  }
+  S.session=r.json.session_token;S.addr=r.json.wallet_address;
+  await mintKey();
+}
+function copyNativeDbg(){
+  const d=S.lastDbg;
+  if(!d){say('out2','Niciun debug nativ de copiat — încearcă întâi extensia.','warn');return;}
+  navigator.clipboard.writeText(JSON.stringify(d)).then(()=>say('out2','Debug complet copiat ('+d.sig.length+' sig chars, token '+d.token.length+' chars) — lipește-l lui Pylon.','ok'));
+}
+// ---- canal brut erdw-inpage (fără SDK): op 'connect' + token STRING ----
+// Forma exactă pe care o vorbește extensia oficială (același canal ca
+// provider-ul SDK): postMessage({target:'erdw-inpage',type:'connect',
+// data:<loginToken>}), răspuns 'erdw-contentScript'/connectResponse cu
+// {address, signature}. Fără dependențe, fără singleton-uri.
+function extRaw(op,data,timeoutMs){
+  return new Promise((resolve,reject)=>{
+    let done=false;
+    const timer=setTimeout(()=>fin(false,new Error('extensia nu a răspuns — e deblocată?')),timeoutMs||90000);
+    function fin(ok,v){if(done)return;done=true;clearTimeout(timer);window.removeEventListener('message',h);if(ok)resolve(v);else reject(v);}
+    function h(ev){const d=ev&&ev.data;if(!d||typeof d!=='object')return;if(String(d.target||'').toLowerCase()!=='erdw-contentscript')return;if(/cancel/i.test(String(d.type||''))){fin(false,new Error('anulat în wallet'));return;}fin(true,d.data);}
+    window.addEventListener('message',h,false);
+    try{window.postMessage({target:'erdw-inpage',type:op,data:data},window.origin);}catch(e){fin(false,e);}
+  });
+}
+async function extRawLogin(token){
+  const res=await extRaw('connect',token);
+  const addr=res&&(res.address||(res.data&&res.data.address));
+  const sig=res&&(res.signature||(res.data&&res.data.signature));
+  if(!addr||!sig)throw new Error('extensia n-a întors adresă/semnătură (anulat?).');
+  return{addr:String(addr),sig:String(sig)};
+}
+// ---- Web Wallet oficial: hook/login (wallet-ul semnează token-ul) ----
+// Popup-ul răspunde LOGIN_RESPONSE către window.opener; același-tab
+// revine cu ?address=…&signature=… (token-ul stă în sessionStorage).
+function webHookUrl(token){
+  const wurl=S.net==='multiversx-mainnet'?'https://wallet.multiversx.com':'https://testnet-wallet.multiversx.com';
+  const cb=location.origin+location.pathname;
+  return wurl+'/hook/login?token='+encodeURIComponent(token)+'&callbackUrl='+encodeURIComponent(cb);
+}
+async function connectWebHook(){
+  const token=await nativeToken();
+  try{sessionStorage.setItem('decentraai.pending.native',token);}catch(_){}
+  say('out2','Se deschide Web Wallet-ul oficial — autentifică-te acolo…','');
+  const got=await new Promise((resolve)=>{
+    let done=false;
+    function h(ev){
+      try{
+        const d=ev&&ev.data;if(!d||typeof d!=='object')return;
+        if(!/^LOGIN_RESPONSE$/i.test(String(d.type||'')))return;
+        if(!/wallet\.multiversx\.com$/i.test(String(ev.origin||'')))return;
+        const data=(d.payload&&d.payload.data)||d.data||{};
+        if(data.address&&data.signature){done=true;window.removeEventListener('message',h);resolve({address:String(data.address),signature:String(data.signature)});}
+      }catch(_){}
+    }
+    window.addEventListener('message',h,false);
+    let popup=null;
+    try{popup=window.open(webHookUrl(token),'mx-web-wallet','width=520,height=780');}catch(_){popup=null;}
+    if(popup&&!popup.closed){setTimeout(()=>{if(!done){window.removeEventListener('message',h);resolve(null);}},180000);}
+    else{try{location.href=webHookUrl(token);}catch(_){}resolve(null);}
+  });
+  if(!got)throw new Error('fără răspuns de la Web Wallet.');
+  S.lastSig=got.signature;S.lastToken=token;
+  say('out2','Token nativ semnat de '+got.address+' — verific…','');
+  await doNativeVerify(got.address,token,got.signature);
+}
+// Revenire același-tab din hook/login (?address&signature).
+(function webHookCallback(){
+  try{
+    const q=location.search||'';if(q.length<3)return;
+    const p=new URLSearchParams(q.replace(/^\?/,''));const addr=p.get('address'),sig=p.get('signature');
+    if(!addr||!sig)return;
+    let token=null;try{token=sessionStorage.getItem('decentraai.pending.native');}catch(_){}
+    try{history.replaceState(null,'',location.origin+location.pathname+(location.hash||''));}catch(_){}
+    if(!token){say('out2','Web Wallet a răspuns, dar token-ul de login lipsește (alt tab?). Reîncearcă.','err');return;}
+    say('out2','Răspuns Web Wallet — verific…','');
+    S.lastSig=sig;S.lastToken=token;
+    doNativeVerify(addr,token,sig).catch(e=>say('out2','Web Wallet: '+String(e.message||e).slice(0,300),'err'));
+  }catch(_){}
+})();
+// Documented SignableMessage shape (sdk-core, cached import). The docs
+// pass `new SignableMessage({message})` — providers read the documented
+// field; raw {data} stays as fallback.
+let _coreMod=null;
+async function signableMessage(bytes){
+  try{
+    if(!_coreMod)_coreMod=await import('/*__MX_CORE_URL__*/');
+    const SM=_coreMod.SignableMessage||(_coreMod.default&&_coreMod.default.SignableMessage);
+    if(typeof SM==='function')return new SM({message:bytes});
+  }catch(_){}
+  return null;
+}
+async function providerSign(p,message){
+  const bytes=msgBytes(message);
+  if(typeof p.signMessage!=='function')throw new Error('provider fără signMessage(). Semnează manual.');
+  const doc=await signableMessage(bytes);
+  const shapes=[];
+  if(doc)shapes.push(['doc',doc]);
+  shapes.push(['data',{data:bytes}]);
+  shapes.push(['str',message]);
+  const errs=[];
+  for(const [name,shape] of shapes){
+    try{
+      const out=await p.signMessage(shape,{});
+      const sig=extractSig(out);
+      if(sig){S.lastShape=name;return sig;}
+      errs.push(name+': fără semnătură în răspuns');
+    }catch(e){errs.push(name+': '+String(e.message||e).slice(0,150));}
+  }
+  // Some providers mutate the passed object instead of returning.
+  if(doc&&doc.signature){const sig=extractSig(doc);if(sig){S.lastShape='doc-mutated';return sig;}}
+  throw new Error('semnare eșuată ['+errs.join(' | ').slice(0,420)+']. Încearcă Manual.');
+}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// ---- metoda: identitate locală (zero wallet software) ----
+// Cheia se naște în browser (CSPRNG), adresa = bech32(pubkey), semnarea
+// e locală pe bytes-ii exacți ai challenge-ului. Calea care nu poate
+// pica din cauza vreunui wallet: noi controlăm toți bytes-ii.
+// Cheia privată rămâne în localStorage (profilul browserului): identitate
+// de fabrică (acces API), NU ține fonduri — pentru fonduri, wallet-ul.
+function hexBytes(b){return [...b].map(x=>x.toString(16).padStart(2,'0')).join('');}
+function unhex(h){const o=new Uint8Array(h.length/2);for(let i=0;i<o.length;i++)o[i]=parseInt(h.substr(i*2,2),16);return o;}
+async function genIdentity(){
+  say('out2','Se generează identitatea…','');
+  try{
+    const edMod=await import('/*__MX_NOBLE_URL__*/');
+    const ed=edMod.default||edMod;
+    const bMod=await import('/*__MX_BECH32_URL__*/');
+    const B=bMod.bech32||bMod.default||bMod;
+    if(typeof ed.getPublicKey!=='function'||typeof ed.sign!=='function')throw new Error('librăria ed25519 nu s-a încărcat. Reîncearcă.');
+    if(typeof B.encode!=='function'||typeof B.toWords!=='function')throw new Error('librăria bech32 nu s-a încărcat. Reîncearcă.');
+    let seedHex=null;
+    try{seedHex=localStorage.getItem('decentraai.identity.seed');}catch(_){}
+    let priv;
+    if(seedHex&&/^[0-9a-fA-F]{64}$/.test(seedHex)){priv=unhex(seedHex);}
+    else{priv=crypto.getRandomValues(new Uint8Array(32));try{localStorage.setItem('decentraai.identity.seed',hexBytes(priv));}catch(_){}}
+    const pub=await ed.getPublicKey(priv);
+    const addr=B.encode('erd',B.toWords(pub));
+    say('out2','Identitate: '+addr+' — cere challenge…','');
+    const chal=await getChallenge(addr);
+    const sig=hexBytes(await ed.sign(msgBytes(chal.message),priv));
+    await doVerify(addr,chal.challenge_id,sig);
+  }catch(e){say('out2','Identitate locală: '+String(e.message||e).slice(0,300),'err');}
+}
+// ---- metoda: DeFi Extension (SDK pin-uit, import dinamic) ----
+// Provider-ul e SINGLETON: getInstance(), nu create/new. init() confirmă
+// extensia (window.multiversxWallet); login() populează account.address;
+// signMessage({data: bytes}) întoarce sdk-core Message.
+function detectWallets(){
+  const found=[];
+  try{
+    if(window.multiversxWallet)found.push('DeFi/MultiversX (multiversxWallet)');
+    if(window.elrondWallet)found.push('legacy (elrondWallet)');
+    if(window.xportal)found.push('xPortal (xportal)');
+    if(window.maiarProvider)found.push('maiarProvider');
+    if(window.multiversXWallet)found.push('multiversXWallet');
+  }catch(_){}
+  return found;
+}
+async function connectExtension(){
+  const wallets=detectWallets();
+  const det='Portofele detectate: '+(wallets.length?wallets.join(' + '):'NICIUNUL (extensia lipsește/oprită)')+'.'+(wallets.length>1?' ATENȚIE: mai multe extensii pe același canal — dezactivează-le pe toate înafara de una!':'');
+  say('out2',det+' Se încarcă provider-ul DeFi…','');
+  try{
+    const mod=await import('/*__MX_EXTENSION_URL__*/');
+    const Provider=mod.ExtensionProvider||(mod.default&&mod.default.ExtensionProvider);
+    if(!Provider)throw new Error('SDK încărcat, dar ExtensionProvider lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
+    const p=typeof Provider.getInstance==='function'?Provider.getInstance():new Provider();
+    await p.init();
+    if(typeof p.isInitialized==='function'&&!p.isInitialized())throw new Error('Extensia DeFi/MultiversX nu e instalată sau nu e activată pentru site-ul ăsta.');
+    if(typeof p.login!=='function')throw new Error('provider fără login(). Încearcă Manual.');
+    // Calea oficială: token native-auth semnat de portofel.
+    // Întâi canalul brut (forma exactă a extensiei: 'connect' + STRING),
+    // apoi provider-ul SDK, apoi challenge-ul clasic.
+    let token=null;
+    try{
+      token=await nativeToken();
+      say('out2','Token nativ emis — aștept semnătura extensiei…','');
+      const raw=await extRawLogin(token);
+      if(!confirm('Extensia raportează adresa:\n\n'+raw.addr+'\n\nVerifică în extensia DeFi că ACEASTĂ adresă e cea selectată activ (extensia poate semna cu alt cont!). Continui?')){say('out2','Oprit de tine. Selectează adresa în extensie și reîncearcă.','warn');return;}
+      say('out2','Token nativ semnat de '+raw.addr+' — verific…','');
+      S.lastSig=raw.sig;S.lastToken=token;
+      await doNativeVerify(raw.addr,token,raw.sig);
+      return;
+    }catch(e){
+      say('out2','Canal brut indisponibil ('+String(e.message||e).slice(0,120)+') — încerc provider-ul…','warn');
+    }
+    try{
+      if(!token)token=await nativeToken();
+      await p.login({token:token});
+      const addr2=await providerAddress(p);
+      if(!addr2)throw new Error('login-token ok, dar adresa lipsește.');
+      const accSig=p.account&&p.account.signature?p.account.signature:null;
+      const sig=extractSig(accSig);
+      if(!sig)throw new Error('login-token ok, dar fără semnătură — reîncearcă.');
+      S.lastSig=sig;S.lastToken=token;
+      say('out2','Token nativ semnat de '+addr2+' — verific…','');
+      await doNativeVerify(addr2,token,sig);
+      return;
+    }catch(e){
+      if(!/login-token|semnătură|adresă|blockhash/.test(String(e.message||e)))throw e;
+      say('out2','Native-auth indisponibil ('+String(e.message||e).slice(0,120)+') — fallback challenge clasic…','warn');
+    }
+    await p.login();
+    const addr=await providerAddress(p);
+    if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
+    // Poartă anti-confuzie: extensia poate semna cu alt cont decât cel
+    // întors la login (mai multe adrese). Utilizatorul confirmă explicit.
+    if(!confirm('Portofel conectat:\n\n'+addr+'\n\nVerifică în extensia DeFi că ACEASTĂ adresă e cea selectată activ. Dacă ai mai multe adrese, selecteaz-o pe aceasta acum.\n\nContinui cu semnarea?')){say('out2','Oprit de tine. Selectează adresa în extensie și reîncearcă — sau Manual.','warn');return;}
+    say('out2','Conectat: '+addr+' — cere challenge…','');
+    const chal=await getChallenge(addr);
+    // Debug vizibil (semnătura e publică prin construcție — ajunge la
+    // server oricum): ce i s-a cerut extensiei vs ce a înapoiat.
+    S.lastSig=null;
+    const m=$('manMsg');m.style.display='block';m.textContent='Mesaj trimis la semnat (byte-cu-byte):\n'+chal.message;
+    // Semnare brută: păstrăm obiectul Message întreg pentru tripla
+    // verificare de adrese (login vs ecoul semnăturii vs citire curentă).
+    const p2=p;
+    let signedRaw=await (async()=>{try{const o=await p2.signMessage({data:msgBytes(chal.message)});S.lastShape='data';return o;}catch(e1){const o=await p2.signMessage(chal.message);S.lastShape='str';return o;}})();
+    const sig=extractSig(signedRaw);
+    if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
+    S.lastSig=sig;
+    const echoAddr=addrOf(signedRaw&&(signedRaw.address||(signedRaw||{}).address));
+    const curAddr=await providerAddress(p2);
+    if(echoAddr&&echoAddr!==addr)m.textContent+='\n\nATENȚIE: extensia a ecouat adresa '+echoAddr+' (login: '+addr+'). Conturi diferite!';
+    if(curAddr&&curAddr!==addr)m.textContent+='\n\nATENȚIE: adresa curentă în extensie e '+curAddr+' (login: '+addr+'). Selecteaz-o pe cea de login!';
+    await doVerify(addr,chal.challenge_id,sig);
+  }catch(e){
+    const dbg=S.lastSig?(' [debug: shape='+(S.lastShape||'?')+' sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
+    say('out2','Extension: '+String(e.message||e).slice(0,300)+dbg,'err');
+  }
+}
+// ---- metoda: Web Wallet (hook/login oficial, apoi provider popup) ----
+function popupsAllowed(){try{const t=window.open('about:blank','_blank','width=10,height=10');if(!t||t.closed)return false;t.close();return true;}catch(_){return false;}}
+async function connectXWindow(){
+  // Întâi fluxul oficial hook/login (wallet-ul semnează token-ul nativ);
+  // la eșec, provider-ul cross-window clasic cu challenge.
+  try{await connectWebHook();return;}
+  catch(e){say('out2','hook/login indisponibil ('+String(e.message||e).slice(0,120)+') — încerc provider-ul…','warn');}
+  if(!popupsAllowed()){say('out2','Web Wallet are nevoie de popup-uri: permite-le pentru site-ul ăsta (pictograma din bara de adrese), apoi reîncearcă.','warn');return;}
+  say('out2','Se încarcă provider-ul Web Wallet…','');
+  try{
+    const mod=await import('/*__MX_XWINDOW_URL__*/');
+    const XW=mod.CrossWindowProvider
+      ||(mod.default&&(mod.default.CrossWindowProvider||mod.default));
+    if(typeof XW!=='function'&&typeof XW.getInstance!=='function')throw new Error('SDK încărcat, dar CrossWindowProvider lipsește (exports: '+Object.keys(mod).slice(0,8).join(',')+'). Încearcă Manual.');
+    const p=typeof XW.getInstance==='function'?XW.getInstance():new XW();
+    if(typeof p.init==='function')await p.init();
+    const wurl=S.net==='multiversx-mainnet'?'https://wallet.multiversx.com':'https://testnet-wallet.multiversx.com';
+    if(typeof p.setWalletUrl==='function')p.setWalletUrl(wurl);
+    say('out2','Se deschide Web Wallet-ul oficial ('+wurl+') — autentifică-te acolo…','');
+    const loginOut=await p.login();
+    const addr=(typeof loginOut==='string'&&loginOut)||await providerAddress(p);
+    if(!addr)throw new Error('login ok, dar adresa lipsește. Încearcă Manual.');
+    say('out2','Conectat: '+addr+' — cere challenge…','');
+    const chal=await getChallenge(addr);
+    S.lastSig=null;
+    const m=$('manMsg');m.style.display='block';m.textContent='Mesaj trimis la semnat (byte-cu-byte):\n'+chal.message;
+    const sig=await providerSign(p,chal.message);
+    if(!sig)throw new Error('semnătură ilizibilă din provider. Încearcă Manual.');
+    S.lastSig=sig;
+    await doVerify(addr,chal.challenge_id,sig);
+  }catch(e){
+    const dbg=S.lastSig?(' [debug: shape='+(S.lastShape||'?')+' sig_len='+S.lastSig.length+' sig='+S.lastSig+']'):' [debug: fără semnătură]';
+    say('out2','Web Wallet: '+String(e.message||e).slice(0,200)+dbg,'err');
+  }
+}
+function msgBytes(s){return new TextEncoder().encode(s);}
+function addrOf(a){
+  if(!a)return null;
+  if(typeof a==='string')return a;
+  try{if(typeof a.bech32==='function')return a.bech32();}catch(_){}
+  try{const s=String(a);if(s.startsWith('erd1'))return s;}catch(_){}
+  return null;
+}
+function extractSig(signed){
+  if(!signed)return null;
+  if(typeof signed==='string')return signed;
+  const s=signed.signature||signed;
+  if(!s)return null;
+  if(typeof s==='string')return s;
+  // Buffer/Uint8Array (sdk-core Message.signature) → hex
+  if(typeof s.length==='number'&&typeof s.toString==='function'){
+    try{const h=s.toString('hex');if(/^[0-9a-fA-F]{128}$/.test(h))return h;}catch(_){}
+    try{let h='';for(let i=0;i<s.length;i++)h+=s[i].toString(16).padStart(2,'0');if(/^[0-9a-fA-F]{128}$/.test(h))return h;}catch(_){}
+  }
+  if(s&&typeof s.hex==='function')try{return s.hex();}catch(_){}
+  return null;
+}
+async function providerAddress(p){
+  if(!p)return null;
+  if(p.account&&p.account.address)return p.account.address;
+  if(typeof p.getAddress==='function'){try{const a=await p.getAddress();if(a)return a;}catch(_){}}
+  if(typeof p.address==='string'&&p.address)return p.address;
+  if(Array.isArray(p.accounts)&&p.accounts[0])return p.accounts[0];
+  if(typeof p.getAccount==='function'){try{const a=await p.getAccount();if(a&&(a.address||typeof a==='string'))return a.address||a;}catch(_){}}
+  return null;
+}
+// ---- metoda: xPortal (aplicație) — ghidare first-party, fără relay extern ----
+function showXportal(){$('xpoBox').classList.remove('hidden');say('out2','xPortal: vezi caseta de mai sus — fără conturi externe, fără QR extern.','');}
+// ---- metoda: manual (zero dependențe, merge mereu) ----
+function showManual(){$('manualBox').classList.remove('hidden');say('out2','1) tastează adresa → Cere mesaj → 2) semnează mesajul EXACT în wallet → 3) lipește semnătura → Verifică.','');}
+async function manualChallenge(){
+  const addr=$('manAddr').value.trim();
+  if(!/^erd1[0-9a-z]{58}$/.test(addr)){say('out2','Adresă invalidă (erd1 + 58 caractere).','err');return;}
+  try{
+    S.manChal=await getChallenge(addr);
+    const m=$('manMsg');m.style.display='block';m.textContent='Semnează EXACT (byte-cu-byte):\n'+S.manChal.message;
+    say('out2','Mesaj emis. Semnează-l în wallet, lipește semnătura, apasă Verifică.','warn');
+  }catch(e){say('out2','Manual: '+String(e.message||e).slice(0,300),'err');}
+}
+async function manualLogin(){
+  const addr=$('manAddr').value.trim(),sig=$('manSig').value.trim();
+  if(!S.manChal||S.manChal.wallet_address!==addr){say('out2','Cere întâi mesajul (pasul 1) pentru adresa asta.','err');return;}
+  if(!sig){say('out2','Lipsește semnătura.','err');return;}
+  try{await doVerify(addr,S.manChal.challenge_id,sig);}
+  catch(e){say('out2','Manual: '+String(e.message||e).slice(0,300),'err');}
+}
+</script></body></html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_page_markers() {
+        // Structural contract for GET /account: title, the three wallet
+        // methods, pinned provider URLs, backend endpoint refs, once-only
+        // wording, and NO secret-looking material in the template.
+        let html = account_html();
+        for marker in [
+            "DecentraAI — Cont",
+            "multiversx-testnet",
+            "multiversx-mainnet",
+            "DeFi Extension",
+            "Web Wallet (popup)",
+            "Generează identitate locală",
+            "xPortal (aplicație)",
+            "Manual / alt wallet",
+            "/v1/auth/wallet/challenge",
+            "/v1/auth/wallet/verify",
+            "/v1/auth/wallet/key",
+            "/v1/auth/wallet/network",
+            "/v1/auth/wallet/native-auth",
+            "/v1/auth/wallet/blockhash",
+            "/v1/auth/native",
+            "/hook/login",
+            "LOGIN_RESPONSE",
+            "erdw-inpage",
+            "getInstance",
+            "signMessage({data",
+            "xPortal (aplicație)",
+            "showXportal",
+            "arătată o singură dată",
+            "Bine ai revenit",
+            "Revocă + re-emite",
+            "dca_",
+        ] {
+            assert!(html.contains(marker), "missing marker: {marker}");
+        }
+        assert!(
+            html.contains(MX_EXTENSION_PROVIDER_URL),
+            "extension provider URL must be pinned"
+        );
+        assert!(
+            html.contains(MX_XWINDOW_PROVIDER_URL),
+            "cross-window provider URL must be pinned"
+        );
+        assert!(
+            html.contains(MX_CORE_URL),
+            "sdk-core URL must be pinned"
+        );
+        assert!(
+            !html.contains("/*__MX_EXTENSION_URL__*/"),
+            "URL placeholders must be substituted"
+        );
+        assert!(
+            !html.contains("/*__MX_HASHES_URL__*/"),
+            "hashes URL placeholder must be substituted"
+        );
+        // No secret material in the template: the identity seed lives only
+        // in the visitor's localStorage, never in served HTML.
+        for bad in ["dsk_", "BEGIN PRIVATE", "mnemonic"] {
+            assert!(!html.contains(bad), "template must not contain: {bad}");
+        }
+        // First-party only: no WalletConnect/QR/external-relay references.
+        for bad in ["wallet-connect", "walletconnect", "qrcode", "wss://relay"] {
+            assert!(!html.to_lowercase().contains(bad), "must stay first-party: {bad}");
+        }
+    }
+
+    #[test]
+    fn provider_urls_are_pinned_versions() {
+        // No @latest / floating tags: reproducible client, no supply-chain drift.
+        // First-party MultiversX only.
+        for url in [
+            MX_EXTENSION_PROVIDER_URL,
+            MX_XWINDOW_PROVIDER_URL,
+            MX_CORE_URL,
+        ] {
+            assert!(url.starts_with("https://cdn.jsdelivr.net/npm/@multiversx/"));
+            assert!(url.ends_with("/+esm"));
+            assert!(!url.contains("@latest"), "must pin exact version: {url}");
+        }
+        // Crypto primitives: same pin discipline, different vendors.
+        for url in [MX_NOBLE_ED25519_URL, MX_BECH32_URL, MX_NOBLE_HASHES_URL] {
+            assert!(url.starts_with("https://cdn.jsdelivr.net/npm/"));
+            assert!(url.ends_with("/+esm"));
+            assert!(!url.contains("@latest"), "must pin exact version: {url}");
+        }
+    }
+}

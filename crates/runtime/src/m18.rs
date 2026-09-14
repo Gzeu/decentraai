@@ -61,7 +61,24 @@ impl M18State {
         let escrow_path = data_dir.join("db/escrow.json");
         let trust_path = data_dir.join("db/trust.json");
         let contracts = load_json(&contracts_path).unwrap_or_default();
-        let escrow = load_json(&escrow_path).unwrap_or_default();
+        let mut escrow: decentraai_economy::escrow::EscrowLedger =
+            load_json(&escrow_path).unwrap_or_default();
+        // Backfill (2026-09-12): records settled before the `network` field
+        // existed carry real testnet tx hashes (mainnet lane never
+        // broadcast). Without this, verifiers query mainnet and report a
+        // false "not on chain".
+        let mut backfilled = 0;
+        for r in escrow.records.values_mut() {
+            if r.network.is_none()
+                && r.tx_hash.as_deref().is_some_and(|h| h.len() == 64)
+            {
+                r.network = Some("multiversx-testnet".to_string());
+                backfilled += 1;
+            }
+        }
+        if backfilled > 0 {
+            let _ = save_json(&escrow_path, &escrow);
+        }
         let trust = load_json(&trust_path).unwrap_or_default();
         Self {
             contracts: StdMutex::new(contracts),
@@ -240,17 +257,18 @@ pub fn settle_world_sale(
     tx_hash: &str,
     amount_credits: u64,
     now: u64,
+    network: Option<&str>,
 ) -> Result<(), String> {
     {
         let mut escrow = m18.escrow.lock().map_err(|e| e.to_string())?;
-        match escrow.settle_escrow(escrow_id, tx_hash, amount_credits, now) {
+        match escrow.settle_escrow(escrow_id, tx_hash, amount_credits, now, network) {
             Ok(()) => {}
             Err(decentraai_economy::escrow::EscrowError::InvalidTransition(
                 decentraai_economy::escrow::EscrowStatus::Settled,
                 _,
             )) => {
                 escrow
-                    .reanchor_escrow(escrow_id, tx_hash, now)
+                    .reanchor_escrow(escrow_id, tx_hash, now, network)
                     .map_err(|e| format!("m18 escrow reanchor failed: {e}"))?;
             }
             Err(e) => return Err(format!("m18 escrow settle failed: {e}")),
@@ -461,6 +479,9 @@ pub struct EscrowSettleRequest {
     pub evidence_hash: String,
     pub amount_micro_cu: u64,
     pub tx_hash: String,
+    /// Chain the tx lives on; None = unknown (verifiers: do not assume mainnet).
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 pub async fn escrow_settle_handler(
@@ -477,7 +498,7 @@ pub async fn escrow_settle_handler(
     if let Err(e) = escrow.release_escrow(&escrow_id, &req.evidence_hash, now) {
         return error_response(e.to_string());
     }
-    match escrow.settle_escrow(&escrow_id, &req.tx_hash, req.amount_micro_cu, now) {
+    match escrow.settle_escrow(&escrow_id, &req.tx_hash, req.amount_micro_cu, now, req.network.as_deref()) {
         Ok(()) => {
             let r = escrow.get_escrow(&escrow_id).unwrap().clone();
             drop(escrow);
@@ -724,7 +745,7 @@ mod tests {
             Some(eid.clone())
         );
         // Chain settle finalizes.
-        settle_world_sale(&m18, &eid, "deadbeef01", 10, now + 1).unwrap();
+        settle_world_sale(&m18, &eid, "deadbeef01", 10, now + 1, Some("multiversx-testnet")).unwrap();
         let escrow = m18.escrow.lock().unwrap();
         let r = escrow.records.get(&eid).unwrap();
         assert_eq!(r.status, decentraai_economy::escrow::EscrowStatus::Settled);
