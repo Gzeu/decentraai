@@ -126,6 +126,31 @@ pub struct ArenaWorld {
     pub alliances: std::collections::BTreeSet<(String, String)>,
     #[serde(default)]
     pub trades: Vec<String>,
+    /// Passive resource regen per tick-cadence (0 = disabled). The world
+    /// keeps pulsing even with no actions (direction #5: persistent arena).
+    #[serde(default = "default_regen_per_tick")]
+    pub regen_per_tick: u64,
+    /// Resource ceiling for every agent (earned gains also clamp here —
+    /// a real economy, not inflation).
+    #[serde(default = "default_max_resources")]
+    pub max_resources: u64,
+    /// Wall-clock seconds per tick for catch-up (default 60).
+    #[serde(default = "default_tick_seconds")]
+    pub tick_seconds: u64,
+    /// Last wall-clock second the world accounted for (0 = never; set
+    /// without backfill on first touch — no invented history).
+    #[serde(default)]
+    pub last_wall: u64,
+}
+
+fn default_regen_per_tick() -> u64 {
+    1
+}
+fn default_max_resources() -> u64 {
+    100
+}
+fn default_tick_seconds() -> u64 {
+    60
 }
 
 impl Default for ArenaWorld {
@@ -140,6 +165,10 @@ impl Default for ArenaWorld {
             buildings: BTreeMap::new(),
             alliances: std::collections::BTreeSet::new(),
             trades: Vec::new(),
+            regen_per_tick: default_regen_per_tick(),
+            max_resources: default_max_resources(),
+            tick_seconds: default_tick_seconds(),
+            last_wall: 0,
         }
     }
 }
@@ -286,7 +315,7 @@ impl ArenaWorld {
                 if evidence_id.is_some() {
                     {
                         let agent = self.agents.get_mut(agent_id).unwrap();
-                        agent.resources = agent.resources.saturating_add(5);
+                        agent.resources = agent.resources.saturating_add(5).min(self.max_resources);
                         agent.reputation += 1;
                     }
                     detail = "compute verified".to_string();
@@ -326,18 +355,18 @@ impl ArenaWorld {
                 }
                 if let Some(partner) = nearest_trade.clone() {
                     if let Some(p) = self.agents.get_mut(&partner) {
-                        p.resources = p.resources.saturating_add(2);
+                        p.resources = p.resources.saturating_add(2).min(self.max_resources);
                     }
                     {
                         let agent = self.agents.get_mut(agent_id).unwrap();
-                        agent.resources = agent.resources.saturating_add(1);
+                        agent.resources = agent.resources.saturating_add(1).min(self.max_resources);
                     }
                     self.trades.push(format!("{}->{}:1", agent_id, partner));
                     detail = format!("traded with {} ({} trades)", partner, self.trades.len());
                 } else {
                     {
                         let agent = self.agents.get_mut(agent_id).unwrap();
-                        agent.resources = agent.resources.saturating_add(2);
+                        agent.resources = agent.resources.saturating_add(2).min(self.max_resources);
                     }
                     self.trades.push(format!("{}:solo", agent_id));
                     detail = format!("traded solo ({} trades)", self.trades.len());
@@ -365,6 +394,13 @@ impl ArenaWorld {
             let agent = self.agents.get_mut(agent_id).unwrap();
             agent.last_action_tick = self.tick;
         }
+        // Rest is the active recovery move: a fuel-starved agent can always
+        // Rest (cost 0) back into play, up to the ceiling.
+        if action == ActionKind::Rest
+            && let Some(agent) = self.agents.get_mut(agent_id)
+        {
+            agent.resources = agent.resources.saturating_add(3).min(self.max_resources);
+        }
         let ev = ArenaEvent {
             tick: self.tick,
             agent_id: agent_id.to_string(),
@@ -385,6 +421,32 @@ impl ArenaWorld {
 
     pub fn advance_tick(&mut self) {
         self.tick += 1;
+    }
+
+    /// Time catch-up: advance the world for wall-clock elapsed since the
+    /// last accounted second (`tick_seconds` per tick, at most 10_000 steps
+    /// per call), regenerating every agent up to `max_resources`. Called
+    /// before mutating actions (join/apply) — reads never inflate ticks.
+    /// A long-idle world wakes up pulsed, not dead; cadence remainder is
+    /// preserved, not rounded away.
+    pub fn catch_up(&mut self, now_secs: u64) {
+        if self.last_wall == 0 || self.tick_seconds == 0 {
+            self.last_wall = now_secs;
+            return;
+        }
+        let mut steps = now_secs.saturating_sub(self.last_wall) / self.tick_seconds;
+        steps = steps.min(10_000);
+        if steps == 0 {
+            return;
+        }
+        self.tick = self.tick.saturating_add(steps);
+        self.last_wall = self.last_wall.saturating_add(steps * self.tick_seconds);
+        if self.regen_per_tick > 0 {
+            let gain = self.regen_per_tick.saturating_mul(steps);
+            for agent in self.agents.values_mut() {
+                agent.resources = agent.resources.saturating_add(gain).min(self.max_resources);
+            }
+        }
     }
 
     pub fn agent(&self, id: &str) -> Option<&ArenaAgent> {
@@ -522,8 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn events_since_serves_tail_not_head() {
-        // Same contract as the hub feed: newest `limit`, oldest-first.
+    fn events_since_serves_tail_not_head() {        // Same contract as the hub feed: newest `limit`, oldest-first.
         let mut w = ArenaWorld::new(10, 10);
         w.max_events = 100;
         w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5))
@@ -538,5 +599,54 @@ mod tests {
         assert!(win[0].tick <= win[1].tick, "chronological within window");
         let newest = w.events.back().unwrap().tick;
         assert_eq!(win[1].tick, newest, "window ends at the tail");
+    }
+
+    #[test]
+    fn catch_up_advances_ticks_and_regens_with_cap() {
+        let mut w = ArenaWorld::new(10, 10);
+        w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5))
+            .unwrap();
+        // First touch sets the clock without inventing history.
+        w.catch_up(1_000_000);
+        assert_eq!(w.tick, 0);
+        // Ten minutes later: +10 ticks, +10 resources (10 → 20).
+        w.catch_up(1_000_600);
+        assert_eq!(w.tick, 10);
+        assert_eq!(w.agent("a1").unwrap().resources, 20);
+        // A week later: capped steps (10_000), resources clamp at max.
+        w.catch_up(1_000_600 + 7 * 24 * 3600);
+        assert_eq!(w.tick, 10_010);
+        assert_eq!(w.agent("a1").unwrap().resources, 100);
+        // Sub-cadence touches are no-ops (no invented ticks).
+        let tick = w.tick;
+        w.catch_up(w.last_wall + 30);
+        assert_eq!(w.tick, tick);
+    }
+
+    #[test]
+    fn rest_recovers_starved_agent() {
+        let mut w = ArenaWorld::new(10, 10);
+        w.join(ArenaAgent::new("a1".into(), "acc".into(), "A".into(), 5, 5))
+            .unwrap();
+        w.agents.get_mut("a1").unwrap().resources = 0;
+        w.apply("a1", ActionKind::Rest, None, "catch breath".into(), None)
+            .unwrap();
+        assert_eq!(w.agent("a1").unwrap().resources, 3);
+    }
+
+    #[test]
+    fn old_saves_load_without_regen_fields() {
+        // Back-compat: records written before regen existed load with
+        // sane defaults (regen ON at 1/tick, ceiling 100).
+        let old = serde_json::json!({
+            "tick": 23, "width": 20, "height": 20,
+            "agents": {}, "events": [], "max_events": 1000
+        });
+        let w: ArenaWorld = serde_json::from_value(old).unwrap();
+        assert_eq!(w.tick, 23);
+        assert_eq!(w.regen_per_tick, 1);
+        assert_eq!(w.max_resources, 100);
+        assert_eq!(w.tick_seconds, 60);
+        assert_eq!(w.last_wall, 0);
     }
 }
