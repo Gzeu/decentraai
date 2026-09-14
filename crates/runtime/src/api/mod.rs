@@ -1639,7 +1639,8 @@ async fn openapi_handler() -> Response {
             "/v1/auth/wallet/network": { "get": { "operationId": "walletNetwork", "summary": "Server chain binding for wallet onboarding", "responses": { "200": { "description": "Network" } } } },
             "/v1/auth/wallet/blockhash": { "get": { "operationId": "walletBlockhash", "summary": "Fresh block hash for native-auth token minting", "responses": { "200": { "description": "Block hash" } } } },
             "/v1/hub/settle/{task_id}": { "get": { "operationId": "hubSettleReceipt", "summary": "Authoritative settlement receipt (winners, ledger proof, evidence preimage, deliverable)", "responses": { "200": { "description": "Receipt" }, "404": { "description": "Unknown task" } } } },
-            "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
+            "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } },
+            "/sse": { "get": { "operationId": "fabricStream", "summary": "Multiplexed SSE feed (hub + arena events)", "responses": { "200": { "description": "text/event-stream" } } } }
         }
     });
     (
@@ -1698,6 +1699,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/world/onboard", post(world_onboard_handler))
         .route("/v1/world/mission", post(world_mission_handler))
         .route("/v1/world/stream", get(world_stream_handler))
+        .route("/sse", get(sse_handler))
         .route("/v1/world/move", post(world_move_handler))
         .route("/v1/world/list", post(world_list_handler))
         .route("/v1/world/buy", post(world_buy_handler))
@@ -3694,7 +3696,72 @@ async fn world_stream_handler(
     )
 }
 
-/// POST /v1/world/move — move an entity to a new location.
+/// GET /sse — one multiplexed SSE feed (hub + arena) for browser consoles:
+/// a single EventSource instead of two domain streams. Each frame carries
+/// `{"source": "hub"|"arena", "tick": N, "events": [...]}`; idle polls
+/// yield heartbeat comments. First frame is the current backlog (filter
+/// client-side). Public read, same class as the domain streams.
+async fn sse_handler(
+    State(state): State<ApiState>,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let hub_clone = state.hub.clone();
+    let arena_clone = state.arena.clone();
+    let stream = futures::stream::unfold(
+        (hub_clone, arena_clone, 0u64, 0u64),
+        |(hub, arena, hub_last, arena_last)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let hub_guard = hub.lock().await;
+            let arena_guard = arena.lock().await;
+            let hub_events: Vec<_> = hub_guard
+                .events
+                .iter()
+                .filter(|e| e.tick >= hub_last)
+                .cloned()
+                .collect();
+            let arena_events: Vec<_> = arena_guard
+                .events
+                .iter()
+                .filter(|e| e.tick >= arena_last)
+                .cloned()
+                .collect();
+            let next_hub = hub_events
+                .iter()
+                .map(|e| e.tick)
+                .max()
+                .unwrap_or(hub_last)
+                + 1;
+            let next_arena = arena_events
+                .iter()
+                .map(|e| e.tick)
+                .max()
+                .unwrap_or(arena_last)
+                + 1;
+            drop(hub_guard);
+            drop(arena_guard);
+            if hub_events.is_empty() && arena_events.is_empty() {
+                Some((
+                    Ok(SseEvent::default().comment("heartbeat")),
+                    (hub, arena, next_hub, next_arena),
+                ))
+            } else {
+                let data = serde_json::json!({
+                    "hub": hub_events,
+                    "arena": arena_events,
+                })
+                .to_string();
+                Some((
+                    Ok(SseEvent::default().data(data).event("fabric")),
+                    (hub, arena, next_hub, next_arena),
+                ))
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
+}
 async fn world_move_handler(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -19716,8 +19783,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn openapi_document_is_served_and_versioned() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn openapi_document_is_served_and_versioned() {        let dir = tempfile::tempdir().unwrap();
         let (api, manager) = start_stateful_api(dir.path(), None, None).await;
         let resp = reqwest::get(format!("http://{api}/openapi.json"))
             .await
@@ -19732,7 +19798,44 @@ mod tests {
         // probe it before offering login-with-wallet).
         assert!(spec["paths"]["/v1/auth/native"].is_object());
         assert!(spec["paths"]["/v1/auth/wallet/key"].is_object());
+        assert!(spec["paths"]["/sse"].is_object());
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiplexed_sse_serves_first_frame() {
+        // GET /sse streams text/event-stream; the first frame arrives
+        // after one poll tick (empty world → heartbeat comment).
+        use futures::StreamExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{api}/sse"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("text/event-stream"));
+        let mut stream = resp.bytes_stream();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.next(),
+        )
+        .await
+        .expect("first SSE frame")
+        .expect("stream item")
+        .expect("bytes");
+        let text = String::from_utf8_lossy(&first);
+        assert!(
+            text.contains("data:") || text.starts_with(':'),
+            "SSE frame, got: {text}"
+        );
     }
 
     #[cfg(unix)]
