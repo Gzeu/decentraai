@@ -356,6 +356,34 @@ pub async fn hub_execute_handler(
         && task.status != TaskStatus::Open
         && task.status != TaskStatus::Bidding
     {
+        // Idempotent re-execute: an already-settled task returns its
+        // existing evidence (no re-credit — the ledger is ref-idempotent;
+        // no duplicate events). Timeout-reconcile callers poll for this
+        // instead of failing: a repeat call is a read of the settlement.
+        // Legacy records without task-level evidence fall back to the
+        // latest settlement_done event.
+        if task.status == TaskStatus::Settled {
+            let ev = task.evidence_id.clone().or_else(|| {
+                hub.events
+                    .iter()
+                    .rev()
+                    .find(|e| {
+                        e.task_id.as_deref() == Some(req.task_id.as_str())
+                            && e.kind == "settlement_done"
+                    })
+                    .and_then(|e| e.evidence_id.clone())
+            });
+            if let Some(ev) = ev {
+                let team_members: Vec<(String, u8)> = hub
+                    .teams
+                    .values()
+                    .find(|t| t.task_id == req.task_id)
+                    .map(|t| t.members.clone())
+                    .unwrap_or_default();
+                drop(hub);
+                return (axum::http::StatusCode::OK, Json(serde_json::json!({"task_id": req.task_id, "evidence_id": ev, "team": team_members, "reward": task.reward, "note": "already settled"}))).into_response();
+            }
+        }
         return (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("task status {:?} not executable", task.status)}))).into_response();
     }
     // Deliverable hash is validated BEFORE anything mutates (fail-fast):
@@ -629,16 +657,19 @@ pub async fn hub_settle_receipt_handler(
     // blake3(hub:task:actor:tick) matches the evidence. A match is a
     // verification, not an inference; no match stays null.
     // (Runs under the hub lock, before it is released below.)
-    let (settled_by, settled_tick, recovered) = match (&task.settled_by, &task.settled_tick) {
-        (Some(by), Some(tick)) => (Some(by.clone()), Some(*tick), false),
-        _ => {
-            let ev_tick = hub
+    let (settled_by, settled_tick, recovered, evidence) = match (&task.settled_by, &task.settled_tick) {
+        (Some(by), Some(tick)) => (Some(by.clone()), Some(*tick), false, task.evidence_id.clone()),        _ => {
+            // Legacy records: tick + evidence from the latest
+            // settlement_done event (the task predates receipt fields).
+            let (ev_tick, ev_id) = hub
                 .events
                 .iter()
                 .rev()
                 .find(|e| e.task_id.as_deref() == Some(task_id.as_str()) && e.kind == "settlement_done")
-                .map(|e| e.tick);
-            match (task.evidence_id.clone(), ev_tick) {
+                .map(|e| (e.tick, e.evidence_id.clone()))
+                .unwrap_or((0, None));
+            let evidence = task.evidence_id.clone().or(ev_id);
+            match (evidence.clone(), (ev_tick != 0).then_some(ev_tick)) {
                 (Some(ev), Some(tick)) => {
                     let mut candidates: Vec<String> = team
                         .iter()
@@ -653,19 +684,13 @@ pub async fn hub_settle_receipt_handler(
                     candidates.push(task.issuer.clone());
                     candidates.push("operator".to_string());
                     candidates.push("open".to_string());
-                    let hit = candidates.into_iter().find(|cand| {
-                        blake3::hash(format!("hub:{task_id}:{cand}:{tick}").as_bytes())
-                            .to_hex()
-                            .to_string()
-                            == ev
-                    });
-                    (
-                        hit.clone(),
-                        if hit.is_some() { Some(tick) } else { None },
-                        hit.is_some(),
-                    )
+                    let hit = decentraai_agent_hub::HubState::recover_evidence_actor(
+                        &task_id, &ev, tick, &candidates,
+                    );
+                    let tick_opt = if hit.is_some() { Some(tick) } else { None };
+                    (hit, tick_opt, tick_opt.is_some(), evidence)
                 }
-                _ => (None, None, false),
+                _ => (None, None, false, evidence),
             }
         }
     };
@@ -738,7 +763,7 @@ pub async fn hub_settle_receipt_handler(
             "required_capability": task.required_capability,
             "created_tick": task.created_tick,
             "settled_tick": settled_tick,
-            "evidence_id": task.evidence_id,
+            "evidence_id": evidence,
             "settled_by": settled_by,
             "evidence_preimage": preimage,
             "evidence_recovered": recovered,

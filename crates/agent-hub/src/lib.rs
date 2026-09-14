@@ -427,6 +427,26 @@ impl HubState {
         self.tick += 1;
     }
 
+    /// Recover the evidence actor for legacy records (settled before
+    /// receipt fields existed): the unique candidate whose
+    /// `blake3("hub:<task>:<actor>:<tick>")` matches the evidence. A match
+    /// is a cryptographic verification, not an inference; `None` stays null.
+    /// Callers assemble candidates from team members, bidders, issuer, and
+    /// the well-known fallback actors.
+    pub fn recover_evidence_actor(
+        task_id: &str,
+        evidence: &str,
+        tick: u64,
+        candidates: &[String],
+    ) -> Option<String> {
+        candidates.iter().find(|cand| {
+            blake3::hash(format!("hub:{task_id}:{cand}:{tick}").as_bytes())
+                .to_hex()
+                .to_string()
+                == evidence
+        }).cloned()
+    }
+
     /// Feed window: events at/after `since`, OLDEST-first (append-safe),
     /// but capped to the NEWEST `limit` — the tail, not the head. (A
     /// head-window starves followers once the log exceeds `limit`.)
@@ -445,6 +465,37 @@ impl HubState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recover_evidence_actor_verifies_not_guesses() {
+        // Real vectors: task-0097 (twin probe) and task-0096-adjacent shape.
+        let ev97 = blake3::hash(b"hub:task-0097:agent:pylon-verify:334")
+            .to_hex()
+            .to_string();
+        let cands = vec![
+            "operator".to_string(),
+            "agent:pylon-verify".to_string(),
+            "open".to_string(),
+        ];
+        assert_eq!(
+            HubState::recover_evidence_actor("task-0097", &ev97, 334, &cands),
+            Some("agent:pylon-verify".to_string())
+        );
+        // Wrong tick or unknown actor pool → None (stays null, never inferred).
+        assert_eq!(
+            HubState::recover_evidence_actor("task-0097", &ev97, 335, &cands),
+            None
+        );
+        assert_eq!(
+            HubState::recover_evidence_actor(
+                "task-0097",
+                &ev97,
+                334,
+                &["operator".to_string()]
+            ),
+            None
+        );
+    }
 
     #[test]
     fn record_settlement_binds_receipt_fields_and_single_event() {

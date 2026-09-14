@@ -6295,6 +6295,34 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     .into_response();
             }
         };
+        // Idempotent re-execute (same contract as REST): settled tasks
+        // return existing evidence, no re-credit, no duplicate events.
+        if task.status == decentraai_agent_hub::TaskStatus::Settled {
+            if let Some(ev) = task.evidence_id.clone().or_else(|| {
+                hub.events
+                    .iter()
+                    .rev()
+                    .find(|e| {
+                        e.task_id.as_deref() == Some(task_id.as_str())
+                            && e.kind == "settlement_done"
+                    })
+                    .and_then(|e| e.evidence_id.clone())
+            }) {
+                let team_members: Vec<(String, u8)> = hub
+                    .teams
+                    .values()
+                    .find(|t| t.task_id == task_id)
+                    .map(|t| t.members.clone())
+                    .unwrap_or_default();
+                drop(hub);
+                ctx.hub_action = serde_json::json!({"task_id": task_id, "evidence_id": ev, "team": team_members, "reward": task.reward, "note": "already settled"});
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&ctx.hub_action).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        }
         // Deliverable hash validated before anything mutates (same rule as
         // the REST path; receipt-grade binding for passports).
         let deliverable = match args.get("deliverable_hash") {
@@ -8723,6 +8751,39 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     .into_response();
             }
         };
+        // Idempotent re-execute (same contract as REST): settled tasks
+        // return existing evidence, no re-credit, no duplicate events.
+        if task.status == decentraai_agent_hub::TaskStatus::Settled {
+            if let Some(ev) = task.evidence_id.clone().or_else(|| {
+                hub.events
+                    .iter()
+                    .rev()
+                    .find(|e| {
+                        e.task_id.as_deref() == Some(task_id.as_str())
+                            && e.kind == "settlement_done"
+                    })
+                    .and_then(|e| e.evidence_id.clone())
+            }) {
+                let id = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                let team_members: Vec<(String, u8)> = hub
+                    .teams
+                    .values()
+                    .find(|t| t.task_id == task_id)
+                    .map(|t| t.members.clone())
+                    .unwrap_or_default();
+                drop(hub);
+                let res = serde_json::json!({"task_id": task_id, "evidence_id": ev, "team": team_members, "reward": task.reward, "note": "already settled"});
+                let body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": {"content": [{"type":"text","text": serde_json::to_string(&res).unwrap_or_default()}]}});
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&body).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        }
         // Deliverable hash validated before anything mutates (same rule as
         // the REST path; receipt-grade binding for passports).
         let deliverable = match args.get("deliverable_hash") {
@@ -25473,6 +25534,19 @@ mod tests {
         let w = &r["winners"].as_array().unwrap()[0];
         assert_eq!(w["agent"], r["issuer"]);
         assert!(w["ledger_ref"].as_str().unwrap().starts_with("hub-settle-"));
+        // Idempotent re-execute: same evidence, no duplicate settle.
+        let again: serde_json::Value = post(
+            "/v1/hub/execute",
+            serde_json::json!({"task_id": tid}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(again["evidence_id"], exec["evidence_id"]);
+        assert_eq!(again["note"], "already settled");
         // Unknown task → 404.
         let nf = client
             .get(format!("http://{api}/v1/hub/settle/task-nope"))
@@ -25558,6 +25632,21 @@ mod tests {
         assert!(r["evidence_id"].as_str().is_some());
         assert!(r["evidence_preimage"].as_str().is_some());
         assert_eq!(r["evidence_recovered"], false);
+        // MCP re-execute is idempotent too (timeout-reconcile safe).
+        let again: serde_json::Value = mcp(
+            "hub_execute",
+            serde_json::json!({"task_id": tid}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let again_text = again["result"]["content"][0]["text"].as_str().unwrap();
+        let again_json: serde_json::Value = serde_json::from_str(again_text).unwrap();
+        assert_eq!(again_json["evidence_id"], exec_json["evidence_id"]);
+        assert_eq!(again_json["note"], "already settled");
     }
 
     #[tokio::test]
