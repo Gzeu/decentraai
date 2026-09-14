@@ -36,6 +36,13 @@ pub const SETTLEMENT_GAS_PRICE: u64 = 1_000_000_000;
 pub const SETTLEMENT_BASE_GAS: u64 = 50_000;
 /// Extra gas per data byte (verified live against `/network/config`).
 pub const SETTLEMENT_GAS_PER_BYTE: u64 = 1_500;
+/// Safety margin over the raw `base + per_byte * len` estimate: covers
+/// execution overhead observed on testnet anchoring txs.
+/// Mirrors the orchestrator console `mkAnchorGasLimit` (+20000).
+pub const SETTLEMENT_GAS_MARGIN: u64 = 20_000;
+/// Floor for any anchoring tx. The old fixed 60000 died out-of-gas;
+/// operator correction 2026-09-14 (frontend v1.44.6): dynamic with min 300k.
+pub const SETTLEMENT_MIN_GAS: u64 = 300_000;
 /// Transaction version we broadcast.
 pub const SETTLEMENT_TX_VERSION: u64 = 1;
 
@@ -83,8 +90,13 @@ pub async fn reserve_nonce(api_base: &str, sender: &str) -> Result<u64, String> 
 }
 
 /// Gas for an anchoring tx carrying `data_len_bytes` of payload.
+///
+/// Dynamic: `max(300_000, 50_000 + 1_500 * len + 20_000)`.
+/// Mirrors the orchestrator console `mkAnchorGasLimit` (v1.44.6).
+/// Example: 118 B payload → 50_000 + 177_000 + 20_000 = 247_000 → floors to 300_000.
 pub fn gas_limit_for_data(data_len_bytes: usize) -> u64 {
-    SETTLEMENT_BASE_GAS + SETTLEMENT_GAS_PER_BYTE * data_len_bytes as u64
+    (SETTLEMENT_BASE_GAS + SETTLEMENT_GAS_PER_BYTE * data_len_bytes as u64 + SETTLEMENT_GAS_MARGIN)
+        .max(SETTLEMENT_MIN_GAS)
 }
 
 /// Operator wallet address derived from the injected signer.
@@ -337,8 +349,16 @@ mod tests {
 
     #[test]
     fn gas_scales_with_payload() {
-        assert_eq!(gas_limit_for_data(0), 50_000);
-        assert_eq!(gas_limit_for_data(100), 50_000 + 150_000);
+        // Floor: small payloads (incl. empty and the 118 B anchor payload)
+        // all land on the 300k minimum (operator correction 2026-09-14).
+        assert_eq!(gas_limit_for_data(0), 300_000);
+        assert_eq!(gas_limit_for_data(100), 300_000);
+        assert_eq!(gas_limit_for_data(118), 300_000);
+        // Large payloads scale above the floor:
+        // 500 B → 50_000 + 750_000 + 20_000 = 820_000.
+        assert_eq!(gas_limit_for_data(500), 820_000);
+        // Never below the floor.
+        assert!(gas_limit_for_data(0) >= 300_000);
     }
 
     #[test]
