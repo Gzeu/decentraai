@@ -26,6 +26,23 @@ pub struct HubTask {
     pub status: TaskStatus,
     pub created_tick: u64,
     pub deadline_tick: Option<u64>,
+    /// Tick at which the task settled (`None` = not settled). Set together
+    /// with `evidence_id` — the pair makes the evidence preimage
+    /// (`hub:<task>:<actor>:<tick>`) recomputable by anyone, which passport
+    /// anchoring depends on. Old records without these fields still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_tick: Option<u64>,
+    /// BLAKE3 evidence id minted at settle time (`None` = not settled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+    /// Actor the evidence was computed for (request actor at execute time).
+    /// Stored so the preimage is authoritative, never inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_by: Option<String>,
+    /// Optional hash of the work deliverable (64 hex chars), bound at
+    /// execute time. Binds the settlement to an artifact for passports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliverable_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +193,10 @@ impl HubState {
             status: TaskStatus::Open,
             created_tick: self.tick,
             deadline_tick: None,
+            settled_tick: None,
+            evidence_id: None,
+            settled_by: None,
+            deliverable_hash: None,
         };
         self.tasks.insert(id.clone(), task.clone());
         self.push_event(
@@ -375,6 +396,33 @@ impl HubState {
         );
     }
 
+    /// Authoritative settlement record: status + tick + evidence + actor +
+    /// optional deliverable hash, all on the task itself. The evidence
+    /// preimage (`hub:<task>:<actor>:<tick>`) becomes recomputable from the
+    /// receipt — passports anchor on this, never on inference.
+    pub fn record_settlement(
+        &mut self,
+        task_id: &str,
+        evidence_id: String,
+        actor: String,
+        tick: u64,
+        deliverable_hash: Option<String>,
+    ) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Settled;
+            t.settled_tick = Some(tick);
+            t.evidence_id = Some(evidence_id.clone());
+            t.settled_by = Some(actor);
+            t.deliverable_hash = deliverable_hash;
+        }
+        self.push_event(
+            "settlement_done",
+            format!("settlement for {}", task_id),
+            Some(task_id.to_string()),
+            Some(evidence_id),
+        );
+    }
+
     pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
@@ -399,8 +447,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn events_since_returns_newest_window_oldest_first() {
-        // Regression: the feed must serve the TAIL, not the head — a
+    fn record_settlement_binds_receipt_fields_and_single_event() {
+        let mut hub = HubState::new();
+        let task = hub.publish_task(
+            "alice".into(),
+            "t".into(),
+            "d".into(),
+            100,
+            None,
+        );
+        let before = hub.events.len();
+        hub.record_settlement(
+            &task.id,
+            "ev123".into(),
+            "bob".into(),
+            7,
+            Some("ab".repeat(32)),
+        );
+        let t = hub.tasks.get(&task.id).unwrap();
+        assert_eq!(t.status, TaskStatus::Settled);
+        assert_eq!(t.settled_tick, Some(7));
+        assert_eq!(t.evidence_id.as_deref(), Some("ev123"));
+        assert_eq!(t.settled_by.as_deref(), Some("bob"));
+        let expect_dh = "ab".repeat(32);
+        assert_eq!(t.deliverable_hash.as_deref(), Some(expect_dh.as_str()));
+        // Exactly one settlement event (record subsumes settle).
+        assert_eq!(hub.events.len(), before + 1);
+        let ev = hub.events.back().unwrap();
+        assert_eq!(ev.kind, "settlement_done");
+        assert_eq!(ev.evidence_id.as_deref(), Some("ev123"));
+    }
+
+    #[test]
+    fn events_since_returns_newest_window_oldest_first() {        // Regression: the feed must serve the TAIL, not the head — a
         // head-window starves followers once the log exceeds `limit`.
         let mut hub = HubState::new();
         for i in 0..5 {

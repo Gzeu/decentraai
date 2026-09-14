@@ -4,7 +4,7 @@
 use crate::api::{ApiState, Auth};
 use axum::{
     Json,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::HeaderMap,
     response::{
         IntoResponse,
@@ -86,6 +86,11 @@ pub struct TeamRequest {
 #[serde(deny_unknown_fields)]
 pub struct ExecuteRequest {
     pub task_id: String,
+    /// Optional hash of the work deliverable (64 hex chars). Stored on the
+    /// task at settle time and surfaced in the settlement receipt, binding
+    /// the settlement to an artifact for passport anchoring.
+    #[serde(default)]
+    pub deliverable_hash: Option<String>,
 }
 
 // ---------- Handlers ----------
@@ -353,6 +358,13 @@ pub async fn hub_execute_handler(
     {
         return (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("task status {:?} not executable", task.status)}))).into_response();
     }
+    // Deliverable hash is validated BEFORE anything mutates (fail-fast):
+    // 64 hex chars binding the settlement to a work artifact.
+    if let Some(ref dh) = req.deliverable_hash {
+        if dh.len() != 64 || !dh.chars().all(|c| c.is_ascii_hexdigit()) {
+            return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "deliverable_hash must be 64 hex chars"}))).into_response();
+        }
+    }
     hub.mark_executing(&req.task_id);
     // Settlement: distribute reward via QuotaLedger to team members or issuer/best bidder
     let team_members: Vec<(String, u8)> = hub
@@ -383,13 +395,23 @@ pub async fn hub_execute_handler(
             }
         }
     }
-    hub.settle(&req.task_id, Some(evidence_id.clone()));
+    // Authoritative settlement record on the task itself (receipt-grade):
+    // tick + evidence + actor make the preimage recomputable, the optional
+    // deliverable binds an artifact. Old tasks without these stay valid.
+    // (record_settlement subsumes settle: exactly one settlement event.)
+    let settled_tick = hub.tick;
+    hub.record_settlement(
+        &req.task_id,
+        evidence_id.clone(),
+        actor.clone(),
+        settled_tick,
+        req.deliverable_hash.clone(),
+    );
     hub.advance_tick();
     let path = hub_path_for(&state.info.repo_root);
     save_hub_state(&path, &hub);
     // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
-    let _team_for_society = team_members.clone();
-    let _ev_for_society = evidence_id.clone();
+    let _team_for_society = team_members.clone();    let _ev_for_society = evidence_id.clone();
     let _task_for_society = req.task_id.clone();
     let _reward_for_society = task.reward;
     let _issuer_for_society = task.issuer.clone();
@@ -554,6 +576,132 @@ pub async fn hub_execute_handler(
         crate::arena::save_arena_world(&apath, &arena);
     }
     (axum::http::StatusCode::OK, Json(serde_json::json!({"task_id": req.task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward}))).into_response()
+}
+
+/// GET /v1/hub/settle/{task_id} — authoritative settlement receipt.
+///
+/// Joins, for one task: the task record (status, settled tick, evidence,
+/// actor, deliverable), the winning team (members + shares + amounts), the
+/// ledger transfer proof (quota events matching `hub-settle-<task>-<member>`
+/// refs), and the society contributions/outcome. Everything a passport
+/// anchor needs, recomputable, in one object. Public read (market data).
+/// Unknown task → 404. Unsettled task → 200 with null settlement fields.
+pub async fn hub_settle_receipt_handler(
+    State(state): State<ApiState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let hub = state.hub.lock().await;
+    let task = match hub.tasks.get(&task_id) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "task not found"})),
+            )
+                .into_response();
+        }
+    };
+    let team: Vec<(String, u8)> = hub
+        .teams
+        .values()
+        .find(|t| t.task_id == task_id)
+        .map(|t| t.members.clone())
+        .unwrap_or_else(|| {
+            // Same fallback as the execute path: best bid, else the issuer.
+            if let Some(best) = hub.best_bid(&task_id) {
+                vec![(best.bidder.clone(), 100)]
+            } else {
+                vec![(task.issuer.clone(), 100)]
+            }
+        });
+    let bids: Vec<serde_json::Value> = hub
+        .bids
+        .values()
+        .filter(|b| b.task_id == task_id)
+        .map(|b| {
+            serde_json::json!({"id": b.id, "bidder": b.bidder, "price": b.price, "tick": b.created_tick})
+        })
+        .collect();
+    drop(hub);
+    // Society side (best-effort: empty when the task predates society).
+    let society = state.society.lock().await;
+    let contributions: Vec<serde_json::Value> = society
+        .contributions
+        .get(&task_id)
+        .map(|v| {
+            v.iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "agent": c.agent_id,
+                        "planned_share": c.planned_share,
+                        "verified_contribution": c.verified_contribution,
+                        "evidence_id": c.evidence_id,
+                        "quality": c.quality,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    drop(society);
+    // Winners + ledger transfer proof (server-side, no trust needed).
+    let mut winners = Vec::new();
+    if let Some(ledger) = &state.quota_ledger {
+        let l = ledger.lock().unwrap();
+        for (member, share) in &team {
+            let ref_id = format!("hub-settle-{task_id}-{member}");
+            let hit = l
+                .events()
+                .iter()
+                .rev()
+                .find(|e| e.op == "credit" && e.ref_id == ref_id);
+            winners.push(serde_json::json!({
+                "agent": member,
+                "share": share,
+                "amount": task.reward as u128 * *share as u128 / 100,
+                "ledger_ref": ref_id,
+                "ledger_confirmed": hit.is_some(),
+                "ledger_amount": hit.map(|e| e.amount),
+            }));
+        }
+        drop(l);
+    } else {
+        for (member, share) in &team {
+            winners.push(serde_json::json!({
+                "agent": member,
+                "share": share,
+                "amount": task.reward as u128 * *share as u128 / 100,
+                "ledger_ref": format!("hub-settle-{task_id}-{member}"),
+                "ledger_confirmed": None::<bool>,
+                "ledger_amount": None::<u64>,
+            }));
+        }
+    }
+    // Recomputable preimage (authoritative, never inferred).
+    let preimage = match (&task.settled_by, &task.settled_tick) {
+        (Some(by), Some(tick)) => Some(format!("hub:{task_id}:{by}:{tick}")),
+        _ => None,
+    };
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task.id,
+            "status": task.status,
+            "issuer": task.issuer,
+            "title": task.title,
+            "reward": task.reward,
+            "required_capability": task.required_capability,
+            "created_tick": task.created_tick,
+            "settled_tick": task.settled_tick,
+            "evidence_id": task.evidence_id,
+            "settled_by": task.settled_by,
+            "evidence_preimage": preimage,
+            "deliverable_hash": task.deliverable_hash,
+            "winners": winners,
+            "bids": bids,
+            "contributions": contributions,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn hub_events_handler(

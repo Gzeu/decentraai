@@ -1638,6 +1638,7 @@ async fn openapi_handler() -> Response {
             "/v1/auth/wallet/key": { "post": { "operationId": "walletSelfIssueKey", "summary": "Mint the wallet agent dca_ key (session, once-only plaintext)", "responses": { "200": { "description": "Issued key (shown once)" }, "409": { "description": "Key already issued" } } }, "delete": { "operationId": "walletRevokeKey", "summary": "Revoke the wallet agent key (session)", "responses": { "200": { "description": "Revoked" } } } },
             "/v1/auth/wallet/network": { "get": { "operationId": "walletNetwork", "summary": "Server chain binding for wallet onboarding", "responses": { "200": { "description": "Network" } } } },
             "/v1/auth/wallet/blockhash": { "get": { "operationId": "walletBlockhash", "summary": "Fresh block hash for native-auth token minting", "responses": { "200": { "description": "Block hash" } } } },
+            "/v1/hub/settle/{task_id}": { "get": { "operationId": "hubSettleReceipt", "summary": "Authoritative settlement receipt (winners, ledger proof, evidence preimage, deliverable)", "responses": { "200": { "description": "Receipt" }, "404": { "description": "Unknown task" } } } },
             "/openapi.json": { "get": { "operationId": "openapi", "summary": "This document", "responses": { "200": { "description": "OpenAPI spec" } } } }
         }
     });
@@ -1676,6 +1677,7 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/v1/hub/team", post(crate::hub::hub_team_handler))
         .route("/v1/hub/execute", post(crate::hub::hub_execute_handler))
+        .route("/v1/hub/settle/{task_id}", get(crate::hub::hub_settle_receipt_handler))
         .route("/v1/hub/events", get(crate::hub::hub_events_handler))
         .route("/v1/hub/stream", get(crate::hub::hub_stream_handler))
         .route("/world", get(world_html_handler))
@@ -25345,6 +25347,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn hub_settle_receipt_round_trip() {
+        // Settle → receipt: winners with ledger refs, recomputable
+        // preimage, deliverable binding. Unknown task → 404, bad
+        // deliverable hash → 400 (fail-fast, nothing mutates).
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _) = start_consumer_state(dir.path(), "master-token".to_string()).await;
+        let client = reqwest::Client::new();
+        let auth = ("Authorization", "Bearer master-token");
+        let post = |path: &str, body: serde_json::Value| {
+            client
+                .post(format!("http://{api}{path}"))
+                .header(auth.0, auth.1)
+                .json(&body)
+        };
+        let published: serde_json::Value = post(
+            "/v1/hub/task",
+            serde_json::json!({"title": "receipt probe", "reward": 42}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let tid = published["id"].as_str().unwrap().to_string();
+        // Bad deliverable hash is refused before anything mutates.
+        let bad = post(
+            "/v1/hub/execute",
+            serde_json::json!({"task_id": tid, "deliverable_hash": "nope"}),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(bad.status(), 400);
+        // Execute with a bound deliverable.
+        let dh = "cd".repeat(32);
+        let exec: serde_json::Value = post(
+            "/v1/hub/execute",
+            serde_json::json!({"task_id": tid, "deliverable_hash": dh}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(exec["evidence_id"].as_str().is_some());
+        // Receipt joins everything the passport needs.
+        let r: serde_json::Value = client
+            .get(format!("http://{api}/v1/hub/settle/{tid}"))
+            .header(auth.0, auth.1)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r["status"], "settled");
+        assert_eq!(r["settled_by"], "operator");
+        assert_eq!(r["deliverable_hash"], dh);
+        assert_eq!(r["evidence_id"], exec["evidence_id"]);
+        let expect_pre = format!("hub:{tid}:operator:{}", r["settled_tick"].as_u64().unwrap());
+        assert_eq!(r["evidence_preimage"].as_str().unwrap(), expect_pre);
+        // Winner fallback (no team/bids): the issuer, with ledger ref.
+        let w = &r["winners"].as_array().unwrap()[0];
+        assert_eq!(w["agent"], r["issuer"]);
+        assert!(w["ledger_ref"].as_str().unwrap().starts_with("hub-settle-"));
+        // Unknown task → 404.
+        let nf = client
+            .get(format!("http://{api}/v1/hub/settle/task-nope"))
+            .header(auth.0, auth.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nf.status(), 404);
     }
 
     #[tokio::test]
