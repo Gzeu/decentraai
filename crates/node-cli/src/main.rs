@@ -9029,72 +9029,78 @@ async fn spawn_compute_broadcaster(
 ) -> Result<()> {
     use decentraai_system_probe::{SystemSnapshot, probe_gpu};
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            compute_manager.advertisement_interval_ms(),
-        ));
-        loop {
-            interval.tick().await;
-            // M24: gate the advertisement on live engine health. A dead engine
-            // means this node is not a usable worker this beat. The engine
-            // address comes from the SINGLE authoritative source (the supervisor-
-            // published live URL cache, falling back to the ServeManager's live
-            // base_url), so a respawn on a new port is always probed and a frozen
-            // startup URL can never suppress or wrongly enable advertisement.
-            let health_sockaddr = match (&live_engine_url, &manager) {
-                (Some(cache), _) => cache
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .and_then(|u| parse_http_addr(&u).map(|(h, p)| format!("{h}:{p}"))),
-                (None, Some(m)) => m
-                    .lock()
-                    .await
-                    .base_url()
-                    .as_deref()
-                    .and_then(parse_http_addr)
-                    .map(|(h, p)| format!("{h}:{p}")),
-                (None, None) => None,
-            };
-            if let Some(addr) = &health_sockaddr {
-                let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
-                if !alive {
-                    tracing::warn!(
-                        "skipping worker advertisement: local inference engine not reachable at {addr}"
-                    );
-                    continue;
+    spawn_supervised_loop("compute-broadcaster", move || {
+        let compute_manager = compute_manager.clone();
+        let p2p_node = p2p_node.clone();
+        let manager = manager.clone();
+        let live_engine_url = live_engine_url.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                compute_manager.advertisement_interval_ms(),
+            ));
+            loop {
+                interval.tick().await;
+                // M24: gate the advertisement on live engine health. A dead engine
+                // means this node is not a usable worker this beat. The engine
+                // address comes from the SINGLE authoritative source (the supervisor-
+                // published live URL cache, falling back to the ServeManager's live
+                // base_url), so a respawn on a new port is always probed and a frozen
+                // startup URL can never suppress or wrongly enable advertisement.
+                let health_sockaddr = match (&live_engine_url, &manager) {
+                    (Some(cache), _) => cache
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .and_then(|u| parse_http_addr(&u).map(|(h, p)| format!("{h}:{p}"))),
+                    (None, Some(m)) => m
+                        .lock()
+                        .await
+                        .base_url()
+                        .as_deref()
+                        .and_then(parse_http_addr)
+                        .map(|(h, p)| format!("{h}:{p}")),
+                    (None, None) => None,
+                };
+                if let Some(addr) = &health_sockaddr {
+                    let alive = tokio::net::TcpStream::connect(addr).await.is_ok();
+                    if !alive {
+                        tracing::warn!(
+                            "skipping worker advertisement: local inference engine not reachable at {addr}"
+                        );
+                        continue;
+                    }
                 }
-            }
-            let snapshot = SystemSnapshot::collect();
-            let gpu = probe_gpu();
-            // Advertise the latest probe; served_models and available_models
-            // come from the last full advertisement stored in the manager (the
-            // on-disk model set is recomputed at registration, not re-hashed on
-            // every heartbeat).
-            let workers = compute_manager.workers().await;
-            let (served_models, available_models) = workers
-                .iter()
-                .find(|w| w.peer_id == compute_manager.local_peer())
-                .map(|w| {
-                    (
-                        w.capability.served_models.clone(),
-                        w.capability.available_models.clone(),
+                let snapshot = SystemSnapshot::collect();
+                let gpu = probe_gpu();
+                // Advertise the latest probe; served_models and available_models
+                // come from the last full advertisement stored in the manager (the
+                // on-disk model set is recomputed at registration, not re-hashed on
+                // every heartbeat).
+                let workers = compute_manager.workers().await;
+                let (served_models, available_models) = workers
+                    .iter()
+                    .find(|w| w.peer_id == compute_manager.local_peer())
+                    .map(|w| {
+                        (
+                            w.capability.served_models.clone(),
+                            w.capability.available_models.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let adv = compute_manager
+                    .advertise_local(
+                        snapshot,
+                        gpu,
+                        served_models,
+                        available_models,
+                        can_provision,
                     )
-                })
-                .unwrap_or_default();
-            let adv = compute_manager
-                .advertise_local(
-                    snapshot,
-                    gpu,
-                    served_models,
-                    available_models,
-                    can_provision,
-                )
-                .await;
-            // P3: sign the advertisement when the node has a signing key set,
-            // so recipients authenticate it (anti-spoof).
-            if let Ok(bytes) = compute_manager.advertisement_wire_bytes(&adv) {
-                p2p_node.announce(bytes);
+                    .await;
+                // P3: sign the advertisement when the node has a signing key set,
+                // so recipients authenticate it (anti-spoof).
+                if let Ok(bytes) = compute_manager.advertisement_wire_bytes(&adv) {
+                    p2p_node.announce(bytes);
+                }
             }
         }
     });
@@ -9110,23 +9116,71 @@ fn spawn_agent_broadcaster(
     p2p_node: decentraai_p2p::P2PNode,
 ) {
     use decentraai_compute::DEFAULT_ADVERTISEMENT_INTERVAL_MS;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            DEFAULT_ADVERTISEMENT_INTERVAL_MS,
-        ));
-        loop {
-            interval.tick().await;
-            match agent_manager.advertisement_wire_bytes() {
-                Ok(bytes) => p2p_node.announce(bytes),
-                Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
+    spawn_supervised_loop("agent-broadcaster", move || {
+        let agent_manager = agent_manager.clone();
+        let p2p_node = p2p_node.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                DEFAULT_ADVERTISEMENT_INTERVAL_MS,
+            ));
+            loop {
+                interval.tick().await;
+                match agent_manager.advertisement_wire_bytes() {
+                    Ok(bytes) => p2p_node.announce(bytes),
+                    Err(e) => tracing::warn!(error = %e, "failed to build agent advertisement"),
+                }
+                // Expire remote agent views that have not refreshed (pure
+                // bookkeeping — never touches trust or reputation).
+                let stale =
+                    std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
+                let evicted = agent_manager.prune_stale(stale);
+                if evicted > 0 {
+                    tracing::debug!(evicted, "pruned stale remote agent views");
+                }
             }
-            // Expire remote agent views that have not refreshed (pure
-            // bookkeeping — never touches trust or reputation).
-            let stale =
-                std::time::Duration::from_millis(decentraai_compute::DEFAULT_STALE_AFTER_MS);
-            let evicted = agent_manager.prune_stale(stale);
-            if evicted > 0 {
-                tracing::debug!(evicted, "pruned stale remote agent views");
+        }
+    });
+}
+
+/// Supervised loop: spawns a tokio task that restarts on panic or cancellation.
+/// The factory closure is called each time to create a fresh future.
+/// If the inner task panics, it is automatically respawned after a short backoff.
+fn spawn_supervised_loop<F, Fut>(name: &'static str, mut factory: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restarts: u64 = 0;
+        loop {
+            let handle = tokio::spawn(factory());
+            match handle.await {
+                Ok(()) => {
+                    // Task completed normally (shouldn't happen for an infinite
+                    // loop, but handle gracefully — respawn after a short delay).
+                    tracing::warn!(task = name, "supervised task exited; respawning");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    restarts = restarts.saturating_add(1);
+                    let backoff_ms = std::cmp::min(1000 * restarts, 30_000);
+                    if e.is_panic() {
+                        tracing::error!(
+                            task = name,
+                            restarts,
+                            backoff_ms,
+                            "supervised task panicked; restarting"
+                        );
+                    } else {
+                        tracing::warn!(
+                            task = name,
+                            restarts,
+                            backoff_ms,
+                            "supervised task cancelled; restarting"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
             }
         }
     });
@@ -9161,43 +9215,47 @@ async fn spawn_network_probe(
     p2p_node: decentraai_p2p::P2PNode,
 ) {
     use decentraai_protocol::{InferMessage, serialize_message};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            let local = compute_manager.local_peer();
-            let peers = compute_manager.workers().await;
-            for adv in peers.iter().filter(|w| w.peer_id != local) {
-                let peer = adv.peer_id;
-                let pong = InferMessage::InferPing {
-                    request_id: uuid::Uuid::new_v4(),
-                };
-                let Ok(bytes) = serialize_message(&pong) else {
-                    continue;
-                };
-                let start = Instant::now();
-                // A request error/timeout counts as a *lost* probe (M9 P2): it
-                // contributes to the packet-loss derivation but yields no RTT.
-                // Best-effort: a busy worker may drop the ping; we just record
-                // the lost sample and keep probing.
-                if p2p_node.request(peer, bytes).await.is_ok() {
-                    let rtt_us = start.elapsed().as_micros() as u64;
-                    compute_manager.record_rtt_sample(&peer, rtt_us, 0, false);
-                    let link = compute_manager.network_graph().get(&peer.to_string());
-                    info!(
-                        peer = %peer,
-                        measured_rtt_us = rtt_us,
-                        jitter_us = ?link.jitter_us,
-                        packet_loss_percent = link.packet_loss_percent,
-                        graph_rtt_us = link.rtt_us,
-                        graph_locality = ?link.locality,
-                        graph_peers = compute_manager.network_graph().measured_len(),
-                        "M19 network probe: measured RTT recorded, planner reads via NetworkGraph"
-                    );
-                } else {
-                    compute_manager.record_rtt_sample(&peer, 0, 0, true);
+    spawn_supervised_loop("network-probe", move || {
+        let compute_manager = compute_manager.clone();
+        let p2p_node = p2p_node.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let local = compute_manager.local_peer();
+                let peers = compute_manager.workers().await;
+                for adv in peers.iter().filter(|w| w.peer_id != local) {
+                    let peer = adv.peer_id;
+                    let pong = InferMessage::InferPing {
+                        request_id: uuid::Uuid::new_v4(),
+                    };
+                    let Ok(bytes) = serialize_message(&pong) else {
+                        continue;
+                    };
+                    let start = Instant::now();
+                    // A request error/timeout counts as a *lost* probe (M9 P2): it
+                    // contributes to the packet-loss derivation but yields no RTT.
+                    // Best-effort: a busy worker may drop the ping; we just record
+                    // the lost sample and keep probing.
+                    if p2p_node.request(peer, bytes).await.is_ok() {
+                        let rtt_us = start.elapsed().as_micros() as u64;
+                        compute_manager.record_rtt_sample(&peer, rtt_us, 0, false);
+                        let link = compute_manager.network_graph().get(&peer.to_string());
+                        info!(
+                            peer = %peer,
+                            measured_rtt_us = rtt_us,
+                            jitter_us = ?link.jitter_us,
+                            packet_loss_percent = link.packet_loss_percent,
+                            graph_rtt_us = link.rtt_us,
+                            graph_locality = ?link.locality,
+                            graph_peers = compute_manager.network_graph().measured_len(),
+                            "M19 network probe: measured RTT recorded, planner reads via NetworkGraph"
+                        );
+                    } else {
+                        compute_manager.record_rtt_sample(&peer, 0, 0, true);
+                    }
                 }
             }
         }
@@ -9221,21 +9279,25 @@ async fn spawn_worker_reaper(
     logs_dir: std::path::PathBuf,
     grace: std::time::Duration,
 ) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let (expired, evicted) = compute_manager.reap_unhealthy(grace).await;
-            if expired > 0 {
-                tracing::warn!(expired, "released expired reservations");
-            }
-            for (peer, name) in evicted {
-                tracing::warn!(%peer, node = %name, "evicting unhealthy worker");
-                decentraai_audit::record_best_effort(
-                    &logs_dir,
-                    "worker_evicted",
-                    serde_json::json!({ "peer_id": peer.to_string(), "node_name": name }),
-                );
+    spawn_supervised_loop("worker-reaper", move || {
+        let compute_manager = compute_manager.clone();
+        let logs_dir = logs_dir.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let (expired, evicted) = compute_manager.reap_unhealthy(grace).await;
+                if expired > 0 {
+                    tracing::warn!(expired, "released expired reservations");
+                }
+                for (peer, name) in evicted {
+                    tracing::warn!(%peer, node = %name, "evicting unhealthy worker");
+                    decentraai_audit::record_best_effort(
+                        &logs_dir,
+                        "worker_evicted",
+                        serde_json::json!({ "peer_id": peer.to_string(), "node_name": name }),
+                    );
+                }
             }
         }
     });
