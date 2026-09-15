@@ -9442,6 +9442,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             "decentraai_compute_request" => {
                                 scopes.iter().any(|s| s == "compute" || s == "*")
                             }
+                            "diffusion_generate" => {
+                                scopes.iter().any(|s| s == "image_generation" || s == "*")
+                            }
                             "hub_publish_task"
                             | "hub_place_bid"
                             | "hub_propose"
@@ -9456,7 +9459,11 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             | "society_relationships"
                             | "society_contributions"
                             | "society_outcomes"
-                            | "society_decision_hints" => {
+                            | "society_decision_hints"
+                            | "society_record_relationship"
+                            | "society_record_contribution"
+                            | "society_record_outcome"
+                            | "society_record_reputation_event" => {
                                 scopes.iter().any(|s| s == "society" || s == "*")
                             }
                             "agent_memory_read"

@@ -195,6 +195,53 @@ impl ToolAnnotations {
     }
 }
 
+/// Machine-readable scope requirements for consumer keys (§1.2 fix).
+/// Returns the scope(s) a consumer key must have to call this tool.
+/// Empty = no scope needed (always available or operator-only).
+pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        // No scope needed — always available or fabric-level read-only
+        "get_status" | "list_workers" | "list_models" | "list_executions"
+        | "get_quota" | "list_peers" | "search_models_by_capability"
+        | "find_local_models_by_capability" | "get_worker_capability"
+        | "resolve_intent" | "resolve_intent_with_fit" | "get_fabric_graph"
+        | "list_sessions" | "decide" | "execute_decision"
+        | "discover_capabilities" => &[],
+        // Embeddings scope
+        "decentraai_embeddings" => &["embeddings"],
+        // Compute scope
+        "decentraai_compute_request" => &["compute"],
+        // Image generation scope
+        "diffusion_generate" => &["image_generation"],
+        // Hub marketplace scope
+        "hub_state" | "hub_events" | "hub_publish_task" | "hub_place_bid"
+        | "hub_propose" | "hub_decide_proposal" | "hub_form_team"
+        | "hub_execute" => &["hub"],
+        // Society scope
+        "society_state" | "society_trust" | "society_reputation"
+        | "society_relationships" | "society_contributions" | "society_outcomes"
+        | "society_decision_hints" | "society_record_relationship"
+        | "society_record_contribution" | "society_record_outcome"
+        | "society_record_reputation_event" => &["society"],
+        // Memory scope
+        "agent_memory_read" | "agent_memory_write" | "agent_memory_search"
+        | "agent_memory_snapshot" | "agent_memory_export"
+        | "memory_list_scopes" | "memory_read_entries" | "memory_write_entry"
+        | "memory_list_conflicts" | "memory_resolve_conflict" => &["memory"],
+        // Arena scope
+        "arena_state" | "arena_act" => &["arena"],
+        // Orchestrate scope
+        "orchestrate_propose" | "orchestrate_status" => &["orchestrate"],
+        // Economy scope
+        name if name.starts_with("m18_") => &["economy"],
+        // Operator-only (never consumer)
+        "serve_model" | "pull_model" | "list_consumer_keys"
+        | "get_compensation" | "diffusion_list_models" => &[],
+        // Unknown tools: no scope (will be rejected at dispatch)
+        _ => &[],
+    }
+}
+
 pub fn all_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -2467,12 +2514,21 @@ pub fn handle_message(ctx: &McpContext, raw: &str) -> Option<Value> {
         "tools/list" => Ok(json!({
             "tools": all_tools()
                 .iter()
-                .map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                    "annotations": t.annotations.to_json(),
-                }))
+                .map(|t| {
+                    let mut tool_json = json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                        "annotations": t.annotations.to_json(),
+                    });
+                    // §1.2: machine-readable scope requirements so clients
+                    // can badge tools accurately without parsing error text.
+                    let scopes = required_scopes_for(t.name);
+                    if !scopes.is_empty() {
+                        tool_json["requiredScopes"] = json!(scopes);
+                    }
+                    tool_json
+                })
                 .collect::<Vec<_>>()
         })),
         "tools/call" => match msg
