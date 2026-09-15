@@ -1388,6 +1388,10 @@ impl ApiState {
         log.truncate(RECENT_REQUEST_LIMIT);
     }
 
+    /// Track token generation per auth identity. For subscribers, this also
+    /// counts requests (no separate entry-point counter). For consumers,
+    /// requests are counted at the `mcp_consumer_handler` entry point — this
+    /// function only adds tokens + updates timestamp.
     fn note_token_usage(&self, auth: &Auth, generated: u64) {
         match auth {
             Auth::Subscriber { name, .. } => {
@@ -1403,7 +1407,7 @@ impl ApiState {
             Auth::Consumer { key_id, .. } => {
                 let mut usage = self.consumer_usage.lock().unwrap();
                 let entry = usage.entry(key_id.clone()).or_default();
-                entry.0 += 1;
+                // entry.0 (requests) is incremented at mcp_consumer_handler entry.
                 entry.1 += generated;
                 entry.2 = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -8429,6 +8433,18 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     // boundary, single-flight, and fail-closed pre-audit below.
     let is_gateway = key_id.starts_with("gk-");
     let raw = String::from_utf8_lossy(body);
+    // §2.4 Billing: always count every consumer request (even read-only)
+    // and update last_used_at. Tokens are added later by note_token_usage
+    // only when actual inference output is produced.
+    {
+        let mut usage = state.consumer_usage.lock().unwrap();
+        let entry = usage.entry(key_id.clone()).or_default();
+        entry.0 += 1; // requests
+        entry.2 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
     let mut ctx = mcp_context(state).await;
 
     // `decide`: read-only unified decision projection — allowed for consumers
