@@ -6088,6 +6088,88 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             }
         };
     }
+    // §2.6 Revenue: node contribution state + quota summary (read-only).
+    // Aggregates verified executions, credits earned/consumed, balance, and
+    // per-model/worker/time breakdowns from the real contribution ledger.
+    if crate::mcp::revenue_request(&raw) {
+        ctx.revenue = match &state.compute {
+            Some(cm) => {
+                let cs = cm.contribution_state();
+                let quota_accounts: Vec<serde_json::Value> = cm
+                    .quota_accounts()
+                    .into_iter()
+                    .map(|(account, acc)| {
+                        serde_json::json!({
+                            "account": account,
+                            "earned": acc.earned,
+                            "available": acc.available,
+                            "reserved": acc.reserved,
+                            "consumed": acc.consumed,
+                        })
+                    })
+                    .collect();
+                let by_model: Vec<serde_json::Value> = cs
+                    .by_model
+                    .into_iter()
+                    .map(|(model, mc)| {
+                        serde_json::json!({
+                            "model": model,
+                            "executions": mc.executions,
+                            "tokens": mc.tokens,
+                            "credits": mc.credits,
+                        })
+                    })
+                    .collect();
+                let by_worker: Vec<serde_json::Value> = cs
+                    .by_worker
+                    .into_iter()
+                    .map(|(worker, wc)| {
+                        serde_json::json!({
+                            "worker": worker,
+                            "executions": wc.executions,
+                            "tokens": wc.tokens,
+                            "credits": wc.credits,
+                        })
+                    })
+                    .collect();
+                let by_time_range: Vec<serde_json::Value> = cs
+                    .by_time_range
+                    .into_iter()
+                    .map(|(range, trc)| {
+                        serde_json::json!({
+                            "range": range,
+                            "executions": trc.executions,
+                            "credits": trc.credits,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "verified_executions": cs.verified_executions,
+                    "failed_executions": cs.failed_executions,
+                    "total_credits_earned": cs.total_credits_earned,
+                    "total_credits_consumed": cs.total_credits_consumed,
+                    "balance": cs.balance,
+                    "by_model": by_model,
+                    "by_worker": by_worker,
+                    "by_time_range": by_time_range,
+                    "quota_accounts": quota_accounts,
+                })
+            }
+            None => {
+                serde_json::json!({
+                    "verified_executions": 0,
+                    "failed_executions": 0,
+                    "total_credits_earned": 0,
+                    "total_credits_consumed": 0,
+                    "balance": 0,
+                    "by_model": [],
+                    "by_worker": [],
+                    "by_time_range": [],
+                    "quota_accounts": [],
+                })
+            }
+        };
+    }
     // Arena act via MCP (M3): mutating, same validation/quota/LLM as HTTP
     if let Some(args) = crate::mcp::arena_act_request(&raw) {
         let action_str = args
@@ -9478,8 +9560,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                             "discover_capabilities" => true, // always available for onboarding
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
-                            // M18 Economic Layer: available with "economy" scope or "*"
-                            name if name.starts_with("m18_") => {
+                            // M18 Economic Layer + §2.6 Revenue: available with "economy" scope or "*"
+                            name if name.starts_with("m18_") || name == "get_revenue" => {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
                             "orchestrate_propose" | "orchestrate_status" => {
@@ -10713,6 +10795,8 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         compute_result: serde_json::json!({}),
         orchestrate_propose_result: serde_json::json!({}),
         orchestrate_status_result: serde_json::json!({}),
+        // §2.6 Revenue: empty until mcp_handler populates it.
+        revenue: serde_json::json!({}),
     }
 }
 

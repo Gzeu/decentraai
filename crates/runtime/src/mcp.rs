@@ -128,6 +128,8 @@ pub struct McpContext {
     pub orchestrate_propose_result: Value,
     /// M17: Result of `orchestrate_status` (operator path): orchestration plan status.
     pub orchestrate_status_result: Value,
+    /// §2.6 Revenue: node contribution + quota summary (read-only).
+    pub revenue: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -230,6 +232,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         | "memory_list_conflicts" | "memory_resolve_conflict" => &["memory"],
         // Arena scope
         "arena_state" | "arena_act" => &["arena"],
+        // Revenue/economy scope
+        "get_revenue" => &["economy"],
         // Orchestrate scope
         "orchestrate_propose" | "orchestrate_status" => &["orchestrate"],
         // Economy scope
@@ -279,6 +283,12 @@ pub fn all_tools() -> Vec<ToolDef> {
             description: "Reputation-based compensation (M9-9): lifetime contribution credits per worker (earned only from verified work, reputation-scaled), the most recent audited credit events, and the active reward policy. Read-only; synthetic bookkeeping — never money, never the token registry.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "get_revenue",
+            description: "Node revenue summary (§2.6): verified executions, credits earned/consumed, balance, per-model and per-worker breakdowns, quota accounts. Read-only; every figure is real measured work — never fabricated.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
         },
         ToolDef {
             name: "list_peers",
@@ -1508,6 +1518,21 @@ pub fn quota_request(raw: &str) -> bool {
         == Some("get_quota")
 }
 
+/// Whether the incoming message is a `get_revenue` tool call. Pure —
+/// lets the HTTP layer precompute the revenue snapshot into [`McpContext::revenue`].
+pub fn revenue_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_revenue")
+}
+
 /// Whether the incoming message is a `list_consumer_keys` tool call. Pure —
 /// lets the HTTP layer precompute the consumer-key metadata snapshot into
 /// [`McpContext::consumer_keys`].
@@ -2591,6 +2616,7 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "list_sessions" => &ctx.sessions,
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
+        "get_revenue" => &ctx.revenue,
         "list_consumer_keys" => &ctx.consumer_keys,
         "arena_state" => &ctx.arena_state,
         "arena_act" => &ctx.arena_action,
@@ -2711,6 +2737,7 @@ mod tests {
             compute_result: json!({}),
             orchestrate_propose_result: json!({}),
             orchestrate_status_result: json!({}),
+            revenue: json!({}),
         }
     }
 
@@ -3720,5 +3747,46 @@ mod tests {
         let c = ctx(); // diffusion_action defaults to json!({})
         let r = handle_message(&c, r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"diffusion_generate","arguments":{"prompt":"test"}}}"#).unwrap();
         assert_eq!(r["result"]["content"][0]["text"], "{}");
+    }
+
+    #[test]
+    fn revenue_request_matches_only_the_tool() {
+        assert!(revenue_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_revenue","arguments":{}}}"#
+        ));
+        assert!(!revenue_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!revenue_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#
+        ));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_revenue() {
+        let r = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "get_revenue");
+        assert!(t.is_some(), "get_revenue must be in tools/list");
+        // Verify requiredScopes is present
+        let scopes = t.unwrap().get("requiredScopes");
+        assert!(scopes.is_some(), "get_revenue must carry requiredScopes");
+        assert_eq!(scopes.unwrap().clone(), json!(["economy"]));
+    }
+
+    #[test]
+    fn get_revenue_returns_precomputed_snapshot() {
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"get_revenue","arguments":{}}}"#,
+        );
+        // Test ctx() has empty revenue default; the dispatch returns it as-is.
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(content, "{}");
+        // Verify tool is in tools/list with correct schema
+        let list = call(r#"{"jsonrpc":"2.0","id":43,"method":"tools/list"}"#);
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "get_revenue").unwrap();
+        assert!(t["description"].as_str().unwrap().contains("revenue"));
+        assert_eq!(t["annotations"]["readOnlyHint"], true);
     }
 }
