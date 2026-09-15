@@ -6932,6 +6932,7 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         if let Some(json) = soc_json {
             decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
         }
+        ctx.society_action = serde_json::json!({"success": true, "relationship": rel});
     }
     if let Some(args) = crate::mcp::society_record_contribution_request(&raw) {
         let task_id = args
@@ -7206,6 +7207,212 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
         }
         ctx.society_action = serde_json::json!({"success": true, "event": event});
+    }
+    // ── Operator compute tools (§1.3 BUG 1 fix) ──────────────────────────
+    // These tools are reachable from the operator (dsk_) path.  The consumer
+    // path already handles them via mcp_consumer_handler; here we provide the
+    // operator equivalent.  No scope/quota checks — operator is trusted.
+    if let Some((input, _model)) = crate::mcp::embeddings_request(&raw) {
+        let result = if let Some(client) = &state.embedding {
+            match client.embed(&input).await {
+                Ok(vec) => serde_json::json!({
+                    "capability": "embeddings",
+                    "input": input.chars().take(100).collect::<String>(),
+                    "embedding": vec.iter().take(8).collect::<Vec<_>>(),
+                    "dimensions": vec.len(),
+                    "truncated": vec.len() > 8,
+                }),
+                Err(e) => serde_json::json!({
+                    "capability": "embeddings",
+                    "input_chars": input.chars().count(),
+                    "error": e.to_string(),
+                    "note": "embedding client error — check model availability",
+                }),
+            }
+        } else {
+            serde_json::json!({
+                "capability": "embeddings",
+                "input_chars": input.chars().count(),
+                "note": "embeddings via fabric — stub (no embedding model loaded on this node)",
+            })
+        };
+        ctx.embeddings_result = result;
+    } else if let Some((capability, payload, lease_secs)) =
+        crate::mcp::compute_request(&raw)
+    {
+        let result = match &state.p2p {
+            Some(p2p) => {
+                let peers = p2p.connected_peers().await;
+                if peers.is_empty() {
+                    serde_json::json!({"error": "no connected workers for compute assist"})
+                } else {
+                    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+                    let (success, result_payload, explanation) =
+                        crate::intel_assist::run_assist_request(
+                            p2p,
+                            peers,
+                            decentraai_compute::assist::AssistRequest {
+                                capability: capability.clone(),
+                                cpu_cores: 2,
+                                ram_mb: 512,
+                            },
+                            payload_bytes,
+                            lease_secs,
+                        )
+                        .await;
+                    let result_json: serde_json::Value =
+                        serde_json::from_slice(&result_payload)
+                            .unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({
+                        "status": if success { 200 } else { 502 },
+                        "ok": success,
+                        "capability": capability,
+                        "explanation": explanation,
+                        "body": result_json,
+                    })
+                }
+            }
+            None => serde_json::json!({"error": "p2p not attached for compute assist"}),
+        };
+        ctx.compute_result = result;
+    } else if let Some((stages_v, total, cap)) =
+        crate::mcp::orchestrate_propose_request(&raw)
+    {
+        use decentraai_agents::orchestration as orch;
+        let stages = match stages_v.as_array() {
+            Some(s) if !s.is_empty() && s.len() <= orch::MAX_ORCHESTRATION_STAGES => s,
+            _ => {
+                ctx.orchestrate_propose_result =
+                    serde_json::json!({"error": "stages must be a non-empty array (max 8)"});
+                // fall through to handle_message which returns the result
+                return {
+                    let response = crate::mcp::handle_message(&ctx, &raw);
+                    let json = response.unwrap_or_else(|| serde_json::json!({}));
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&json).unwrap_or_default(),
+                    )
+                        .into_response()
+                };
+            }
+        };
+        if stages.len() > 8 || total > 80000 || cap > 80000 {
+            ctx.orchestrate_propose_result =
+                serde_json::json!({"error": "plan/price bounds exceeded"});
+        } else {
+            let plan_id = format!("m17-operator-{}", now_ms());
+            let mut assignments = Vec::new();
+            let mut store_lock = state
+                .orchestration_tasks
+                .as_ref()
+                .map(|s| s.lock().unwrap());
+            let ads = orchestration_provider_ads(&state);
+            let now = now_ms();
+            for st in stages {
+                let stage_id = st
+                    .get("stage_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && s.len() <= 128)
+                    .unwrap_or("");
+                let capability = st
+                    .get("capability")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && s.len() <= 128)
+                    .unwrap_or("");
+                let max_price = st.get("max_price").and_then(|v| v.as_u64()).unwrap_or(0);
+                let replicas = match st.get("replicas").and_then(|v| v.as_u64()) {
+                    Some(n) if (1..=3).contains(&n) => n as u32,
+                    _ => 1,
+                };
+                let req_orch = orch::StageRequirement {
+                    capability: capability.to_string(),
+                    max_price,
+                };
+                let selected: Vec<String> = if replicas <= 1 {
+                    orch::select_provider(&ads, &req_orch, now)
+                        .map(|a| vec![a.agent_id.clone()])
+                        .unwrap_or_default()
+                } else {
+                    match orch::select_providers(&ads, &req_orch, replicas, cap, now) {
+                        Ok(v) => v.iter().map(|a| a.agent_id.clone()).collect(),
+                        Err(_) => Vec::new(),
+                    }
+                };
+                let assigned = selected.first().cloned();
+                if let Some(store) = store_lock.as_deref_mut() {
+                    let _ = store.propose_with_replicas(
+                        &plan_id, stage_id, capability, max_price,
+                        "operator", replicas, now,
+                    );
+                    if replicas > 1 && !selected.is_empty() {
+                        let _ = store.init_replicas(&plan_id, stage_id, replicas, &selected, now);
+                    }
+                    if assigned.is_some() {
+                        let _ = store.assign(&plan_id, stage_id, assigned.as_deref().unwrap_or(""), now);
+                    }
+                }
+                assignments.push(serde_json::json!({
+                    "stage_id": stage_id,
+                    "capability": capability,
+                    "max_price": max_price,
+                    "replicas": replicas,
+                    "assigned_to": assigned,
+                    "replica_providers": selected,
+                }));
+            }
+            ctx.orchestrate_propose_result = serde_json::json!({
+                "plan_id": plan_id,
+                "stage_count": stages.len(),
+                "total_price": total,
+                "budget_cap": cap,
+                "dry_run": true,
+                "assignments": assignments,
+            });
+        }
+    } else if let Some(plan_id) = crate::mcp::orchestrate_status_request(&raw) {
+        let result = match &state.orchestration_tasks {
+            Some(store) => {
+                let stages: Vec<serde_json::Value> = {
+                    let g = store.lock().unwrap();
+                    g.plan(&plan_id)
+                        .iter()
+                        .map(|a| {
+                            let replica_details: Vec<serde_json::Value> = if a.replicas > 1 {
+                                g.replicas(&a.plan_id, &a.stage_id)
+                                    .into_iter()
+                                    .map(|r| serde_json::json!({
+                                        "replica": r.replica,
+                                        "executor": r.executor,
+                                        "state": format!("{:?}", r.state),
+                                    }))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let consensus = g.consensus(&a.plan_id, &a.stage_id).map(|c| {
+                                serde_json::json!({
+                                    "verdict": format!("{:?}", c.verdict),
+                                    "outputs_count": c.outputs.len(),
+                                    "resolved_at_ms": c.resolved_at_ms,
+                                })
+                            });
+                            serde_json::json!({
+                                "stage_id": a.stage_id,
+                                "capability": a.capability,
+                                "price": a.price,
+                                "replicas": a.replicas,
+                                "state": format!("{:?}", a.state),
+                                "replica_details": replica_details,
+                                "consensus": consensus,
+                            })
+                        })
+                        .collect()
+                };
+                serde_json::json!({ "plan_id": plan_id, "stages": stages })
+            }
+            None => serde_json::json!({"error": "orchestration not attached"}),
+        };
+        ctx.orchestrate_status_result = result;
     }
     if crate::mcp::consumer_keys_request(&raw) {
         let keys = match &state.consumer_keys_path {
@@ -7654,8 +7861,41 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                         match escrow.settle_escrow(id, tx, amt, now, net) {
                             Ok(()) => {
                                 let r = escrow.get_escrow(id).unwrap().clone();
+                                let provider = r.provider_wallet.clone();
+                                let settled_amt = r.amount_micro_cu;
                                 drop(escrow);
                                 let _ = m18.save_escrow();
+                                // BUG 4 FIX: credit the provider's compensation
+                                // ledger so `get_compensation` reports real
+                                // earnings from settled escrows.
+                                if settled_amt > 0 {
+                                    if let Some(cm) = &state.compute {
+                                        use decentraai_compute::ContributionProfile;
+                                        let profile = ContributionProfile {
+                                            cpu_cores: 4,
+                                            ram_mb: 8192,
+                                            vram_mb: 0,
+                                            online_seconds: 3600,
+                                            verified_requests: 1,
+                                            failed_requests: 0,
+                                        };
+                                        let ledger_arc = cm.compensation_ledger();
+                                        let mut ledger = ledger_arc.lock().unwrap();
+                                        let credited = ledger.credit(
+                                            &provider,
+                                            &format!("escrow:{id}"),
+                                            &profile,
+                                        );
+                                        if credited > 0 {
+                                            tracing::info!(
+                                                escrow_id = %id,
+                                                provider = %provider,
+                                                amount = credited,
+                                                "compensation credited on escrow settle"
+                                            );
+                                        }
+                                    }
+                                }
                                 serde_json::to_value(&r).unwrap()
                             }
                             Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -9472,6 +9712,268 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
         };
         ctx.society_action =
             decentraai_agent_society::mcp::build_decision_hints_response(&rules, &ctx_decision);
+    } else if let Some(args) = crate::mcp::society_record_relationship_request(&raw) {
+        // Society mutating tools for consumers (require "society" scope)
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let subject = args
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = match kind_str {
+            "worked_with" => decentraai_agent_society::state::RelationshipKind::WorkedWith,
+            "accepted" => decentraai_agent_society::state::RelationshipKind::Accepted,
+            "rejected" => decentraai_agent_society::state::RelationshipKind::Rejected,
+            "countered" => decentraai_agent_society::state::RelationshipKind::Countered,
+            "successful" => decentraai_agent_society::state::RelationshipKind::Successful,
+            "failed" => decentraai_agent_society::state::RelationshipKind::Failed,
+            "trust_signal" => decentraai_agent_society::state::RelationshipKind::TrustSignal,
+            "distrust_signal" => decentraai_agent_society::state::RelationshipKind::DistrustSignal,
+            _ => decentraai_agent_society::state::RelationshipKind::WorkedWith,
+        };
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let strength = args.get("strength").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let rel = decentraai_agent_society::state::SocialRelationship::new(
+            account.clone(),
+            subject,
+            kind,
+            state.society.lock().await.tick,
+        )
+        .with_task(task_id.unwrap_or_default())
+        .with_detail(detail.unwrap_or_default())
+        .with_strength(strength);
+        let mut society = state.society.lock().await;
+        society.record_relationship(rel.clone());
+        society.advance_tick();
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
+        ctx.society_action = serde_json::json!({"success": true, "relationship": rel});
+    } else if let Some(args) = crate::mcp::society_record_contribution_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let agent_id = args
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let planned_share = args
+            .get("planned_share")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u8;
+        let verified = args
+            .get("verified_contribution")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        let evidence = args
+            .get("evidence_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let quality = args
+            .get("quality")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        let met_sla = args.get("met_sla").and_then(|v| v.as_bool());
+        let tick = state.society.lock().await.tick;
+        let contrib = decentraai_agent_society::state::ContributionRecord::new(
+            task_id, agent_id, planned_share, tick,
+        )
+        .verify(
+            verified.unwrap_or(0.0),
+            evidence.unwrap_or_default(),
+            quality.unwrap_or(0.0),
+            met_sla.unwrap_or(false),
+            tick,
+        );
+        let mut society = state.society.lock().await;
+        society.record_contribution(contrib.clone());
+        society.advance_tick();
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
+        ctx.society_action = serde_json::json!({"success": true, "contribution": contrib});
+    } else if let Some(args) = crate::mcp::society_record_outcome_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let issuer = args
+            .get("issuer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let team_members = args
+            .get("team_members")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let status_str = args
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("settled");
+        let status = match status_str {
+            "completed" => decentraai_agent_society::state::TaskOutcomeStatus::Completed,
+            "settled" => decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+            "failed" => decentraai_agent_society::state::TaskOutcomeStatus::Failed,
+            "disputed" => decentraai_agent_society::state::TaskOutcomeStatus::Disputed,
+            _ => decentraai_agent_society::state::TaskOutcomeStatus::Settled,
+        };
+        let evidence = args
+            .get("evidence_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let total_reward = args
+            .get("total_reward")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let dists = args
+            .get("distributions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        let agent_id = e.get("agent_id").and_then(|v| v.as_str())?.to_string();
+                        let amount = e.get("amount").and_then(|v| v.as_u64())?;
+                        let share_basis_str = e
+                            .get("share_basis")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("planned");
+                        let share_basis = match share_basis_str {
+                            "planned" => decentraai_agent_society::state::ShareBasis::Planned,
+                            "verified" => decentraai_agent_society::state::ShareBasis::Verified,
+                            "hybrid" => decentraai_agent_society::state::ShareBasis::Hybrid,
+                            _ => decentraai_agent_society::state::ShareBasis::Planned,
+                        };
+                        Some(decentraai_agent_society::state::RewardDistribution {
+                            agent_id,
+                            amount,
+                            share_basis,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tick = state.society.lock().await.tick;
+        let outcome = decentraai_agent_society::state::TaskOutcome {
+            task_id,
+            issuer,
+            team_members,
+            status,
+            evidence_id: evidence,
+            settled_tick: tick,
+            total_reward,
+            distributions: dists,
+            contributor_records: Vec::new(),
+        };
+        let mut society = state.society.lock().await;
+        society.record_outcome(outcome.clone());
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
+        ctx.society_action = serde_json::json!({"success": true, "outcome": outcome});
+    } else if let Some(args) = crate::mcp::society_record_reputation_event_request(&raw) {
+        if !scopes.iter().any(|s| s == "society" || s == "*") {
+            return forbidden("consumer key missing society scope");
+        }
+        let agent_id = args
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let event_type_str = args
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let event_type = match event_type_str {
+            "task_completed" => decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+            "task_failed" => decentraai_agent_society::state::ReputationEventType::TaskFailed,
+            "quality_high" => decentraai_agent_society::state::ReputationEventType::QualityHigh,
+            "quality_low" => decentraai_agent_society::state::ReputationEventType::QualityLow,
+            "sla_met" => decentraai_agent_society::state::ReputationEventType::SlaMet,
+            "sla_missed" => decentraai_agent_society::state::ReputationEventType::SlaMissed,
+            "contribution_verified" => {
+                decentraai_agent_society::state::ReputationEventType::ContributionVerified
+            }
+            "contribution_missing" => {
+                decentraai_agent_society::state::ReputationEventType::ContributionMissing
+            }
+            "proposal_accepted" => {
+                decentraai_agent_society::state::ReputationEventType::ProposalAccepted
+            }
+            "proposal_rejected" => {
+                decentraai_agent_society::state::ReputationEventType::ProposalRejected
+            }
+            "bid_accepted" => decentraai_agent_society::state::ReputationEventType::BidAccepted,
+            "bid_rejected" => decentraai_agent_society::state::ReputationEventType::BidRejected,
+            _ => decentraai_agent_society::state::ReputationEventType::TaskCompleted,
+        };
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let delta = args.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let evidence = args
+            .get("evidence_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tick = state.society.lock().await.tick;
+        let event = decentraai_agent_society::state::ReputationEvent {
+            agent_id,
+            event_type,
+            task_id,
+            delta,
+            tick,
+            evidence_id: evidence,
+            detail,
+        };
+        let mut society = state.society.lock().await;
+        society.record_reputation_event(event.clone());
+        society.advance_tick();
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
+        ctx.society_action = serde_json::json!({"success": true, "event": event});
     } else if crate::mcp::agent_memory_read_request(&raw).is_some() {
         // Personal Memory read-only tools for consumers (require "memory" scope)
         if !scopes.iter().any(|s| s == "memory" || s == "*") {
@@ -10001,7 +10503,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope),              decentraai_compute_request (compute scope), hub_* tools (hub scope),              society_* tools (society scope), agent_memory_* tools (memory scope),              arena_* tools (arena scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -10199,6 +10701,11 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             "models": if state.diffusion.enabled() { vec!["stable-diffusion"] } else { vec![] },
         }),
         diffusion_action: serde_json::json!({}),
+        // Operator compute tools: empty until mcp_handler populates them.
+        embeddings_result: serde_json::json!({}),
+        compute_result: serde_json::json!({}),
+        orchestrate_propose_result: serde_json::json!({}),
+        orchestrate_status_result: serde_json::json!({}),
     }
 }
 

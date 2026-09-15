@@ -120,6 +120,14 @@ pub struct McpContext {
     pub diffusion_models: Value,
     /// M22 Diffusion: result of last image generation operation via MCP.
     pub diffusion_action: Value,
+    /// Result of `decentraai_embeddings` (operator path): embedding computation.
+    pub embeddings_result: Value,
+    /// Result of `decentraai_compute_request` (operator path): DFCP compute assist.
+    pub compute_result: Value,
+    /// M17: Result of `orchestrate_propose` (operator path): orchestration plan creation.
+    pub orchestrate_propose_result: Value,
+    /// M17: Result of `orchestrate_status` (operator path): orchestration plan status.
+    pub orchestrate_status_result: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -2545,6 +2553,11 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "society_contributions" => &ctx.society_action,
         "society_outcomes" => &ctx.society_action,
         "society_decision_hints" => &ctx.society_action,
+        // Society mutating tools (M2): execution in mcp_handler populates ctx.
+        "society_record_relationship" | "society_record_contribution"
+        | "society_record_outcome" | "society_record_reputation_event" => {
+            &ctx.society_action
+        }
         "agent_memory_read" => &ctx.personal_memory_action,
         "agent_memory_write" => &ctx.personal_memory_action,
         "agent_memory_search" => &ctx.personal_memory_action,
@@ -2577,6 +2590,11 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         // M22 — Diffusion
         "diffusion_list_models" => &ctx.diffusion_models,
         "diffusion_generate" => &ctx.diffusion_action,
+        // Operator compute tools: execution in mcp_handler populates ctx.
+        "decentraai_embeddings" => &ctx.embeddings_result,
+        "decentraai_compute_request" => &ctx.compute_result,
+        "orchestrate_propose" => &ctx.orchestrate_propose_result,
+        "orchestrate_status" => &ctx.orchestrate_status_result,
         _ => return None,
     };
     Some(json!({
@@ -2633,6 +2651,10 @@ mod tests {
             m18_action: json!({}),
             diffusion_models: json!({ "enabled": false, "healthy": false, "models": [] }),
             diffusion_action: json!({}),
+            embeddings_result: json!({}),
+            compute_result: json!({}),
+            orchestrate_propose_result: json!({}),
+            orchestrate_status_result: json!({}),
         }
     }
 
