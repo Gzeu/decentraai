@@ -25341,17 +25341,31 @@ mod tests {
     /// that exists — fake hashes are refused by the existence check).
     /// Requires network; the E2E suite already assumes it.
     async fn live_blockhash(client: &reqwest::Client) -> String {
-        client
-            .get("https://testnet-api.multiversx.com/blocks?size=1&fields=hash")
-            .send()
-            .await
-            .expect("test needs testnet-api")
-            .json::<serde_json::Value>()
-            .await
-            .expect("test needs testnet-api JSON")[0]["hash"]
-            .as_str()
-            .expect("block hash shape")
-            .to_string()
+        // The testnet API rate-limits bursts: under parallel `cargo test`
+        // several tests fetch a blockhash at once and a single attempt flakes.
+        // Retry with backoff; a truly-offline run still fails loudly below
+        // (never a fabricated hash — the chain-existence gate needs a real one).
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 << (attempt - 1))).await;
+            }
+            let res = client
+                .get("https://testnet-api.multiversx.com/blocks?size=1&fields=hash")
+                .send()
+                .await;
+            match res {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(v) => match v[0]["hash"].as_str() {
+                        Some(h) => return h.to_string(),
+                        None => last_err = "block hash shape".to_string(),
+                    },
+                    Err(e) => last_err = format!("testnet-api JSON: {e}"),
+                },
+                Err(e) => last_err = format!("testnet-api: {e}"),
+            }
+        }
+        panic!("test needs testnet-api: {last_err}");
     }
 
     #[tokio::test]
