@@ -3419,7 +3419,7 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         return result;
     }
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown().await;
 
     // Clean shutdown: stop the llama-server we own and the distributed node.
     if let Some(server) = maybe_server.take() {
@@ -3880,7 +3880,7 @@ async fn swarm_start(config_path: PathBuf) -> Result<()> {
         node.local_peer_id(),
         announced
     );
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown().await;
     node.shutdown();
     Ok(())
 }
@@ -4193,7 +4193,7 @@ async fn serve_start(
             true,
         )
         .await?;
-        tokio::signal::ctrl_c().await?;
+        wait_for_shutdown().await;
         manager.lock().await.shutdown().await?;
         return Ok(());
     }
@@ -4315,7 +4315,7 @@ async fn serve_start(
         model_path.display(),
         runtime.threads.unwrap_or(0),
     );
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown().await;
     manager.lock().await.shutdown().await?;
     let _ = api_addr;
     Ok(())
@@ -8890,7 +8890,7 @@ async fn distributed_command(args: DistributedArgs) -> Result<()> {
                 }
             }
         });
-        tokio::signal::ctrl_c().await?;
+        wait_for_shutdown().await;
     }
 
     // If we spawned a local llama-server for worker mode, stop it cleanly.
@@ -9189,6 +9189,27 @@ where
 /// Parses `http://host:port/...` into `(host, port)`. Returns `None` on an
 /// unrecognised address so the liveness gate degrades to "always advertise"
 /// (never falsely blocks a healthy worker on a malformed URL).
+/// Waits for either SIGINT (Ctrl+C) or SIGTERM (systemd/kill).
+/// This ensures clean shutdown on both interactive and service-managed nodes.
+async fn wait_for_shutdown() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => { info!("received SIGINT; shutting down"); }
+            _ = sigterm.recv() => { info!("received SIGTERM; shutting down"); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        info!("received shutdown signal; shutting down");
+    }
+}
+
 fn parse_http_addr(url: &str) -> Option<(String, u16)> {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let authority = rest.split('/').next().unwrap_or("");
@@ -9384,7 +9405,7 @@ async fn run_distributed_ask(
     });
 
     let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_shutdown().await;
         info!(%request_id, "user cancelled; sending InferCancel to worker");
         let msg = InferMessage::InferCancel {
             request_id,
