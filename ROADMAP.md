@@ -3357,6 +3357,15 @@ not new features**. This section closes the concrete gaps.
 - [x] `node.example.yaml` documents the new knobs.
 - [x] Test: `from_section_respects_operator_yaml_and_defaults`.
 
+### 132.1.1 Leaf types crate — compute decoupled from libp2p
+
+- [x] `decentraai-types` crate: re-exports `PeerId` from `libp2p-identity`
+  (lightweight, no tokio/kad/relay/transport stack).
+- [x] `decentraai-compute` production deps: `decentraai-types` + `serde` +
+  `serde_json` + `uuid`. `libp2p` moved to dev-dependency only.
+- [x] `decentraai-agents`: `libp2p` moved to dev-dependency.
+- [x] 2004 workspace tests green, clippy clean.
+
 ### 132.2 Real config schema
 
 - [x] `configs/node.schema.json` rewritten from an empty stub (7 bare
@@ -3385,10 +3394,6 @@ not new features**. This section closes the concrete gaps.
 
 ### Open (honest, from the same review — not yet closed)
 
-- `compute` still depends on libp2p for `PeerId` only, which pulls the full
-  tokio/kad/relay stack into the pure domain crate. The clean fix is a
-  leaf crate (e.g. `decentraai-types`) — a larger refactor, deferred to keep
-  this pass regression-free.
 - CI still never runs a real llama-server (httpmock/fake binaries); the real
   engine contract (SSE, KV telemetry, crash behavior) is validated on live
   LAN only.
