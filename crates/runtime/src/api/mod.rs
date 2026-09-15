@@ -4842,7 +4842,7 @@ async fn world_settle_sweep_handler(State(state): State<ApiState>) -> Response {
                                     let path = crate::world::world_path_for(&state.info.repo_root);
                                     crate::world::save_world_state(&path, &world);
                                     RequeueOutcome::Capped
-                                } else {
+                                    } else {
                                     RequeueOutcome::Other
                                 }
                             }
@@ -10567,6 +10567,7 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 | "memory_read_entries"
                 | "memory_write_entry" => "memory",
                 "arena_state" | "arena_act" => "arena",
+                "get_revenue" => "economy",
                 _ => "none",
             };
             capabilities.insert(
@@ -10605,10 +10606,76 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             serde_json::to_string(&response).unwrap_or_default(),
         )
             .into_response();
+    } else if crate::mcp::revenue_request(&raw) {
+        // §2.6 Revenue: consumer can read node revenue (economy scope).
+        // Populate ctx.revenue from contribution_state + quota ledger.
+        if !scopes.iter().any(|s| s == "economy" || s == "*") {
+            return forbidden("consumer key missing economy scope");
+        }
+        ctx.revenue = match &state.compute {
+            Some(cm) => {
+                let cs = cm.contribution_state();
+                let quota_accounts: Vec<serde_json::Value> = cm
+                    .quota_accounts()
+                    .into_iter()
+                    .map(|(account, acc)| {
+                        serde_json::json!({
+                            "account": account,
+                            "earned": acc.earned,
+                            "available": acc.available,
+                            "reserved": acc.reserved,
+                            "consumed": acc.consumed,
+                        })
+                    })
+                    .collect();
+                let by_model: Vec<serde_json::Value> = cs
+                    .by_model
+                    .into_iter()
+                    .map(|(model, mc)| {
+                        serde_json::json!({
+                            "model": model,
+                            "executions": mc.executions,
+                            "tokens": mc.tokens,
+                            "credits": mc.credits,
+                        })
+                    })
+                    .collect();
+                let by_worker: Vec<serde_json::Value> = cs
+                    .by_worker
+                    .into_iter()
+                    .map(|(worker, wc)| {
+                        serde_json::json!({
+                            "worker": worker,
+                            "executions": wc.executions,
+                            "tokens": wc.tokens,
+                            "credits": wc.credits,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "verified_executions": cs.verified_executions,
+                    "failed_executions": cs.failed_executions,
+                    "total_credits_earned": cs.total_credits_earned,
+                    "total_credits_consumed": cs.total_credits_consumed,
+                    "balance": cs.balance,
+                    "by_model": by_model,
+                    "by_worker": by_worker,
+                    "quota_accounts": quota_accounts,
+                })
+            }
+            None => {
+                serde_json::json!({
+                    "verified_executions": 0, "failed_executions": 0,
+                    "total_credits_earned": 0, "total_credits_consumed": 0,
+                    "balance": 0, "by_model": [], "by_worker": [],
+                    "quota_accounts": [],
+                })
+            }
+        };
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), or discover_capabilities (no scope)",
         );
     }
 
