@@ -1,7 +1,7 @@
 //! Time-varying availability of a compute worker plus the full
 //! advertisement broadcast over the P2P network.
 
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::ComputeCapability;

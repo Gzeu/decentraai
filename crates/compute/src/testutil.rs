@@ -2,14 +2,20 @@
 
 #![cfg(test)]
 
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 
 use crate::availability::{ComputeAdvertisement, ComputeAvailability, WorkerHealth};
 use crate::capability::{ComputeCapability, GpuSpec, ServedModel};
 
+/// Generate a random PeerId for testing.
+///
+/// Uses libp2p's key generation under the hood (dev-dependency only).
+/// The resulting PeerId is a real ed25519-based multihash.
 pub(crate) fn test_peer() -> PeerId {
     let keypair = libp2p::identity::Keypair::generate_ed25519();
-    PeerId::from(keypair.public())
+    let libp2p_pid = libp2p::PeerId::from(keypair.public());
+    // Convert via raw bytes — our PeerId is wire-compatible
+    PeerId::from_bytes(&libp2p_pid.to_bytes()).expect("libp2p PeerId bytes are always valid")
 }
 
 pub(crate) fn test_advertisement(

@@ -9,10 +9,11 @@ repository.workspace = true
 description = "Compute-sharing domain: worker capabilities, availability, resource reservations, capability matching and scheduling"
 
 [dependencies]
-libp2p.workspace = true
+decentraai-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+libp2p.workspace = true
 tempfile.workspace = true

@@ -12,7 +12,7 @@
 //! `decentraai_protocol::SignedAgentAdvertisement` (opaque bytes +
 //! signature), exactly like compute advertisements.
 
-use libp2p::PeerId;
+use decentraai_compute::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::AGENT_ADVERTISEMENT_VERSION;
@@ -79,7 +79,8 @@ mod tests {
     use libp2p::identity::Keypair;
 
     fn peer() -> PeerId {
-        PeerId::from(Keypair::generate_ed25519().public())
+        let libp2p_pid = libp2p::PeerId::from(Keypair::generate_ed25519().public());
+        PeerId::from_bytes(&libp2p_pid.to_bytes()).expect("valid PeerId")
     }
 
     #[test]

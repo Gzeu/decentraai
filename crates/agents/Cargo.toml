@@ -9,7 +9,6 @@ repository.workspace = true
 description = "Collective-intelligence agent model: logical agents, unified semantic+execution capabilities, agent tasks, local registry and wire advertisements"
 
 [dependencies]
-libp2p.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -21,4 +20,5 @@ decentraai-compute = { path = "../compute" }
 decentraai-hub = { path = "../hub" }
 
 [dev-dependencies]
+libp2p.workspace = true
 rand_core.workspace = true

@@ -5,7 +5,7 @@ members = [
   "crates/compute",
   "crates/config",
   "crates/discovery",
-    "crates/economy",
+  "crates/economy",
   "crates/distributed",
   "crates/fabric",
   "crates/fabric-intelligence",
@@ -23,6 +23,7 @@ members = [
   "crates/runtime",
   "crates/system-probe",
   "crates/tokens",
+  "crates/types",
   "crates/arena",
   "crates/agent-society",
   "crates/agent-personal-memory",
@@ -44,6 +45,7 @@ authors = ["DecentraAI Contributors"]
 repository = "https://github.com/Gzeu/decentraai"
 
 [workspace.dependencies]
+decentraai-types = { path = "crates/types" }
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"

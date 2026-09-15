@@ -95,6 +95,10 @@ pub use resource_contribution::{
 };
 pub use scheduler::{ComputeScheduler, Placement};
 
+// Re-export PeerId from the leaf types crate so downstream consumers
+// don't need to depend on decentraai-types directly.
+pub use decentraai_types::PeerId;
+
 /// Default heartbeat interval for compute advertisements (ms).
 pub const DEFAULT_ADVERTISEMENT_INTERVAL_MS: u64 = 5_000;
 

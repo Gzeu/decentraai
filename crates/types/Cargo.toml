@@ -1,0 +1,20 @@
+[package]
+name = "decentraai-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared leaf types for the DecentraAI fabric — minimal identity deps, no tokio/kad/relay."
+
+[dependencies]
+# libp2p-identity is the ONLY heavy-ish dep: it provides PeerId, Keypair, PublicKey.
+# Crucially it does NOT pull in tokio, kad, relay, swarm, tcp, noise, yamux.
+# This lets compute (and other pure-domain crates) use PeerId without the full
+# libp2p transport/protocol stack.
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "serde"] }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

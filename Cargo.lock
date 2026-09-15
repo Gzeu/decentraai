@@ -1104,6 +1104,7 @@ dependencies = [
 name = "decentraai-compute"
 version = "1.0.0"
 dependencies = [
+ "decentraai-types",
  "libp2p",
  "serde",
  "serde_json",
@@ -1502,6 +1503,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "decentraai-types"
+version = "1.0.0"
+dependencies = [
+ "libp2p-identity",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

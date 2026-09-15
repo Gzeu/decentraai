@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 
 use crate::availability::ComputeAdvertisement;
 use crate::matcher::{CapabilityMatcher, MatchOutcome};
@@ -194,7 +194,7 @@ impl ComputeScheduler {
     /// composed, never contradicted.
     pub fn reserve_worker(
         &mut self,
-        worker: &libp2p::PeerId,
+        worker: &decentraai_types::PeerId,
         req: &WorkloadRequirements,
         now: Instant,
     ) -> Option<Placement> {
@@ -277,7 +277,8 @@ mod tests {
 
     fn peer() -> PeerId {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-        PeerId::from(keypair.public())
+        let libp2p_pid = libp2p::PeerId::from(keypair.public());
+        PeerId::from_bytes(&libp2p_pid.to_bytes()).expect("valid PeerId")
     }
 
     fn advertisement(

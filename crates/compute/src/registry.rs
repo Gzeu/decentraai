@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 
 use crate::availability::{ComputeAdvertisement, WorkerHealth};
 

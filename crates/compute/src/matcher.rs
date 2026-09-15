@@ -3,7 +3,7 @@
 use crate::availability::ComputeAdvertisement;
 use crate::requirements::WorkloadRequirements;
 use crate::reservation::ReservationLedger;
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 
 /// Why a worker was rejected, so operators and logs can distinguish a
 /// missing model from an overloaded GPU.

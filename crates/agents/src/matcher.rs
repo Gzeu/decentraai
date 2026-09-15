@@ -25,7 +25,7 @@ use decentraai_hub::capability::CapabilityKind;
 use decentraai_hub::requirements::{
     CapabilityMatch, CapabilityRequirement, EvidenceLevel, match_requirements,
 };
-use libp2p::PeerId;
+use decentraai_compute::PeerId;
 
 use crate::agent::AgentRecord;
 use crate::capability::model_capabilities_from_claims;
@@ -198,7 +198,8 @@ mod tests {
     use std::time::Duration;
 
     fn test_peer() -> PeerId {
-        PeerId::from(Keypair::generate_ed25519().public())
+        let libp2p_pid = libp2p::PeerId::from(Keypair::generate_ed25519().public());
+        PeerId::from_bytes(&libp2p_pid.to_bytes()).expect("valid PeerId")
     }
 
     /// A node that serves model "abc" (est_ram 256, est_vram 3072) with 16 GiB

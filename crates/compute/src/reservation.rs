@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use libp2p::PeerId;
+use decentraai_types::PeerId;
 use uuid::Uuid;
 
 /// A reservation held by the coordinator on a worker for the duration of a
@@ -189,7 +189,8 @@ mod tests {
 
     fn peer() -> PeerId {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-        PeerId::from(keypair.public())
+        let libp2p_pid = libp2p::PeerId::from(keypair.public());
+        PeerId::from_bytes(&libp2p_pid.to_bytes()).expect("valid PeerId")
     }
 
     #[test]
