@@ -2312,7 +2312,10 @@ impl ComputeManager {
         );
         adv.capability.available_models = available_models;
         self.scheduler.lock().await.upsert(adv.clone());
-        *self.last_local_ad.lock().unwrap() = Some(adv.clone());
+        // Poison-tolerant: a panic elsewhere must never kill the periodic
+        // broadcaster (observed silent mesh decay). A poisoned mutex still
+        // holds the last good value — take it and keep beating.
+        *self.last_local_ad.lock().unwrap_or_else(|e| e.into_inner()) = Some(adv.clone());
         adv
     }
 
@@ -2335,7 +2338,10 @@ impl ComputeManager {
     /// capacity it committed to the network). Synchronous, for the worker's
     /// on_infer admission gate. `None` until the first `advertise_local`.
     pub fn last_local_advertisement_sync(&self) -> Option<ComputeAdvertisement> {
-        self.last_local_ad.lock().unwrap().clone()
+        self.last_local_ad
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Refreshes this node's on-disk model set after a model install/removal
