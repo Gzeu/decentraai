@@ -6464,8 +6464,9 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             deliverable.clone(),
         );
         hub.advance_tick();
-        let path = crate::hub::hub_path_for(&state.info.repo_root);
-        crate::hub::save_hub_state(&path, &hub);
+        let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
+        // Serialize under lock; write AFTER releasing to avoid blocking tokio.
+        let hub_json = crate::hub::serialize_hub_state(&hub);
 
         // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
         let _team_for_society = team_members.clone();
@@ -6478,6 +6479,10 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
             .clone()
             .unwrap_or_else(|| "general".to_string());
         drop(hub);
+        // Write hub state AFTER releasing lock — sync I/O outside tokio Mutex.
+        if let Some(json) = hub_json {
+            crate::hub::write_json_atomic(&hub_path, &json);
+        }
         {
             let mut society = state.society.lock().await;
             if !society.outcomes.contains_key(&_task_for_society) {
@@ -6523,24 +6528,6 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     contributor_records: contrib_records,
                 };
                 society.record_outcome(outcome);
-                // --- M18 Trust Bridge: create trust anchors from verified outcomes ---
-                if let Some(m18) = &state.m18 {
-                    for (agent_id, share) in &_team_for_society {
-                        let params = decentraai_economy::trust_anchor::AnchorParams {
-                            agent_wallet: agent_id.clone(),
-                            evidence_hash: _ev_for_society.clone(),
-                            capability: _cap_for_society.clone(),
-                            quality_score: 85u8,
-                            verified: true,
-                            micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
-                            contract_id: None,
-                        };
-                        let mut trust = m18.trust.lock().unwrap();
-                        let _ = trust.record_anchor(&params, tick);
-                        drop(trust);
-                    }
-                    let _ = m18.save_trust();
-                }
                 for (agent_id, _) in &_team_for_society {
                     let ev = decentraai_agent_society::state::ReputationEvent {
                         agent_id: agent_id.clone(),
@@ -6568,8 +6555,38 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                     society.record_reputation_event(ev2);
                 }
                 society.advance_tick();
-                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-                decentraai_agent_society::state::save_society_state(&path, &society);
+                let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+                let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                drop(society);
+                if let Some(json) = soc_json {
+                    decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+                }
+                // --- M18 Trust Bridge (spawn_blocking: StdMutex + disk I/O) ---
+                if let Some(m18) = &state.m18 {
+                    let m18_arc = m18.clone();
+                    let team_clone = _team_for_society.clone();
+                    let ev_clone = _ev_for_society.clone();
+                    let cap_clone = _cap_for_society.clone();
+                    let reward_clone = _reward_for_society;
+                    let tick_clone = tick;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for (agent_id, share) in &team_clone {
+                            let params = decentraai_economy::trust_anchor::AnchorParams {
+                                agent_wallet: agent_id.clone(),
+                                evidence_hash: ev_clone.clone(),
+                                capability: cap_clone.clone(),
+                                quality_score: 85u8,
+                                verified: true,
+                                micro_cu: (reward_clone as u128 * *share as u128 / 100) as u64,
+                                contract_id: None,
+                            };
+                            let mut trust = m18_arc.trust.lock().unwrap();
+                            let _ = trust.record_anchor(&params, tick_clone);
+                            drop(trust);
+                        }
+                        let _ = m18_arc.save_trust();
+                    }).await;
+                }
             }
         }
         if let Some(pm) = &state.personal_memory {
@@ -6653,46 +6670,24 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                 arena.events.pop_front();
             }
             arena.advance_tick();
+            // Serialize under lock; write AFTER releasing.
+            let arena_json = crate::arena::serialize_arena_world(&arena);
             let apath = crate::arena::arena_path_for(&state.info.repo_root);
-            crate::arena::save_arena_world(&apath, &arena);
-        }
-        // M18: Auto-record trust anchors for each team member after Hub execution.
-        // Each verified execution becomes a wallet-backed trust anchor in the
-        // economic layer, linking agent identity to verified work output.
-        if let Some(ref m18) = state.m18 {
-            use decentraai_economy::trust_anchor as econ_trust;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let capability = task
-                .required_capability
-                .clone()
-                .unwrap_or_else(|| "general".to_string());
-            let per_member_cu = if !team_members.is_empty() {
-                task.reward / team_members.len() as u64
-            } else {
-                task.reward
-            };
-            let mut trust = m18.trust.lock().unwrap();
-            for (agent_id, _share) in &team_members {
-                let anchor_id = format!("{}:{}", evidence_id, agent_id);
-                if trust.anchors.contains_key(&anchor_id) {
-                    continue; // dedup
+            drop(arena);
+            if let Some(json) = arena_json {
+                if let Some(parent) = apath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
-                let params = econ_trust::AnchorParams {
-                    agent_wallet: agent_id.clone(),
-                    evidence_hash: evidence_id.clone(),
-                    capability: capability.clone(),
-                    quality_score: 100, // Hub-verified = full quality
-                    verified: true,
-                    micro_cu: per_member_cu,
-                    contract_id: None,
-                };
-                let _ = trust.record_anchor(&params, now);
+                let tmp = apath.with_extension("tmp");
+                if std::fs::write(&tmp, &json).is_ok() {
+                    let _ = std::fs::rename(&tmp, &apath);
+                }
             }
-            let _ = m18.save_trust();
         }
+        // NOTE: M18 trust anchors are already recorded by the spawn_blocking
+        // block above (line ~6564). This second duplicate block was causing a
+        // deadlock by acquiring StdMutex<TrustStore> inside the tokio context
+        // without spawn_blocking. Removed to fix the deadlock.
         let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
         ctx.hub_action = res;
     }
@@ -6931,9 +6926,12 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let mut society = state.society.lock().await;
         society.record_relationship(rel.clone());
         society.advance_tick();
-        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-        decentraai_agent_society::state::save_society_state(&path, &society);
-        ctx.society_action = serde_json::json!({"success": true, "relationship": rel});
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
     }
     if let Some(args) = crate::mcp::society_record_contribution_request(&raw) {
         let task_id = args
@@ -6980,8 +6978,12 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let mut society = state.society.lock().await;
         society.record_contribution(contrib.clone());
         society.advance_tick();
-        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-        decentraai_agent_society::state::save_society_state(&path, &society);
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
         ctx.society_action = serde_json::json!({"success": true, "contribution": contrib});
     }
     if let Some(args) = crate::mcp::society_record_outcome_request(&raw) {
@@ -7102,27 +7104,39 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         };
         let mut society = state.society.lock().await;
         society.record_outcome(outcome.clone());
-        // --- M18 Trust Bridge: create trust anchors from MCP-recorded outcomes ---
-        if let Some(m18) = &state.m18 {
-            for agent_id in &outcome.team_members {
-                let params = decentraai_economy::trust_anchor::AnchorParams {
-                    agent_wallet: agent_id.clone(),
-                    evidence_hash: evidence.clone().unwrap_or_default(),
-                    capability: "general".to_string(),
-                    quality_score: 80u8,
-                    verified: true,
-                    micro_cu: total_reward / outcome.team_members.len().max(1) as u64,
-                    contract_id: None,
-                };
-                let mut trust = m18.trust.lock().unwrap();
-                let _ = trust.record_anchor(&params, tick);
-                drop(trust);
-            }
-            let _ = m18.save_trust();
+        // --- M18 Trust Bridge: moved OUTSIDE society lock to avoid StdMutex deadlock ---
+        // (spawn_blocking below; society lock dropped first)
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
         }
-        society.advance_tick();
-        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-        decentraai_agent_society::state::save_society_state(&path, &society);
+        // M18 Trust Bridge (spawn_blocking: StdMutex + disk I/O)
+        if let Some(m18) = &state.m18 {
+            let m18_arc = m18.clone();
+            let team_clone = outcome.team_members.clone();
+            let ev_clone = evidence.clone().unwrap_or_default();
+            let reward_clone = total_reward;
+            let tick_clone = tick;
+            let _ = tokio::task::spawn_blocking(move || {
+                for agent_id in &team_clone {
+                    let params = decentraai_economy::trust_anchor::AnchorParams {
+                        agent_wallet: agent_id.clone(),
+                        evidence_hash: ev_clone.clone(),
+                        capability: "general".to_string(),
+                        quality_score: 80u8,
+                        verified: true,
+                        micro_cu: reward_clone / team_clone.len().max(1) as u64,
+                        contract_id: None,
+                    };
+                    let mut trust = m18_arc.trust.lock().unwrap();
+                    let _ = trust.record_anchor(&params, tick_clone);
+                    drop(trust);
+                }
+                let _ = m18_arc.save_trust();
+            }).await;
+        }
         ctx.society_action = serde_json::json!({"success": true, "outcome": outcome});
     }
     if let Some(args) = crate::mcp::society_record_reputation_event_request(&raw) {
@@ -7185,8 +7199,12 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
         let mut society = state.society.lock().await;
         society.record_reputation_event(event.clone());
         society.advance_tick();
-        let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-        decentraai_agent_society::state::save_society_state(&path, &society);
+        let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+        let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+        drop(society);
+        if let Some(json) = soc_json {
+            decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+        }
         ctx.society_action = serde_json::json!({"success": true, "event": event});
     }
     if crate::mcp::consumer_keys_request(&raw) {
@@ -8924,8 +8942,8 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             deliverable.clone(),
         );
         hub.advance_tick();
-        let path = crate::hub::hub_path_for(&state.info.repo_root);
-        crate::hub::save_hub_state(&path, &hub);
+        let hub_path = crate::hub::hub_path_for(&state.info.repo_root);
+        let hub_json = crate::hub::serialize_hub_state(&hub);
 
         // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
         let _team_for_society = team_members.clone();
@@ -8938,6 +8956,9 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
             .clone()
             .unwrap_or_else(|| "general".to_string());
         drop(hub);
+        if let Some(json) = hub_json {
+            crate::hub::write_json_atomic(&hub_path, &json);
+        }
         {
             let mut society = state.society.lock().await;
             if !society.outcomes.contains_key(&_task_for_society) {
@@ -8983,24 +9004,6 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     contributor_records: contrib_records,
                 };
                 society.record_outcome(outcome);
-                // --- M18 Trust Bridge: create trust anchors from verified outcomes ---
-                if let Some(m18) = &state.m18 {
-                    for (agent_id, share) in &_team_for_society {
-                        let params = decentraai_economy::trust_anchor::AnchorParams {
-                            agent_wallet: agent_id.clone(),
-                            evidence_hash: _ev_for_society.clone(),
-                            capability: _cap_for_society.clone(),
-                            quality_score: 85u8,
-                            verified: true,
-                            micro_cu: (_reward_for_society as u128 * *share as u128 / 100) as u64,
-                            contract_id: None,
-                        };
-                        let mut trust = m18.trust.lock().unwrap();
-                        let _ = trust.record_anchor(&params, tick);
-                        drop(trust);
-                    }
-                    let _ = m18.save_trust();
-                }
                 for (agent_id, _) in &_team_for_society {
                     let ev = decentraai_agent_society::state::ReputationEvent {
                         agent_id: agent_id.clone(),
@@ -9028,8 +9031,38 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                     society.record_reputation_event(ev2);
                 }
                 society.advance_tick();
-                let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-                decentraai_agent_society::state::save_society_state(&path, &society);
+                let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+                let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+                drop(society);
+                if let Some(json) = soc_json {
+                    decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+                }
+                // --- M18 Trust Bridge (spawn_blocking: StdMutex + disk I/O) ---
+                if let Some(m18) = &state.m18 {
+                    let m18_arc = m18.clone();
+                    let team_clone = _team_for_society.clone();
+                    let ev_clone = _ev_for_society.clone();
+                    let cap_clone = _cap_for_society.clone();
+                    let reward_clone = _reward_for_society;
+                    let tick_clone = tick;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for (agent_id, share) in &team_clone {
+                            let params = decentraai_economy::trust_anchor::AnchorParams {
+                                agent_wallet: agent_id.clone(),
+                                evidence_hash: ev_clone.clone(),
+                                capability: cap_clone.clone(),
+                                quality_score: 85u8,
+                                verified: true,
+                                micro_cu: (reward_clone as u128 * *share as u128 / 100) as u64,
+                                contract_id: None,
+                            };
+                            let mut trust = m18_arc.trust.lock().unwrap();
+                            let _ = trust.record_anchor(&params, tick_clone);
+                            drop(trust);
+                        }
+                        let _ = m18_arc.save_trust();
+                    }).await;
+                }
             }
         }
         if let Some(pm) = &state.personal_memory {
@@ -9113,8 +9146,18 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                 arena.events.pop_front();
             }
             arena.advance_tick();
+            let arena_json = crate::arena::serialize_arena_world(&arena);
             let apath = crate::arena::arena_path_for(&state.info.repo_root);
-            crate::arena::save_arena_world(&apath, &arena);
+            drop(arena);
+            if let Some(json) = arena_json {
+                if let Some(parent) = apath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp = apath.with_extension("tmp");
+                if std::fs::write(&tmp, &json).is_ok() {
+                    let _ = std::fs::rename(&tmp, &apath);
+                }
+            }
         }
         let res = serde_json::json!({"task_id": task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward});
         let id = serde_json::from_str::<serde_json::Value>(&raw)

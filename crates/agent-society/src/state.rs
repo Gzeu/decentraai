@@ -352,11 +352,26 @@ pub fn load_society_state(path: &Path) -> SocietyState {
 
 /// Save society state to disk
 pub fn save_society_state(path: &Path, state: &SocietyState) {
+    if let Some(s) = serialize_society_state(state) {
+        write_json_atomic(path, &s);
+    }
+}
+
+/// Serialize society state to JSON string (fast, in-memory only).
+pub fn serialize_society_state(state: &SocietyState) -> Option<String> {
+    serde_json::to_string_pretty(state).ok()
+}
+
+/// Write a pre-serialized JSON string atomically (write + rename).
+/// Safe to call outside a lock — does blocking I/O.
+pub fn write_json_atomic(path: &Path, json: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let json = serde_json::to_string_pretty(state).unwrap_or_default();
-    let _ = std::fs::write(path, json);
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// Reputation event from verified outcomes

@@ -36,14 +36,25 @@ pub fn load_hub_state(path: &Path) -> HubState {
         .unwrap_or_default()
 }
 pub fn save_hub_state(path: &Path, state: &HubState) {
+    if let Some(s) = serialize_hub_state(state) {
+        write_json_atomic(path, &s);
+    }
+}
+
+/// Serialize hub state to JSON string (fast, in-memory only).
+pub fn serialize_hub_state(state: &HubState) -> Option<String> {
+    serde_json::to_string(state).ok()
+}
+
+/// Write a pre-serialized JSON string atomically (tmp + rename).
+/// Safe to call outside a lock — does blocking I/O.
+pub fn write_json_atomic(path: &Path, json: &str) {
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
     let tmp = path.with_extension("tmp");
-    if let Ok(s) = serde_json::to_string(state) {
-        if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -436,14 +447,20 @@ pub async fn hub_execute_handler(
         req.deliverable_hash.clone(),
     );
     hub.advance_tick();
-    let path = hub_path_for(&state.info.repo_root);
-    save_hub_state(&path, &hub);
+    let hub_path = hub_path_for(&state.info.repo_root);
+    // Serialize under lock (fast, in-memory); write file AFTER releasing lock
+    // to avoid blocking the tokio runtime with sync I/O.
+    let hub_json = serialize_hub_state(&hub);
     // --- Auto Society + Personal Memory side-effects (deterministic, idempotent) ---
     let _team_for_society = team_members.clone();    let _ev_for_society = evidence_id.clone();
     let _task_for_society = req.task_id.clone();
     let _reward_for_society = task.reward;
     let _issuer_for_society = task.issuer.clone();
     drop(hub);
+    // Write hub state AFTER releasing lock — sync I/O outside tokio Mutex.
+    if let Some(json) = hub_json {
+        write_json_atomic(&hub_path, &json);
+    }
     {
         let mut society = state.society.lock().await;
         if !society.outcomes.contains_key(&_task_for_society) {
@@ -516,8 +533,13 @@ pub async fn hub_execute_handler(
                 society.record_reputation_event(ev2);
             }
             society.advance_tick();
-            let path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
-            decentraai_agent_society::state::save_society_state(&path, &society);
+            // Serialize under lock; write file AFTER releasing lock.
+            let soc_json = decentraai_agent_society::state::serialize_society_state(&society);
+            let soc_path = decentraai_agent_society::state::society_path_for(&state.info.repo_root);
+            drop(society);
+            if let Some(json) = soc_json {
+                decentraai_agent_society::state::write_json_atomic(&soc_path, &json);
+            }
         }
     }
     if let Some(pm) = &state.personal_memory {
@@ -600,8 +622,19 @@ pub async fn hub_execute_handler(
             arena.events.pop_front();
         }
         arena.advance_tick();
+        // Serialize under lock; write file AFTER releasing lock.
+        let arena_json = crate::arena::serialize_arena_world(&arena);
         let apath = crate::arena::arena_path_for(&state.info.repo_root);
-        crate::arena::save_arena_world(&apath, &arena);
+        drop(arena);
+        if let Some(json) = arena_json {
+            if let Some(parent) = apath.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = apath.with_extension("tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &apath);
+            }
+        }
     }
     (axum::http::StatusCode::OK, Json(serde_json::json!({"task_id": req.task_id, "evidence_id": evidence_id, "team": team_members, "reward": task.reward}))).into_response()
 }

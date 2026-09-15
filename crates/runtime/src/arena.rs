@@ -46,15 +46,20 @@ pub fn load_arena_world(path: &Path) -> ArenaWorld {
 }
 
 pub fn save_arena_world(path: &Path, world: &ArenaWorld) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("tmp");
-    if let Ok(s) = serde_json::to_string(world) {
+    if let Some(s) = serialize_arena_world(world) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, s).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
     }
+}
+
+/// Serialize arena world to JSON string (fast, in-memory only).
+pub fn serialize_arena_world(world: &ArenaWorld) -> Option<String> {
+    serde_json::to_string(world).ok()
 }
 
 // ---------- API shapes (closed, deny_unknown_fields) ----------
