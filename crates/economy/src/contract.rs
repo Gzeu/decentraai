@@ -125,6 +125,20 @@ pub struct AgentContract {
     /// Free-form notes from either party.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<ContractNote>,
+    /// Simulation flag. `sim` contracts settle normally but are EXCLUDED
+    /// from compensation and trust totals (read-side exclusion, never
+    /// deletion). Old records load as `false`.
+    #[serde(default)]
+    pub sim: bool,
+}
+
+/// Identity equality for self-dealing checks: trimmed, exact. Empty ids
+/// never match (two missing wallets are not "the same party" — they fail
+/// wallet validation separately).
+pub fn same_party(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    !a.is_empty() && !b.is_empty() && a == b
 }
 
 /// A timestamped note on a contract.
@@ -144,7 +158,7 @@ pub enum ContractError {
     TerminalStatus(ContractStatus),
     #[error("invalid status transition: {0:?} → {1:?}")]
     InvalidTransition(ContractStatus, ContractStatus),
-    #[error("provider and consumer must differ")]
+    #[error("self_deal_forbidden: provider and consumer must differ")]
     SameParty,
     #[error("contract not found")]
     NotFound,
@@ -200,7 +214,7 @@ pub fn propose_contract(
     terms: ContractTerms,
     now: u64,
 ) -> Result<AgentContract, ContractError> {
-    if provider_wallet == consumer_wallet {
+    if same_party(provider_wallet, consumer_wallet) {
         return Err(ContractError::SameParty);
     }
     // Accept erd1... bech32 (production) or agent: prefixed (local network).
@@ -222,6 +236,7 @@ pub fn propose_contract(
         updated_at: now,
         settlement: None,
         notes: vec![],
+        sim: false,
     })
 }
 
@@ -373,6 +388,20 @@ mod tests {
             propose_contract(&p, &p, service(), terms(), 1),
             Err(ContractError::SameParty)
         ));
+    }
+
+    #[test]
+    fn same_party_rule_is_normalized_and_non_empty() {
+        // Whitespace-padded self-deal still rejected, with a stable message.
+        let p = provider();
+        let err = propose_contract(&format!("  {p} "), &p, service(), terms(), 1).unwrap_err();
+        assert!(matches!(err, ContractError::SameParty));
+        assert!(err.to_string().contains("self_deal_forbidden"));
+        // Two empty wallets are NOT "the same party" (wallet validation
+        // rejects them separately).
+        assert!(!same_party("", ""));
+        assert!(!same_party("  ", "erd1x"));
+        assert!(same_party("erd1x", "erd1x"));
     }
 
     #[test]

@@ -1122,7 +1122,8 @@ pub fn all_tools() -> Vec<ToolDef> {
                 "price_micro_cu": { "type": "integer", "description": "Price in micro-CU" },
                 "max_duration_secs": { "type": "integer", "description": "Max execution time in seconds" },
                 "min_quality_percent": { "type": "integer", "description": "Minimum quality SLA (0 = none)" },
-                "escrow_required": { "type": "boolean", "description": "Whether provider must stake escrow" }
+                "escrow_required": { "type": "boolean", "description": "Whether provider must stake escrow" },
+                "sim": { "type": "boolean", "description": "Simulation flag: the contract settles normally but is excluded from compensation and trust totals (default false)" }
             }, "required": ["consumer_wallet", "provider_wallet", "capability", "description", "price_micro_cu"], "additionalProperties": false }),
             annotations: ToolAnnotations::additive(),
         },

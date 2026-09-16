@@ -727,9 +727,11 @@ impl ComputeManager {
             tokens_used,
             processing_time_ms,
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_credited_contribution_with_model(
         &self,
         peer: &PeerId,
@@ -738,6 +740,7 @@ impl ComputeManager {
         tokens_used: Option<u32>,
         processing_time_ms: Option<u32>,
         model: Option<String>,
+        requested: Option<String>,
     ) -> bool {
         const MAX_CREDITED: usize = 4096;
         // Dedup: if this execution was already credited, do NOT credit again.
@@ -817,6 +820,9 @@ impl ComputeManager {
                 ));
             if let Some(m) = model {
                 builder = builder.model(m);
+            }
+            if let Some(r) = requested {
+                builder = builder.requested_model(r);
             }
             let rc = builder.build();
             let now = std::time::SystemTime::now()

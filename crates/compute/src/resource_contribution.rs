@@ -72,6 +72,11 @@ pub struct ResourceContribution {
     pub capability: String,
     /// Model identity (file hash or canonical name) when known.
     pub model: Option<String>,
+    /// Requested model id (verbatim, before any normalization) when known.
+    /// `None` = the caller never saw a request id (streaming, legacy
+    /// paths); attribution falls back to asked==got.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     /// Verdict of the verified execution.
     pub success: bool,
 
@@ -142,6 +147,7 @@ pub struct ResourceContributionBuilder {
     worker_node: String,
     capability: String,
     model: Option<String>,
+    requested_model: Option<String>,
     success: bool,
     dimensions: Vec<ResourceDimension>,
     receipt_id: Option<String>,
@@ -165,6 +171,11 @@ impl ResourceContributionBuilder {
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub fn requested_model(mut self, model: impl Into<String>) -> Self {
+        self.requested_model = Some(model.into());
         self
     }
 
@@ -199,6 +210,7 @@ impl ResourceContributionBuilder {
             worker_node: self.worker_node,
             capability: self.capability,
             model: self.model,
+            requested_model: self.requested_model,
             success: self.success,
             cpu_time_seconds: None,
             ram_bytes_seconds: None,

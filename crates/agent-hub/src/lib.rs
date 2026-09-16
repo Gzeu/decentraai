@@ -127,6 +127,8 @@ pub enum HubError {
     TaskNotOpen,
     #[error("bid price exceeds reward")]
     PriceTooHigh,
+    #[error("self_bid_forbidden: bidder and task issuer must differ")]
+    SelfBid,
     #[error("proposal not found")]
     ProposalNotFound,
     #[error("not proposal recipient")]
@@ -208,6 +210,29 @@ impl HubState {
         task
     }
 
+    /// Identity equality for self-dealing checks: trimmed, exact. Empty
+    /// ids never match (a missing bidder/issuer fails validation
+    /// elsewhere, never the sybil guard). Intentional mirror of the M18
+    /// `same_party` rule — the crates share no dependency, so the 3-line
+    /// rule lives in both rather than growing a new leaf crate.
+    pub fn same_party(a: &str, b: &str) -> bool {
+        let a = a.trim();
+        let b = b.trim();
+        !a.is_empty() && !b.is_empty() && a == b
+    }
+
+    /// Self-dealing award check: true when the task's best bid was placed
+    /// by the task issuer (the issuer accepting their own bid). The no-bid
+    /// issuer fallback is NOT covered — settling a task nobody bid on is
+    /// not "accepting your own bid" (no bid exists). Execute paths refuse
+    /// on true; nothing is mutated by the check itself.
+    pub fn self_bid_award(&self, task_id: &str) -> bool {
+        match (self.tasks.get(task_id), self.best_bid(task_id)) {
+            (Some(task), Some(best)) => Self::same_party(&best.bidder, &task.issuer),
+            _ => false,
+        }
+    }
+
     pub fn place_bid(
         &mut self,
         bidder: String,
@@ -218,6 +243,9 @@ impl HubState {
         let task = self.tasks.get(&task_id).ok_or(HubError::TaskNotFound)?;
         if task.status != TaskStatus::Open && task.status != TaskStatus::Bidding {
             return Err(HubError::TaskNotOpen);
+        }
+        if Self::same_party(&bidder, &task.issuer) {
+            return Err(HubError::SelfBid);
         }
         if price > task.reward {
             return Err(HubError::PriceTooHigh);
@@ -547,6 +575,47 @@ mod tests {
         assert_eq!(win[0].detail, "e4");
         // Zero limit = empty, never a panic.
         assert!(hub.events_since(0, 0).is_empty());
+    }
+
+    #[test]
+    fn self_bid_rejected_and_award_detected() {
+        let mut hub = HubState::new();
+        let task = hub.publish_task(
+            "alice".into(),
+            "T".into(),
+            "d".into(),
+            500,
+            Some("analysis".into()),
+        );
+        // Issuer bidding on her own task: refused, nothing recorded.
+        let err = hub
+            .place_bid("alice".into(), task.id.clone(), 100, "me".into())
+            .unwrap_err();
+        assert!(matches!(err, HubError::SelfBid));
+        assert!(err.to_string().contains("self_bid_forbidden"));
+        assert!(hub.bids.is_empty());
+        assert!(!hub.self_bid_award(&task.id), "no bids: not an own-bid award");
+        // Padded identity still matches (normalized, non-empty rule).
+        assert!(HubState::same_party(" alice ", "alice"));
+        assert!(!HubState::same_party("", ""));
+        // Honest bid: no refusal, no award flag.
+        hub.place_bid("beta".into(), task.id.clone(), 100, "ok".into())
+            .unwrap();
+        assert!(!hub.self_bid_award(&task.id));
+        // Legacy self-bid (predates the place_bid gate, e.g. from disk):
+        // the award detector still catches it at execute time.
+        hub.bids.insert(
+            "bid-legacy".to_string(),
+            crate::Bid {
+                id: "bid-legacy".to_string(),
+                task_id: task.id.clone(),
+                bidder: "alice".to_string(),
+                price: 50,
+                rationale: "legacy".to_string(),
+                created_tick: 0,
+            },
+        );
+        assert!(hub.self_bid_award(&task.id));
     }
 
     #[test]

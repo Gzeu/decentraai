@@ -397,6 +397,17 @@ pub async fn hub_execute_handler(
         }
         return (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("task status {:?} not executable", task.status)}))).into_response();
     }
+    // sybil: refusing to award the issuer their own bid happens BEFORE
+    // anything mutates (no execution, no credit, no events). The no-bid
+    // issuer fallback below is untouched — settling a task nobody bid on
+    // is not "accepting your own bid" (no bid exists).
+    if hub.self_bid_award(&req.task_id) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": {"message": "self_bid_forbidden: task issuer cannot be awarded their own bid", "type": "invalid_request"}})),
+        )
+            .into_response();
+    }
     // Deliverable hash is validated BEFORE anything mutates (fail-fast):
     // 64 hex chars binding the settlement to a work artifact.
     if let Some(ref dh) = req.deliverable_hash {

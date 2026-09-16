@@ -71,6 +71,11 @@ pub struct EscrowRecord {
     pub created_at: u64,
     /// When the status last changed.
     pub updated_at: u64,
+    /// Simulation flag, inherited from the contract at creation. `sim`
+    /// escrows settle normally but are EXCLUDED from compensation and
+    /// trust totals. Old records load as `false`.
+    #[serde(default)]
+    pub sim: bool,
 }
 
 /// Settlement request — what the settlement flow needs to execute.
@@ -123,6 +128,8 @@ pub enum EscrowError {
     AmountMismatch { escrow: u64, evidence: u64 },
     #[error("invalid transition: {0:?} → {1:?}")]
     InvalidTransition(EscrowStatus, EscrowStatus),
+    #[error("self_deal_forbidden: escrow consumer and provider must differ")]
+    SelfDeal,
 }
 
 impl EscrowLedger {
@@ -140,6 +147,12 @@ impl EscrowLedger {
         if self.records.contains_key(&contract.contract_id) {
             return Err(EscrowError::EscrowExists(contract.contract_id.clone()));
         }
+        // Defense in depth: a self-dealing contract must never back an
+        // escrow, even if it bypassed the propose gate (legacy records,
+        // direct construction). Same normalized, non-empty rule.
+        if crate::contract::same_party(&contract.consumer_wallet, &contract.provider_wallet) {
+            return Err(EscrowError::SelfDeal);
+        }
         let record = EscrowRecord {
             escrow_id: contract.contract_id.clone(),
             contract_id: contract.contract_id.clone(),
@@ -152,6 +165,7 @@ impl EscrowLedger {
             network: None,
             created_at: now,
             updated_at: now,
+            sim: contract.sim,
         };
         self.records
             .insert(contract.contract_id.clone(), record.clone());
@@ -374,6 +388,28 @@ mod tests {
             back.get_escrow(&c.contract_id).unwrap().network.as_deref(),
             Some("multiversx-testnet")
         );
+    }
+
+    #[test]
+    fn self_deal_contract_never_backs_escrow() {
+        let mut ledger = EscrowLedger::default();
+        // Bypass propose (legacy/direct construction) with consumer==provider.
+        let mut c = make_contract();
+        c.consumer_wallet = provider();
+        c.provider_wallet = provider();
+        let err = ledger.create_escrow(&c, 300).unwrap_err();
+        assert!(matches!(err, EscrowError::SelfDeal));
+        assert!(err.to_string().contains("self_deal_forbidden"));
+        assert!(ledger.records.is_empty(), "nothing recorded");
+    }
+
+    #[test]
+    fn sim_inherited_from_contract() {
+        let mut ledger = EscrowLedger::default();
+        let mut c = make_contract();
+        c.sim = true;
+        let r = ledger.create_escrow(&c, 300).unwrap();
+        assert!(r.sim);
     }
 
     #[test]

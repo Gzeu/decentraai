@@ -35,7 +35,23 @@ pub struct ModelContribution {
     pub executions: u64,
     pub tokens: u64,
     pub credits: u64,
+    /// Requested-model ids (verbatim) attributed to this served model.
+    /// Bounded: at most 8 named ids, overflow folds into "other", so the
+    /// map can never grow without bound. The honest asked==got entry is
+    /// included, so Σ requested == executions for rows born after this
+    /// tracking landed (legacy rows predate it — see `record_execution`).
+    #[serde(default)]
+    pub requested: BTreeMap<String, u64>,
+    /// Executions whose requested id differs from the served model.
+    /// Always derivable as Σ requested − requested[served]; published
+    /// explicitly so readers never have to derive it.
+    #[serde(default)]
+    pub routed: u64,
 }
+
+/// Max distinct requested ids kept per served model; overflow folds into
+/// the "other" bucket (counts preserved, keys bounded).
+pub const MAX_REQUESTED_IDS: usize = 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerContribution {
@@ -80,7 +96,7 @@ impl NodeContributionState {
             *self.by_resource.entry("gpu_time".to_string()).or_default() += d.value;
         }
 
-        // by_model
+        // by_model (+ reqserv requested/routed, nested in the row).
         if let Some(model) = &rc.model {
             let mc = self
                 .by_model
@@ -94,6 +110,23 @@ impl NodeContributionState {
                 mc.tokens = mc.tokens.saturating_add(d.value as u64);
             }
             mc.credits = mc.credits.saturating_add(credits);
+            // reqserv: attribute the requested id verbatim. Unknown
+            // requested falls back to asked==got (the only honest default
+            // when the caller never saw a request id — e.g. legacy paths).
+            // Every execution adds exactly one, so Σ requested == executions
+            // for rows born after this tracking landed.
+            let asked = rc
+                .requested_model
+                .clone()
+                .unwrap_or_else(|| model.clone());
+            if asked != *model {
+                mc.routed += 1;
+            }
+            if mc.requested.contains_key(&asked) || mc.requested.len() < MAX_REQUESTED_IDS {
+                *mc.requested.entry(asked).or_default() += 1;
+            } else {
+                *mc.requested.entry("other".to_string()).or_default() += 1;
+            }
         }
 
         // by_worker
@@ -171,6 +204,36 @@ mod tests {
         assert_eq!(trc.executions, 2);
         assert_eq!(trc.credits, 75);
         assert_eq!(trc.range, today);
+    }
+
+    #[test]
+    fn requested_routed_tracks_verbatim_and_stays_bounded() {
+        let mut state = NodeContributionState::default();
+        let req = |asked: &str| {
+            ResourceContributionBuilder::new("e", "peer-a")
+                .capability("inference")
+                .model("served.gguf")
+                .requested_model(asked)
+                .success(true)
+                .dimension(ResourceDimension::new("tokens_processed", 1.0, "tokens"))
+                .build()
+        };
+        // asked == got: no routing.
+        state.record_execution(&req("served.gguf"), 10);
+        // asked != got: routed.
+        state.record_execution(&req("other.gguf"), 10);
+        // Overflow: 10 distinct ids against a cap of 8 named.
+        for i in 0..10 {
+            state.record_execution(&req(&format!("m-{i}")), 1);
+        }
+        let mc = state.by_model.get("served.gguf").unwrap();
+        assert_eq!(mc.executions, 12);
+        let sum: u64 = mc.requested.values().sum();
+        assert_eq!(sum, 12, "every execution lands exactly once in requested");
+        assert_eq!(mc.requested.get("served.gguf"), Some(&1));
+        assert_eq!(mc.requested.get("other.gguf"), Some(&1));
+        assert!(mc.requested.len() <= super::MAX_REQUESTED_IDS + 1);
+        assert_eq!(mc.routed, 11);
     }
 
     #[test]

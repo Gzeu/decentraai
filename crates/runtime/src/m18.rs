@@ -305,6 +305,10 @@ pub struct ProposeContractRequest {
     pub max_duration_secs: u64,
     pub min_quality_percent: u8,
     pub escrow_required: bool,
+    /// Simulation flag (default false): settles normally but excluded
+    /// from compensation and trust totals.
+    #[serde(default)]
+    pub sim: bool,
 }
 
 pub async fn contract_propose_handler(
@@ -336,13 +340,25 @@ pub async fn contract_propose_handler(
         terms,
         now,
     ) {
-        Ok(c) => {
+        Ok(mut c) => {
+            c.sim = req.sim;
             m18.contracts
                 .lock()
                 .unwrap()
                 .insert(c.contract_id.clone(), c.clone());
             let _ = m18.save_contracts();
             json_response(&c)
+        }
+        // sybil: stable §1.4 error shape for the self-deal refusal; all
+        // other creation errors keep the legacy flat shape.
+        Err(contract::ContractError::SameParty) => {
+            let body = serde_json::json!({"error": {"message": contract::ContractError::SameParty.to_string(), "type": "invalid_request"}});
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response()
         }
         Err(e) => error_response(e.to_string()),
     }

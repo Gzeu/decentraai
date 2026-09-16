@@ -5977,6 +5977,28 @@ fn summarize_tool_latencies(
     map
 }
 
+/// sybil: true when a trust anchor is linked to a `sim` contract and must
+/// be excluded from trust totals (list/score). Anchors without contract
+/// linkage, or linked to non-sim/missing contracts, always count. The
+/// anchor itself stays stored (audit trail); only the totals exclude it.
+fn anchor_is_sim_linked(
+    contracts: &std::collections::BTreeMap<String, decentraai_economy::contract::AgentContract>,
+    anchor: &decentraai_economy::trust_anchor::TrustAnchor,
+) -> bool {
+    anchor
+        .contract_id
+        .as_deref()
+        .and_then(|id| contracts.get(id))
+        .is_some_and(|c| c.sim)
+}
+
+/// §1.4 error contract for policy refusals: a stable machine-readable
+/// shape `{error: {message, type: "invalid_request"}}`. Only NEW refusals
+/// (sybil guards) use it; every legacy error surface stays byte-identical.
+fn invalid_request(msg: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({"error": {"message": msg.into(), "type": "invalid_request"}})
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -6371,6 +6393,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                             "executions": mc.executions,
                             "tokens": mc.tokens,
                             "credits": mc.credits,
+                            "requested": mc.requested,
+                            "routed": mc.routed,
                         })
                     })
                     .collect();
@@ -6727,6 +6751,9 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 crate::hub::save_hub_state(&path, &hub);
                 serde_json::to_value(&bid).unwrap_or(serde_json::json!({}))
             }
+            Err(decentraai_agent_hub::HubError::SelfBid) => {
+                invalid_request(decentraai_agent_hub::HubError::SelfBid.to_string())
+            }
             Err(e) => serde_json::json!({"error": e.to_string()}),
         };
         ctx.hub_action = res;
@@ -6891,6 +6918,19 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 }
             },
         };
+        // sybil: refusing to award the issuer their own bid happens BEFORE
+        // anything mutates (no execution, no credit, no events). The no-bid
+        // issuer fallback below is untouched (no bid exists there).
+        if hub.self_bid_award(&task_id) {
+            ctx.hub_action = invalid_request(
+                "self_bid_forbidden: task issuer cannot be awarded their own bid",
+            );
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&ctx.hub_action).unwrap_or_default(),
+            )
+                .into_response();
+        }
         hub.mark_executing(&task_id);
         let team_members: Vec<(String, u8)> = hub
             .teams
@@ -8165,6 +8205,10 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         .get("escrow_required")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // sybil: simulation flag (default false). sim contracts
+                    // settle normally but are excluded from compensation
+                    // and trust totals (read-side exclusion).
+                    let sim = args.get("sim").and_then(|v| v.as_bool()).unwrap_or(false);
                     let service = econ_contract::ServiceDescriptor {
                         capability: capability.to_string(),
                         description: description.to_string(),
@@ -8178,13 +8222,17 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         escrow_required: escrow_req,
                     };
                     match econ_contract::propose_contract(provider, consumer, service, terms, now) {
-                        Ok(c) => {
+                        Ok(mut c) => {
+                            c.sim = sim;
                             m18.contracts
                                 .lock()
                                 .unwrap()
                                 .insert(c.contract_id.clone(), c.clone());
                             let _ = m18.save_contracts();
                             serde_json::to_value(&c).unwrap_or(serde_json::json!({}))
+                        }
+                        Err(econ_contract::ContractError::SameParty) => {
+                            invalid_request(econ_contract::ContractError::SameParty.to_string())
                         }
                         Err(e) => serde_json::json!({"error": e.to_string()}),
                     }
@@ -8311,6 +8359,11 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                                     let _ = m18.save_escrow();
                                     serde_json::to_value(&r).unwrap()
                                 }
+                                Err(decentraai_economy::escrow::EscrowError::SelfDeal) => {
+                                    invalid_request(
+                                        decentraai_economy::escrow::EscrowError::SelfDeal.to_string(),
+                                    )
+                                }
                                 Err(e) => serde_json::json!({"error": e.to_string()}),
                             }
                         }
@@ -8343,7 +8396,9 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                                 // BUG 4 FIX: credit the provider's compensation
                                 // ledger so `get_compensation` reports real
                                 // earnings from settled escrows.
-                                if settled_amt > 0 {
+                                // sybil: sim escrows settle normally but earn
+                                // no compensation (excluded, not deleted).
+                                if settled_amt > 0 && !r.sim {
                                     if let Some(cm) = &state.compute {
                                         use decentraai_compute::ContributionProfile;
                                         let profile = ContributionProfile {
@@ -8436,10 +8491,21 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                 }
                 "m18_trust_score" => {
                     let wallet = args.get("wallet").and_then(|v| v.as_str()).unwrap_or("");
+                    let contracts = m18.contracts.lock().unwrap();
                     let trust = m18.trust.lock().unwrap();
-                    let score = trust.trust_score(wallet);
-                    let anchors = trust.anchors_for_wallet(wallet);
-                    serde_json::json!({"wallet": wallet, "score": score, "anchor_count": anchors.len(), "verified_count": anchors.iter().filter(|a| a.verified).count()})
+                    // sybil: score counts only non-sim anchors.
+                    let anchors: Vec<_> = trust
+                        .anchors_for_wallet(wallet)
+                        .into_iter()
+                        .filter(|a| !anchor_is_sim_linked(&contracts, a))
+                        .collect();
+                    let verified = anchors.iter().filter(|a| a.verified).count();
+                    let score = if anchors.is_empty() {
+                        0.0
+                    } else {
+                        verified as f64 / anchors.len() as f64
+                    };
+                    serde_json::json!({"wallet": wallet, "score": score, "anchor_count": anchors.len(), "verified_count": verified})
                 }
                 "m18_update_needs" => {
                     let needs: Vec<String> = args
@@ -9441,6 +9507,9 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 crate::hub::save_hub_state(&path, &hub);
                 serde_json::to_value(&bid).unwrap_or(serde_json::json!({}))
             }
+            Err(decentraai_agent_hub::HubError::SelfBid) => {
+                invalid_request(decentraai_agent_hub::HubError::SelfBid.to_string())
+            }
             Err(e) => serde_json::json!({"error": e.to_string()}),
         };
         let id = serde_json::from_str::<serde_json::Value>(&raw)
@@ -9652,6 +9721,23 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 }
             },
         };
+        // sybil: refusing to award the issuer their own bid happens BEFORE
+        // anything mutates. The no-bid issuer fallback below is untouched.
+        // (This branch answers in the path's own JSON-RPC error envelope,
+        // whose schema has no `type` slot — the stable `self_bid_forbidden`
+        // message token is what clients key off.)
+        if hub.self_bid_award(&task_id) {
+            let id = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let body = serde_json::json!({"jsonrpc":"2.0","id": id, "error": {"code": -32000, "message": "self_bid_forbidden: task issuer cannot be awarded their own bid"}});
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+                .into_response();
+        }
         hub.mark_executing(&task_id);
         let team_members: Vec<(String, u8)> = hub
             .teams
@@ -11053,6 +11139,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             "executions": mc.executions,
                             "tokens": mc.tokens,
                             "credits": mc.credits,
+                            "requested": mc.requested,
+                            "routed": mc.routed,
                         })
                     })
                     .collect();
@@ -11421,9 +11509,12 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         },
         m18_trust: {
             if let Some(ref m18) = state.m18 {
+                let contracts = m18.contracts.lock().unwrap();
                 let trust = m18.trust.lock().unwrap();
+                // sybil: sim-linked anchors are excluded from the list
+                // (they stay stored — audit trail intact).
                 let list: Vec<&decentraai_economy::trust_anchor::TrustAnchor> =
-                    trust.anchors.values().collect();
+                    trust.anchors.values().filter(|a| !anchor_is_sim_linked(&contracts, a)).collect();
                 serde_json::to_value(&list).unwrap_or(serde_json::json!([]))
             } else {
                 serde_json::json!([])
@@ -17521,12 +17612,15 @@ fn stream_inference(
                 if let Some(cm) = &state.compute {
                     let req_id = format!("chat-stream-{}", uuid::Uuid::new_v4());
                     let local_peer = cm.local_peer();
+                    // Streaming: served model unknown at drain time, so no
+                    // by_model row is minted (never attribute to a guess).
                     cm.record_credited_contribution_with_model(
                         &local_peer,
                         &req_id,
                         true,
                         Some(completion as u32),
                         Some(started.elapsed().as_millis() as u32),
+                        None,
                         None,
                     );
                 }
@@ -18252,7 +18346,10 @@ async fn proxy_with_auth(
                     let model_name = generated["model"]
                         .as_str()
                         .map(String::from)
-                        .or(requested_model);
+                        .or_else(|| requested_model.clone());
+                    // reqserv: the requested id verbatim (before any
+                    // normalization); attribution falls back to asked==got
+                    // when the request carried no model id.
                     cm.record_credited_contribution_with_model(
                         &local_peer,
                         &req_id,
@@ -18260,6 +18357,7 @@ async fn proxy_with_auth(
                         Some(total_tokens as u32),
                         Some(started.elapsed().as_millis() as u32),
                         model_name,
+                        requested_model,
                     );
                 }
                 // Q2: settle the consumer reservation against real measured
@@ -18838,6 +18936,31 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sim_linked_anchors_excluded_from_trust_totals() {
+        use decentraai_economy::contract::AgentContract;
+        use decentraai_economy::trust_anchor::TrustAnchor;
+        let anchor = |contract_id: Option<&str>| TrustAnchor {
+            anchor_id: "ta-1".to_string(),
+            agent_wallet: "w".to_string(),
+            evidence_hash: "ev".to_string(),
+            capability: "chat".to_string(),
+            quality_score: 90,
+            verified: true,
+            micro_cu: 100,
+            previous_anchor_hash: None,
+            anchor_hash: "h".to_string(),
+            created_at: 1,
+            contract_id: contract_id.map(str::to_string),
+        };
+        let contracts: std::collections::BTreeMap<String, AgentContract> =
+            std::collections::BTreeMap::new();
+        // No linkage: always counts.
+        assert!(!anchor_is_sim_linked(&contracts, &anchor(None)));
+        // Linked to missing contract: counts (cannot prove sim).
+        assert!(!anchor_is_sim_linked(&contracts, &anchor(Some("ct-x"))));
+    }
 
     #[test]
     fn tool_latency_summary_carries_avg_and_skips_empty() {
