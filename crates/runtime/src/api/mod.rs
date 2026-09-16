@@ -6188,29 +6188,65 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         })
                     })
                     .collect();
+                let tool_latencies_summary: std::collections::BTreeMap<String, serde_json::Value> = {
+                    let lats = state.tool_latencies.lock().unwrap();
+                    let mut map = std::collections::BTreeMap::new();
+                    for (tool, times) in lats.iter() {
+                        if times.is_empty() {
+                            continue;
+                        }
+                        let mut sorted = times.clone();
+                        sorted.sort_unstable();
+                        let n = sorted.len();
+                        let p50 = sorted[n / 2];
+                        let p95 = sorted[(n * 95) / 100];
+                        let max = *sorted.last().unwrap_or(&0);
+                        map.insert(tool.clone(), serde_json::json!({
+                            "p50_ms": p50,
+                            "p95_ms": p95,
+                            "max_ms": max,
+                            "n": n,
+                        }));
+                    }
+                    map
+                };
+                let as_of = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 serde_json::json!({
                     "verified_executions": cs.verified_executions,
                     "failed_executions": cs.failed_executions,
                     "total_credits_earned": cs.total_credits_earned,
                     "total_credits_consumed": cs.total_credits_consumed,
                     "balance": cs.balance,
+                    "ledger_version": cs.ledger_version,
+                    "as_of": as_of,
                     "by_model": by_model,
                     "by_worker": by_worker,
                     "by_time_range": by_time_range,
                     "quota_accounts": quota_accounts,
+                    "tool_latencies": tool_latencies_summary,
                 })
             }
             None => {
+                let as_of = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 serde_json::json!({
                     "verified_executions": 0,
                     "failed_executions": 0,
                     "total_credits_earned": 0,
                     "total_credits_consumed": 0,
                     "balance": 0,
+                    "ledger_version": 0,
+                    "as_of": as_of,
                     "by_model": [],
                     "by_worker": [],
                     "by_time_range": [],
                     "quota_accounts": [],
+                    "tool_latencies": {},
                 })
             }
         };
