@@ -21,6 +21,8 @@ pub struct NodeContributionState {
     pub total_credits_earned: u64,
     pub total_credits_consumed: u64,
     pub balance: u64,
+    #[serde(default)]
+    pub ledger_version: u64,
     pub by_resource: BTreeMap<String, f64>,
     pub by_model: BTreeMap<String, ModelContribution>,
     pub by_worker: BTreeMap<String, WorkerContribution>,
@@ -52,6 +54,7 @@ pub struct TimeRangeContribution {
 
 impl NodeContributionState {
     pub fn record_execution(&mut self, rc: &ResourceContribution, credits: u64) {
+        self.ledger_version = self.ledger_version.saturating_add(1);
         if rc.success {
             self.verified_executions += 1;
         } else {

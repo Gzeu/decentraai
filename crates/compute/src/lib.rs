@@ -44,6 +44,7 @@ pub mod compensation;
 pub mod contribution;
 pub mod contribution_state;
 pub mod credits;
+pub mod demand;
 pub mod fabric_graph;
 pub mod loadbalance;
 pub mod matcher;
@@ -73,6 +74,7 @@ pub use credits::{
     CreditAccount, CreditCalculation, CreditEvent, CreditLedger, CreditLedgerSnapshot,
     CreditPolicy, CreditPolicyDimension, ResourceSummary,
 };
+pub use demand::{DemandStore, DemandSignal, DemandStatus, DemandSummary};
 pub use fabric_graph::{
     AdvertisedCapabilities, CapabilityGraph, ComputeGraph, FabricGraph, FabricNode, LinkFacts,
 };

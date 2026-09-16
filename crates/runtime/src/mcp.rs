@@ -130,6 +130,8 @@ pub struct McpContext {
     pub orchestrate_status_result: Value,
     /// §2.6 Revenue: node contribution + quota summary (read-only).
     pub revenue: Value,
+    /// §1 External demand signal: result of last demand operation.
+    pub demand_result: Value,
 }
 
 /// A single MCP tool definition (name + description + JSON-Schema input).
@@ -234,6 +236,8 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         "arena_state" | "arena_act" => &["arena"],
         // Revenue/economy scope
         "get_revenue" => &["economy"],
+        // Demand signal tools — available to all authenticated users
+        "announce_demand" | "list_demands" | "cancel_demand" => &[],
         // Orchestrate scope
         "orchestrate_propose" | "orchestrate_status" => &["orchestrate"],
         // Economy scope
@@ -289,6 +293,53 @@ pub fn all_tools() -> Vec<ToolDef> {
             description: "Node revenue summary (§2.6): verified executions, credits earned/consumed, balance, per-model and per-worker breakdowns, quota accounts. Read-only; every figure is real measured work — never fabricated.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
+        },
+        // §1 External demand signal tools
+        ToolDef {
+            name: "announce_demand",
+            description: "Announce a compute demand signal: this node needs a specific capability with resource requirements. Other nodes/coordinators can read these to understand network demand and offer resources proactively.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capability": { "type": "string", "description": "Capability needed (snake_case, e.g. 'inference', 'ocr', 'embeddings')" },
+                    "cpu_cores": { "type": "integer", "description": "CPU cores needed (0 = any)", "default": 0 },
+                    "ram_mb": { "type": "integer", "description": "RAM needed in MB (0 = any)", "default": 0 },
+                    "vram_mb": { "type": "integer", "description": "VRAM needed in MB (0 = CPU-only)", "default": 0 },
+                    "duration_secs": { "type": "integer", "description": "Estimated duration in seconds (0 = unknown)", "default": 0 },
+                    "max_price_per_unit": { "type": "integer", "description": "Max price per unit willing to pay (0 = free/any)", "default": 0 },
+                    "model_hash": { "type": "string", "description": "Specific model hash needed (empty = any)", "default": "" },
+                    "ttl_secs": { "type": "integer", "description": "Time-to-live in seconds (0 = never expires)", "default": 0 },
+                    "reason": { "type": "string", "description": "Free-text reason for operator visibility", "default": "" }
+                },
+                "required": ["capability"],
+                "additionalProperties": false
+            }),
+            annotations: ToolAnnotations::additive(),
+        },
+        ToolDef {
+            name: "list_demands",
+            description: "List active demand signals on this node. Shows what compute is needed, resource requirements, status, and age. Read-only.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "description": "Filter by status: 'pending', 'fulfilled', 'cancelled', 'expired', or empty for all", "default": "" }
+                },
+                "additionalProperties": false
+            }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "cancel_demand",
+            description: "Cancel a pending demand signal. Only pending demands can be cancelled.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "demand_id": { "type": "string", "description": "The demand signal id to cancel (e.g. 'dem-...')" }
+                },
+                "required": ["demand_id"],
+                "additionalProperties": false
+            }),
+            annotations: ToolAnnotations::destructive(),
         },
         ToolDef {
             name: "list_peers",
@@ -1533,6 +1584,60 @@ pub fn revenue_request(raw: &str) -> bool {
         == Some("get_revenue")
 }
 
+/// §1 Demand signal parsers
+pub fn announce_demand_request(raw: &str) -> Option<Value> {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return None;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg.get("params")?.get("name")?.as_str()?;
+    if name != "announce_demand" {
+        return None;
+    }
+    msg.get("params").and_then(|p| p.get("arguments")).cloned()
+}
+
+pub fn list_demands_request(raw: &str) -> Option<String> {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return None;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg.get("params")?.get("name")?.as_str()?;
+    if name != "list_demands" {
+        return None;
+    }
+    let status = msg
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|a| a.get("status"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(status)
+}
+
+pub fn cancel_demand_request(raw: &str) -> Option<String> {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return None;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg.get("params")?.get("name")?.as_str()?;
+    if name != "cancel_demand" {
+        return None;
+    }
+    msg.get("params")?
+        .get("arguments")?
+        .get("demand_id")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Whether the incoming message is a `list_consumer_keys` tool call. Pure —
 /// lets the HTTP layer precompute the consumer-key metadata snapshot into
 /// [`McpContext::consumer_keys`].
@@ -2617,6 +2722,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "get_quota" => &ctx.quota,
         "get_compensation" => &ctx.compensation,
         "get_revenue" => &ctx.revenue,
+        // §1 Demand tools
+        "announce_demand" | "list_demands" | "cancel_demand" => &ctx.demand_result,
         "list_consumer_keys" => &ctx.consumer_keys,
         "arena_state" => &ctx.arena_state,
         "arena_act" => &ctx.arena_action,
@@ -2738,6 +2845,7 @@ mod tests {
             orchestrate_propose_result: json!({}),
             orchestrate_status_result: json!({}),
             revenue: json!({}),
+            demand_result: json!({}),
         }
     }
 
@@ -3788,5 +3896,28 @@ mod tests {
         let t = tools.iter().find(|t| t["name"] == "get_revenue").unwrap();
         assert!(t["description"].as_str().unwrap().contains("revenue"));
         assert_eq!(t["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
+    fn demand_request_parsers() {
+        let ann = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"announce_demand","arguments":{"capability":"inference","cpu_cores":2}}}"#;
+        assert!(announce_demand_request(ann).is_some());
+        assert_eq!(announce_demand_request(ann).unwrap()["capability"], "inference");
+
+        let lst = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_demands","arguments":{"status":"pending"}}}"#;
+        assert_eq!(list_demands_request(lst), Some("pending".to_string()));
+
+        let cnl = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cancel_demand","arguments":{"demand_id":"dem-12345"}}}"#;
+        assert_eq!(cancel_demand_request(cnl), Some("dem-12345".to_string()));
+    }
+
+    #[test]
+    fn tools_list_exposes_demand_tools() {
+        let r = call(r#"{"jsonrpc":"2.0","id":10,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        for name in &["announce_demand", "list_demands", "cancel_demand"] {
+            let t = tools.iter().find(|t| t["name"] == *name);
+            assert!(t.is_some(), "tool {} must be in tools/list", name);
+        }
     }
 }

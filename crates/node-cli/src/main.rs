@@ -3359,6 +3359,13 @@ async fn node_start(args: NodeArgs) -> Result<()> {
             state.attach_m18(m18);
             tracing::info!("M18 economic layer loaded");
         }
+        // §1 External demand signal: local demand store
+        {
+            let demand_store = std::sync::Arc::new(std::sync::Mutex::new(
+                decentraai_compute::DemandStore::open(&data_dir.join("db")),
+            ));
+            state.attach_demand_store(demand_store);
+        }
         // DCAI ecosystem asset identifier slot: None = shadow mode (Cr-only).
         // See docs/DCAI_MECHANICS.md — set token_identifier only after on-chain
         // token creation; the same code paths denominate from here.
@@ -4388,6 +4395,13 @@ async fn serve_common(
     {
         let m18 = std::sync::Arc::new(decentraai_runtime::m18::M18State::load(&data_dir));
         state.attach_m18(m18);
+    }
+    // §1 External demand signal: local demand store
+    {
+        let demand_store = std::sync::Arc::new(std::sync::Mutex::new(
+            decentraai_compute::DemandStore::open(&data_dir.join("db")),
+        ));
+        state.attach_demand_store(demand_store);
     }
     // DCAI ecosystem asset projection (None = shadow mode, Cr-only economy)
     state.attach_dcai(config.dcai.clone());

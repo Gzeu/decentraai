@@ -392,9 +392,13 @@ pub struct ApiState {
     /// restarts via db/model_intel.json; shared with the intel/route/
     /// governance handlers.
     model_intel: Option<Arc<std::sync::RwLock<decentraai_hub::model_intel::ModelIntelRegistry>>>,
+    /// Server-side MCP tool execution latencies: tool_name -> list of durations in ms.
+    pub(crate) tool_latencies: Arc<StdMutex<HashMap<String, Vec<u64>>>>,
     /// Path for the persisted registry (set at attach time).
     model_intel_path: Option<PathBuf>,
     talent_tree: Option<Arc<decentraai_agents::TalentTree>>,
+    /// §1 External demand signal: local demand store (capability needs announced by this node).
+    pub(crate) demand_store: Option<Arc<StdMutex<decentraai_compute::DemandStore>>>,
     /// Provider control plane (Model Fabric): external OpenAI-compatible
     /// provider registry + connected models + credential store. `None` when
     /// the node does not run the provider manager (plain serve).
@@ -516,9 +520,11 @@ impl ApiState {
             memory_bridge: None,
             bridge_sync: false,
             research_trigger: None,
+            tool_latencies: Arc::new(StdMutex::new(HashMap::new())),
             model_intel: None,
             model_intel_path: None,
             talent_tree: None,
+            demand_store: None,
             providers: None,
             tts: Arc::new(TtsManager::disabled()),
             ocr: Arc::new(crate::tools::OcrManager::disabled()),
@@ -928,6 +934,21 @@ impl ApiState {
     /// M18 — MultiversX Trust & Economic Layer: contracts, escrow, trust anchors.
     pub fn attach_m18(&mut self, m18: Arc<crate::m18::M18State>) {
         self.m18 = Some(m18);
+    }
+
+    /// §1 External demand signal: attach the local demand store.
+    pub fn attach_demand_store(&mut self, store: Arc<StdMutex<decentraai_compute::DemandStore>>) {
+        self.demand_store = Some(store);
+    }
+
+    /// Record server-side MCP tool execution latency.
+    pub fn record_tool_latency(&self, tool_name: &str, duration_ms: u64) {
+        let mut lats = self.tool_latencies.lock().unwrap();
+        let entry = lats.entry(tool_name.to_string()).or_default();
+        entry.push(duration_ms);
+        if entry.len() > 1000 {
+            entry.remove(0);
+        }
     }
 
     /// M15 Research Pressure Trigger: attach the validated runtime config.
@@ -5747,7 +5768,27 @@ fn mcp_wallet_mutation_request(raw: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn extract_tool_name(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if v.get("method")?.as_str()? == "tools/call" {
+        v.get("params")?.get("name")?.as_str().map(String::from)
+    } else {
+        v.get("method").and_then(|m| m.as_str()).map(String::from)
+    }
+}
+
 async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+    let raw = String::from_utf8_lossy(&body);
+    let tool_name = extract_tool_name(&raw);
+    let started = Instant::now();
+    let resp = mcp_handler_inner(State(state.clone()), headers, body).await;
+    if let Some(name) = tool_name {
+        state.record_tool_latency(&name, started.elapsed().as_millis() as u64);
+    }
+    resp
+}
+
+async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = match state.classify(&headers) {
         Ok(a) => a,
         Err(e) => return e.into_response(),
@@ -6173,6 +6214,102 @@ async fn mcp_handler(State(state): State<ApiState>, headers: HeaderMap, body: By
                 })
             }
         };
+    }
+    // §1 External demand signal: announce/list/cancel demand signals.
+    if let Some(args) = crate::mcp::announce_demand_request(&raw) {
+        if let Some(ref ds) = state.demand_store {
+            let capability = args
+                .get("capability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general")
+                .to_string();
+            let cpu_cores = args.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let ram_mb = args.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+            let vram_mb = args.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+            let duration_secs = args.get("duration_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max_price = args.get("max_price_per_unit").and_then(|v| v.as_u64()).unwrap_or(0);
+            let model_hash = args
+                .get("model_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ttl = args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut store = ds.lock().unwrap();
+            match store.announce(
+                capability, cpu_cores, ram_mb, vram_mb, duration_secs, max_price, model_hash,
+                ttl, reason,
+            ) {
+                Ok(id) => {
+                    ctx.demand_result = serde_json::json!({
+                        "success": true, "demand_id": id,
+                        "message": "demand signal announced"
+                    });
+                }
+                Err(e) => {
+                    ctx.demand_result = serde_json::json!({
+                        "success": false, "error": e
+                    });
+                }
+            }
+        } else {
+            ctx.demand_result = serde_json::json!({
+                "success": false, "error": "demand store not available"
+            });
+        }
+    } else if let Some(status_filter) = crate::mcp::list_demands_request(&raw) {
+        if let Some(ref ds) = state.demand_store {
+            let mut store = ds.lock().unwrap();
+            store.prune_expired();
+            let filter = match status_filter.as_str() {
+                "pending" => Some(decentraai_compute::DemandStatus::Pending),
+                "fulfilled" => Some(decentraai_compute::DemandStatus::Fulfilled),
+                "cancelled" => Some(decentraai_compute::DemandStatus::Cancelled),
+                "expired" => Some(decentraai_compute::DemandStatus::Expired),
+                _ => None,
+            };
+            let demands: Vec<serde_json::Value> = store
+                .list(filter.as_ref())
+                .into_iter()
+                .map(|d| serde_json::to_value(d).unwrap_or_default())
+                .collect();
+            let summary = store.summary();
+            ctx.demand_result = serde_json::json!({
+                "demands": demands,
+                "count": demands.len(),
+                "summary": summary,
+            });
+        } else {
+            ctx.demand_result = serde_json::json!({
+                "demands": [], "count": 0,
+                "error": "demand store not available"
+            });
+        }
+    } else if let Some(demand_id) = crate::mcp::cancel_demand_request(&raw) {
+        if let Some(ref ds) = state.demand_store {
+            let mut store = ds.lock().unwrap();
+            match store.cancel(&demand_id) {
+                Ok(()) => {
+                    ctx.demand_result = serde_json::json!({
+                        "success": true, "demand_id": demand_id,
+                        "message": "demand signal cancelled"
+                    });
+                }
+                Err(e) => {
+                    ctx.demand_result = serde_json::json!({
+                        "success": false, "error": e
+                    });
+                }
+            }
+        } else {
+            ctx.demand_result = serde_json::json!({
+                "success": false, "error": "demand store not available"
+            });
+        }
     }
     // Arena act via MCP (M3): mutating, same validation/quota/LLM as HTTP
     if let Some(args) = crate::mcp::arena_act_request(&raw) {
@@ -8418,6 +8555,17 @@ fn orchestration_status_resp(state: &ApiState, plan_id: &str) -> Response {
 }
 
 async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
+    let raw = String::from_utf8_lossy(body);
+    let tool_name = extract_tool_name(&raw);
+    let started = Instant::now();
+    let resp = mcp_consumer_handler_inner(state, auth, body).await;
+    if let Some(name) = tool_name {
+        state.record_tool_latency(&name, started.elapsed().as_millis() as u64);
+    }
+    resp
+}
+
+async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) -> Response {
     let Auth::Consumer {
         key_id,
         account,
@@ -10652,26 +10800,161 @@ async fn mcp_consumer_handler(state: &ApiState, auth: &Auth, body: &[u8]) -> Res
                         })
                     })
                     .collect();
+                let tool_latencies_summary: std::collections::BTreeMap<String, serde_json::Value> = {
+                    let lats = state.tool_latencies.lock().unwrap();
+                    let mut map = std::collections::BTreeMap::new();
+                    for (tool, times) in lats.iter() {
+                        if times.is_empty() {
+                            continue;
+                        }
+                        let mut sorted = times.clone();
+                        sorted.sort_unstable();
+                        let n = sorted.len();
+                        let p50 = sorted[n / 2];
+                        let p95 = sorted[(n * 95) / 100];
+                        let max = *sorted.last().unwrap_or(&0);
+                        map.insert(tool.clone(), serde_json::json!({
+                            "p50_ms": p50,
+                            "p95_ms": p95,
+                            "max_ms": max,
+                            "n": n,
+                        }));
+                    }
+                    map
+                };
+                let as_of = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 serde_json::json!({
                     "verified_executions": cs.verified_executions,
                     "failed_executions": cs.failed_executions,
                     "total_credits_earned": cs.total_credits_earned,
                     "total_credits_consumed": cs.total_credits_consumed,
                     "balance": cs.balance,
+                    "ledger_version": cs.ledger_version,
+                    "as_of": as_of,
                     "by_model": by_model,
                     "by_worker": by_worker,
                     "quota_accounts": quota_accounts,
+                    "tool_latencies": tool_latencies_summary,
                 })
             }
             None => {
+                let as_of = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 serde_json::json!({
                     "verified_executions": 0, "failed_executions": 0,
                     "total_credits_earned": 0, "total_credits_consumed": 0,
-                    "balance": 0, "by_model": [], "by_worker": [],
-                    "quota_accounts": [],
+                    "balance": 0, "ledger_version": 0, "as_of": as_of,
+                    "by_model": [], "by_worker": [],
+                    "quota_accounts": [], "tool_latencies": {},
                 })
             }
         };
+    } else if crate::mcp::announce_demand_request(&raw).is_some()
+        || crate::mcp::list_demands_request(&raw).is_some()
+        || crate::mcp::cancel_demand_request(&raw).is_some()
+    {
+        // §1 Demand signals: consumers can announce/list/cancel demands.
+        // Reuses the same operator handler logic via shared state.
+        if let Some(args) = crate::mcp::announce_demand_request(&raw) {
+            if let Some(ref ds) = state.demand_store {
+                let capability = args
+                    .get("capability")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("general")
+                    .to_string();
+                let cpu_cores = args.get("cpu_cores").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                let ram_mb = args.get("ram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+                let vram_mb = args.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+                let duration_secs = args.get("duration_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let max_price = args.get("max_price_per_unit").and_then(|v| v.as_u64()).unwrap_or(0);
+                let model_hash = args
+                    .get("model_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ttl = args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut store = ds.lock().unwrap();
+                match store.announce(
+                    capability, cpu_cores, ram_mb, vram_mb, duration_secs, max_price, model_hash,
+                    ttl, reason,
+                ) {
+                    Ok(id) => {
+                        ctx.demand_result = serde_json::json!({
+                            "success": true, "demand_id": id,
+                            "message": "demand signal announced"
+                        });
+                    }
+                    Err(e) => {
+                        ctx.demand_result = serde_json::json!({
+                            "success": false, "error": e
+                        });
+                    }
+                }
+            } else {
+                ctx.demand_result = serde_json::json!({
+                    "success": false, "error": "demand store not available"
+                });
+            }
+        } else if let Some(status_filter) = crate::mcp::list_demands_request(&raw) {
+            if let Some(ref ds) = state.demand_store {
+                let mut store = ds.lock().unwrap();
+                store.prune_expired();
+                let filter = match status_filter.as_str() {
+                    "pending" => Some(decentraai_compute::DemandStatus::Pending),
+                    "fulfilled" => Some(decentraai_compute::DemandStatus::Fulfilled),
+                    "cancelled" => Some(decentraai_compute::DemandStatus::Cancelled),
+                    "expired" => Some(decentraai_compute::DemandStatus::Expired),
+                    _ => None,
+                };
+                let demands: Vec<serde_json::Value> = store
+                    .list(filter.as_ref())
+                    .into_iter()
+                    .map(|d| serde_json::to_value(d).unwrap_or_default())
+                    .collect();
+                let summary = store.summary();
+                ctx.demand_result = serde_json::json!({
+                    "demands": demands,
+                    "count": demands.len(),
+                    "summary": summary,
+                });
+            } else {
+                ctx.demand_result = serde_json::json!({
+                    "demands": [], "count": 0,
+                    "error": "demand store not available"
+                });
+            }
+        } else if let Some(demand_id) = crate::mcp::cancel_demand_request(&raw) {
+            if let Some(ref ds) = state.demand_store {
+                let mut store = ds.lock().unwrap();
+                match store.cancel(&demand_id) {
+                    Ok(()) => {
+                        ctx.demand_result = serde_json::json!({
+                            "success": true, "demand_id": demand_id,
+                            "message": "demand signal cancelled"
+                        });
+                    }
+                    Err(e) => {
+                        ctx.demand_result = serde_json::json!({
+                            "success": false, "error": e
+                        });
+                    }
+                }
+            } else {
+                ctx.demand_result = serde_json::json!({
+                    "success": false, "error": "demand store not available"
+                });
+            }
+        }
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
@@ -10880,6 +11163,8 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
         orchestrate_status_result: serde_json::json!({}),
         // §2.6 Revenue: empty until mcp_handler populates it.
         revenue: serde_json::json!({}),
+        // §1 Demand signals: empty until mcp_handler populates it.
+        demand_result: serde_json::json!({}),
     }
 }
 
@@ -16860,6 +17145,17 @@ fn stream_inference(
                     .tokens_generated
                     .fetch_add(completion, Ordering::SeqCst);
                 state.note_token_usage(&auth, completion);
+                if let Some(cm) = &state.compute {
+                    let req_id = format!("chat-stream-{}", uuid::Uuid::new_v4());
+                    let local_peer = cm.local_peer();
+                    cm.record_credited_contribution(
+                        &local_peer,
+                        &req_id,
+                        true,
+                        Some(completion as u32),
+                        Some(started.elapsed().as_millis() as u32),
+                    );
+                }
             }
             // Chat history (USER DATA): persist the turn once the full reply
             // is drained. Failures are silent by design — history never
@@ -17566,6 +17862,19 @@ async fn proxy_with_auth(
                     .as_u64()
                     .unwrap_or(0);
                 state.note_token_usage(&auth, completion);
+                if let Some(cm) = &state.compute {
+                    let prompt_tokens = generated["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+                    let total_tokens = prompt_tokens + completion;
+                    let req_id = format!("chat-{}", uuid::Uuid::new_v4());
+                    let local_peer = cm.local_peer();
+                    cm.record_credited_contribution(
+                        &local_peer,
+                        &req_id,
+                        true,
+                        Some(total_tokens as u32),
+                        Some(started.elapsed().as_millis() as u32),
+                    );
+                }
                 // Q2: settle the consumer reservation against real measured
                 // completion tokens; the unused reserved quota is released.
                 if let Some(guard) = consumer_quota.as_mut() {
