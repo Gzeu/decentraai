@@ -5768,6 +5768,116 @@ fn mcp_wallet_mutation_request(raw: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Builds one page of per-agent anchor history (anchhist) from the
+/// hash-chained trust-anchor store, joined to on-chain events by exact
+/// evidence match. Pure over snapshots: deterministic, read-only.
+///
+/// Ordering is per-agent chronological (created_at, anchor_id); seq is the
+/// 1-based position in that order. Cursor = last seen anchor_id ("" = first
+/// page); an unknown non-empty cursor yields an empty terminal page, never
+/// a silent restart. Missing data stays null: trust anchors carry no task
+/// ids (contract linkage only) and no ticks (writers mix epoch/tick units),
+/// and tx exists only when the same evidence appears in a confirmed world
+/// proof or a settled escrow.
+fn agent_anchor_history(
+    trust: &decentraai_economy::trust_anchor::TrustStore,
+    proofs: &[crate::world::OnChainProof],
+    escrow: &decentraai_economy::escrow::EscrowLedger,
+    agent_id: &str,
+    cursor: &str,
+    limit: usize,
+) -> serde_json::Value {
+    use crate::world::SettlementStatus;
+    use decentraai_economy::escrow::EscrowStatus;
+    let mut ordered: Vec<&decentraai_economy::trust_anchor::TrustAnchor> = trust
+        .anchors
+        .values()
+        .filter(|a| a.agent_wallet == agent_id)
+        .collect();
+    ordered.sort_by(|a, b| {
+        (a.created_at, &a.anchor_id).cmp(&(b.created_at, &b.anchor_id))
+    });
+    let start = if cursor.is_empty() {
+        0
+    } else {
+        match ordered.iter().position(|a| a.anchor_id == cursor) {
+            Some(pos) => pos + 1,
+            None => {
+                return serde_json::json!({
+                    "agent_id": agent_id,
+                    "entries": [],
+                    "next_cursor": "",
+                    "count": 0,
+                });
+            }
+        }
+    };
+    let mut entries = Vec::new();
+    let mut last_id = String::new();
+    for (idx, a) in ordered.iter().enumerate().skip(start).take(limit) {
+        let ev = if a.evidence_hash.is_empty() {
+            None
+        } else {
+            Some(a.evidence_hash.clone())
+        };
+        // On-chain join by exact evidence match: confirmed world proof
+        // first, settled escrow second. Empty evidence never matches.
+        let mut tx: Option<String> = None;
+        if let Some(ref e) = ev {
+            if tx.is_none() {
+                tx = proofs
+                    .iter()
+                    .find(|p| {
+                        p.status == SettlementStatus::Confirmed
+                            && !p.tx_hash.is_empty()
+                            && p.evidence_hash == *e
+                    })
+                    .map(|p| p.tx_hash.clone());
+            }
+            if tx.is_none() {
+                tx = escrow
+                    .records
+                    .values()
+                    .find(|r| {
+                        r.status == EscrowStatus::Settled
+                            && r.tx_hash.as_ref().is_some_and(|h| !h.is_empty())
+                            && r.evidence_hash.as_deref() == Some(e.as_str())
+                    })
+                    .and_then(|r| r.tx_hash.clone());
+            }
+        }
+        let on_chain_flag = ev
+            .as_ref()
+            .is_some_and(|e| trust.on_chain_anchored.contains(e));
+        let status = if tx.is_some() || on_chain_flag {
+            "anchored"
+        } else {
+            "open"
+        };
+        entries.push(serde_json::json!({
+            "seq": (idx + 1) as u64,
+            "task_id": a.contract_id,
+            "tick": serde_json::Value::Null,
+            "anchor_hash": a.anchor_hash,
+            "prev_hash": a.previous_anchor_hash,
+            "evidence_hash": ev,
+            "tx_hash": tx,
+            "status": status,
+            "ts": a.created_at,
+        }));
+        last_id = a.anchor_id.clone();
+    }
+    let exhausted = start + entries.len() >= ordered.len();
+    let next_cursor = if exhausted { String::new() } else { last_id };
+    let count = entries.len();
+    serde_json::json!({
+        "agent_id": agent_id,
+        "entries": entries,
+        "next_cursor": next_cursor,
+        "count": count,
+    })
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -6249,6 +6359,26 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                     "tool_latencies": {},
                 })
             }
+        };
+    }
+    // Per-agent anchor history (anchhist): read-only page over the
+    // hash-chained trust-anchor store, joined to on-chain events.
+    if let Some((agent_id, cursor, limit)) = crate::mcp::agent_anchors_request(&raw) {
+        ctx.agent_anchors = match &state.m18 {
+            Some(m18) => {
+                let world = state.world.lock().await;
+                let proofs = world.proofs.clone();
+                drop(world);
+                let trust = m18.trust.lock().unwrap();
+                let escrow = m18.escrow.lock().unwrap();
+                agent_anchor_history(&trust, &proofs, &escrow, &agent_id, &cursor, limit)
+            }
+            None => serde_json::json!({
+                "agent_id": agent_id,
+                "entries": [],
+                "next_cursor": "",
+                "count": 0,
+            }),
         };
     }
     // §1 External demand signal: announce/list/cancel demand signals.
@@ -9760,11 +9890,14 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             "discover_capabilities" => true, // always available for onboarding
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
-                            // M18 Economic Layer + §2.6 Revenue + escrow verdicts:
-                            // available with "economy" scope or "*"
+                            // M18 Economic Layer + §2.6 Revenue + escrow verdicts +
+                            // anchor coverage/history: available with "economy"
+                            // scope or "*"
                             name if name.starts_with("m18_")
                                 || name == "get_revenue"
-                                || name == "get_escrow_verdicts" =>
+                                || name == "get_escrow_verdicts"
+                                || name == "get_anchor_coverage"
+                                || name == "list_agent_anchors" =>
                             {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
@@ -10906,6 +11039,27 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                 })
             }
         };
+    } else if let Some((agent_id, cursor, limit)) = crate::mcp::agent_anchors_request(&raw) {
+        // Per-agent anchor history (anchhist) for consumer keys: economy scope.
+        if !scopes.iter().any(|s| s == "economy" || s == "*") {
+            return forbidden("consumer key missing economy scope");
+        }
+        ctx.agent_anchors = match &state.m18 {
+            Some(m18) => {
+                let world = state.world.lock().await;
+                let proofs = world.proofs.clone();
+                drop(world);
+                let trust = m18.trust.lock().unwrap();
+                let escrow = m18.escrow.lock().unwrap();
+                agent_anchor_history(&trust, &proofs, &escrow, &agent_id, &cursor, limit)
+            }
+            None => serde_json::json!({
+                "agent_id": agent_id,
+                "entries": [],
+                "next_cursor": "",
+                "count": 0,
+            }),
+        };
     } else if crate::mcp::announce_demand_request(&raw).is_some()
         || crate::mcp::list_demands_request(&raw).is_some()
         || crate::mcp::cancel_demand_request(&raw).is_some()
@@ -11010,7 +11164,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), get_anchor_coverage (economy scope), list_agent_anchors (economy scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -11201,6 +11355,44 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             }
         },
         m18_action: serde_json::json!({}),
+        // Anchor coverage (cov): totals over the node's on-chain settlement
+        // proofs. Units = settlement proofs, credits = proof amounts
+        // (micro-CU). Anchored = Confirmed status AND non-empty tx_hash;
+        // status alone never counts. Invariant: total = anchored +
+        // unanchored, on counts and credits. Empty world = honest zeros.
+        anchor_coverage: {
+            let world = state.world.lock().await;
+            let mut total = 0u64;
+            let mut anchored = 0u64;
+            let mut anchored_credits = 0u64;
+            let mut unanchored_credits = 0u64;
+            for p in world.proofs.iter() {
+                total += 1;
+                if p.status == crate::world::SettlementStatus::Confirmed
+                    && !p.tx_hash.is_empty()
+                {
+                    anchored += 1;
+                    anchored_credits = anchored_credits.saturating_add(p.amount);
+                } else {
+                    unanchored_credits = unanchored_credits.saturating_add(p.amount);
+                }
+            }
+            let as_of = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            serde_json::json!({
+                "total_executions": total,
+                "anchored_executions": anchored,
+                "unanchored_executions": total.saturating_sub(anchored),
+                "anchored_credits": anchored_credits,
+                "unanchored_credits": unanchored_credits,
+                "as_of": as_of,
+            })
+        },
+        // Per-agent anchors (anchhist): empty until the handler populates it
+        // per-request (needs agent_id/cursor/limit arguments).
+        agent_anchors: serde_json::json!({}),
         // Escrow verdicts (escrowv): per-escrow verdict snapshot, read-only.
         // Verdict derives from the record status (Settled→settled,
         // Refunded→refunded, anything else→open); settled_at/refunded_at

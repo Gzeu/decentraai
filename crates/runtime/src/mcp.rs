@@ -118,6 +118,10 @@ pub struct McpContext {
     pub m18_action: Value,
     /// Escrow verdicts snapshot (escrowv): per-escrow verdict objects.
     pub escrow_verdicts: Value,
+    /// Anchor coverage snapshot (cov): anchored vs unanchored settlements.
+    pub anchor_coverage: Value,
+    /// Per-agent anchor history page (anchhist).
+    pub agent_anchors: Value,
     /// M22 Diffusion: list of available models on this node.
     pub diffusion_models: Value,
     /// M22 Diffusion: result of last image generation operation via MCP.
@@ -237,7 +241,9 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         // Arena scope
         "arena_state" | "arena_act" => &["arena"],
         // Revenue/economy scope
-        "get_revenue" | "get_escrow_verdicts" => &["economy"],
+        "get_revenue" | "get_escrow_verdicts" | "get_anchor_coverage" | "list_agent_anchors" => {
+            &["economy"]
+        }
         // Demand signal tools — available to all authenticated users
         "announce_demand" | "list_demands" | "cancel_demand" => &[],
         // Orchestrate scope
@@ -300,6 +306,27 @@ pub fn all_tools() -> Vec<ToolDef> {
             name: "get_escrow_verdicts",
             description: "Per-escrow verdicts (escrowv): one verdict object per M18 escrow record — verdict (settled/refunded/open), settled_at/refunded_at (status-change timestamps, 0 when not applicable), evidence_hash/tx_hash (null when absent), amount_micro_cu. Read-only; settled_at/refunded_at reuse the record's last-change timestamp, no new clock is invented.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "get_anchor_coverage",
+            description: "Settlement anchoring coverage (cov): totals over the node's on-chain settlement proofs (units = settlement proofs, credits = proof amounts in micro-CU). Anchored = carries a confirmed on-chain MultiversX tx_hash (status Confirmed, non-empty tx); status alone never counts, empty/unknown tx means unanchored. Invariant: total = anchored + unanchored, on counts and credits. Read-only.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "list_agent_anchors",
+            description: "Per-agent anchor history (anchhist) from the hash-chained trust-anchor store. seq = 1-based position in per-agent chronological (created_at, anchor_id) order; task_id = linked contract id or null (trust anchors carry no task ids); tick = null by design (anchor writers mix epoch/tick units — never laundered); empty evidence_hash reads as null; tx_hash = on-chain tx joined by exact evidence match (confirmed world proof, else settled escrow) or null; status = anchored iff a tx was joined or the evidence is in the on-chain set, else open; ts = created_at. Cursor = last seen anchor_id (unknown cursor yields an empty terminal page, never a silent restart). Read-only.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent wallet/id whose anchor chain to read" },
+                    "cursor": { "type": "string", "description": "anchor_id of the last seen entry (empty = first page)", "default": "" },
+                    "limit": { "type": "integer", "description": "Max entries per page (1-200, default 50)", "default": 50 }
+                },
+                "required": ["agent_id"],
+                "additionalProperties": false
+            }),
             annotations: ToolAnnotations::read_only(),
         },
         // §1 External demand signal tools
@@ -1607,6 +1634,52 @@ pub fn escrow_verdicts_request(raw: &str) -> bool {
         == Some("get_escrow_verdicts")
 }
 
+/// Whether the incoming message is a `get_anchor_coverage` tool call. Pure.
+pub fn coverage_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_anchor_coverage")
+}
+
+/// Extracts a `list_agent_anchors` tool call. Returns (agent_id, cursor, limit).
+/// Limit is clamped to 1..=200 (default 50). Pure.
+pub fn agent_anchors_request(raw: &str) -> Option<(String, String, usize)> {
+    let msg: Value = serde_json::from_str(raw).ok()?;
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = msg
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if name != "list_agent_anchors" {
+        return None;
+    }
+    let args = msg.get("params").and_then(|p| p.get("arguments"))?;
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())?.to_string();
+    if agent_id.is_empty() {
+        return None;
+    }
+    let cursor = args
+        .get("cursor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    Some((agent_id, cursor, limit))
+}
+
 /// §1 Demand signal parsers
 pub fn announce_demand_request(raw: &str) -> Option<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(raw) else {
@@ -2797,6 +2870,10 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "m18_list_trust" => &ctx.m18_trust,
         // Escrow verdicts (escrowv): precomputed snapshot, both paths.
         "get_escrow_verdicts" => &ctx.escrow_verdicts,
+        // Anchor coverage (cov): precomputed snapshot, both paths.
+        "get_anchor_coverage" => &ctx.anchor_coverage,
+        // Per-agent anchors (anchhist): populated per-request (needs agent_id).
+        "list_agent_anchors" => &ctx.agent_anchors,
         "m18_record_trust" => &ctx.m18_action,
         "m18_verify_trust" => &ctx.m18_action,
         "m18_trust_score" => &ctx.m18_action,
@@ -2864,6 +2941,8 @@ mod tests {
             m18_trust: json!([]),
             m18_action: json!({}),
             escrow_verdicts: json!({}),
+            anchor_coverage: json!({}),
+            agent_anchors: json!({}),
             diffusion_models: json!({ "enabled": false, "healthy": false, "models": [] }),
             diffusion_action: json!({}),
             embeddings_result: json!({}),
@@ -3979,5 +4058,61 @@ mod tests {
         // Test ctx() has empty default; the dispatch returns it as-is.
         let content = r["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(content, "{}");
+    }
+
+    #[test]
+    fn coverage_request_matches_only_the_tool() {
+        assert!(coverage_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_anchor_coverage","arguments":{}}}"#
+        ));
+        assert!(!coverage_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!coverage_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_revenue","arguments":{}}}"#
+        ));
+    }
+
+    #[test]
+    fn agent_anchors_request_parses_args_and_clamps_limit() {
+        let full = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_agent_anchors","arguments":{"agent_id":"erd1abc","cursor":"ta-x","limit":500}}}"#;
+        assert_eq!(
+            agent_anchors_request(full),
+            Some(("erd1abc".to_string(), "ta-x".to_string(), 200))
+        );
+        let minimal = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agent_anchors","arguments":{"agent_id":"erd1abc"}}}"#;
+        assert_eq!(
+            agent_anchors_request(minimal),
+            Some(("erd1abc".to_string(), "".to_string(), 50))
+        );
+        let missing = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_agent_anchors","arguments":{}}}"#;
+        assert!(agent_anchors_request(missing).is_none());
+        let wrong = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_anchor_coverage","arguments":{}}}"#;
+        assert!(agent_anchors_request(wrong).is_none());
+    }
+
+    #[test]
+    fn tools_list_exposes_coverage_and_anchor_history() {
+        let r = call(r#"{"jsonrpc":"2.0","id":13,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        for name in &["get_anchor_coverage", "list_agent_anchors"] {
+            let t = tools.iter().find(|t| t["name"] == *name);
+            assert!(t.is_some(), "tool {} must be in tools/list", name);
+            let t = t.unwrap();
+            assert_eq!(t.get("requiredScopes").cloned(), Some(json!(["economy"])));
+            assert_eq!(t["annotations"]["readOnlyHint"], true);
+        }
+    }
+
+    #[test]
+    fn coverage_and_anchors_return_precomputed_snapshots() {
+        for name in &["get_anchor_coverage", "list_agent_anchors"] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{{"name":"{name}","arguments":{{"agent_id":"x"}}}}}}"#
+            );
+            let r = call(&msg);
+            let content = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(content, "{}");
+        }
     }
 }
