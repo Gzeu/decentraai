@@ -5772,8 +5772,8 @@ fn mcp_wallet_mutation_request(raw: &str) -> bool {
 /// hash-chained trust-anchor store, joined to on-chain events by exact
 /// evidence match. Pure over snapshots: deterministic, read-only.
 ///
-/// Ordering is per-agent chronological (created_at, anchor_id); seq is the
-/// 1-based position in that order. Cursor = last seen anchor_id ("" = first
+/// Ordering follows the hash linkage (genesis to tip); seq is the 1-based
+/// position in that order. Cursor = last seen anchor_id ("" = first
 /// page); an unknown non-empty cursor yields an empty terminal page, never
 /// a silent restart. Missing data stays null: trust anchors carry no task
 /// ids (contract linkage only) and no ticks (writers mix epoch/tick units),
@@ -5789,14 +5789,48 @@ fn agent_anchor_history(
 ) -> serde_json::Value {
     use crate::world::SettlementStatus;
     use decentraai_economy::escrow::EscrowStatus;
-    let mut ordered: Vec<&decentraai_economy::trust_anchor::TrustAnchor> = trust
+    let mine: Vec<&decentraai_economy::trust_anchor::TrustAnchor> = trust
         .anchors
         .values()
         .filter(|a| a.agent_wallet == agent_id)
         .collect();
-    ordered.sort_by(|a, b| {
-        (a.created_at, &a.anchor_id).cmp(&(b.created_at, &b.anchor_id))
-    });
+    // Order follows the hash linkage (genesis → tip), NOT wall-clock:
+    // writers can stamp equal or non-monotonic `created_at`, and a
+    // timestamp sort then scrambles prev_hash continuity (measured live:
+    // same-tick anchors broke the chain). Walk back from the chain tip
+    // and reverse. Anchors unreachable from the tip (orphans) trail
+    // sorted by (created_at, anchor_id) — visible, never silently dropped.
+    let by_hash: std::collections::BTreeMap<&str, &_> = mine
+        .iter()
+        .map(|a| (a.anchor_hash.as_str(), *a))
+        .collect();
+    let mut ordered: Vec<&decentraai_economy::trust_anchor::TrustAnchor> = Vec::new();
+    if let Some(tip) = trust.agent_chains.get(agent_id) {
+        let mut cur: Option<&str> = Some(tip.as_str());
+        let mut guard = 0usize;
+        while let Some(h) = cur {
+            guard += 1;
+            if guard > mine.len() + 1 {
+                break; // cycle-safe: never loop forever on corrupt data
+            }
+            match by_hash.get(h) {
+                Some(a) => {
+                    ordered.push(*a);
+                    cur = a.previous_anchor_hash.as_deref();
+                }
+                None => break, // tip points outside our view; stop honestly
+            }
+        }
+        ordered.reverse();
+    }
+    let in_chain: std::collections::BTreeSet<&str> =
+        ordered.iter().map(|a| a.anchor_id.as_str()).collect();
+    let mut orphans: Vec<&decentraai_economy::trust_anchor::TrustAnchor> = mine
+        .into_iter()
+        .filter(|a| !in_chain.contains(a.anchor_id.as_str()))
+        .collect();
+    orphans.sort_by(|a, b| (a.created_at, &a.anchor_id).cmp(&(b.created_at, &b.anchor_id)));
+    ordered.extend(orphans);
     let start = if cursor.is_empty() {
         0
     } else {
@@ -18756,6 +18790,54 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agent_anchor_history_follows_hash_linkage_not_wall_clock() {
+        use decentraai_economy::trust_anchor::{AnchorParams, TrustStore};
+        // Two anchors stamped with the SAME timestamp: a wall-clock sort
+        // could order them either way, but the hash linkage is unambiguous
+        // (B chained after A). The history must follow the linkage.
+        let mut trust = TrustStore::default();
+        let mk = |ev: &str| AnchorParams {
+            agent_wallet: "agent:test".to_string(),
+            evidence_hash: ev.to_string(),
+            capability: "chat".to_string(),
+            quality_score: 90,
+            verified: true,
+            micro_cu: 100,
+            contract_id: None,
+        };
+        let a = trust.record_anchor(&mk(&"a1".repeat(32)), 1000).unwrap().clone();
+        let b = trust.record_anchor(&mk(&"b2".repeat(32)), 1000).unwrap().clone();
+        assert_eq!(b.previous_anchor_hash, Some(a.anchor_hash.clone()));
+        let proofs: Vec<crate::world::OnChainProof> = vec![];
+        let escrow = decentraai_economy::escrow::EscrowLedger::default();
+        let page = agent_anchor_history(&trust, &proofs, &escrow, "agent:test", "", 10);
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["seq"], 1);
+        assert_eq!(entries[0]["anchor_hash"], a.anchor_hash);
+        assert_eq!(entries[1]["seq"], 2);
+        assert_eq!(entries[1]["prev_hash"], a.anchor_hash);
+        assert_eq!(entries[1]["tick"], serde_json::Value::Null);
+        assert_eq!(entries[1]["status"], "open");
+        // Cursor pagination walks the linkage order one entry at a time.
+        let first = agent_anchor_history(&trust, &proofs, &escrow, "agent:test", "", 1);
+        let first_entries = first["entries"].as_array().unwrap();
+        assert_eq!(first_entries.len(), 1);
+        assert_eq!(first_entries[0]["seq"], 1);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        assert!(!cursor.is_empty());
+        let second = agent_anchor_history(&trust, &proofs, &escrow, "agent:test", cursor, 1);
+        let second_entries = second["entries"].as_array().unwrap();
+        assert_eq!(second_entries.len(), 1);
+        assert_eq!(second_entries[0]["seq"], 2);
+        assert_eq!(second["next_cursor"], "");
+        // Unknown cursor: empty terminal page, never a silent restart.
+        let lost = agent_anchor_history(&trust, &proofs, &escrow, "agent:test", "ta-nope", 10);
+        assert_eq!(lost["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(lost["next_cursor"], "");
+    }
 
     #[test]
     fn consumer_quota_settle_consumes_and_drop_releases() {

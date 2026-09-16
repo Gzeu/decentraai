@@ -316,7 +316,7 @@ pub fn all_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_agent_anchors",
-            description: "Per-agent anchor history (anchhist) from the hash-chained trust-anchor store. seq = 1-based position in per-agent chronological (created_at, anchor_id) order; task_id = linked contract id or null (trust anchors carry no task ids); tick = null by design (anchor writers mix epoch/tick units — never laundered); empty evidence_hash reads as null; tx_hash = on-chain tx joined by exact evidence match (confirmed world proof, else settled escrow) or null; status = anchored iff a tx was joined or the evidence is in the on-chain set, else open; ts = created_at. Cursor = last seen anchor_id (unknown cursor yields an empty terminal page, never a silent restart). Read-only.",
+            description: "Per-agent anchor history (anchhist) from the hash-chained trust-anchor store. seq = 1-based position in chain order (genesis to tip via prev_hash linkage; orphans unreachable from the tip trail by timestamp, never dropped); task_id = linked contract id or null (trust anchors carry no task ids); tick = null by design (anchor writers mix epoch/tick units — never laundered); empty evidence_hash reads as null; tx_hash = on-chain tx joined by exact evidence match (confirmed world proof, else settled escrow) or null; status = anchored iff a tx was joined or the evidence is in the on-chain set, else open; ts = created_at. Cursor = last seen anchor_id (unknown cursor yields an empty terminal page, never a silent restart). Read-only.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
