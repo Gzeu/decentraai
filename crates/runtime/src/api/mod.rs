@@ -5943,6 +5943,40 @@ fn agent_anchor_history(
     })
 }
 
+/// Summarizes server-side per-tool execution latencies for `get_revenue`.
+/// Each tool maps to {p50_ms, p95_ms, avg_ms, max_ms, n}. avg_ms is the
+/// integer-mean (floor) over the rolling window; empty series are skipped
+/// (absent tool ≠ zero latency). Deterministic key order for stable reads.
+fn summarize_tool_latencies(
+    lats: &std::collections::HashMap<String, Vec<u64>>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut map = std::collections::BTreeMap::new();
+    for (tool, times) in lats.iter() {
+        if times.is_empty() {
+            continue;
+        }
+        let mut sorted = times.clone();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let p50 = sorted[n / 2];
+        let p95 = sorted[(n * 95) / 100];
+        let max = *sorted.last().unwrap_or(&0);
+        let sum = sorted.iter().fold(0u64, |a, b| a.saturating_add(*b));
+        let avg = sum / n as u64;
+        map.insert(
+            tool.clone(),
+            serde_json::json!({
+                "p50_ms": p50,
+                "p95_ms": p95,
+                "avg_ms": avg,
+                "max_ms": max,
+                "n": n,
+            }),
+        );
+    }
+    map
+}
+
 fn extract_tool_name(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if v.get("method")?.as_str()? == "tools/call" {
@@ -6363,28 +6397,8 @@ async fn mcp_handler_inner(State(state): State<ApiState>, headers: HeaderMap, bo
                         })
                     })
                     .collect();
-                let tool_latencies_summary: std::collections::BTreeMap<String, serde_json::Value> = {
-                    let lats = state.tool_latencies.lock().unwrap();
-                    let mut map = std::collections::BTreeMap::new();
-                    for (tool, times) in lats.iter() {
-                        if times.is_empty() {
-                            continue;
-                        }
-                        let mut sorted = times.clone();
-                        sorted.sort_unstable();
-                        let n = sorted.len();
-                        let p50 = sorted[n / 2];
-                        let p95 = sorted[(n * 95) / 100];
-                        let max = *sorted.last().unwrap_or(&0);
-                        map.insert(tool.clone(), serde_json::json!({
-                            "p50_ms": p50,
-                            "p95_ms": p95,
-                            "max_ms": max,
-                            "n": n,
-                        }));
-                    }
-                    map
-                };
+                let tool_latencies_summary =
+                    summarize_tool_latencies(&state.tool_latencies.lock().unwrap());
                 let as_of = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -11065,28 +11079,8 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                         })
                     })
                     .collect();
-                let tool_latencies_summary: std::collections::BTreeMap<String, serde_json::Value> = {
-                    let lats = state.tool_latencies.lock().unwrap();
-                    let mut map = std::collections::BTreeMap::new();
-                    for (tool, times) in lats.iter() {
-                        if times.is_empty() {
-                            continue;
-                        }
-                        let mut sorted = times.clone();
-                        sorted.sort_unstable();
-                        let n = sorted.len();
-                        let p50 = sorted[n / 2];
-                        let p95 = sorted[(n * 95) / 100];
-                        let max = *sorted.last().unwrap_or(&0);
-                        map.insert(tool.clone(), serde_json::json!({
-                            "p50_ms": p50,
-                            "p95_ms": p95,
-                            "max_ms": max,
-                            "n": n,
-                        }));
-                    }
-                    map
-                };
+                let tool_latencies_summary =
+                    summarize_tool_latencies(&state.tool_latencies.lock().unwrap());
                 let as_of = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -18844,6 +18838,21 @@ pub fn ensure_api_token(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_latency_summary_carries_avg_and_skips_empty() {
+        let mut lats = std::collections::HashMap::new();
+        lats.insert("a".to_string(), vec![10u64, 20, 30, 40]);
+        lats.insert("empty".to_string(), vec![]);
+        let out = summarize_tool_latencies(&lats);
+        assert!(!out.contains_key("empty"), "empty series stay absent");
+        let a = &out["a"];
+        assert_eq!(a["n"], 4);
+        assert_eq!(a["p50_ms"], 30);
+        assert_eq!(a["p95_ms"], 40);
+        assert_eq!(a["avg_ms"], 25);
+        assert_eq!(a["max_ms"], 40);
+    }
 
     #[test]
     fn agent_anchor_history_follows_hash_linkage_not_wall_clock() {
