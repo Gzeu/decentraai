@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Compute-sharing domain: worker capabilities, availability, resource reservations, capability matching and scheduling"
 
 [dependencies]
+chrono.workspace = true
 decentraai-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -10836,6 +10836,17 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                         })
                     })
                     .collect();
+                let by_time_range: Vec<serde_json::Value> = cs
+                    .by_time_range
+                    .into_iter()
+                    .map(|(range, trc)| {
+                        serde_json::json!({
+                            "range": range,
+                            "executions": trc.executions,
+                            "credits": trc.credits,
+                        })
+                    })
+                    .collect();
                 let tool_latencies_summary: std::collections::BTreeMap<String, serde_json::Value> = {
                     let lats = state.tool_latencies.lock().unwrap();
                     let mut map = std::collections::BTreeMap::new();
@@ -10872,6 +10883,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                     "as_of": as_of,
                     "by_model": by_model,
                     "by_worker": by_worker,
+                    "by_time_range": by_time_range,
                     "quota_accounts": quota_accounts,
                     "tool_latencies": tool_latencies_summary,
                 })
@@ -10885,7 +10897,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                     "verified_executions": 0, "failed_executions": 0,
                     "total_credits_earned": 0, "total_credits_consumed": 0,
                     "balance": 0, "ledger_version": 0, "as_of": as_of,
-                    "by_model": [], "by_worker": [],
+                    "by_model": [], "by_worker": [], "by_time_range": [],
                     "quota_accounts": [], "tool_latencies": {},
                 })
             }

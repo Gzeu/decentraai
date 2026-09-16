@@ -109,6 +109,21 @@ impl NodeContributionState {
             wc.tokens = wc.tokens.saturating_add(d.value as u64);
         }
         wc.credits = wc.credits.saturating_add(credits);
+
+        // by_time_range: bucket executions per UTC calendar day so the
+        // dimension carries real data instead of staying present-but-empty
+        // on the wire. Day granularity keeps cardinality bounded (one
+        // entry per day) while giving the console a durable daily series.
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let trc = self
+            .by_time_range
+            .entry(day.clone())
+            .or_insert_with(|| TimeRangeContribution {
+                range: day,
+                ..Default::default()
+            });
+        trc.executions += 1;
+        trc.credits = trc.credits.saturating_add(credits);
     }
 
     pub fn consume(&mut self, amount: u64) -> bool {
@@ -139,6 +154,23 @@ mod tests {
         assert_eq!(state.verified_executions, 1);
         assert_eq!(state.balance, 100);
         assert!(state.by_model.contains_key("llama.gguf"));
+    }
+
+    #[test]
+    fn time_range_buckets_per_utc_day() {
+        let mut state = NodeContributionState::default();
+        let rc = ResourceContributionBuilder::new("exec-3", "peer-a")
+            .capability("inference")
+            .success(true)
+            .dimension(ResourceDimension::new("tokens_processed", 10.0, "tokens"))
+            .build();
+        state.record_execution(&rc, 50);
+        state.record_execution(&rc, 25);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let trc = state.by_time_range.get(&today).expect("today bucket exists");
+        assert_eq!(trc.executions, 2);
+        assert_eq!(trc.credits, 75);
+        assert_eq!(trc.range, today);
     }
 
     #[test]

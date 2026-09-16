@@ -2014,6 +2014,17 @@ async fn node_start(args: NodeArgs) -> Result<()> {
         });
     }
 
+    // ---- Part 17/22 + P14 Phase Q: persistent execution history, credit
+    // ledger and node-local contribution state (db/executions.jsonl,
+    // db/credits.json, db/contribution.json). Without these the `node`
+    // path keeps aggregates purely in memory and every restart silently
+    // zeroes verified_executions / by_model / by_worker / ledger_version.
+    // Mirrors the `distributed` command wiring; replay-on-set restores
+    // snapshots written by previous runs (best-effort, corrupt-safe).
+    compute_manager.set_executions_path(Some(data_dir.join("db/executions.jsonl")));
+    compute_manager.set_credits_path(Some(data_dir.join("db/credits.json")));
+    compute_manager.set_contribution_path(Some(data_dir.join("db/contribution.json")));
+
     // ---- Collective Intelligence P1: this node's logical agents ----
     // Agents are logical execution contexts hosted by the node (NOT extra
     // processes): identity + capabilities + policies, advertised to the
