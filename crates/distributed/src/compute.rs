@@ -720,6 +720,25 @@ impl ComputeManager {
         tokens_used: Option<u32>,
         processing_time_ms: Option<u32>,
     ) -> bool {
+        self.record_credited_contribution_with_model(
+            peer,
+            request_id,
+            verified,
+            tokens_used,
+            processing_time_ms,
+            None,
+        )
+    }
+
+    pub fn record_credited_contribution_with_model(
+        &self,
+        peer: &PeerId,
+        request_id: &str,
+        verified: bool,
+        tokens_used: Option<u32>,
+        processing_time_ms: Option<u32>,
+        model: Option<String>,
+    ) -> bool {
         const MAX_CREDITED: usize = 4096;
         // Dedup: if this execution was already credited, do NOT credit again.
         {
@@ -783,7 +802,7 @@ impl ComputeManager {
         // above keep working exactly as before.
         if verified {
             use decentraai_compute::{ResourceContributionBuilder, ResourceDimension};
-            let rc = ResourceContributionBuilder::new(request_id, peer.to_string())
+            let mut builder = ResourceContributionBuilder::new(request_id, peer.to_string())
                 .capability("inference")
                 .success(true)
                 .dimension(ResourceDimension::new(
@@ -795,8 +814,11 @@ impl ComputeManager {
                     "execution_duration_ms",
                     processing_time_ms.map(f64::from).unwrap_or(0.0),
                     "ms",
-                ))
-                .build();
+                ));
+            if let Some(m) = model {
+                builder = builder.model(m);
+            }
+            let rc = builder.build();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

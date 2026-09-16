@@ -17184,12 +17184,13 @@ fn stream_inference(
                 if let Some(cm) = &state.compute {
                     let req_id = format!("chat-stream-{}", uuid::Uuid::new_v4());
                     let local_peer = cm.local_peer();
-                    cm.record_credited_contribution(
+                    cm.record_credited_contribution_with_model(
                         &local_peer,
                         &req_id,
                         true,
                         Some(completion as u32),
                         Some(started.elapsed().as_millis() as u32),
+                        None,
                     );
                 }
             }
@@ -17854,6 +17855,9 @@ async fn proxy_with_auth(
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
+    let requested_model = serde_json::from_slice::<serde_json::Value>(&outgoing)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(String::from));
     let wants_stream = is_inference && detect_stream(&outgoing);
     // Non-streaming only: the whole body arrives in one buffered read, so a
     // total cap is safe here and keeps a hung engine from holding the queue
@@ -17903,12 +17907,17 @@ async fn proxy_with_auth(
                     let total_tokens = prompt_tokens + completion;
                     let req_id = format!("chat-{}", uuid::Uuid::new_v4());
                     let local_peer = cm.local_peer();
-                    cm.record_credited_contribution(
+                    let model_name = generated["model"]
+                        .as_str()
+                        .map(String::from)
+                        .or(requested_model);
+                    cm.record_credited_contribution_with_model(
                         &local_peer,
                         &req_id,
                         true,
                         Some(total_tokens as u32),
                         Some(started.elapsed().as_millis() as u32),
+                        model_name,
                     );
                 }
                 // Q2: settle the consumer reservation against real measured
