@@ -9760,8 +9760,12 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
                             "discover_capabilities" => true, // always available for onboarding
                             "serve_model" | "pull_model" | "list_consumer_keys"
                             | "get_compensation" => false,
-                            // M18 Economic Layer + §2.6 Revenue: available with "economy" scope or "*"
-                            name if name.starts_with("m18_") || name == "get_revenue" => {
+                            // M18 Economic Layer + §2.6 Revenue + escrow verdicts:
+                            // available with "economy" scope or "*"
+                            name if name.starts_with("m18_")
+                                || name == "get_revenue"
+                                || name == "get_escrow_verdicts" =>
+                            {
                                 scopes.iter().any(|s| s == "economy" || s == "*")
                             }
                             "orchestrate_propose" | "orchestrate_status" => {
@@ -11006,7 +11010,7 @@ async fn mcp_consumer_handler_inner(state: &ApiState, auth: &Auth, body: &[u8]) 
     } else {
         // Any other tool is not in the consumer consumption scope.
         return forbidden(
-            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), or discover_capabilities (no scope)",
+            "consumer API keys may only call: decide, execute_decision, decentraai_embeddings (embeddings scope), decentraai_compute_request (compute scope), diffusion_generate (image_generation scope), hub_* tools (hub scope), society_* tools (society scope), agent_memory_* tools (memory scope), memory_* tools (memory scope), orchestrate_* tools (orchestrate scope), arena_* tools (arena scope), get_revenue (economy scope), get_escrow_verdicts (economy scope), or discover_capabilities (no scope)",
         );
     }
 
@@ -11197,6 +11201,59 @@ async fn mcp_context(state: &ApiState) -> crate::mcp::McpContext {
             }
         },
         m18_action: serde_json::json!({}),
+        // Escrow verdicts (escrowv): per-escrow verdict snapshot, read-only.
+        // Verdict derives from the record status (Settled→settled,
+        // Refunded→refunded, anything else→open); settled_at/refunded_at
+        // reuse the record's last-change timestamp (0 when not applicable);
+        // evidence_hash/tx_hash stay null when absent (absent ≠ empty).
+        escrow_verdicts: {
+            if let Some(ref m18) = state.m18 {
+                let escrow = m18.escrow.lock().unwrap();
+                let mut verdicts: Vec<serde_json::Value> = escrow
+                    .records
+                    .values()
+                    .map(|r| {
+                        use decentraai_economy::escrow::EscrowStatus;
+                        let verdict = match r.status {
+                            EscrowStatus::Settled => "settled",
+                            EscrowStatus::Refunded => "refunded",
+                            _ => "open",
+                        };
+                        let settled_at =
+                            if r.status == EscrowStatus::Settled { r.updated_at } else { 0 };
+                        let refunded_at =
+                            if r.status == EscrowStatus::Refunded { r.updated_at } else { 0 };
+                        serde_json::json!({
+                            "escrow_id": r.escrow_id,
+                            "contract_id": r.contract_id,
+                            "verdict": verdict,
+                            "settled_at": settled_at,
+                            "refunded_at": refunded_at,
+                            "evidence_hash": r.evidence_hash,
+                            "tx_hash": r.tx_hash,
+                            "amount_micro_cu": r.amount_micro_cu,
+                        })
+                    })
+                    .collect();
+                verdicts.sort_by(|a, b| {
+                    a.get("escrow_id")
+                        .and_then(|v| v.as_str())
+                        .cmp(&b.get("escrow_id").and_then(|v| v.as_str()))
+                });
+                let as_of = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let count = verdicts.len();
+                serde_json::json!({
+                    "escrows": verdicts,
+                    "count": count,
+                    "as_of": as_of,
+                })
+            } else {
+                serde_json::json!({ "escrows": [], "count": 0 })
+            }
+        },
         // M22 Diffusion
         diffusion_models: serde_json::json!({
             "enabled": state.diffusion.enabled(),

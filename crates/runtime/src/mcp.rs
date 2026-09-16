@@ -116,6 +116,8 @@ pub struct McpContext {
     pub m18_trust: Value,
     /// M18 Economic Layer: result of last contract/escrow/trust mutation via MCP.
     pub m18_action: Value,
+    /// Escrow verdicts snapshot (escrowv): per-escrow verdict objects.
+    pub escrow_verdicts: Value,
     /// M22 Diffusion: list of available models on this node.
     pub diffusion_models: Value,
     /// M22 Diffusion: result of last image generation operation via MCP.
@@ -235,7 +237,7 @@ pub fn required_scopes_for(tool_name: &str) -> &'static [&'static str] {
         // Arena scope
         "arena_state" | "arena_act" => &["arena"],
         // Revenue/economy scope
-        "get_revenue" => &["economy"],
+        "get_revenue" | "get_escrow_verdicts" => &["economy"],
         // Demand signal tools — available to all authenticated users
         "announce_demand" | "list_demands" | "cancel_demand" => &[],
         // Orchestrate scope
@@ -291,6 +293,12 @@ pub fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "get_revenue",
             description: "Node revenue summary (§2.6): verified executions, credits earned/consumed, balance, per-model and per-worker breakdowns, quota accounts. Read-only; every figure is real measured work — never fabricated.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            annotations: ToolAnnotations::read_only(),
+        },
+        ToolDef {
+            name: "get_escrow_verdicts",
+            description: "Per-escrow verdicts (escrowv): one verdict object per M18 escrow record — verdict (settled/refunded/open), settled_at/refunded_at (status-change timestamps, 0 when not applicable), evidence_hash/tx_hash (null when absent), amount_micro_cu. Read-only; settled_at/refunded_at reuse the record's last-change timestamp, no new clock is invented.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             annotations: ToolAnnotations::read_only(),
         },
@@ -1584,6 +1592,21 @@ pub fn revenue_request(raw: &str) -> bool {
         == Some("get_revenue")
 }
 
+/// Whether the incoming message is a `get_escrow_verdicts` tool call. Pure —
+/// lets the HTTP layer precompute the verdict snapshot into [`McpContext::escrow_verdicts`].
+pub fn escrow_verdicts_request(raw: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    if msg.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    msg.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        == Some("get_escrow_verdicts")
+}
+
 /// §1 Demand signal parsers
 pub fn announce_demand_request(raw: &str) -> Option<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(raw) else {
@@ -2772,6 +2795,8 @@ fn call_tool(ctx: &McpContext, name: &str, _args: Option<Value>) -> Option<Value
         "m18_create_escrow" => &ctx.m18_action,
         "m18_settle_escrow" => &ctx.m18_action,
         "m18_list_trust" => &ctx.m18_trust,
+        // Escrow verdicts (escrowv): precomputed snapshot, both paths.
+        "get_escrow_verdicts" => &ctx.escrow_verdicts,
         "m18_record_trust" => &ctx.m18_action,
         "m18_verify_trust" => &ctx.m18_action,
         "m18_trust_score" => &ctx.m18_action,
@@ -2838,6 +2863,7 @@ mod tests {
             m18_escrow: json!([]),
             m18_trust: json!([]),
             m18_action: json!({}),
+            escrow_verdicts: json!({}),
             diffusion_models: json!({ "enabled": false, "healthy": false, "models": [] }),
             diffusion_action: json!({}),
             embeddings_result: json!({}),
@@ -3919,5 +3945,39 @@ mod tests {
             let t = tools.iter().find(|t| t["name"] == *name);
             assert!(t.is_some(), "tool {} must be in tools/list", name);
         }
+    }
+
+    #[test]
+    fn escrow_verdicts_request_matches_only_the_tool() {
+        assert!(escrow_verdicts_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_escrow_verdicts","arguments":{}}}"#
+        ));
+        assert!(!escrow_verdicts_request(
+            r#"{"jsonrpc":"2.0","method":"tools/list"}"#
+        ));
+        assert!(!escrow_verdicts_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_revenue","arguments":{}}}"#
+        ));
+    }
+
+    #[test]
+    fn tools_list_exposes_get_escrow_verdicts() {
+        let r = call(r#"{"jsonrpc":"2.0","id":11,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "get_escrow_verdicts");
+        assert!(t.is_some(), "get_escrow_verdicts must be in tools/list");
+        let t = t.unwrap();
+        assert_eq!(t.get("requiredScopes").cloned(), Some(json!(["economy"])));
+        assert_eq!(t["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
+    fn get_escrow_verdicts_returns_precomputed_snapshot() {
+        let r = call(
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_escrow_verdicts","arguments":{}}}"#,
+        );
+        // Test ctx() has empty default; the dispatch returns it as-is.
+        let content = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(content, "{}");
     }
 }
